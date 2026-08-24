@@ -1,0 +1,11 @@
+[package]
+name = "hane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hane-benchmark.workspace = true
+hane-editor.workspace = true
+hane-ui.workspace = true
+gpui.workspace = true

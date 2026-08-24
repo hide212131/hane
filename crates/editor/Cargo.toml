@@ -1,0 +1,10 @@
+[package]
+name = "hane-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hane-document.workspace = true
+unicode-segmentation.workspace = true
+

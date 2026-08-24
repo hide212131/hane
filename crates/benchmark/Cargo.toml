@@ -1,0 +1,16 @@
+[package]
+name = "hane-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hane-document.workspace = true
+hane-editor.workspace = true
+hane-markdown.workspace = true
+hane-presentation.workspace = true
+
+[[bin]]
+name = "hane-bench"
+path = "src/main.rs"
+

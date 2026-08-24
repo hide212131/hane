@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/app",
+    "crates/benchmark",
+    "crates/document",
+    "crates/editor",
+    "crates/markdown",
+    "crates/presentation",
+    "crates/ui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.93"
+
+[workspace.dependencies]
+hane-document = { path = "crates/document" }
+hane-editor = { path = "crates/editor" }
+hane-markdown = { path = "crates/markdown" }
+hane-presentation = { path = "crates/presentation" }
+hane-benchmark = { path = "crates/benchmark" }
+hane-ui = { path = "crates/ui" }
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+ropey = "=1.6.1"
+unicode-segmentation = "=1.12.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

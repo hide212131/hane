@@ -1,0 +1,10 @@
+[package]
+name = "hane-presentation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hane-document.workspace = true
+hane-markdown.workspace = true
+
