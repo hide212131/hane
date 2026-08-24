@@ -28,5 +28,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-測定結果と残りの手動検証は [Phase 0 report](docs/phase0/report.md) を参照してください。
+## UI の画面キャプチャ
 
+行境界にカーソルを置いた再現画面は、次のコマンドで取得できます。
+
+```sh
+scripts/capture_cursor_boundary.sh
+```
+
+既定の出力先は `target/captures/cursor-line-boundary.png` です。引数で別の出力先も指定できます。初回実行時にmacOSから画面収録の許可を求められた場合は、使用中のターミナルまたはCodexに許可してください。
+
+末尾改行後の空行など、別のbyte offsetを確認する場合は `HANE_CAPTURE_CURSOR_OFFSET` を指定できます。
+
+```sh
+HANE_CAPTURE_CURSOR_OFFSET=23 scripts/capture_cursor_boundary.sh
+```
+
+測定結果と残りの手動検証は [Phase 0 report](docs/phase0/report.md) を参照してください。

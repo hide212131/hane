@@ -36,6 +36,14 @@ const LINE_HEIGHT: f32 = 26.0;
 const VIEWPORT_HEIGHT: f32 = 720.0;
 const OVERSCAN: f32 = 260.0;
 
+fn line_owns_cursor(
+    range: SourceRange,
+    cursor: hane_document::SourceOffset,
+    is_final_line: bool,
+) -> bool {
+    range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
+}
+
 pub struct EditorView {
     editor: Editor,
     focus_handle: FocusHandle,
@@ -75,6 +83,20 @@ impl EditorView {
 
     pub fn editor(&self) -> &Editor {
         &self.editor
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_cursor_offset_for_development(
+        &mut self,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), hane_document::BufferError> {
+        self.editor
+            .set_selection(hane_editor::Selection::caret(hane_document::SourceOffset(
+                offset,
+            )))?;
+        self.after_input(cx);
+        Ok(())
     }
 
     fn after_input(&mut self, cx: &mut Context<Self>) {
@@ -197,7 +219,11 @@ impl EditorView {
             block.visual_text.pop();
         }
         let cursor = self.editor.selection().active;
-        let visual_cursor = if range.start <= cursor && cursor <= range.end {
+        let visual_cursor = if line_owns_cursor(
+            range,
+            cursor,
+            line + 1 == self.editor.document().line_count(),
+        ) {
             block
                 .source_map
                 .source_to_visual(cursor, Bias::After)
@@ -525,4 +551,39 @@ pub fn register_key_bindings(cx: &mut App) {
         gpui::KeyBinding::new("end", End, Some("HaneEditor")),
         gpui::KeyBinding::new("escape", CancelComposition, Some("HaneEditor")),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hane_document::SourceOffset;
+
+    #[test]
+    fn shared_line_boundary_belongs_only_to_the_following_line() {
+        let first = SourceRange::new(0, 4);
+        let second = SourceRange::new(4, 8);
+        let cursor = SourceOffset(4);
+
+        assert!(!line_owns_cursor(first, cursor, false));
+        assert!(line_owns_cursor(second, cursor, true));
+    }
+
+    #[test]
+    fn document_end_belongs_to_the_final_line() {
+        assert!(line_owns_cursor(
+            SourceRange::new(4, 8),
+            SourceOffset(8),
+            true
+        ));
+    }
+
+    #[test]
+    fn trailing_empty_line_exclusively_owns_document_end() {
+        let content_line = SourceRange::new(0, 4);
+        let trailing_empty_line = SourceRange::new(4, 4);
+        let cursor = SourceOffset(4);
+
+        assert!(!line_owns_cursor(content_line, cursor, false));
+        assert!(line_owns_cursor(trailing_empty_line, cursor, true));
+    }
 }
