@@ -7,7 +7,7 @@ use gpui::{
 };
 use hane_document::{Bias, LineCol, LineId, SourceRange, TextBuffer};
 use hane_editor::{Editor, EditorCommand};
-use hane_presentation::{HeightIndex, StyleKind, VisualOffset, present_bold};
+use hane_presentation::{HeightIndex, StyleKind, present_bold};
 use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -232,44 +232,42 @@ impl EditorView {
         } else {
             None
         };
-        if let Some(at) = visual_cursor {
-            let at = at.min(block.visual_text.len());
-            block.visual_text.insert(at, '│');
-            for run in &mut block.style_runs {
-                if run.visual_range.start.0 >= at {
-                    run.visual_range.start = VisualOffset(run.visual_range.start.0 + 3);
-                }
-                if run.visual_range.end.0 >= at {
-                    run.visual_range.end = VisualOffset(run.visual_range.end.0 + 3);
-                }
-            }
-        }
+        let visual_cursor = visual_cursor.map(|at| at.min(block.visual_text.len()));
         let mut boundaries = vec![0, block.visual_text.len()];
+        boundaries.extend(visual_cursor);
         for run in &block.style_runs {
             boundaries.push(run.visual_range.start.0);
             boundaries.push(run.visual_range.end.0);
         }
         boundaries.sort_unstable();
         boundaries.dedup();
-        let spans = boundaries.windows(2).filter_map(|pair| {
+        let mut spans = Vec::new();
+        for pair in boundaries.windows(2) {
             let (start, end) = (pair[0], pair[1]);
+            if visual_cursor == Some(start) {
+                spans.push(cursor_overlay().into_any_element());
+            }
             if start == end
                 || !block.visual_text.is_char_boundary(start)
                 || !block.visual_text.is_char_boundary(end)
             {
-                return None;
+                continue;
             }
             let bold = block.style_runs.iter().any(|run| {
                 run.kind == StyleKind::Bold
                     && start >= run.visual_range.start.0
                     && end <= run.visual_range.end.0
             });
-            Some(
+            spans.push(
                 div()
                     .when(bold, |d| d.font_weight(gpui::FontWeight::BOLD))
-                    .child(block.visual_text[start..end].to_owned()),
-            )
-        });
+                    .child(block.visual_text[start..end].to_owned())
+                    .into_any_element(),
+            );
+        }
+        if visual_cursor == Some(block.visual_text.len()) {
+            spans.push(cursor_overlay().into_any_element());
+        }
         let selected = self.editor.selection().range().intersects(range);
         div()
             .h(px(LINE_HEIGHT))
@@ -280,6 +278,23 @@ impl EditorView {
             .when(selected, |d| d.bg(rgb(0xe8eefc)))
             .children(spans)
     }
+}
+
+fn cursor_overlay() -> gpui::Div {
+    div()
+        .relative()
+        .flex_none()
+        .w(px(0.))
+        .h(px(LINE_HEIGHT))
+        .child(
+            div()
+                .absolute()
+                .top(px(3.))
+                .left(px(0.))
+                .w(px(1.))
+                .h(px(LINE_HEIGHT - 6.))
+                .bg(rgb(0x262626)),
+        )
 }
 
 impl Focusable for EditorView {
