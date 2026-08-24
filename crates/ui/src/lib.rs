@@ -19,8 +19,12 @@ actions!(
         Delete,
         Left,
         Right,
+        Up,
+        Down,
         SelectLeft,
         SelectRight,
+        SelectUp,
+        SelectDown,
         SelectAll,
         Home,
         End,
@@ -101,11 +105,23 @@ impl EditorView {
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorCommand::MoveRight { extend: false }, cx);
     }
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorCommand::MoveUp { extend: false }, cx);
+    }
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorCommand::MoveDown { extend: false }, cx);
+    }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorCommand::MoveLeft { extend: true }, cx);
     }
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorCommand::MoveRight { extend: true }, cx);
+    }
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorCommand::MoveUp { extend: true }, cx);
+    }
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.dispatch(EditorCommand::MoveDown { extend: true }, cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.dispatch(EditorCommand::SelectAll, cx);
@@ -287,7 +303,12 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.editor.commit_text(range_utf16, new_text) {
+        let result = if range_utf16.is_none() && self.editor.ime().is_none() {
+            self.editor.insert_text(new_text).map(|_| ())
+        } else {
+            self.editor.commit_text(range_utf16, new_text).map(|_| ())
+        };
+        if let Err(error) = result {
             eprintln!("text input rejected: {error}");
         }
         self.after_input(cx);
@@ -438,8 +459,12 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
@@ -489,8 +514,12 @@ pub fn register_key_bindings(cx: &mut App) {
         gpui::KeyBinding::new("delete", Delete, Some("HaneEditor")),
         gpui::KeyBinding::new("left", Left, Some("HaneEditor")),
         gpui::KeyBinding::new("right", Right, Some("HaneEditor")),
+        gpui::KeyBinding::new("up", Up, Some("HaneEditor")),
+        gpui::KeyBinding::new("down", Down, Some("HaneEditor")),
         gpui::KeyBinding::new("shift-left", SelectLeft, Some("HaneEditor")),
         gpui::KeyBinding::new("shift-right", SelectRight, Some("HaneEditor")),
+        gpui::KeyBinding::new("shift-up", SelectUp, Some("HaneEditor")),
+        gpui::KeyBinding::new("shift-down", SelectDown, Some("HaneEditor")),
         gpui::KeyBinding::new("cmd-a", SelectAll, Some("HaneEditor")),
         gpui::KeyBinding::new("home", Home, Some("HaneEditor")),
         gpui::KeyBinding::new("end", End, Some("HaneEditor")),

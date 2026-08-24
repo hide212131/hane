@@ -81,6 +81,8 @@ pub enum EditorCommand<'a> {
     Delete,
     MoveLeft { extend: bool },
     MoveRight { extend: bool },
+    MoveUp { extend: bool },
+    MoveDown { extend: bool },
     MoveToStart { extend: bool },
     MoveToEnd { extend: bool },
     SelectAll,
@@ -89,6 +91,7 @@ pub enum EditorCommand<'a> {
 pub struct Editor {
     document: RopeBuffer,
     selection: Selection,
+    preferred_grapheme_column: Option<usize>,
     ime: Option<ImeState>,
     next_transaction: u64,
     next_input_sequence: u64,
@@ -100,6 +103,7 @@ impl Editor {
         Self {
             document: RopeBuffer::from_text(text),
             selection: Selection::caret(SourceOffset(0)),
+            preferred_grapheme_column: None,
             ime: None,
             next_transaction: 1,
             next_input_sequence: 1,
@@ -120,6 +124,7 @@ impl Editor {
         self.document.validate_offset(selection.anchor)?;
         self.document.validate_offset(selection.active)?;
         self.selection = selection;
+        self.preferred_grapheme_column = None;
         Ok(())
     }
 
@@ -129,6 +134,12 @@ impl Editor {
     ) -> Result<Option<EditSummary>, BufferError> {
         let received = Instant::now();
         self.commit_composition();
+        if !matches!(
+            command,
+            EditorCommand::MoveUp { .. } | EditorCommand::MoveDown { .. }
+        ) {
+            self.preferred_grapheme_column = None;
+        }
         let edit = match command {
             EditorCommand::Insert(text) => Some(self.replace_selection(text)?),
             EditorCommand::Backspace => self.backspace()?,
@@ -139,6 +150,14 @@ impl Editor {
             }
             EditorCommand::MoveRight { extend } => {
                 self.move_grapheme(true, extend)?;
+                None
+            }
+            EditorCommand::MoveUp { extend } => {
+                self.move_vertical(false, extend)?;
+                None
+            }
+            EditorCommand::MoveDown { extend } => {
+                self.move_vertical(true, extend)?;
                 None
             }
             EditorCommand::MoveToStart { extend } => {
@@ -159,6 +178,16 @@ impl Editor {
         };
         self.record_model_update(received);
         Ok(edit)
+    }
+
+    /// Inserts text through the same command path used by interactive editing.
+    ///
+    /// This is intentionally public so regression tests can describe input as a
+    /// sequence of cursor commands followed by text insertion.
+    pub fn insert_text(&mut self, text: &str) -> Result<EditSummary, BufferError> {
+        Ok(self
+            .dispatch(EditorCommand::Insert(text))?
+            .expect("inserting text always produces an edit"))
     }
 
     fn record_model_update(&mut self, received_at: Instant) {
@@ -203,6 +232,11 @@ impl Editor {
             .document
             .offset_for_line_col(line, hane_document::LineCol(0))?
             .0;
+        if offset.0 == line_start && line.0 > 0 {
+            return Ok(self
+                .line_content_range(hane_document::LineId(line.0 - 1))?
+                .end);
+        }
         let text = self.document.text(SourceRange::new(line_start, offset.0))?;
         Ok(SourceOffset(
             line_start
@@ -253,6 +287,63 @@ impl Editor {
         self.move_to(target, extend);
         Ok(())
     }
+
+    fn move_vertical(&mut self, down: bool, extend: bool) -> Result<(), BufferError> {
+        let current_line = self.document.line_for_offset(self.selection.active)?;
+        let current_range = self.line_content_range(current_line)?;
+        let current_prefix = self.document.text(SourceRange {
+            start: current_range.start,
+            end: self.selection.active.min(current_range.end),
+        })?;
+        let preferred_column = *self
+            .preferred_grapheme_column
+            .get_or_insert_with(|| current_prefix.graphemes(true).count());
+
+        let target_line = if down {
+            let next = current_line.0 + 1;
+            if next >= self.document.line_count() {
+                return Ok(());
+            }
+            hane_document::LineId(next)
+        } else {
+            let Some(previous) = current_line.0.checked_sub(1) else {
+                return Ok(());
+            };
+            hane_document::LineId(previous)
+        };
+        let target_range = self.line_content_range(target_line)?;
+        let target_text = self.document.text(target_range)?;
+        let relative_offset = target_text
+            .grapheme_indices(true)
+            .nth(preferred_column)
+            .map(|(offset, _)| offset)
+            .unwrap_or(target_text.len());
+        self.move_to(SourceOffset(target_range.start.0 + relative_offset), extend);
+        Ok(())
+    }
+
+    fn line_content_range(&self, line: hane_document::LineId) -> Result<SourceRange, BufferError> {
+        let start = self
+            .document
+            .offset_for_line_col(line, hane_document::LineCol(0))?;
+        let raw_end = if line.0 + 1 < self.document.line_count() {
+            self.document
+                .offset_for_line_col(hane_document::LineId(line.0 + 1), hane_document::LineCol(0))?
+        } else {
+            SourceOffset(self.document.len_bytes().0)
+        };
+        let raw_text = self.document.text(SourceRange {
+            start,
+            end: raw_end,
+        })?;
+        let content = if let Some(without_lf) = raw_text.strip_suffix('\n') {
+            without_lf.strip_suffix('\r').unwrap_or(without_lf)
+        } else {
+            &raw_text
+        };
+        let content_len = content.len();
+        Ok(SourceRange::new(start.0, start.0 + content_len))
+    }
     fn move_to(&mut self, target: SourceOffset, extend: bool) {
         if extend {
             self.selection.active = target;
@@ -289,6 +380,7 @@ impl Editor {
         selected_utf16: Option<Range<usize>>,
     ) -> Result<EditSummary, BufferError> {
         let received = Instant::now();
+        self.preferred_grapheme_column = None;
         if self.ime.is_none() {
             let original_range = if let Some(range) = replacement_utf16 {
                 self.utf16_range_to_source(range)?
@@ -338,6 +430,7 @@ impl Editor {
         text: &str,
     ) -> Result<EditSummary, BufferError> {
         let received = Instant::now();
+        self.preferred_grapheme_column = None;
         let range = if let Some(range) = replacement_utf16 {
             self.utf16_range_to_source(range)?
         } else {
@@ -376,6 +469,7 @@ impl Editor {
         }
         self.document.edit(current, &ime.original_text)?;
         self.selection = ime.original_selection;
+        self.preferred_grapheme_column = None;
         Ok(ImeCancelOutcome::Restored)
     }
 

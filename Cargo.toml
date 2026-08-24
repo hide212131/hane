@@ -24,7 +24,7 @@ hane-presentation = { path = "crates/presentation" }
 hane-benchmark = { path = "crates/benchmark" }
 hane-ui = { path = "crates/ui" }
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
-ropey = "=1.6.1"
+ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 unicode-segmentation = "=1.12.0"
 
 [profile.release]

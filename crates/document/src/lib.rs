@@ -433,6 +433,18 @@ mod tests {
     }
 
     #[test]
+    fn only_lf_and_crlf_are_line_breaks() {
+        let buffer = RopeBuffer::from_text("a\rb\u{2028}c\nd");
+        assert_eq!(buffer.line_count(), 2);
+        assert_eq!(
+            buffer.offset_for_line_col(LineId(0), LineCol(5)).unwrap(),
+            SourceOffset(7)
+        );
+        assert_eq!(buffer.line_for_offset(SourceOffset(3)).unwrap(), LineId(0));
+        assert_eq!(buffer.line_for_offset(SourceOffset(8)).unwrap(), LineId(1));
+    }
+
+    #[test]
     fn anchors_follow_insert_bias_and_deletion() {
         let mut buffer = RopeBuffer::from_text("abcd");
         let before = buffer.anchor(SourceOffset(2), Bias::Before).unwrap();
