@@ -15,6 +15,25 @@ use std::time::Instant;
 
 const METRICS_CAPACITY: usize = 4_096;
 
+fn scroll_y_for_cursor(
+    scroll_y: f32,
+    cursor_top: f32,
+    line_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    if cursor_top < scroll_y {
+        cursor_top
+    } else if cursor_top + line_height > scroll_y + viewport_height {
+        cursor_top + line_height - viewport_height
+    } else {
+        scroll_y
+    }
+}
+
+fn content_top_for_scroll(scroll_y: f32) -> f32 {
+    -scroll_y
+}
+
 pub struct EditorView {
     pub(crate) editor: Editor,
     pub(crate) focus_handle: FocusHandle,
@@ -71,6 +90,20 @@ impl EditorView {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
+    pub fn move_cursor_down_for_development(
+        &mut self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), BufferError> {
+        for _ in 0..count {
+            self.editor
+                .dispatch(EditorCommand::MoveDown { extend: false })?;
+        }
+        self.after_input(cx);
+        Ok(())
+    }
+
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
         let lines = self.editor.document().line_count();
         if lines != self.heights.len() {
@@ -115,11 +148,12 @@ impl EditorView {
             return;
         };
         let top = self.heights.prefix_sum(line.0);
-        if top < self.scroll_y {
-            self.scroll_y = top;
-        } else if top + self.theme.line_height > self.scroll_y + self.viewport_height {
-            self.scroll_y = top + self.theme.line_height - self.viewport_height;
-        }
+        self.scroll_y = scroll_y_for_cursor(
+            self.scroll_y,
+            top,
+            self.theme.line_height,
+            self.viewport_height,
+        );
     }
 }
 
@@ -186,6 +220,8 @@ impl Render for EditorView {
                 .child(InputCapture { input: cx.entity() })
                 .child(
                     div()
+                        .absolute()
+                        .top(px(content_top_for_scroll(self.scroll_y)))
                         .flex()
                         .flex_col()
                         .w_full()
@@ -194,5 +230,41 @@ impl Render for EditorView {
                         .child(div().h(px(bottom_space))),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hane_document::LineId;
+
+    #[test]
+    fn moving_down_through_forty_lines_scrolls_cursor_to_viewport_bottom() {
+        let text = (1..=40)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&text);
+
+        for _ in 0..32 {
+            editor
+                .dispatch(EditorCommand::MoveDown { extend: false })
+                .unwrap();
+        }
+
+        let line = editor
+            .document()
+            .line_for_offset(editor.selection().active)
+            .unwrap();
+        let heights = HeightIndex::new(std::iter::repeat_n(DEFAULT_THEME.line_height, 40));
+        let viewport_height = 722.0;
+        let cursor_top = heights.prefix_sum(line.0);
+        let scroll_y =
+            scroll_y_for_cursor(0.0, cursor_top, DEFAULT_THEME.line_height, viewport_height);
+
+        assert_eq!(line, LineId(32));
+        assert_eq!(scroll_y, 136.0);
+        assert_eq!(content_top_for_scroll(scroll_y), -136.0);
+        assert_eq!(cursor_top - scroll_y, 696.0);
     }
 }

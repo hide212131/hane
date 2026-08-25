@@ -44,4 +44,14 @@ scripts/capture_cursor_boundary.sh
 HANE_CAPTURE_CURSOR_OFFSET=23 scripts/capture_cursor_boundary.sh
 ```
 
+40行の文書で↓キー相当のカーソル移動を32回実行し、追従スクロールを確認する場合は
+次のコマンドを使います。
+
+```sh
+scripts/capture_cursor_scroll.sh
+```
+
+既定の出力先は `target/captures/cursor-scroll.png` です。移動回数は
+`HANE_CAPTURE_CURSOR_DOWN` で変更できます。
+
 測定結果と残りの手動検証は [Phase 0 report](docs/phase0/report.md) を参照してください。

@@ -14,6 +14,12 @@ fn main() {
             .parse::<usize>()
             .expect("HANE_DEV_CURSOR_OFFSET must be a byte offset")
     });
+    #[cfg(debug_assertions)]
+    let development_cursor_down = std::env::var("HANE_DEV_CURSOR_DOWN").ok().map(|value| {
+        value
+            .parse::<usize>()
+            .expect("HANE_DEV_CURSOR_DOWN must be a non-negative integer")
+    });
     Application::new().run(move |cx: &mut App| {
         register_key_bindings(cx);
         let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
@@ -32,6 +38,15 @@ fn main() {
                 })
                 .expect("set development cursor")
                 .expect("HANE_DEV_CURSOR_OFFSET must be a valid character boundary");
+        }
+        #[cfg(debug_assertions)]
+        if let Some(count) = development_cursor_down {
+            window
+                .update(cx, |view, _, cx| {
+                    view.move_cursor_down_for_development(count, cx)
+                })
+                .expect("move development cursor down")
+                .expect("development cursor movement must succeed");
         }
         window.update(cx, |view, window, cx| { window.focus(&view.focus_handle(cx)); }).expect("focus editor");
         cx.activate(true);
