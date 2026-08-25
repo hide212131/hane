@@ -25,6 +25,8 @@ ADR-0001 から ADR-0011 はPhase 0、ADR-0012からADR-0014はPhase 1、ADR-001
 | [ADR-0013](0013-undo-redo-transactions.md) | Undo/Redo transaction |
 | [ADR-0014](0014-gpui-memory-baseline.md) | GPUI memory baselineと空Editor RSS目標 |
 | [ADR-0015](0015-phase2-markdown-presentation-plan.md) | Phase 2 Markdown Presentation実装計画 |
+| [ADR-0016](0016-phase3-typora-editing-plan.md) | Phase 3 Typora-style Editing実装計画 |
+| [ADR-0017](0017-phase4-polish-plan.md) | Phase 4 Polish実装計画 |
 
 ## Phase 0 実装時の参照順
 
@@ -89,5 +91,15 @@ Phase 0 の実装を始める場合は、以下の順に読む。
 3. [ADR-0004](0004-source-visual-mapping.md)
 4. [ADR-0008](0008-markdown-parsing-strategy.md)
 5. [ADR-0005](0005-revision-and-background-work.md)
+6. [ADR-0007](0007-ime-composition.md)
+7. [ADR-0009](0009-performance-harness.md)
+
+## Phase 4 実装時の参照順
+
+1. [Phase 3 report](../phase3/report.md)
+2. [ADR-0017](0017-phase4-polish-plan.md)
+3. [ADR-0004](0004-source-visual-mapping.md)
+4. [ADR-0005](0005-revision-and-background-work.md)
+5. [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md)
 6. [ADR-0007](0007-ime-composition.md)
 7. [ADR-0009](0009-performance-harness.md)

@@ -41,6 +41,10 @@ macro_rules! command_actions {
 }
 
 command_actions! {
+    Open ("cmd-o") => open_action |view, cx| { view.prompt_open(cx); },
+    Save ("cmd-s") => save |view, cx| { view.save_or_prompt(cx); },
+    SaveAs ("cmd-shift-s") => save_as |view, cx| { view.prompt_save_as(cx); },
+    ToggleAutosave ("cmd-alt-a") => toggle_autosave_action |view, cx| { view.toggle_autosave(cx); },
     Newline ("enter") => newline |view, cx| {
         if view.editor.ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);

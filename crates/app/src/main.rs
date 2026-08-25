@@ -34,7 +34,7 @@ fn main() {
                     Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| EditorView::new(&format!("Could not open {}: {error}", path.display()), path.display().to_string(), cx)),
                     None if std::env::var("HANE_MEASUREMENT_EMPTY")
                         .is_ok_and(|value| !value.is_empty()) => EditorView::new("", "Untitled", cx),
-                    None => EditorView::new("# Hane Phase 3\n\n日本語IME、範囲選択、Undo / Redoに加えて、**太字**、_斜体_、~~取り消し線~~、`inline code`を試せます。\n\n## Typora-style Editing\n\nPhase 3ではMarkdown記号を通常は隠し、カーソルや選択が構文へ入ったときだけ段階表示します。\n\n```rust\nlet fast = true;\n```\n", "Untitled", cx),
+                    None => EditorView::new("# Hane Phase 4\n\n日本語IME、範囲選択、Undo / Redo、Markdown記号の段階表示に加えて、画像、表、保存、自動保存、Recent Files、themeを試せます。\n\n![Hane feather](assets/phase4-feather.svg)\n\n| Feature | Status |\n|:---|---:|\n| Typora-style editing | ✓ |\n| Atomic autosave | ✓ |\n| Light / Dark theme | ✓ |\n\n## Polish\n\n画像と表も元Markdownを唯一の正として保持します。行へカーソルを移動するとsourceを編集できます。\n", "Untitled", cx),
                 };
                 view.arm_startup_timing(process_started);
                 view

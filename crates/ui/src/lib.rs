@@ -5,6 +5,7 @@ mod capture;
 mod input;
 mod line;
 mod phase0_metrics;
+mod storage;
 mod theme;
 mod view;
 

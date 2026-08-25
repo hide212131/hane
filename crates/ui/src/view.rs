@@ -2,21 +2,23 @@ use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 use crate::line::{block_font_size, disclosure_for_line, line_element_from_block, presented_line};
 use crate::phase0_metrics::Phase0MetricsOutput;
-use crate::theme::{DEFAULT_THEME, Theme};
+use crate::storage::{PersistentState, atomic_save_document};
+use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, FontStyle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollWheelEvent, Styled,
-    TextRun, Window, div, px, rgb,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, TextRun, Window, div, px, rgb,
 };
 use hane_document::{
-    Bias, BufferError, LineId, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
+    Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
+    TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, Selection};
 use hane_markdown::{BlockContextIndex, FenceDelimiter, fence_delimiter, parse_block_context};
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
@@ -40,6 +42,20 @@ fn content_top_for_scroll(scroll_y: f32) -> f32 {
     -scroll_y
 }
 
+fn autosave_request_is_current(
+    current_generation: u64,
+    requested_generation: u64,
+    current_revision: Revision,
+    requested_revision: Revision,
+    enabled: bool,
+    has_path: bool,
+) -> bool {
+    enabled
+        && has_path
+        && current_generation == requested_generation
+        && current_revision == requested_revision
+}
+
 pub struct EditorView {
     pub(crate) editor: Editor,
     pub(crate) focus_handle: FocusHandle,
@@ -48,6 +64,8 @@ pub struct EditorView {
     viewport_height: f32,
     pub(crate) metrics: FrameMetrics,
     file_label: String,
+    file_path: Option<PathBuf>,
+    saved_revision: Revision,
     status: Option<String>,
     theme: Theme,
     pub(crate) process_started: Instant,
@@ -61,15 +79,32 @@ pub struct EditorView {
     display_linked_scroll_direction: Option<f32>,
     block_context: Option<BlockContextIndex>,
     block_context_job_running: bool,
+    persistent_state: PersistentState,
+    save_generation: u64,
+    save_job_running: bool,
+    pending_save_path: Option<PathBuf>,
 }
 
 impl EditorView {
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
-        Self::from_editor(Editor::new(text), file_label, cx)
+        Self::from_editor(
+            Editor::new(text),
+            file_label,
+            None,
+            PersistentState::load_default(),
+            cx,
+        )
     }
 
-    fn from_editor(editor: Editor, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
+    fn from_editor(
+        editor: Editor,
+        file_label: impl Into<String>,
+        file_path: Option<PathBuf>,
+        persistent_state: PersistentState,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let theme = DEFAULT_THEME;
+        let saved_revision = editor.document().revision();
         let heights = HeightIndex::new(std::iter::repeat_n(
             theme.line_height,
             editor.document().line_count(),
@@ -82,6 +117,8 @@ impl EditorView {
             viewport_height: theme.line_height,
             metrics: FrameMetrics::new(METRICS_CAPACITY),
             file_label: file_label.into(),
+            file_path,
+            saved_revision,
             status: None,
             theme,
             process_started: Instant::now(),
@@ -98,6 +135,10 @@ impl EditorView {
             display_linked_scroll_direction: None,
             block_context: None,
             block_context_job_running: false,
+            persistent_state,
+            save_generation: 0,
+            save_job_running: false,
+            pending_save_path: None,
         }
     }
 
@@ -105,9 +146,17 @@ impl EditorView {
         let started = Instant::now();
         let file = std::fs::File::open(path)?;
         let document = RopeBuffer::from_reader(std::io::BufReader::new(file))?;
+        let mut persistent_state = PersistentState::load_default();
+        persistent_state.remember(path);
+        if let Err(error) = persistent_state.save() {
+            eprintln!("could not save recent files: {error}");
+        }
+        cx.add_recent_document(path);
         let mut view = Self::from_editor(
             Editor::from_document(document),
             path.display().to_string(),
+            Some(path.to_path_buf()),
+            persistent_state,
             cx,
         );
         view.file_open_time = started.elapsed();
@@ -194,6 +243,224 @@ impl EditorView {
         }
         self.scroll_cursor_into_view();
         self.schedule_block_context(cx);
+        self.schedule_autosave(cx);
+        cx.notify();
+    }
+
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        self.save_generation = self.save_generation.wrapping_add(1);
+        if !self.persistent_state.settings.autosave
+            || self.file_path.is_none()
+            || self.editor.document().revision() == self.saved_revision
+        {
+            return;
+        }
+        let generation = self.save_generation;
+        let revision = self.editor.document().revision();
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(750)).await;
+            let should_save = view
+                .read_with(cx, |view, _| {
+                    autosave_request_is_current(
+                        view.save_generation,
+                        generation,
+                        view.editor.document().revision(),
+                        revision,
+                        view.persistent_state.settings.autosave,
+                        view.file_path.is_some(),
+                    )
+                })
+                .unwrap_or(false);
+            if should_save {
+                let _ = view.update(cx, |view, cx| view.save_current(cx));
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.file_path.clone() else {
+            self.status = Some("Use Save As for an untitled document".to_owned());
+            cx.notify();
+            return;
+        };
+        self.save_to(path, cx);
+    }
+
+    pub(crate) fn save_or_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.file_path.is_some() {
+            self.save_current(cx);
+        } else {
+            self.prompt_save_as(cx);
+        }
+    }
+
+    fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.save_job_running {
+            self.pending_save_path = Some(path);
+            self.status = Some("Save queued…".to_owned());
+            cx.notify();
+            return;
+        }
+        self.save_job_running = true;
+        let snapshot = self.editor.document().clone();
+        let revision = snapshot.revision();
+        self.status = Some("Saving…".to_owned());
+        cx.spawn(async move |view, cx| {
+            let save_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { atomic_save_document(&save_path, &snapshot) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.save_job_running = false;
+                match result {
+                    Ok(()) => {
+                        view.file_path = Some(path.clone());
+                        view.file_label = path.display().to_string();
+                        if view.editor.document().revision() == revision {
+                            view.saved_revision = revision;
+                            view.status = Some("Saved".to_owned());
+                        } else {
+                            view.status = Some("Saved snapshot; newer edits pending".to_owned());
+                            view.schedule_autosave(cx);
+                        }
+                        view.persistent_state.remember(&path);
+                        if let Err(error) = view.persistent_state.save() {
+                            view.status =
+                                Some(format!("Saved document; recent files failed: {error}"));
+                        }
+                        cx.add_recent_document(&path);
+                    }
+                    Err(error) => view.status = Some(format!("Save failed: {error}")),
+                }
+                if let Some(pending) = view.pending_save_path.take() {
+                    view.save_to(pending, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
+        let directory = self
+            .file_path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        let receiver = cx.prompt_for_new_path(directory, Some("Untitled.md"));
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(path))) => {
+                let _ = view.update(cx, |view, cx| view.save_to(path, cx));
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(format!("Save As failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    pub(crate) fn prompt_open(&mut self, cx: &mut Context<Self>) {
+        if self.editor.document().revision() != self.saved_revision {
+            self.status = Some("Save current changes before opening another file".to_owned());
+            cx.notify();
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open Markdown".into()),
+        });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = view.update(cx, |view, cx| view.load_path(&path, cx));
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(format!("Open failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    fn load_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let result = std::fs::File::open(path)
+            .and_then(|file| RopeBuffer::from_reader(std::io::BufReader::new(file)));
+        match result {
+            Ok(document) => {
+                self.editor = Editor::from_document(document);
+                self.file_path = Some(path.to_path_buf());
+                self.file_label = path.display().to_string();
+                self.saved_revision = self.editor.document().revision();
+                self.heights = HeightIndex::new(std::iter::repeat_n(
+                    self.theme.line_height,
+                    self.editor.document().line_count(),
+                ));
+                self.scroll_y = 0.0;
+                self.line_cache.clear();
+                self.block_context = None;
+                self.persistent_state.remember(path);
+                if let Err(error) = self.persistent_state.save() {
+                    self.status = Some(format!("Opened; recent files failed: {error}"));
+                } else {
+                    self.status = Some("Opened".to_owned());
+                }
+                cx.add_recent_document(path);
+                self.schedule_block_context(cx);
+            }
+            Err(error) => self.status = Some(format!("Open failed: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn open_recent_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.editor.document().revision() != self.saved_revision {
+            self.status = Some("Save current changes before opening a recent file".to_owned());
+            cx.notify();
+        } else {
+            self.load_path(path, cx);
+        }
+    }
+
+    pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
+        self.persistent_state.settings.autosave = !self.persistent_state.settings.autosave;
+        self.status = Some(format!(
+            "Autosave {}",
+            if self.persistent_state.settings.autosave {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        if let Err(error) = self.persistent_state.save() {
+            self.status = Some(format!("Settings failed: {error}"));
+        }
+        self.schedule_autosave(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.persistent_state.settings.theme = self.persistent_state.settings.theme.next();
+        self.theme = resolve_theme(self.persistent_state.settings.theme, window.appearance());
+        self.heights = HeightIndex::new(std::iter::repeat_n(
+            self.theme.line_height,
+            self.editor.document().line_count(),
+        ));
+        self.line_cache.clear();
+        if let Err(error) = self.persistent_state.save() {
+            self.status = Some(format!("Settings failed: {error}"));
+        }
         cx.notify();
     }
 
@@ -280,7 +547,7 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, false))
+            .or_else(|| presented_line(&self.editor, line, false, false))
         else {
             return;
         };
@@ -316,7 +583,7 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, false))
+            .or_else(|| presented_line(&self.editor, line, false, false))
         else {
             return;
         };
@@ -352,6 +619,7 @@ impl EditorView {
         &mut self,
         line: usize,
         fenced_code_context: bool,
+        table_context: bool,
     ) -> Option<hane_presentation::VisualBlock> {
         let current_revision = self.editor.document().revision();
         if let Some(mut block) = self.line_cache.remove(&line) {
@@ -384,12 +652,15 @@ impl EditorView {
                     .text(block.source_range)
                     .is_ok_and(|text| fence_delimiter(&text).is_some());
             let context_matches = (block.kind == BlockKind::CodeBlock) == expected_code_kind;
-            if reusable && context_matches {
+            let table_matches =
+                matches!(block.kind, BlockKind::TableRow | BlockKind::TableDelimiter)
+                    == table_context;
+            if reusable && context_matches && table_matches {
                 self.line_cache.insert(line, block.clone());
                 return Some(block);
             }
         }
-        let block = presented_line(&self.editor, line, fenced_code_context)?;
+        let block = presented_line(&self.editor, line, fenced_code_context, table_context)?;
         self.line_cache.insert(line, block.clone());
         Some(block)
     }
@@ -417,6 +688,7 @@ impl Focusable for EditorView {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
+        self.theme = resolve_theme(self.persistent_state.settings.theme, window.appearance());
         self.schedule_block_context(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
@@ -452,7 +724,13 @@ impl Render for EditorView {
                 .filter(|_| has_background_context)
                 .and_then(|index| index.line_is_fenced(line))
                 .unwrap_or_else(|| fence.is_some() || delimiter.is_some());
-            if let Some(block) = self.cached_line(line, fenced_code_context) {
+            let table_context = self
+                .block_context
+                .as_ref()
+                .filter(|_| has_background_context)
+                .and_then(|index| index.line_is_table(line))
+                .unwrap_or_else(|| local_table_context(&self.editor, line));
+            if let Some(block) = self.cached_line(line, fenced_code_context, table_context) {
                 rendered_lines.push((line, block));
             }
             if !has_background_context && let Some(delimiter) = delimiter {
@@ -482,8 +760,13 @@ impl Render for EditorView {
         } else {
             String::new()
         };
+        let dirty = if self.editor.document().revision() == self.saved_revision {
+            ""
+        } else {
+            " · modified"
+        };
         let status = self.status.clone().unwrap_or_else(|| {
-            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}")
+            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
         });
 
         let root = div()
@@ -496,19 +779,12 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle(cx));
         let root = install_action_listeners(root, cx)
             .on_scroll_wheel(cx.listener(Self::on_scroll))
-            .child(
-                div()
-                    .h(px(self.theme.header_height))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .bg(rgb(self.theme.header_background))
-                    .text_color(rgb(self.theme.header_foreground))
-                    .child(self.file_label.clone())
-                    .child(status),
-            );
+            .child(self.header_element(status, cx));
+        let document_directory = self
+            .file_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         let rendered = root.child(
             div()
                 .relative()
@@ -524,22 +800,109 @@ impl Render for EditorView {
                         .w_full()
                         .child(div().h(px(top_space)))
                         .children(rendered_lines.into_iter().map(|(line, block)| {
-                            line_element_from_block(&self.editor, line, &block, self.theme)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |view, event, window, cx| {
-                                        view.on_line_mouse_down(line, event, window, cx)
-                                    }),
-                                )
-                                .on_mouse_move(cx.listener(move |view, event, window, cx| {
+                            line_element_from_block(
+                                &self.editor,
+                                line,
+                                &block,
+                                self.theme,
+                                document_directory.as_deref(),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.on_line_mouse_down(line, event, window, cx)
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                move |view, event, window, cx| {
                                     view.on_line_mouse_move(line, event, window, cx)
-                                }))
+                                },
+                            ))
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
         );
         self.metrics.record_layout(layout_started.elapsed());
         rendered
+    }
+}
+
+impl EditorView {
+    fn header_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
+        let autosave = if self.persistent_state.settings.autosave {
+            "Autosave on"
+        } else {
+            "Autosave off"
+        };
+        let theme = format!("Theme {:?}", self.persistent_state.settings.theme);
+        let recent = self
+            .persistent_state
+            .recent_files
+            .iter()
+            .filter(|path| Some(path.as_path()) != self.file_path.as_deref())
+            .take(3)
+            .cloned()
+            .enumerate()
+            .map(|(index, path)| {
+                let label = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                div()
+                    .id(("recent-file", index))
+                    .px_2()
+                    .rounded_sm()
+                    .bg(rgb(self.theme.code_background))
+                    .text_color(rgb(self.theme.foreground))
+                    .cursor_pointer()
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| view.open_recent_path(&path, cx)))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .h(px(self.theme.header_height))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .bg(rgb(self.theme.header_background))
+            .text_color(rgb(self.theme.header_foreground))
+            .child(
+                div()
+                    .h(px(38.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .child(self.file_label.clone())
+                    .child(status),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .text_size(px(11.0))
+                    .child(
+                        div()
+                            .id("toggle-autosave")
+                            .cursor_pointer()
+                            .child(autosave)
+                            .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("cycle-theme")
+                            .cursor_pointer()
+                            .child(theme)
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.cycle_theme(window, cx)),
+                            ),
+                    )
+                    .child("Recent:")
+                    .children(recent),
+            )
     }
 }
 
@@ -651,6 +1014,41 @@ fn fence_before_line(editor: &Editor, line: usize) -> Option<FenceDelimiter> {
     fence
 }
 
+fn local_table_context(editor: &Editor, line: usize) -> bool {
+    const LOCAL_TABLE_LINES: usize = 256;
+    let source = |candidate| {
+        editor
+            .document()
+            .line_range(LineId(candidate))
+            .ok()
+            .and_then(|range| editor.document().text(range).ok())
+            .unwrap_or_default()
+    };
+    let current = source(line);
+    if !hane_presentation::is_pipe_row(&current) && !hane_presentation::is_table_delimiter(&current)
+    {
+        return false;
+    }
+    let start = line.saturating_sub(LOCAL_TABLE_LINES);
+    for candidate in (start..=line).rev() {
+        let candidate_source = source(candidate);
+        if hane_presentation::is_table_delimiter(&candidate_source)
+            && candidate > 0
+            && hane_presentation::is_pipe_row(&source(candidate - 1))
+        {
+            return line + 1 >= candidate
+                && (candidate..=line)
+                    .all(|row| row == candidate || hane_presentation::is_pipe_row(&source(row)));
+        }
+        if candidate < line && !hane_presentation::is_pipe_row(&candidate_source) {
+            break;
+        }
+    }
+    line + 1 < editor.document().line_count()
+        && hane_presentation::is_pipe_row(&current)
+        && hane_presentation::is_table_delimiter(&source(line + 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,7 +1058,7 @@ mod tests {
     fn visual_click_positions_map_back_to_source_offsets() {
         let editor = Editor::new("ab🙂\n\n**bold**");
 
-        let first = presented_line(&editor, 0, false).unwrap();
+        let first = presented_line(&editor, 0, false, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, &first, 2),
             SourceOffset(2)
@@ -670,13 +1068,13 @@ mod tests {
             SourceOffset(6)
         );
 
-        let empty = presented_line(&editor, 1, false).unwrap();
+        let empty = presented_line(&editor, 1, false, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 1, &empty, 0),
             SourceOffset(7)
         );
 
-        let bold = presented_line(&editor, 2, false).unwrap();
+        let bold = presented_line(&editor, 2, false, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, 0),
             SourceOffset(10)
@@ -750,5 +1148,33 @@ mod tests {
             })
         );
         assert_eq!(fence_before_line(&editor, 4), None);
+    }
+
+    #[test]
+    fn autosave_rejects_stale_generation_or_revision() {
+        assert!(autosave_request_is_current(
+            8,
+            8,
+            Revision(4),
+            Revision(4),
+            true,
+            true,
+        ));
+        assert!(!autosave_request_is_current(
+            9,
+            8,
+            Revision(4),
+            Revision(4),
+            true,
+            true,
+        ));
+        assert!(!autosave_request_is_current(
+            8,
+            8,
+            Revision(5),
+            Revision(4),
+            true,
+            true,
+        ));
     }
 }

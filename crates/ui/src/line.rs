@@ -1,13 +1,13 @@
 use crate::theme::Theme;
 use gpui::{
-    Div, FontWeight, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px, rgb,
+    Div, FontWeight, IntoElement, ObjectFit, ParentElement, Styled, StyledImage, div, img,
+    prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_presentation::{
-    BlockKind, StyleKind, VisualBlock, VisualOffset, present_markdown_with_disclosure,
-};
+use hane_presentation::{BlockKind, StyleKind, VisualBlock, VisualOffset, present_polished_line};
 use std::ops::Range;
+use std::path::Path;
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
@@ -17,19 +17,21 @@ pub(crate) fn presented_line(
     editor: &Editor,
     line: usize,
     fenced_code_context: bool,
+    table_context: bool,
 ) -> Option<VisualBlock> {
     let Ok(range) = editor.document().line_range(LineId(line)) else {
         return None;
     };
     let source = editor.document().text(range).unwrap_or_default();
     let disclosure = disclosure_for_line(editor, line, range);
-    let mut block = present_markdown_with_disclosure(
+    let mut block = present_polished_line(
         line as u64,
         editor.document().revision(),
         range,
         &source,
         DEFAULT_LINE_HEIGHT,
         disclosure,
+        table_context,
     );
     while block.visual_text.ends_with(['\r', '\n']) {
         block.visual_text.pop();
@@ -95,7 +97,39 @@ pub(crate) fn line_element_from_block(
     line: usize,
     block: &VisualBlock,
     theme: Theme,
+    document_directory: Option<&Path>,
 ) -> Div {
+    if let Some(image) = &block.image {
+        let destination = Path::new(&image.destination);
+        let resolved = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            document_directory
+                .unwrap_or_else(|| Path::new("."))
+                .join(destination)
+        };
+        return div()
+            .h(px(block.height()))
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .px(px(theme.line_horizontal_padding))
+            .bg(rgb(theme.media_background))
+            .child(
+                img(resolved)
+                    .max_w(px(640.))
+                    .h(px((block.height() - 32.0).max(1.0)))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(theme.quote_foreground))
+                    .child(image.alt.clone()),
+            );
+    }
     let range = block.source_range;
 
     let cursor = editor.selection().active;
@@ -170,6 +204,11 @@ pub(crate) fn line_element_from_block(
         })
         .when(block.kind == BlockKind::Quote, |element| {
             element.text_color(rgb(theme.quote_foreground))
+        })
+        .when(block.kind == BlockKind::TableRow, |element| {
+            element
+                .font_family("ui-monospace")
+                .bg(rgb(theme.table_background))
         })
         .children(elements)
 }
@@ -358,7 +397,7 @@ mod tests {
     #[test]
     fn phase3_line_discloses_only_the_active_construct() {
         let editor = Editor::new("# **bold** and _italic_");
-        let block = presented_line(&editor, 0, false).unwrap();
+        let block = presented_line(&editor, 0, false, false).unwrap();
         assert_eq!(block.visual_text, "# bold and italic");
         assert_eq!(block.disclosure, Some(SourceRange::empty(0)));
         assert_eq!(block.kind, BlockKind::Heading(1));

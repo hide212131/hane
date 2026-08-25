@@ -215,6 +215,15 @@ impl RopeBuffer {
         self.rope.to_string()
     }
 
+    /// Writes the current Rope without first materializing the full document as
+    /// one contiguous `String`.
+    pub fn write_to(&self, mut writer: impl io::Write) -> io::Result<()> {
+        for chunk in self.rope.chunks() {
+            writer.write_all(chunk.as_bytes())?;
+        }
+        Ok(())
+    }
+
     pub fn line_count(&self) -> usize {
         self.rope.len_lines()
     }

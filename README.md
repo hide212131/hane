@@ -1,6 +1,8 @@
-# Hane Phase 3
+# Hane Phase 4
 
-Rust + GPUIによる巨大Markdown文書向けの高速Markdown editorです。Phase 3では`pulldown-cmark`のbyte rangeを使い、Markdown記号を通常は隠し、caret・selection・IMEが構文へ入ったときだけ段階表示します。sourceは常にMarkdownのまま保持し、zero-length hidden segmentを含むSourceMapでvisual positionと対応させます。
+![Hane logo](./assets/phase4-feather.svg)
+
+Rust + GPUIによる巨大Markdown文書向けの高速Markdown editorです。Markdown記号を通常は隠し、caret・selection・IMEが構文へ入ったときだけ段階表示します。Phase 4では画像、pipe table、atomic save、自動保存、Recent Files、永続設定、system/light/dark themeを追加しました。sourceは常にMarkdownのまま保持し、hidden/synthesized segmentを含むSourceMapでvisual positionと対応させます。
 
 ## 実行
 
@@ -28,13 +30,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-主なkey bindingは矢印、Shift+矢印、Home/End、Command+A/C/X/V/Z、Command+Shift+Zです。
+主なkey bindingは矢印、Shift+矢印、Home/End、Command+A/C/X/V/Z、Command+Shift+Z、Command+O/S、Command+Shift+Sです。Command+Option+Aで自動保存を切り替えられます。themeと自動保存はheaderの設定からも変更できます。
 
-## Phase 3測定
+## Phase 4測定
 
 ```sh
-scripts/measure_phase3.sh
-scripts/measure_phase3_memory.sh
+scripts/measure_phase4.sh
+scripts/measure_phase4_memory.sh
 ```
 
 ## UI の画面キャプチャ
@@ -42,7 +44,7 @@ scripts/measure_phase3_memory.sh
 Markdown presentationの再現画面は次のコマンドで取得できます。
 
 ```sh
-scripts/capture_phase3.sh
+scripts/capture_phase4.sh
 ```
 
 行境界にカーソルを置いた再現画面は、次のコマンドで取得できます。
@@ -69,4 +71,4 @@ scripts/capture_cursor_scroll.sh
 既定の出力先は `target/captures/cursor-scroll.png` です。移動回数は
 `HANE_CAPTURE_CURSOR_DOWN` で変更できます。
 
-Phase 0の技術検証結果は[Phase 0 report](docs/phase0/report.md)、plain text editor完成時点は[Phase 1 report](docs/phase1/report.md)、Markdown presentationは[Phase 2 report](docs/phase2/report.md)、現在の実装・測定結果は[Phase 3 report](docs/phase3/report.md)を参照してください。
+Phase 0の技術検証結果は[Phase 0 report](docs/phase0/report.md)、plain text editor完成時点は[Phase 1 report](docs/phase1/report.md)、Markdown presentationは[Phase 2 report](docs/phase2/report.md)、Typora-style editingは[Phase 3 report](docs/phase3/report.md)、現在の実装・測定結果は[Phase 4 report](docs/phase4/report.md)を参照してください。

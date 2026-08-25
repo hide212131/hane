@@ -53,6 +53,7 @@ pub struct FenceDelimiter {
 pub struct BlockContextIndex {
     pub revision: Revision,
     fenced_lines: Vec<bool>,
+    table_lines: Vec<bool>,
 }
 
 impl BlockContextIndex {
@@ -63,6 +64,26 @@ impl BlockContextIndex {
     pub fn line_count(&self) -> usize {
         self.fenced_lines.len()
     }
+
+    pub fn line_is_table(&self, line: usize) -> Option<bool> {
+        self.table_lines.get(line).copied()
+    }
+}
+
+fn is_pipe_row(source: &str) -> bool {
+    let content = source.trim_end_matches(['\r', '\n']);
+    content.matches('|').count() >= 2
+        && (content.trim_start().starts_with('|') || content.trim_end().ends_with('|'))
+}
+
+fn is_table_delimiter(source: &str) -> bool {
+    let content = source.trim_end_matches(['\r', '\n']).trim();
+    let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let trimmed = cell.trim().trim_matches(':');
+            trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')
+        })
 }
 
 pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
@@ -86,14 +107,18 @@ pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
 /// This is intended for a single coalesced background job, never an input path.
 pub fn parse_block_context(buffer: &RopeBuffer) -> BlockContextIndex {
     let mut fenced_lines = Vec::with_capacity(buffer.line_count());
+    let mut pipe_rows = Vec::with_capacity(buffer.line_count());
+    let mut table_delimiters = Vec::with_capacity(buffer.line_count());
     let mut fence: Option<FenceDelimiter> = None;
     for line in 0..buffer.line_count() {
-        let delimiter = buffer
+        let source = buffer
             .line_range(LineId(line))
             .ok()
             .and_then(|range| buffer.text(range).ok())
-            .as_deref()
-            .and_then(fence_delimiter);
+            .unwrap_or_default();
+        let delimiter = fence_delimiter(&source);
+        pipe_rows.push(is_pipe_row(&source));
+        table_delimiters.push(is_table_delimiter(&source));
         fenced_lines.push(fence.is_some() || delimiter.is_some());
         if let Some(delimiter) = delimiter {
             fence = match fence {
@@ -103,9 +128,23 @@ pub fn parse_block_context(buffer: &RopeBuffer) -> BlockContextIndex {
             };
         }
     }
+    let mut table_lines = vec![false; pipe_rows.len()];
+    for delimiter in 1..pipe_rows.len() {
+        if !table_delimiters[delimiter] || !pipe_rows[delimiter - 1] {
+            continue;
+        }
+        table_lines[delimiter - 1] = true;
+        table_lines[delimiter] = true;
+        let mut row = delimiter + 1;
+        while row < pipe_rows.len() && pipe_rows[row] && !table_delimiters[row] {
+            table_lines[row] = true;
+            row += 1;
+        }
+    }
     BlockContextIndex {
         revision: buffer.revision(),
         fenced_lines,
+        table_lines,
     }
 }
 
@@ -334,5 +373,18 @@ mod tests {
         assert_eq!(index.line_count(), buffer.line_count());
         assert_eq!(index.line_is_fenced(2_050), Some(true));
         assert_eq!(index.line_is_fenced(2_102), Some(false));
+    }
+
+    #[test]
+    fn background_context_tracks_gfm_pipe_tables() {
+        let buffer = RopeBuffer::from_text(
+            "before\n| Name | 値 |\n|:---|---:|\n| 羽 | 3 |\n| 鳥 | 4 |\nafter\n",
+        );
+        let index = parse_block_context(&buffer);
+        assert_eq!(index.line_is_table(0), Some(false));
+        for line in 1..=4 {
+            assert_eq!(index.line_is_table(line), Some(true));
+        }
+        assert_eq!(index.line_is_table(5), Some(false));
     }
 }

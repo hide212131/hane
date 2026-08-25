@@ -186,6 +186,8 @@ pub enum StyleKind {
     InlineCode,
     CodeBlock,
     Link,
+    Image,
+    Table,
     MarkedText,
 }
 
@@ -204,6 +206,15 @@ pub enum BlockKind {
     Quote,
     ListItem,
     Rule,
+    Image,
+    TableRow,
+    TableDelimiter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImagePresentation {
+    pub alt: String,
+    pub destination: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -220,6 +231,10 @@ pub struct VisualBlock {
     pub invalid: bool,
     /// Source range whose Markdown markers are currently disclosed.
     pub disclosure: Option<SourceRange>,
+    /// Present only for an inactive standalone Markdown image. The UI resolves
+    /// relative destinations against the document directory and loads only
+    /// visible image blocks.
+    pub image: Option<ImagePresentation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +400,7 @@ pub fn present_bold(
         measured_height: None,
         invalid: false,
         disclosure: None,
+        image: None,
     }
 }
 
@@ -412,6 +428,7 @@ pub fn present_plain(
         measured_height: None,
         invalid: false,
         disclosure: None,
+        image: None,
     }
 }
 
@@ -444,6 +461,8 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
         BlockKind::Heading(3) => line_height * 1.25,
         BlockKind::Heading(_) => line_height * 1.1,
         BlockKind::CodeBlock => line_height * 1.15,
+        BlockKind::Image => 190.0,
+        BlockKind::TableDelimiter => 8.0,
         _ => line_height,
     }
 }
@@ -709,6 +728,239 @@ pub fn present_markdown_with_disclosure(
         invalid: false,
         kind,
         disclosure,
+        image: None,
+    }
+}
+
+/// Presents one physical source line with Phase 4 block polish. Table context
+/// is supplied by the UI's bounded neighboring-line check; standalone image
+/// recognition is local to this source slice.
+pub fn present_polished_line(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    table_context: bool,
+) -> VisualBlock {
+    if let Some(image) = parse_standalone_image(source)
+        && disclosure.is_none_or(|active| !range_touches(range, active))
+    {
+        return present_image(block_id, revision, range, source, line_height, image);
+    }
+    if table_context && disclosure.is_none_or(|active| !range_touches(range, active)) {
+        return present_table_line(block_id, revision, range, source, line_height);
+    }
+    present_markdown_with_disclosure(block_id, revision, range, source, line_height, disclosure)
+}
+
+struct StandaloneImage<'a> {
+    alt: &'a str,
+    destination: &'a str,
+    prefix_end: usize,
+    alt_start: usize,
+    alt_end: usize,
+    suffix_start: usize,
+    suffix_end: usize,
+}
+
+fn parse_standalone_image(source: &str) -> Option<StandaloneImage<'_>> {
+    let content_end = source.trim_end_matches(['\r', '\n']).len();
+    let content = &source[..content_end];
+    let leading = content.len() - content.trim_start().len();
+    let image = &content[leading..];
+    let alt_end_relative = image.find("](")?;
+    if !image.starts_with("![") || !image.ends_with(')') {
+        return None;
+    }
+    let alt_start = leading + 2;
+    let alt_end = leading + alt_end_relative;
+    let destination_start = alt_end + 2;
+    let suffix_end = content.len();
+    (destination_start <= suffix_end.saturating_sub(1)).then_some(StandaloneImage {
+        alt: &source[alt_start..alt_end],
+        destination: &source[destination_start..suffix_end - 1],
+        prefix_end: alt_start,
+        alt_start,
+        alt_end,
+        suffix_start: alt_end,
+        suffix_end,
+    })
+}
+
+fn present_image(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    image: StandaloneImage<'_>,
+) -> VisualBlock {
+    let mut segments = Vec::new();
+    let base = range.start.0;
+    if image.prefix_end > 2 {
+        segments.push(MappingSegment {
+            source_range: SourceRange::new(base, base + image.prefix_end - 2),
+            visual_range: VisualRange::new(0, image.prefix_end - 2),
+            visibility: Visibility::Visible,
+        });
+    }
+    let visual_prefix = image.prefix_end.saturating_sub(2);
+    segments.push(MappingSegment {
+        source_range: SourceRange::new(base + visual_prefix, base + image.prefix_end),
+        visual_range: VisualRange::new(visual_prefix, visual_prefix),
+        visibility: Visibility::HiddenMarkup,
+    });
+    segments.push(MappingSegment {
+        source_range: SourceRange::new(base + image.alt_start, base + image.alt_end),
+        visual_range: VisualRange::new(visual_prefix, visual_prefix + image.alt.len()),
+        visibility: Visibility::Visible,
+    });
+    let visual_end = visual_prefix + image.alt.len();
+    segments.push(MappingSegment {
+        source_range: SourceRange::new(base + image.suffix_start, base + image.suffix_end),
+        visual_range: VisualRange::new(visual_end, visual_end),
+        visibility: Visibility::HiddenMarkup,
+    });
+    if image.suffix_end < source.len() {
+        segments.push(MappingSegment {
+            source_range: SourceRange::new(base + image.suffix_end, range.end.0),
+            visual_range: VisualRange::new(
+                visual_end,
+                visual_end + source.len() - image.suffix_end,
+            ),
+            visibility: Visibility::Visible,
+        });
+    }
+    VisualBlock {
+        block_id,
+        source_range: range,
+        revision,
+        visual_text: format!("{}{}", &source[..visual_prefix], image.alt),
+        style_runs: vec![StyleRun {
+            visual_range: VisualRange::new(visual_prefix, visual_end),
+            kind: StyleKind::Image,
+        }],
+        kind: BlockKind::Image,
+        source_map: SourceMap { segments },
+        estimated_height: estimated_height(BlockKind::Image, line_height),
+        measured_height: None,
+        invalid: false,
+        disclosure: None,
+        image: Some(ImagePresentation {
+            alt: image.alt.to_owned(),
+            destination: image.destination.to_owned(),
+        }),
+    }
+}
+
+fn is_alignment_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let dashes = trimmed.trim_matches(':');
+    dashes.len() >= 3 && dashes.bytes().all(|byte| byte == b'-')
+}
+
+pub fn is_table_delimiter(source: &str) -> bool {
+    let content = source.trim_end_matches(['\r', '\n']).trim();
+    let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
+    cells.len() >= 2 && cells.iter().all(|cell| is_alignment_cell(cell))
+}
+
+pub fn is_pipe_row(source: &str) -> bool {
+    let content = source.trim_end_matches(['\r', '\n']);
+    content.matches('|').count() >= 2
+        && (content.trim_start().starts_with('|') || content.trim_end().ends_with('|'))
+}
+
+fn present_table_line(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+) -> VisualBlock {
+    if is_table_delimiter(source) {
+        return VisualBlock {
+            block_id,
+            source_range: range,
+            revision,
+            visual_text: String::new(),
+            style_runs: Vec::new(),
+            kind: BlockKind::TableDelimiter,
+            source_map: SourceMap {
+                segments: vec![MappingSegment {
+                    source_range: range,
+                    visual_range: VisualRange::new(0, 0),
+                    visibility: Visibility::HiddenMarkup,
+                }],
+            },
+            estimated_height: estimated_height(BlockKind::TableDelimiter, line_height),
+            measured_height: None,
+            invalid: false,
+            disclosure: None,
+            image: None,
+        };
+    }
+    let content_end = source.trim_end_matches(['\r', '\n']).len();
+    let mut visual = String::new();
+    let mut segments = Vec::new();
+    let base = range.start.0;
+    let mut cursor = 0;
+    for (index, marker) in source[..content_end].match_indices('|') {
+        if cursor < index {
+            append_segment(
+                &mut visual,
+                &mut segments,
+                source,
+                range,
+                SourceRange::new(base + cursor, base + index),
+                Visibility::Visible,
+            );
+        }
+        let at = visual.len();
+        segments.push(MappingSegment {
+            source_range: SourceRange::new(base + index, base + index + marker.len()),
+            visual_range: VisualRange::new(at, at),
+            visibility: Visibility::HiddenMarkup,
+        });
+        if index > 0 && index + 1 < content_end {
+            visual.push('│');
+            segments.push(MappingSegment {
+                source_range: SourceRange::empty(base + index + 1),
+                visual_range: VisualRange::new(at, visual.len()),
+                visibility: Visibility::Synthesized,
+            });
+        }
+        cursor = index + marker.len();
+    }
+    if cursor < source.len() {
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            SourceRange::new(base + cursor, range.end.0),
+            Visibility::Visible,
+        );
+    }
+    let visual_len = visual.len();
+    VisualBlock {
+        block_id,
+        source_range: range,
+        revision,
+        visual_text: visual,
+        style_runs: vec![StyleRun {
+            visual_range: VisualRange::new(0, visual_len),
+            kind: StyleKind::Table,
+        }],
+        kind: BlockKind::TableRow,
+        source_map: SourceMap { segments },
+        estimated_height: line_height * 1.2,
+        measured_height: None,
+        invalid: false,
+        disclosure: None,
+        image: None,
     }
 }
 
@@ -1023,5 +1275,72 @@ mod tests {
             block.source_map.segments.last().unwrap().source_range,
             SourceRange::new(9, 12)
         );
+    }
+
+    #[test]
+    fn phase4_image_keeps_source_and_exposes_lazy_destination() {
+        let source = "![羽のロゴ](assets/phase4-feather.svg)\n";
+        let range = SourceRange::new(100, 100 + source.len());
+        let block = present_polished_line(7, Revision(2), range, source, 26.0, None, false);
+        assert_eq!(block.kind, BlockKind::Image);
+        assert_eq!(block.visual_text, "羽のロゴ");
+        assert_eq!(
+            block.image,
+            Some(ImagePresentation {
+                alt: "羽のロゴ".to_owned(),
+                destination: "assets/phase4-feather.svg".to_owned(),
+            })
+        );
+        assert!(block.source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.source_range.start == range.start
+        }));
+        let active = present_polished_line(
+            7,
+            Revision(2),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(105)),
+            false,
+        );
+        assert_eq!(active.kind, BlockKind::Paragraph);
+        assert!(active.image.is_none());
+        assert!(active.visual_text.contains("assets/phase4-feather.svg"));
+    }
+
+    #[test]
+    fn phase4_table_uses_synthesized_separators_with_canonical_mapping() {
+        let source = "| 名前 | 値 |\n";
+        let range = SourceRange::new(50, 50 + source.len());
+        let block = present_polished_line(1, Revision(3), range, source, 26.0, None, true);
+        assert_eq!(block.kind, BlockKind::TableRow);
+        assert_eq!(block.visual_text, " 名前 │ 値 \n");
+        let synthesized = block
+            .source_map
+            .segments
+            .iter()
+            .find(|segment| segment.visibility == Visibility::Synthesized)
+            .unwrap();
+        assert!(synthesized.source_range.is_empty());
+        for affinity in [Bias::Before, Bias::After] {
+            let visual = synthesized.visual_range.start;
+            let normalized = block.source_map.normalize_visual(visual, affinity).unwrap();
+            assert_eq!(
+                block.source_map.normalize_visual(normalized, affinity),
+                Some(normalized)
+            );
+        }
+        let active = present_polished_line(
+            1,
+            Revision(3),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(54)),
+            true,
+        );
+        assert_eq!(active.visual_text, source);
+        assert_eq!(active.kind, BlockKind::Paragraph);
     }
 }

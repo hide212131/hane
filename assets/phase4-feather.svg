@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300" role="img" aria-labelledby="title desc">
+  <title id="title">Hane feather</title>
+  <desc id="desc">A warm blue feather above the word Hane.</desc>
+  <rect width="640" height="300" rx="28" fill="#f3f0eb"/>
+  <path d="M430 42c-91 7-174 61-210 145 46-48 101-76 165-93-70 31-125 72-165 126l-34 39 17 12 31-43c46-5 91-25 126-59 37-36 61-80 70-127z" fill="#4d83a9"/>
+  <path d="M203 259c58-83 121-133 210-170" fill="none" stroke="#285b7c" stroke-width="9" stroke-linecap="round"/>
+  <text x="320" y="278" text-anchor="middle" font-family="system-ui, sans-serif" font-size="34" font-weight="600" fill="#262626">Hane · 羽</text>
+</svg>
