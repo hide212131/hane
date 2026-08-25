@@ -1,15 +1,15 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
-use crate::line::line_element;
+use crate::line::{line_element, presented_line};
 use crate::theme::{DEFAULT_THEME, Theme};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollWheelEvent, Styled, Window, div, px, rgb,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, ScrollWheelEvent, Styled, TextRun, Window, div, px, rgb,
 };
-use hane_document::{BufferError, TextBuffer};
-use hane_editor::{Editor, EditorCommand};
+use hane_document::{Bias, BufferError, LineId, SourceOffset, TextBuffer};
+use hane_editor::{Editor, EditorCommand, Selection};
 use hane_metrics::FrameMetrics;
-use hane_presentation::HeightIndex;
+use hane_presentation::{HeightIndex, VisualOffset, line_spans};
 use std::path::Path;
 use std::time::Instant;
 
@@ -139,6 +139,57 @@ impl EditorView {
         cx.notify();
     }
 
+    fn on_line_mouse_down(
+        &mut self,
+        line: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        let Some(block) = presented_line(&self.editor, line) else {
+            return;
+        };
+        let visual_offset = if block.visual_text.is_empty() {
+            0
+        } else {
+            let style = window.text_style();
+            let base_font = style.font();
+            let runs = line_spans(&block, None)
+                .0
+                .into_iter()
+                .map(|span| TextRun {
+                    len: span.visual_range.len(),
+                    font: if span.bold {
+                        base_font.clone().bold()
+                    } else {
+                        base_font.clone()
+                    },
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                })
+                .collect::<Vec<_>>();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let layout = window.text_system().shape_line(
+                block.visual_text.clone().into(),
+                font_size,
+                &runs,
+                None,
+            );
+            let x = event.position.x - px(self.theme.line_horizontal_padding);
+            layout.closest_index_for_x(x)
+        };
+        let offset = source_offset_for_visual_position(&self.editor, line, &block, visual_offset);
+        if let Err(error) = self.editor.set_selection(Selection::caret(offset)) {
+            self.report_error("mouse selection", error);
+        } else {
+            self.status = None;
+        }
+        self.after_input(cx);
+    }
+
     fn scroll_cursor_into_view(&mut self) {
         let Ok(line) = self
             .editor
@@ -226,17 +277,75 @@ impl Render for EditorView {
                         .flex_col()
                         .w_full()
                         .child(div().h(px(top_space)))
-                        .children(visible.map(|line| line_element(&self.editor, line, self.theme)))
+                        .children(visible.map(|line| {
+                            line_element(&self.editor, line, self.theme).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |view, event, window, cx| {
+                                    view.on_line_mouse_down(line, event, window, cx)
+                                }),
+                            )
+                        }))
                         .child(div().h(px(bottom_space))),
                 ),
         )
     }
 }
 
+fn source_offset_for_visual_position(
+    editor: &Editor,
+    line: usize,
+    block: &hane_presentation::VisualBlock,
+    visual_offset: usize,
+) -> SourceOffset {
+    block
+        .source_map
+        .visual_to_source(VisualOffset(visual_offset), Bias::After)
+        .map(|candidate| candidate.source_offset)
+        .or_else(|| {
+            editor
+                .document()
+                .line_content_range(LineId(line))
+                .ok()
+                .map(|range| range.start)
+        })
+        .unwrap_or(block.source_range.start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hane_document::LineId;
+
+    #[test]
+    fn visual_click_positions_map_back_to_source_offsets() {
+        let editor = Editor::new("ab🙂\n\n**bold**");
+
+        let first = presented_line(&editor, 0).unwrap();
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, &first, 2),
+            SourceOffset(2)
+        );
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, &first, first.visual_text.len()),
+            SourceOffset(6)
+        );
+
+        let empty = presented_line(&editor, 1).unwrap();
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 1, &empty, 0),
+            SourceOffset(7)
+        );
+
+        let bold = presented_line(&editor, 2).unwrap();
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 2, &bold, 0),
+            SourceOffset(10)
+        );
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 2, &bold, bold.visual_text.len()),
+            SourceOffset(14)
+        );
+    }
 
     #[test]
     fn moving_down_through_forty_lines_scrolls_cursor_to_viewport_bottom() {

@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Theme {
     pub line_height: f32,
+    pub line_horizontal_padding: f32,
     pub header_height: f32,
     pub overscan: f32,
     pub editor_background: u32,
@@ -12,6 +13,7 @@ pub(crate) struct Theme {
 
 pub(crate) const DEFAULT_THEME: Theme = Theme {
     line_height: 26.0,
+    line_horizontal_padding: 12.0,
     header_height: 38.0,
     overscan: 260.0,
     editor_background: 0xfaf9f7,

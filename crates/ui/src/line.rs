@@ -2,21 +2,29 @@ use crate::theme::Theme;
 use gpui::{Div, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px, rgb};
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_presentation::{VisualOffset, line_spans, present_bold};
+use hane_presentation::{VisualBlock, VisualOffset, line_spans, present_bold};
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
-pub(crate) fn line_element(editor: &Editor, line: usize, theme: Theme) -> Div {
+pub(crate) fn presented_line(editor: &Editor, line: usize) -> Option<VisualBlock> {
     let Ok(range) = editor.document().line_range(LineId(line)) else {
-        return div().h(px(theme.line_height));
+        return None;
     };
     let source = editor.document().text(range).unwrap_or_default();
     let mut block = present_bold(line as u64, editor.document().revision(), range, &source);
     while block.visual_text.ends_with(['\r', '\n']) {
         block.visual_text.pop();
     }
+    Some(block)
+}
+
+pub(crate) fn line_element(editor: &Editor, line: usize, theme: Theme) -> Div {
+    let Some(block) = presented_line(editor, line) else {
+        return div().h(px(theme.line_height));
+    };
+    let range = block.source_range;
 
     let cursor = editor.selection().active;
     let visual_cursor =
@@ -54,7 +62,7 @@ pub(crate) fn line_element(editor: &Editor, line: usize, theme: Theme) -> Div {
         .w_full()
         .flex()
         .items_center()
-        .px_3()
+        .px(px(theme.line_horizontal_padding))
         .when(selected, |element| {
             element.bg(rgb(theme.selection_background))
         })
