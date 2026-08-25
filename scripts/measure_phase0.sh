@@ -10,7 +10,8 @@ helper="$script_dir/phase0_input.swift"
 warmup=${HANE_MEASUREMENT_WARMUP:-5}
 samples=${HANE_MEASUREMENT_SAMPLES:-30}
 refresh_rate=${HANE_REFRESH_RATE_HZ:-"variable (CGDisplayMode reports 0)"}
-ascii_source=$($helper current-source)
+original_input_source=$($helper current-source)
+ascii_source=${HANE_ASCII_INPUT_SOURCE:-com.apple.keylayout.ABC}
 japanese_source=${HANE_JAPANESE_INPUT_SOURCE:-com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese}
 
 mkdir -p "$results_dir"
@@ -23,7 +24,7 @@ cleanup() {
         kill "$app_pid" 2>/dev/null || true
         wait "$app_pid" 2>/dev/null || true
     fi
-    "$helper" select-source "$ascii_source" 2>/dev/null || true
+    "$helper" select-source "$original_input_source" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -120,6 +121,7 @@ input_scenario() {
         "$helper" select-source "$japanese_source"
         input_source=$japanese_source
     else
+        "$helper" select-source "$ascii_source"
         input_source=$ascii_source
     fi
     launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$fixture" "$offset" "$background" "" "$gate" "$input_source" "$autoscroll"

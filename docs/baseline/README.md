@@ -1,8 +1,8 @@
 # Refactor baseline
 
 R0で固定したリファクタリング前の回帰基準。製品コードの基準commitは `a811425`、
-計画書を含む採取時のHEADは `7646ad0` である。両commit間の製品コード、Cargo設定、
-計測スクリプトに差分はない。
+UI採取時のHEADは `3efbaac` である。両commit間で製品コードに差分はなく、後者には
+計画書とR0計測シナリオだけが追加されている。
 
 ## 検証結果
 
@@ -22,7 +22,7 @@ R0で固定したリファクタリング前の回帰基準。製品コードの
 - GPUI: 0.2.2
 - Build profile: `release`（thin LTO、codegen-units = 1）
 - 非GUIベンチ採取時: battery 70%、AC未接続、Low Power Mode off
-- UI測定時の電源状態: 既存raw dataに記録がないため不明
+- UIベンチ採取時: battery 80%、AC接続、Low Power Mode off
 
 ## 非GUIベンチ
 
@@ -49,34 +49,43 @@ RSSの `285,097,984` bytesは同一process内で100 MBシナリオまで順番�
 
 ## UIベンチ
 
-現行製品コードと同一内容に対して採取済みの
-`target/phase4/2026-08-26-final-optimized/`を基準にする。raw CSVはローカルの同directory、
-集計結果は `results.md` にある。主要値は次のとおり。
+現行製品コードに対してAC接続状態で採取した
+`target/refactor-baseline/r0-2026-08-26-ac-v3/`を基準にする。raw CSVはローカルの同directory、
+追跡対象の集計結果は [`ui-results.md`](ui-results.md) にある。主要値は次のとおり。
 
 | Metric | Baseline |
 |---|---:|
-| warm startup median | 136.004 ms |
-| cold startup median（OS cache未purge） | 130.749 ms |
-| normal input keystroke-to-frame p95 / p99 | 4.284 / 5.021 ms |
-| 100 MB input keystroke-to-frame p95 / p99 | 3.982 / 4.655 ms |
-| 100 MB input layout p95 / p99 | 1.602 / 1.625 ms |
-| 100 MB scroll frame interval p95 / p99 | 8.632 / 9.256 ms |
-| input while scrolling p95 / p99 | 2.621 / 3.449 ms |
-| background presentation input p95 / p99 | 4.289 / 4.379 ms |
-| Japanese IME all-event p95 / p99 | 3.412 / 4.940 ms |
-| Japanese IME commit p95 / p99 | 4.212 / 5.150 ms |
-| empty editor ready median / max RSS | 64,503,808 / 64,733,184 bytes |
-| 10 MB idle RSS | 103,759,872 bytes |
-| 100 MB idle RSS | 262,864,896 bytes |
+| warm startup median | 165.934 ms |
+| cold startup median（OS cache未purge） | 174.552 ms |
+| normal input keystroke-to-frame p95 / p99 | 4.104 / 4.149 ms |
+| 100 MB input keystroke-to-frame p95 / p99 | 4.975 / 7.648 ms |
+| 100 MB input layout p95 / p99 | 1.667 / 1.709 ms |
+| 100 MB scroll frame interval p95 / p99 | 9.038 / 9.273 ms |
+| 100 MB input while scrolling p95 / p99 | 4.676 / 4.679 ms |
+| 100k paragraphs input at start p95 / p99 | 5.302 / 5.671 ms |
+| 100k paragraphs input at middle p95 / p99 | 7.219 / 9.622 ms |
+| 100k paragraphs input at end p95 / p99 | 5.362 / 6.093 ms |
+| 100k paragraphs scroll frame interval p95 / p99 | 9.191 / 9.551 ms |
+| 100k paragraphs input while scrolling p95 / p99 | 3.846 / 4.686 ms |
+| background presentation input p95 / p99 | 2.615 / 3.468 ms |
+| Japanese IME all-event p95 / p99 | 3.414 / 4.419 ms |
+| Japanese IME commit p95 / p99 | 5.300 / 6.125 ms |
+| empty editor ready median / max RSS | 64,323,584 / 64,520,192 bytes |
+| 10 MB idle RSS | 103,579,648 bytes |
+| 100 MB idle RSS | 263,061,504 bytes |
 
-100,000段落fixtureは先頭・中央・末尾入力、scroll、scroll中入力のUIシナリオへ接続済み。
-ただし、R0ではデスクトップ入力を奪う自動操作と条件の悪いbattery駆動での採取を避けたため、
-この5シナリオの初回数値は未採取である。
+通常ASCII、大容量、100,000段落の各入力ケースは30 samples以上、日本語IMEは
+210 composition eventsと30 commitsを採取した。`/usr/sbin/purge`は権限不足のため、
+cold startupはOS cache未purge条件である。
+
+このAC測定のwarm startup medianは165.934 msで、RFPの絶対gate 150 msを超えた。同一製品コードの
+Phase 4確定測定は136.004 msだったため、製品回帰とは判定せず測定環境差として両方を保存する。
+startupに触れる変更では、静穏状態で再測定して絶対gateと相対差の両方を確認する。
 
 ## 回帰判定
 
 比較測定は同じhardware、release profile、Rust/GPUI version、入力source、refresh-rate設定で行う。
-新規の正式UI基準線はAC接続、Low Power Mode off、30 samples以上で採り、電源状態を結果に残す。
+正式UI基準線はAC接続、Low Power Mode off、30 samples以上で採り、電源状態を結果に残す。
 
 - test、clippy、source↔visual契約: 1件でも失敗したら回帰。
 - latency p95 / p99: 基準値から15%超の悪化を暫定failとし、同条件で再測定する。
@@ -89,5 +98,5 @@ RSSの `285,097,984` bytesは同一process内で100 MBシナリオまで順番�
 
 現在の製品経路は `file_open`、presentation/parse、visible layout、memoryを記録するが、
 `local_parse_time`、`full_parse_time`、cache hit/miss、block-index update timeを独立した指標としては
-まだ出力しない。BlockIndex未導入の指標を先取りせず、該当構造を導入するフェーズで追加する。
-
+まだ出力しない。これらはR0時点では「未実装」を基準状態として記録し、BlockIndexやcacheを
+導入する該当フェーズで追加する。

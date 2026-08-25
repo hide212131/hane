@@ -60,9 +60,9 @@ def main() -> None:
                 scenario = row.get("scenario")
                 if not scenario or not row.get("record_type"):
                     continue
-                metadata["input_source"].add(row["input_source"])
-                metadata["refresh_rate_hz"].add(row["refresh_rate_hz"])
-                metadata["background_job"].add(row["background_job"])
+                for key in ("input_source", "refresh_rate_hz", "background_job"):
+                    if value := row.get(key):
+                        metadata[key].add(value)
                 for metric, (record_type, column) in LATENCY_COLUMNS.items():
                     if row["record_type"] == record_type and row[column]:
                         value = float(row[column])

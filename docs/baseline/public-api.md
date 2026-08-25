@@ -1,6 +1,6 @@
 # Public API snapshot
 
-R0時点（HEAD `7646ad0`）のworkspace crate公開面。`cargo-public-api`は環境に未導入だったため、
+R0時点（HEAD `3efbaac`）のworkspace crate公開面。`cargo-public-api`は環境に未導入だったため、
 各crate rootのexportと公開型のimplをソースから棚卸しした。R5ではこの一覧との差分を確認する。
 
 ## hane-benchmark
@@ -63,4 +63,3 @@ R0時点（HEAD `7646ad0`）のworkspace crate公開面。`cargo-public-api`は�
 ```sh
 rg -n '^(pub (struct|enum|trait|type|const|fn|mod|use)|    pub fn )' crates/*/src
 ```
-
