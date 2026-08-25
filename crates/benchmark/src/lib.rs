@@ -71,16 +71,7 @@ impl Environment {
 }
 
 pub fn process_memory_bytes() -> Option<u64> {
-    let pid = std::process::id().to_string();
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|kb| kb * 1024)
+    hane_metrics::process_memory_bytes()
 }
 
 #[derive(Clone, Debug)]

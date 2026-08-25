@@ -1,4 +1,4 @@
-use crate::{Editor, Selection};
+use crate::{Editor, InputMeasurementKind, Selection};
 use hane_document::{
     Anchor, Bias, BufferError, EditSummary, Revision, SourceOffset, SourceRange, TextBuffer,
     TransactionId,
@@ -94,7 +94,7 @@ impl Editor {
             anchor: SourceOffset(summary.range_after.start.0 + relative.start),
             active: SourceOffset(summary.range_after.start.0 + relative.end),
         };
-        self.record_model_update(received);
+        self.record_model_update(received, InputMeasurementKind::ImeComposition);
         Ok(summary)
     }
 
@@ -116,7 +116,7 @@ impl Editor {
         let summary = self.document.edit(range, text)?;
         self.selection = Selection::caret(summary.range_after.end);
         self.ime = None;
-        self.record_model_update(received);
+        self.record_model_update(received, InputMeasurementKind::ImeCommit);
         Ok(summary)
     }
 

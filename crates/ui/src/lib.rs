@@ -4,6 +4,7 @@ mod actions;
 mod capture;
 mod input;
 mod line;
+mod phase0_metrics;
 mod theme;
 mod view;
 

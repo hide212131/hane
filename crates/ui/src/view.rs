@@ -1,6 +1,7 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 use crate::line::{line_element, presented_line};
+use crate::phase0_metrics::Phase0MetricsOutput;
 use crate::theme::{DEFAULT_THEME, Theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
@@ -11,7 +12,7 @@ use hane_editor::{Editor, EditorCommand, Selection};
 use hane_metrics::FrameMetrics;
 use hane_presentation::{HeightIndex, VisualOffset, line_spans};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
 
@@ -44,6 +45,13 @@ pub struct EditorView {
     file_label: String,
     status: Option<String>,
     theme: Theme,
+    pub(crate) process_started: Instant,
+    pub(crate) file_open_time: Duration,
+    pub(crate) load_rss_bytes: Option<u64>,
+    pub(crate) ready_reported: bool,
+    pub(crate) ready_armed: bool,
+    pub(crate) metrics_output: Option<Phase0MetricsOutput>,
+    background_presentation_generation: u64,
 }
 
 impl EditorView {
@@ -64,20 +72,61 @@ impl EditorView {
             file_label: file_label.into(),
             status: None,
             theme,
+            process_started: Instant::now(),
+            file_open_time: Duration::ZERO,
+            load_rss_bytes: None,
+            ready_reported: false,
+            ready_armed: false,
+            metrics_output: Phase0MetricsOutput::from_environment().unwrap_or_else(|error| {
+                eprintln!("could not open HANE_METRICS_CSV: {error}");
+                None
+            }),
+            background_presentation_generation: 0,
         }
     }
 
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
+        let started = Instant::now();
         let text = std::fs::read_to_string(path)?;
-        Ok(Self::new(&text, path.display().to_string(), cx))
+        let mut view = Self::new(&text, path.display().to_string(), cx);
+        view.file_open_time = started.elapsed();
+        view.load_rss_bytes = process_rss_bytes();
+        Ok(view)
     }
 
     pub fn editor(&self) -> &Editor {
         &self.editor
     }
 
-    #[cfg(debug_assertions)]
-    pub fn set_cursor_offset_for_development(
+    pub fn arm_startup_timing(&mut self, process_started: Instant) {
+        self.process_started = process_started;
+        self.ready_armed = true;
+    }
+
+    pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>) {
+        if let Some(output) = &mut self.metrics_output
+            && let Err(error) = output.memory("memory_idle_30s", rss_bytes)
+        {
+            eprintln!("could not write idle memory metrics: {error}");
+        }
+    }
+
+    pub fn apply_phase0_background_presentation(
+        &mut self,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_presentation_generation = generation;
+        cx.notify();
+    }
+
+    pub fn apply_phase0_scroll_step(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let max = (self.heights.total_height() - self.viewport_height).max(0.0);
+        self.scroll_y = (self.scroll_y + delta).clamp(0.0, max);
+        cx.notify();
+    }
+
+    pub fn set_cursor_offset_for_measurement(
         &mut self,
         offset: usize,
         cx: &mut Context<Self>,
@@ -90,7 +139,6 @@ impl EditorView {
         Ok(())
     }
 
-    #[cfg(debug_assertions)]
     pub fn move_cursor_down_for_development(
         &mut self,
         count: usize,
@@ -208,6 +256,10 @@ impl EditorView {
     }
 }
 
+fn process_rss_bytes() -> Option<u64> {
+    hane_metrics::process_memory_bytes()
+}
+
 impl Focusable for EditorView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -234,10 +286,14 @@ impl Render for EditorView {
             .metrics
             .painted_percentile(0.95)
             .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-        let status = self
-            .status
-            .clone()
-            .unwrap_or_else(|| format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms"));
+        let background = if self.background_presentation_generation > 0 {
+            format!(" · bg {}", self.background_presentation_generation)
+        } else {
+            String::new()
+        };
+        let status = self.status.clone().unwrap_or_else(|| {
+            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}")
+        });
 
         let root = div()
             .size_full()
@@ -262,8 +318,7 @@ impl Render for EditorView {
                     .child(self.file_label.clone())
                     .child(status),
             );
-        self.metrics.record_layout(layout_started.elapsed());
-        root.child(
+        let rendered = root.child(
             div()
                 .relative()
                 .flex_1()
@@ -287,7 +342,9 @@ impl Render for EditorView {
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
-        )
+        );
+        self.metrics.record_layout(layout_started.elapsed());
+        rendered
     }
 }
 

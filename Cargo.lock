@@ -2352,7 +2352,9 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "hane-benchmark",
+ "hane-document",
  "hane-editor",
+ "hane-presentation",
  "hane-ui",
 ]
 
@@ -2393,6 +2395,9 @@ dependencies = [
 [[package]]
 name = "hane-metrics"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "hane-presentation"

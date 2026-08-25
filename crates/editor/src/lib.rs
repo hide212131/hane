@@ -14,9 +14,27 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct InputMeasurement {
     pub sequence: u64,
+    pub kind: InputMeasurementKind,
     pub received_at: Instant,
     pub model_updated_at: Instant,
     pub frame_painted_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMeasurementKind {
+    Command,
+    ImeComposition,
+    ImeCommit,
+}
+
+impl InputMeasurementKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::ImeComposition => "ime_composition",
+            Self::ImeCommit => "ime_commit",
+        }
+    }
 }
 
 impl InputMeasurement {
@@ -131,7 +149,7 @@ impl Editor {
                 None
             }
         };
-        self.record_model_update(received);
+        self.record_model_update(received, InputMeasurementKind::Command);
         Ok(edit)
     }
 
@@ -145,9 +163,10 @@ impl Editor {
             .expect("inserting text always produces an edit"))
     }
 
-    pub(crate) fn record_model_update(&mut self, received_at: Instant) {
+    pub(crate) fn record_model_update(&mut self, received_at: Instant, kind: InputMeasurementKind) {
         self.pending_measurements.push(InputMeasurement {
             sequence: self.next_input_sequence,
+            kind,
             received_at,
             model_updated_at: Instant::now(),
             frame_painted_at: None,
