@@ -1,6 +1,6 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
-use crate::line::{block_font_size, line_element_from_block, presented_line};
+use crate::line::{block_font_size, disclosure_for_line, line_element_from_block, presented_line};
 use crate::phase0_metrics::Phase0MetricsOutput;
 use crate::theme::{DEFAULT_THEME, Theme};
 use gpui::{
@@ -12,6 +12,7 @@ use hane_document::{
     Bias, BufferError, LineId, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, Selection};
+use hane_markdown::{BlockContextIndex, FenceDelimiter, fence_delimiter, parse_block_context};
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
 use std::collections::HashMap;
@@ -58,6 +59,8 @@ pub struct EditorView {
     background_presentation_generation: u64,
     line_cache: HashMap<usize, hane_presentation::VisualBlock>,
     display_linked_scroll_direction: Option<f32>,
+    block_context: Option<BlockContextIndex>,
+    block_context_job_running: bool,
 }
 
 impl EditorView {
@@ -93,6 +96,8 @@ impl EditorView {
             background_presentation_generation: 0,
             line_cache: HashMap::new(),
             display_linked_scroll_direction: None,
+            block_context: None,
+            block_context_job_running: false,
         }
     }
 
@@ -188,7 +193,53 @@ impl EditorView {
             self.line_cache.clear();
         }
         self.scroll_cursor_into_view();
+        self.schedule_block_context(cx);
         cx.notify();
+    }
+
+    fn schedule_block_context(&mut self, cx: &mut Context<Self>) {
+        let revision = self.editor.document().revision();
+        if self
+            .block_context
+            .as_ref()
+            .is_some_and(|index| index.revision == revision)
+        {
+            return;
+        }
+        if self.block_context_job_running {
+            return;
+        }
+        self.block_context_job_running = true;
+        let snapshot = self.editor.document().clone();
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(40)).await;
+            let current = view
+                .update(cx, |view, _| view.editor.document().revision() == revision)
+                .unwrap_or(false);
+            if !current {
+                let _ = view.update(cx, |view, cx| {
+                    view.block_context_job_running = false;
+                    view.schedule_block_context(cx);
+                });
+                return;
+            }
+            let index = cx
+                .background_executor()
+                .spawn(async move { parse_block_context(&snapshot) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.block_context_job_running = false;
+                if view.editor.document().revision() == index.revision {
+                    view.background_presentation_generation = index.revision.0 + 1;
+                    view.block_context = Some(index);
+                    view.line_cache.clear();
+                    cx.notify();
+                } else {
+                    view.schedule_block_context(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn report_error(&mut self, operation: &str, error: BufferError) {
@@ -304,13 +355,20 @@ impl EditorView {
     ) -> Option<hane_presentation::VisualBlock> {
         let current_revision = self.editor.document().revision();
         if let Some(mut block) = self.line_cache.remove(&line) {
+            let expected_disclosure = self
+                .editor
+                .document()
+                .line_range(LineId(line))
+                .ok()
+                .and_then(|range| disclosure_for_line(&self.editor, line, range));
             let reusable = if block.revision == current_revision {
-                true
+                block.disclosure == expected_disclosure
             } else if let Ok(deltas) = self.editor.document().deltas_since(block.revision) {
                 !deltas
                     .iter()
                     .any(|delta| edit_affects_range(*delta, block.source_range))
                     && block.rebase(&deltas, current_revision)
+                    && block.disclosure == expected_disclosure
                     && self
                         .editor
                         .document()
@@ -324,7 +382,7 @@ impl EditorView {
                     .editor
                     .document()
                     .text(block.source_range)
-                    .is_ok_and(|text| markdown_fence(&text).is_some());
+                    .is_ok_and(|text| fence_delimiter(&text).is_some());
             let context_matches = (block.kind == BlockKind::CodeBlock) == expected_code_kind;
             if reusable && context_matches {
                 self.line_cache.insert(line, block.clone());
@@ -359,6 +417,7 @@ impl Focusable for EditorView {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
+        self.schedule_block_context(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
             .max(self.theme.line_height);
@@ -375,17 +434,28 @@ impl Render for EditorView {
         let cache_end = (visible.end + 128).min(self.heights.len());
         self.line_cache
             .retain(|line, _| cache_start <= *line && *line < cache_end);
-        let mut fence = fence_before_line(&self.editor, visible.start);
+        let has_background_context = self.block_context.as_ref().is_some_and(|index| {
+            index.revision == self.editor.document().revision()
+                && index.line_count() == self.editor.document().line_count()
+        });
+        let mut fence = (!has_background_context)
+            .then(|| fence_before_line(&self.editor, visible.start))
+            .flatten();
         let mut rendered_lines = Vec::with_capacity(visible.len());
         for line in visible.clone() {
             let range = self.editor.document().line_range(LineId(line)).ok();
             let source = range.and_then(|range| self.editor.document().text(range).ok());
-            let delimiter = source.as_deref().and_then(markdown_fence);
-            let fenced_code_context = fence.is_some() || delimiter.is_some();
+            let delimiter = source.as_deref().and_then(fence_delimiter);
+            let fenced_code_context = self
+                .block_context
+                .as_ref()
+                .filter(|_| has_background_context)
+                .and_then(|index| index.line_is_fenced(line))
+                .unwrap_or_else(|| fence.is_some() || delimiter.is_some());
             if let Some(block) = self.cached_line(line, fenced_code_context) {
                 rendered_lines.push((line, block));
             }
-            if let Some(delimiter) = delimiter {
+            if !has_background_context && let Some(delimiter) = delimiter {
                 fence = match fence {
                     Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => {
                         None
@@ -556,36 +626,12 @@ fn source_offset_for_visual_position(
         .unwrap_or(block.source_range.start)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MarkdownFence {
-    marker: u8,
-    len: usize,
-}
-
-fn markdown_fence(source: &str) -> Option<MarkdownFence> {
-    let trimmed = source.trim_start_matches(' ');
-    if source.len() - trimmed.len() > 3 {
-        return None;
-    }
-    let marker = *trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let len = trimmed
-        .as_bytes()
-        .iter()
-        .take_while(|byte| **byte == marker)
-        .count();
-    (len >= 3).then_some(MarkdownFence { marker, len })
-}
-
 /// Establishes local fenced-code context without making visible parsing depend
-/// on total document size. Extremely long fences are reconciled by later
-/// background/block parsing in Phase 3.
-fn fence_before_line(editor: &Editor, line: usize) -> Option<MarkdownFence> {
+/// on total document size while the background index is pending.
+fn fence_before_line(editor: &Editor, line: usize) -> Option<FenceDelimiter> {
     const LOCAL_CONTEXT_LINES: usize = 2_048;
     let start = line.saturating_sub(LOCAL_CONTEXT_LINES);
-    let mut fence: Option<MarkdownFence> = None;
+    let mut fence: Option<FenceDelimiter> = None;
     for candidate in start..line {
         let Ok(range) = editor.document().line_range(LineId(candidate)) else {
             continue;
@@ -593,7 +639,7 @@ fn fence_before_line(editor: &Editor, line: usize) -> Option<MarkdownFence> {
         let Ok(source) = editor.document().text(range) else {
             continue;
         };
-        let Some(delimiter) = markdown_fence(&source) else {
+        let Some(delimiter) = fence_delimiter(&source) else {
             continue;
         };
         fence = match fence {
@@ -633,11 +679,11 @@ mod tests {
         let bold = presented_line(&editor, 2, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, 0),
-            SourceOffset(8)
+            SourceOffset(10)
         );
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, bold.visual_text.len()),
-            SourceOffset(16)
+            SourceOffset(14)
         );
     }
 
@@ -698,7 +744,7 @@ mod tests {
         assert_eq!(fence_before_line(&editor, 1), None);
         assert_eq!(
             fence_before_line(&editor, 2),
-            Some(MarkdownFence {
+            Some(FenceDelimiter {
                 marker: b'`',
                 len: 3
             })

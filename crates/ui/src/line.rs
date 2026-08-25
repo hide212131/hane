@@ -4,7 +4,9 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_presentation::{BlockKind, StyleKind, VisualBlock, VisualOffset, present_markdown};
+use hane_presentation::{
+    BlockKind, StyleKind, VisualBlock, VisualOffset, present_markdown_with_disclosure,
+};
 use std::ops::Range;
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
@@ -20,12 +22,14 @@ pub(crate) fn presented_line(
         return None;
     };
     let source = editor.document().text(range).unwrap_or_default();
-    let mut block = present_markdown(
+    let disclosure = disclosure_for_line(editor, line, range);
+    let mut block = present_markdown_with_disclosure(
         line as u64,
         editor.document().revision(),
         range,
         &source,
         DEFAULT_LINE_HEIGHT,
+        disclosure,
     );
     while block.visual_text.ends_with(['\r', '\n']) {
         block.visual_text.pop();
@@ -41,6 +45,37 @@ pub(crate) fn presented_line(
         }
     }
     Some(block)
+}
+
+pub(crate) fn disclosure_for_line(
+    editor: &Editor,
+    line: usize,
+    range: SourceRange,
+) -> Option<SourceRange> {
+    let selection = editor.selection().range();
+    let disclosure = if selection.is_empty() {
+        line_owns_cursor(
+            range,
+            selection.start,
+            line + 1 == editor.document().line_count(),
+        )
+        .then_some(selection)
+    } else if selection.intersects(range) {
+        Some(SourceRange {
+            start: selection.start.max(range.start),
+            end: selection.end.min(range.end),
+        })
+    } else {
+        None
+    };
+    editor
+        .ime()
+        .and_then(|ime| {
+            ime.current_range
+                .intersects(range)
+                .then_some(ime.current_range)
+        })
+        .or(disclosure)
 }
 
 const DEFAULT_LINE_HEIGHT: f32 = 26.0;
@@ -321,10 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn phase2_line_styles_markdown_and_keeps_source_bytes_visible() {
+    fn phase3_line_discloses_only_the_active_construct() {
         let editor = Editor::new("# **bold** and _italic_");
         let block = presented_line(&editor, 0, false).unwrap();
-        assert_eq!(block.visual_text, "# **bold** and _italic_");
+        assert_eq!(block.visual_text, "# bold and italic");
+        assert_eq!(block.disclosure, Some(SourceRange::empty(0)));
         assert_eq!(block.kind, BlockKind::Heading(1));
         assert!(
             block

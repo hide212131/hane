@@ -2415,6 +2415,7 @@ dependencies = [
  "gpui",
  "hane-document",
  "hane-editor",
+ "hane-markdown",
  "hane-metrics",
  "hane-presentation",
 ]

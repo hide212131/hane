@@ -81,3 +81,13 @@ Phase 0 の実装を始める場合は、以下の順に読む。
 6. [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md)
 7. [ADR-0014](0014-gpui-memory-baseline.md)
 8. [ADR-0009](0009-performance-harness.md)
+
+## Phase 3 実装時の参照順
+
+1. [Phase 2 report](../phase2/report.md)
+2. [ADR-0016](0016-phase3-typora-editing-plan.md)
+3. [ADR-0004](0004-source-visual-mapping.md)
+4. [ADR-0008](0008-markdown-parsing-strategy.md)
+5. [ADR-0005](0005-revision-and-background-work.md)
+6. [ADR-0007](0007-ime-composition.md)
+7. [ADR-0009](0009-performance-harness.md)

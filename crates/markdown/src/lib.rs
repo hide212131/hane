@@ -1,6 +1,6 @@
 //! CommonMark parsing with source-byte ranges.
 
-use hane_document::{Revision, SourceRange};
+use hane_document::{LineId, Revision, RopeBuffer, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +41,72 @@ pub struct MarkdownParse {
     pub source_range: SourceRange,
     pub blocks: Vec<MarkdownBlock>,
     pub spans: Vec<MarkdownSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FenceDelimiter {
+    pub marker: u8,
+    pub len: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockContextIndex {
+    pub revision: Revision,
+    fenced_lines: Vec<bool>,
+}
+
+impl BlockContextIndex {
+    pub fn line_is_fenced(&self, line: usize) -> Option<bool> {
+        self.fenced_lines.get(line).copied()
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.fenced_lines.len()
+    }
+}
+
+pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
+    let trimmed = source.trim_start_matches(' ');
+    if source.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let marker = *trimmed.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (len >= 3).then_some(FenceDelimiter { marker, len })
+}
+
+/// Builds document-wide fenced-block context from a shared Rope snapshot.
+/// This is intended for a single coalesced background job, never an input path.
+pub fn parse_block_context(buffer: &RopeBuffer) -> BlockContextIndex {
+    let mut fenced_lines = Vec::with_capacity(buffer.line_count());
+    let mut fence: Option<FenceDelimiter> = None;
+    for line in 0..buffer.line_count() {
+        let delimiter = buffer
+            .line_range(LineId(line))
+            .ok()
+            .and_then(|range| buffer.text(range).ok())
+            .as_deref()
+            .and_then(fence_delimiter);
+        fenced_lines.push(fence.is_some() || delimiter.is_some());
+        if let Some(delimiter) = delimiter {
+            fence = match fence {
+                Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => None,
+                None => Some(delimiter),
+                current => current,
+            };
+        }
+    }
+    BlockContextIndex {
+        revision: buffer.revision(),
+        fenced_lines,
+    }
 }
 
 fn absolute_range(base: usize, range: std::ops::Range<usize>) -> SourceRange {
@@ -255,5 +321,18 @@ mod tests {
                 .iter()
                 .any(|span| span.kind == InlineKind::CodeBlock)
         );
+    }
+
+    #[test]
+    fn background_context_tracks_fences_longer_than_local_overscan() {
+        let mut source = String::from("```rust\n");
+        source.push_str(&"inside\n".repeat(2_100));
+        source.push_str("```\nafter\n");
+        let buffer = RopeBuffer::from_text(&source);
+        let index = parse_block_context(&buffer);
+        assert_eq!(index.revision, Revision(0));
+        assert_eq!(index.line_count(), buffer.line_count());
+        assert_eq!(index.line_is_fenced(2_050), Some(true));
+        assert_eq!(index.line_is_fenced(2_102), Some(false));
     }
 }

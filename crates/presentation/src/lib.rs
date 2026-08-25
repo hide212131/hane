@@ -4,11 +4,12 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockKind as MarkdownBlockKind, InlineKind as MarkdownInlineKind, parse_bold, parse_document,
+    BlockKind as MarkdownBlockKind, InlineKind as MarkdownInlineKind, MarkdownParse,
+    fence_delimiter, parse_bold, parse_document,
 };
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct VisualOffset(pub usize);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -67,7 +68,7 @@ impl SourceMap {
         visual: VisualOffset,
         affinity: Bias,
     ) -> Option<PositionCandidate> {
-        let mut candidates = self.segments.iter().filter_map(|segment| {
+        let candidates = self.segments.iter().filter_map(|segment| {
             if visual.0 < segment.visual_range.start.0 || visual.0 > segment.visual_range.end.0 {
                 return None;
             }
@@ -96,9 +97,28 @@ impl SourceMap {
                 visibility: segment.visibility,
             })
         });
-        candidates
-            .find(|c| c.visibility == Visibility::Visible)
-            .or_else(|| candidates.next())
+        let mut candidates = candidates.collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.source_offset);
+        let visible = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.visibility,
+                    Visibility::Visible | Visibility::ExpandedMarkup
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        match affinity {
+            Bias::Before => visible
+                .first()
+                .copied()
+                .or_else(|| candidates.first().copied()),
+            Bias::After => visible
+                .last()
+                .copied()
+                .or_else(|| candidates.last().copied()),
+        }
     }
 
     pub fn source_to_visual(
@@ -106,33 +126,55 @@ impl SourceMap {
         source: SourceOffset,
         affinity: Bias,
     ) -> Option<PositionCandidate> {
-        self.segments.iter().find_map(|segment| {
-            if source.0 < segment.source_range.start.0 || source.0 > segment.source_range.end.0 {
-                return None;
-            }
-            let visual = match segment.visibility {
-                Visibility::Visible | Visibility::ExpandedMarkup => VisualOffset(
-                    segment.visual_range.start.0
-                        + source.0.saturating_sub(segment.source_range.start.0),
-                ),
-                Visibility::HiddenMarkup => match affinity {
-                    Bias::Before => segment.visual_range.start,
-                    Bias::After => segment.visual_range.end,
-                },
-                Visibility::Synthesized => segment.visual_range.start,
-            };
-            Some(PositionCandidate {
-                source_offset: source,
-                visual_offset: visual,
-                affinity,
-                side: if affinity == Bias::Before {
-                    BoundarySide::Leading
-                } else {
-                    BoundarySide::Trailing
-                },
-                visibility: segment.visibility,
+        let mut candidates = self
+            .segments
+            .iter()
+            .filter_map(|segment| {
+                if source.0 < segment.source_range.start.0 || source.0 > segment.source_range.end.0
+                {
+                    return None;
+                }
+                let visual = match segment.visibility {
+                    Visibility::Visible | Visibility::ExpandedMarkup => VisualOffset(
+                        segment.visual_range.start.0
+                            + source.0.saturating_sub(segment.source_range.start.0),
+                    ),
+                    Visibility::HiddenMarkup => match affinity {
+                        Bias::Before => segment.visual_range.start,
+                        Bias::After => segment.visual_range.end,
+                    },
+                    Visibility::Synthesized => segment.visual_range.start,
+                };
+                Some(PositionCandidate {
+                    source_offset: source,
+                    visual_offset: visual,
+                    affinity,
+                    side: if affinity == Bias::Before {
+                        BoundarySide::Leading
+                    } else {
+                        BoundarySide::Trailing
+                    },
+                    visibility: segment.visibility,
+                })
             })
-        })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.visual_offset);
+        match affinity {
+            Bias::Before => candidates.first().copied(),
+            Bias::After => candidates.last().copied(),
+        }
+    }
+
+    pub fn normalize_source(&self, source: SourceOffset, affinity: Bias) -> Option<SourceOffset> {
+        let visual = self.source_to_visual(source, affinity)?.visual_offset;
+        self.visual_to_source(visual, affinity)
+            .map(|candidate| candidate.source_offset)
+    }
+
+    pub fn normalize_visual(&self, visual: VisualOffset, affinity: Bias) -> Option<VisualOffset> {
+        let source = self.visual_to_source(visual, affinity)?.source_offset;
+        self.source_to_visual(source, affinity)
+            .map(|candidate| candidate.visual_offset)
     }
 }
 
@@ -176,6 +218,8 @@ pub struct VisualBlock {
     pub estimated_height: f32,
     pub measured_height: Option<f32>,
     pub invalid: bool,
+    /// Source range whose Markdown markers are currently disclosed.
+    pub disclosure: Option<SourceRange>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,6 +302,12 @@ impl VisualBlock {
                 };
                 segment.source_range = rebased;
             }
+            if let Some(disclosure) = self.disclosure {
+                let Some(rebased) = delta.transform_range(disclosure) else {
+                    return false;
+                };
+                self.disclosure = Some(rebased);
+            }
         }
         self.source_range = range;
         self.revision = current;
@@ -334,6 +384,7 @@ pub fn present_bold(
         estimated_height: 24.0,
         measured_height: None,
         invalid: false,
+        disclosure: None,
     }
 }
 
@@ -360,6 +411,7 @@ pub fn present_plain(
         estimated_height: 24.0,
         measured_height: None,
         invalid: false,
+        disclosure: None,
     }
 }
 
@@ -396,14 +448,174 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
     }
 }
 
-/// Builds a Phase 2 visual block. Markdown bytes remain visible, so the source
-/// map is deliberately an identity map until progressive disclosure in Phase 3.
-pub fn present_markdown(
+fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
+    if disclosure.is_empty() {
+        range.start <= disclosure.start && disclosure.start <= range.end
+    } else {
+        range.intersects(disclosure)
+    }
+}
+
+fn marker_ranges(parsed: &MarkdownParse, range: SourceRange, source: &str) -> Vec<SourceRange> {
+    let mut markers = Vec::new();
+    for block in &parsed.blocks {
+        let relative = block.source_range.start.0.saturating_sub(range.start.0);
+        let tail = source.get(relative..).unwrap_or_default();
+        match block.kind {
+            MarkdownBlockKind::Heading(_) => {
+                let hashes = tail
+                    .as_bytes()
+                    .iter()
+                    .take_while(|byte| **byte == b'#')
+                    .count();
+                if hashes > 0 {
+                    let suffix = usize::from(tail.as_bytes().get(hashes) == Some(&b' '));
+                    markers.push(SourceRange::new(
+                        block.source_range.start.0,
+                        block.source_range.start.0 + hashes + suffix,
+                    ));
+                }
+            }
+            MarkdownBlockKind::Quote => {
+                if tail.starts_with("> ") {
+                    markers.push(SourceRange::new(
+                        block.source_range.start.0,
+                        block.source_range.start.0 + 2,
+                    ));
+                }
+            }
+            MarkdownBlockKind::ListItem => {
+                let prefix = tail
+                    .find(|character: char| !character.is_ascii_whitespace())
+                    .unwrap_or(0);
+                let item = &tail[prefix..];
+                let marker_len =
+                    if item.starts_with("- ") || item.starts_with("* ") || item.starts_with("+ ") {
+                        2
+                    } else {
+                        item.find(". ").map_or(0, |end| end + 2)
+                    };
+                if marker_len > 0 {
+                    markers.push(SourceRange::new(
+                        block.source_range.start.0 + prefix,
+                        block.source_range.start.0 + prefix + marker_len,
+                    ));
+                }
+            }
+            MarkdownBlockKind::CodeBlock => {
+                if fence_delimiter(tail).is_some() {
+                    let delimiter_end = tail.trim_end_matches(['\r', '\n']).len();
+                    if delimiter_end > 0 {
+                        markers.push(SourceRange::new(
+                            block.source_range.start.0,
+                            block.source_range.start.0 + delimiter_end,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for span in &parsed.spans {
+        let start = span.source_range.start.0;
+        let end = span.source_range.end.0;
+        if start < range.start.0 || end > range.end.0 || start >= end {
+            continue;
+        }
+        let text = &source[start - range.start.0..end - range.start.0];
+        let marker_len = match span.kind {
+            MarkdownInlineKind::Bold | MarkdownInlineKind::Italic => text
+                .as_bytes()
+                .first()
+                .filter(|marker| matches!(marker, b'*' | b'_'))
+                .map_or(0, |marker| {
+                    text.as_bytes()
+                        .iter()
+                        .take_while(|byte| *byte == marker)
+                        .count()
+                }),
+            MarkdownInlineKind::Strikethrough => 2,
+            MarkdownInlineKind::InlineCode => text.bytes().take_while(|byte| *byte == b'`').count(),
+            MarkdownInlineKind::Link => {
+                if let (Some(open), Some(close)) = (text.find('['), text.find("](")) {
+                    markers.push(SourceRange::new(start + open, start + open + 1));
+                    markers.push(SourceRange::new(start + close, end));
+                }
+                0
+            }
+            MarkdownInlineKind::CodeBlock => 0,
+        };
+        if marker_len > 0 && marker_len * 2 <= text.len() {
+            markers.push(SourceRange::new(start, start + marker_len));
+            markers.push(SourceRange::new(end - marker_len, end));
+        }
+    }
+    markers.sort_by_key(|marker| (marker.start, marker.end));
+    let mut merged: Vec<SourceRange> = Vec::with_capacity(markers.len());
+    for marker in markers {
+        if let Some(previous) = merged.last_mut()
+            && marker.start < previous.end
+        {
+            previous.end = previous.end.max(marker.end);
+        } else {
+            merged.push(marker);
+        }
+    }
+    merged
+}
+
+fn marker_is_disclosed(
+    marker: SourceRange,
+    parsed: &MarkdownParse,
+    disclosure: Option<SourceRange>,
+) -> bool {
+    let Some(disclosure) = disclosure else {
+        return false;
+    };
+    range_touches(marker, disclosure)
+        || parsed.spans.iter().any(|span| {
+            span.source_range.start <= marker.start
+                && marker.end <= span.source_range.end
+                && range_touches(span.source_range, disclosure)
+        })
+        || parsed.blocks.iter().any(|block| {
+            marker.start == block.source_range.start
+                && marker.end <= block.source_range.end
+                && range_touches(block.source_range, disclosure)
+        })
+}
+
+fn append_segment(
+    visual: &mut String,
+    segments: &mut Vec<MappingSegment>,
+    source: &str,
+    block_range: SourceRange,
+    source_range: SourceRange,
+    visibility: Visibility,
+) {
+    let visual_start = visual.len();
+    if visibility != Visibility::HiddenMarkup {
+        visual.push_str(
+            &source[source_range.start.0 - block_range.start.0
+                ..source_range.end.0 - block_range.start.0],
+        );
+    }
+    segments.push(MappingSegment {
+        source_range,
+        visual_range: VisualRange::new(visual_start, visual.len()),
+        visibility,
+    });
+}
+
+/// Builds a native Markdown block with progressive disclosure. Markdown source
+/// remains authoritative; only marker ranges outside `disclosure` collapse.
+pub fn present_markdown_with_disclosure(
     block_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
+    disclosure: Option<SourceRange>,
 ) -> VisualBlock {
     if source.is_empty() {
         let mut block = present_plain(block_id, revision, range, source);
@@ -416,19 +628,70 @@ pub fn present_markdown(
         .first()
         .map(|block| presentation_block_kind(block.kind))
         .unwrap_or_default();
+    let marker_ranges = marker_ranges(&parsed, range, source);
+    let mut visual = String::with_capacity(source.len());
+    let mut segments = Vec::with_capacity(marker_ranges.len() * 2 + 1);
+    let mut source_cursor = range.start.0;
+    for marker in marker_ranges {
+        if source_cursor < marker.start.0 {
+            append_segment(
+                &mut visual,
+                &mut segments,
+                source,
+                range,
+                SourceRange::new(source_cursor, marker.start.0),
+                Visibility::Visible,
+            );
+        }
+        let expanded = marker_is_disclosed(marker, &parsed, disclosure);
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            marker,
+            if expanded {
+                Visibility::ExpandedMarkup
+            } else {
+                Visibility::HiddenMarkup
+            },
+        );
+        source_cursor = marker.end.0;
+    }
+    if source_cursor < range.end.0 {
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            SourceRange::new(source_cursor, range.end.0),
+            Visibility::Visible,
+        );
+    }
+    if segments.is_empty() {
+        segments.push(MappingSegment {
+            source_range: range,
+            visual_range: VisualRange::new(0, visual.len()),
+            visibility: Visibility::Visible,
+        });
+    }
+    let source_map = SourceMap { segments };
     let mut style_runs = parsed
         .spans
-        .into_iter()
+        .iter()
         .filter_map(|span| {
             let clipped = SourceRange {
                 start: span.source_range.start.max(range.start),
                 end: span.source_range.end.min(range.end),
             };
-            (!clipped.is_empty()).then_some(StyleRun {
-                visual_range: VisualRange::new(
-                    clipped.start.0 - range.start.0,
-                    clipped.end.0 - range.start.0,
-                ),
+            let start = source_map
+                .source_to_visual(clipped.start, Bias::After)?
+                .visual_offset;
+            let end = source_map
+                .source_to_visual(clipped.end, Bias::Before)?
+                .visual_offset;
+            (start.0 < end.0).then_some(StyleRun {
+                visual_range: VisualRange { start, end },
                 kind: presentation_style_kind(span.kind),
             })
         })
@@ -438,20 +701,25 @@ pub fn present_markdown(
         block_id,
         source_range: range,
         revision,
-        visual_text: source.to_owned(),
+        visual_text: visual,
         style_runs,
-        source_map: SourceMap {
-            segments: vec![MappingSegment {
-                source_range: range,
-                visual_range: VisualRange::new(0, source.len()),
-                visibility: Visibility::Visible,
-            }],
-        },
+        source_map,
         estimated_height: estimated_height(kind, line_height),
         measured_height: None,
         invalid: false,
         kind,
+        disclosure,
     }
+}
+
+pub fn present_markdown(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+) -> VisualBlock {
+    present_markdown_with_disclosure(block_id, revision, range, source, line_height, None)
 }
 
 pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBlock> {
@@ -652,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_presentation_styles_markdown_without_changing_source_identity() {
+    fn phase3_presentation_hides_markers_without_changing_source() {
         let source = "## Hello **太字** and _italic_ with `code`";
         let block = present_markdown(
             5,
@@ -661,21 +929,99 @@ mod tests {
             source,
             26.0,
         );
-        assert_eq!(block.visual_text, source);
+        assert_eq!(block.visual_text, "Hello 太字 and italic with code");
         assert_eq!(block.kind, BlockKind::Heading(2));
         for kind in [StyleKind::Bold, StyleKind::Italic, StyleKind::InlineCode] {
             assert!(block.style_runs.iter().any(|run| run.kind == kind));
         }
-        for relative in [0, 3, source.len()] {
-            assert_eq!(
-                block
-                    .source_map
-                    .visual_to_source(VisualOffset(relative), Bias::After)
-                    .unwrap()
-                    .source_offset,
-                SourceOffset(40 + relative)
-            );
-        }
+        assert_eq!(
+            block
+                .source_map
+                .visual_to_source(VisualOffset(0), Bias::After)
+                .unwrap()
+                .source_offset,
+            SourceOffset(43)
+        );
+        assert!(
+            block
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::HiddenMarkup)
+        );
         assert!(block.height() > 26.0);
+    }
+
+    #[test]
+    fn disclosure_expands_only_the_active_inline_construct() {
+        let source = "**one** and _two_";
+        let range = SourceRange::new(20, 20 + source.len());
+        let block = present_markdown_with_disclosure(
+            1,
+            Revision(4),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(23)),
+        );
+        assert_eq!(block.visual_text, "**one** and two");
+        assert!(block.source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::ExpandedMarkup
+                && segment.source_range == SourceRange::new(20, 22)
+        }));
+        assert!(block.source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.source_range == SourceRange::new(32, 33)
+        }));
+    }
+
+    #[test]
+    fn hidden_unicode_boundaries_normalize_with_affinity() {
+        let source = "**日本🙂**";
+        let block = present_markdown(
+            0,
+            Revision(1),
+            SourceRange::new(100, 100 + source.len()),
+            source,
+            26.0,
+        );
+        assert_eq!(block.visual_text, "日本🙂");
+        assert_eq!(
+            block
+                .source_map
+                .normalize_source(SourceOffset(101), Bias::After),
+            Some(SourceOffset(102))
+        );
+        assert_eq!(
+            block
+                .source_map
+                .normalize_visual(VisualOffset("日本🙂".len()), Bias::Before),
+            Some(VisualOffset("日本🙂".len()))
+        );
+        for segment in &block.source_map.segments {
+            assert!(source.is_char_boundary(segment.source_range.start.0 - 100));
+            assert!(source.is_char_boundary(segment.source_range.end.0 - 100));
+        }
+    }
+
+    #[test]
+    fn nested_delimiter_runs_do_not_duplicate_visual_or_source_segments() {
+        let source = "***nested***";
+        let block = present_markdown(
+            0,
+            Revision(1),
+            SourceRange::new(0, source.len()),
+            source,
+            26.0,
+        );
+        assert_eq!(block.visual_text, "nested");
+        assert_eq!(
+            block.source_map.segments[0].source_range,
+            SourceRange::new(0, 3)
+        );
+        assert_eq!(
+            block.source_map.segments.last().unwrap().source_range,
+            SourceRange::new(9, 12)
+        );
     }
 }
