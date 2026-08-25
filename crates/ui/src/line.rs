@@ -1,24 +1,58 @@
 use crate::theme::Theme;
-use gpui::{Div, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px, rgb};
+use gpui::{
+    Div, FontWeight, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder, px, rgb,
+};
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_presentation::{VisualBlock, VisualOffset, present_plain};
+use hane_presentation::{BlockKind, StyleKind, VisualBlock, VisualOffset, present_markdown};
 use std::ops::Range;
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
-pub(crate) fn presented_line(editor: &Editor, line: usize) -> Option<VisualBlock> {
+pub(crate) fn presented_line(
+    editor: &Editor,
+    line: usize,
+    fenced_code_context: bool,
+) -> Option<VisualBlock> {
     let Ok(range) = editor.document().line_range(LineId(line)) else {
         return None;
     };
     let source = editor.document().text(range).unwrap_or_default();
-    let mut block = present_plain(line as u64, editor.document().revision(), range, &source);
+    let mut block = present_markdown(
+        line as u64,
+        editor.document().revision(),
+        range,
+        &source,
+        DEFAULT_LINE_HEIGHT,
+    );
     while block.visual_text.ends_with(['\r', '\n']) {
         block.visual_text.pop();
     }
+    if fenced_code_context {
+        block.kind = BlockKind::CodeBlock;
+        block.estimated_height = DEFAULT_LINE_HEIGHT * 1.15;
+        if !block.visual_text.is_empty() {
+            block.style_runs.push(hane_presentation::StyleRun {
+                visual_range: hane_presentation::VisualRange::new(0, block.visual_text.len()),
+                kind: StyleKind::CodeBlock,
+            });
+        }
+    }
     Some(block)
+}
+
+const DEFAULT_LINE_HEIGHT: f32 = 26.0;
+
+pub(crate) fn block_font_size(block: &VisualBlock) -> f32 {
+    match block.kind {
+        BlockKind::Heading(1) => 24.0,
+        BlockKind::Heading(2) => 21.0,
+        BlockKind::Heading(3) => 18.0,
+        BlockKind::Heading(_) => 16.0,
+        _ => 14.0,
+    }
 }
 
 pub(crate) fn line_element_from_block(
@@ -50,6 +84,7 @@ pub(crate) fn line_element_from_block(
         visual_cursor.map(|offset| offset.0),
         selected_visual,
         marked_visual,
+        &block.style_runs,
     );
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
     for segment in &segments {
@@ -63,6 +98,19 @@ pub(crate) fn line_element_from_block(
                         element.bg(rgb(theme.selection_background))
                     })
                     .when(segment.marked, |element| element.underline())
+                    .when(segment.bold, |element| {
+                        element.font_weight(FontWeight::BOLD)
+                    })
+                    .when(segment.italic, |element| element.italic())
+                    .when(segment.strikethrough, |element| element.line_through())
+                    .when(segment.code, |element| {
+                        element
+                            .font_family("ui-monospace")
+                            .text_bg(rgb(theme.code_background))
+                    })
+                    .when(segment.link, |element| {
+                        element.underline().text_color(rgb(theme.link_foreground))
+                    })
                     .child(block.visual_text[segment.visual_range.clone()].to_owned())
                     .into_any_element(),
             );
@@ -73,11 +121,21 @@ pub(crate) fn line_element_from_block(
     }
 
     div()
-        .h(px(theme.line_height))
+        .h(px(block.height()))
         .w_full()
         .flex()
         .items_center()
         .px(px(theme.line_horizontal_padding))
+        .text_size(px(block_font_size(block)))
+        .when(matches!(block.kind, BlockKind::Heading(_)), |element| {
+            element.font_weight(FontWeight::SEMIBOLD)
+        })
+        .when(block.kind == BlockKind::CodeBlock, |element| {
+            element.bg(rgb(theme.code_block_background))
+        })
+        .when(block.kind == BlockKind::Quote, |element| {
+            element.text_color(rgb(theme.quote_foreground))
+        })
         .children(elements)
 }
 
@@ -110,6 +168,11 @@ struct LineSegment {
     selected: bool,
     marked: bool,
     cursor_before: bool,
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    code: bool,
+    link: bool,
 }
 
 fn line_segments(
@@ -117,6 +180,7 @@ fn line_segments(
     cursor: Option<usize>,
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
+    style_runs: &[hane_presentation::StyleRun],
 ) -> Vec<LineSegment> {
     let mut boundaries = vec![0, text_len];
     boundaries.extend(cursor.map(|offset| offset.min(text_len)));
@@ -124,12 +188,23 @@ fn line_segments(
         boundaries.push(range.start.min(text_len));
         boundaries.push(range.end.min(text_len));
     }
+    for run in style_runs {
+        boundaries.push(run.visual_range.start.0.min(text_len));
+        boundaries.push(run.visual_range.end.0.min(text_len));
+    }
     boundaries.sort_unstable();
     boundaries.dedup();
     boundaries
         .windows(2)
         .map(|pair| {
             let range = pair[0]..pair[1];
+            let has_style = |kind| {
+                style_runs.iter().any(|run| {
+                    run.kind == kind
+                        && range.start >= run.visual_range.start.0
+                        && range.end <= run.visual_range.end.0
+                })
+            };
             LineSegment {
                 selected: selected.as_ref().is_some_and(|selected| {
                     range.start >= selected.start && range.end <= selected.end
@@ -138,27 +213,27 @@ fn line_segments(
                     .as_ref()
                     .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
                 cursor_before: cursor == Some(range.start),
-                visual_range: range,
+                visual_range: range.clone(),
+                bold: has_style(StyleKind::Bold),
+                italic: has_style(StyleKind::Italic),
+                strikethrough: has_style(StyleKind::Strikethrough),
+                code: has_style(StyleKind::InlineCode) || has_style(StyleKind::CodeBlock),
+                link: has_style(StyleKind::Link),
             }
         })
         .collect()
 }
 
 fn cursor_overlay(theme: Theme) -> Div {
-    div()
-        .relative()
-        .flex_none()
-        .w(px(0.))
-        .h(px(theme.line_height))
-        .child(
-            div()
-                .absolute()
-                .top(px(3.))
-                .left(px(0.))
-                .w(px(1.))
-                .h(px(theme.line_height - 6.))
-                .bg(rgb(theme.foreground)),
-        )
+    div().relative().flex_none().w(px(0.)).h_full().child(
+        div()
+            .absolute()
+            .top(px(3.))
+            .left(px(0.))
+            .w(px(1.))
+            .bottom(px(3.))
+            .bg(rgb(theme.foreground)),
+    )
 }
 
 #[cfg(test)]
@@ -195,40 +270,73 @@ mod tests {
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(12, Some(3), Some(3..9), Some(6..12)),
+            line_segments(12, Some(3), Some(3..9), Some(6..12), &[]),
             vec![
                 LineSegment {
                     visual_range: 0..3,
                     selected: false,
                     marked: false,
-                    cursor_before: false
+                    cursor_before: false,
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    code: false,
+                    link: false
                 },
                 LineSegment {
                     visual_range: 3..6,
                     selected: true,
                     marked: false,
-                    cursor_before: true
+                    cursor_before: true,
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    code: false,
+                    link: false
                 },
                 LineSegment {
                     visual_range: 6..9,
                     selected: true,
                     marked: true,
-                    cursor_before: false
+                    cursor_before: false,
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    code: false,
+                    link: false
                 },
                 LineSegment {
                     visual_range: 9..12,
                     selected: false,
                     marked: true,
-                    cursor_before: false
+                    cursor_before: false,
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    code: false,
+                    link: false
                 },
             ]
         );
     }
 
     #[test]
-    fn phase1_line_keeps_markdown_markers_visible() {
-        let editor = Editor::new("**bold**");
-        let block = presented_line(&editor, 0).unwrap();
-        assert_eq!(block.visual_text, "**bold**");
+    fn phase2_line_styles_markdown_and_keeps_source_bytes_visible() {
+        let editor = Editor::new("# **bold** and _italic_");
+        let block = presented_line(&editor, 0, false).unwrap();
+        assert_eq!(block.visual_text, "# **bold** and _italic_");
+        assert_eq!(block.kind, BlockKind::Heading(1));
+        assert!(
+            block
+                .style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::Bold)
+        );
+        assert!(
+            block
+                .style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::Italic)
+        );
     }
 }

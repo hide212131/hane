@@ -2,7 +2,7 @@
 
 use hane_document::{RopeBuffer, SourceRange, TextBuffer};
 use hane_metrics::percentile;
-use hane_presentation::{HeightIndex, present_bold};
+use hane_presentation::{HeightIndex, present_markdown};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -180,11 +180,12 @@ pub fn run_presentation_scenario(iterations: usize) -> Distribution {
     let mut samples = Vec::with_capacity(iterations);
     for revision in 0..iterations {
         let start = std::time::Instant::now();
-        let block = present_bold(
+        let block = present_markdown(
             revision as u64,
             hane_document::Revision(revision as u64),
             range,
             source,
+            26.0,
         );
         std::hint::black_box(block);
         samples.push(start.elapsed());

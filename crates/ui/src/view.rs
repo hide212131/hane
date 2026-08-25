@@ -1,19 +1,19 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
-use crate::line::{line_element_from_block, presented_line};
+use crate::line::{block_font_size, line_element_from_block, presented_line};
 use crate::phase0_metrics::Phase0MetricsOutput;
 use crate::theme::{DEFAULT_THEME, Theme};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollWheelEvent, Styled, TextRun,
-    Window, div, px, rgb,
+    App, Context, FocusHandle, Focusable, FontStyle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollWheelEvent, Styled,
+    TextRun, Window, div, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, Selection};
 use hane_metrics::FrameMetrics;
-use hane_presentation::{HeightIndex, VisualOffset};
+use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -225,7 +225,12 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        let Some(block) = presented_line(&self.editor, line) else {
+        let Some(block) = self
+            .line_cache
+            .get(&line)
+            .cloned()
+            .or_else(|| presented_line(&self.editor, line, false))
+        else {
             return;
         };
         let visual_offset = visual_offset_at_x(&block, event.position.x, self.theme, window);
@@ -256,7 +261,12 @@ impl EditorView {
         if !event.dragging() {
             return;
         }
-        let Some(block) = presented_line(&self.editor, line) else {
+        let Some(block) = self
+            .line_cache
+            .get(&line)
+            .cloned()
+            .or_else(|| presented_line(&self.editor, line, false))
+        else {
             return;
         };
         let visual = visual_offset_at_x(&block, event.position.x, self.theme, window);
@@ -287,7 +297,11 @@ impl EditorView {
         );
     }
 
-    fn cached_line(&mut self, line: usize) -> Option<hane_presentation::VisualBlock> {
+    fn cached_line(
+        &mut self,
+        line: usize,
+        fenced_code_context: bool,
+    ) -> Option<hane_presentation::VisualBlock> {
         let current_revision = self.editor.document().revision();
         if let Some(mut block) = self.line_cache.remove(&line) {
             let reusable = if block.revision == current_revision {
@@ -305,12 +319,19 @@ impl EditorView {
             } else {
                 false
             };
-            if reusable {
+            let expected_code_kind = fenced_code_context
+                || self
+                    .editor
+                    .document()
+                    .text(block.source_range)
+                    .is_ok_and(|text| markdown_fence(&text).is_some());
+            let context_matches = (block.kind == BlockKind::CodeBlock) == expected_code_kind;
+            if reusable && context_matches {
                 self.line_cache.insert(line, block.clone());
                 return Some(block);
             }
         }
-        let block = presented_line(&self.editor, line)?;
+        let block = presented_line(&self.editor, line, fenced_code_context)?;
         self.line_cache.insert(line, block.clone());
         Some(block)
     }
@@ -354,10 +375,29 @@ impl Render for EditorView {
         let cache_end = (visible.end + 128).min(self.heights.len());
         self.line_cache
             .retain(|line, _| cache_start <= *line && *line < cache_end);
-        let rendered_lines = visible
-            .clone()
-            .filter_map(|line| self.cached_line(line).map(|block| (line, block)))
-            .collect::<Vec<_>>();
+        let mut fence = fence_before_line(&self.editor, visible.start);
+        let mut rendered_lines = Vec::with_capacity(visible.len());
+        for line in visible.clone() {
+            let range = self.editor.document().line_range(LineId(line)).ok();
+            let source = range.and_then(|range| self.editor.document().text(range).ok());
+            let delimiter = source.as_deref().and_then(markdown_fence);
+            let fenced_code_context = fence.is_some() || delimiter.is_some();
+            if let Some(block) = self.cached_line(line, fenced_code_context) {
+                rendered_lines.push((line, block));
+            }
+            if let Some(delimiter) = delimiter {
+                fence = match fence {
+                    Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => {
+                        None
+                    }
+                    None => Some(delimiter),
+                    current => current,
+                };
+            }
+        }
+        for (line, block) in &rendered_lines {
+            self.heights.update(*line, block.height());
+        }
         let top_space = self.heights.prefix_sum(visible.start);
         let bottom_space =
             (self.heights.total_height() - self.heights.prefix_sum(visible.end)).max(0.0);
@@ -443,19 +483,56 @@ fn visual_offset_at_x(
         return 0;
     }
     let style = window.text_style();
-    let run = TextRun {
-        len: block.visual_text.len(),
-        font: style.font(),
-        color: style.color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let font_size = style.font_size.to_pixels(window.rem_size());
+    let mut boundaries = vec![0, block.visual_text.len()];
+    for run in &block.style_runs {
+        boundaries.push(run.visual_range.start.0.min(block.visual_text.len()));
+        boundaries.push(run.visual_range.end.0.min(block.visual_text.len()));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let runs = boundaries
+        .windows(2)
+        .filter_map(|pair| {
+            let range = pair[0]..pair[1];
+            if range.is_empty() {
+                return None;
+            }
+            let has_style = |kind| {
+                block.style_runs.iter().any(|run| {
+                    run.kind == kind
+                        && range.start >= run.visual_range.start.0
+                        && range.end <= run.visual_range.end.0
+                })
+            };
+            let mut font = style.font();
+            if matches!(block.kind, BlockKind::Heading(_)) || has_style(StyleKind::Bold) {
+                font.weight = if has_style(StyleKind::Bold) {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::SEMIBOLD
+                };
+            }
+            if has_style(StyleKind::Italic) {
+                font.style = FontStyle::Italic;
+            }
+            if has_style(StyleKind::InlineCode) || has_style(StyleKind::CodeBlock) {
+                font.family = "ui-monospace".into();
+            }
+            Some(TextRun {
+                len: range.len(),
+                font,
+                color: style.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let font_size = px(block_font_size(block));
     let layout =
         window
             .text_system()
-            .shape_line(block.visual_text.clone().into(), font_size, &[run], None);
+            .shape_line(block.visual_text.clone().into(), font_size, &runs, None);
     layout.closest_index_for_x(position_x - px(theme.line_horizontal_padding))
 }
 
@@ -479,6 +556,55 @@ fn source_offset_for_visual_position(
         .unwrap_or(block.source_range.start)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MarkdownFence {
+    marker: u8,
+    len: usize,
+}
+
+fn markdown_fence(source: &str) -> Option<MarkdownFence> {
+    let trimmed = source.trim_start_matches(' ');
+    if source.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let marker = *trimmed.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (len >= 3).then_some(MarkdownFence { marker, len })
+}
+
+/// Establishes local fenced-code context without making visible parsing depend
+/// on total document size. Extremely long fences are reconciled by later
+/// background/block parsing in Phase 3.
+fn fence_before_line(editor: &Editor, line: usize) -> Option<MarkdownFence> {
+    const LOCAL_CONTEXT_LINES: usize = 2_048;
+    let start = line.saturating_sub(LOCAL_CONTEXT_LINES);
+    let mut fence: Option<MarkdownFence> = None;
+    for candidate in start..line {
+        let Ok(range) = editor.document().line_range(LineId(candidate)) else {
+            continue;
+        };
+        let Ok(source) = editor.document().text(range) else {
+            continue;
+        };
+        let Some(delimiter) = markdown_fence(&source) else {
+            continue;
+        };
+        fence = match fence {
+            Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => None,
+            None => Some(delimiter),
+            current => current,
+        };
+    }
+    fence
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +614,7 @@ mod tests {
     fn visual_click_positions_map_back_to_source_offsets() {
         let editor = Editor::new("ab🙂\n\n**bold**");
 
-        let first = presented_line(&editor, 0).unwrap();
+        let first = presented_line(&editor, 0, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, &first, 2),
             SourceOffset(2)
@@ -498,13 +624,13 @@ mod tests {
             SourceOffset(6)
         );
 
-        let empty = presented_line(&editor, 1).unwrap();
+        let empty = presented_line(&editor, 1, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 1, &empty, 0),
             SourceOffset(7)
         );
 
-        let bold = presented_line(&editor, 2).unwrap();
+        let bold = presented_line(&editor, 2, false).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, 0),
             SourceOffset(8)
@@ -564,5 +690,19 @@ mod tests {
         };
         assert!(edit_affects_range(inside, range));
         assert!(!edit_affects_range(before_line, range));
+    }
+
+    #[test]
+    fn fenced_code_context_tracks_open_and_close_markers() {
+        let editor = Editor::new("before\n```rust\nlet answer = 42;\n```\nafter\n");
+        assert_eq!(fence_before_line(&editor, 1), None);
+        assert_eq!(
+            fence_before_line(&editor, 2),
+            Some(MarkdownFence {
+                marker: b'`',
+                len: 3
+            })
+        );
+        assert_eq!(fence_before_line(&editor, 4), None);
     }
 }

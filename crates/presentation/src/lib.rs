@@ -3,7 +3,9 @@
 use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
-use hane_markdown::parse_bold;
+use hane_markdown::{
+    BlockKind as MarkdownBlockKind, InlineKind as MarkdownInlineKind, parse_bold, parse_document,
+};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -137,6 +139,11 @@ impl SourceMap {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StyleKind {
     Bold,
+    Italic,
+    Strikethrough,
+    InlineCode,
+    CodeBlock,
+    Link,
     MarkedText,
 }
 
@@ -146,6 +153,17 @@ pub struct StyleRun {
     pub kind: StyleKind,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockKind {
+    #[default]
+    Paragraph,
+    Heading(u8),
+    CodeBlock,
+    Quote,
+    ListItem,
+    Rule,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualBlock {
     pub block_id: u64,
@@ -153,6 +171,7 @@ pub struct VisualBlock {
     pub revision: Revision,
     pub visual_text: String,
     pub style_runs: Vec<StyleRun>,
+    pub kind: BlockKind,
     pub source_map: SourceMap,
     pub estimated_height: f32,
     pub measured_height: Option<f32>,
@@ -310,6 +329,7 @@ pub fn present_bold(
         revision,
         visual_text: visual,
         style_runs: styles,
+        kind: BlockKind::Paragraph,
         source_map: map,
         estimated_height: 24.0,
         measured_height: None,
@@ -329,6 +349,7 @@ pub fn present_plain(
         revision,
         visual_text: source.to_owned(),
         style_runs: Vec::new(),
+        kind: BlockKind::Paragraph,
         source_map: SourceMap {
             segments: vec![MappingSegment {
                 source_range: range,
@@ -342,6 +363,97 @@ pub fn present_plain(
     }
 }
 
+fn presentation_block_kind(kind: MarkdownBlockKind) -> BlockKind {
+    match kind {
+        MarkdownBlockKind::Paragraph => BlockKind::Paragraph,
+        MarkdownBlockKind::Heading(level) => BlockKind::Heading(level),
+        MarkdownBlockKind::CodeBlock => BlockKind::CodeBlock,
+        MarkdownBlockKind::Quote => BlockKind::Quote,
+        MarkdownBlockKind::ListItem => BlockKind::ListItem,
+        MarkdownBlockKind::Rule => BlockKind::Rule,
+    }
+}
+
+fn presentation_style_kind(kind: MarkdownInlineKind) -> StyleKind {
+    match kind {
+        MarkdownInlineKind::Bold => StyleKind::Bold,
+        MarkdownInlineKind::Italic => StyleKind::Italic,
+        MarkdownInlineKind::Strikethrough => StyleKind::Strikethrough,
+        MarkdownInlineKind::InlineCode => StyleKind::InlineCode,
+        MarkdownInlineKind::Link => StyleKind::Link,
+        MarkdownInlineKind::CodeBlock => StyleKind::CodeBlock,
+    }
+}
+
+fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
+    match kind {
+        BlockKind::Heading(1) => line_height * 1.65,
+        BlockKind::Heading(2) => line_height * 1.45,
+        BlockKind::Heading(3) => line_height * 1.25,
+        BlockKind::Heading(_) => line_height * 1.1,
+        BlockKind::CodeBlock => line_height * 1.15,
+        _ => line_height,
+    }
+}
+
+/// Builds a Phase 2 visual block. Markdown bytes remain visible, so the source
+/// map is deliberately an identity map until progressive disclosure in Phase 3.
+pub fn present_markdown(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+) -> VisualBlock {
+    if source.is_empty() {
+        let mut block = present_plain(block_id, revision, range, source);
+        block.estimated_height = line_height;
+        return block;
+    }
+    let parsed = parse_document(revision, range, source);
+    let kind = parsed
+        .blocks
+        .first()
+        .map(|block| presentation_block_kind(block.kind))
+        .unwrap_or_default();
+    let mut style_runs = parsed
+        .spans
+        .into_iter()
+        .filter_map(|span| {
+            let clipped = SourceRange {
+                start: span.source_range.start.max(range.start),
+                end: span.source_range.end.min(range.end),
+            };
+            (!clipped.is_empty()).then_some(StyleRun {
+                visual_range: VisualRange::new(
+                    clipped.start.0 - range.start.0,
+                    clipped.end.0 - range.start.0,
+                ),
+                kind: presentation_style_kind(span.kind),
+            })
+        })
+        .collect::<Vec<_>>();
+    style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+    VisualBlock {
+        block_id,
+        source_range: range,
+        revision,
+        visual_text: source.to_owned(),
+        style_runs,
+        source_map: SourceMap {
+            segments: vec![MappingSegment {
+                source_range: range,
+                visual_range: VisualRange::new(0, source.len()),
+                visibility: Visibility::Visible,
+            }],
+        },
+        estimated_height: estimated_height(kind, line_height),
+        measured_height: None,
+        invalid: false,
+        kind,
+    }
+}
+
 pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBlock> {
     let mut blocks = Vec::with_capacity(buffer.line_count());
     for line in 0..buffer.line_count() {
@@ -349,8 +461,7 @@ pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBloc
             continue;
         };
         let text = buffer.text(range).unwrap_or_default();
-        let mut block = present_bold(line as u64, buffer.revision(), range, &text);
-        block.estimated_height = line_height;
+        let block = present_markdown(line as u64, buffer.revision(), range, &text, line_height);
         blocks.push(block);
     }
     blocks
@@ -538,5 +649,33 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn phase2_presentation_styles_markdown_without_changing_source_identity() {
+        let source = "## Hello **太字** and _italic_ with `code`";
+        let block = present_markdown(
+            5,
+            Revision(3),
+            SourceRange::new(40, 40 + source.len()),
+            source,
+            26.0,
+        );
+        assert_eq!(block.visual_text, source);
+        assert_eq!(block.kind, BlockKind::Heading(2));
+        for kind in [StyleKind::Bold, StyleKind::Italic, StyleKind::InlineCode] {
+            assert!(block.style_runs.iter().any(|run| run.kind == kind));
+        }
+        for relative in [0, 3, source.len()] {
+            assert_eq!(
+                block
+                    .source_map
+                    .visual_to_source(VisualOffset(relative), Bias::After)
+                    .unwrap()
+                    .source_offset,
+                SourceOffset(40 + relative)
+            );
+        }
+        assert!(block.height() > 26.0);
     }
 }

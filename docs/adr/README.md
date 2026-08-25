@@ -4,7 +4,7 @@
 
 ADR は実装前にすべてを固定するためではなく、実装時に迷うと性能・正確性・依存境界へ影響する判断を明示するために使う。
 
-ADR-0001 から ADR-0011 はPhase 0、ADR-0012以降はPhase 1の実装判断を記録する。
+ADR-0001 から ADR-0011 はPhase 0、ADR-0012からADR-0014はPhase 1、ADR-0015以降はPhase 2の実装判断を記録する。
 
 ## ADR 一覧
 
@@ -24,6 +24,7 @@ ADR-0001 から ADR-0011 はPhase 0、ADR-0012以降はPhase 1の実装判断を
 | [ADR-0012](0012-phase1-plain-text-editor-plan.md) | Phase 1 Plain Text Editor実装計画 |
 | [ADR-0013](0013-undo-redo-transactions.md) | Undo/Redo transaction |
 | [ADR-0014](0014-gpui-memory-baseline.md) | GPUI memory baselineと空Editor RSS目標 |
+| [ADR-0015](0015-phase2-markdown-presentation-plan.md) | Phase 2 Markdown Presentation実装計画 |
 
 ## Phase 0 実装時の参照順
 
@@ -69,3 +70,14 @@ Phase 0 の実装を始める場合は、以下の順に読む。
 7. [ADR-0007](0007-ime-composition.md)
 8. [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md)
 9. [ADR-0009](0009-performance-harness.md)
+
+## Phase 2 実装時の参照順
+
+1. [Phase 1 report](../phase1/report.md)
+2. [ADR-0015](0015-phase2-markdown-presentation-plan.md)
+3. [ADR-0008](0008-markdown-parsing-strategy.md)
+4. [ADR-0004](0004-source-visual-mapping.md)
+5. [ADR-0005](0005-revision-and-background-work.md)
+6. [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md)
+7. [ADR-0014](0014-gpui-memory-baseline.md)
+8. [ADR-0009](0009-performance-harness.md)

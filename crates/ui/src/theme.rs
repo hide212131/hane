@@ -9,6 +9,10 @@ pub(crate) struct Theme {
     pub selection_background: u32,
     pub header_background: u32,
     pub header_foreground: u32,
+    pub code_background: u32,
+    pub code_block_background: u32,
+    pub link_foreground: u32,
+    pub quote_foreground: u32,
 }
 
 pub(crate) const DEFAULT_THEME: Theme = Theme {
@@ -21,4 +25,8 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     selection_background: 0xe8eefc,
     header_background: 0x242424,
     header_foreground: 0xf5f5f5,
+    code_background: 0xeeeae4,
+    code_block_background: 0xf1eee9,
+    link_foreground: 0x2867a9,
+    quote_foreground: 0x6b6259,
 };

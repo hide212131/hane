@@ -57,8 +57,10 @@ launch() {
     autoscroll=${10:-}
     if [ -n "$fixture" ]; then
         set -- "$binary" "$fixture"
+        measurement_empty=""
     else
         set -- "$binary"
+        measurement_empty=1
     fi
     env \
         HANE_METRICS_SCENARIO="$scenario" \
@@ -70,6 +72,7 @@ launch() {
         HANE_PHASE0_BACKGROUND_PRESENTATION="$background" \
         HANE_MEASURE_IDLE_RSS="$idle" \
         HANE_PHASE0_AUTOSCROLL="$autoscroll" \
+        HANE_MEASUREMENT_EMPTY="$measurement_empty" \
         "$@" 2>"$log_path" &
     app_pid=$!
     wait_ready "$log_path"

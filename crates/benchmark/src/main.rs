@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ("100 MB buffer edit", hundred),
                         ("10 MB file open", open_ten),
                         ("100 MB file open", open_hundred),
-                        ("bold presentation update", presentation),
+                        ("Markdown presentation update", presentation),
                         ("visible layout index", layout),
                     ]
                 )

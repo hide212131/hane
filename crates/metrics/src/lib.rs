@@ -72,7 +72,9 @@ impl<T> RollingWindow<T> {
         assert!(capacity > 0, "rolling-window capacity must be non-zero");
         Self {
             capacity,
-            values: VecDeque::with_capacity(capacity),
+            // Keep the logical bound without reserving the worst case in every
+            // fresh editor. Metrics grow only when samples actually arrive.
+            values: VecDeque::new(),
         }
     }
 

@@ -32,7 +32,9 @@ fn main() {
             cx.new(|cx| {
                 let mut view = match path.as_deref() {
                     Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| EditorView::new(&format!("Could not open {}: {error}", path.display()), path.display().to_string(), cx)),
-                    None => EditorView::new("Hane Phase 1\n\n日本語 IME、範囲選択、Undo / Redoを試せます。\nMarkdown記号は **plain text** として表示します。\n\n10 MB / 100 MB fixture は `cargo run -p hane-benchmark --bin hane-bench -- fixtures` で生成できます。\n", "Untitled", cx),
+                    None if std::env::var("HANE_MEASUREMENT_EMPTY")
+                        .is_ok_and(|value| !value.is_empty()) => EditorView::new("", "Untitled", cx),
+                    None => EditorView::new("# Hane Phase 2\n\n日本語IME、範囲選択、Undo / Redoに加えて、**太字**、_斜体_、~~取り消し線~~、`inline code`を試せます。\n\n## Markdown Presentation\n\nPhase 2ではMarkdown記号を表示したまま装飾し、source byteとの恒等対応を維持します。\n\n```rust\nlet fast = true;\n```\n", "Untitled", cx),
                 };
                 view.arm_startup_timing(process_started);
                 view
@@ -60,7 +62,8 @@ fn main() {
                 window.focus(&view.focus_handle(cx));
             }).expect("focus editor");
         }
-        if std::env::var("HANE_PHASE1_AUTOSCROLL")
+        if std::env::var("HANE_PHASE2_AUTOSCROLL")
+            .or_else(|_| std::env::var("HANE_PHASE1_AUTOSCROLL"))
             .or_else(|_| std::env::var("HANE_PHASE0_AUTOSCROLL"))
             .is_ok_and(|value| !value.is_empty())
         {
