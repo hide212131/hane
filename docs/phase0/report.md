@@ -36,6 +36,34 @@ Phase 0 の非目標である保存UI、完全なMarkdown parser、Undo/Redo com
 
 測定プロセスの100 MB scenario後RSSは238,108,672 bytesだった。この値にはallocatorが保持した以前のscenarioの領域も含まれるため、ADR-0001の「100 MB文書 <= 350 MB」に対する保守的な参考値として扱う。
 
+## 追加自動UI検証
+
+検証日: 2026-08-25。release profileのネイティブGPUIウィンドウを起動し、PIDからウィンドウを特定してmacOSの`System Events`から入力し、ヘッダのrevision・byte数と本文をスクリーンショットで確認した。キャプチャは`target/captures/`に保存した。
+
+- 10 MB fixtureは10,485,760 bytesで起動し、OS入力後にrevision 7、10,485,767 bytesとなり、先頭行の表示も更新された。
+- 100 MB fixtureはrevision 0、104,857,600 bytesで起動し、OS入力後にrevision 3、104,857,609 bytesとなり、画面表示の`frame p95`は1.97 msだった。
+- macOS日本語IMEで`nihongo`を入力すると、composition中に本文先頭へ「日本語」が反映されrevision 7、1,048,585 bytesとなった。Return確定後はrevision 8、同じbyte数となり、composition updateとcommitが実IME経由で別イベントとして通ることを確認した。
+- 40行fixtureで下方カーソル移動を32回実行し、表示が6〜33行目へスクロールし、カーソルが33行目のviewport下端に追従することを確認した。
+
+100 MB UIプロセスのRSSは次の通りだった。
+
+| 観測点 | RSS (bytes) |
+|---|---:|
+| `hane_ready`直後 | 347,635,712 |
+| visible layout・入力後 | 350,404,608 |
+| 30秒idle後 | 245,694,464 |
+
+連続起動によるwarm条件を30回測定した。現在の`hane_ready`は初回paintより前に出力されるため、これらは現在の観測点における起動時間であり、ADR-0009の「入力可能になるまで」の厳密な代替とはしない。
+
+| Scenario | Samples | Median (ms) | p95 (ms) | p99 (ms) | Max (ms) |
+|---|---:|---:|---:|---:|---:|
+| empty warm startup | 30 | 134.840 | 144.412 | 148.211 | 148.211 |
+| empty file open section | 30 | 65.216 | 81.523 | 85.114 | 85.114 |
+| 100 MB warm startup | 30 | 236.017 | 294.510 | 344.317 | 344.317 |
+| 100 MB file open section | 30 | 175.334 | 238.555 | 246.082 | 246.082 |
+
+UI画面の`frame p95`は少数イベントのrolling window値である。上記の1.97 ms、5.19 ms、11.04 ms、15.12 msは機能動作の証跡にのみ使い、ADR-0001の性能合否判定には使わない。
+
 ## UI測定点
 
 アプリは起動時に `startup_time_ms` と `file_open_time_ms` を標準エラーへ出力する。入力ごとに `input received → model updated` を記録し、その編集を含む `InputCapture::paint` で `keystroke_to_frame` を確定する。直近のp95はウィンドウ上部に表示する。paint間隔とvisible layout時間は上限付きrolling windowへ記録し、RSS取得APIも実装済みである。visible range、scroll上限、cursor追従には固定値ではなく、render時に取得したウィンドウ実寸からヘッダ高を除いたviewport heightを使用する。
@@ -46,6 +74,9 @@ Phase 0 の非目標である保存UI、完全なMarkdown parser、Undo/Redo com
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass
 - `cargo test --workspace`: 31 tests pass
 - GPUI window smoke launch: pass（2026-08-24時点。行境界の cursor overlay をスクリーンショットで確認）
+- 10 MB / 100 MB GPUI windowでOS入力と画面更新: pass（2026-08-25）
+- macOS日本語IME composition / commit: pass（2026-08-25、1 sequence）
+- cursor追従scroll capture: pass（2026-08-25）
 - fixture byte size: 10,485,760 bytes / 104,857,600 bytes
 - `paragraphs_100k.md`: 100,000 lines
 
@@ -57,7 +88,7 @@ Phase 0 の非目標である保存UI、完全なMarkdown parser、Undo/Redo com
 
 ## Phase 1 判断
 
-現時点の判断は **保留** とする。buffer edit、file open、局所presentation、visible range indexは十分小さい値だが、ADR-0001の合格判断には実IMEを使った30回以上の `keystroke_to_frame`、cold / warm startup、100 MB文書でのscroll frame time、load直後・visible layout後・30秒idleのRSSを同一手順で採取する必要がある。
+現時点の判断は **保留** とする。10 MB / 100 MBの実UI入力、実IMEのcomposition / commit、カーソル追従スクロール、warm条件30回、100 MB UIプロセスの3点RSSは追加確認済みである。ADR-0001の合格判断には、実IMEを使った30回以上の`keystroke_to_frame`・`keystroke_to_model`、初回paint以降を観測点とするcold / warm startup、100 MB文書でのscroll frame time、scroll中・background presentation更新中の入力値を分布として採取する必要がある。
 
 手動検証では次を固定する。
 
