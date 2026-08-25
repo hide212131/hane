@@ -106,7 +106,7 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
       条件と判定方法は `docs/baseline/README.md` に定義。
 - [x] 現行の公開 API 一覧（`cargo public-api` 等）をスナップショット。
       `docs/baseline/public-api.md` に保存。
-- [ ] 基準タグ `refactor-baseline` を打つ。
+- [x] 基準タグ `refactor-baseline` を打つ（`0111cdc`）。
 
 **完了条件**: 以降のフェーズで参照する「緑のテスト・性能原本・APIスナップショット」が揃う。
 
@@ -116,14 +116,18 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 
 **目的**: ブロック境界や描画実装を変更しても守るべき振る舞いを、構造変更より先に固定する。
 
-- [ ] 文書内の全編集可能 source offset について、`source → visual → source` の往復を検証する。
+- [x] 文書内の全編集可能 source offset について、`source → visual → source` の往復を検証する。
       ASCII、日本語、絵文字、結合文字、サロゲートペア相当の UTF-16 変換を含める。
-- [ ] 複数行の quote/list/code/table、Setext heading、`1)` 形式の番号付きリスト、
+- [x] 複数行の quote/list/code/table、Setext heading、`1)` 形式の番号付きリスト、
       reference link、escape 済みマーカを golden fixture として追加する。
-- [ ] 開きフェンスの追加・削除により遠方のブロック境界が変化するケースを追加する。
-- [ ] 背景 parse 中の連続編集、stale revision の破棄、正式解析待ちの暫定表示をテストする。
-- [ ] カーソル上下移動、クリック、ドラッグ選択、IME marked range を、複数行ブロックでも
+- [x] 開きフェンスの追加・削除により遠方のブロック境界が変化するケースを追加する。
+- [x] 背景 parse 中の連続編集、stale revision の破棄、正式解析待ちの暫定表示をテストする。
+- [x] カーソル上下移動、クリック、ドラッグ選択、IME marked range を、複数行ブロックでも
       検証できる UI 非依存の契約テスト API を用意する。
+
+契約テストは `crates/markdown/tests/document_contract.rs`、
+`crates/presentation/tests/source_map_contract.rs`、`crates/editor/tests/ime_contract.rs` に置く。
+現行モデルで未対応の期待値は `docs/baseline/unsupported-markdown.md` に固定する。
 
 **完了条件**: R4 系フェーズで内部型を置換しても再利用できる契約テストが緑。既知の未対応構文は
 期待値を曖昧にせず、明示的な pending/unsupported 一覧へ分離されている。

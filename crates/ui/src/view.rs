@@ -56,6 +56,10 @@ fn autosave_request_is_current(
         && current_revision == requested_revision
 }
 
+fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
+    current == candidate
+}
+
 pub struct EditorView {
     pub(crate) editor: Editor,
     pub(crate) focus_handle: FocusHandle,
@@ -481,7 +485,9 @@ impl EditorView {
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
             let current = view
-                .update(cx, |view, _| view.editor.document().revision() == revision)
+                .update(cx, |view, _| {
+                    block_context_revision_is_current(view.editor.document().revision(), revision)
+                })
                 .unwrap_or(false);
             if !current {
                 let _ = view.update(cx, |view, cx| {
@@ -496,7 +502,10 @@ impl EditorView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.block_context_job_running = false;
-                if view.editor.document().revision() == index.revision {
+                if block_context_revision_is_current(
+                    view.editor.document().revision(),
+                    index.revision,
+                ) {
                     view.background_presentation_generation = index.revision.0 + 1;
                     view.block_context = Some(index);
                     view.line_cache.clear();
@@ -1176,5 +1185,11 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn block_context_rejects_stale_revision() {
+        assert!(block_context_revision_is_current(Revision(4), Revision(4)));
+        assert!(!block_context_revision_is_current(Revision(5), Revision(4)));
     }
 }
