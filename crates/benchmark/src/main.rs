@@ -12,8 +12,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("buffer") => {
+            let one = run_buffer_edit_scenario(1024 * 1024, 90);
             let ten = run_buffer_edit_scenario(10 * 1024 * 1024, 90);
             let hundred = run_buffer_edit_scenario(100 * 1024 * 1024, 90);
+            let open_one =
+                run_file_open_scenario(Path::new("target/fixtures/markdown_1mb.md"), 30)?;
             let open_ten =
                 run_file_open_scenario(Path::new("target/fixtures/markdown_10mb.md"), 30)?;
             let open_hundred =
@@ -25,8 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 markdown_report(
                     &Environment::collect("release"),
                     &[
+                        ("1 MB buffer edit", one),
                         ("10 MB buffer edit", ten),
                         ("100 MB buffer edit", hundred),
+                        ("1 MB file open", open_one),
                         ("10 MB file open", open_ten),
                         ("100 MB file open", open_hundred),
                         ("Markdown presentation update", presentation),

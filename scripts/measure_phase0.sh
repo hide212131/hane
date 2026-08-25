@@ -158,6 +158,12 @@ while ! python3 -c 'import sys; stream=open(sys.argv[1],"rb"); stream.seek(int(s
     middle_offset=$((middle_offset - 1))
 done
 
+paragraphs_size=$(wc -c < "$fixtures/paragraphs_100k.md" | tr -d ' ')
+paragraphs_middle_offset=$((paragraphs_size / 2))
+while ! python3 -c 'import sys; stream=open(sys.argv[1],"rb"); stream.seek(int(sys.argv[2])); data=stream.read(1); sys.exit(0 if not data or data[0] & 0xC0 != 0x80 else 1)' "$fixtures/paragraphs_100k.md" "$paragraphs_middle_offset" 2>/dev/null; do
+    paragraphs_middle_offset=$((paragraphs_middle_offset - 1))
+done
+
 startup_series "empty warm startup" "$results_dir/startup_warm" false
 if /usr/sbin/purge >/dev/null 2>&1; then
     startup_series "empty cold startup" "$results_dir/startup_cold" true
@@ -171,6 +177,11 @@ input_scenario "100 MB input at middle" hundred_middle ascii "$fixtures/markdown
 input_scenario "100 MB input at end" hundred_end ascii "$fixtures/markdown_100mb.md" "$hundred_size"
 input_scenario "100 MB scroll only" scroll scroll "$fixtures/markdown_100mb.md" 0
 input_scenario "100 MB input while scrolling" scroll_input scroll-input "$fixtures/markdown_100mb.md" 0
+input_scenario "100k paragraphs input at start" paragraphs_start ascii "$fixtures/paragraphs_100k.md" 0
+input_scenario "100k paragraphs input at middle" paragraphs_middle ascii "$fixtures/paragraphs_100k.md" "$paragraphs_middle_offset"
+input_scenario "100k paragraphs input at end" paragraphs_end ascii "$fixtures/paragraphs_100k.md" "$paragraphs_size"
+input_scenario "100k paragraphs scroll only" paragraphs_scroll scroll "$fixtures/paragraphs_100k.md" 0
+input_scenario "100k paragraphs input while scrolling" paragraphs_scroll_input scroll-input "$fixtures/paragraphs_100k.md" 0
 input_scenario "input during background presentation update" background_input ascii "$fixtures/japanese.md" 0 1
 memory_scenario "memory 10 MB" memory_10mb "$fixtures/markdown_10mb.md"
 memory_scenario "memory 100 MB" memory_100mb "$fixtures/markdown_100mb.md"

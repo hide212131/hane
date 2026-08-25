@@ -91,16 +91,21 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 
 **目的**: 後続の全変更を測るための不変の物差しを作る。
 
-- [ ] `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` が緑であることを確認・記録。
+- [x] `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` が緑であることを確認・記録。
+      結果と実行環境は `docs/baseline/README.md` に保存。
 - [ ] 現行の性能数値（1/10/100 MB, 10万段落）を `measure_phase*` で採取し
       `docs/refactor-plan.md` の付録か `docs/baseline/` に固定保存（回帰比較の原本）。
 - [ ] 10万段落 fixture を UI 性能シナリオへ追加し、先頭・中央・末尾での入力、
       スクロール、入力しながらのスクロールを採取する。
+      シナリオ追加は完了。デスクトップを占有する初回採取は未実施。
 - [ ] `file_open_time` / `local_parse_time` / `full_parse_time` / `layout_time` /
       cache hit/miss / block-index update time を記録し、回帰原因を切り分けられるようにする。
 - [ ] 測定機、電源状態、refresh rate、build profile、サンプル数を固定し、
       「完全不変」ではなく許容回帰率とばらつきの判定方法を明記する。
-- [ ] 現行の公開 API 一覧（`cargo public-api` 等）をスナップショット。
+      判定方法と今後のAC測定条件は `docs/baseline/README.md` に定義済み。既存UI測定の
+      電源状態が未記録のため、初回の正式な再採取後に完了とする。
+- [x] 現行の公開 API 一覧（`cargo public-api` 等）をスナップショット。
+      `docs/baseline/public-api.md` に保存。
 - [ ] 基準タグ `refactor-baseline` を打つ。
 
 **完了条件**: 以降のフェーズで参照する「緑のテスト・性能原本・APIスナップショット」が揃う。

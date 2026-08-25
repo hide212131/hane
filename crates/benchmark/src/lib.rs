@@ -83,6 +83,11 @@ pub struct Fixture {
 
 pub const FIXTURES: &[Fixture] = &[
     Fixture {
+        name: "markdown_1mb.md",
+        target_bytes: 1024 * 1024,
+        pattern: "# 見出し\n\nこれは **重要な段落** です。ASCII, 日本語, emoji 🙂, e\u{301}.\n\n",
+    },
+    Fixture {
         name: "markdown_10mb.md",
         target_bytes: 10 * 1024 * 1024,
         pattern: "# 見出し\n\nこれは **重要な段落** です。ASCII, 日本語, emoji 🙂, e\u{301}.\n\n",
