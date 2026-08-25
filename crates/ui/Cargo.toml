@@ -5,9 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-hane-benchmark.workspace = true
 hane-document.workspace = true
 hane-editor.workspace = true
+hane-metrics.workspace = true
 hane-presentation.workspace = true
 gpui.workspace = true
-

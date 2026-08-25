@@ -1,6 +1,7 @@
 //! Reproducible Phase 0 fixtures and latency aggregation.
 
 use hane_document::{RopeBuffer, SourceRange, TextBuffer};
+use hane_metrics::percentile;
 use hane_presentation::{HeightIndex, present_bold};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -23,16 +24,11 @@ pub fn distribution(samples: &[Duration]) -> Distribution {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
-    let percentile = |p: f64| {
-        sorted[((sorted.len() as f64 * p).ceil() as usize)
-            .saturating_sub(1)
-            .min(sorted.len() - 1)]
-    };
     Distribution {
         samples: sorted.len(),
-        median: percentile(0.50),
-        p95: percentile(0.95),
-        p99: percentile(0.99),
+        median: percentile(sorted.iter().copied(), 0.50).unwrap(),
+        p95: percentile(sorted.iter().copied(), 0.95).unwrap(),
+        p99: percentile(sorted.iter().copied(), 0.99).unwrap(),
         max: *sorted.last().unwrap(),
     }
 }

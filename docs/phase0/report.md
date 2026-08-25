@@ -5,13 +5,17 @@
 ADR-0010 の順序に沿って、以下を実装した。
 
 - GPUI `0.2.2` と Rust `1.93.1` を固定。Metal Toolchain がない開発環境では `runtime_shaders` を使用。
-- `app`、`document`、`markdown`、`presentation`、`editor`、`ui`、`benchmark` の Cargo workspace。
+- `app`、`document`、`markdown`、`metrics`、`presentation`、`editor`、`ui`、`benchmark` の Cargo workspace。
 - `ropey` による UTF-8 byte offset の Text Buffer、revision、edit summary、inverse edit、anchor、revision delta。
-- grapheme 単位の cursor、単一 selection、通常 text input。
+- Text Buffer に集約した改行込み／改行除外の行範囲計算と、文書全体を `String` 化しない UTF-16 ↔ UTF-8 offset 変換。
+- grapheme 単位の cursor、単一 selection、通常 text input。cursor は表示文字列へ文字を挿入せず、文字位置を変えないオーバーレイとして描画。
 - UTF-16 ↔ UTF-8 変換を含む IME composition transaction、commit、cancel、競合検出。
 - 太字だけの局所 parse、hidden marker を持つ SourceMap、bold style run。
+- style と cursor の境界を純粋計算で分割する line span と、GPUI element への変換を分離した行描画。
 - Fenwick tree の `HeightIndex`、overscan 付き visible range、scroll anchoring primitive。
 - GPUI `EntityInputHandler`、未確定範囲、選択 UTF-16 range、paint callback への入力 latency 観測点。
+- 依存を持たない `metrics` crate の rolling window と percentile 集計。UI と benchmark は同じ percentile 実装を使用する。
+- ウィンドウ実寸から算出する viewport height と、色・行高・overscan を集約した UI theme。
 - 10 MB / 100 MB / 100,000段落 / 日本語 / Unicode混在 fixture generator。
 - median / p95 / p99 / max、環境情報、RSS、buffer edit、file open、presentation、layout の harness。
 
@@ -34,18 +38,22 @@ Phase 0 の非目標である保存UI、完全なMarkdown parser、Undo/Redo com
 
 ## UI測定点
 
-アプリは起動時に `startup_time_ms` と `file_open_time_ms` を標準エラーへ出力する。入力ごとに `input received → model updated` を記録し、その編集を含む `InputCapture::paint` で `keystroke_to_frame` を確定する。直近のp95はウィンドウ上部に表示する。paint間隔、visible layout時間、RSS取得APIも実装済みである。
+アプリは起動時に `startup_time_ms` と `file_open_time_ms` を標準エラーへ出力する。入力ごとに `input received → model updated` を記録し、その編集を含む `InputCapture::paint` で `keystroke_to_frame` を確定する。直近のp95はウィンドウ上部に表示する。paint間隔とvisible layout時間は上限付きrolling windowへ記録し、RSS取得APIも実装済みである。visible range、scroll上限、cursor追従には固定値ではなく、render時に取得したウィンドウ実寸からヘッダ高を除いたviewport heightを使用する。
 
 ## 検証結果
 
 - `cargo check --workspace`: pass
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass
-- `cargo test --workspace`: 15 tests pass
-- GPUI window smoke launch: pass
+- `cargo test --workspace`: 31 tests pass
+- GPUI window smoke launch: pass（2026-08-24時点。行境界の cursor overlay をスクリーンショットで確認）
 - fixture byte size: 10,485,760 bytes / 104,857,600 bytes
 - `paragraphs_100k.md`: 100,000 lines
 
-単体テストはUTF-8境界、CRLF、anchor bias、inverse edit、revision rebase、日本語・絵文字・結合文字・サロゲートペア、IME update / commit / cancel、bold SourceMap、HeightIndexを対象とする。
+単体テストはUTF-8境界、CRLFを含む行範囲、anchor bias、inverse edit、revision rebase、日本語・絵文字・結合文字・サロゲートペア、Ropeを平坦化しないUTF-16 offset変換、cursorのgrapheme・行境界、IME update / commit / cancel、bold SourceMap、cursorとboldが重なるline span、HeightIndex、rolling metrics windowを対象とする。
+
+## 現時点の制約
+
+`VisualBlock::rebase`、`measured_height`、`ScrollAnchor`、`anchored_scroll_y` は後続実装のprimitiveとして存在するが、UIの描画経路にはまだ統合していない。現在のUIは可視範囲とoverscanに含まれる行だけを毎frame再構築する。したがって、ADR-0006で定めたblock cache、局所invalidation、実測高さ更新に伴うscroll anchoringは未完了である。
 
 ## Phase 1 判断
 
@@ -58,4 +66,3 @@ Phase 0 の非目標である保存UI、完全なMarkdown parser、Undo/Redo com
 3. scrollのみ、scroll中の入力、background presentation更新中の入力を各30秒計測する。
 4. 上部のframe p95、標準エラーのstartup / file open、RSSを記録する。
 5. ADR-0001の閾値と比較し、Phase 1の Go / Hold を更新する。
-

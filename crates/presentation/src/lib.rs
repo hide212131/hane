@@ -159,6 +159,68 @@ pub struct VisualBlock {
     pub invalid: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineSpan {
+    pub visual_range: Range<usize>,
+    pub bold: bool,
+}
+
+/// Splits a visual block at style and cursor boundaries.
+///
+/// The returned cursor index is an insertion point in the span vector, so the
+/// UI can insert its caret element without repeating presentation logic.
+pub fn line_spans(
+    block: &VisualBlock,
+    cursor: Option<VisualOffset>,
+) -> (Vec<LineSpan>, Option<usize>) {
+    let cursor = cursor.map(|offset| offset.0.min(block.visual_text.len()));
+    let mut boundaries = vec![0, block.visual_text.len()];
+    boundaries.extend(cursor);
+    for run in &block.style_runs {
+        boundaries.push(run.visual_range.start.0);
+        boundaries.push(run.visual_range.end.0);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut spans = Vec::with_capacity(boundaries.len().saturating_sub(1));
+    let mut cursor_span = None;
+    let mut style_index = 0;
+    for pair in boundaries.windows(2) {
+        let range = pair[0]..pair[1];
+        if cursor == Some(range.start) {
+            cursor_span = Some(spans.len());
+        }
+        if range.is_empty()
+            || !block.visual_text.is_char_boundary(range.start)
+            || !block.visual_text.is_char_boundary(range.end)
+        {
+            continue;
+        }
+        while style_index < block.style_runs.len()
+            && block.style_runs[style_index].visual_range.end.0 <= range.start
+        {
+            style_index += 1;
+        }
+        let bold = block.style_runs[style_index..]
+            .iter()
+            .take_while(|run| run.visual_range.start.0 < range.end)
+            .any(|run| {
+                run.kind == StyleKind::Bold
+                    && range.start >= run.visual_range.start.0
+                    && range.end <= run.visual_range.end.0
+            });
+        spans.push(LineSpan {
+            visual_range: range,
+            bold,
+        });
+    }
+    if cursor == Some(block.visual_text.len()) {
+        cursor_span = Some(spans.len());
+    }
+    (spans, cursor_span)
+}
+
 impl VisualBlock {
     pub fn height(&self) -> f32 {
         self.measured_height.unwrap_or(self.estimated_height)
@@ -257,22 +319,14 @@ pub fn present_bold(
 
 pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBlock> {
     let mut blocks = Vec::with_capacity(buffer.line_count());
-    let mut start = 0;
     for line in 0..buffer.line_count() {
-        let end = if line + 1 < buffer.line_count() {
-            buffer
-                .offset_for_line_col(hane_document::LineId(line + 1), hane_document::LineCol(0))
-                .unwrap()
-                .0
-        } else {
-            buffer.len_bytes().0
+        let Ok(range) = buffer.line_range(hane_document::LineId(line)) else {
+            continue;
         };
-        let range = SourceRange::new(start, end);
         let text = buffer.text(range).unwrap_or_default();
         let mut block = present_bold(line as u64, buffer.revision(), range, &text);
         block.estimated_height = line_height;
         blocks.push(block);
-        start = end;
     }
     blocks
 }
@@ -412,5 +466,35 @@ mod tests {
         };
         assert!(b.rebase(&[d], Revision(1)));
         assert_eq!(b.source_range, SourceRange::new(8, 11));
+    }
+
+    #[test]
+    fn line_spans_split_bold_text_at_the_cursor() {
+        let source = "a **日本語** z";
+        let block = present_bold(1, Revision(0), SourceRange::new(0, source.len()), source);
+        let cursor = VisualOffset("a 日".len());
+        let (spans, cursor_span) = line_spans(&block, Some(cursor));
+        assert_eq!(cursor_span, Some(2));
+        assert_eq!(
+            spans,
+            vec![
+                LineSpan {
+                    visual_range: 0..2,
+                    bold: false
+                },
+                LineSpan {
+                    visual_range: 2..5,
+                    bold: true
+                },
+                LineSpan {
+                    visual_range: 5..11,
+                    bold: true
+                },
+                LineSpan {
+                    visual_range: 11..13,
+                    bold: false
+                },
+            ]
+        );
     }
 }

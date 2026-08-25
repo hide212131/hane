@@ -6,5 +6,5 @@ license.workspace = true
 
 [dependencies]
 hane-document.workspace = true
+hane-metrics.workspace = true
 unicode-segmentation.workspace = true
-

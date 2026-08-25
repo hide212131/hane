@@ -23,6 +23,7 @@ crates/
 ├── app/
 ├── document/
 ├── markdown/
+├── metrics/
 ├── presentation/
 ├── editor/
 ├── ui/
@@ -39,11 +40,12 @@ app
 
 ui
  ├── editor
+ ├── metrics
  └── presentation
 
 editor
  ├── document
- └── presentation
+ └── metrics
 
 presentation
  ├── document
@@ -54,12 +56,13 @@ markdown
 
 benchmark
  ├── document
+ ├── metrics
  ├── markdown
  ├── presentation
  └── editor
 ```
 
-`document` は最下層とし、GPUI、Markdown parser、OS UI API に依存しない。
+`document` と `metrics` は最下層とし、GPUI、Markdown parser、OS UI API に依存しない。
 
 各 crate の責務は以下とする。
 
@@ -68,6 +71,7 @@ benchmark
 | `app` | 起動、ウィンドウ生成、アプリライフサイクル、OS 連携 |
 | `document` | Text Buffer、Edit、Anchor、Revision、Undo/Redo の基礎 |
 | `markdown` | Markdown 解析、block index、source range 抽出 |
+| `metrics` | 依存を持たない rolling window と percentile 集計 |
 | `presentation` | Markdown source から visual block / style run / mapping を生成 |
 | `editor` | Cursor、Selection、IME state、command dispatch |
 | `ui` | GPUI element、描画、入力イベント接続、スクロール |

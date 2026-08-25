@@ -167,6 +167,10 @@ pub trait TextBuffer {
     fn edit(&mut self, range: SourceRange, replacement: &str) -> Result<EditSummary, BufferError>;
     fn line_for_offset(&self, offset: SourceOffset) -> Result<LineId, BufferError>;
     fn offset_for_line_col(&self, line: LineId, col: LineCol) -> Result<SourceOffset, BufferError>;
+    fn line_range(&self, line: LineId) -> Result<SourceRange, BufferError>;
+    fn line_content_range(&self, line: LineId) -> Result<SourceRange, BufferError>;
+    fn byte_to_utf16(&self, offset: SourceOffset) -> Result<usize, BufferError>;
+    fn utf16_to_byte(&self, offset: usize) -> SourceOffset;
     fn anchor(&self, offset: SourceOffset, bias: Bias) -> Result<Anchor, BufferError>;
 }
 
@@ -386,6 +390,61 @@ impl TextBuffer for RopeBuffer {
         Ok(SourceOffset(self.rope.char_to_byte(char_idx)))
     }
 
+    fn line_range(&self, line: LineId) -> Result<SourceRange, BufferError> {
+        if line.0 >= self.rope.len_lines() {
+            return Err(BufferError::InvalidLineColumn {
+                line,
+                col: LineCol(0),
+            });
+        }
+        let start = self.rope.line_to_byte(line.0);
+        let end = if line.0 + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line.0 + 1)
+        } else {
+            self.rope.len_bytes()
+        };
+        Ok(SourceRange::new(start, end))
+    }
+
+    fn line_content_range(&self, line: LineId) -> Result<SourceRange, BufferError> {
+        let range = self.line_range(line)?;
+        let line_slice = self.rope.line(line.0);
+        let mut content_chars = line_slice.len_chars();
+        if content_chars > 0 && line_slice.char(content_chars - 1) == '\n' {
+            content_chars -= 1;
+            if content_chars > 0 && line_slice.char(content_chars - 1) == '\r' {
+                content_chars -= 1;
+            }
+        }
+        Ok(SourceRange {
+            start: range.start,
+            end: SourceOffset(range.start.0 + line_slice.char_to_byte(content_chars)),
+        })
+    }
+
+    fn byte_to_utf16(&self, offset: SourceOffset) -> Result<usize, BufferError> {
+        let char_offset = self.byte_to_char(offset)?;
+        Ok(self
+            .rope
+            .slice(..char_offset)
+            .chars()
+            .map(char::len_utf16)
+            .sum())
+    }
+
+    fn utf16_to_byte(&self, offset: usize) -> SourceOffset {
+        let mut utf16 = 0;
+        let mut bytes = 0;
+        for ch in self.rope.chars() {
+            if utf16 >= offset || offset < utf16 + ch.len_utf16() {
+                break;
+            }
+            utf16 += ch.len_utf16();
+            bytes += ch.len_utf8();
+        }
+        SourceOffset(bytes)
+    }
+
     fn anchor(&self, offset: SourceOffset, bias: Bias) -> Result<Anchor, BufferError> {
         self.validate_offset(offset)?;
         Ok(Anchor { offset, bias })
@@ -430,6 +489,23 @@ mod tests {
             SourceOffset(10)
         );
         assert!(buffer.offset_for_line_col(LineId(0), LineCol(3)).is_err());
+        assert_eq!(
+            buffer.line_range(LineId(0)).unwrap(),
+            SourceRange::new(0, 4)
+        );
+        assert_eq!(
+            buffer.line_content_range(LineId(0)).unwrap(),
+            SourceRange::new(0, 2)
+        );
+    }
+
+    #[test]
+    fn utf16_offsets_convert_without_flattening_the_rope() {
+        let buffer = RopeBuffer::from_text("a🙂羽");
+        assert_eq!(buffer.byte_to_utf16(SourceOffset(5)).unwrap(), 3);
+        assert_eq!(buffer.utf16_to_byte(3), SourceOffset(5));
+        assert_eq!(buffer.utf16_to_byte(2), SourceOffset(1));
+        assert_eq!(buffer.utf16_to_byte(99), SourceOffset(8));
     }
 
     #[test]
