@@ -32,7 +32,7 @@ fn main() {
             cx.new(|cx| {
                 let mut view = match path.as_deref() {
                     Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| EditorView::new(&format!("Could not open {}: {error}", path.display()), path.display().to_string(), cx)),
-                    None => EditorView::new("# Hane Phase 0\n\n日本語 IME と **太字表示** を試せます。\n\n10 MB / 100 MB fixture は `cargo run -p hane-benchmark --bin hane-bench -- fixtures` で生成できます。\n", "Untitled", cx),
+                    None => EditorView::new("Hane Phase 1\n\n日本語 IME、範囲選択、Undo / Redoを試せます。\nMarkdown記号は **plain text** として表示します。\n\n10 MB / 100 MB fixture は `cargo run -p hane-benchmark --bin hane-bench -- fixtures` で生成できます。\n", "Untitled", cx),
                 };
                 view.arm_startup_timing(process_started);
                 view
@@ -60,20 +60,16 @@ fn main() {
                 window.focus(&view.focus_handle(cx));
             }).expect("focus editor");
         }
-        if std::env::var("HANE_PHASE0_AUTOSCROLL").is_ok_and(|value| !value.is_empty()) {
-            let view = window.entity(cx).expect("read Hane root entity").downgrade();
-            cx.spawn(async move |cx| {
-                let mut direction = 1.0_f32;
-                loop {
-                    Timer::after(std::time::Duration::from_micros(16_667)).await;
-                    if view.update(cx, |view, cx| {
-                        view.apply_phase0_scroll_step(direction * 72.0, cx);
-                    }).is_err() {
-                        break;
-                    }
-                    direction = -direction;
-                }
-            }).detach();
+        if std::env::var("HANE_PHASE1_AUTOSCROLL")
+            .or_else(|_| std::env::var("HANE_PHASE0_AUTOSCROLL"))
+            .is_ok_and(|value| !value.is_empty())
+        {
+            window
+                .update(cx, |view, _, cx| {
+                    view.enable_display_linked_scroll_measurement();
+                    cx.notify();
+                })
+                .expect("schedule display-linked scroll measurement");
         }
         if std::env::var("HANE_MEASURE_IDLE_RSS").is_ok_and(|value| !value.is_empty()) {
             let view = window.entity(cx).expect("read Hane root entity").downgrade();

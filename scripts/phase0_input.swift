@@ -50,6 +50,45 @@ func automate(_ pid: pid_t, count: Int, ime: Bool) {
     if let error { fail("System Events automation failed: \(error)") }
 }
 
+func automatePhase1Editing(_ pid: pid_t) {
+    let source = """
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            keystroke "phase1"
+            delay 0.1
+            keystroke "a" using command down
+            keystroke "c" using command down
+            keystroke "x" using command down
+            keystroke "v" using command down
+            keystroke "z" using command down
+            keystroke "z" using {command down, shift down}
+            delay 0.2
+        end tell
+    end tell
+    """
+    var error: NSDictionary?
+    NSAppleScript(source: source)?.executeAndReturnError(&error)
+    if let error { fail("Phase 1 editing automation failed: \(error)") }
+}
+
+func automateNewline(_ pid: pid_t, count: Int) {
+    let source = """
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            repeat \(count) times
+                key code 36
+                delay 0.05
+            end repeat
+        end tell
+    end tell
+    """
+    var error: NSDictionary?
+    NSAppleScript(source: source)?.executeAndReturnError(&error)
+    if let error { fail("newline automation failed: \(error)") }
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else { fail("usage: phase0_input.swift <current-source|select-source|ascii|ime|scroll|scroll-input> ...") }
 
@@ -62,6 +101,16 @@ case "current-source":
 case "select-source":
     guard arguments.count == 2 else { fail("select-source requires an input source id") }
     selectSource(arguments[1])
+case "editing":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else {
+        fail("editing requires PID")
+    }
+    automatePhase1Editing(pid)
+case "newline":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]), let count = Int(arguments[2]) else {
+        fail("newline requires PID and count")
+    }
+    automateNewline(pid, count: count)
 case "ascii", "ime", "scroll", "scroll-input":
     guard arguments.count == 3, let pid = pid_t(arguments[1]), let count = Int(arguments[2]) else {
         fail("\(command) requires PID and count")

@@ -3,6 +3,7 @@
 use ropey::{Rope, RopeSlice};
 use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -194,8 +195,16 @@ impl RopeBuffer {
     }
 
     pub fn from_text(text: &str) -> Self {
+        Self::from_rope(Rope::from_str(text))
+    }
+
+    pub fn from_reader(reader: impl io::Read) -> io::Result<Self> {
+        Ok(Self::from_rope(Rope::from_reader(reader)?))
+    }
+
+    fn from_rope(rope: Rope) -> Self {
         Self {
-            rope: Rope::from_str(text),
+            rope,
             revision: Revision(0),
             deltas: VecDeque::new(),
             delta_capacity: 4_096,
@@ -544,5 +553,13 @@ mod tests {
             delta.transform_range(SourceRange::new(4, 7)),
             Some(SourceRange::new(8, 11))
         );
+    }
+
+    #[test]
+    fn reader_builds_rope_without_intermediate_document_string() {
+        let input = std::io::Cursor::new("日本語\nplain text".as_bytes());
+        let buffer = RopeBuffer::from_reader(input).unwrap();
+        assert_eq!(buffer.full_text(), "日本語\nplain text");
+        assert_eq!(buffer.line_count(), 2);
     }
 }

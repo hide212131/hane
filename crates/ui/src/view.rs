@@ -1,16 +1,20 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
-use crate::line::{line_element, presented_line};
+use crate::line::{line_element_from_block, presented_line};
 use crate::phase0_metrics::Phase0MetricsOutput;
 use crate::theme::{DEFAULT_THEME, Theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, ScrollWheelEvent, Styled, TextRun, Window, div, px, rgb,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollWheelEvent, Styled, TextRun,
+    Window, div, px, rgb,
 };
-use hane_document::{Bias, BufferError, LineId, SourceOffset, TextBuffer};
+use hane_document::{
+    Bias, BufferError, LineId, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
+};
 use hane_editor::{Editor, EditorCommand, Selection};
 use hane_metrics::FrameMetrics;
-use hane_presentation::{HeightIndex, VisualOffset, line_spans};
+use hane_presentation::{HeightIndex, VisualOffset};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -52,11 +56,16 @@ pub struct EditorView {
     pub(crate) ready_armed: bool,
     pub(crate) metrics_output: Option<Phase0MetricsOutput>,
     background_presentation_generation: u64,
+    line_cache: HashMap<usize, hane_presentation::VisualBlock>,
+    display_linked_scroll_direction: Option<f32>,
 }
 
 impl EditorView {
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
-        let editor = Editor::new(text);
+        Self::from_editor(Editor::new(text), file_label, cx)
+    }
+
+    fn from_editor(editor: Editor, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
         let theme = DEFAULT_THEME;
         let heights = HeightIndex::new(std::iter::repeat_n(
             theme.line_height,
@@ -82,13 +91,20 @@ impl EditorView {
                 None
             }),
             background_presentation_generation: 0,
+            line_cache: HashMap::new(),
+            display_linked_scroll_direction: None,
         }
     }
 
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
         let started = Instant::now();
-        let text = std::fs::read_to_string(path)?;
-        let mut view = Self::new(&text, path.display().to_string(), cx);
+        let file = std::fs::File::open(path)?;
+        let document = RopeBuffer::from_reader(std::io::BufReader::new(file))?;
+        let mut view = Self::from_editor(
+            Editor::from_document(document),
+            path.display().to_string(),
+            cx,
+        );
         view.file_open_time = started.elapsed();
         view.load_rss_bytes = process_rss_bytes();
         Ok(view)
@@ -120,10 +136,23 @@ impl EditorView {
         cx.notify();
     }
 
-    pub fn apply_phase0_scroll_step(&mut self, delta: f32, cx: &mut Context<Self>) {
+    pub fn enable_display_linked_scroll_measurement(&mut self) {
+        self.display_linked_scroll_direction = Some(1.0);
+    }
+
+    fn apply_phase1_scroll_frame(&mut self) {
+        let direction = self.display_linked_scroll_direction.unwrap_or(1.0);
         let max = (self.heights.total_height() - self.viewport_height).max(0.0);
-        self.scroll_y = (self.scroll_y + delta).clamp(0.0, max);
-        cx.notify();
+        let proposed = self.scroll_y + direction * 72.0;
+        let next_direction = if proposed <= 0.0 {
+            1.0
+        } else if proposed >= max {
+            -1.0
+        } else {
+            direction
+        };
+        self.scroll_y = proposed.clamp(0.0, max);
+        self.display_linked_scroll_direction = Some(next_direction);
     }
 
     pub fn set_cursor_offset_for_measurement(
@@ -156,6 +185,7 @@ impl EditorView {
         let lines = self.editor.document().line_count();
         if lines != self.heights.len() {
             self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
+            self.line_cache.clear();
         }
         self.scroll_cursor_into_view();
         cx.notify();
@@ -198,44 +228,46 @@ impl EditorView {
         let Some(block) = presented_line(&self.editor, line) else {
             return;
         };
-        let visual_offset = if block.visual_text.is_empty() {
-            0
-        } else {
-            let style = window.text_style();
-            let base_font = style.font();
-            let runs = line_spans(&block, None)
-                .0
-                .into_iter()
-                .map(|span| TextRun {
-                    len: span.visual_range.len(),
-                    font: if span.bold {
-                        base_font.clone().bold()
-                    } else {
-                        base_font.clone()
-                    },
-                    color: style.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                })
-                .collect::<Vec<_>>();
-            let font_size = style.font_size.to_pixels(window.rem_size());
-            let layout = window.text_system().shape_line(
-                block.visual_text.clone().into(),
-                font_size,
-                &runs,
-                None,
-            );
-            let x = event.position.x - px(self.theme.line_horizontal_padding);
-            layout.closest_index_for_x(x)
-        };
+        let visual_offset = visual_offset_at_x(&block, event.position.x, self.theme, window);
         let offset = source_offset_for_visual_position(&self.editor, line, &block, visual_offset);
-        if let Err(error) = self.editor.set_selection(Selection::caret(offset)) {
+        let selection = if event.modifiers.shift {
+            Selection {
+                anchor: self.editor.selection().anchor,
+                active: offset,
+            }
+        } else {
+            Selection::caret(offset)
+        };
+        if let Err(error) = self.editor.set_selection(selection) {
             self.report_error("mouse selection", error);
         } else {
             self.status = None;
         }
         self.after_input(cx);
+    }
+
+    fn on_line_mouse_move(
+        &mut self,
+        line: usize,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(block) = presented_line(&self.editor, line) else {
+            return;
+        };
+        let visual = visual_offset_at_x(&block, event.position.x, self.theme, window);
+        let offset = source_offset_for_visual_position(&self.editor, line, &block, visual);
+        let selection = Selection {
+            anchor: self.editor.selection().anchor,
+            active: offset,
+        };
+        if self.editor.set_selection(selection).is_ok() {
+            self.after_input(cx);
+        }
     }
 
     fn scroll_cursor_into_view(&mut self) {
@@ -253,6 +285,43 @@ impl EditorView {
             self.theme.line_height,
             self.viewport_height,
         );
+    }
+
+    fn cached_line(&mut self, line: usize) -> Option<hane_presentation::VisualBlock> {
+        let current_revision = self.editor.document().revision();
+        if let Some(mut block) = self.line_cache.remove(&line) {
+            let reusable = if block.revision == current_revision {
+                true
+            } else if let Ok(deltas) = self.editor.document().deltas_since(block.revision) {
+                !deltas
+                    .iter()
+                    .any(|delta| edit_affects_range(*delta, block.source_range))
+                    && block.rebase(&deltas, current_revision)
+                    && self
+                        .editor
+                        .document()
+                        .line_range(LineId(line))
+                        .is_ok_and(|range| range == block.source_range)
+            } else {
+                false
+            };
+            if reusable {
+                self.line_cache.insert(line, block.clone());
+                return Some(block);
+            }
+        }
+        let block = presented_line(&self.editor, line)?;
+        self.line_cache.insert(line, block.clone());
+        Some(block)
+    }
+}
+
+fn edit_affects_range(delta: RevisionDelta, range: SourceRange) -> bool {
+    let edit = delta.edited_source_range_before;
+    if edit.is_empty() {
+        range.start <= edit.start && edit.start <= range.end
+    } else {
+        range.intersects(edit)
     }
 }
 
@@ -272,11 +341,23 @@ impl Render for EditorView {
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
             .max(self.theme.line_height);
+        if self.display_linked_scroll_direction.is_some() {
+            self.apply_phase1_scroll_frame();
+            window.request_animation_frame();
+        }
         let max_scroll = (self.heights.total_height() - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
+        let cache_start = visible.start.saturating_sub(128);
+        let cache_end = (visible.end + 128).min(self.heights.len());
+        self.line_cache
+            .retain(|line, _| cache_start <= *line && *line < cache_end);
+        let rendered_lines = visible
+            .clone()
+            .filter_map(|line| self.cached_line(line).map(|block| (line, block)))
+            .collect::<Vec<_>>();
         let top_space = self.heights.prefix_sum(visible.start);
         let bottom_space =
             (self.heights.total_height() - self.heights.prefix_sum(visible.end)).max(0.0);
@@ -332,13 +413,17 @@ impl Render for EditorView {
                         .flex_col()
                         .w_full()
                         .child(div().h(px(top_space)))
-                        .children(visible.map(|line| {
-                            line_element(&self.editor, line, self.theme).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |view, event, window, cx| {
-                                    view.on_line_mouse_down(line, event, window, cx)
-                                }),
-                            )
+                        .children(rendered_lines.into_iter().map(|(line, block)| {
+                            line_element_from_block(&self.editor, line, &block, self.theme)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.on_line_mouse_down(line, event, window, cx)
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(move |view, event, window, cx| {
+                                    view.on_line_mouse_move(line, event, window, cx)
+                                }))
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
@@ -346,6 +431,32 @@ impl Render for EditorView {
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
+}
+
+fn visual_offset_at_x(
+    block: &hane_presentation::VisualBlock,
+    position_x: gpui::Pixels,
+    theme: Theme,
+    window: &mut Window,
+) -> usize {
+    if block.visual_text.is_empty() {
+        return 0;
+    }
+    let style = window.text_style();
+    let run = TextRun {
+        len: block.visual_text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let layout =
+        window
+            .text_system()
+            .shape_line(block.visual_text.clone().into(), font_size, &[run], None);
+    layout.closest_index_for_x(position_x - px(theme.line_horizontal_padding))
 }
 
 fn source_offset_for_visual_position(
@@ -396,11 +507,11 @@ mod tests {
         let bold = presented_line(&editor, 2).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, 0),
-            SourceOffset(10)
+            SourceOffset(8)
         );
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, bold.visual_text.len()),
-            SourceOffset(14)
+            SourceOffset(16)
         );
     }
 
@@ -432,5 +543,26 @@ mod tests {
         assert_eq!(scroll_y, 136.0);
         assert_eq!(content_top_for_scroll(scroll_y), -136.0);
         assert_eq!(cursor_top - scroll_y, 696.0);
+    }
+
+    #[test]
+    fn cache_invalidation_only_marks_intersecting_lines() {
+        let range = SourceRange::new(10, 20);
+        let before = hane_document::Revision(1);
+        let after = hane_document::Revision(2);
+        let inside = RevisionDelta {
+            from_revision: before,
+            to_revision: after,
+            edited_source_range_before: SourceRange::empty(15),
+            edited_source_range_after: SourceRange::new(15, 16),
+            byte_delta: 1,
+        };
+        let before_line = RevisionDelta {
+            edited_source_range_before: SourceRange::empty(3),
+            edited_source_range_after: SourceRange::new(3, 4),
+            ..inside
+        };
+        assert!(edit_affects_range(inside, range));
+        assert!(!edit_affects_range(before_line, range));
     }
 }

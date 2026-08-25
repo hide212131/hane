@@ -99,7 +99,22 @@ impl Editor {
         }
     }
 
-    pub(crate) fn backspace(&mut self) -> Result<Option<EditSummary>, BufferError> {
+    pub(crate) fn move_to_line_boundary(
+        &mut self,
+        end: bool,
+        extend: bool,
+    ) -> Result<(), BufferError> {
+        let line = self.document.line_for_offset(self.selection.active)?;
+        let range = self.document.line_content_range(line)?;
+        self.move_to(if end { range.end } else { range.start }, extend);
+        Ok(())
+    }
+
+    pub(crate) fn backspace(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<Option<EditSummary>, BufferError> {
+        let selection_before = self.selection;
         if self.selection.range().is_empty() {
             let previous = self.previous_grapheme(self.selection.active)?;
             if previous == self.selection.active {
@@ -107,10 +122,19 @@ impl Editor {
             }
             self.selection.anchor = previous;
         }
-        Ok(Some(self.replace_selection("")?))
+        Ok(Some(self.replace_selection_recorded_from(
+            "",
+            selection_before,
+            crate::history::EditKind::Backspace,
+            now,
+        )?))
     }
 
-    pub(crate) fn delete(&mut self) -> Result<Option<EditSummary>, BufferError> {
+    pub(crate) fn delete(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Result<Option<EditSummary>, BufferError> {
+        let selection_before = self.selection;
         if self.selection.range().is_empty() {
             let next = self.next_grapheme(self.selection.active)?;
             if next == self.selection.active {
@@ -118,6 +142,11 @@ impl Editor {
             }
             self.selection.active = next;
         }
-        Ok(Some(self.replace_selection("")?))
+        Ok(Some(self.replace_selection_recorded_from(
+            "",
+            selection_before,
+            crate::history::EditKind::Delete,
+            now,
+        )?))
     }
 }

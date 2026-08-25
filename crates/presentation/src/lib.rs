@@ -317,6 +317,31 @@ pub fn present_bold(
     }
 }
 
+pub fn present_plain(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+) -> VisualBlock {
+    VisualBlock {
+        block_id,
+        source_range: range,
+        revision,
+        visual_text: source.to_owned(),
+        style_runs: Vec::new(),
+        source_map: SourceMap {
+            segments: vec![MappingSegment {
+                source_range: range,
+                visual_range: VisualRange::new(0, source.len()),
+                visibility: Visibility::Visible,
+            }],
+        },
+        estimated_height: 24.0,
+        measured_height: None,
+        invalid: false,
+    }
+}
+
 pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBlock> {
     let mut blocks = Vec::with_capacity(buffer.line_count());
     for line in 0..buffer.line_count() {
@@ -443,6 +468,23 @@ mod tests {
                 .source_offset,
             SourceOffset(14)
         );
+    }
+
+    #[test]
+    fn plain_presentation_preserves_markdown_source_bytes() {
+        let text = "**日本語**";
+        let block = present_plain(3, Revision(2), SourceRange::new(10, 10 + text.len()), text);
+        assert_eq!(block.visual_text, text);
+        for relative in [0, 2, 5, 8, text.len()] {
+            assert_eq!(
+                block
+                    .source_map
+                    .visual_to_source(VisualOffset(relative), Bias::After)
+                    .unwrap()
+                    .source_offset,
+                SourceOffset(10 + relative)
+            );
+        }
     }
     #[test]
     fn fenwick_updates_and_finds_visible_blocks() {

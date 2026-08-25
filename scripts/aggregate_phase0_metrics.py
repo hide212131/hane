@@ -49,6 +49,7 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--profile", default="release")
+    parser.add_argument("--phase", default="0")
     args = parser.parse_args()
 
     samples: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -56,7 +57,9 @@ def main() -> None:
     for path in sorted(args.input.rglob("*.csv")):
         with path.open(newline="", encoding="utf-8") as stream:
             for row in csv.DictReader(stream):
-                scenario = row["scenario"]
+                scenario = row.get("scenario")
+                if not scenario or not row.get("record_type"):
+                    continue
                 metadata["input_source"].add(row["input_source"])
                 metadata["refresh_rate_hz"].add(row["refresh_rate_hz"])
                 metadata["background_job"].add(row["background_job"])
@@ -79,9 +82,11 @@ def main() -> None:
                     samples[(scenario, row["record_type"])].append(float(row["rss_bytes"]))
                 if scenario.startswith("memory ") and row["record_type"] == "ready" and row["rss_bytes"]:
                     samples[(scenario, "memory_visible_layout")].append(float(row["rss_bytes"]))
+                if scenario.startswith("empty ") and row["record_type"] == "ready" and row["rss_bytes"]:
+                    samples[(scenario, "memory_ready")].append(float(row["rss_bytes"]))
 
     lines = [
-        "# Phase 0 UI measurement results",
+        f"# Phase {args.phase} UI measurement results",
         "",
         f"- Git: `{command('git', 'rev-parse', 'HEAD')}`",
         f"- Profile: `{args.profile}`",
@@ -96,7 +101,7 @@ def main() -> None:
         "| Scenario / metric | Samples | Median | p95 | p99 | Max | Unit |",
         "|---|---:|---:|---:|---:|---:|---|",
     ]
-    metric_order = list(LATENCY_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame", "memory_load", "memory_visible_layout", "memory_idle_30s"]
+    metric_order = list(LATENCY_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame", "memory_load", "memory_ready", "memory_visible_layout", "memory_idle_30s"]
     for scenario in sorted({scenario for scenario, _ in samples}):
         for metric in metric_order:
             values = samples.get((scenario, metric), [])

@@ -1,4 +1,4 @@
-//! Reproducible Phase 0 fixtures and latency aggregation.
+//! Reproducible fixtures and latency aggregation shared by project phases.
 
 use hane_document::{RopeBuffer, SourceRange, TextBuffer};
 use hane_metrics::percentile;
@@ -166,8 +166,8 @@ pub fn run_file_open_scenario(path: &Path, iterations: usize) -> io::Result<Dist
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = std::time::Instant::now();
-        let text = fs::read_to_string(path)?;
-        let buffer = RopeBuffer::from_text(&text);
+        let file = File::open(path)?;
+        let buffer = RopeBuffer::from_reader(std::io::BufReader::new(file))?;
         std::hint::black_box(buffer.len_bytes());
         samples.push(start.elapsed());
     }
@@ -208,7 +208,7 @@ pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
 
 pub fn markdown_report(environment: &Environment, scenarios: &[(&str, Distribution)]) -> String {
     let mut report = format!(
-        "# Phase 0 Performance Report\n\n- Git: `{}`\n- Profile: `{}`\n- Rust: `{}`\n- GPUI: `{}`\n- OS: `{}`\n- CPU: `{}`\n- RSS: `{}` bytes\n\n| Scenario | Samples | Median (ms) | p95 (ms) | p99 (ms) | Max (ms) |\n|---|---:|---:|---:|---:|---:|\n",
+        "# Hane Performance Report\n\n- Git: `{}`\n- Profile: `{}`\n- Rust: `{}`\n- GPUI: `{}`\n- OS: `{}`\n- CPU: `{}`\n- RSS: `{}` bytes\n\n| Scenario | Samples | Median (ms) | p95 (ms) | p99 (ms) | Max (ms) |\n|---|---:|---:|---:|---:|---:|\n",
         environment.git_commit,
         environment.profile,
         environment.rustc,

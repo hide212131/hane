@@ -1,5 +1,6 @@
 //! GPUI-independent editor commands, cursor/selection, and IME transactions.
 
+mod history;
 mod ime;
 mod movement;
 mod selection;
@@ -9,6 +10,7 @@ pub use selection::Selection;
 
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, TextBuffer};
 use hane_metrics::RollingWindow;
+use history::{EditKind, History};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -58,7 +60,11 @@ pub enum EditorCommand<'a> {
     MoveDown { extend: bool },
     MoveToStart { extend: bool },
     MoveToEnd { extend: bool },
+    MoveToLineStart { extend: bool },
+    MoveToLineEnd { extend: bool },
     SelectAll,
+    Undo,
+    Redo,
 }
 
 pub struct Editor {
@@ -69,6 +75,7 @@ pub struct Editor {
     pub(crate) next_transaction: u64,
     next_input_sequence: u64,
     pending_measurements: RollingWindow<InputMeasurement>,
+    history: History,
 }
 
 impl Editor {
@@ -81,7 +88,14 @@ impl Editor {
             next_transaction: 1,
             next_input_sequence: 1,
             pending_measurements: RollingWindow::new(2_048),
+            history: History::default(),
         }
+    }
+
+    pub fn from_document(document: RopeBuffer) -> Self {
+        let mut editor = Self::new("");
+        editor.document = document;
+        editor
     }
     pub fn document(&self) -> &RopeBuffer {
         &self.document
@@ -114,9 +128,11 @@ impl Editor {
             self.preferred_grapheme_column = None;
         }
         let edit = match command {
-            EditorCommand::Insert(text) => Some(self.replace_selection(text)?),
-            EditorCommand::Backspace => self.backspace()?,
-            EditorCommand::Delete => self.delete()?,
+            EditorCommand::Insert(text) => {
+                Some(self.replace_selection_recorded(text, EditKind::Insert, received)?)
+            }
+            EditorCommand::Backspace => self.backspace(received)?,
+            EditorCommand::Delete => self.delete(received)?,
             EditorCommand::MoveLeft { extend } => {
                 self.move_grapheme(false, extend)?;
                 None
@@ -141,6 +157,14 @@ impl Editor {
                 self.move_to(SourceOffset(self.document.len_bytes().0), extend);
                 None
             }
+            EditorCommand::MoveToLineStart { extend } => {
+                self.move_to_line_boundary(false, extend)?;
+                None
+            }
+            EditorCommand::MoveToLineEnd { extend } => {
+                self.move_to_line_boundary(true, extend)?;
+                None
+            }
             EditorCommand::SelectAll => {
                 self.selection = Selection {
                     anchor: SourceOffset(0),
@@ -148,6 +172,8 @@ impl Editor {
                 };
                 None
             }
+            EditorCommand::Undo => self.undo()?,
+            EditorCommand::Redo => self.redo()?,
         };
         self.record_model_update(received, InputMeasurementKind::Command);
         Ok(edit)
@@ -187,6 +213,60 @@ impl Editor {
         let summary = self.document.edit(self.selection.range(), text)?;
         self.selection = Selection::caret(summary.range_after.end);
         Ok(summary)
+    }
+
+    pub(crate) fn replace_selection_recorded(
+        &mut self,
+        text: &str,
+        kind: EditKind,
+        now: Instant,
+    ) -> Result<EditSummary, BufferError> {
+        let before = self.selection;
+        let summary = self.replace_selection(text)?;
+        self.history
+            .record(&summary, text, before, self.selection, kind, now);
+        Ok(summary)
+    }
+
+    pub(crate) fn replace_selection_recorded_from(
+        &mut self,
+        text: &str,
+        selection_before: Selection,
+        kind: EditKind,
+        now: Instant,
+    ) -> Result<EditSummary, BufferError> {
+        let summary = self.replace_selection(text)?;
+        self.history
+            .record(&summary, text, selection_before, self.selection, kind, now);
+        Ok(summary)
+    }
+
+    pub fn selected_text(&self) -> Result<String, BufferError> {
+        self.document.text(self.selection.range())
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    fn undo(&mut self) -> Result<Option<EditSummary>, BufferError> {
+        let Some((summary, selection)) = self.history.undo(&mut self.document)? else {
+            return Ok(None);
+        };
+        self.selection = selection;
+        Ok(Some(summary))
+    }
+
+    fn redo(&mut self) -> Result<Option<EditSummary>, BufferError> {
+        let Some((summary, selection)) = self.history.redo(&mut self.document)? else {
+            return Ok(None);
+        };
+        self.selection = selection;
+        Ok(Some(summary))
     }
 }
 
@@ -245,5 +325,126 @@ mod tests {
             e.source_range_to_utf16(SourceRange::new(1, 8)).unwrap(),
             1..4
         );
+    }
+
+    #[test]
+    fn consecutive_typing_is_one_undo_transaction() {
+        let mut e = Editor::new("");
+        for text in ["h", "e", "l", "l", "o"] {
+            e.dispatch(EditorCommand::Insert(text)).unwrap();
+        }
+        assert_eq!(e.document().full_text(), "hello");
+        assert!(e.can_undo());
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "");
+        assert_eq!(e.selection(), Selection::caret(SourceOffset(0)));
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(e.document().full_text(), "hello");
+        assert_eq!(e.selection(), Selection::caret(SourceOffset(5)));
+    }
+
+    #[test]
+    fn consecutive_backspace_and_delete_are_grouped() {
+        let mut backspace = Editor::new("日本語");
+        backspace
+            .dispatch(EditorCommand::MoveToEnd { extend: false })
+            .unwrap();
+        backspace.dispatch(EditorCommand::Backspace).unwrap();
+        backspace.dispatch(EditorCommand::Backspace).unwrap();
+        assert_eq!(backspace.document().full_text(), "日");
+        backspace.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(backspace.document().full_text(), "日本語");
+
+        let mut delete = Editor::new("a🙂羽");
+        delete.dispatch(EditorCommand::Delete).unwrap();
+        delete.dispatch(EditorCommand::Delete).unwrap();
+        delete.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(delete.document().full_text(), "a🙂羽");
+    }
+
+    #[test]
+    fn ime_updates_form_one_undo_transaction() {
+        let mut e = Editor::new("a旧b");
+        e.set_selection(Selection {
+            anchor: SourceOffset(1),
+            active: SourceOffset(4),
+        })
+        .unwrap();
+        e.replace_and_mark_text(None, "に", None).unwrap();
+        e.replace_and_mark_text(None, "日本", None).unwrap();
+        e.commit_text(None, "日本語").unwrap();
+        assert_eq!(e.document().full_text(), "a日本語b");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "a旧b");
+        assert_eq!(
+            e.selection(),
+            Selection {
+                anchor: SourceOffset(1),
+                active: SourceOffset(4)
+            }
+        );
+    }
+
+    #[test]
+    fn selection_replacement_restores_text_and_selection() {
+        let mut e = Editor::new("hello 日本語");
+        let original = Selection {
+            anchor: SourceOffset(6),
+            active: SourceOffset(15),
+        };
+        e.set_selection(original).unwrap();
+        e.dispatch(EditorCommand::Insert("world")).unwrap();
+        assert_eq!(e.document().full_text(), "hello world");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "hello 日本語");
+        assert_eq!(e.selection(), original);
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(e.document().full_text(), "hello world");
+    }
+
+    #[test]
+    fn new_edit_after_undo_discards_redo() {
+        let mut e = Editor::new("");
+        e.dispatch(EditorCommand::Insert("a")).unwrap();
+        e.dispatch(EditorCommand::Undo).unwrap();
+        e.dispatch(EditorCommand::Insert("b")).unwrap();
+        assert!(!e.can_redo());
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(e.document().full_text(), "b");
+    }
+
+    #[test]
+    fn home_and_end_are_line_boundaries() {
+        let mut e = Editor::new("first\n日本語\nlast");
+        e.set_selection(Selection::caret(SourceOffset(12))).unwrap();
+        e.dispatch(EditorCommand::MoveToLineStart { extend: false })
+            .unwrap();
+        assert_eq!(e.selection(), Selection::caret(SourceOffset(6)));
+        e.dispatch(EditorCommand::MoveToLineEnd { extend: true })
+            .unwrap();
+        assert_eq!(
+            e.selection(),
+            Selection {
+                anchor: SourceOffset(6),
+                active: SourceOffset(15)
+            }
+        );
+    }
+
+    #[test]
+    fn newline_replaces_selection_and_is_its_own_undo_transaction() {
+        let mut e = Editor::new("ab");
+        e.set_selection(Selection::caret(SourceOffset(1))).unwrap();
+        e.dispatch(EditorCommand::Insert("x")).unwrap();
+        e.dispatch(EditorCommand::Insert("\n")).unwrap();
+        e.dispatch(EditorCommand::Insert("y")).unwrap();
+        assert_eq!(e.document().full_text(), "ax\nyb");
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ax\nb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "axb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ab");
     }
 }

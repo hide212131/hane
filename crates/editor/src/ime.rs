@@ -113,15 +113,50 @@ impl Editor {
                 .map(|ime| ime.current_range)
                 .unwrap_or(self.selection.range())
         };
+        let ime = self.ime.take();
+        let selection_before = self.selection;
         let summary = self.document.edit(range, text)?;
         self.selection = Selection::caret(summary.range_after.end);
-        self.ime = None;
+        if let Some(ime) = ime {
+            self.history.record_replacement(
+                ime.original_range.start.0,
+                ime.original_text,
+                text.to_owned(),
+                ime.original_selection,
+                self.selection,
+                crate::history::EditKind::Ime,
+            );
+        } else {
+            let kind = if selection_before.range().is_empty() {
+                crate::history::EditKind::Insert
+            } else {
+                crate::history::EditKind::Replace
+            };
+            self.history.record(
+                &summary,
+                text,
+                selection_before,
+                self.selection,
+                kind,
+                received,
+            );
+        }
         self.record_model_update(received, InputMeasurementKind::ImeCommit);
         Ok(summary)
     }
 
     pub fn commit_composition(&mut self) {
-        self.ime = None;
+        let Some(ime) = self.ime.take() else {
+            return;
+        };
+        self.history.record_replacement(
+            ime.original_range.start.0,
+            ime.original_text,
+            ime.marked_text,
+            ime.original_selection,
+            self.selection,
+            crate::history::EditKind::Ime,
+        );
     }
 
     pub fn cancel_composition(&mut self) -> Result<ImeCancelOutcome, BufferError> {

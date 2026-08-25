@@ -4,7 +4,7 @@
 
 ADR は実装前にすべてを固定するためではなく、実装時に迷うと性能・正確性・依存境界へ影響する判断を明示するために使う。
 
-現時点の ADR-0001 から ADR-0011 は、Phase 0 実装開始の前提として `承認済み` とする。
+ADR-0001 から ADR-0011 はPhase 0、ADR-0012以降はPhase 1の実装判断を記録する。
 
 ## ADR 一覧
 
@@ -21,6 +21,9 @@ ADR は実装前にすべてを固定するためではなく、実装時に迷�
 | [ADR-0009](0009-performance-harness.md) | Performance Harness と測定基準 |
 | [ADR-0010](0010-phase0-implementation-plan.md) | Phase 0 実装順序 |
 | [ADR-0011](0011-dependency-and-license-policy.md) | 依存関係とライセンス確認方針 |
+| [ADR-0012](0012-phase1-plain-text-editor-plan.md) | Phase 1 Plain Text Editor実装計画 |
+| [ADR-0013](0013-undo-redo-transactions.md) | Undo/Redo transaction |
+| [ADR-0014](0014-gpui-memory-baseline.md) | GPUI memory baselineと空Editor RSS目標 |
 
 ## Phase 0 実装時の参照順
 
@@ -54,3 +57,15 @@ Phase 0 の実装を始める場合は、以下の順に読む。
 - GPUI の IME / paint 観測点を最初に spike すること。
 
 実装中に新しい設計判断が必要になった場合は、既存 ADR を更新するか、新しい ADR を追加する。
+
+## Phase 1 実装時の参照順
+
+1. [Phase 0 report](../phase0/report.md)
+2. [ADR-0012](0012-phase1-plain-text-editor-plan.md)
+3. [ADR-0013](0013-undo-redo-transactions.md)
+4. [ADR-0014](0014-gpui-memory-baseline.md)
+5. [ADR-0003](0003-text-buffer.md)
+6. [ADR-0005](0005-revision-and-background-work.md)
+7. [ADR-0007](0007-ime-composition.md)
+8. [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md)
+9. [ADR-0009](0009-performance-harness.md)

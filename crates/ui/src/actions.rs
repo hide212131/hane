@@ -1,5 +1,5 @@
 use crate::view::EditorView;
-use gpui::{App, Context, InteractiveElement, KeyBinding, Window, actions};
+use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::EditorCommand;
 
 macro_rules! command_actions {
@@ -41,6 +41,16 @@ macro_rules! command_actions {
 }
 
 command_actions! {
+    Newline ("enter") => newline |view, cx| {
+        if view.editor.ime().is_none() {
+            view.dispatch(EditorCommand::Insert("\n"), cx);
+        }
+    },
+    ShiftNewline ("shift-enter") => shift_newline |view, cx| {
+        if view.editor.ime().is_none() {
+            view.dispatch(EditorCommand::Insert("\n"), cx);
+        }
+    },
     Backspace ("backspace") => backspace |view, cx| { view.dispatch(EditorCommand::Backspace, cx); },
     Delete ("delete") => delete |view, cx| { view.dispatch(EditorCommand::Delete, cx); },
     Left ("left") => left |view, cx| { view.dispatch(EditorCommand::MoveLeft { extend: false }, cx); },
@@ -52,7 +62,31 @@ command_actions! {
     SelectUp ("shift-up") => select_up |view, cx| { view.dispatch(EditorCommand::MoveUp { extend: true }, cx); },
     SelectDown ("shift-down") => select_down |view, cx| { view.dispatch(EditorCommand::MoveDown { extend: true }, cx); },
     SelectAll ("cmd-a") => select_all |view, cx| { view.dispatch(EditorCommand::SelectAll, cx); },
-    Home ("home") => home |view, cx| { view.dispatch(EditorCommand::MoveToStart { extend: false }, cx); },
-    End ("end") => end |view, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx); },
+    Home ("home") => home |view, cx| { view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx); },
+    End ("end") => end |view, cx| { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); },
+    SelectHome ("shift-home") => select_home |view, cx| { view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx); },
+    SelectEnd ("shift-end") => select_end |view, cx| { view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx); },
+    DocumentStart ("cmd-up") => document_start |view, cx| { view.dispatch(EditorCommand::MoveToStart { extend: false }, cx); },
+    DocumentEnd ("cmd-down") => document_end |view, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx); },
+    SelectDocumentStart ("cmd-shift-up") => select_document_start |view, cx| { view.dispatch(EditorCommand::MoveToStart { extend: true }, cx); },
+    SelectDocumentEnd ("cmd-shift-down") => select_document_end |view, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx); },
+    Undo ("cmd-z") => undo |view, cx| { view.dispatch(EditorCommand::Undo, cx); },
+    Redo ("cmd-shift-z") => redo |view, cx| { view.dispatch(EditorCommand::Redo, cx); },
+    Copy ("cmd-c") => copy |view, cx| {
+        if let Ok(text) = view.editor.selected_text() && !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    },
+    Cut ("cmd-x") => cut |view, cx| {
+        if let Ok(text) = view.editor.selected_text() && !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            view.dispatch(EditorCommand::Backspace, cx);
+        }
+    },
+    Paste ("cmd-v") => paste |view, cx| {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            view.dispatch(EditorCommand::Insert(&text), cx);
+        }
+    },
     CancelComposition ("escape") => cancel_composition |view, cx| { view.perform_cancel_composition(cx); },
 }
