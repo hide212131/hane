@@ -25,7 +25,7 @@ while [ "$line" -le 40 ]; do
     line=$((line + 1))
 done > "$fixture"
 
-cargo build --manifest-path "$workspace_dir/Cargo.toml" -p hane
+cargo build --manifest-path "$workspace_dir/Cargo.toml" -p hane --features instrument
 HANE_DEV_CURSOR_DOWN="$cursor_down" "$workspace_dir/target/debug/hane" "$fixture" 2> "$log" &
 app_pid=$!
 

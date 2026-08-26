@@ -160,13 +160,19 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 
 **目的**: 「速さの証明」に必要な計測を残しつつ、製品型・製品バイナリから計測関心を剥がす。
 
-- [ ] 計測専用の入口を集約：`EditorView` の `*_for_measurement` / `*_for_development` /
-      `phase0/1` 系メソッド、CSV 出力、合成入力、自動スクロールを feature フラグ（例
-      `instrument`）配下、または専用 runner へ隔離する。
+- [x] 計測専用の入口を集約：`EditorView` の `*_for_measurement` / `*_for_development` /
+      `phase0/1` 系メソッド、CSV 出力、合成入力、自動スクロールを feature フラグ
+      `instrument` 配下へ隔離。UI 側は `crates/ui/src/instrument.rs`（計測状態・CSV・env 解釈）と
+      `EditorView` の `#[cfg(feature="instrument")]` impl に集約し、製品ビルドは no-op stub のみ。
+      app 側の合成入力ハーネスは `crates/app/src/instrument.rs` へ分離。既定 `cargo build -p hane`
+      には CSV・合成入力・開発操作 API が含まれない（optional 依存 markdown/metrics/presentation/document
+      も instrument 配下）。
 - [ ] `keystroke_to_paint` 等の低オーバーヘッド timing hook は製品と同じ入力・paint 経路に残す。
       instrument on/off の差を R0 基準線で測り、計測ビルドだけ別の挙動にならないことを確認する。
-- [ ] `HANE_*` 環境変数を1か所（計測モジュール）で解釈するよう集約。
-      `PHASE0/1/2_AUTOSCROLL` の別名エイリアスは単一名に統一。
+      （コード上は `FrameMetrics` 記録を両ビルドの同一 paint 経路に維持済み。on/off の実測比較は未実施。）
+- [x] `HANE_*` 環境変数を1か所（`ui::instrument::InstrumentationConfig::from_environment`）で解釈するよう集約。
+      `PHASE0/1/2_AUTOSCROLL` → `HANE_AUTOSCROLL`、`PHASE0_BACKGROUND_PRESENTATION` → `HANE_BACKGROUND_PRESENTATION`、
+      `PHASE0_NO_FOCUS` → `HANE_NO_FOCUS` に統一。`scripts/` も追従（計測ビルドは `--features instrument`）。
 - [ ] `metrics` と `benchmark` の役割を再定義：ランタイム計測=`metrics`、
       オフライン集計/フィクスチャ=`benchmark` に線引きし、重複 `Distribution`/`percentile` を統合。
 - [ ] **P1** スクリプトを引数化して統合：`scripts/measure.sh <scenario>` /

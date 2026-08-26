@@ -16,7 +16,7 @@ japanese_source=${HANE_JAPANESE_INPUT_SOURCE:-com.apple.inputmethod.Kotoeri.Roma
 
 mkdir -p "$results_dir"
 cargo run --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
-cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane
+cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features instrument
 
 app_pid=""
 cleanup() {
@@ -70,9 +70,9 @@ launch() {
         HANE_INPUT_SOURCE="$input_source" \
         HANE_REFRESH_RATE_HZ="$refresh_rate" \
         HANE_MEASUREMENT_CURSOR_OFFSET="$cursor_offset" \
-        HANE_PHASE0_BACKGROUND_PRESENTATION="$background" \
+        HANE_BACKGROUND_PRESENTATION="$background" \
         HANE_MEASURE_IDLE_RSS="$idle" \
-        HANE_PHASE0_AUTOSCROLL="$autoscroll" \
+        HANE_AUTOSCROLL="$autoscroll" \
         HANE_MEASUREMENT_EMPTY="$measurement_empty" \
         "$@" 2>"$log_path" &
     app_pid=$!

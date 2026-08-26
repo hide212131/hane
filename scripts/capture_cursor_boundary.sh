@@ -21,8 +21,8 @@ trap cleanup EXIT HUP INT TERM
 
 printf 'first line\nsecond line\n' > "$fixture"
 
-cargo build --manifest-path "$workspace_dir/Cargo.toml" -p hane
-HANE_DEV_CURSOR_OFFSET="$cursor_offset" "$workspace_dir/target/debug/hane" "$fixture" 2> "$log" &
+cargo build --manifest-path "$workspace_dir/Cargo.toml" -p hane --features instrument
+HANE_MEASUREMENT_CURSOR_OFFSET="$cursor_offset" "$workspace_dir/target/debug/hane" "$fixture" 2> "$log" &
 app_pid=$!
 
 attempt=0

@@ -1,4 +1,3 @@
-use crate::phase0_metrics::log_summary;
 use crate::view::EditorView;
 use gpui::{
     App, Bounds, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, IntoElement,
@@ -77,42 +76,7 @@ impl Element for InputCapture {
                 .metrics
                 .record_paint(painted_at, model_latencies, frame_latencies);
             let layout = view.metrics.latest_layout();
-            if view.ready_armed && !view.ready_reported {
-                view.ready_reported = true;
-                let startup = view.process_started.elapsed();
-                let rss = process_rss_bytes();
-                eprintln!(
-                    "hane_ready startup_time_ms={:.3} file_open_time_ms={:.3} rss_bytes={}",
-                    startup.as_secs_f64() * 1_000.0,
-                    view.file_open_time.as_secs_f64() * 1_000.0,
-                    rss.unwrap_or(0),
-                );
-                if let Some(output) = &mut view.metrics_output {
-                    if let Err(error) = output.memory("memory_load", view.load_rss_bytes) {
-                        eprintln!("could not write load memory metrics: {error}");
-                    }
-                    if let Err(error) = output.ready(startup, view.file_open_time, rss) {
-                        eprintln!("could not write ready metrics: {error}");
-                    }
-                }
-            }
-            if let Some(output) = &mut view.metrics_output {
-                if let Err(error) = output.paint(interval, layout) {
-                    eprintln!("could not write paint metrics: {error}");
-                }
-                for measurement in &measurements {
-                    if let Err(error) = output.input(measurement) {
-                        eprintln!("could not write input metrics: {error}");
-                    }
-                }
-            }
-            if !measurements.is_empty() {
-                log_summary(&view.metrics);
-            }
+            view.record_frame_instrumentation(&measurements, interval, layout);
         });
     }
-}
-
-fn process_rss_bytes() -> Option<u64> {
-    hane_metrics::process_memory_bytes()
 }

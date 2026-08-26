@@ -2,15 +2,15 @@
 
 mod actions;
 mod capture;
+#[cfg(feature = "instrument")]
+mod instrument;
 mod input;
 mod line;
-#[cfg(feature = "instrument")]
-mod phase0_metrics;
 mod storage;
 mod theme;
 mod view;
 
 pub use actions::register_key_bindings;
 #[cfg(feature = "instrument")]
-pub use phase0_metrics::InstrumentationConfig;
+pub use instrument::InstrumentationConfig;
 pub use view::EditorView;

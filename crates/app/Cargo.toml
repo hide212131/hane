@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 instrument = [
+    "dep:hane-document",
     "dep:hane-markdown",
     "dep:hane-metrics",
     "dep:hane-presentation",
@@ -14,10 +15,14 @@ instrument = [
 ]
 
 [dependencies]
-hane-document.workspace = true
+hane-document = { workspace = true, optional = true }
 hane-editor.workspace = true
 hane-markdown = { workspace = true, optional = true }
 hane-metrics = { workspace = true, optional = true }
 hane-presentation = { workspace = true, optional = true }
 hane-ui.workspace = true
 gpui.workspace = true
+
+[[example]]
+name = "gpui_baseline"
+required-features = ["instrument"]

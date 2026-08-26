@@ -1,7 +1,8 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
+#[cfg(feature = "instrument")]
+use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{block_font_size, disclosure_for_line, line_element_from_block, presented_line};
-use crate::phase0_metrics::Phase0MetricsOutput;
 use crate::storage::{PersistentState, atomic_save_document};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
@@ -13,7 +14,7 @@ use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
 };
-use hane_editor::{Editor, EditorCommand, Selection};
+use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockContextIndex, FenceDelimiter, fence_delimiter, is_pipe_row, is_table_delimiter,
     parse_block_context,
@@ -75,15 +76,10 @@ pub struct EditorView {
     saved_revision: Revision,
     status: Option<String>,
     theme: Theme,
-    pub(crate) process_started: Instant,
-    pub(crate) file_open_time: Duration,
-    pub(crate) load_rss_bytes: Option<u64>,
-    pub(crate) ready_reported: bool,
-    pub(crate) ready_armed: bool,
-    pub(crate) metrics_output: Option<Phase0MetricsOutput>,
+    #[cfg(feature = "instrument")]
+    pub(crate) instrumentation: Instrumentation,
     background_presentation_generation: u64,
     line_cache: HashMap<usize, hane_presentation::VisualBlock>,
-    display_linked_scroll_direction: Option<f32>,
     block_context: Option<BlockContextIndex>,
     block_context_job_running: bool,
     persistent_state: PersistentState,
@@ -128,18 +124,10 @@ impl EditorView {
             saved_revision,
             status: None,
             theme,
-            process_started: Instant::now(),
-            file_open_time: Duration::ZERO,
-            load_rss_bytes: None,
-            ready_reported: false,
-            ready_armed: false,
-            metrics_output: Phase0MetricsOutput::from_environment().unwrap_or_else(|error| {
-                eprintln!("could not open HANE_METRICS_CSV: {error}");
-                None
-            }),
+            #[cfg(feature = "instrument")]
+            instrumentation: Instrumentation::from_environment(),
             background_presentation_generation: 0,
             line_cache: HashMap::new(),
-            display_linked_scroll_direction: None,
             block_context: None,
             block_context_job_running: false,
             persistent_state,
@@ -150,6 +138,7 @@ impl EditorView {
     }
 
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
+        #[cfg(feature = "instrument")]
         let started = Instant::now();
         let file = std::fs::File::open(path)?;
         let document = RopeBuffer::from_reader(std::io::BufReader::new(file))?;
@@ -159,6 +148,7 @@ impl EditorView {
             eprintln!("could not save recent files: {error}");
         }
         cx.add_recent_document(path);
+        #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
         let mut view = Self::from_editor(
             Editor::from_document(document),
             path.display().to_string(),
@@ -166,80 +156,16 @@ impl EditorView {
             persistent_state,
             cx,
         );
-        view.file_open_time = started.elapsed();
-        view.load_rss_bytes = process_rss_bytes();
+        #[cfg(feature = "instrument")]
+        {
+            view.instrumentation.file_open_time = started.elapsed();
+            view.instrumentation.load_rss_bytes = hane_metrics::process_memory_bytes();
+        }
         Ok(view)
     }
 
     pub fn editor(&self) -> &Editor {
         &self.editor
-    }
-
-    pub fn arm_startup_timing(&mut self, process_started: Instant) {
-        self.process_started = process_started;
-        self.ready_armed = true;
-    }
-
-    pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>) {
-        if let Some(output) = &mut self.metrics_output
-            && let Err(error) = output.memory("memory_idle_30s", rss_bytes)
-        {
-            eprintln!("could not write idle memory metrics: {error}");
-        }
-    }
-
-    pub fn apply_phase0_background_presentation(
-        &mut self,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) {
-        self.background_presentation_generation = generation;
-        cx.notify();
-    }
-
-    pub fn enable_display_linked_scroll_measurement(&mut self) {
-        self.display_linked_scroll_direction = Some(1.0);
-    }
-
-    fn apply_phase1_scroll_frame(&mut self) {
-        let direction = self.display_linked_scroll_direction.unwrap_or(1.0);
-        let max = (self.heights.total_height() - self.viewport_height).max(0.0);
-        let proposed = self.scroll_y + direction * 72.0;
-        let next_direction = if proposed <= 0.0 {
-            1.0
-        } else if proposed >= max {
-            -1.0
-        } else {
-            direction
-        };
-        self.scroll_y = proposed.clamp(0.0, max);
-        self.display_linked_scroll_direction = Some(next_direction);
-    }
-
-    pub fn set_cursor_offset_for_measurement(
-        &mut self,
-        offset: usize,
-        cx: &mut Context<Self>,
-    ) -> Result<(), BufferError> {
-        self.editor
-            .set_selection(hane_editor::Selection::caret(hane_document::SourceOffset(
-                offset,
-            )))?;
-        self.after_input(cx);
-        Ok(())
-    }
-
-    pub fn move_cursor_down_for_development(
-        &mut self,
-        count: usize,
-        cx: &mut Context<Self>,
-    ) -> Result<(), BufferError> {
-        for _ in 0..count {
-            self.editor
-                .dispatch(EditorCommand::MoveDown { extend: false })?;
-        }
-        self.after_input(cx);
-        Ok(())
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
@@ -687,13 +613,143 @@ fn edit_affects_range(delta: RevisionDelta, range: SourceRange) -> bool {
     }
 }
 
-fn process_rss_bytes() -> Option<u64> {
-    hane_metrics::process_memory_bytes()
-}
-
 impl Focusable for EditorView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(feature = "instrument")]
+impl EditorView {
+    pub fn arm_startup_timing(&mut self, process_started: Instant) {
+        self.instrumentation.process_started = process_started;
+        self.instrumentation.ready_armed = true;
+    }
+
+    pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>) {
+        if let Some(output) = &mut self.instrumentation.metrics_output
+            && let Err(error) = output.memory("memory_idle_30s", rss_bytes)
+        {
+            eprintln!("could not write idle memory metrics: {error}");
+        }
+    }
+
+    pub fn apply_phase0_background_presentation(
+        &mut self,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_presentation_generation = generation;
+        cx.notify();
+    }
+
+    pub fn enable_display_linked_scroll_measurement(&mut self) {
+        self.instrumentation.display_linked_scroll_direction = Some(1.0);
+    }
+
+    fn apply_phase1_scroll_frame(&mut self) {
+        let direction = self
+            .instrumentation
+            .display_linked_scroll_direction
+            .unwrap_or(1.0);
+        let max = (self.heights.total_height() - self.viewport_height).max(0.0);
+        let proposed = self.scroll_y + direction * 72.0;
+        let next_direction = if proposed <= 0.0 {
+            1.0
+        } else if proposed >= max {
+            -1.0
+        } else {
+            direction
+        };
+        self.scroll_y = proposed.clamp(0.0, max);
+        self.instrumentation.display_linked_scroll_direction = Some(next_direction);
+    }
+
+    pub(crate) fn step_measurement_scroll(&mut self, window: &mut Window) {
+        if self.instrumentation.display_linked_scroll_direction.is_some() {
+            self.apply_phase1_scroll_frame();
+            window.request_animation_frame();
+        }
+    }
+
+    pub fn set_cursor_offset_for_measurement(
+        &mut self,
+        offset: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), BufferError> {
+        self.editor
+            .set_selection(hane_editor::Selection::caret(hane_document::SourceOffset(
+                offset,
+            )))?;
+        self.after_input(cx);
+        Ok(())
+    }
+
+    pub fn move_cursor_down_for_development(
+        &mut self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Result<(), BufferError> {
+        for _ in 0..count {
+            self.editor
+                .dispatch(EditorCommand::MoveDown { extend: false })?;
+        }
+        self.after_input(cx);
+        Ok(())
+    }
+
+    pub(crate) fn record_frame_instrumentation(
+        &mut self,
+        measurements: &[InputMeasurement],
+        interval: Option<Duration>,
+        layout: Option<Duration>,
+    ) {
+        let instrumentation = &mut self.instrumentation;
+        if instrumentation.ready_armed && !instrumentation.ready_reported {
+            instrumentation.ready_reported = true;
+            let startup = instrumentation.process_started.elapsed();
+            let rss = hane_metrics::process_memory_bytes();
+            eprintln!(
+                "hane_ready startup_time_ms={:.3} file_open_time_ms={:.3} rss_bytes={}",
+                startup.as_secs_f64() * 1_000.0,
+                instrumentation.file_open_time.as_secs_f64() * 1_000.0,
+                rss.unwrap_or(0),
+            );
+            if let Some(output) = &mut instrumentation.metrics_output {
+                if let Err(error) = output.memory("memory_load", instrumentation.load_rss_bytes) {
+                    eprintln!("could not write load memory metrics: {error}");
+                }
+                if let Err(error) = output.ready(startup, instrumentation.file_open_time, rss) {
+                    eprintln!("could not write ready metrics: {error}");
+                }
+            }
+        }
+        if let Some(output) = &mut instrumentation.metrics_output {
+            if let Err(error) = output.paint(interval, layout) {
+                eprintln!("could not write paint metrics: {error}");
+            }
+            for measurement in measurements {
+                if let Err(error) = output.input(measurement) {
+                    eprintln!("could not write input metrics: {error}");
+                }
+            }
+        }
+        if !measurements.is_empty() {
+            log_summary(&self.metrics);
+        }
+    }
+}
+
+#[cfg(not(feature = "instrument"))]
+impl EditorView {
+    pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
+
+    pub(crate) fn record_frame_instrumentation(
+        &mut self,
+        _measurements: &[InputMeasurement],
+        _interval: Option<Duration>,
+        _layout: Option<Duration>,
+    ) {
     }
 }
 
@@ -705,10 +761,7 @@ impl Render for EditorView {
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
             .max(self.theme.line_height);
-        if self.display_linked_scroll_direction.is_some() {
-            self.apply_phase1_scroll_frame();
-            window.request_animation_frame();
-        }
+        self.step_measurement_scroll(window);
         let max_scroll = (self.heights.total_height() - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let visible =

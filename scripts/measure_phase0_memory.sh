@@ -26,7 +26,7 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$results_dir/memory_10mb" "$results_dir/memory_100mb"
 rm -f "$results_dir/memory_10mb/metrics.csv" "$results_dir/memory_10mb/hane.log"
 rm -f "$results_dir/memory_100mb/metrics.csv" "$results_dir/memory_100mb/hane.log"
-cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane
+cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features instrument
 
 launch_one() {
     scenario=$1
@@ -39,7 +39,7 @@ launch_one() {
         HANE_INPUT_SOURCE="$input_source" \
         HANE_REFRESH_RATE_HZ="$refresh_rate" \
         HANE_MEASURE_IDLE_RSS=1 \
-        HANE_PHASE0_NO_FOCUS=1 \
+        HANE_NO_FOCUS=1 \
         "$binary" "$fixture" 2>"$log_path" &
     launched_pid=$!
 }

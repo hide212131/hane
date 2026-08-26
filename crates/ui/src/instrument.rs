@@ -1,18 +1,101 @@
+//! Measurement/instrumentation scaffolding, compiled only under the
+//! `instrument` feature. Product builds contain none of this code, so the
+//! shipping binary carries no CSV output, synthetic input, or development
+//! operations. All `HANE_*` environment variables are interpreted here in a
+//! single place.
+
 use hane_editor::InputMeasurement;
 use hane_metrics::{DurationDistribution, FrameMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+/// A single interpretation of the `HANE_*` measurement environment variables.
+///
+/// Both the UI (CSV output) and the app harness (synthetic input) read the
+/// same configuration, so variable names live in exactly one function.
 #[derive(Clone, Debug)]
 pub struct InstrumentationConfig {
     pub metrics_csv: Option<PathBuf>,
     pub scenario: String,
     pub input_source: String,
     pub refresh_rate_hz: String,
-    pub background_job: bool,
     pub gate: Option<PathBuf>,
+    pub start_empty: bool,
+    pub no_focus: bool,
+    pub measurement_cursor_offset: Option<usize>,
+    pub dev_cursor_down: Option<usize>,
+    pub autoscroll: bool,
+    pub measure_idle_rss: bool,
+    pub background_presentation: bool,
+}
+
+impl InstrumentationConfig {
+    pub fn from_environment() -> Self {
+        fn flag(name: &str) -> bool {
+            std::env::var(name).is_ok_and(|value| !value.is_empty())
+        }
+        fn usize_var(name: &str) -> Option<usize> {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .unwrap_or_else(|_| panic!("{name} must be a non-negative integer"))
+                })
+        }
+        Self {
+            metrics_csv: std::env::var_os("HANE_METRICS_CSV").map(PathBuf::from),
+            scenario: std::env::var("HANE_METRICS_SCENARIO")
+                .unwrap_or_else(|_| "unspecified".into()),
+            input_source: std::env::var("HANE_INPUT_SOURCE")
+                .unwrap_or_else(|_| "unspecified".into()),
+            refresh_rate_hz: std::env::var("HANE_REFRESH_RATE_HZ")
+                .unwrap_or_else(|_| "unknown".into()),
+            gate: std::env::var_os("HANE_METRICS_GATE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            start_empty: flag("HANE_MEASUREMENT_EMPTY"),
+            no_focus: flag("HANE_NO_FOCUS"),
+            measurement_cursor_offset: usize_var("HANE_MEASUREMENT_CURSOR_OFFSET"),
+            dev_cursor_down: usize_var("HANE_DEV_CURSOR_DOWN"),
+            autoscroll: flag("HANE_AUTOSCROLL"),
+            measure_idle_rss: flag("HANE_MEASURE_IDLE_RSS"),
+            background_presentation: flag("HANE_BACKGROUND_PRESENTATION"),
+        }
+    }
+}
+
+/// Runtime measurement state carried by `EditorView` only in instrument builds.
+pub(crate) struct Instrumentation {
+    pub(crate) metrics_output: Option<Phase0MetricsOutput>,
+    pub(crate) process_started: Instant,
+    pub(crate) file_open_time: Duration,
+    pub(crate) load_rss_bytes: Option<u64>,
+    pub(crate) ready_reported: bool,
+    pub(crate) ready_armed: bool,
+    pub(crate) display_linked_scroll_direction: Option<f32>,
+}
+
+impl Instrumentation {
+    pub(crate) fn from_environment() -> Self {
+        let config = InstrumentationConfig::from_environment();
+        let metrics_output = Phase0MetricsOutput::new(&config).unwrap_or_else(|error| {
+            eprintln!("could not open HANE_METRICS_CSV: {error}");
+            None
+        });
+        Self {
+            metrics_output,
+            process_started: Instant::now(),
+            file_open_time: Duration::ZERO,
+            load_rss_bytes: None,
+            ready_reported: false,
+            ready_armed: false,
+            display_linked_scroll_direction: None,
+        }
+    }
 }
 
 pub(crate) struct Phase0MetricsOutput {
@@ -46,7 +129,7 @@ impl Phase0MetricsOutput {
             scenario: config.scenario.clone(),
             input_source: config.input_source.clone(),
             refresh_rate_hz: config.refresh_rate_hz.clone(),
-            background_job: config.background_job,
+            background_job: config.background_presentation,
             gate: config.gate.clone(),
         }))
     }
