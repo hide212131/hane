@@ -1,74 +1,65 @@
-# Hane Phase 4
+# Hane
 
 ![Hane logo](./assets/phase4-feather.svg)
 
-Rust + GPUIによる巨大Markdown文書向けの高速Markdown editorです。Markdown記号を通常は隠し、caret・selection・IMEが構文へ入ったときだけ段階表示します。Phase 4では画像、pipe table、atomic save、自動保存、Recent Files、永続設定、system/light/dark themeを追加しました。sourceは常にMarkdownのまま保持し、hidden/synthesized segmentを含むSourceMapでvisual positionと対応させます。
+Hane は、巨大な Markdown 文書も軽快に編集できるデスクトップ向け Markdown エディタです。Rust と GPUI で作られており、Typora のように Markdown 記号を普段は隠して見やすく表示し、カーソルや選択範囲が構文に入ったときだけ記号を表示します。編集中のデータは常に Markdown のまま保持されるので、いつでもそのままのテキストとして扱えます。
 
-## 実行
+## 主な機能
+
+- **軽快な編集** — 100MB 級の Markdown でもスムーズにスクロール・編集できます。
+- **すっきりした表示** — 見出しや強調などの Markdown 記号を普段は隠し、編集する箇所だけ記号を表示します。
+- **画像・表の表示** — 画像やパイプテーブルをインラインで表示します。
+- **安全な保存** — atomic save により保存中の破損を防ぎます。自動保存にも対応しています。
+- **Recent Files** — 最近開いたファイルにすぐアクセスできます。
+- **設定の保存** — テーマや自動保存などの設定は次回起動時も引き継がれます。
+- **テーマ** — system / light / dark のテーマを切り替えられます。
+
+## 動作環境
+
+- macOS
+- [Rust](https://www.rust-lang.org/tools/install)（ビルドに必要）
+
+> macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
+
+## インストールと起動
+
+ソースからビルドして起動します。
 
 ```sh
+# そのまま起動
 cargo run -p hane
-cargo run -p hane -- target/fixtures/markdown_100mb.md
+
+# ファイルを指定して起動
+cargo run -p hane -- path/to/document.md
 ```
 
-macOS で Metal Toolchain を別途導入しなくても開発ビルドできるよう、GPUI の `runtime_shaders` feature を使っています。
-
-## Fixture と benchmark
+快適に使うにはリリースビルドをおすすめします。
 
 ```sh
-cargo run -p hane-benchmark --bin hane-bench -- fixtures
-cargo run --release -p hane-benchmark --bin hane-bench -- buffer
+cargo run --release -p hane
 ```
 
-fixture は `target/fixtures/` に生成され、Git には含まれません。
+## 使い方
 
-## 検証
+起動したら Markdown を入力・編集するだけです。主なキーボードショートカット:
 
-```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
+| 操作 | ショートカット |
+| --- | --- |
+| カーソル移動 | 矢印キー / Home / End |
+| 選択 | Shift + 矢印キー |
+| 全選択 | Command + A |
+| コピー / 切り取り / 貼り付け | Command + C / X / V |
+| 元に戻す / やり直す | Command + Z / Command + Shift + Z |
+| 開く | Command + O |
+| 保存 / 名前を付けて保存 | Command + S / Command + Shift + S |
+| 自動保存の切り替え | Command + Option + A |
 
-主なkey bindingは矢印、Shift+矢印、Home/End、Command+A/C/X/V/Z、Command+Shift+Z、Command+O/S、Command+Shift+Sです。Command+Option+Aで自動保存を切り替えられます。themeと自動保存はheaderの設定からも変更できます。
+テーマや自動保存は、ヘッダーの設定からも変更できます。
 
-## Phase 4測定
+## ライセンス
 
-```sh
-scripts/measure_phase4.sh
-scripts/measure_phase4_memory.sh
-```
+Apache-2.0
 
-## UI の画面キャプチャ
+## 開発者向け
 
-Markdown presentationの再現画面は次のコマンドで取得できます。
-
-```sh
-scripts/capture_phase4.sh
-```
-
-行境界にカーソルを置いた再現画面は、次のコマンドで取得できます。
-
-```sh
-scripts/capture_cursor_boundary.sh
-```
-
-既定の出力先は `target/captures/cursor-line-boundary.png` です。引数で別の出力先も指定できます。初回実行時にmacOSから画面収録の許可を求められた場合は、使用中のターミナルまたはCodexに許可してください。
-
-末尾改行後の空行など、別のbyte offsetを確認する場合は `HANE_CAPTURE_CURSOR_OFFSET` を指定できます。
-
-```sh
-HANE_CAPTURE_CURSOR_OFFSET=23 scripts/capture_cursor_boundary.sh
-```
-
-40行の文書で↓キー相当のカーソル移動を32回実行し、追従スクロールを確認する場合は
-次のコマンドを使います。
-
-```sh
-scripts/capture_cursor_scroll.sh
-```
-
-既定の出力先は `target/captures/cursor-scroll.png` です。移動回数は
-`HANE_CAPTURE_CURSOR_DOWN` で変更できます。
-
-Phase 0の技術検証結果は[Phase 0 report](docs/phase0/report.md)、plain text editor完成時点は[Phase 1 report](docs/phase1/report.md)、Markdown presentationは[Phase 2 report](docs/phase2/report.md)、Typora-style editingは[Phase 3 report](docs/phase3/report.md)、現在の実装・測定結果は[Phase 4 report](docs/phase4/report.md)を参照してください。
+ベンチマーク、パフォーマンス測定、画面キャプチャの手順や、各開発フェーズのレポートは [docs/](docs/) を参照してください。
