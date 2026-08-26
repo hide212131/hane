@@ -14,7 +14,10 @@ use hane_document::{
     TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, Selection};
-use hane_markdown::{BlockContextIndex, FenceDelimiter, fence_delimiter, parse_block_context};
+use hane_markdown::{
+    BlockContextIndex, FenceDelimiter, fence_delimiter, is_pipe_row, is_table_delimiter,
+    parse_block_context,
+};
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
 use std::collections::HashMap;
@@ -1034,28 +1037,26 @@ fn local_table_context(editor: &Editor, line: usize) -> bool {
             .unwrap_or_default()
     };
     let current = source(line);
-    if !hane_presentation::is_pipe_row(&current) && !hane_presentation::is_table_delimiter(&current)
-    {
+    if !is_pipe_row(&current) && !is_table_delimiter(&current) {
         return false;
     }
     let start = line.saturating_sub(LOCAL_TABLE_LINES);
     for candidate in (start..=line).rev() {
         let candidate_source = source(candidate);
-        if hane_presentation::is_table_delimiter(&candidate_source)
+        if is_table_delimiter(&candidate_source)
             && candidate > 0
-            && hane_presentation::is_pipe_row(&source(candidate - 1))
+            && is_pipe_row(&source(candidate - 1))
         {
             return line + 1 >= candidate
-                && (candidate..=line)
-                    .all(|row| row == candidate || hane_presentation::is_pipe_row(&source(row)));
+                && (candidate..=line).all(|row| row == candidate || is_pipe_row(&source(row)));
         }
-        if candidate < line && !hane_presentation::is_pipe_row(&candidate_source) {
+        if candidate < line && !is_pipe_row(&candidate_source) {
             break;
         }
     }
     line + 1 < editor.document().line_count()
-        && hane_presentation::is_pipe_row(&current)
-        && hane_presentation::is_table_delimiter(&source(line + 1))
+        && is_pipe_row(&current)
+        && is_table_delimiter(&source(line + 1))
 }
 
 #[cfg(test)]

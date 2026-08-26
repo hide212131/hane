@@ -5,6 +5,16 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Clone, Debug)]
+pub struct InstrumentationConfig {
+    pub metrics_csv: Option<PathBuf>,
+    pub scenario: String,
+    pub input_source: String,
+    pub refresh_rate_hz: String,
+    pub background_job: bool,
+    pub gate: Option<PathBuf>,
+}
+
 pub(crate) struct Phase0MetricsOutput {
     file: File,
     scenario: String,
@@ -15,8 +25,8 @@ pub(crate) struct Phase0MetricsOutput {
 }
 
 impl Phase0MetricsOutput {
-    pub(crate) fn from_environment() -> io::Result<Option<Self>> {
-        let Some(path) = std::env::var_os("HANE_METRICS_CSV").map(PathBuf::from) else {
+    pub(crate) fn new(config: &InstrumentationConfig) -> io::Result<Option<Self>> {
+        let Some(path) = config.metrics_csv.as_deref() else {
             return Ok(None);
         };
         if let Some(parent) = path.parent() {
@@ -33,17 +43,11 @@ impl Phase0MetricsOutput {
         )?;
         Ok(Some(Self {
             file,
-            scenario: std::env::var("HANE_METRICS_SCENARIO")
-                .unwrap_or_else(|_| "unspecified".into()),
-            input_source: std::env::var("HANE_INPUT_SOURCE")
-                .unwrap_or_else(|_| "unspecified".into()),
-            refresh_rate_hz: std::env::var("HANE_REFRESH_RATE_HZ")
-                .unwrap_or_else(|_| "unknown".into()),
-            background_job: std::env::var("HANE_PHASE0_BACKGROUND_PRESENTATION")
-                .is_ok_and(|value| !value.is_empty()),
-            gate: std::env::var_os("HANE_METRICS_GATE")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            scenario: config.scenario.clone(),
+            input_source: config.input_source.clone(),
+            refresh_rate_hz: config.refresh_rate_hz.clone(),
+            background_job: config.background_job,
+            gate: config.gate.clone(),
         }))
     }
 

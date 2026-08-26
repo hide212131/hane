@@ -56,7 +56,7 @@ impl Environment {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
                 .unwrap_or_else(|| "unknown".into())
         }
-        let memory_bytes = process_memory_bytes();
+        let memory_bytes = hane_metrics::process_memory_bytes();
         Self {
             git_commit: output("git", &["rev-parse", "HEAD"]),
             profile: profile.into(),
@@ -68,10 +68,6 @@ impl Environment {
             refresh_rate_hz: None,
         }
     }
-}
-
-pub fn process_memory_bytes() -> Option<u64> {
-    hane_metrics::process_memory_bytes()
 }
 
 #[derive(Clone, Debug)]

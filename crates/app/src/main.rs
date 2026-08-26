@@ -1,9 +1,10 @@
 use gpui::{
     App, AppContext, Application, Bounds, Focusable, Timer, WindowBounds, WindowOptions, px, size,
 };
-use hane_benchmark::process_memory_bytes;
 use hane_document::SourceRange;
-use hane_presentation::present_bold;
+use hane_markdown::parse_document;
+use hane_metrics::process_memory_bytes;
+use hane_presentation::present_markdown;
 use hane_ui::{EditorView, register_key_bindings};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,11 +94,14 @@ fn main() {
                 for generation in 1_u64.. {
                     let source = Arc::clone(&source);
                     cx.background_executor().spawn(async move {
-                        std::hint::black_box(present_bold(
+                        let revision = hane_document::Revision(generation);
+                        std::hint::black_box(parse_document(revision, range, &source));
+                        std::hint::black_box(present_markdown(
                             generation,
-                            hane_document::Revision(generation),
+                            revision,
                             range,
                             &source,
+                            26.0,
                         ));
                     }).await;
                     if view.update(cx, |view, cx| {

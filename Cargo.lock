@@ -2351,9 +2351,10 @@ name = "hane"
 version = "0.1.0"
 dependencies = [
  "gpui",
- "hane-benchmark",
  "hane-document",
  "hane-editor",
+ "hane-markdown",
+ "hane-metrics",
  "hane-presentation",
  "hane-ui",
 ]

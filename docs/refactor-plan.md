@@ -138,15 +138,16 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 
 **目的**: 誰も使っていない／二重定義のコードを消し、以降の見通しを上げる。
 
-- [ ] `presentation::present_bold` / `markdown::parse_bold` を削除。
+- [x] `presentation::present_bold` / `markdown::parse_bold` を削除。
       `app/main.rs` の Phase 0 合成負荷は、現在の背景解析を代表する `parse_document` /
       `present_markdown` workload として再定義する。旧 `present_bold` と処理量が異なるため、
       このシナリオだけは R1 で新しい基準線を取り、以後の比較原本とする。
-- [ ] `presentation::line_spans` / `LineSpan` と関連テストを削除（製品未使用を確認済み）。
-- [ ] `is_pipe_row` / `is_table_delimiter` を `markdown` に一本化し `pub` 化。
+      新基準は `docs/baseline/r1-background-workload.md` に保存。
+- [x] `presentation::line_spans` / `LineSpan` と関連テストを削除（製品未使用を確認済み）。
+- [x] `is_pipe_row` / `is_table_delimiter` を `markdown` に一本化し `pub` 化。
       `presentation` / `ui` はそれを import。`presentation` 側の重複定義と
       `is_alignment_cell` を削除。
-- [ ] `benchmark::process_memory_bytes` の間接層を削除。`app` は `hane-metrics` に直接依存。
+- [x] `benchmark::process_memory_bytes` の間接層を削除。`app` は `hane-metrics` に直接依存。
       `gpui_baseline` example も直接参照へ変更し、`Cargo.toml` から不要になった
       `hane-benchmark` 依存を除去。
 

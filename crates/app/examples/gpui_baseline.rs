@@ -13,7 +13,7 @@ impl Render for BaselineView {
             self.reported = true;
             eprintln!(
                 "hane_gpui_baseline rss_bytes={}",
-                hane_benchmark::process_memory_bytes().unwrap_or(0)
+                hane_metrics::process_memory_bytes().unwrap_or(0)
             );
         }
         div().size_full()
