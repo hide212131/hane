@@ -5,7 +5,7 @@ use hane_document::{
 };
 use hane_markdown::{
     BlockKind as MarkdownBlockKind, InlineKind as MarkdownInlineKind, MarkdownParse,
-    fence_delimiter, is_table_delimiter, parse_document,
+    is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 
@@ -339,114 +339,6 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     }
 }
 
-fn marker_ranges(parsed: &MarkdownParse, range: SourceRange, source: &str) -> Vec<SourceRange> {
-    let mut markers = Vec::new();
-    for block in &parsed.blocks {
-        let relative = block.source_range.start.0.saturating_sub(range.start.0);
-        let tail = source.get(relative..).unwrap_or_default();
-        match block.kind {
-            MarkdownBlockKind::Heading(_) => {
-                let hashes = tail
-                    .as_bytes()
-                    .iter()
-                    .take_while(|byte| **byte == b'#')
-                    .count();
-                if hashes > 0 {
-                    let suffix = usize::from(tail.as_bytes().get(hashes) == Some(&b' '));
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0,
-                        block.source_range.start.0 + hashes + suffix,
-                    ));
-                }
-            }
-            MarkdownBlockKind::Quote => {
-                if tail.starts_with("> ") {
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0,
-                        block.source_range.start.0 + 2,
-                    ));
-                }
-            }
-            MarkdownBlockKind::ListItem => {
-                let prefix = tail
-                    .find(|character: char| !character.is_ascii_whitespace())
-                    .unwrap_or(0);
-                let item = &tail[prefix..];
-                let marker_len =
-                    if item.starts_with("- ") || item.starts_with("* ") || item.starts_with("+ ") {
-                        2
-                    } else {
-                        item.find(". ").map_or(0, |end| end + 2)
-                    };
-                if marker_len > 0 {
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0 + prefix,
-                        block.source_range.start.0 + prefix + marker_len,
-                    ));
-                }
-            }
-            MarkdownBlockKind::CodeBlock => {
-                if fence_delimiter(tail).is_some() {
-                    let delimiter_end = tail.trim_end_matches(['\r', '\n']).len();
-                    if delimiter_end > 0 {
-                        markers.push(SourceRange::new(
-                            block.source_range.start.0,
-                            block.source_range.start.0 + delimiter_end,
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    for span in &parsed.spans {
-        let start = span.source_range.start.0;
-        let end = span.source_range.end.0;
-        if start < range.start.0 || end > range.end.0 || start >= end {
-            continue;
-        }
-        let text = &source[start - range.start.0..end - range.start.0];
-        let marker_len = match span.kind {
-            MarkdownInlineKind::Bold | MarkdownInlineKind::Italic => text
-                .as_bytes()
-                .first()
-                .filter(|marker| matches!(marker, b'*' | b'_'))
-                .map_or(0, |marker| {
-                    text.as_bytes()
-                        .iter()
-                        .take_while(|byte| *byte == marker)
-                        .count()
-                }),
-            MarkdownInlineKind::Strikethrough => 2,
-            MarkdownInlineKind::InlineCode => text.bytes().take_while(|byte| *byte == b'`').count(),
-            MarkdownInlineKind::Link => {
-                if let (Some(open), Some(close)) = (text.find('['), text.find("](")) {
-                    markers.push(SourceRange::new(start + open, start + open + 1));
-                    markers.push(SourceRange::new(start + close, end));
-                }
-                0
-            }
-            MarkdownInlineKind::CodeBlock => 0,
-        };
-        if marker_len > 0 && marker_len * 2 <= text.len() {
-            markers.push(SourceRange::new(start, start + marker_len));
-            markers.push(SourceRange::new(end - marker_len, end));
-        }
-    }
-    markers.sort_by_key(|marker| (marker.start, marker.end));
-    let mut merged: Vec<SourceRange> = Vec::with_capacity(markers.len());
-    for marker in markers {
-        if let Some(previous) = merged.last_mut()
-            && marker.start < previous.end
-        {
-            previous.end = previous.end.max(marker.end);
-        } else {
-            merged.push(marker);
-        }
-    }
-    merged
-}
-
 fn marker_is_disclosed(
     marker: SourceRange,
     parsed: &MarkdownParse,
@@ -511,11 +403,10 @@ pub fn present_markdown_with_disclosure(
         .first()
         .map(|block| presentation_block_kind(block.kind))
         .unwrap_or_default();
-    let marker_ranges = marker_ranges(&parsed, range, source);
     let mut visual = String::with_capacity(source.len());
-    let mut segments = Vec::with_capacity(marker_ranges.len() * 2 + 1);
+    let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    for marker in marker_ranges {
+    for &marker in &parsed.markers {
         if source_cursor < marker.start.0 {
             append_segment(
                 &mut visual,

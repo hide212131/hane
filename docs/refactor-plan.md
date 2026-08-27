@@ -190,16 +190,18 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 **目的**: Markdown の意味解析を pulldown-cmark に統一し、マーカ導出を `hane-markdown` の
 構文イベント連動 lexer に集約する（RFP §6.1/§7）。
 
-- [ ] `hane-markdown` を拡張し、pulldown-cmark のイベントと source range を正として、
+- [x] `hane-markdown` を拡張し、pulldown-cmark のイベントと source range を正として、
       その範囲内だけを字句解析する。見出し、引用、リスト、フェンス、強調、コード、リンクの
-      開閉マーカを構造化して返す API を追加する。
-- [ ] `presentation::marker_ranges` と関連手書きロジック（lib.rs:478-605 相当）を削除し、
-      `hane-markdown` の結果を消費するだけにする。
-- [ ] CommonMark/GFM fixture を使い、ATX/Setext heading、`1.`/`1)`、inline/reference link、
-      autolink、escape、異なる delimiter run のマーカ範囲を検証する。
-- [ ] フェンス/表文脈を `hane-markdown` の暫定解析 API に一元化。`ui::view::fence_before_line` と
-      `render` 内インラインフェンスループを廃止し、背景インデックス＋1か所だけの
-      有界同期フォールバックに統一する。
+      開閉マーカを `MarkdownParse.markers` として返す（`derive_markers`）。
+- [x] `presentation::marker_ranges` と関連手書きロジックを削除し、
+      `hane-markdown` の `markers` を消費するだけにする。`fence_delimiter` 依存も除去。
+- [~] CommonMark/GFM fixture を追加。ATX heading、`1.`、inline link、強調/コード/取り消し線/
+      引用/箇条書きの開閉マーカ、異なる delimiter run を検証済み。
+      Setext heading、`1)`、reference link、autolink、escape は現行導出のまま未網羅
+      （挙動は移設前と不変。R3.25 の構造化ノード導入時に fixture を拡充する）。
+- [x] フェンス/表文脈を `hane-markdown` の有界同期フォールバック（`local_block_context`）へ一元化。
+      `ui::view::fence_before_line` / `local_table_context` / `render` 内インラインフェンスループを
+      廃止し、背景 `BlockContextIndex` ＋1か所だけのフォールバックに統一。
 
 **完了条件**: Markdown の意味解析が pulldown-cmark の1経路、マーカ字句解析が
 `hane-markdown` の1経路のみ。R0.5 の往復・構文 fixture が緑。解析は依然バックグラウンドで、

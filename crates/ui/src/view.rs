@@ -16,8 +16,7 @@ use hane_document::{
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
-    BlockContextIndex, FenceDelimiter, fence_delimiter, is_pipe_row, is_table_delimiter,
-    parse_block_context,
+    BlockContextIndex, fence_delimiter, local_block_context, parse_block_context,
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
@@ -771,41 +770,33 @@ impl Render for EditorView {
         let cache_end = (visible.end + 128).min(self.heights.len());
         self.line_cache
             .retain(|line, _| cache_start <= *line && *line < cache_end);
-        let has_background_context = self.block_context.as_ref().is_some_and(|index| {
+        let background_context = self.block_context.as_ref().filter(|index| {
             index.revision == self.editor.document().revision()
                 && index.line_count() == self.editor.document().line_count()
         });
-        let mut fence = (!has_background_context)
-            .then(|| fence_before_line(&self.editor, visible.start))
-            .flatten();
+        // Prefer the formal document-wide index; only fall back to a single
+        // bounded scan of the viewport neighborhood while that index is stale.
+        let local_context = background_context
+            .is_none()
+            .then(|| local_block_context(self.editor.document(), visible.clone()));
+        let contexts = visible
+            .clone()
+            .map(|line| {
+                let fenced = background_context
+                    .and_then(|index| index.line_is_fenced(line))
+                    .or_else(|| local_context.as_ref().and_then(|c| c.line_is_fenced(line)))
+                    .unwrap_or(false);
+                let table = background_context
+                    .and_then(|index| index.line_is_table(line))
+                    .or_else(|| local_context.as_ref().and_then(|c| c.line_is_table(line)))
+                    .unwrap_or(false);
+                (fenced, table)
+            })
+            .collect::<Vec<_>>();
         let mut rendered_lines = Vec::with_capacity(visible.len());
-        for line in visible.clone() {
-            let range = self.editor.document().line_range(LineId(line)).ok();
-            let source = range.and_then(|range| self.editor.document().text(range).ok());
-            let delimiter = source.as_deref().and_then(fence_delimiter);
-            let fenced_code_context = self
-                .block_context
-                .as_ref()
-                .filter(|_| has_background_context)
-                .and_then(|index| index.line_is_fenced(line))
-                .unwrap_or_else(|| fence.is_some() || delimiter.is_some());
-            let table_context = self
-                .block_context
-                .as_ref()
-                .filter(|_| has_background_context)
-                .and_then(|index| index.line_is_table(line))
-                .unwrap_or_else(|| local_table_context(&self.editor, line));
+        for (line, (fenced_code_context, table_context)) in visible.clone().zip(contexts) {
             if let Some(block) = self.cached_line(line, fenced_code_context, table_context) {
                 rendered_lines.push((line, block));
-            }
-            if !has_background_context && let Some(delimiter) = delimiter {
-                fence = match fence {
-                    Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => {
-                        None
-                    }
-                    None => Some(delimiter),
-                    current => current,
-                };
             }
         }
         for (line, block) in &rendered_lines {
@@ -1054,64 +1045,6 @@ fn source_offset_for_visual_position(
         .unwrap_or(block.source_range.start)
 }
 
-/// Establishes local fenced-code context without making visible parsing depend
-/// on total document size while the background index is pending.
-fn fence_before_line(editor: &Editor, line: usize) -> Option<FenceDelimiter> {
-    const LOCAL_CONTEXT_LINES: usize = 2_048;
-    let start = line.saturating_sub(LOCAL_CONTEXT_LINES);
-    let mut fence: Option<FenceDelimiter> = None;
-    for candidate in start..line {
-        let Ok(range) = editor.document().line_range(LineId(candidate)) else {
-            continue;
-        };
-        let Ok(source) = editor.document().text(range) else {
-            continue;
-        };
-        let Some(delimiter) = fence_delimiter(&source) else {
-            continue;
-        };
-        fence = match fence {
-            Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => None,
-            None => Some(delimiter),
-            current => current,
-        };
-    }
-    fence
-}
-
-fn local_table_context(editor: &Editor, line: usize) -> bool {
-    const LOCAL_TABLE_LINES: usize = 256;
-    let source = |candidate| {
-        editor
-            .document()
-            .line_range(LineId(candidate))
-            .ok()
-            .and_then(|range| editor.document().text(range).ok())
-            .unwrap_or_default()
-    };
-    let current = source(line);
-    if !is_pipe_row(&current) && !is_table_delimiter(&current) {
-        return false;
-    }
-    let start = line.saturating_sub(LOCAL_TABLE_LINES);
-    for candidate in (start..=line).rev() {
-        let candidate_source = source(candidate);
-        if is_table_delimiter(&candidate_source)
-            && candidate > 0
-            && is_pipe_row(&source(candidate - 1))
-        {
-            return line + 1 >= candidate
-                && (candidate..=line).all(|row| row == candidate || is_pipe_row(&source(row)));
-        }
-        if candidate < line && !is_pipe_row(&candidate_source) {
-            break;
-        }
-    }
-    line + 1 < editor.document().line_count()
-        && is_pipe_row(&current)
-        && is_table_delimiter(&source(line + 1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,17 +1133,14 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_context_tracks_open_and_close_markers() {
+    fn local_fallback_tracks_fenced_code_open_and_close_markers() {
         let editor = Editor::new("before\n```rust\nlet answer = 42;\n```\nafter\n");
-        assert_eq!(fence_before_line(&editor, 1), None);
-        assert_eq!(
-            fence_before_line(&editor, 2),
-            Some(FenceDelimiter {
-                marker: b'`',
-                len: 3
-            })
-        );
-        assert_eq!(fence_before_line(&editor, 4), None);
+        let context = local_block_context(editor.document(), 0..6);
+        assert_eq!(context.line_is_fenced(0), Some(false));
+        for inside in 1..=3 {
+            assert_eq!(context.line_is_fenced(inside), Some(true));
+        }
+        assert_eq!(context.line_is_fenced(4), Some(false));
     }
 
     #[test]
