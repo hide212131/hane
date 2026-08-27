@@ -214,17 +214,19 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 **目的**: Markdown 機能を追加するたびに parser/presentation/ui の型と分岐を個別増築せずに済む
 境界を、追加機能の実装前に確定する。
 
-- [ ] `MarkdownParse` の flat な `blocks` / `spans` だけに依存せず、親子関係と順序を表現できる
-      block/inline node または同等のイベントモデルを定義する。list→item、quote→paragraph、
-      table→row→cell などを source range 付きで表現できること。
-- [ ] parser が返す構文種別、presentation が返す表示種別、UI の描画方針を分離し、
-      新しい構文が UI crate の場当たり的な文字列判定を要求しない API にする。
-- [ ] `Unsupported` / raw-source fallback を正式な表示契約に含める。未実装構文でも source を失わず、
+- [x] `MarkdownParse` の flat な `blocks` / `spans` を `MarkdownTree`（block/inline node ツリー）へ置換。
+      全ノードが parent / children / document 順 / depth / source range を持ち、list→item→paragraph、
+      quote→paragraph、table→head/row→cell、task list の checkbox 状態を表現できる。
+      未モデル構文は `NodeKind::Unsupported` として range を保持する。
+- [x] parser が返す構文種別（`markdown::NodeKind`）、presentation が返す表示種別
+      （`presentation::BlockKind` / `StyleKind`）、UI の描画方針（`BlockDisplay` / `InlineDisplay`）を
+      3層に分離。UI crate に `NodeKind` / `BlockKind` / `StyleKind` の出現はなく、文字列判定もない。
+- [x] `Unsupported` / raw-source fallback を正式な表示契約に含める。未実装構文でも source を失わず、
       編集・保存・カーソル移動が継続できるようにする。
-- [ ] Markdown feature ごとの fixture を共通形式にし、parse tree、marker ranges、SourceMap、
-      disclosure、保存後 source bytes を同じケースで検証できるようにする。
-- [ ] 初期の拡張対象（task list、nested list、複数行 quote/code、image、table、link）で API を試し、
-      feature 固有の情報が `EditorView` へ漏れないことを確認する。
+- [x] Markdown feature ごとの fixture を共通形式（`presentation/tests/support`）にし、parse tree、
+      marker ranges、SourceMap、disclosure、保存後 source bytes を同じケースで検証する。
+- [x] 初期の拡張対象（task list、nested list、複数行 quote/code、image、table、link）で API を試し、
+      feature 固有の情報が `EditorView` へ漏れないことを確認した（UI crate の変更は不要）。
 
 **完了条件**: 新しい Markdown 構文を追加するときの主な変更先が `markdown` と `presentation` の
 feature 実装・fixture に限定され、既存構文の共通 SourceMap/編集経路を複製しない。

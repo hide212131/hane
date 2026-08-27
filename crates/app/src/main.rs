@@ -1,6 +1,6 @@
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 #[cfg(not(feature = "instrument"))]
 use gpui::Focusable;
+use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_ui::{EditorView, register_key_bindings};
 use std::path::PathBuf;
 

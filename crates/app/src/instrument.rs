@@ -65,8 +65,9 @@ pub(crate) fn apply(
             .expect("read Hane root entity")
             .downgrade();
         cx.spawn(async move |cx| {
-            let source: Arc<str> =
-                ("background **presentation update** 日本語 🙂\n").repeat(16_384).into();
+            let source: Arc<str> = ("background **presentation update** 日本語 🙂\n")
+                .repeat(16_384)
+                .into();
             let range = SourceRange::new(0, source.len());
             for generation in 1_u64.. {
                 let source = Arc::clone(&source);
@@ -75,11 +76,7 @@ pub(crate) fn apply(
                         let revision = Revision(generation);
                         std::hint::black_box(parse_document(revision, range, &source));
                         std::hint::black_box(present_markdown(
-                            generation,
-                            revision,
-                            range,
-                            &source,
-                            26.0,
+                            generation, revision, range, &source, 26.0,
                         ));
                     })
                     .await;

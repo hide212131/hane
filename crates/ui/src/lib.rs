@@ -2,9 +2,9 @@
 
 mod actions;
 mod capture;
+mod input;
 #[cfg(feature = "instrument")]
 mod instrument;
-mod input;
 mod line;
 mod storage;
 mod theme;

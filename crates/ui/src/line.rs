@@ -6,7 +6,8 @@ use gpui::{
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_presentation::{
-    BlockKind, LineContext, StyleKind, VisualBlock, VisualOffset, present_polished_line,
+    BlockDisplay, BlockSurface, BlockTint, BlockWeight, InlineDisplay, LineContext, VisualBlock,
+    VisualOffset, present_polished_line,
 };
 use std::ops::Range;
 use std::path::Path;
@@ -18,23 +19,13 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
 pub(crate) fn presented_line(
     editor: &Editor,
     line: usize,
-    fenced_code_context: bool,
-    table_context: bool,
+    context: LineContext,
 ) -> Option<VisualBlock> {
     let Ok(range) = editor.document().line_range(LineId(line)) else {
         return None;
     };
     let source = editor.document().text(range).unwrap_or_default();
     let disclosure = disclosure_for_line(editor, line, range);
-    // Fenced code wins over table context: a line inside a fence is literal, so
-    // its pipes and markers must not be re-read as table/inline syntax.
-    let context = if fenced_code_context {
-        LineContext::FencedCode
-    } else if table_context {
-        LineContext::Table
-    } else {
-        LineContext::Normal
-    };
     let mut block = present_polished_line(
         line as u64,
         editor.document().revision(),
@@ -83,14 +74,41 @@ pub(crate) fn disclosure_for_line(
 
 const DEFAULT_LINE_HEIGHT: f32 = 26.0;
 
+/// Body text size. Every block size is this scaled by the presentation-supplied
+/// [`BlockDisplay::font_scale`], so the UI never keys sizing off a Markdown kind.
+pub(crate) const BODY_FONT_SIZE: f32 = 14.0;
+
 pub(crate) fn block_font_size(block: &VisualBlock) -> f32 {
-    match block.kind {
-        BlockKind::Heading(1) => 24.0,
-        BlockKind::Heading(2) => 21.0,
-        BlockKind::Heading(3) => 18.0,
-        BlockKind::Heading(_) => 16.0,
-        _ => 14.0,
+    BODY_FONT_SIZE * block.display().font_scale
+}
+
+/// Resolves a presentation background role against the active theme.
+fn surface_color(surface: BlockSurface, theme: Theme) -> Option<u32> {
+    match surface {
+        BlockSurface::Default => None,
+        BlockSurface::Code => Some(theme.code_block_background),
+        BlockSurface::Table => Some(theme.table_background),
+        BlockSurface::Media => Some(theme.media_background),
     }
+}
+
+/// Applies a whole-block render policy. Adding a Markdown construct means giving
+/// it a `BlockDisplay` in `hane-presentation`; nothing here changes.
+fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
+    element
+        .text_size(px(BODY_FONT_SIZE * display.font_scale))
+        .when(display.weight == BlockWeight::Semibold, |element| {
+            element.font_weight(FontWeight::SEMIBOLD)
+        })
+        .when(display.monospace, |element| {
+            element.font_family("ui-monospace")
+        })
+        .when(display.tint == BlockTint::Muted, |element| {
+            element.text_color(rgb(theme.quote_foreground))
+        })
+        .when_some(surface_color(display.surface, theme), |element, color| {
+            element.bg(rgb(color))
+        })
 }
 
 pub(crate) fn line_element_from_block(
@@ -100,6 +118,7 @@ pub(crate) fn line_element_from_block(
     theme: Theme,
     document_directory: Option<&Path>,
 ) -> Div {
+    let display = block.display();
     if let Some(image) = &block.image {
         let destination = Path::new(&image.destination);
         let resolved = if destination.is_absolute() {
@@ -109,27 +128,30 @@ pub(crate) fn line_element_from_block(
                 .unwrap_or_else(|| Path::new("."))
                 .join(destination)
         };
-        return div()
-            .h(px(block.height()))
-            .w_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .px(px(theme.line_horizontal_padding))
-            .bg(rgb(theme.media_background))
-            .child(
-                img(resolved)
-                    .max_w(px(640.))
-                    .h(px((block.height() - 32.0).max(1.0)))
-                    .object_fit(ObjectFit::Contain),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(theme.quote_foreground))
-                    .child(image.alt.clone()),
-            );
+        return styled_block(
+            div()
+                .h(px(block.height()))
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(theme.line_horizontal_padding)),
+            display,
+            theme,
+        )
+        .child(
+            img(resolved)
+                .max_w(px(640.))
+                .h(px((block.height() - 32.0).max(1.0)))
+                .object_fit(ObjectFit::Contain),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(theme.quote_foreground))
+                .child(image.alt.clone()),
+        );
     }
     let range = block.source_range;
 
@@ -167,19 +189,24 @@ pub(crate) fn line_element_from_block(
                     .when(segment.selected, |element| {
                         element.bg(rgb(theme.selection_background))
                     })
-                    .when(segment.marked, |element| element.underline())
-                    .when(segment.bold, |element| {
+                    .when(segment.marked || segment.display.underline, |element| {
+                        element.underline()
+                    })
+                    .when(segment.display.bold, |element| {
                         element.font_weight(FontWeight::BOLD)
                     })
-                    .when(segment.italic, |element| element.italic())
-                    .when(segment.strikethrough, |element| element.line_through())
-                    .when(segment.code, |element| {
-                        element
-                            .font_family("ui-monospace")
-                            .text_bg(rgb(theme.code_background))
+                    .when(segment.display.italic, |element| element.italic())
+                    .when(segment.display.strikethrough, |element| {
+                        element.line_through()
                     })
-                    .when(segment.link, |element| {
-                        element.underline().text_color(rgb(theme.link_foreground))
+                    .when(segment.display.monospace, |element| {
+                        element.font_family("ui-monospace")
+                    })
+                    .when(segment.display.code_background, |element| {
+                        element.text_bg(rgb(theme.code_background))
+                    })
+                    .when(segment.display.link_color, |element| {
+                        element.text_color(rgb(theme.link_foreground))
                     })
                     .child(block.visual_text[segment.visual_range.clone()].to_owned())
                     .into_any_element(),
@@ -190,28 +217,17 @@ pub(crate) fn line_element_from_block(
         elements.push(cursor_overlay(theme).into_any_element());
     }
 
-    div()
-        .h(px(block.height()))
-        .w_full()
-        .flex()
-        .items_center()
-        .px(px(theme.line_horizontal_padding))
-        .text_size(px(block_font_size(block)))
-        .when(matches!(block.kind, BlockKind::Heading(_)), |element| {
-            element.font_weight(FontWeight::SEMIBOLD)
-        })
-        .when(block.kind == BlockKind::CodeBlock, |element| {
-            element.bg(rgb(theme.code_block_background))
-        })
-        .when(block.kind == BlockKind::Quote, |element| {
-            element.text_color(rgb(theme.quote_foreground))
-        })
-        .when(block.kind == BlockKind::TableRow, |element| {
-            element
-                .font_family("ui-monospace")
-                .bg(rgb(theme.table_background))
-        })
-        .children(elements)
+    styled_block(
+        div()
+            .h(px(block.height()))
+            .w_full()
+            .flex()
+            .items_center()
+            .px(px(theme.line_horizontal_padding)),
+        display,
+        theme,
+    )
+    .children(elements)
 }
 
 fn clipped_visual_range(block: &VisualBlock, source: SourceRange) -> Option<Range<usize>> {
@@ -243,11 +259,19 @@ struct LineSegment {
     selected: bool,
     marked: bool,
     cursor_before: bool,
-    bold: bool,
-    italic: bool,
-    strikethrough: bool,
-    code: bool,
-    link: bool,
+    /// Inline render policy for this stretch, supplied by presentation.
+    display: InlineDisplay,
+}
+
+/// Combined inline policy for every style run that fully covers `range`.
+pub(crate) fn inline_display_for(
+    range: &Range<usize>,
+    style_runs: &[hane_presentation::StyleRun],
+) -> InlineDisplay {
+    InlineDisplay::for_styles(style_runs.iter().filter_map(|run| {
+        (range.start >= run.visual_range.start.0 && range.end <= run.visual_range.end.0)
+            .then_some(run.kind)
+    }))
 }
 
 fn line_segments(
@@ -273,13 +297,6 @@ fn line_segments(
         .windows(2)
         .map(|pair| {
             let range = pair[0]..pair[1];
-            let has_style = |kind| {
-                style_runs.iter().any(|run| {
-                    run.kind == kind
-                        && range.start >= run.visual_range.start.0
-                        && range.end <= run.visual_range.end.0
-                })
-            };
             LineSegment {
                 selected: selected.as_ref().is_some_and(|selected| {
                     range.start >= selected.start && range.end <= selected.end
@@ -288,12 +305,8 @@ fn line_segments(
                     .as_ref()
                     .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
                 cursor_before: cursor == Some(range.start),
+                display: inline_display_for(&range, style_runs),
                 visual_range: range.clone(),
-                bold: has_style(StyleKind::Bold),
-                italic: has_style(StyleKind::Italic),
-                strikethrough: has_style(StyleKind::Strikethrough),
-                code: has_style(StyleKind::InlineCode) || has_style(StyleKind::CodeBlock),
-                link: has_style(StyleKind::Link),
             }
         })
         .collect()
@@ -352,44 +365,28 @@ mod tests {
                     selected: false,
                     marked: false,
                     cursor_before: false,
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    code: false,
-                    link: false
+                    display: InlineDisplay::default()
                 },
                 LineSegment {
                     visual_range: 3..6,
                     selected: true,
                     marked: false,
                     cursor_before: true,
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    code: false,
-                    link: false
+                    display: InlineDisplay::default()
                 },
                 LineSegment {
                     visual_range: 6..9,
                     selected: true,
                     marked: true,
                     cursor_before: false,
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    code: false,
-                    link: false
+                    display: InlineDisplay::default()
                 },
                 LineSegment {
                     visual_range: 9..12,
                     selected: false,
                     marked: true,
                     cursor_before: false,
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    code: false,
-                    link: false
+                    display: InlineDisplay::default()
                 },
             ]
         );
@@ -398,21 +395,16 @@ mod tests {
     #[test]
     fn phase3_line_discloses_only_the_active_construct() {
         let editor = Editor::new("# **bold** and _italic_");
-        let block = presented_line(&editor, 0, false, false).unwrap();
+        let block = presented_line(&editor, 0, LineContext::Normal).unwrap();
         assert_eq!(block.visual_text, "# bold and italic");
         assert_eq!(block.disclosure, Some(SourceRange::empty(0)));
-        assert_eq!(block.kind, BlockKind::Heading(1));
-        assert!(
-            block
-                .style_runs
-                .iter()
-                .any(|run| run.kind == StyleKind::Bold)
-        );
-        assert!(
-            block
-                .style_runs
-                .iter()
-                .any(|run| run.kind == StyleKind::Italic)
-        );
+        assert_eq!(block.display().weight, BlockWeight::Semibold);
+        assert_eq!(block_font_size(&block), 24.0);
+        // Asserted through the render policy, not the Markdown style kind: the UI
+        // only ever sees `InlineDisplay`.
+        let bold = block.visual_text.find("bold").unwrap();
+        assert!(inline_display_for(&(bold..bold + "bold".len()), &block.style_runs).bold);
+        let italic = block.visual_text.find("italic").unwrap();
+        assert!(inline_display_for(&(italic..italic + "italic".len()), &block.style_runs).italic);
     }
 }

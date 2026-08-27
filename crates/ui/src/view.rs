@@ -2,7 +2,10 @@ use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 #[cfg(feature = "instrument")]
 use crate::instrument::{Instrumentation, log_summary};
-use crate::line::{block_font_size, disclosure_for_line, line_element_from_block, presented_line};
+use crate::line::{
+    block_font_size, disclosure_for_line, inline_display_for, line_element_from_block,
+    presented_line,
+};
 use crate::storage::{PersistentState, atomic_save_document};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
@@ -15,11 +18,9 @@ use hane_document::{
     TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
-use hane_markdown::{
-    BlockContextIndex, fence_delimiter, local_block_context, parse_block_context,
-};
+use hane_markdown::{BlockContextIndex, local_block_context, parse_block_context};
 use hane_metrics::FrameMetrics;
-use hane_presentation::{BlockKind, HeightIndex, StyleKind, VisualOffset};
+use hane_presentation::{BlockWeight, HeightIndex, LineContext, VisualOffset};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -484,7 +485,7 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, false, false))
+            .or_else(|| presented_line(&self.editor, line, LineContext::Normal))
         else {
             return;
         };
@@ -520,7 +521,7 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, false, false))
+            .or_else(|| presented_line(&self.editor, line, LineContext::Normal))
         else {
             return;
         };
@@ -555,8 +556,7 @@ impl EditorView {
     fn cached_line(
         &mut self,
         line: usize,
-        fenced_code_context: bool,
-        table_context: bool,
+        context: LineContext,
     ) -> Option<hane_presentation::VisualBlock> {
         let current_revision = self.editor.document().revision();
         if let Some(mut block) = self.line_cache.remove(&line) {
@@ -582,22 +582,14 @@ impl EditorView {
             } else {
                 false
             };
-            let expected_code_kind = fenced_code_context
-                || self
-                    .editor
-                    .document()
-                    .text(block.source_range)
-                    .is_ok_and(|text| fence_delimiter(&text).is_some());
-            let context_matches = (block.kind == BlockKind::CodeBlock) == expected_code_kind;
-            let table_matches =
-                matches!(block.kind, BlockKind::TableRow | BlockKind::TableDelimiter)
-                    == table_context;
-            if reusable && context_matches && table_matches {
+            // A cached block records the context it was presented with, so the
+            // check is an equality test rather than a re-derivation of the kind.
+            if reusable && block.context == context {
                 self.line_cache.insert(line, block.clone());
                 return Some(block);
             }
         }
-        let block = presented_line(&self.editor, line, fenced_code_context, table_context)?;
+        let block = presented_line(&self.editor, line, context)?;
         self.line_cache.insert(line, block.clone());
         Some(block)
     }
@@ -665,7 +657,11 @@ impl EditorView {
     }
 
     pub(crate) fn step_measurement_scroll(&mut self, window: &mut Window) {
-        if self.instrumentation.display_linked_scroll_direction.is_some() {
+        if self
+            .instrumentation
+            .display_linked_scroll_direction
+            .is_some()
+        {
             self.apply_phase1_scroll_frame();
             window.request_animation_frame();
         }
@@ -790,12 +786,12 @@ impl Render for EditorView {
                     .and_then(|index| index.line_is_table(line))
                     .or_else(|| local_context.as_ref().and_then(|c| c.line_is_table(line)))
                     .unwrap_or(false);
-                (fenced, table)
+                LineContext::from_document_context(fenced, table)
             })
             .collect::<Vec<_>>();
         let mut rendered_lines = Vec::with_capacity(visible.len());
-        for (line, (fenced_code_context, table_context)) in visible.clone().zip(contexts) {
-            if let Some(block) = self.cached_line(line, fenced_code_context, table_context) {
+        for (line, context) in visible.clone().zip(contexts) {
+            if let Some(block) = self.cached_line(line, context) {
                 rendered_lines.push((line, block));
             }
         }
@@ -986,25 +982,21 @@ fn visual_offset_at_x(
             if range.is_empty() {
                 return None;
             }
-            let has_style = |kind| {
-                block.style_runs.iter().any(|run| {
-                    run.kind == kind
-                        && range.start >= run.visual_range.start.0
-                        && range.end <= run.visual_range.end.0
-                })
-            };
+            // Same policy the painted elements use, so hit testing and painting
+            // cannot drift apart.
+            let inline = inline_display_for(&range, &block.style_runs);
             let mut font = style.font();
-            if matches!(block.kind, BlockKind::Heading(_)) || has_style(StyleKind::Bold) {
-                font.weight = if has_style(StyleKind::Bold) {
+            if block.display().weight == BlockWeight::Semibold || inline.bold {
+                font.weight = if inline.bold {
                     FontWeight::BOLD
                 } else {
                     FontWeight::SEMIBOLD
                 };
             }
-            if has_style(StyleKind::Italic) {
+            if inline.italic {
                 font.style = FontStyle::Italic;
             }
-            if has_style(StyleKind::InlineCode) || has_style(StyleKind::CodeBlock) {
+            if inline.monospace {
                 font.family = "ui-monospace".into();
             }
             Some(TextRun {
@@ -1054,7 +1046,7 @@ mod tests {
     fn visual_click_positions_map_back_to_source_offsets() {
         let editor = Editor::new("ab🙂\n\n**bold**");
 
-        let first = presented_line(&editor, 0, false, false).unwrap();
+        let first = presented_line(&editor, 0, LineContext::Normal).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, &first, 2),
             SourceOffset(2)
@@ -1064,13 +1056,13 @@ mod tests {
             SourceOffset(6)
         );
 
-        let empty = presented_line(&editor, 1, false, false).unwrap();
+        let empty = presented_line(&editor, 1, LineContext::Normal).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 1, &empty, 0),
             SourceOffset(7)
         );
 
-        let bold = presented_line(&editor, 2, false, false).unwrap();
+        let bold = presented_line(&editor, 2, LineContext::Normal).unwrap();
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, &bold, 0),
             SourceOffset(10)

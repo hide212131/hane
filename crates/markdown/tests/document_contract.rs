@@ -1,50 +1,36 @@
 use hane_document::{Revision, RopeBuffer, SourceRange, TextBuffer};
-use hane_markdown::{BlockKind, InlineKind, parse_block_context, parse_document};
+use hane_markdown::{NodeKind, parse_block_context, parse_document};
 
-fn block_count(source: &str, kind: BlockKind) -> usize {
+fn node_count(source: &str, kind: NodeKind) -> usize {
     parse_document(
         Revision(7),
         SourceRange::new(100, 100 + source.len()),
         source,
     )
-    .blocks
+    .tree
     .iter()
-    .filter(|block| block.kind == kind)
+    .filter(|(_, node)| node.kind == kind)
     .count()
 }
 
 #[test]
 fn multiline_commonmark_fixtures_keep_structural_ranges() {
     let quote = "> first\n> second\n";
-    assert_eq!(block_count(quote, BlockKind::Quote), 1);
-    assert_eq!(block_count(quote, BlockKind::Paragraph), 1);
+    assert_eq!(node_count(quote, NodeKind::Quote), 1);
+    assert_eq!(node_count(quote, NodeKind::Paragraph), 1);
 
     let list = "1) first\n2) second\n";
-    assert_eq!(block_count(list, BlockKind::ListItem), 2);
+    assert_eq!(node_count(list, NodeKind::ListItem { task: None }), 2);
 
     let fenced = "```rust\nlet answer = 42;\n```\n";
-    let parsed = parse_document(Revision(3), SourceRange::new(40, 40 + fenced.len()), fenced);
-    assert_eq!(
-        parsed
-            .blocks
-            .iter()
-            .filter(|block| block.kind == BlockKind::CodeBlock)
-            .count(),
-        1
-    );
-    assert!(
-        parsed
-            .spans
-            .iter()
-            .any(|span| span.kind == InlineKind::CodeBlock)
-    );
+    assert_eq!(node_count(fenced, NodeKind::CodeBlock), 1);
 
     let setext = "Heading 羽\n=========\n";
     let parsed = parse_document(Revision(9), SourceRange::new(12, 12 + setext.len()), setext);
-    let heading = parsed
-        .blocks
+    let (_, heading) = parsed
+        .tree
         .iter()
-        .find(|block| block.kind == BlockKind::Heading(1))
+        .find(|(_, node)| node.kind == NodeKind::Heading(1))
         .expect("Setext heading must retain heading semantics");
     assert_eq!(
         heading.source_range,
@@ -55,21 +41,15 @@ fn multiline_commonmark_fixtures_keep_structural_ranges() {
 #[test]
 fn reference_links_and_escaped_markers_have_unambiguous_parse_contracts() {
     let reference = "[Hane][project]\n\n[project]: https://example.com/hane\n";
-    let parsed = parse_document(Revision(1), SourceRange::new(0, reference.len()), reference);
-    assert!(
-        parsed
-            .spans
-            .iter()
-            .any(|span| span.kind == InlineKind::Link)
-    );
+    assert_eq!(node_count(reference, NodeKind::Link), 1);
 
     let escaped = r"\*literal emphasis\* and \[literal link\]";
     let parsed = parse_document(Revision(2), SourceRange::new(0, escaped.len()), escaped);
     assert!(
         parsed
-            .spans
+            .tree
             .iter()
-            .all(|span| !matches!(span.kind, InlineKind::Italic | InlineKind::Link))
+            .all(|(_, node)| !matches!(node.kind, NodeKind::Emphasis | NodeKind::Link))
     );
 }
 

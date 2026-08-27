@@ -78,7 +78,9 @@ fn unsupported_and_edge_constructs_never_lose_source() {
             .segments
             .iter()
             .filter(|segment| !segment.source_range.is_empty())
-            .map(|segment| &source[segment.source_range.start.0 - base..segment.source_range.end.0 - base])
+            .map(|segment| {
+                &source[segment.source_range.start.0 - base..segment.source_range.end.0 - base]
+            })
             .collect();
         assert_eq!(
             reconstructed, source,

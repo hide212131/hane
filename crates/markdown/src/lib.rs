@@ -3,44 +3,187 @@
 use hane_document::{LineId, Revision, RopeBuffer, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
+/// Markdown *syntax* kind, as written in the source.
+///
+/// This type is the parser's vocabulary only. It says nothing about how a
+/// construct is displayed: `hane_presentation` owns the display kind, and the UI
+/// crate never sees a `NodeKind` at all. Constructs Hane does not model yet map
+/// to [`NodeKind::Unsupported`] instead of being dropped, so the tree always
+/// covers the whole event stream and no source range goes unaccounted for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InlineKind {
-    Bold,
-    Italic,
-    Strikethrough,
-    InlineCode,
-    Link,
-    CodeBlock,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockKind {
+pub enum NodeKind {
+    /// Synthetic root spanning the whole parsed source range.
+    Document,
     Paragraph,
     Heading(u8),
     CodeBlock,
     Quote,
-    ListItem,
+    List {
+        ordered: bool,
+    },
+    /// `task` is `Some(checked)` for a GFM task-list item and `None` otherwise.
+    ListItem {
+        task: Option<bool>,
+    },
+    Table,
+    TableHead,
+    TableRow,
+    TableCell,
     Rule,
+    HtmlBlock,
+    Html,
+    FootnoteDefinition,
+    Text,
+    Strong,
+    Emphasis,
+    Strikethrough,
+    InlineCode,
+    Link,
+    Image,
+    InlineHtml,
+    FootnoteReference,
+    TaskMarker(bool),
+    Break,
+    /// A construct with no modeled kind. Retains its source range so callers can
+    /// still account for the bytes.
+    Unsupported,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkdownSpan {
-    pub kind: InlineKind,
-    pub source_range: SourceRange,
+impl NodeKind {
+    pub const fn is_block(self) -> bool {
+        matches!(
+            self,
+            Self::Document
+                | Self::Paragraph
+                | Self::Heading(_)
+                | Self::CodeBlock
+                | Self::Quote
+                | Self::List { .. }
+                | Self::ListItem { .. }
+                | Self::Table
+                | Self::TableHead
+                | Self::TableRow
+                | Self::TableCell
+                | Self::Rule
+                | Self::HtmlBlock
+                | Self::Html
+                | Self::FootnoteDefinition
+        )
+    }
+
+    pub const fn is_inline(self) -> bool {
+        matches!(
+            self,
+            Self::Text
+                | Self::Strong
+                | Self::Emphasis
+                | Self::Strikethrough
+                | Self::InlineCode
+                | Self::Link
+                | Self::Image
+                | Self::InlineHtml
+                | Self::FootnoteReference
+                | Self::TaskMarker(_)
+                | Self::Break
+        )
+    }
 }
 
+/// Identifies a node inside a [`MarkdownTree`]. Ids are storage indices assigned
+/// in document order, so a smaller id never starts after a larger one, and
+/// [`MarkdownTree::ROOT`] is always `NodeId(0)`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeId(pub usize);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkdownBlock {
-    pub kind: BlockKind,
+pub struct MarkdownNode {
+    pub kind: NodeKind,
     pub source_range: SourceRange,
+    pub parent: Option<NodeId>,
+    pub children: Vec<NodeId>,
+    /// Distance from the document root, which sits at depth 0.
+    pub depth: usize,
+}
+
+/// Block/inline node tree for one parsed source slice: parent/child structure,
+/// document order, and a source range on every node.
+///
+/// This replaces the previous flat block and span lists. Nested constructs
+/// (list → item → paragraph, quote → paragraph, table → row → cell) are
+/// expressible without a new side table per feature, which is what keeps a new
+/// Markdown construct from growing parallel vectors here and matching branches
+/// downstream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownTree {
+    nodes: Vec<MarkdownNode>,
+}
+
+impl MarkdownTree {
+    pub const ROOT: NodeId = NodeId(0);
+
+    pub fn root(&self) -> &MarkdownNode {
+        &self.nodes[Self::ROOT.0]
+    }
+
+    pub fn node(&self, id: NodeId) -> Option<&MarkdownNode> {
+        self.nodes.get(id.0)
+    }
+
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
+        self.node(id).map_or(&[], |node| node.children.as_slice())
+    }
+
+    /// Node count including the synthetic root.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// True when the slice parsed to nothing but the synthetic root.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.len() <= 1
+    }
+
+    /// Every node except the synthetic root, in document order.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (NodeId, &MarkdownNode)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(index, node)| (NodeId(index), node))
+    }
+
+    pub fn blocks(&self) -> impl Iterator<Item = (NodeId, &MarkdownNode)> {
+        self.iter().filter(|(_, node)| node.kind.is_block())
+    }
+
+    pub fn inlines(&self) -> impl Iterator<Item = (NodeId, &MarkdownNode)> {
+        self.iter().filter(|(_, node)| node.kind.is_inline())
+    }
+
+    /// `id` followed by each ancestor up to and including the root.
+    pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::successors(Some(id), move |current| {
+            self.node(*current).and_then(|node| node.parent)
+        })
+    }
+
+    /// How many enclosing lists a node sits in. `1` for a top-level list item,
+    /// `2` for an item of a list nested inside another item, and so on.
+    pub fn list_depth(&self, id: NodeId) -> usize {
+        self.ancestors(id)
+            .filter(|ancestor| {
+                self.node(*ancestor)
+                    .is_some_and(|node| matches!(node.kind, NodeKind::List { .. }))
+            })
+            .count()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkdownParse {
     pub revision: Revision,
     pub source_range: SourceRange,
-    pub blocks: Vec<MarkdownBlock>,
-    pub spans: Vec<MarkdownSpan>,
+    pub tree: MarkdownTree,
     /// Sorted, non-overlapping source ranges of the syntactic markers (heading
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
@@ -222,22 +365,33 @@ fn absolute_range(base: usize, range: std::ops::Range<usize>) -> SourceRange {
     SourceRange::new(base + range.start, base + range.end)
 }
 
+/// Inline kinds whose open/close delimiters are collapsible markup. Kept in one
+/// place because marker derivation and presentation must agree on exactly which
+/// nodes carry delimiters; `CodeBlock` is included because presentation styles it
+/// as an inline run even though its fence markers are derived block-side.
+pub const fn is_delimited_inline(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Strong
+            | NodeKind::Emphasis
+            | NodeKind::Strikethrough
+            | NodeKind::InlineCode
+            | NodeKind::Link
+            | NodeKind::CodeBlock
+    )
+}
+
 /// Derives marker source ranges by lexing only inside the source ranges that
-/// pulldown-cmark already attributed to each block/span. The event ranges stay
+/// pulldown-cmark already attributed to each node. The event ranges stay
 /// authoritative; this only recovers open/close delimiter positions that the
 /// event stream does not expose. Returned ranges are sorted and merged.
-fn derive_markers(
-    blocks: &[MarkdownBlock],
-    spans: &[MarkdownSpan],
-    range: SourceRange,
-    source: &str,
-) -> Vec<SourceRange> {
+fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
     let mut markers = Vec::new();
-    for block in blocks {
+    for (_, block) in tree.blocks() {
         let relative = block.source_range.start.0.saturating_sub(range.start.0);
         let tail = source.get(relative..).unwrap_or_default();
         match block.kind {
-            BlockKind::Heading(_) => {
+            NodeKind::Heading(_) => {
                 let hashes = tail
                     .as_bytes()
                     .iter()
@@ -251,7 +405,7 @@ fn derive_markers(
                     ));
                 }
             }
-            BlockKind::Quote => {
+            NodeKind::Quote => {
                 if tail.starts_with("> ") {
                     markers.push(SourceRange::new(
                         block.source_range.start.0,
@@ -259,7 +413,7 @@ fn derive_markers(
                     ));
                 }
             }
-            BlockKind::ListItem => {
+            NodeKind::ListItem { .. } => {
                 let prefix = tail
                     .find(|character: char| !character.is_ascii_whitespace())
                     .unwrap_or(0);
@@ -277,13 +431,30 @@ fn derive_markers(
                     ));
                 }
             }
-            BlockKind::CodeBlock => {
-                if fence_delimiter(tail).is_some() {
-                    let delimiter_end = tail.trim_end_matches(['\r', '\n']).len();
-                    if delimiter_end > 0 {
+            NodeKind::CodeBlock => {
+                // Only the fence delimiter lines are markup; the code between
+                // them is literal content and must stay visible. `tail` runs to
+                // the end of the parsed slice, so clip it to the block first.
+                let body = tail
+                    .get(..block.source_range.end.0 - block.source_range.start.0)
+                    .unwrap_or(tail);
+                if fence_delimiter(body).is_some() {
+                    let opening_end = body.find('\n').unwrap_or(body.len());
+                    let opening = body[..opening_end].trim_end_matches(['\r', '\n']).len();
+                    if opening > 0 {
                         markers.push(SourceRange::new(
                             block.source_range.start.0,
-                            block.source_range.start.0 + delimiter_end,
+                            block.source_range.start.0 + opening,
+                        ));
+                    }
+                    let closed = body.trim_end_matches(['\r', '\n']);
+                    if let Some(closing_start) = closed.rfind('\n').map(|line_end| line_end + 1)
+                        && closing_start > opening_end
+                        && fence_delimiter(&closed[closing_start..]).is_some()
+                    {
+                        markers.push(SourceRange::new(
+                            block.source_range.start.0 + closing_start,
+                            block.source_range.start.0 + closed.len(),
                         ));
                     }
                 }
@@ -291,7 +462,10 @@ fn derive_markers(
             _ => {}
         }
     }
-    for span in spans {
+    for (_, span) in tree
+        .iter()
+        .filter(|(_, node)| is_delimited_inline(node.kind))
+    {
         let start = span.source_range.start.0;
         let end = span.source_range.end.0;
         if start < range.start.0 || end > range.end.0 || start >= end {
@@ -299,7 +473,7 @@ fn derive_markers(
         }
         let text = &source[start - range.start.0..end - range.start.0];
         let marker_len = match span.kind {
-            InlineKind::Bold | InlineKind::Italic => text
+            NodeKind::Strong | NodeKind::Emphasis => text
                 .as_bytes()
                 .first()
                 .filter(|marker| matches!(marker, b'*' | b'_'))
@@ -309,16 +483,16 @@ fn derive_markers(
                         .take_while(|byte| *byte == marker)
                         .count()
                 }),
-            InlineKind::Strikethrough => 2,
-            InlineKind::InlineCode => text.bytes().take_while(|byte| *byte == b'`').count(),
-            InlineKind::Link => {
+            NodeKind::Strikethrough => 2,
+            NodeKind::InlineCode => text.bytes().take_while(|byte| *byte == b'`').count(),
+            NodeKind::Link => {
                 if let (Some(open), Some(close)) = (text.find('['), text.find("](")) {
                     markers.push(SourceRange::new(start + open, start + open + 1));
                     markers.push(SourceRange::new(start + close, end));
                 }
                 0
             }
-            InlineKind::CodeBlock => 0,
+            _ => 0,
         };
         if marker_len > 0 && marker_len * 2 <= text.len() {
             markers.push(SourceRange::new(start, start + marker_len));
@@ -350,79 +524,133 @@ fn heading_level(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Parses a source slice and retains the byte range of every presentation item.
-/// The returned offsets are absolute within the document, even for a local slice.
+/// The single parser configuration. Every parse in Hane goes through this so
+/// enabling a GFM extension is a one-line change with no second code path.
+fn parser_options() -> Options {
+    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES
+}
+
+fn node_kind_for_tag(tag: &Tag) -> NodeKind {
+    match tag {
+        Tag::Paragraph => NodeKind::Paragraph,
+        Tag::Heading { level, .. } => NodeKind::Heading(heading_level(*level)),
+        Tag::CodeBlock(_) => NodeKind::CodeBlock,
+        Tag::BlockQuote(_) => NodeKind::Quote,
+        Tag::List(start) => NodeKind::List {
+            ordered: start.is_some(),
+        },
+        Tag::Item => NodeKind::ListItem { task: None },
+        Tag::Table(_) => NodeKind::Table,
+        Tag::TableHead => NodeKind::TableHead,
+        Tag::TableRow => NodeKind::TableRow,
+        Tag::TableCell => NodeKind::TableCell,
+        Tag::HtmlBlock => NodeKind::HtmlBlock,
+        Tag::FootnoteDefinition(_) => NodeKind::FootnoteDefinition,
+        Tag::Strong => NodeKind::Strong,
+        Tag::Emphasis => NodeKind::Emphasis,
+        Tag::Strikethrough => NodeKind::Strikethrough,
+        Tag::Link { .. } => NodeKind::Link,
+        Tag::Image { .. } => NodeKind::Image,
+        _ => NodeKind::Unsupported,
+    }
+}
+
+/// Builds the node tree from the offset event stream. Container `Start`/`End`
+/// pairs push and pop; every other event becomes a leaf under the open
+/// container. Unmodeled tags still push a node so the stack stays balanced and
+/// their source range remains reachable.
+fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
+    let mut nodes = vec![MarkdownNode {
+        kind: NodeKind::Document,
+        source_range,
+        parent: None,
+        children: Vec::new(),
+        depth: 0,
+    }];
+    let mut open = vec![MarkdownTree::ROOT];
+    fn push(
+        nodes: &mut Vec<MarkdownNode>,
+        open: &[NodeId],
+        kind: NodeKind,
+        range: SourceRange,
+    ) -> NodeId {
+        let parent = open.last().copied().unwrap_or(MarkdownTree::ROOT);
+        let id = NodeId(nodes.len());
+        let depth = nodes[parent.0].depth + 1;
+        nodes.push(MarkdownNode {
+            kind,
+            source_range: range,
+            parent: Some(parent),
+            children: Vec::new(),
+            depth,
+        });
+        nodes[parent.0].children.push(id);
+        id
+    }
+    for (event, relative_range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
+        let range = absolute_range(source_range.start.0, relative_range);
+        match event {
+            Event::Start(tag) => {
+                let id = push(&mut nodes, &open, node_kind_for_tag(&tag), range);
+                open.push(id);
+            }
+            Event::End(_) => {
+                open.pop();
+            }
+            Event::TaskListMarker(checked) => {
+                // pulldown reports the checkbox as a child event, so the item kind
+                // is only complete once the marker arrives.
+                if let Some(item) = open.last()
+                    && let NodeKind::ListItem { task } = &mut nodes[item.0].kind
+                {
+                    *task = Some(checked);
+                }
+                push(&mut nodes, &open, NodeKind::TaskMarker(checked), range);
+            }
+            Event::Text(_) => {
+                push(&mut nodes, &open, NodeKind::Text, range);
+            }
+            Event::Code(_) => {
+                push(&mut nodes, &open, NodeKind::InlineCode, range);
+            }
+            Event::Html(_) => {
+                push(&mut nodes, &open, NodeKind::Html, range);
+            }
+            Event::InlineHtml(_) => {
+                push(&mut nodes, &open, NodeKind::InlineHtml, range);
+            }
+            Event::FootnoteReference(_) => {
+                push(&mut nodes, &open, NodeKind::FootnoteReference, range);
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                push(&mut nodes, &open, NodeKind::Break, range);
+            }
+            Event::Rule => {
+                push(&mut nodes, &open, NodeKind::Rule, range);
+            }
+            _ => {
+                push(&mut nodes, &open, NodeKind::Unsupported, range);
+            }
+        }
+    }
+    MarkdownTree { nodes }
+}
+
+/// Parses a source slice into a node tree and retains the byte range of every
+/// node. The returned offsets are absolute within the document, even for a local
+/// slice.
 pub fn parse_document(
     revision: Revision,
     source_range: SourceRange,
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut blocks = Vec::new();
-    let mut spans = Vec::new();
-    for (event, relative_range) in Parser::new_ext(source, options).into_offset_iter() {
-        let range = absolute_range(source_range.start.0, relative_range);
-        match event {
-            Event::Start(Tag::Heading { level, .. }) => blocks.push(MarkdownBlock {
-                kind: BlockKind::Heading(heading_level(level)),
-                source_range: range,
-            }),
-            Event::Start(Tag::Paragraph) => blocks.push(MarkdownBlock {
-                kind: BlockKind::Paragraph,
-                source_range: range,
-            }),
-            Event::Start(Tag::CodeBlock(_)) => {
-                blocks.push(MarkdownBlock {
-                    kind: BlockKind::CodeBlock,
-                    source_range: range,
-                });
-                spans.push(MarkdownSpan {
-                    kind: InlineKind::CodeBlock,
-                    source_range: range,
-                });
-            }
-            Event::Start(Tag::BlockQuote(_)) => blocks.push(MarkdownBlock {
-                kind: BlockKind::Quote,
-                source_range: range,
-            }),
-            Event::Start(Tag::Item) => blocks.push(MarkdownBlock {
-                kind: BlockKind::ListItem,
-                source_range: range,
-            }),
-            Event::Start(Tag::Strong) => spans.push(MarkdownSpan {
-                kind: InlineKind::Bold,
-                source_range: range,
-            }),
-            Event::Start(Tag::Emphasis) => spans.push(MarkdownSpan {
-                kind: InlineKind::Italic,
-                source_range: range,
-            }),
-            Event::Start(Tag::Strikethrough) => spans.push(MarkdownSpan {
-                kind: InlineKind::Strikethrough,
-                source_range: range,
-            }),
-            Event::Start(Tag::Link { .. }) => spans.push(MarkdownSpan {
-                kind: InlineKind::Link,
-                source_range: range,
-            }),
-            Event::Code(_) => spans.push(MarkdownSpan {
-                kind: InlineKind::InlineCode,
-                source_range: range,
-            }),
-            Event::Rule => blocks.push(MarkdownBlock {
-                kind: BlockKind::Rule,
-                source_range: range,
-            }),
-            _ => {}
-        }
-    }
-    let markers = derive_markers(&blocks, &spans, source_range, source);
+    let tree = build_tree(source_range, source);
+    let markers = derive_markers(&tree, source_range, source);
     MarkdownParse {
         revision,
         source_range,
-        blocks,
-        spans,
+        tree,
         markers,
     }
 }
@@ -440,25 +668,21 @@ mod tests {
             source,
         );
         assert_eq!(parsed.revision, Revision(7));
-        assert!(parsed.blocks.iter().any(|block| {
-            block.kind == BlockKind::Heading(2)
+        assert!(parsed.tree.blocks().any(|(_, block)| {
+            block.kind == NodeKind::Heading(2)
                 && block.source_range == SourceRange::new(100, 100 + source.len())
         }));
         for kind in [
-            InlineKind::Bold,
-            InlineKind::Italic,
-            InlineKind::InlineCode,
-            InlineKind::Strikethrough,
+            NodeKind::Strong,
+            NodeKind::Emphasis,
+            NodeKind::InlineCode,
+            NodeKind::Strikethrough,
         ] {
-            assert!(parsed.spans.iter().any(|span| span.kind == kind));
+            assert!(parsed.tree.iter().any(|(_, node)| node.kind == kind));
         }
-        assert!(
-            parsed
-                .spans
-                .iter()
-                .all(|span| span.source_range.start.0 >= 100
-                    && span.source_range.end.0 <= 100 + source.len())
-        );
+        assert!(parsed.tree.iter().all(|(_, node)| {
+            node.source_range.start.0 >= 100 && node.source_range.end.0 <= 100 + source.len()
+        }));
     }
 
     #[test]
@@ -467,16 +691,72 @@ mod tests {
         let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
         assert!(
             parsed
-                .blocks
-                .iter()
-                .any(|block| block.kind == BlockKind::CodeBlock)
+                .tree
+                .blocks()
+                .any(|(_, block)| block.kind == NodeKind::CodeBlock)
         );
-        assert!(
-            parsed
-                .spans
-                .iter()
-                .any(|span| span.kind == InlineKind::CodeBlock)
-        );
+    }
+
+    #[test]
+    fn tree_nests_children_inside_their_parent_source_ranges() {
+        let source = "- outer\n  - inner **bold**\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        for (id, node) in parsed.tree.iter() {
+            let parent = parsed
+                .tree
+                .node(node.parent.expect("non-root node"))
+                .unwrap();
+            assert!(
+                parent.source_range.start <= node.source_range.start
+                    && node.source_range.end <= parent.source_range.end,
+                "{id:?} {:?} escapes its parent {:?}",
+                node.kind,
+                parent.kind
+            );
+            assert_eq!(node.depth, parent.depth + 1);
+        }
+        let inner = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .map(|(id, _)| parsed.tree.list_depth(id))
+            .collect::<Vec<_>>();
+        assert_eq!(inner, vec![1, 2]);
+    }
+
+    #[test]
+    fn task_list_items_carry_their_checkbox_state() {
+        let source = "- [ ] todo\n- [x] done\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let tasks = parsed
+            .tree
+            .iter()
+            .filter_map(|(_, node)| match node.kind {
+                NodeKind::ListItem { task } => Some(task),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tasks, vec![Some(false), Some(true)]);
+    }
+
+    #[test]
+    fn tables_nest_rows_and_cells_under_the_table() {
+        let source = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (table, _) = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| node.kind == NodeKind::Table)
+            .expect("pipe table must parse as a table");
+        let rows = parsed.tree.children(table);
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                parsed.tree.children(*row).len(),
+                2,
+                "each row has two cells"
+            );
+        }
     }
 
     #[test]
@@ -536,16 +816,25 @@ mod tests {
     #[test]
     fn markers_cover_block_prefixes_for_heading_quote_and_list() {
         let heading = parse_document(Revision(1), SourceRange::new(0, 8), "## Head\n");
-        assert_eq!(heading.markers.first().copied(), Some(SourceRange::new(0, 3)));
+        assert_eq!(
+            heading.markers.first().copied(),
+            Some(SourceRange::new(0, 3))
+        );
 
         let quote = parse_document(Revision(1), SourceRange::new(0, 8), "> quote\n");
         assert_eq!(quote.markers.first().copied(), Some(SourceRange::new(0, 2)));
 
         let bullet = parse_document(Revision(1), SourceRange::new(0, 7), "- item\n");
-        assert_eq!(bullet.markers.first().copied(), Some(SourceRange::new(0, 2)));
+        assert_eq!(
+            bullet.markers.first().copied(),
+            Some(SourceRange::new(0, 2))
+        );
 
         let ordered = parse_document(Revision(1), SourceRange::new(0, 8), "1. item\n");
-        assert_eq!(ordered.markers.first().copied(), Some(SourceRange::new(0, 3)));
+        assert_eq!(
+            ordered.markers.first().copied(),
+            Some(SourceRange::new(0, 3))
+        );
     }
 
     #[test]

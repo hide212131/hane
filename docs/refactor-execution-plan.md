@@ -5,8 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-27）
 
-**現在地: R3.25（Markdown 拡張契約）着手中。表示契約の漏れ解消（UI の block-kind パッチ撤去）と
-`Unsupported` raw-source fallback の契約化まで完了。**
+**現在地: R3.25（Markdown 拡張契約）完了。次は R3.5（revision 付き BlockIndex）に着手する。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -15,8 +14,8 @@
 | 3 | R1 死蔵・重複コード削除 | ✅ 完了 |
 | 4 | R2 前半（計測ハーネス分離） | 🔶 ほぼ完了（下記残タスクあり） |
 | 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
-| 6 | R3.25 Markdown 拡張契約 | 🔶 着手中（下記残タスクあり） ← **現在地** |
-| 7 | R3.5 revision 付き BlockIndex | ⬜ 未着手 |
+| 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
+| 7 | R3.5 revision 付き BlockIndex | ⬜ 未着手 ← **現在地** |
 | 8 | R3.75 DocumentSession / FileService | ⬜ 未着手 |
 | 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 |
 | 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 |
@@ -24,7 +23,7 @@
 | 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
 
-### R3.25 の残タスク
+### R3.25 の完了内容
 
 - ✅ 表示契約の漏れ解消（第一段）: fenced-code の表示決定を `presentation::present_polished_line`
   へ集約し、UI 側（`ui::line`）の `block.kind = CodeBlock` 直接パッチと style run 手注入を撤去。
@@ -34,11 +33,26 @@
   は marker 導出が source range を tile できない場合に raw-source へ降格。契約テスト
   `unsupported_and_edge_constructs_never_lose_source`（raw HTML / autolink / footnote 参照 /
   task list / escape / entity）で source 復元と往復を固定。
-- ⬜ parser 構文種別 / presentation 表示種別 / UI 描画方針の型分離を明示（`markdown::BlockKind` と
-  `presentation::BlockKind` の役割整理）。
-- ⬜ flat `blocks`/`spans` に代わる block/inline node ツリー（親子・順序・source range）。
-- ⬜ Markdown feature 共通 fixture 形式（parse tree・marker・SourceMap・disclosure・保存後 bytes）。
-- ⬜ 初期拡張対象（task list、nested list、複数行 quote/code、image、table、link）で API 試行。
+- ✅ parser 構文種別 / presentation 表示種別 / UI 描画方針の型を3層に分離。
+  `markdown::NodeKind`（構文のみ）→ `presentation::BlockKind` / `StyleKind`（表示種別）→
+  `presentation::BlockDisplay` / `InlineDisplay`（描画方針: font scale・weight・surface/tint role・
+  monospace 等）。UI は `BlockDisplay` / `InlineDisplay` だけを適用し、`BlockKind` を一切 match しない
+  （`crates/ui` `crates/app` に `NodeKind` / `BlockKind` / `StyleKind` の出現なし）。
+  `visual_offset_at_x` の shape 経路と描画経路も `inline_display_for` の1経路に統合。
+- ✅ flat `blocks`/`spans` を `markdown::MarkdownTree`（block/inline node ツリー）へ置換。
+  親子・document 順・depth・source range を全ノードが保持し、list→item→paragraph、quote→paragraph、
+  table→head/row→cell、task list の checkbox 状態（`ListItem { task }`）、nested list の
+  `list_depth` を表現できる。未モデル構文は `NodeKind::Unsupported` として range を保持し、
+  event stream を取りこぼさない。`Options::ENABLE_TABLES` を有効化し parser 設定は `parser_options()` の1か所。
+- ✅ Markdown feature 共通 fixture 形式（`crates/presentation/tests/support/mod.rs`）。
+  1 fixture が parse tree のチェーン・marker range・表示種別・visual text・全カーソル位置での
+  SourceMap 往復と正規化の冪等性・保存後 bytes を同時に検証する。harness は `EditorView` と同じ
+  3 呼び出し（`parse_block_context` → `LineContext::from_document_context` → `present_polished_line`）
+  だけを行い feature 固有分岐を持たないため、fixture が通ること自体が UI 非依存の証明になる。
+- ✅ 初期拡張対象（task list、nested list、複数行 quote、複数行 fenced code、image、table、link）で
+  API 試行（`crates/presentation/tests/markdown_features.rs`）。UI crate の変更は不要だった。
+  副産物として、文書全体 parse 時に fenced code の marker がコードブロック全体を飲み込む
+  marker 導出のバグを発見・修正（開始/終了 fence 行のみを marker とする）。
 
 ### R2 前半の残タスク
 

@@ -4,8 +4,7 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockKind as MarkdownBlockKind, InlineKind as MarkdownInlineKind, MarkdownParse,
-    is_table_delimiter, parse_document,
+    MarkdownParse, NodeKind, is_delimited_inline, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 
@@ -197,6 +196,85 @@ pub struct StyleRun {
     pub kind: StyleKind,
 }
 
+/// Render policy for one inline run, the same idea as [`BlockDisplay`] one level
+/// down: the UI applies these flags and never matches on [`StyleKind`]. Flags are
+/// unioned when several runs cover the same text, so overlapping constructs
+/// compose without the UI knowing which ones exist.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InlineDisplay {
+    pub bold: bool,
+    pub italic: bool,
+    pub strikethrough: bool,
+    pub monospace: bool,
+    /// Paint the inline-code background behind the text.
+    pub code_background: bool,
+    pub underline: bool,
+    /// Draw the text in the theme's link color.
+    pub link_color: bool,
+}
+
+impl InlineDisplay {
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            bold: self.bold || other.bold,
+            italic: self.italic || other.italic,
+            strikethrough: self.strikethrough || other.strikethrough,
+            monospace: self.monospace || other.monospace,
+            code_background: self.code_background || other.code_background,
+            underline: self.underline || other.underline,
+            link_color: self.link_color || other.link_color,
+        }
+    }
+
+    /// Combined policy for every style covering one stretch of visual text.
+    pub fn for_styles(styles: impl IntoIterator<Item = StyleKind>) -> Self {
+        styles.into_iter().fold(Self::default(), |display, kind| {
+            display.union(kind.display())
+        })
+    }
+}
+
+impl StyleKind {
+    pub const fn display(self) -> InlineDisplay {
+        let base = InlineDisplay {
+            bold: false,
+            italic: false,
+            strikethrough: false,
+            monospace: false,
+            code_background: false,
+            underline: false,
+            link_color: false,
+        };
+        match self {
+            Self::Bold => InlineDisplay { bold: true, ..base },
+            Self::Italic => InlineDisplay {
+                italic: true,
+                ..base
+            },
+            Self::Strikethrough => InlineDisplay {
+                strikethrough: true,
+                ..base
+            },
+            Self::InlineCode | Self::CodeBlock => InlineDisplay {
+                monospace: true,
+                code_background: true,
+                ..base
+            },
+            Self::Link => InlineDisplay {
+                underline: true,
+                link_color: true,
+                ..base
+            },
+            Self::MarkedText => InlineDisplay {
+                underline: true,
+                ..base
+            },
+            // Images and tables are carried by the block-level display.
+            Self::Image | Self::Table => base,
+        }
+    }
+}
+
 /// Block-level context that a single source line sits in, resolved by the caller
 /// from the document-wide [`hane_markdown::BlockContextIndex`] (or its bounded
 /// fallback). Presentation owns the resulting display kind and style runs so the
@@ -207,6 +285,22 @@ pub enum LineContext {
     Normal,
     FencedCode,
     Table,
+}
+
+impl LineContext {
+    /// Resolves the per-line flags of a document context index into the display
+    /// context. Fenced code wins over table context: a line inside a fence is
+    /// literal, so its pipes must not be re-read as table syntax. The precedence
+    /// rule lives here so callers only forward the index lookups.
+    pub const fn from_document_context(fenced_code: bool, table: bool) -> Self {
+        if fenced_code {
+            Self::FencedCode
+        } else if table {
+            Self::Table
+        } else {
+            Self::Normal
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -227,6 +321,104 @@ pub enum BlockKind {
     Unsupported,
 }
 
+/// Block-level font weight the UI must apply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockWeight {
+    #[default]
+    Normal,
+    Semibold,
+}
+
+/// Background fill role for a block. A role, not a color: the UI theme picks the
+/// concrete value, so a new construct never forces a new UI branch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockSurface {
+    #[default]
+    Default,
+    Code,
+    Table,
+    Media,
+}
+
+/// Foreground role for a block.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockTint {
+    #[default]
+    Default,
+    Muted,
+}
+
+/// Everything the UI needs to draw a block, expressed as roles and ratios rather
+/// than Markdown kinds or theme colors.
+///
+/// This is the third type in the R3.25 split: `hane_markdown::NodeKind` is
+/// syntax, [`BlockKind`] is the display kind presentation decides, and
+/// `BlockDisplay` is the render policy the UI applies verbatim. Adding a Markdown
+/// construct means giving it a `BlockDisplay` here; the UI crate does not change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockDisplay {
+    /// Multiplier on the UI's body text size.
+    pub font_scale: f32,
+    pub weight: BlockWeight,
+    pub surface: BlockSurface,
+    pub tint: BlockTint,
+    /// Whether the whole block is set in the monospace family.
+    pub monospace: bool,
+}
+
+impl Default for BlockDisplay {
+    fn default() -> Self {
+        Self {
+            font_scale: 1.0,
+            weight: BlockWeight::Normal,
+            surface: BlockSurface::Default,
+            tint: BlockTint::Default,
+            monospace: false,
+        }
+    }
+}
+
+impl BlockKind {
+    /// The render policy for this display kind. Heading scales are relative to
+    /// body text; they mirror the pixel sizes the UI used before the split.
+    pub fn display(self) -> BlockDisplay {
+        let heading = |scale| BlockDisplay {
+            font_scale: scale,
+            weight: BlockWeight::Semibold,
+            ..BlockDisplay::default()
+        };
+        match self {
+            Self::Heading(1) => heading(24.0 / 14.0),
+            Self::Heading(2) => heading(21.0 / 14.0),
+            Self::Heading(3) => heading(18.0 / 14.0),
+            Self::Heading(_) => heading(16.0 / 14.0),
+            Self::CodeBlock => BlockDisplay {
+                surface: BlockSurface::Code,
+                monospace: true,
+                ..BlockDisplay::default()
+            },
+            Self::Quote => BlockDisplay {
+                tint: BlockTint::Muted,
+                ..BlockDisplay::default()
+            },
+            Self::TableRow => BlockDisplay {
+                surface: BlockSurface::Table,
+                monospace: true,
+                ..BlockDisplay::default()
+            },
+            Self::Image => BlockDisplay {
+                surface: BlockSurface::Media,
+                ..BlockDisplay::default()
+            },
+            Self::Paragraph
+            | Self::ListItem
+            | Self::Rule
+            | Self::TableDelimiter
+            | Self::Unsupported => BlockDisplay::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImagePresentation {
     pub alt: String,
@@ -245,6 +437,10 @@ pub struct VisualBlock {
     pub estimated_height: f32,
     pub measured_height: Option<f32>,
     pub invalid: bool,
+    /// The block context this presentation was built from. Callers cache blocks
+    /// and must rebuild when the document context index changes the answer, so
+    /// the input is recorded here instead of being inferred back from `kind`.
+    pub context: LineContext,
     /// Source range whose Markdown markers are currently disclosed.
     pub disclosure: Option<SourceRange>,
     /// Present only for an inactive standalone Markdown image. The UI resolves
@@ -256,6 +452,12 @@ pub struct VisualBlock {
 impl VisualBlock {
     pub fn height(&self) -> f32 {
         self.measured_height.unwrap_or(self.estimated_height)
+    }
+
+    /// Render policy for this block. The UI draws from this alone and never
+    /// matches on [`BlockKind`].
+    pub fn display(&self) -> BlockDisplay {
+        self.kind.display()
     }
 
     pub fn rebase(&mut self, deltas: &[RevisionDelta], current: Revision) -> bool {
@@ -307,6 +509,7 @@ pub fn present_plain(
         estimated_height: 24.0,
         measured_height: None,
         invalid: false,
+        context: LineContext::Normal,
         disclosure: None,
         image: None,
     }
@@ -331,25 +534,34 @@ pub fn present_raw_source(
     block
 }
 
-fn presentation_block_kind(kind: MarkdownBlockKind) -> BlockKind {
+/// Maps a parser syntax kind to the display kind for a block. Returning `None`
+/// means "this node does not decide how the block looks" — either it is a
+/// structural container (list, table) or a construct with no presenter yet, in
+/// which case the raw-source fallback applies. This function is the single seam
+/// between the parser vocabulary and the display vocabulary.
+fn presentation_block_kind(kind: NodeKind) -> Option<BlockKind> {
     match kind {
-        MarkdownBlockKind::Paragraph => BlockKind::Paragraph,
-        MarkdownBlockKind::Heading(level) => BlockKind::Heading(level),
-        MarkdownBlockKind::CodeBlock => BlockKind::CodeBlock,
-        MarkdownBlockKind::Quote => BlockKind::Quote,
-        MarkdownBlockKind::ListItem => BlockKind::ListItem,
-        MarkdownBlockKind::Rule => BlockKind::Rule,
+        NodeKind::Paragraph => Some(BlockKind::Paragraph),
+        NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
+        NodeKind::CodeBlock => Some(BlockKind::CodeBlock),
+        NodeKind::Quote => Some(BlockKind::Quote),
+        NodeKind::ListItem { .. } => Some(BlockKind::ListItem),
+        NodeKind::Rule => Some(BlockKind::Rule),
+        _ => None,
     }
 }
 
-fn presentation_style_kind(kind: MarkdownInlineKind) -> StyleKind {
+/// Maps a parser syntax kind to the display kind for an inline run. `None` means
+/// the node carries no styling of its own.
+fn presentation_style_kind(kind: NodeKind) -> Option<StyleKind> {
     match kind {
-        MarkdownInlineKind::Bold => StyleKind::Bold,
-        MarkdownInlineKind::Italic => StyleKind::Italic,
-        MarkdownInlineKind::Strikethrough => StyleKind::Strikethrough,
-        MarkdownInlineKind::InlineCode => StyleKind::InlineCode,
-        MarkdownInlineKind::Link => StyleKind::Link,
-        MarkdownInlineKind::CodeBlock => StyleKind::CodeBlock,
+        NodeKind::Strong => Some(StyleKind::Bold),
+        NodeKind::Emphasis => Some(StyleKind::Italic),
+        NodeKind::Strikethrough => Some(StyleKind::Strikethrough),
+        NodeKind::InlineCode => Some(StyleKind::InlineCode),
+        NodeKind::Link => Some(StyleKind::Link),
+        NodeKind::CodeBlock => Some(StyleKind::CodeBlock),
+        _ => None,
     }
 }
 
@@ -383,16 +595,24 @@ fn marker_is_disclosed(
         return false;
     };
     range_touches(marker, disclosure)
-        || parsed.spans.iter().any(|span| {
-            span.source_range.start <= marker.start
-                && marker.end <= span.source_range.end
-                && range_touches(span.source_range, disclosure)
-        })
-        || parsed.blocks.iter().any(|block| {
-            marker.start == block.source_range.start
-                && marker.end <= block.source_range.end
-                && range_touches(block.source_range, disclosure)
-        })
+        || parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| is_delimited_inline(node.kind))
+            .any(|(_, span)| {
+                span.source_range.start <= marker.start
+                    && marker.end <= span.source_range.end
+                    && range_touches(span.source_range, disclosure)
+            })
+        || parsed
+            .tree
+            .blocks()
+            .filter(|(_, node)| presentation_block_kind(node.kind).is_some())
+            .any(|(_, block)| {
+                marker.start == block.source_range.start
+                    && marker.end <= block.source_range.end
+                    && range_touches(block.source_range, disclosure)
+            })
 }
 
 /// Returns true when `segments` tile `range` contiguously, so every source byte
@@ -453,9 +673,9 @@ pub fn present_markdown_with_disclosure(
     }
     let parsed = parse_document(revision, range, source);
     let kind = parsed
-        .blocks
-        .first()
-        .map(|block| presentation_block_kind(block.kind))
+        .tree
+        .blocks()
+        .find_map(|(_, block)| presentation_block_kind(block.kind))
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
@@ -511,9 +731,11 @@ pub fn present_markdown_with_disclosure(
     }
     let source_map = SourceMap { segments };
     let mut style_runs = parsed
-        .spans
+        .tree
         .iter()
-        .filter_map(|span| {
+        .filter(|(_, node)| is_delimited_inline(node.kind))
+        .filter_map(|(_, span)| {
+            let style = presentation_style_kind(span.kind)?;
             let clipped = SourceRange {
                 start: span.source_range.start.max(range.start),
                 end: span.source_range.end.min(range.end),
@@ -526,7 +748,7 @@ pub fn present_markdown_with_disclosure(
                 .visual_offset;
             (start.0 < end.0).then_some(StyleRun {
                 visual_range: VisualRange { start, end },
-                kind: presentation_style_kind(span.kind),
+                kind: style,
             })
         })
         .collect::<Vec<_>>();
@@ -542,6 +764,7 @@ pub fn present_markdown_with_disclosure(
         measured_height: None,
         invalid: false,
         kind,
+        context: LineContext::Normal,
         disclosure,
         image: None,
     }
@@ -564,20 +787,21 @@ pub fn present_polished_line(
     // A fenced-code line has no disclosable inline markup; its content is literal,
     // so it stays a code block regardless of cursor position and wins over image
     // and table recognition that would otherwise mis-read the literal text.
-    if context == LineContext::FencedCode {
-        return present_fenced_code_line(block_id, revision, range, source, line_height);
-    }
-    if let Some(image) = parse_standalone_image(source)
+    let mut block = if context == LineContext::FencedCode {
+        present_fenced_code_line(block_id, revision, range, source, line_height)
+    } else if let Some(image) = parse_standalone_image(source)
+        .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
+    {
+        present_image(block_id, revision, range, source, line_height, image)
+    } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
-        return present_image(block_id, revision, range, source, line_height, image);
-    }
-    if context == LineContext::Table
-        && disclosure.is_none_or(|active| !range_touches(range, active))
-    {
-        return present_table_line(block_id, revision, range, source, line_height);
-    }
-    present_markdown_with_disclosure(block_id, revision, range, source, line_height, disclosure)
+        present_table_line(block_id, revision, range, source, line_height)
+    } else {
+        present_markdown_with_disclosure(block_id, revision, range, source, line_height, disclosure)
+    };
+    block.context = context;
+    block
 }
 
 /// Presents one line that the context index reports is inside a fenced code
@@ -696,6 +920,7 @@ fn present_image(
         estimated_height: estimated_height(BlockKind::Image, line_height),
         measured_height: None,
         invalid: false,
+        context: LineContext::Normal,
         disclosure: None,
         image: Some(ImagePresentation {
             alt: image.alt.to_owned(),
@@ -729,6 +954,7 @@ fn present_table_line(
             estimated_height: estimated_height(BlockKind::TableDelimiter, line_height),
             measured_height: None,
             invalid: false,
+            context: LineContext::Normal,
             disclosure: None,
             image: None,
         };
@@ -790,6 +1016,7 @@ fn present_table_line(
         estimated_height: line_height * 1.2,
         measured_height: None,
         invalid: false,
+        context: LineContext::Normal,
         disclosure: None,
         image: None,
     }
