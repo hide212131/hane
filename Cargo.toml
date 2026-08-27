@@ -7,6 +7,7 @@ members = [
     "crates/markdown",
     "crates/metrics",
     "crates/presentation",
+    "crates/session",
     "crates/ui",
 ]
 resolver = "2"
@@ -23,6 +24,7 @@ hane-editor = { path = "crates/editor" }
 hane-markdown = { path = "crates/markdown" }
 hane-metrics = { path = "crates/metrics" }
 hane-presentation = { path = "crates/presentation" }
+hane-session = { path = "crates/session" }
 hane-benchmark = { path = "crates/benchmark" }
 hane-ui = { path = "crates/ui" }
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }

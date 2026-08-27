@@ -65,7 +65,7 @@ impl Element for InputCapture {
         );
         self.input.update(cx, |view, _| {
             let painted_at = Instant::now();
-            let measurements = view.editor.mark_frame_painted();
+            let measurements = view.editor_mut().mark_frame_painted();
             let model_latencies = measurements
                 .iter()
                 .map(|measurement| measurement.keystroke_to_model());

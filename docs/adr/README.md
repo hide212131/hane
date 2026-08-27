@@ -30,6 +30,7 @@ Phase 2以降の実装判断を記録する。ADR-0018以降は `docs/refactor-p
 | [ADR-0016](0016-phase3-typora-editing-plan.md) | Phase 3 Typora-style Editing実装計画 |
 | [ADR-0017](0017-phase4-polish-plan.md) | Phase 4 Polish実装計画 |
 | [ADR-0018](0018-block-index.md) | revision 付き Block Index |
+| [ADR-0019](0019-document-session-and-file-service.md) | DocumentSession と File I/O 境界 |
 
 ## Phase 0 実装時の参照順
 

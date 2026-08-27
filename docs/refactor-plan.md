@@ -267,17 +267,17 @@ block 分割 median 5.4 µs / p95 6.4 µs、1編集あたりの再解析は 1 Ki
 **目的**: ファイラー追加前に、ファイル状態・永続化・最近使ったファイルを描画主体の
 `EditorView` から分離し、複数ファイル/選択切替へ拡張できるようにする。
 
-- [ ] `DocumentSession`（document/editor、path、dirty/saved revision、save generation、表示状態）と
+- [x] `DocumentSession`（document/editor、path、dirty/saved revision、save generation、表示状態）と
       `EditorView`（GPUI 入出力・描画）を分離する。
-- [ ] open/save/save-as/autosave/atomic write を `FileService` または同等の I/O 境界へ集約し、
+- [x] open/save/save-as/autosave/atomic write を `FileService` または同等の I/O 境界へ集約し、
       UI は request/result を扱うだけにする。ファイル I/O は入力処理を待たせない。
-- [ ] canonical path と表示名を分離し、同一ファイル判定、rename/move、削除、外部変更、
+- [x] canonical path と表示名を分離し、同一ファイル判定、rename/move、削除、外部変更、
       読み込み失敗を表現できる `FileIdentity` を定義する。
-- [ ] Recent Files と将来の filer tree state を分け、永続設定が `EditorView` のライフサイクルに
+- [x] Recent Files と将来の filer tree state を分け、永続設定が `EditorView` のライフサイクルに
       依存しない repository/store API にする。
-- [ ] 画像等の相対 resource 解決を `EditorView` の `document_directory` 計算から分離し、
+- [x] 画像等の相対 resource 解決を `EditorView` の `document_directory` 計算から分離し、
       session/file identity を基準に解決する `ResourceResolver` を用意する。
-- [ ] filer が発行する open/rename/move/delete と、未保存 session、autosave、外部変更の競合規則を
+- [x] filer が発行する open/rename/move/delete と、未保存 session、autosave、外部変更の競合規則を
       UI 非依存テストで固定する。
 
 **完了条件**: `EditorView` が `PathBuf`、atomic save、recent-files 永続化を直接所有しない。

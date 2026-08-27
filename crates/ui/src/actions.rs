@@ -46,12 +46,12 @@ command_actions! {
     SaveAs ("cmd-shift-s") => save_as |view, cx| { view.prompt_save_as(cx); },
     ToggleAutosave ("cmd-alt-a") => toggle_autosave_action |view, cx| { view.toggle_autosave(cx); },
     Newline ("enter") => newline |view, cx| {
-        if view.editor.ime().is_none() {
+        if view.editor().ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, cx| {
-        if view.editor.ime().is_none() {
+        if view.editor().ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);
         }
     },
@@ -77,12 +77,12 @@ command_actions! {
     Undo ("cmd-z") => undo |view, cx| { view.dispatch(EditorCommand::Undo, cx); },
     Redo ("cmd-shift-z") => redo |view, cx| { view.dispatch(EditorCommand::Redo, cx); },
     Copy ("cmd-c") => copy |view, cx| {
-        if let Ok(text) = view.editor.selected_text() && !text.is_empty() {
+        if let Ok(text) = view.editor().selected_text() && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     },
     Cut ("cmd-x") => cut |view, cx| {
-        if let Ok(text) = view.editor.selected_text() && !text.is_empty() {
+        if let Ok(text) = view.editor().selected_text() && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             view.dispatch(EditorCommand::Backspace, cx);
         }

@@ -3,9 +3,9 @@
 `docs/refactor-plan.md` に定義された各フェーズを、依存関係と手戻りの少なさを基準に並べた
 実施計画。フェーズ番号順ではなく、後続作業の前提を先に確定できる順序を採用する。
 
-## 進捗ステータス（最終更新: 2026-08-27）
+## 進捗ステータス（最終更新: 2026-08-28）
 
-**現在地: R3.5（revision 付き BlockIndex）完了。次は R3.75（DocumentSession / FileService）に着手する。**
+**現在地: R3.75（DocumentSession / FileService）完了。次は R4A（ブロック単位の仮想化・描画）に着手する。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -16,8 +16,8 @@
 | 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
 | 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
 | 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
-| 8 | R3.75 DocumentSession / FileService | ⬜ 未着手 ← **現在地** |
-| 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 |
+| 8 | R3.75 DocumentSession / FileService | ✅ 完了 |
+| 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 ← **現在地** |
 | 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 |
 | 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 |
 | 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
@@ -79,6 +79,50 @@
   instrument build は metrics CSV の `block_index` record（3列追加）へ出力する。
   `hane-bench` に再現シナリオを追加。100k block の文書で打鍵 median 2.5 µs / p95 4.2 µs、
   block 分割 median 5.4 µs / p95 6.4 µs、1編集の再解析は 1 KiB 未満、invalidate 0。
+
+### R3.75 の完了内容
+
+- ✅ 新 crate `hane-session`（GPUI 非依存、`document` / `editor` のみに依存）。ファイル状態・
+  永続化・I/O 境界をここへ集約した。設計判断は ADR-0019。
+- ✅ `FileIdentity`。読み書きに使う path と同一性判定用の canonical path を分離し、表示名は
+  判定に関与しない。`.` / `..` の正規化は fs に触れずに行うため、存在しない Save As 先も
+  同一ファイル判定に載る。rename/move は path だけを差し替え、削除・外部変更は
+  `FileStamp`（長さ + 更新時刻）比較の `ExternalChange` として表す。
+- ✅ `FileService`（`load` / `save` / `stamp`）が唯一のファイル境界。atomic write（一時ファイル +
+  rename）はここだけが行う。上書き可否は `OverwriteGuard` を job が運び、`ExpectStamp` は
+  書き込み直前に disk を確認して不一致なら書かずに `ExternalChange` を返す。起動時の初回読み込み
+  以外の open / save はすべて background executor へ出すため、入力処理がファイル I/O を待たない。
+- ✅ `DocumentSession`。editor・`FileState`・保存済み revision・autosave 世代・実行中/待機中の
+  保存を持ち、I/O はせず要求（`SaveDecision` / `OpenDecision` / `FileEventOutcome`）を返す。
+  document 差し替えごとに増える `generation` で、派生状態と実行中 job の有効性を判定する。
+  保存は同時に1つで、実行中の追加要求は最後の1つだけを queue する。`SaveTicket` に一致しない
+  結果は `Superseded` として捨てる。外部変更・削除は自動解決せず、dirty な session の内容を
+  失わない。
+- ✅ `SessionSet`。open 要求を「既に開いている → 切替」「clean な active → 差し替え」
+  「dirty な active → 拒否」へ振り分ける。同じファイルを開き直しても未保存編集は破棄しない。
+  最後の1 session を閉じると untitled へ置き換わり、window が空にならない。
+- ✅ 永続設定を `SettingsRepository` / `RecentFilesRepository` の2 trait に分け、`StateStores`
+  が `Arc` handle として渡す。store は view より長生きしてよく、view の生成・破棄に従属しない。
+  filer tree state は3つ目の repository として足せる。
+- ✅ `ResourceResolver`。相対画像の解決を `EditorView::document_directory` の計算から外し、
+  session の file identity を基準に行う。untitled 文書は base を持たず working directory を借りない。
+- ✅ UI 配線。`EditorView` は `sessions: SessionSet` と `files: Arc<dyn FileService>` を持ち、
+  `PathBuf` フィールド・atomic save・recent-files 永続化を所有しない。`crates/ui` から
+  `storage.rs` を撤去し、`editor` フィールドは `editor()` / `editor_mut()` 経由になった。
+  `activate_session` で scroll 位置を持ち回しながら session を切り替えられる。
+- ✅ 競合規則の UI 非依存テスト（`crates/session/tests/conflict_rules.rs`、16 本）。
+  未保存時の open 拒否、既に開いているファイルの切替、保存の直列化と queue 畳み込み、
+  document 差し替え後の結果破棄、autosave の世代・revision 判定、外部変更時の上書き拒否と
+  確認後の上書き、rename/delete の追従、読み込み失敗、close 拒否、session 切替時の状態保持。
+- ✅ 性能。`hane-bench buffer` は R3.5 記録と同水準（打鍵時 block index median 3 µs / p95 4 µs、
+  block 分割 median 5 µs / p95 7 µs、再解析 980 bytes 以下、invalidate 0）。
+
+### R3.75 の残メモ
+
+- 🔶 GUI 経由の `keystroke_to_paint` 実測（instrument build + 入力注入）は未実施。R2 前半の
+  残タスクと同じ枠で回収する。
+- 🔶 外部変更の検出は `FileEvent` を受け取る API までで、ファイル監視そのものは未実装。
+  filer 実装時に watcher を足す。
 
 ### R3.5 の残メモ（R4A で回収する）
 

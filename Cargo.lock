@@ -2410,6 +2410,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hane-session"
+version = "0.1.0"
+dependencies = [
+ "hane-document",
+ "hane-editor",
+]
+
+[[package]]
 name = "hane-ui"
 version = "0.1.0"
 dependencies = [
@@ -2419,6 +2427,7 @@ dependencies = [
  "hane-markdown",
  "hane-metrics",
  "hane-presentation",
+ "hane-session",
 ]
 
 [[package]]

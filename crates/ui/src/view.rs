@@ -6,7 +6,6 @@ use crate::line::{
     block_font_size, disclosure_for_line, inline_display_for, line_element_from_block,
     presented_line,
 };
-use crate::storage::{PersistentState, atomic_save_document};
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, FontStyle, FontWeight, InteractiveElement, IntoElement,
@@ -24,8 +23,14 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockWeight, HeightIndex, LineContext, VisualOffset};
+use hane_session::{
+    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService, RecentFiles,
+    SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId,
+    SessionSet, SessionViewState, Settings, StateStores, run_save_job,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
@@ -49,34 +54,34 @@ fn content_top_for_scroll(scroll_y: f32) -> f32 {
     -scroll_y
 }
 
-fn autosave_request_is_current(
-    current_generation: u64,
-    requested_generation: u64,
-    current_revision: Revision,
-    requested_revision: Revision,
-    enabled: bool,
-    has_path: bool,
-) -> bool {
-    enabled
-        && has_path
-        && current_generation == requested_generation
-        && current_revision == requested_revision
-}
-
 fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
     current == candidate
 }
 
+/// Identifies the document a background job was started for. A result that
+/// comes back for another session, or for a document that has since been
+/// replaced, is dropped instead of published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentKey {
+    session: SessionId,
+    generation: u64,
+}
+
 pub struct EditorView {
-    pub(crate) editor: Editor,
+    /// Every open document. Holding a set rather than one editor is what lets a
+    /// filer add and switch documents without the renderer changing.
+    sessions: SessionSet,
+    /// The only route to the filesystem. Reads and writes are handed to it on a
+    /// background thread, so no file operation sits on the input path.
+    files: Arc<dyn FileService>,
+    stores: StateStores,
+    settings: Settings,
+    recent: RecentFiles,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
     viewport_height: f32,
     pub(crate) metrics: FrameMetrics,
-    file_label: String,
-    file_path: Option<PathBuf>,
-    saved_revision: Revision,
     status: Option<String>,
     theme: Theme,
     #[cfg(feature = "instrument")]
@@ -89,47 +94,42 @@ pub struct EditorView {
     /// priority between the two lives in `BlockIndexState`.
     block_index: BlockIndexState,
     document_parse_job_running: bool,
-    document_generation: u64,
-    persistent_state: PersistentState,
-    save_generation: u64,
-    save_job_running: bool,
-    pending_save_path: Option<PathBuf>,
 }
 
 impl EditorView {
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
-        Self::from_editor(
-            Editor::new(text),
-            file_label,
-            None,
-            PersistentState::load_default(),
+        Self::from_sessions(
+            SessionSet::with_untitled(text, file_label),
+            Arc::new(OsFileService),
+            StateStores::from_environment(),
             cx,
         )
     }
 
-    fn from_editor(
-        editor: Editor,
-        file_label: impl Into<String>,
-        file_path: Option<PathBuf>,
-        persistent_state: PersistentState,
+    fn from_sessions(
+        sessions: SessionSet,
+        files: Arc<dyn FileService>,
+        stores: StateStores,
         cx: &mut Context<Self>,
     ) -> Self {
         let theme = DEFAULT_THEME;
-        let saved_revision = editor.document().revision();
+        let settings = stores.settings().load();
+        let recent = stores.recent_files().load();
         let heights = HeightIndex::new(std::iter::repeat_n(
             theme.line_height,
-            editor.document().line_count(),
+            sessions.active().editor().document().line_count(),
         ));
         Self {
-            editor,
+            sessions,
+            files,
+            stores,
+            settings,
+            recent,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
             viewport_height: theme.line_height,
             metrics: FrameMetrics::new(METRICS_CAPACITY),
-            file_label: file_label.into(),
-            file_path,
-            saved_revision,
             status: None,
             theme,
             #[cfg(feature = "instrument")]
@@ -139,33 +139,25 @@ impl EditorView {
             block_context: None,
             block_index: BlockIndexState::new(),
             document_parse_job_running: false,
-            document_generation: 0,
-            persistent_state,
-            save_generation: 0,
-            save_job_running: false,
-            pending_save_path: None,
         }
     }
 
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
         #[cfg(feature = "instrument")]
         let started = Instant::now();
-        let file = std::fs::File::open(path)?;
-        let document = RopeBuffer::from_reader(std::io::BufReader::new(file))?;
-        let mut persistent_state = PersistentState::load_default();
-        persistent_state.remember(path);
-        if let Err(error) = persistent_state.save() {
-            eprintln!("could not save recent files: {error}");
-        }
-        cx.add_recent_document(path);
+        let files: Arc<dyn FileService> = Arc::new(OsFileService);
+        // The first document is read before the window exists, so this one read
+        // is synchronous by construction; every later one goes to a thread.
+        let loaded = files.load(path)?;
         #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
-        let mut view = Self::from_editor(
-            Editor::from_document(document),
-            path.display().to_string(),
-            Some(path.to_path_buf()),
-            persistent_state,
+        let mut view = Self::from_sessions(
+            SessionSet::with_loaded(loaded),
+            files,
+            StateStores::from_environment(),
             cx,
         );
+        view.remember_recent(path);
+        cx.add_recent_document(path);
         #[cfg(feature = "instrument")]
         {
             view.instrumentation.file_open_time = started.elapsed();
@@ -175,23 +167,88 @@ impl EditorView {
     }
 
     pub fn editor(&self) -> &Editor {
-        &self.editor
+        self.sessions.active().editor()
+    }
+
+    pub(crate) fn editor_mut(&mut self) -> &mut Editor {
+        self.sessions.active_mut().editor_mut()
+    }
+
+    /// The open documents, for a tab strip or filer to render.
+    pub fn sessions(&self) -> impl Iterator<Item = &DocumentSession> {
+        self.sessions.sessions()
+    }
+
+    pub fn active_session(&self) -> &DocumentSession {
+        self.sessions.active()
+    }
+
+    /// Switches to another open document, carrying the current one's scroll
+    /// position with it and rebuilding everything derived from the document.
+    pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        if id == self.sessions.active_id() {
+            return true;
+        }
+        let scroll_y = self.scroll_y;
+        self.sessions
+            .active_mut()
+            .set_view_state(SessionViewState { scroll_y });
+        if !self.sessions.activate(id) {
+            return false;
+        }
+        self.on_document_replaced();
+        self.schedule_document_parse(cx);
+        cx.notify();
+        true
+    }
+
+    fn document_key(&self) -> DocumentKey {
+        DocumentKey {
+            session: self.sessions.active_id(),
+            generation: self.sessions.active().generation(),
+        }
+    }
+
+    /// Rebuilds the view state that only makes sense for one document instance.
+    fn on_document_replaced(&mut self) {
+        let lines = self.sessions.active().editor().document().line_count();
+        self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
+        self.scroll_y = self.sessions.active().view_state().scroll_y;
+        self.line_cache.clear();
+        self.block_context = None;
+        self.block_index = BlockIndexState::new();
+    }
+
+    fn remember_recent(&mut self, path: &Path) {
+        self.recent.remember(path);
+        if let Err(error) = self.stores.recent_files().store(&self.recent) {
+            self.status = Some(format!("Recent files failed: {error}"));
+        }
+    }
+
+    fn store_settings(&mut self) {
+        if let Err(error) = self.stores.settings().store(&self.settings) {
+            self.status = Some(format!("Settings failed: {error}"));
+        }
     }
 
     /// Block that owns a physical source line, with the confidence the index has
     /// in it. `None` while no index is published yet, or for a line in a document
     /// that holds no Markdown block at all.
     pub fn block_at_line(&self, line: usize) -> Option<IndexedBlock> {
-        block_at_line(self.block_index.index()?, self.editor.document(), line)
+        block_at_line(self.block_index.index()?, self.editor().document(), line)
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
         // Keep block boundaries current without waiting for the background parse:
         // this re-parses only the edited window, never the document.
-        if let Some(update) = self.block_index.apply_edits(self.editor.document()) {
+        if let Some(update) = self
+            .block_index
+            .apply_edits(self.sessions.active().editor().document())
+        {
             self.record_block_index_update(&update);
         }
-        let lines = self.editor.document().line_count();
+        let lines = self.editor().document().line_count();
         if lines != self.heights.len() {
             self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
             self.line_cache.clear();
@@ -202,28 +259,26 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Arms the debounce timer for the active session. Each call invalidates the
+    /// timer armed by the previous keystroke, so a burst of typing produces one
+    /// write at the end rather than one per key.
     fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
-        self.save_generation = self.save_generation.wrapping_add(1);
-        if !self.persistent_state.settings.autosave
-            || self.file_path.is_none()
-            || self.editor.document().revision() == self.saved_revision
-        {
+        let autosave = self.settings.autosave;
+        let session = self.sessions.active_mut();
+        session.note_edit();
+        let Some(ticket) = session.autosave_ticket(autosave) else {
             return;
-        }
-        let generation = self.save_generation;
-        let revision = self.editor.document().revision();
+        };
+        let id = session.id();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(750)).await;
             let should_save = view
                 .read_with(cx, |view, _| {
-                    autosave_request_is_current(
-                        view.save_generation,
-                        generation,
-                        view.editor.document().revision(),
-                        revision,
-                        view.persistent_state.settings.autosave,
-                        view.file_path.is_some(),
-                    )
+                    view.sessions.active_id() == id
+                        && view
+                            .sessions
+                            .active()
+                            .autosave_is_current(ticket, view.settings.autosave)
                 })
                 .unwrap_or(false);
             if should_save {
@@ -234,80 +289,118 @@ impl EditorView {
     }
 
     pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.file_path.clone() else {
-            self.status = Some("Use Save As for an untitled document".to_owned());
-            cx.notify();
-            return;
-        };
-        self.save_to(path, cx);
+        self.save_active(SaveIntent::Current, cx);
     }
 
     pub(crate) fn save_or_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.file_path.is_some() {
+        if self.sessions.active().path().is_some() {
             self.save_current(cx);
         } else {
             self.prompt_save_as(cx);
         }
     }
 
-    fn save_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.save_job_running {
-            self.pending_save_path = Some(path);
-            self.status = Some("Save queued…".to_owned());
-            cx.notify();
+    fn save_active(&mut self, intent: SaveIntent, cx: &mut Context<Self>) {
+        self.save_session(self.sessions.active_id(), intent, cx);
+    }
+
+    /// Hands one accepted write to the I/O boundary. The session decides whether
+    /// there is a write to do at all; the view only reports what happened.
+    fn save_session(&mut self, id: SessionId, intent: SaveIntent, cx: &mut Context<Self>) {
+        let Some(decision) = self
+            .sessions
+            .get_mut(id)
+            .map(|session| session.request_save(intent))
+        else {
             return;
+        };
+        match decision {
+            SaveDecision::NeedsPath => {
+                self.status = Some("Use Save As for an untitled document".to_owned());
+            }
+            SaveDecision::Queued => {
+                self.status = Some("Save queued…".to_owned());
+            }
+            SaveDecision::Write(job) => {
+                self.status = Some("Saving…".to_owned());
+                let files = self.files.clone();
+                let path = job.path.clone();
+                let ticket = job.ticket;
+                cx.spawn(async move |view, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
+                        })
+                        .await;
+                    let _ = view.update(cx, |view, cx| {
+                        view.finish_save(id, ticket, &path, result, cx);
+                    });
+                })
+                .detach();
+            }
         }
-        self.save_job_running = true;
-        let snapshot = self.editor.document().clone();
-        let revision = snapshot.revision();
-        self.status = Some("Saving…".to_owned());
-        cx.spawn(async move |view, cx| {
-            let save_path = path.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { atomic_save_document(&save_path, &snapshot) })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.save_job_running = false;
-                match result {
-                    Ok(()) => {
-                        view.file_path = Some(path.clone());
-                        view.file_label = path.display().to_string();
-                        if view.editor.document().revision() == revision {
-                            view.saved_revision = revision;
-                            view.status = Some("Saved".to_owned());
-                        } else {
-                            view.status = Some("Saved snapshot; newer edits pending".to_owned());
-                            view.schedule_autosave(cx);
-                        }
-                        view.persistent_state.remember(&path);
-                        if let Err(error) = view.persistent_state.save() {
-                            view.status =
-                                Some(format!("Saved document; recent files failed: {error}"));
-                        }
-                        cx.add_recent_document(&path);
-                    }
-                    Err(error) => view.status = Some(format!("Save failed: {error}")),
-                }
-                if let Some(pending) = view.pending_save_path.take() {
-                    view.save_to(pending, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        cx.notify();
+    }
+
+    fn finish_save(
+        &mut self,
+        id: SessionId,
+        ticket: SaveTicket,
+        path: &Path,
+        result: Result<SavedFile, SaveFailure>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(outcome) = self
+            .sessions
+            .get_mut(id)
+            .map(|session| session.finish_save(ticket, result))
+        else {
+            return;
+        };
+        match outcome {
+            SaveOutcome::Saved => {
+                self.status = Some("Saved".to_owned());
+                self.remember_recent(path);
+                cx.add_recent_document(path);
+            }
+            SaveOutcome::SavedStale => {
+                self.status = Some("Saved snapshot; newer edits pending".to_owned());
+                self.remember_recent(path);
+                cx.add_recent_document(path);
+                self.schedule_autosave(cx);
+            }
+            SaveOutcome::Conflict => {
+                self.status = Some(
+                    "Save refused: the file changed on disk. Save As, or save again to overwrite"
+                        .to_owned(),
+                );
+            }
+            SaveOutcome::Failed(error) => self.status = Some(format!("Save failed: {error}")),
+            // The document this write belonged to is gone; nothing to report.
+            SaveOutcome::Superseded => {}
+        }
+        if let Some(pending) = self
+            .sessions
+            .get_mut(id)
+            .and_then(DocumentSession::take_pending_save)
+        {
+            self.save_session(id, pending, cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
         let directory = self
-            .file_path
-            .as_deref()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("."));
-        let receiver = cx.prompt_for_new_path(directory, Some("Untitled.md"));
+            .sessions
+            .active()
+            .file()
+            .directory()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
-                let _ = view.update(cx, |view, cx| view.save_to(path, cx));
+                let _ = view.update(cx, |view, cx| view.save_active(SaveIntent::To(path), cx));
             }
             Ok(Err(error)) => {
                 let _ = view.update(cx, |view, cx| {
@@ -321,7 +414,7 @@ impl EditorView {
     }
 
     pub(crate) fn prompt_open(&mut self, cx: &mut Context<Self>) {
-        if self.editor.document().revision() != self.saved_revision {
+        if self.sessions.active().is_dirty() {
             self.status = Some("Save current changes before opening another file".to_owned());
             cx.notify();
             return;
@@ -335,7 +428,7 @@ impl EditorView {
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
-                    let _ = view.update(cx, |view, cx| view.load_path(&path, cx));
+                    let _ = view.update(cx, |view, cx| view.open_path(&path, cx));
                 }
             }
             Ok(Err(error)) => {
@@ -349,77 +442,90 @@ impl EditorView {
         .detach();
     }
 
-    fn load_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let result = std::fs::File::open(path)
-            .and_then(|file| RopeBuffer::from_reader(std::io::BufReader::new(file)));
-        match result {
-            Ok(document) => {
-                self.editor = Editor::from_document(document);
-                self.file_path = Some(path.to_path_buf());
-                self.file_label = path.display().to_string();
-                self.saved_revision = self.editor.document().revision();
-                self.heights = HeightIndex::new(std::iter::repeat_n(
-                    self.theme.line_height,
-                    self.editor.document().line_count(),
-                ));
-                self.scroll_y = 0.0;
-                self.line_cache.clear();
-                self.block_context = None;
-                self.block_index = BlockIndexState::new();
-                // A parse job started for the previous document must not publish
-                // into this one; revisions alone cannot tell them apart.
-                self.document_generation = self.document_generation.wrapping_add(1);
-                self.persistent_state.remember(path);
-                if let Err(error) = self.persistent_state.save() {
-                    self.status = Some(format!("Opened; recent files failed: {error}"));
-                } else {
-                    self.status = Some("Opened".to_owned());
-                }
-                cx.add_recent_document(path);
-                self.schedule_document_parse(cx);
+    /// Opens a path the way a filer will: the session set decides whether this
+    /// is a switch, a load, or a refusal, and the read itself happens on a
+    /// background thread so a large file never blocks typing.
+    pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        match self.sessions.open_decision(path, OpenPolicy::ReuseActive) {
+            OpenDecision::Reject(_) => {
+                self.status = Some("Save current changes before opening another file".to_owned());
+                cx.notify();
             }
+            OpenDecision::Activate(id) => {
+                self.activate_session(id, cx);
+                self.status = Some("Already open".to_owned());
+                cx.notify();
+            }
+            OpenDecision::Load { into } => {
+                self.status = Some("Opening…".to_owned());
+                let files = self.files.clone();
+                let path = path.to_path_buf();
+                cx.spawn(async move |view, cx| {
+                    let loaded = cx
+                        .background_executor()
+                        .spawn({
+                            let path = path.clone();
+                            async move { files.load(&path) }
+                        })
+                        .await;
+                    let _ = view.update(cx, |view, cx| view.finish_open(into, &path, loaded, cx));
+                })
+                .detach();
+                cx.notify();
+            }
+        }
+    }
+
+    fn finish_open(
+        &mut self,
+        into: Option<SessionId>,
+        path: &Path,
+        loaded: std::io::Result<LoadedFile>,
+        cx: &mut Context<Self>,
+    ) {
+        match loaded {
             Err(error) => self.status = Some(format!("Open failed: {error}")),
+            Ok(loaded) => {
+                // The read took time, and the target session may have been
+                // edited in the meantime: re-check before replacing it.
+                if into
+                    .is_some_and(|id| self.sessions.get(id).is_some_and(DocumentSession::is_dirty))
+                {
+                    self.status =
+                        Some("Save current changes before opening another file".to_owned());
+                } else {
+                    self.sessions.apply_open(into, loaded);
+                    self.on_document_replaced();
+                    self.status = Some("Opened".to_owned());
+                    self.remember_recent(path);
+                    cx.add_recent_document(path);
+                    self.schedule_document_parse(cx);
+                }
+            }
         }
         cx.notify();
     }
 
-    fn open_recent_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if self.editor.document().revision() != self.saved_revision {
-            self.status = Some("Save current changes before opening a recent file".to_owned());
-            cx.notify();
-        } else {
-            self.load_path(path, cx);
-        }
-    }
-
     pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
-        self.persistent_state.settings.autosave = !self.persistent_state.settings.autosave;
+        self.settings.autosave = !self.settings.autosave;
         self.status = Some(format!(
             "Autosave {}",
-            if self.persistent_state.settings.autosave {
-                "on"
-            } else {
-                "off"
-            }
+            if self.settings.autosave { "on" } else { "off" }
         ));
-        if let Err(error) = self.persistent_state.save() {
-            self.status = Some(format!("Settings failed: {error}"));
-        }
+        self.store_settings();
         self.schedule_autosave(cx);
         cx.notify();
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
-        self.persistent_state.settings.theme = self.persistent_state.settings.theme.next();
-        self.theme = resolve_theme(self.persistent_state.settings.theme, window.appearance());
+        self.settings.theme = self.settings.theme.next();
+        self.theme = resolve_theme(self.settings.theme, window.appearance());
         self.heights = HeightIndex::new(std::iter::repeat_n(
             self.theme.line_height,
-            self.editor.document().line_count(),
+            self.editor().document().line_count(),
         ));
         self.line_cache.clear();
-        if let Err(error) = self.persistent_state.save() {
-            self.status = Some(format!("Settings failed: {error}"));
-        }
+        self.store_settings();
         cx.notify();
     }
 
@@ -428,27 +534,31 @@ impl EditorView {
     /// formal `BlockIndex`. One job at a time; a result that no longer matches
     /// the document revision is re-scheduled instead of published.
     fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        let revision = self.editor.document().revision();
+        let revision = self.sessions.active().editor().document().revision();
         let context_is_current = self
             .block_context
             .as_ref()
             .is_some_and(|index| index.revision == revision);
-        if context_is_current && !self.block_index.needs_formal_parse(self.editor.document()) {
+        if context_is_current
+            && !self
+                .block_index
+                .needs_formal_parse(self.sessions.active().editor().document())
+        {
             return;
         }
         if self.document_parse_job_running {
             return;
         }
         self.document_parse_job_running = true;
-        let generation = self.document_generation;
-        let snapshot = self.editor.document().clone();
+        let key = self.document_key();
+        let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
             let current = view
                 .update(cx, |view, _| {
-                    view.document_generation == generation
+                    view.document_key() == key
                         && block_context_revision_is_current(
-                            view.editor.document().revision(),
+                            view.editor().document().revision(),
                             revision,
                         )
                 })
@@ -470,16 +580,17 @@ impl EditorView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.document_parse_job_running = false;
-                if view.document_generation != generation {
+                if view.document_key() != key {
                     view.schedule_document_parse(cx);
                     return;
                 }
                 // The index carries its own staleness rule, so it can still be
                 // rebased onto edits the context index has to be re-run for.
+                let document = view.sessions.active().editor().document();
                 view.block_index
-                    .publish(index, IndexSource::Formal, view.editor.document());
+                    .publish(index, IndexSource::Formal, document);
                 if block_context_revision_is_current(
-                    view.editor.document().revision(),
+                    view.editor().document().revision(),
                     context.revision,
                 ) {
                     view.background_presentation_generation = context.revision.0 + 1;
@@ -499,7 +610,7 @@ impl EditorView {
     }
 
     pub(crate) fn dispatch(&mut self, command: EditorCommand<'_>, cx: &mut Context<Self>) {
-        match self.editor.dispatch(command) {
+        match self.editor_mut().dispatch(command) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
         }
@@ -507,7 +618,7 @@ impl EditorView {
     }
 
     pub(crate) fn perform_cancel_composition(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self.editor.cancel_composition() {
+        if let Err(error) = self.editor_mut().cancel_composition() {
             self.report_error("composition cancel", error);
         }
         self.after_input(cx);
@@ -532,21 +643,21 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, LineContext::Normal))
+            .or_else(|| presented_line(self.editor(), line, LineContext::Normal))
         else {
             return;
         };
         let visual_offset = visual_offset_at_x(&block, event.position.x, self.theme, window);
-        let offset = source_offset_for_visual_position(&self.editor, line, &block, visual_offset);
+        let offset = source_offset_for_visual_position(self.editor(), line, &block, visual_offset);
         let selection = if event.modifiers.shift {
             Selection {
-                anchor: self.editor.selection().anchor,
+                anchor: self.editor().selection().anchor,
                 active: offset,
             }
         } else {
             Selection::caret(offset)
         };
-        if let Err(error) = self.editor.set_selection(selection) {
+        if let Err(error) = self.editor_mut().set_selection(selection) {
             self.report_error("mouse selection", error);
         } else {
             self.status = None;
@@ -568,27 +679,24 @@ impl EditorView {
             .line_cache
             .get(&line)
             .cloned()
-            .or_else(|| presented_line(&self.editor, line, LineContext::Normal))
+            .or_else(|| presented_line(self.editor(), line, LineContext::Normal))
         else {
             return;
         };
         let visual = visual_offset_at_x(&block, event.position.x, self.theme, window);
-        let offset = source_offset_for_visual_position(&self.editor, line, &block, visual);
+        let offset = source_offset_for_visual_position(self.editor(), line, &block, visual);
         let selection = Selection {
-            anchor: self.editor.selection().anchor,
+            anchor: self.editor().selection().anchor,
             active: offset,
         };
-        if self.editor.set_selection(selection).is_ok() {
+        if self.editor_mut().set_selection(selection).is_ok() {
             self.after_input(cx);
         }
     }
 
     fn scroll_cursor_into_view(&mut self) {
-        let Ok(line) = self
-            .editor
-            .document()
-            .line_for_offset(self.editor.selection().active)
-        else {
+        let editor = self.sessions.active().editor();
+        let Ok(line) = editor.document().line_for_offset(editor.selection().active) else {
             return;
         };
         let top = self.heights.prefix_sum(line.0);
@@ -605,24 +713,23 @@ impl EditorView {
         line: usize,
         context: LineContext,
     ) -> Option<hane_presentation::VisualBlock> {
-        let current_revision = self.editor.document().revision();
+        let current_revision = self.editor().document().revision();
         if let Some(mut block) = self.line_cache.remove(&line) {
-            let expected_disclosure = self
-                .editor
+            let editor = self.sessions.active().editor();
+            let expected_disclosure = editor
                 .document()
                 .line_range(LineId(line))
                 .ok()
-                .and_then(|range| disclosure_for_line(&self.editor, line, range));
+                .and_then(|range| disclosure_for_line(editor, line, range));
             let reusable = if block.revision == current_revision {
                 block.disclosure == expected_disclosure
-            } else if let Ok(deltas) = self.editor.document().deltas_since(block.revision) {
+            } else if let Ok(deltas) = editor.document().deltas_since(block.revision) {
                 !deltas
                     .iter()
                     .any(|delta| edit_affects_range(*delta, block.source_range))
                     && block.rebase(&deltas, current_revision)
                     && block.disclosure == expected_disclosure
-                    && self
-                        .editor
+                    && editor
                         .document()
                         .line_range(LineId(line))
                         .is_ok_and(|range| range == block.source_range)
@@ -636,7 +743,7 @@ impl EditorView {
                 return Some(block);
             }
         }
-        let block = presented_line(&self.editor, line, context)?;
+        let block = presented_line(self.sessions.active().editor(), line, context)?;
         self.line_cache.insert(line, block.clone());
         Some(block)
     }
@@ -727,7 +834,7 @@ impl EditorView {
         offset: usize,
         cx: &mut Context<Self>,
     ) -> Result<(), BufferError> {
-        self.editor
+        self.editor_mut()
             .set_selection(hane_editor::Selection::caret(hane_document::SourceOffset(
                 offset,
             )))?;
@@ -741,7 +848,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> Result<(), BufferError> {
         for _ in 0..count {
-            self.editor
+            self.editor_mut()
                 .dispatch(EditorCommand::MoveDown { extend: false })?;
         }
         self.after_input(cx);
@@ -816,7 +923,7 @@ impl EditorView {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
-        self.theme = resolve_theme(self.persistent_state.settings.theme, window.appearance());
+        self.theme = resolve_theme(self.settings.theme, window.appearance());
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
@@ -831,15 +938,15 @@ impl Render for EditorView {
         let cache_end = (visible.end + 128).min(self.heights.len());
         self.line_cache
             .retain(|line, _| cache_start <= *line && *line < cache_end);
+        let document = self.sessions.active().editor().document();
         let background_context = self.block_context.as_ref().filter(|index| {
-            index.revision == self.editor.document().revision()
-                && index.line_count() == self.editor.document().line_count()
+            index.revision == document.revision() && index.line_count() == document.line_count()
         });
         // Prefer the formal document-wide index; only fall back to a single
         // bounded scan of the viewport neighborhood while that index is stale.
         let local_context = background_context
             .is_none()
-            .then(|| local_block_context(self.editor.document(), visible.clone()));
+            .then(|| local_block_context(document, visible.clone()));
         let contexts = visible
             .clone()
             .map(|line| {
@@ -866,8 +973,8 @@ impl Render for EditorView {
         let top_space = self.heights.prefix_sum(visible.start);
         let bottom_space =
             (self.heights.total_height() - self.heights.prefix_sum(visible.end)).max(0.0);
-        let revision = self.editor.document().revision().0;
-        let bytes = self.editor.document().len_bytes().0;
+        let revision = self.editor().document().revision().0;
+        let bytes = self.editor().document().len_bytes().0;
         let p95 = self
             .metrics
             .painted_percentile(0.95)
@@ -877,10 +984,10 @@ impl Render for EditorView {
         } else {
             String::new()
         };
-        let dirty = if self.editor.document().revision() == self.saved_revision {
-            ""
-        } else {
+        let dirty = if self.sessions.active().is_dirty() {
             " · modified"
+        } else {
+            ""
         };
         let status = self.status.clone().unwrap_or_else(|| {
             format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
@@ -897,11 +1004,10 @@ impl Render for EditorView {
         let root = install_action_listeners(root, cx)
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(self.header_element(status, cx));
-        let document_directory = self
-            .file_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
+        // Relative image destinations resolve against the session's own file,
+        // never against the directory the process happens to run in.
+        let resolver = self.sessions.active().resource_resolver();
+        let editor = self.sessions.active().editor();
         let rendered = root.child(
             div()
                 .relative()
@@ -917,24 +1023,16 @@ impl Render for EditorView {
                         .w_full()
                         .child(div().h(px(top_space)))
                         .children(rendered_lines.into_iter().map(|(line, block)| {
-                            line_element_from_block(
-                                &self.editor,
-                                line,
-                                &block,
-                                self.theme,
-                                document_directory.as_deref(),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |view, event, window, cx| {
-                                    view.on_line_mouse_down(line, event, window, cx)
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(
-                                move |view, event, window, cx| {
+                            line_element_from_block(editor, line, &block, self.theme, &resolver)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |view, event, window, cx| {
+                                        view.on_line_mouse_down(line, event, window, cx)
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(move |view, event, window, cx| {
                                     view.on_line_mouse_move(line, event, window, cx)
-                                },
-                            ))
+                                }))
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
@@ -946,17 +1044,18 @@ impl Render for EditorView {
 
 impl EditorView {
     fn header_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
-        let autosave = if self.persistent_state.settings.autosave {
+        let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
             "Autosave off"
         };
-        let theme = format!("Theme {:?}", self.persistent_state.settings.theme);
+        let theme = format!("Theme {:?}", self.settings.theme);
+        let active_path = self.sessions.active().path();
         let recent = self
-            .persistent_state
-            .recent_files
+            .recent
+            .entries()
             .iter()
-            .filter(|path| Some(path.as_path()) != self.file_path.as_deref())
+            .filter(|path| Some(path.as_path()) != active_path)
             .take(3)
             .cloned()
             .enumerate()
@@ -973,7 +1072,7 @@ impl EditorView {
                     .text_color(rgb(self.theme.foreground))
                     .cursor_pointer()
                     .child(label)
-                    .on_click(cx.listener(move |view, _, _, cx| view.open_recent_path(&path, cx)))
+                    .on_click(cx.listener(move |view, _, _, cx| view.open_path(&path, cx)))
             })
             .collect::<Vec<_>>();
         div()
@@ -990,7 +1089,7 @@ impl EditorView {
                     .items_center()
                     .justify_between()
                     .px_3()
-                    .child(self.file_label.clone())
+                    .child(self.sessions.active().label())
                     .child(status),
             )
             .child(
@@ -1201,34 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn autosave_rejects_stale_generation_or_revision() {
-        assert!(autosave_request_is_current(
-            8,
-            8,
-            Revision(4),
-            Revision(4),
-            true,
-            true,
-        ));
-        assert!(!autosave_request_is_current(
-            9,
-            8,
-            Revision(4),
-            Revision(4),
-            true,
-            true,
-        ));
-        assert!(!autosave_request_is_current(
-            8,
-            8,
-            Revision(5),
-            Revision(4),
-            true,
-            true,
-        ));
-    }
-
-    #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
         let mut document = RopeBuffer::from_text(source);
@@ -1265,8 +1336,7 @@ mod tests {
             Some(hane_markdown::NodeKind::CodeBlock)
         );
         assert!(
-            (0..document.line_count())
-                .all(|line| block_at_line(&index, &document, line).is_some())
+            (0..document.line_count()).all(|line| block_at_line(&index, &document, line).is_some())
         );
     }
 

@@ -9,8 +9,8 @@ use hane_presentation::{
     BlockDisplay, BlockSurface, BlockTint, BlockWeight, InlineDisplay, LineContext, VisualBlock,
     VisualOffset, present_polished_line,
 };
+use hane_session::ResourceResolver;
 use std::ops::Range;
-use std::path::Path;
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
@@ -116,18 +116,11 @@ pub(crate) fn line_element_from_block(
     line: usize,
     block: &VisualBlock,
     theme: Theme,
-    document_directory: Option<&Path>,
+    resolver: &ResourceResolver,
 ) -> Div {
     let display = block.display();
     if let Some(image) = &block.image {
-        let destination = Path::new(&image.destination);
-        let resolved = if destination.is_absolute() {
-            destination.to_path_buf()
-        } else {
-            document_directory
-                .unwrap_or_else(|| Path::new("."))
-                .join(destination)
-        };
+        let resolved = resolver.resolve(&image.destination);
         return styled_block(
             div()
                 .h(px(block.height()))

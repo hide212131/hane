@@ -16,7 +16,8 @@ RFP では `document` と `editor` は GPUI への依存をできるだけ持た
 
 ## 決定
 
-初期実装では以下の crate 境界を採用する。
+初期実装では以下の crate 境界を採用する。R3.75 で `session` crate を追加した。
+更新後の境界と依存方向は [ADR-0019](0019-document-session-and-file-service.md) を参照する。
 
 ```text
 crates/

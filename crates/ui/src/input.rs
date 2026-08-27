@@ -11,7 +11,7 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let (text, actual) = self.editor.text_for_utf16_range(range_utf16).ok()?;
+        let (text, actual) = self.editor().text_for_utf16_range(range_utf16).ok()?;
         actual_range.replace(actual);
         Some(text)
     }
@@ -24,21 +24,21 @@ impl EntityInputHandler for EditorView {
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: self
-                .editor
-                .source_range_to_utf16(self.editor.selection().range())
+                .editor()
+                .source_range_to_utf16(self.editor().selection().range())
                 .ok()?,
-            reversed: self.editor.selection().is_reversed(),
+            reversed: self.editor().selection().is_reversed(),
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.editor
+        self.editor()
             .ime()
-            .and_then(|ime| self.editor.source_range_to_utf16(ime.current_range).ok())
+            .and_then(|ime| self.editor().source_range_to_utf16(ime.current_range).ok())
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.editor.commit_composition();
+        self.editor_mut().commit_composition();
     }
 
     fn replace_text_in_range(
@@ -48,10 +48,12 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let result = if range_utf16.is_none() && self.editor.ime().is_none() {
-            self.editor.insert_text(new_text).map(|_| ())
+        let result = if range_utf16.is_none() && self.editor().ime().is_none() {
+            self.editor_mut().insert_text(new_text).map(|_| ())
         } else {
-            self.editor.commit_text(range_utf16, new_text).map(|_| ())
+            self.editor_mut()
+                .commit_text(range_utf16, new_text)
+                .map(|_| ())
         };
         if let Err(error) = result {
             self.report_error("text input", error);
@@ -68,7 +70,7 @@ impl EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         if let Err(error) =
-            self.editor
+            self.editor_mut()
                 .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
         {
             self.report_error("IME update", error);
@@ -92,8 +94,8 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        self.editor
-            .source_range_to_utf16(SourceRange::empty(self.editor.selection().active.0))
+        self.editor()
+            .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))
             .ok()
             .map(|range| range.start)
     }

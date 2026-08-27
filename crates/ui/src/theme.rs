@@ -1,5 +1,5 @@
-use crate::storage::ThemePreference;
 use gpui::WindowAppearance;
+use hane_session::ThemePreference;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Theme {
