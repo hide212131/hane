@@ -197,6 +197,18 @@ pub struct StyleRun {
     pub kind: StyleKind,
 }
 
+/// Block-level context that a single source line sits in, resolved by the caller
+/// from the document-wide [`hane_markdown::BlockContextIndex`] (or its bounded
+/// fallback). Presentation owns the resulting display kind and style runs so the
+/// UI never re-derives fenced-code or table styling from raw source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LineContext {
+    #[default]
+    Normal,
+    FencedCode,
+    Table,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlockKind {
     #[default]
@@ -487,9 +499,11 @@ pub fn present_markdown_with_disclosure(
     }
 }
 
-/// Presents one physical source line with Phase 4 block polish. Table context
-/// is supplied by the UI's bounded neighboring-line check; standalone image
-/// recognition is local to this source slice.
+/// Presents one physical source line with Phase 4 block polish. The block-level
+/// [`LineContext`] is supplied by the caller from the document context index;
+/// standalone image recognition is local to this source slice. Presentation owns
+/// every display-kind and style-run decision here so the UI renders purely by
+/// [`BlockKind`]/[`StyleKind`] without re-inspecting the source.
 pub fn present_polished_line(
     block_id: u64,
     revision: Revision,
@@ -497,17 +511,49 @@ pub fn present_polished_line(
     source: &str,
     line_height: f32,
     disclosure: Option<SourceRange>,
-    table_context: bool,
+    context: LineContext,
 ) -> VisualBlock {
+    // A fenced-code line has no disclosable inline markup; its content is literal,
+    // so it stays a code block regardless of cursor position and wins over image
+    // and table recognition that would otherwise mis-read the literal text.
+    if context == LineContext::FencedCode {
+        return present_fenced_code_line(block_id, revision, range, source, line_height);
+    }
     if let Some(image) = parse_standalone_image(source)
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
         return present_image(block_id, revision, range, source, line_height, image);
     }
-    if table_context && disclosure.is_none_or(|active| !range_touches(range, active)) {
+    if context == LineContext::Table
+        && disclosure.is_none_or(|active| !range_touches(range, active))
+    {
         return present_table_line(block_id, revision, range, source, line_height);
     }
     present_markdown_with_disclosure(block_id, revision, range, source, line_height, disclosure)
+}
+
+/// Presents one line that the context index reports is inside a fenced code
+/// block. The source is shown verbatim (no marker hiding) and styled as code.
+fn present_fenced_code_line(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+) -> VisualBlock {
+    let mut block = present_plain(block_id, revision, range, source);
+    block.kind = BlockKind::CodeBlock;
+    block.estimated_height = estimated_height(BlockKind::CodeBlock, line_height);
+    // Style the code content but not the trailing newline the visual text keeps
+    // for source-map fidelity; callers trim the newline before painting.
+    let content_end = source.trim_end_matches(['\r', '\n']).len();
+    if content_end > 0 {
+        block.style_runs = vec![StyleRun {
+            visual_range: VisualRange::new(0, content_end),
+            kind: StyleKind::CodeBlock,
+        }];
+    }
+    block
 }
 
 struct StandaloneImage<'a> {
@@ -974,7 +1020,15 @@ mod tests {
     fn phase4_image_keeps_source_and_exposes_lazy_destination() {
         let source = "![羽のロゴ](assets/phase4-feather.svg)\n";
         let range = SourceRange::new(100, 100 + source.len());
-        let block = present_polished_line(7, Revision(2), range, source, 26.0, None, false);
+        let block = present_polished_line(
+            7,
+            Revision(2),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::Normal,
+        );
         assert_eq!(block.kind, BlockKind::Image);
         assert_eq!(block.visual_text, "羽のロゴ");
         assert_eq!(
@@ -995,7 +1049,7 @@ mod tests {
             source,
             26.0,
             Some(SourceRange::empty(105)),
-            false,
+            LineContext::Normal,
         );
         assert_eq!(active.kind, BlockKind::Paragraph);
         assert!(active.image.is_none());
@@ -1006,7 +1060,15 @@ mod tests {
     fn phase4_table_uses_synthesized_separators_with_canonical_mapping() {
         let source = "| 名前 | 値 |\n";
         let range = SourceRange::new(50, 50 + source.len());
-        let block = present_polished_line(1, Revision(3), range, source, 26.0, None, true);
+        let block = present_polished_line(
+            1,
+            Revision(3),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::Table,
+        );
         assert_eq!(block.kind, BlockKind::TableRow);
         assert_eq!(block.visual_text, " 名前 │ 値 \n");
         let synthesized = block
@@ -1031,9 +1093,43 @@ mod tests {
             source,
             26.0,
             Some(SourceRange::empty(54)),
-            true,
+            LineContext::Table,
         );
         assert_eq!(active.visual_text, source);
         assert_eq!(active.kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn fenced_code_context_styles_the_line_as_code_without_hiding_markup() {
+        let source = "let answer = **42**;\n";
+        let range = SourceRange::new(30, 30 + source.len());
+        let block = present_polished_line(
+            2,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::FencedCode,
+        );
+        assert_eq!(block.kind, BlockKind::CodeBlock);
+        // Source is literal inside a fence: emphasis markers stay visible.
+        assert_eq!(block.visual_text, source);
+        assert_eq!(block.style_runs.len(), 1);
+        let run = block.style_runs[0];
+        assert_eq!(run.kind, StyleKind::CodeBlock);
+        // The style run covers the content but stops before the trailing newline.
+        assert_eq!(
+            run.visual_range,
+            VisualRange::new(0, source.trim_end_matches('\n').len())
+        );
+        assert!(block.height() > 26.0);
+        assert!(
+            block
+                .source_map
+                .segments
+                .iter()
+                .all(|segment| segment.visibility == Visibility::Visible)
+        );
     }
 }

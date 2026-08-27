@@ -5,7 +5,9 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_presentation::{BlockKind, StyleKind, VisualBlock, VisualOffset, present_polished_line};
+use hane_presentation::{
+    BlockKind, LineContext, StyleKind, VisualBlock, VisualOffset, present_polished_line,
+};
 use std::ops::Range;
 use std::path::Path;
 
@@ -24,6 +26,15 @@ pub(crate) fn presented_line(
     };
     let source = editor.document().text(range).unwrap_or_default();
     let disclosure = disclosure_for_line(editor, line, range);
+    // Fenced code wins over table context: a line inside a fence is literal, so
+    // its pipes and markers must not be re-read as table/inline syntax.
+    let context = if fenced_code_context {
+        LineContext::FencedCode
+    } else if table_context {
+        LineContext::Table
+    } else {
+        LineContext::Normal
+    };
     let mut block = present_polished_line(
         line as u64,
         editor.document().revision(),
@@ -31,20 +42,10 @@ pub(crate) fn presented_line(
         &source,
         DEFAULT_LINE_HEIGHT,
         disclosure,
-        table_context,
+        context,
     );
     while block.visual_text.ends_with(['\r', '\n']) {
         block.visual_text.pop();
-    }
-    if fenced_code_context {
-        block.kind = BlockKind::CodeBlock;
-        block.estimated_height = DEFAULT_LINE_HEIGHT * 1.15;
-        if !block.visual_text.is_empty() {
-            block.style_runs.push(hane_presentation::StyleRun {
-                visual_range: hane_presentation::VisualRange::new(0, block.visual_text.len()),
-                kind: StyleKind::CodeBlock,
-            });
-        }
     }
     Some(block)
 }

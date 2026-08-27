@@ -5,7 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-27）
 
-**現在地: R3（Markdown 解析の単一化）完了。次は R3.25（Markdown 拡張契約）。**
+**現在地: R3.25（Markdown 拡張契約）着手中。表示契約の漏れ解消（UI の block-kind パッチ撤去）まで完了。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -14,7 +14,7 @@
 | 3 | R1 死蔵・重複コード削除 | ✅ 完了 |
 | 4 | R2 前半（計測ハーネス分離） | 🔶 ほぼ完了（下記残タスクあり） |
 | 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
-| 6 | R3.25 Markdown 拡張契約 | ⬜ 未着手 ← **次はここ** |
+| 6 | R3.25 Markdown 拡張契約 | 🔶 着手中（下記残タスクあり） ← **現在地** |
 | 7 | R3.5 revision 付き BlockIndex | ⬜ 未着手 |
 | 8 | R3.75 DocumentSession / FileService | ⬜ 未着手 |
 | 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 |
@@ -22,6 +22,18 @@
 | 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 |
 | 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
+
+### R3.25 の残タスク
+
+- ✅ 表示契約の漏れ解消（第一段）: fenced-code の表示決定を `presentation::present_polished_line`
+  へ集約し、UI 側（`ui::line`）の `block.kind = CodeBlock` 直接パッチと style run 手注入を撤去。
+  UI へ渡す block 文脈を型付き `LineContext`（Normal/FencedCode/Table）に統一。
+- ⬜ `Unsupported` / raw-source fallback を正式な表示契約に含める（未実装構文でも source を失わない）。
+- ⬜ parser 構文種別 / presentation 表示種別 / UI 描画方針の型分離を明示（`markdown::BlockKind` と
+  `presentation::BlockKind` の役割整理）。
+- ⬜ flat `blocks`/`spans` に代わる block/inline node ツリー（親子・順序・source range）。
+- ⬜ Markdown feature 共通 fixture 形式（parse tree・marker・SourceMap・disclosure・保存後 bytes）。
+- ⬜ 初期拡張対象（task list、nested list、複数行 quote/code、image、table、link）で API 試行。
 
 ### R2 前半の残タスク
 

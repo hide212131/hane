@@ -1,6 +1,6 @@
 use hane_document::{Bias, Revision, SourceOffset, SourceRange};
 use hane_presentation::{
-    Visibility, VisualOffset, present_markdown_with_disclosure, present_polished_line,
+    LineContext, Visibility, VisualOffset, present_markdown_with_disclosure, present_polished_line,
 };
 
 fn char_boundaries(text: &str) -> impl Iterator<Item = usize> + '_ {
@@ -89,7 +89,7 @@ fn hidden_and_synthesized_positions_normalize_idempotently() {
         table,
         26.0,
         None,
-        true,
+        LineContext::Table,
     );
     let synthesized = table_block
         .source_map
