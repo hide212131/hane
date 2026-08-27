@@ -5,7 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-28）
 
-**現在地: R4A（ブロック単位の仮想化・描画）完了。次は R4B（Block→LayoutLine→Run）に着手する。**
+**現在地: R4B（Block→LayoutLine→Run）完了。次は R4C（レイアウトキャッシュ・差分更新）に着手する。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -18,8 +18,8 @@
 | 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
 | 8 | R3.75 DocumentSession / FileService | ✅ 完了 |
 | 9 | R4A ブロック仮想化・描画 | ✅ 完了 |
-| 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 ← **現在地** |
-| 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 |
+| 10 | R4B Block→LayoutLine→Run | ✅ 完了 |
+| 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 ← **現在地** |
 | 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
 
@@ -153,15 +153,71 @@
   `hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致
   （画面キャプチャ比較。100 MB / 10万段落・1ブロック文書でも正しく描画される）。
 
+### R4B の完了内容
+
+- ✅ ブロックと run の間に「画面上の1行」`LayoutLine` を入れた（`hane_presentation::layout`）。
+  物理行1本、または折り返された物理行の1断片で、行ローカル/ブロックローカルの visual range・
+  受け持つ source range・`y`/`height`・`Hard`/`Soft` の切れ目を持つ。行はその物理行の source を
+  タイルし、物理行はブロックをタイルするので、source の1 byte は必ず1つの行に属する。
+  設計判断は ADR-0021。
+- ✅ フォントに聞くのは折り返し位置と x だけにした（`LineShaper` の3メソッド）。UI は window の
+  text system（`ui::shape::WindowShaper`、`shape_text` の wrap boundary と `shape_line` の
+  `x_for_index` / `closest_index_for_x`）、テストは1文字固定幅の
+  `hane_presentation::testing::FixedAdvanceShaper` で実装する。行の始端・終端・受け持つ source・
+  位置はレイアウト側が決めるため、座標契約が window 無しでテストできる。
+- ✅ カーソルの質問を `BlockLayout` の1か所へ集約。`row_for_source` / `point_for_source` /
+  `source_for_point` / `source_at_x` / `vertical_target` / `visual_range_on_row` /
+  `row_bounds_for_source`。soft の切れ目の offset は次の行の先頭に属し、行末位置を持てるのは
+  `Hard` で終わる行だけ、という規則で caret の描画位置とヒットテストが一致する。
+- ✅ 上下移動を preferred grapheme column から preferred x へ移行。`Editor::preferred_visual_x` と
+  `move_vertical_to` が入口で、移動先の決定は `EditorView::move_vertical` が caret のブロック
+  （前後1行を含む）をレイアウトして行う。ブロックの端に達したときだけ隣のブロックの1行を
+  present する。索引がまだ無い起動直後は `EditorCommand::MoveUp` / `MoveDown` がフォールバック。
+- ✅ クリック・ドラッグは行断片の中だけを測る（`offset_at_row_x`）。折り返し行の右端より先を
+  クリックしても次の行のテキストへは届かない。選択と IME 下線は `visual_range_on_row` で
+  行ごとに切り出すので、折り返しをまたぐ選択が両方の行に出る。
+- ✅ 高さと caret 矩形をレイアウトから取るようにした。`HeightIndex` の更新値は
+  `BlockLayout::height()`（行粒度では `line_height_of`）で、折り返した行はその行数分の高さを
+  占める。`bounds_for_range` は最後のフレームが描いた caret 矩形（`CaretGeometry`）を返すため、
+  IME 候補ウィンドウがカーソル位置に出る。
+- ✅ レイアウトをブロック単位でキャッシュ（`layout_cache`、保持規則は `block_cache` と同じ）。
+  presentation を再利用できたフレームでは幅と revision が一致する限りレイアウトも再利用し、
+  ブロックに触れない編集では `BlockLayout::rebase` で source range だけを移送する。
+  上下移動も、caret のブロックが直前のフレームで描かれていれば parse も shape もしない。
+- ✅ 契約テスト `crates/presentation/tests/layout_contract.rs`（8本）。折り返し段落・引用・
+  リスト・コード・表を含む文書の全 source offset で「source → 点 → source」が同じ offset に
+  戻ること（source map が隠す offset は編集可能位置ではないため対象外）、行が物理行の source と
+  visual text をタイルすること、`Soft`/`Hard` の区別、折り返し位置の caret が次の行の先頭に
+  出ること、短い行を通過しても preferred x が戻ること、ブロック端が `PastEdge` を返すこと。
+  UI 側にはブロックをまたぐ上下移動（`neighbor_row_target`）と行断片の描画範囲のテストを追加。
+- ✅ 計測。`hane-bench buffer` に `viewport block layout` を追加（10万ブロック文書の viewport
+  14 ブロックを present + layout、固定幅シェイパで median 0.048 ms / p95 0.051 ms）。
+  既存シナリオは R4A・R3.5 と同水準（打鍵時 block index median 3 µs / p95 4 µs、block 分割
+  median 6 µs / p95 8 µs、再解析 980 bytes 以下、invalidate 0、block height index rebuild 0.647 ms）。
+- ✅ 検証。`cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` 緑。
+  instrument build を 100 MB 文書と `paragraphs_100k.md` で起動し、新しい描画経路で
+  `hane_ready` とペイントまで到達することを確認した。
+
+### R4B の残メモ
+
+- 🔶 レイアウトは1フレームに1回テキストを shape し、GPUI も描画時に shape する。可視行の
+  shape が二重になっている。解消は R4C（cache entry に shape 結果を持たせる）。
+- 🔶 GUI の画面キャプチャ比較と `keystroke_to_paint` 実測は未実施。この環境では window を
+  前面にできず、`CGWindowListCopyWindowInfo` も screen recording 権限が無いため window を
+  取得できなかった（25 秒の autoscroll で paint record 2 件）。R4A・R2 前半の残タスクと
+  同じ枠で回収する。折り返し・caret・選択の目視確認もそこに含める。
+- 🔶 `HeightIndex` の初期値は折り返しを知らない（`block_heights` は行数 × 行高）。描画された
+  ブロックから実測値へ置き換わるので、スクロール範囲は読み進めるにつれて正確になる。
+  ブロック内の可視行の見積もりは、そのブロックを一度描いていれば実測の平均行高を使う。
+
 ### R4A の残メモ
 
 - 🔶 GUI の `keystroke_to_paint` / scroll frame interval の master 比較は未実施。window が
   前面でない環境では OS 側の throttle に支配され、frame 数が同条件で 145〜1304 と振れるため
   判定に使えなかった。アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下
   （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R2 前半の残タスクと同じ枠で回収する。
-- 🔶 ブロック内の行位置とスクロール位置の対応は行高一定を仮定している。画像行を含む
-  ブロックでは可視行の見積もりが1〜2行ずれうる（overscan が吸収する）。正確な対応は
-  R4B の `LayoutLine` が持つ。
+- ✅ ブロック内の行位置とスクロール位置の対応は R4B の `LayoutLine` が持つようになった
+  （描画済みブロックは実測の平均行高、未描画は行高一定の見積もり）。
 - 🔶 ブロック数が変わる編集では `HeightIndex` を作り直す。差分 splice は R4C の担当。
 
 ### R3.75 の残メモ
@@ -205,7 +261,7 @@
 7. **R3.5 — revision付き `BlockIndex` を導入**
 8. **R3.75 — `DocumentSession` / `FileService` を `EditorView` から分離**
 9. **R4A — ブロック単位の仮想化・描画へ移行**（完了）
-10. **R4B — `Block → LayoutLine → Run` とvisual座標移動を実装**
+10. **R4B — `Block → LayoutLine → Run` とvisual座標移動を実装**（完了）
 11. **R4C — レイアウトキャッシュと差分更新を実装**
 12. **R2 後半 — スクリプト統合、環境変数整理、歴史文書移動**
 13. **R5 — 型、公開API、ドキュメントの最終整理**
@@ -221,7 +277,8 @@
 - R3.75でファイル状態と永続化を描画責務から分離し、ファイラー実装の土台を作る。
 - R4AからR4Cは、仮想化、visual座標系、差分キャッシュの順に独立して導入する。R4Aで
   ブロック境界が唯一の表示文脈になり、要素生成が可視ブロック数（ブロック内では可視行数）に
-  比例するようになった。
+  比例するようになった。R4Bでカーソル・選択・IME・クリック・上下移動が同じ座標変換
+  （`BlockLayout`）を通るようになり、折り返しが表示・入力の両方で成立している。
 - R5は構造変更が完了した後の実装を正として、型、公開API、ドキュメントを整理する。
 
 ## 依存関係

@@ -71,6 +71,12 @@ pub struct Editor {
     pub(crate) document: RopeBuffer,
     pub(crate) selection: Selection,
     pub(crate) preferred_grapheme_column: Option<usize>,
+    /// The x a layout-driven vertical move aims at, in the text column's own
+    /// coordinates. A wrapped row has no source line, so a grapheme column
+    /// cannot describe where the caret should land; the view resolves the x
+    /// against the layout and hands the result back through
+    /// [`Editor::move_vertical_to`].
+    pub(crate) preferred_visual_x: Option<f32>,
     pub(crate) ime: Option<ImeState>,
     pub(crate) next_transaction: u64,
     next_input_sequence: u64,
@@ -84,6 +90,7 @@ impl Editor {
             document: RopeBuffer::from_text(text),
             selection: Selection::caret(SourceOffset(0)),
             preferred_grapheme_column: None,
+            preferred_visual_x: None,
             ime: None,
             next_transaction: 1,
             next_input_sequence: 1,
@@ -112,6 +119,33 @@ impl Editor {
         self.document.validate_offset(selection.active)?;
         self.selection = selection;
         self.preferred_grapheme_column = None;
+        self.preferred_visual_x = None;
+        Ok(())
+    }
+
+    /// The x later vertical moves should aim at, if one has been established.
+    pub fn preferred_visual_x(&self) -> Option<f32> {
+        self.preferred_visual_x
+    }
+
+    /// Moves the caret to a target the layout resolved, remembering the x it was
+    /// aiming at so a run of vertical moves keeps its column across rows of
+    /// different lengths.
+    ///
+    /// Vertical movement lives here rather than in [`Editor::dispatch`] because
+    /// only the layout knows where a row is: with soft wrap, "the line below" is
+    /// not the next source line, and the same source line can hold several rows.
+    pub fn move_vertical_to(
+        &mut self,
+        target: SourceOffset,
+        extend: bool,
+        preferred_x: f32,
+    ) -> Result<(), BufferError> {
+        self.commit_composition();
+        self.document.validate_offset(target)?;
+        self.move_to(target, extend);
+        self.preferred_grapheme_column = None;
+        self.preferred_visual_x = Some(preferred_x);
         Ok(())
     }
 
@@ -126,6 +160,7 @@ impl Editor {
             EditorCommand::MoveUp { .. } | EditorCommand::MoveDown { .. }
         ) {
             self.preferred_grapheme_column = None;
+            self.preferred_visual_x = None;
         }
         let edit = match command {
             EditorCommand::Insert(text) => {

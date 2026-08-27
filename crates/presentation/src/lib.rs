@@ -1,5 +1,13 @@
 //! Visual blocks and lines, source mapping, and variable-height virtualization.
 
+pub mod layout;
+pub mod testing;
+
+pub use layout::{
+    BlockLayout, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove, layout_block,
+    line_visual_start,
+};
+
 use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };

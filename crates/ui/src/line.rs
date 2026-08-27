@@ -7,8 +7,9 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::IndexedBlock;
 use hane_presentation::{
-    BlockDisplay, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow, InlineDisplay,
-    VisualBlock, VisualLine, VisualOffset, block_line_span, present_block, trailing_blank_lines,
+    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
+    InlineDisplay, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset, block_line_span,
+    present_block, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -135,32 +136,49 @@ fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
         })
 }
 
-/// Container for one Markdown block. The block is the virtualization unit, and
-/// in R4A its children are still one element per physical line, so caret,
-/// selection and IME keep addressing lines while scrolling is driven by blocks.
-pub(crate) fn block_element(block: &VisualBlock, children: impl IntoIterator<Item = Div>) -> Div {
+/// Container for one Markdown block. The block is the virtualization unit; its
+/// children are rows — a whole physical line, or one fragment of a soft-wrapped
+/// one — plus the space standing in for the lines clipped outside the viewport.
+pub(crate) fn block_element(layout: &BlockLayout, children: impl IntoIterator<Item = Div>) -> Div {
     div()
         .flex()
         .flex_col()
         .w_full()
-        .child(div().h(px(block.leading_space())))
+        .child(div().h(px(layout.leading_space)))
         .children(children)
-        .child(div().h(px(block.trailing_space())))
+        .child(div().h(px(layout.trailing_space)))
 }
 
-pub(crate) fn line_element(
+/// True when a caret at `visual` renders on this row. A soft break's boundary
+/// belongs to the row that starts there, so only a row that ends where its
+/// source line ends owns the position past its last character.
+fn row_owns_visual(row: &LayoutLine, visual: usize) -> bool {
+    row.line_visual_range.start <= visual
+        && (visual < row.line_visual_range.end || row.wrap == LineWrap::Hard)
+}
+
+/// One row of a block: the text that fits on it, with the caret, selection and
+/// IME underline that fall inside it.
+///
+/// Rows, not source lines, are what is painted. Which stretch of the line's
+/// visual text this row holds, and which source bytes it stands for, are the
+/// layout's answers; this only applies them.
+pub(crate) fn row_element(
     editor: &Editor,
-    line: usize,
-    block: &VisualLine,
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    row_index: usize,
     theme: Theme,
     resolver: &ResourceResolver,
 ) -> Div {
-    let display = block.display();
-    if let Some(image) = &block.image {
+    let row = &layout.lines[row_index];
+    let line = &block.lines[row.line];
+    let display = line.display();
+    if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
         return styled_block(
             div()
-                .h(px(block.height()))
+                .h(px(row.height))
                 .w_full()
                 .flex()
                 .flex_col()
@@ -173,7 +191,7 @@ pub(crate) fn line_element(
         .child(
             img(resolved)
                 .max_w(px(640.))
-                .h(px((block.height() - 32.0).max(1.0)))
+                .h(px((row.height - 32.0).max(1.0)))
                 .object_fit(ObjectFit::Contain),
         )
         .child(
@@ -183,30 +201,28 @@ pub(crate) fn line_element(
                 .child(image.alt.clone()),
         );
     }
-    let range = block.source_range;
 
     let cursor = editor.selection().active;
-    let visual_cursor =
-        if line_owns_cursor(range, cursor, line + 1 == editor.document().line_count()) {
-            block
-                .source_map
-                .source_to_visual(cursor, Bias::After)
-                .map(|candidate| candidate.visual_offset)
-                .or_else(|| (cursor == range.start).then_some(VisualOffset(0)))
-        } else {
-            None
-        };
-    let selection = editor.selection().range();
-    let selected_visual = clipped_visual_range(block, selection);
+    let is_final_line = row.line_id as usize + 1 == editor.document().line_count();
+    let visual_cursor = if line_owns_cursor(line.source_range, cursor, is_final_line) {
+        line.source_map
+            .source_to_visual(cursor, Bias::After)
+            .map(|candidate| candidate.visual_offset)
+            .or_else(|| (cursor == line.source_range.start).then_some(VisualOffset(0)))
+            .filter(|visual| row_owns_visual(row, visual.0))
+    } else {
+        None
+    };
+    let selected_visual = layout.visual_range_on_row(block, row_index, editor.selection().range());
     let marked_visual = editor
         .ime()
-        .and_then(|ime| clipped_visual_range(block, ime.current_range));
+        .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.current_range));
     let segments = line_segments(
-        block.visual_text.len(),
+        row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
         selected_visual,
         marked_visual,
-        &block.style_runs,
+        &line.style_runs,
     );
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
     for segment in &segments {
@@ -238,49 +254,29 @@ pub(crate) fn line_element(
                     .when(segment.display.link_color, |element| {
                         element.text_color(rgb(theme.link_foreground))
                     })
-                    .child(block.visual_text[segment.visual_range.clone()].to_owned())
+                    .child(line.visual_text[segment.visual_range.clone()].to_owned())
                     .into_any_element(),
             );
         }
     }
-    if visual_cursor == Some(VisualOffset(block.visual_text.len())) {
+    if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
         elements.push(cursor_overlay(theme).into_any_element());
     }
 
     styled_block(
         div()
-            .h(px(block.height()))
+            .h(px(row.height))
             .w_full()
             .flex()
             .items_center()
+            // The row already holds exactly what fits: any further wrapping here
+            // would put text where no layout row accounts for it.
+            .whitespace_nowrap()
             .px(px(theme.line_horizontal_padding)),
         display,
         theme,
     )
     .children(elements)
-}
-
-fn clipped_visual_range(block: &VisualLine, source: SourceRange) -> Option<Range<usize>> {
-    let clipped = SourceRange {
-        start: source.start.max(block.source_range.start),
-        end: source.end.min(block.source_range.end),
-    };
-    if clipped.is_empty() {
-        return None;
-    }
-    let start = block
-        .source_map
-        .source_to_visual(clipped.start, Bias::After)?
-        .visual_offset
-        .0
-        .min(block.visual_text.len());
-    let end = block
-        .source_map
-        .source_to_visual(clipped.end, Bias::Before)?
-        .visual_offset
-        .0
-        .min(block.visual_text.len());
-    (start < end).then_some(start..end)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -304,22 +300,26 @@ pub(crate) fn inline_display_for(
     }))
 }
 
+/// Splits one row's stretch of visual text where the caret, the selection, the
+/// IME underline or an inline style begins or ends. Everything is clamped into
+/// `bounds`, so a construct that spans a soft wrap contributes to both rows.
 fn line_segments(
-    text_len: usize,
+    bounds: Range<usize>,
     cursor: Option<usize>,
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
     style_runs: &[hane_presentation::StyleRun],
 ) -> Vec<LineSegment> {
-    let mut boundaries = vec![0, text_len];
-    boundaries.extend(cursor.map(|offset| offset.min(text_len)));
+    let clamp = |offset: usize| offset.clamp(bounds.start, bounds.end);
+    let mut boundaries = vec![bounds.start, bounds.end];
+    boundaries.extend(cursor.map(clamp));
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
-        boundaries.push(range.start.min(text_len));
-        boundaries.push(range.end.min(text_len));
+        boundaries.push(clamp(range.start));
+        boundaries.push(clamp(range.end));
     }
     for run in style_runs {
-        boundaries.push(run.visual_range.start.0.min(text_len));
-        boundaries.push(run.visual_range.end.0.min(text_len));
+        boundaries.push(clamp(run.visual_range.start.0));
+        boundaries.push(clamp(run.visual_range.end.0));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -400,10 +400,62 @@ mod tests {
         assert!(line_owns_cursor(trailing_empty_line, cursor, true));
     }
 
+    fn row(range: Range<usize>, wrap: LineWrap) -> LayoutLine {
+        LayoutLine {
+            line: 0,
+            line_id: 0,
+            fragment: 0,
+            wrap,
+            visual_range: hane_presentation::VisualRange::new(range.start, range.end),
+            line_visual_range: range,
+            source_range: SourceRange::new(0, 0),
+            y: 0.0,
+            height: 26.0,
+        }
+    }
+
+    #[test]
+    fn only_a_break_the_source_makes_owns_the_caret_past_the_last_character() {
+        let soft = row(0..6, LineWrap::Soft);
+        let hard = row(6..12, LineWrap::Hard);
+        assert!(row_owns_visual(&soft, 0));
+        assert!(row_owns_visual(&soft, 5));
+        assert!(
+            !row_owns_visual(&soft, 6),
+            "a wrap point belongs to the row that starts there, not to the one it ends"
+        );
+        assert!(row_owns_visual(&hard, 6));
+        assert!(
+            row_owns_visual(&hard, 12),
+            "the position after the last character of a source line is on that line"
+        );
+    }
+
+    #[test]
+    fn a_row_paints_only_its_own_stretch_of_the_line() {
+        // Selection and IME ranges that reach past the row are clipped to it, so
+        // a construct spanning a soft wrap is painted on both rows and neither
+        // row draws outside its own text.
+        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[]);
+        assert_eq!(
+            segments.first().map(|segment| segment.visual_range.start),
+            Some(6)
+        );
+        assert_eq!(
+            segments.last().map(|segment| segment.visual_range.end),
+            Some(12)
+        );
+        assert!(
+            segments.iter().all(|segment| !segment.cursor_before),
+            "a caret before the row is not drawn on it"
+        );
+        assert!(segments.iter().any(|segment| segment.selected));
+    }
+
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(12, Some(3), Some(3..9), Some(6..12), &[]),
+            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[]),
             vec![
                 LineSegment {
                     visual_range: 0..3,

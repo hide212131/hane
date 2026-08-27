@@ -1,9 +1,13 @@
 //! Reproducible fixtures and latency aggregation shared by project phases.
 
-use hane_document::{RopeBuffer, SourceRange, TextBuffer};
+use hane_document::{LineId, RopeBuffer, SourceRange, TextBuffer};
 use hane_markdown::BlockIndex;
 use hane_metrics::percentile;
-use hane_presentation::{HeightIndex, block_heights, present_markdown};
+use hane_presentation::testing::FixedAdvanceShaper;
+use hane_presentation::{
+    BlockLine, BlockWindow, HeightIndex, block_heights, block_line_span, layout_block,
+    present_block, present_markdown, trailing_blank_lines,
+};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -204,6 +208,69 @@ pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
         heights.update(index, 22.0 + (iteration % 5) as f32);
         let visible = heights.visible_range((iteration * 137) as f32, 720.0, 260.0);
         std::hint::black_box(visible);
+        samples.push(start.elapsed());
+    }
+    distribution(&samples)
+}
+
+/// Presenting and laying out the blocks of one viewport, the work R4B added to
+/// each frame: rows are built for the visible lines of every visible block, and
+/// their wrap points and heights decided. Text measurement is the fixed-advance
+/// stand-in, so this is the layout cost without the font behind it.
+pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
+    let mut source = String::new();
+    for paragraph in 0..blocks {
+        source.push_str(&format!(
+            "paragraph {paragraph} with enough words in it to wrap onto a second row\n\n"
+        ));
+    }
+    let buffer = RopeBuffer::from_text(&source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let shaper = FixedAdvanceShaper::new(8.0);
+    // A 720 px viewport of 26 px rows, in blocks of two lines each.
+    let visible = 14;
+    let mut samples = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let first = (iteration * 13) % index.len().saturating_sub(visible).max(1);
+        let start = std::time::Instant::now();
+        for ordinal in first..first + visible {
+            let Some(block) = index.block(ordinal) else {
+                continue;
+            };
+            let Some(span) = block_line_span(&buffer, &block) else {
+                continue;
+            };
+            let ranges = span
+                .clone()
+                .map(|line| buffer.line_range(LineId(line)).unwrap_or_default())
+                .collect::<Vec<_>>();
+            let texts = ranges
+                .iter()
+                .map(|range| buffer.text(*range).unwrap_or_default())
+                .collect::<Vec<_>>();
+            let lines = span
+                .clone()
+                .zip(&ranges)
+                .zip(&texts)
+                .map(|((line, range), text)| BlockLine {
+                    line,
+                    range: *range,
+                    text,
+                    disclosure: None,
+                })
+                .collect::<Vec<_>>();
+            let visual = present_block(
+                &block,
+                buffer.revision(),
+                &BlockWindow {
+                    trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+                    span,
+                    lines: &lines,
+                },
+                26.0,
+            );
+            std::hint::black_box(layout_block(&visual, 640.0, &shaper).height());
+        }
         samples.push(start.elapsed());
     }
     distribution(&samples)

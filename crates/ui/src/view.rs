@@ -2,15 +2,13 @@ use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 #[cfg(feature = "instrument")]
 use crate::instrument::{Instrumentation, log_summary};
-use crate::line::{
-    block_element, block_font_size, disclosure_for_line, inline_display_for, line_element,
-    presented_block,
-};
+use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
+use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
-    App, Context, FocusHandle, Focusable, FontStyle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, TextRun, Window, div, px, rgb,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -23,7 +21,8 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockWeight, HeightIndex, VisualBlock, VisualLine, VisualOffset, block_heights, block_line_span,
+    BlockLayout, HeightIndex, LineShaper, VerticalMove, VisualBlock, VisualLine, VisualOffset,
+    block_heights, block_line_span, layout_block,
 };
 use hane_session::{
     DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService, RecentFiles,
@@ -100,6 +99,17 @@ pub struct EditorView {
     /// Physical line to the block that drew it, rebuilt each frame. Mouse hit
     /// testing addresses lines, so it needs the reverse of the render mapping.
     line_owners: HashMap<usize, (BlockId, usize)>,
+    /// Rows for each presented block, keyed like `block_cache`. Kept across
+    /// frames so scrolling back, or typing in another block, does not re-shape
+    /// text that has not changed.
+    layout_cache: HashMap<BlockId, BlockLayout>,
+    /// Width of the text column the rows were laid out for. A change to it
+    /// invalidates every layout, which is why it is recorded rather than
+    /// recomputed.
+    content_width: f32,
+    /// Where the caret was drawn last frame, relative to the content area. The
+    /// IME asks for this to place its candidate window.
+    caret_geometry: Option<CaretGeometry>,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -108,6 +118,15 @@ pub struct EditorView {
     /// published, physical lines until then.
     granularity: Granularity,
     document_parse_job_running: bool,
+}
+
+/// The caret rectangle, in coordinates relative to the top-left of the content
+/// area, as the last frame drew it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaretGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub height: f32,
 }
 
 /// The unit `heights` is keyed by.
@@ -164,6 +183,9 @@ impl EditorView {
             background_presentation_generation: 0,
             block_cache: HashMap::new(),
             line_owners: HashMap::new(),
+            layout_cache: HashMap::new(),
+            content_width: 0.0,
+            caret_geometry: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             document_parse_job_running: false,
@@ -245,6 +267,8 @@ impl EditorView {
         self.scroll_y = self.sessions.active().view_state().scroll_y;
         self.block_cache.clear();
         self.line_owners.clear();
+        self.layout_cache.clear();
+        self.caret_geometry = None;
         self.block_index = BlockIndexState::new();
     }
 
@@ -546,6 +570,7 @@ impl EditorView {
         self.settings.theme = self.settings.theme.next();
         self.theme = resolve_theme(self.settings.theme, window.appearance());
         self.block_cache.clear();
+        self.layout_cache.clear();
         self.heights = HeightIndex::new(self.item_heights());
         self.store_settings();
         cx.notify();
@@ -660,19 +685,41 @@ impl EditorView {
         self.block_cache.get(id)?.lines.get(*at).cloned()
     }
 
-    fn on_line_mouse_down(
+    /// The source offset a click lands on, inside one row of a presented line.
+    /// Only that row's own stretch of text is measured, so a click past the end
+    /// of a soft-wrapped row cannot reach text drawn on the next one.
+    fn offset_at_row_x(
+        &self,
+        line: usize,
+        fragment: Range<usize>,
+        window_x: f32,
+        window: &Window,
+    ) -> Option<SourceOffset> {
+        let visual = self.rendered_line(line)?;
+        let x = window_x - self.theme.line_horizontal_padding;
+        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment, x);
+        Some(source_offset_for_visual_position(
+            self.editor(),
+            line,
+            &visual,
+            visual_offset,
+        ))
+    }
+
+    fn on_row_mouse_down(
         &mut self,
         line: usize,
+        fragment: Range<usize>,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        let Some(block) = self.rendered_line(line) else {
+        let Some(offset) =
+            self.offset_at_row_x(line, fragment, f32::from(event.position.x), window)
+        else {
             return;
         };
-        let visual_offset = visual_offset_at_x(&block, event.position.x, self.theme, window);
-        let offset = source_offset_for_visual_position(self.editor(), line, &block, visual_offset);
         let selection = if event.modifiers.shift {
             Selection {
                 anchor: self.editor().selection().anchor,
@@ -689,9 +736,10 @@ impl EditorView {
         self.after_input(cx);
     }
 
-    fn on_line_mouse_move(
+    fn on_row_mouse_move(
         &mut self,
         line: usize,
+        fragment: Range<usize>,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -699,11 +747,11 @@ impl EditorView {
         if !event.dragging() {
             return;
         }
-        let Some(block) = self.rendered_line(line) else {
+        let Some(offset) =
+            self.offset_at_row_x(line, fragment, f32::from(event.position.x), window)
+        else {
             return;
         };
-        let visual = visual_offset_at_x(&block, event.position.x, self.theme, window);
-        let offset = source_offset_for_visual_position(self.editor(), line, &block, visual);
         let selection = Selection {
             anchor: self.editor().selection().anchor,
             active: offset,
@@ -713,16 +761,145 @@ impl EditorView {
         }
     }
 
+    /// Moves the caret one row up or down.
+    ///
+    /// A row is not a source line: a wrapped paragraph has several, and a
+    /// heading that fits has one. The target is therefore resolved against the
+    /// layout, aiming at the x of the caret when the run of vertical moves
+    /// started. Without block boundaries — the first frames after a document is
+    /// opened — there is no layout to resolve against, and the source-line move
+    /// stands in so the caret is never stuck.
+    pub(crate) fn move_vertical(
+        &mut self,
+        down: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shaper = WindowShaper::new(window);
+        if self.move_vertical_by_layout(down, extend, &shaper) {
+            self.after_input(cx);
+        } else if down {
+            self.dispatch(EditorCommand::MoveDown { extend }, cx);
+        } else {
+            self.dispatch(EditorCommand::MoveUp { extend }, cx);
+        }
+    }
+
+    /// Resolves and applies one vertical move against the layout. Returns false
+    /// when the caret's block cannot be laid out, which is the caller's signal
+    /// to fall back.
+    fn move_vertical_by_layout(
+        &mut self,
+        down: bool,
+        extend: bool,
+        shaper: &dyn LineShaper,
+    ) -> bool {
+        let caret = self.editor().selection().active;
+        let Some((block, layout)) = self.layout_around(caret, shaper) else {
+            return false;
+        };
+        let Some(x) = self.editor().preferred_visual_x().or_else(|| {
+            layout
+                .point_for_source(&block, caret, shaper)
+                .map(|point| point.x)
+        }) else {
+            return false;
+        };
+        let target = match layout.vertical_target(&block, caret, down, x, shaper) {
+            VerticalMove::To(offset) => Some(offset),
+            VerticalMove::PastEdge => self.neighbor_row_target(&block, down, x, shaper),
+            VerticalMove::Unknown => return false,
+        };
+        // No neighbor means the caret is on the first or last row of the
+        // document: staying put is the move.
+        if let Some(target) = target
+            && let Err(error) = self.editor_mut().move_vertical_to(target, extend, x)
+        {
+            self.report_error("vertical move", error);
+        }
+        true
+    }
+
+    /// The block holding `offset`, laid out, with the line above and below it so
+    /// one vertical step always lands on a row that exists.
+    ///
+    /// The caret is nearly always inside a block the last frame drew, so this
+    /// usually costs neither a parse nor a shape. When it is not — the caret was
+    /// just moved off screen — only three lines of the block are presented, which
+    /// matters because a block can be the whole document.
+    fn layout_around(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+    ) -> Option<(VisualBlock, BlockLayout)> {
+        let indexed = self.block_at_offset(offset)?;
+        let line = self.editor().document().line_for_offset(offset).ok()?.0;
+        let window = line.saturating_sub(1)..line + 2;
+        let drawn = self
+            .block_cache
+            .get(&indexed.id)
+            .filter(|block| block.matches(&indexed) && block.covers(&window))
+            .filter(|block| self.disclosures_are_current(block));
+        if let Some(block) = drawn
+            && let Some(layout) = self.layout_cache.get(&indexed.id).filter(|layout| {
+                layout.width == self.content_width && layout.revision == block.revision
+            })
+        {
+            return Some((block.clone(), layout.clone()));
+        }
+        let visual = presented_block(self.editor(), &indexed, &window)?;
+        let layout = layout_block(&visual, self.content_width, shaper);
+        Some((visual, layout))
+    }
+
+    /// The caret target on the last row of the block above, or the first row of
+    /// the block below.
+    fn neighbor_row_target(
+        &self,
+        block: &VisualBlock,
+        down: bool,
+        x: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<SourceOffset> {
+        neighbor_row_target(
+            self.editor(),
+            self.current_index(),
+            block,
+            down,
+            x,
+            self.content_width,
+            shaper,
+        )
+    }
+
+    /// Block boundaries around one source offset: the formal index when it
+    /// describes the current revision, and a bounded local parse otherwise, the
+    /// same two sources the renderer draws from.
+    fn block_at_offset(&self, offset: SourceOffset) -> Option<IndexedBlock> {
+        block_at_offset(self.current_index(), self.editor().document(), offset)
+    }
+
+    /// The caret rectangle the last frame drew, for the IME candidate window.
+    pub(crate) fn caret_geometry(&self) -> Option<CaretGeometry> {
+        self.caret_geometry
+    }
+
+    /// Scrolls so the row holding the caret is on screen.
+    ///
+    /// The row is the exact answer and the layout cache holds it whenever the
+    /// caret's block has been drawn at the current revision, which is the case
+    /// while moving around. Right after an edit the layout is a revision behind,
+    /// and the caret's physical line stands in for its row — the same thing
+    /// wherever nothing wraps.
     fn scroll_cursor_into_view(&mut self) {
         let editor = self.sessions.active().editor();
         let cursor = editor.selection().active;
         let Ok(line) = editor.document().line_for_offset(cursor) else {
             return;
         };
-        // The caret still sits on a physical line, so at block granularity its
-        // top is the block's top plus the lines above it inside the block.
-        let top = match self.granularity {
-            Granularity::Lines => self.heights.prefix_sum(line.0),
+        let (top, height) = match self.granularity {
+            Granularity::Lines => (self.heights.prefix_sum(line.0), self.theme.line_height),
             Granularity::Blocks => {
                 let Some(block) = self
                     .current_index()
@@ -730,18 +907,24 @@ impl EditorView {
                 else {
                     return;
                 };
-                let first = block_line_span(editor.document(), &block)
-                    .map_or(line.0, |span| span.start);
-                self.heights.prefix_sum(block.ordinal)
-                    + (line.0.saturating_sub(first)) as f32 * self.theme.line_height
+                let block_top = self.heights.prefix_sum(block.ordinal);
+                let row = self
+                    .layout_cache
+                    .get(&block.id)
+                    .filter(|layout| layout.revision == editor.document().revision())
+                    .and_then(|layout| layout.row_bounds_for_source(cursor));
+                match row {
+                    Some((y, height)) => (block_top + y, height),
+                    None => {
+                        let first = block_line_span(editor.document(), &block)
+                            .map_or(line.0, |span| span.start);
+                        let inside = line.0.saturating_sub(first) as f32 * self.theme.line_height;
+                        (block_top + inside, self.theme.line_height)
+                    }
+                }
             }
         };
-        self.scroll_y = scroll_y_for_cursor(
-            self.scroll_y,
-            top,
-            self.theme.line_height,
-            self.viewport_height,
-        );
+        self.scroll_y = scroll_y_for_cursor(self.scroll_y, top, height, self.viewport_height);
     }
 
     /// The published index, but only while it describes the current revision.
@@ -893,14 +1076,14 @@ impl EditorView {
     /// At line granularity the visible range already is that window. At block
     /// granularity it has to be read back out of the scroll geometry, because a
     /// block can be taller than the viewport — a document with no blank line in
-    /// it is one block. Lines are line-height tall except for images, so this is
-    /// exact wherever it matters and the overscan absorbs the rest.
+    /// it is one block. How tall a line is depends on how often it wraps, so the
+    /// block's own laid-out rows answer it where they exist and the line height
+    /// stands in where they do not; the overscan absorbs the difference.
     fn visible_line_window(&self, blocks: &[IndexedBlock], items: &Range<usize>) -> Range<usize> {
         match self.granularity {
             Granularity::Lines => items.clone(),
             Granularity::Blocks => {
                 let document = self.sessions.active().editor().document();
-                let line_height = self.theme.line_height.max(1.0);
                 let top = (self.scroll_y - self.theme.overscan).max(0.0);
                 let bottom = self.scroll_y + self.viewport_height + self.theme.overscan;
                 let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
@@ -912,27 +1095,41 @@ impl EditorView {
                 ) else {
                     return 0..0;
                 };
-                let into_block = |y: f32, ordinal: usize| {
-                    ((y - self.heights.prefix_sum(ordinal)) / line_height).max(0.0)
+                let into_block = |y: f32, block: &IndexedBlock| {
+                    ((y - self.heights.prefix_sum(block.ordinal)) / self.drawn_line_height(block))
+                        .max(0.0)
                 };
-                let start = first_span.start
-                    + into_block(top, first.ordinal).floor() as usize;
-                let end =
-                    last_span.start + into_block(bottom, last.ordinal).ceil() as usize + 1;
+                let start = first_span.start + into_block(top, first).floor() as usize;
+                let end = last_span.start + into_block(bottom, last).ceil() as usize + 1;
                 let start = start.min(first_span.end.saturating_sub(1));
                 start..end.max(start + 1).min(last_span.end)
             }
         }
     }
 
+    /// How tall one line of a block draws, on average. A wrapped line occupies
+    /// several rows, so the plain line height under-counts it; the block's own
+    /// layout says by how much once it has been drawn once.
+    fn drawn_line_height(&self, block: &IndexedBlock) -> f32 {
+        self.layout_cache
+            .get(&block.id)
+            .filter(|layout| layout.width == self.content_width)
+            .and_then(BlockLayout::average_line_height)
+            .unwrap_or(self.theme.line_height)
+            .max(1.0)
+    }
+
     /// Presents the part of a block that reaches `visible`, reusing the cached
     /// presentation when the document has not touched it, the index still
     /// describes it the same way, and it already covers the wanted lines.
+    ///
+    /// Reports whether the presentation was reused, because the rows laid out
+    /// from it can be reused exactly when it was.
     fn cached_block(
         &mut self,
         block: &IndexedBlock,
         visible: &Range<usize>,
-    ) -> Option<VisualBlock> {
+    ) -> Option<(VisualBlock, bool)> {
         let revision = self.editor().document().revision();
         if let Some(mut cached) = self.block_cache.remove(&block.id) {
             let editor = self.sessions.active().editor();
@@ -943,6 +1140,12 @@ impl EditorView {
                     .iter()
                     .any(|delta| edit_affects_range(*delta, cached.source_range))
                     && cached.rebase(&deltas, revision)
+                    // The rows describe the same text at shifted offsets, so
+                    // they move with the block rather than being rebuilt.
+                    && self
+                        .layout_cache
+                        .get_mut(&block.id)
+                        .is_none_or(|layout| layout.rebase(&deltas, revision))
             } else {
                 false
             };
@@ -952,12 +1155,32 @@ impl EditorView {
                 && self.disclosures_are_current(&cached)
             {
                 self.block_cache.insert(block.id, cached.clone());
-                return Some(cached);
+                return Some((cached, true));
             }
         }
         let presented = presented_block(self.sessions.active().editor(), block, visible)?;
         self.block_cache.insert(block.id, presented.clone());
-        Some(presented)
+        Some((presented, false))
+    }
+
+    /// Rows for a presented block, shaped only when the presentation is new or
+    /// the text column changed width.
+    fn block_layout(
+        &mut self,
+        block: &VisualBlock,
+        reused: bool,
+        shaper: &dyn LineShaper,
+    ) -> BlockLayout {
+        if reused
+            && let Some(cached) = self.layout_cache.get(&block.id)
+            && cached.width == self.content_width
+            && cached.revision == block.revision
+        {
+            return cached.clone();
+        }
+        let layout = layout_block(block, self.content_width, shaper);
+        self.layout_cache.insert(block.id, layout.clone());
+        layout
     }
 
     /// True while every line of a cached block still discloses what the caret,
@@ -974,6 +1197,58 @@ impl EditorView {
             expected == line.disclosure
         })
     }
+}
+
+/// The caret target one row into the next or previous block, aiming at `x`.
+///
+/// Only the one line of the neighbor that the caret can land on is presented, so
+/// stepping off the edge of a block costs the same whatever the neighbor's size.
+fn neighbor_row_target(
+    editor: &Editor,
+    index: Option<&BlockIndex>,
+    block: &VisualBlock,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+) -> Option<SourceOffset> {
+    let document = editor.document();
+    let probe = if down {
+        let next = block.source_range.end;
+        (next.0 < document.len_bytes().0).then_some(next)?
+    } else {
+        SourceOffset(block.source_range.start.0.checked_sub(1)?)
+    };
+    let indexed = block_at_offset(index, document, probe)?;
+    let span = block_line_span(document, &indexed)?;
+    let window = if down {
+        span.start..span.start + 1
+    } else {
+        span.end.saturating_sub(1)..span.end
+    };
+    let visual = presented_block(editor, &indexed, &window)?;
+    let layout = layout_block(&visual, width, shaper);
+    let row = if down {
+        0
+    } else {
+        layout.lines.len().checked_sub(1)?
+    };
+    layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// The block holding one source offset: the formal index while it describes the
+/// current revision, and a bounded local parse otherwise — the same two sources
+/// the renderer draws from.
+fn block_at_offset(
+    index: Option<&BlockIndex>,
+    document: &RopeBuffer,
+    offset: SourceOffset,
+) -> Option<IndexedBlock> {
+    if let Some(index) = index {
+        return index.block_at(offset);
+    }
+    let line = document.line_for_offset(offset).ok()?.0;
+    local_block_index(document, line..line + 2).block_at(offset)
 }
 
 /// Resolves a physical source line to the block that owns it. Every byte belongs
@@ -1156,6 +1431,12 @@ impl Render for EditorView {
             - self.theme.header_height)
             .max(self.theme.line_height);
         self.step_measurement_scroll(window);
+        // The width of the text column decides where every row breaks, so it is
+        // read once per frame and every layout is keyed by it.
+        self.content_width = (f32::from(window.viewport_size().width)
+            - 2.0 * self.theme.line_horizontal_padding)
+            .max(1.0);
+        let shaper = WindowShaper::new(window);
         let max_scroll = (self.heights.total_height() - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let visible =
@@ -1175,35 +1456,40 @@ impl Render for EditorView {
             .unwrap_or_else(|| blocks.iter().map(|block| block.id).collect());
         self.block_cache.retain(|id, _| retained.contains(id));
 
+        self.layout_cache.retain(|id, _| retained.contains(id));
+
         let lines = self.visible_line_window(&blocks, &visible);
         let mut rendered = Vec::with_capacity(blocks.len());
         for block in &blocks {
-            if let Some(visual) = self.cached_block(block, &lines) {
-                rendered.push((block.ordinal, visual));
+            if let Some((visual, reused)) = self.cached_block(block, &lines) {
+                let layout = self.block_layout(&visual, reused, &shaper);
+                rendered.push((block.ordinal, visual, layout));
             }
         }
         // Height entries follow whatever the index is keyed by: one per block
         // once the document has been parsed, one per physical line until then.
+        // Either way the height is the laid-out one, so a wrapped line takes the
+        // room its rows actually need.
         let mut first_item = usize::MAX;
         let mut last_item = 0;
         self.line_owners.clear();
-        for (ordinal, visual) in &rendered {
+        for (ordinal, visual, layout) in &rendered {
             match self.granularity {
                 Granularity::Blocks => {
                     if *ordinal < self.heights.len() {
-                        self.heights.update(*ordinal, visual.height());
+                        self.heights.update(*ordinal, layout.height());
                     }
                     first_item = first_item.min(*ordinal);
                     last_item = last_item.max(ordinal + 1);
                 }
                 Granularity::Lines => {
-                    for line in &visual.lines {
-                        let at = line.line_id as usize;
-                        if at < self.heights.len() {
-                            self.heights.update(at, line.height());
+                    for (at, line) in visual.lines.iter().enumerate() {
+                        let line_id = line.line_id as usize;
+                        if line_id < self.heights.len() {
+                            self.heights.update(line_id, layout.line_height_of(at));
                         }
-                        first_item = first_item.min(at);
-                        last_item = last_item.max(at + 1);
+                        first_item = first_item.min(line_id);
+                        last_item = last_item.max(line_id + 1);
                     }
                 }
             }
@@ -1212,6 +1498,20 @@ impl Render for EditorView {
                     .insert(line.line_id as usize, (visual.id, at));
             }
         }
+        // Where the caret was drawn, for the IME candidate window. Only the
+        // block that holds it can answer, and only while it is on screen.
+        let caret = self.editor().selection().active;
+        self.caret_geometry = rendered.iter().find_map(|(ordinal, visual, layout)| {
+            if caret < visual.source_range.start || visual.source_range.end < caret {
+                return None;
+            }
+            let point = layout.point_for_source(visual, caret, &shaper)?;
+            Some(CaretGeometry {
+                x: self.theme.line_horizontal_padding + point.x,
+                y: self.heights.prefix_sum(*ordinal) + point.y - self.scroll_y,
+                height: point.height,
+            })
+        });
         // Blocks are drawn whole, so the rendered span can start above the
         // viewport; the spacers have to match what was actually drawn.
         let items = if first_item < last_item {
@@ -1271,22 +1571,45 @@ impl Render for EditorView {
                         .flex_col()
                         .w_full()
                         .child(div().h(px(top_space)))
-                        // One element per Markdown block, not per physical line:
-                        // what is generated scales with visible blocks.
-                        .children(rendered.into_iter().map(|(_, visual)| {
-                            block_element(&visual, visual.lines.iter().map(|visual_line| {
-                                let line = visual_line.line_id as usize;
-                                line_element(editor, line, visual_line, self.theme, &resolver)
+                        // One element per Markdown block, and inside it one per
+                        // row: what is generated scales with visible blocks, and
+                        // within a block with the rows that reach the viewport.
+                        .children(rendered.into_iter().map(|(_, visual, layout)| {
+                            block_element(
+                                &layout,
+                                (0..layout.lines.len()).map(|row_index| {
+                                    let row = &layout.lines[row_index];
+                                    let line = row.line_id as usize;
+                                    let fragment = row.line_visual_range.clone();
+                                    let dragged = fragment.clone();
+                                    row_element(
+                                        editor, &visual, &layout, row_index, self.theme, &resolver,
+                                    )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |view, event, window, cx| {
-                                            view.on_line_mouse_down(line, event, window, cx)
+                                            view.on_row_mouse_down(
+                                                line,
+                                                fragment.clone(),
+                                                event,
+                                                window,
+                                                cx,
+                                            )
                                         }),
                                     )
-                                    .on_mouse_move(cx.listener(move |view, event, window, cx| {
-                                        view.on_line_mouse_move(line, event, window, cx)
-                                    }))
-                            }))
+                                    .on_mouse_move(
+                                        cx.listener(move |view, event, window, cx| {
+                                            view.on_row_mouse_move(
+                                                line,
+                                                dragged.clone(),
+                                                event,
+                                                window,
+                                                cx,
+                                            )
+                                        }),
+                                    )
+                                }),
+                            )
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
@@ -1376,65 +1699,6 @@ impl EditorView {
     }
 }
 
-fn visual_offset_at_x(
-    block: &VisualLine,
-    position_x: gpui::Pixels,
-    theme: Theme,
-    window: &mut Window,
-) -> usize {
-    if block.visual_text.is_empty() {
-        return 0;
-    }
-    let style = window.text_style();
-    let mut boundaries = vec![0, block.visual_text.len()];
-    for run in &block.style_runs {
-        boundaries.push(run.visual_range.start.0.min(block.visual_text.len()));
-        boundaries.push(run.visual_range.end.0.min(block.visual_text.len()));
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    let runs = boundaries
-        .windows(2)
-        .filter_map(|pair| {
-            let range = pair[0]..pair[1];
-            if range.is_empty() {
-                return None;
-            }
-            // Same policy the painted elements use, so hit testing and painting
-            // cannot drift apart.
-            let inline = inline_display_for(&range, &block.style_runs);
-            let mut font = style.font();
-            if block.display().weight == BlockWeight::Semibold || inline.bold {
-                font.weight = if inline.bold {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::SEMIBOLD
-                };
-            }
-            if inline.italic {
-                font.style = FontStyle::Italic;
-            }
-            if inline.monospace {
-                font.family = "ui-monospace".into();
-            }
-            Some(TextRun {
-                len: range.len(),
-                font,
-                color: style.color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            })
-        })
-        .collect::<Vec<_>>();
-    let font_size = px(block_font_size(block));
-    let layout =
-        window
-            .text_system()
-            .shape_line(block.visual_text.clone().into(), font_size, &runs, None);
-    layout.closest_index_for_x(position_x - px(theme.line_horizontal_padding))
-}
-
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
@@ -1459,6 +1723,7 @@ fn source_offset_for_visual_position(
 mod tests {
     use super::*;
     use hane_document::LineId;
+    use hane_presentation::testing::FixedAdvanceShaper;
 
     /// Presents a whole document the way `render` does: index first, then one
     /// `presented_block` call per block.
@@ -1604,9 +1869,7 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let spans = index
             .blocks()
-            .map(|block| {
-                block_line_span(editor.document(), &block).expect("block spans lines")
-            })
+            .map(|block| block_line_span(editor.document(), &block).expect("block spans lines"))
             .collect::<Vec<_>>();
 
         // Three blocks for nine lines: virtualization is driven by the three,
@@ -1680,6 +1943,115 @@ mod tests {
         assert!(
             (0..document.line_count()).all(|line| block_at_line(&index, &document, line).is_some())
         );
+    }
+
+    /// Ten columns at the test shaper's 8 px advance.
+    const TEST_WIDTH: f32 = 80.0;
+
+    fn laid_out(
+        editor: &Editor,
+        index: &BlockIndex,
+        ordinal: usize,
+        shaper: &FixedAdvanceShaper,
+    ) -> (VisualBlock, BlockLayout) {
+        let block = presented_block(editor, &index.block(ordinal).unwrap(), &(0..usize::MAX))
+            .expect("block presents");
+        let layout = layout_block(&block, TEST_WIDTH, shaper);
+        (block, layout)
+    }
+
+    #[test]
+    fn moving_down_past_a_block_lands_on_the_first_row_of_the_next() {
+        let editor = Editor::new("alpha\n\nbravo charlie delta echo\n");
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (first, layout) = laid_out(&editor, &index, 0, &shaper);
+        let x = 3.0 * 8.0;
+
+        // The blank line tiling folded into the first block is still a row of
+        // it, so one move down stays inside the block.
+        let VerticalMove::To(blank) =
+            layout.vertical_target(&first, SourceOffset(3), true, x, &shaper)
+        else {
+            panic!("the blank line is a row of the first block");
+        };
+        assert_eq!(
+            layout.vertical_target(&first, blank, true, x, &shaper),
+            VerticalMove::PastEdge,
+            "the blank line is the last row of the block"
+        );
+
+        let target =
+            neighbor_row_target(&editor, Some(&index), &first, true, x, TEST_WIDTH, &shaper)
+                .expect("there is a block below");
+        let (second, below) = laid_out(&editor, &index, 1, &shaper);
+        let point = below
+            .point_for_source(&second, target, &shaper)
+            .expect("the target is in the block below");
+        assert_eq!(
+            (point.row, point.x),
+            (0, x),
+            "the caret lands on the first row of the next block, at the x it was aiming at"
+        );
+    }
+
+    #[test]
+    fn moving_up_past_a_block_lands_on_its_last_row() {
+        // A heading wide enough to wrap, so the block above has more rows than
+        // it has source lines and only the last of them is the target. A heading
+        // ends its block at its own line, so no blank row sits between the two.
+        let editor = Editor::new("# one two three four five six\nsecond block\n");
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (second, _) = laid_out(&editor, &index, 1, &shaper);
+        let (first, above) = laid_out(&editor, &index, 0, &shaper);
+        assert!(
+            above.lines.len() > 1,
+            "the heading above wraps onto several rows"
+        );
+
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &second,
+            false,
+            0.0,
+            TEST_WIDTH,
+            &shaper,
+        )
+        .expect("there is a block above");
+        assert_eq!(
+            above
+                .point_for_source(&first, target, &shaper)
+                .map(|point| point.row),
+            Some(above.lines.len() - 1),
+            "moving up enters the block above on its last row, not its last line"
+        );
+    }
+
+    #[test]
+    fn the_document_edges_have_no_neighbor_row() {
+        let editor = Editor::new(
+            "only block
+",
+        );
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (block, _) = laid_out(&editor, &index, 0, &shaper);
+        for down in [true, false] {
+            assert_eq!(
+                neighbor_row_target(
+                    &editor,
+                    Some(&index),
+                    &block,
+                    down,
+                    0.0,
+                    TEST_WIDTH,
+                    &shaper
+                ),
+                None
+            );
+        }
     }
 
     #[test]

@@ -325,12 +325,17 @@ OS 側の throttle に支配されるため未実施（R2 前半の残タスク�
 
 **目的**: 複数行ブロックと折り返しを、カーソル・選択・IME と整合する表示座標系へ移す。
 
-- [ ] `LayoutLine` に block-local visual range、source mapping、y/height、shape result を保持する。
-- [ ] source offset ↔ block/LayoutLine/x/y の双方向変換を実装する。
-- [ ] 上下移動を物理行の grapheme column 依存から、layout 上の preferred x へ移行する。
-- [ ] クリック、ドラッグ選択、複数 LayoutLine をまたぐ選択、IME marked range、カーソル矩形を
+- [x] `LayoutLine` に block-local visual range、source mapping、y/height、shape result を保持する。
+      （`hane_presentation::layout`。shape result 自体は `LineShaper` 経由で都度引き、
+      行が持つのは折り返し位置・範囲・座標。shape 結果のキャッシュは R4C）
+- [x] source offset ↔ block/LayoutLine/x/y の双方向変換を実装する。
+- [x] 上下移動を物理行の grapheme column 依存から、layout 上の preferred x へ移行する。
+      （`Editor::move_vertical_to` + `EditorView::move_vertical`。索引が無い間は
+      `EditorCommand::MoveUp` / `MoveDown` がフォールバック）
+- [x] クリック、ドラッグ選択、複数 LayoutLine をまたぐ選択、IME marked range、カーソル矩形を
       新しい座標変換へ統一する。
-- [ ] soft wrap と明示改行を区別し、block 内の source↔visual 往復を R0.5 テストへ追加する。
+- [x] soft wrap と明示改行を区別し、block 内の source↔visual 往復を R0.5 テストへ追加する。
+      （`crates/presentation/tests/layout_contract.rs`）
 
 **完了条件**: 複数行 quote/list/code/table と折り返し段落で、上下移動・クリック・選択・IME が成立。
 全編集可能 source offset の往復テストが緑。

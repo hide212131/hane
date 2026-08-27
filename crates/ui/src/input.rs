@@ -1,5 +1,5 @@
 use crate::view::EditorView;
-use gpui::{Bounds, Context, EntityInputHandler, Pixels, UTF16Selection, Window};
+use gpui::{Bounds, Context, EntityInputHandler, Pixels, Size, UTF16Selection, Window, point, px};
 use hane_document::SourceRange;
 use std::ops::Range;
 
@@ -78,6 +78,9 @@ impl EntityInputHandler for EditorView {
         self.after_input(cx);
     }
 
+    /// Where the IME should put its candidate window: the caret rectangle the
+    /// last frame drew, in window coordinates. `bounds` is the top-left of the
+    /// text area, and the layout answers the rest.
     fn bounds_for_range(
         &mut self,
         _: Range<usize>,
@@ -85,7 +88,16 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(bounds)
+        let Some(caret) = self.caret_geometry() else {
+            return Some(bounds);
+        };
+        Some(Bounds {
+            origin: bounds.origin + point(px(caret.x), px(caret.y)),
+            size: Size {
+                width: px(1.0),
+                height: px(caret.height),
+            },
+        })
     }
 
     fn character_index_for_point(

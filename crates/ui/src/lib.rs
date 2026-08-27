@@ -6,6 +6,7 @@ mod input;
 #[cfg(feature = "instrument")]
 mod instrument;
 mod line;
+mod shape;
 
 mod theme;
 mod view;
