@@ -1,6 +1,7 @@
 //! Reproducible fixtures and latency aggregation shared by project phases.
 
 use hane_document::{RopeBuffer, SourceRange, TextBuffer};
+use hane_markdown::BlockIndex;
 use hane_metrics::percentile;
 use hane_presentation::{HeightIndex, present_markdown};
 use std::fs::{self, File};
@@ -206,6 +207,53 @@ pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
         samples.push(start.elapsed());
     }
     distribution(&samples)
+}
+
+/// What one incremental `BlockIndex` update cost, beyond its duration.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockIndexMeasurement {
+    pub update: Distribution,
+    pub max_reparsed_bytes: usize,
+    pub invalidated_blocks: usize,
+}
+
+/// Incremental block-index updates on a document of `blocks` paragraphs.
+/// `structural` chooses between typing inside one block and edits that split a
+/// block in two, which is the case that has to re-chunk the index.
+pub fn run_block_index_scenario(
+    blocks: usize,
+    iterations: usize,
+    structural: bool,
+) -> BlockIndexMeasurement {
+    let mut source = String::new();
+    for paragraph in 0..blocks {
+        source.push_str(&format!("paragraph {paragraph} with a few words in it\n\n"));
+    }
+    let mut buffer = RopeBuffer::from_text(&source);
+    let mut index = BlockIndex::from_buffer(&buffer);
+    let mut at = index
+        .block(blocks / 2)
+        .map_or(0, |block| block.source_range.start.0 + 10);
+    let mut measurement = BlockIndexMeasurement::default();
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let base = buffer.revision();
+        let insertion = if structural { "\n\n" } else { "x" };
+        if buffer.edit(SourceRange::empty(at), insertion).is_err() {
+            break;
+        }
+        let Ok(deltas) = buffer.deltas_since(base) else {
+            break;
+        };
+        let start = std::time::Instant::now();
+        let update = index.update(&buffer, &deltas);
+        samples.push(start.elapsed());
+        measurement.max_reparsed_bytes = measurement.max_reparsed_bytes.max(update.reparsed_bytes);
+        measurement.invalidated_blocks += update.invalidated_blocks;
+        at += insertion.len() + 1;
+    }
+    measurement.update = distribution(&samples);
+    measurement
 }
 
 pub fn markdown_report(environment: &Environment, scenarios: &[(&str, Distribution)]) -> String {

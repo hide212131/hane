@@ -237,17 +237,28 @@ feature 実装・fixture に限定され、既存構文の共通 SourceMap/編�
 
 **目的**: UI をブロック描画へ移す前に、Markdown ブロック境界と編集差分を管理する土台を作る。
 
-- [ ] `BlockIndex` に stable block ID、kind、source range、revision を保持し、
+- [x] `BlockIndex` に stable block ID、kind、source range、revision を保持し、
       byte offset ↔ block、block ordinal ↔ source range を対数時間または同等の計算量で引けるようにする。
-- [ ] 編集時の再解析開始点と、旧ブロック列へ再同期したと判定する条件を定義する。
+      block は文書を tile し（block 間の空行は上の block に属する）、絶対 offset ではなく byte 長を
+      chunk 単位の Fenwick tree で保持する。ADR-0018。
+- [x] 編集時の再解析開始点と、旧ブロック列へ再同期したと判定する条件を定義する。
       フェンス等で再同期できない場合は、後続を保守的に invalidation する。
-- [ ] 非交差ブロックを revision delta で rebase し、影響ブロックだけを置換する API を実装する。
-- [ ] 背景の正式解析結果、active block 周辺の暫定解析結果、現在 document revision の
+      窓 = dirty run の前後1 block、再同期 = 窓の最後の block が既存の終端 block と同じ
+      開始位置・種別で終わること、打ち切り = 256 KiB / 512 block。
+- [x] 非交差ブロックを revision delta で rebase し、影響ブロックだけを置換する API を実装する。
+      （`BlockIndex::update`。byte 長保持のため非交差 block は書き込みなしで移動する）
+- [x] 背景の正式解析結果、active block 周辺の暫定解析結果、現在 document revision の
       publish 優先順位を定義し、stale result が表示を上書きしないようにする。
-- [ ] BlockIndex 更新時間、再解析バイト数、invalidated block 数を計測する。
+      （`BlockIndexState::publish` / `apply_edits`）
+- [x] BlockIndex 更新時間、再解析バイト数、invalidated block 数を計測する。
+      （`BlockIndexUpdate` → metrics CSV の `block_index` record と `hane-bench` シナリオ）
 
 **完了条件**: UI はまだ行描画のままでも、各行が所属する正式/暫定 block を BlockIndex から取得できる。
 遠方へ影響する編集を含む R0.5 テストが緑で、通常の局所編集が文書サイズ比例の同期処理を発生させない。
+
+**完了（2026-08-27）**: `EditorView::block_at_line` が行→block を返し、背景 job が Formal 索引を
+publish、入力経路が増分更新する。100k block の文書で打鍵 median 2.5 µs / p95 4.2 µs、
+block 分割 median 5.4 µs / p95 6.4 µs、1編集あたりの再解析は 1 KiB 未満。
 
 ---
 

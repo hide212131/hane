@@ -1,6 +1,7 @@
 use hane_benchmark::{
-    Environment, generate_fixtures, markdown_report, run_buffer_edit_scenario,
-    run_file_open_scenario, run_layout_scenario, run_presentation_scenario,
+    Environment, generate_fixtures, markdown_report, run_block_index_scenario,
+    run_buffer_edit_scenario, run_file_open_scenario, run_layout_scenario,
+    run_presentation_scenario,
 };
 use std::path::Path;
 
@@ -23,6 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_file_open_scenario(Path::new("target/fixtures/markdown_100mb.md"), 30)?;
             let presentation = run_presentation_scenario(1_000);
             let layout = run_layout_scenario(100_000, 1_000);
+            const BLOCK_INDEX_EDITS: usize = 200;
+            let typing_index = run_block_index_scenario(100_000, BLOCK_INDEX_EDITS, false);
+            let structural_index = run_block_index_scenario(100_000, BLOCK_INDEX_EDITS, true);
             print!(
                 "{}",
                 markdown_report(
@@ -36,8 +40,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ("100 MB file open", open_hundred),
                         ("Markdown presentation update", presentation),
                         ("visible layout index", layout),
+                        ("block index update while typing", typing_index.update),
+                        ("block index update splitting a block", structural_index.update),
                     ]
                 )
+            );
+            println!(
+                "- Block index re-parse: at most {} bytes while typing, {} bytes when splitting a block",
+                typing_index.max_reparsed_bytes, structural_index.max_reparsed_bytes,
+            );
+            println!(
+                "- Block index invalidation: {} blocks over {} local edits",
+                typing_index.invalidated_blocks + structural_index.invalidated_blocks,
+                2 * BLOCK_INDEX_EDITS,
             );
         }
         _ => {

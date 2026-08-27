@@ -4,7 +4,9 @@
 
 ADR は実装前にすべてを固定するためではなく、実装時に迷うと性能・正確性・依存境界へ影響する判断を明示するために使う。
 
-ADR-0001 から ADR-0011 はPhase 0、ADR-0012からADR-0014はPhase 1、ADR-0015以降はPhase 2の実装判断を記録する。
+ADR-0001 から ADR-0011 はPhase 0、ADR-0012からADR-0014はPhase 1、ADR-0015からADR-0017は
+Phase 2以降の実装判断を記録する。ADR-0018以降は `docs/refactor-plan.md` の各フェーズで
+必要になった判断を記録する。
 
 ## ADR 一覧
 
@@ -27,6 +29,7 @@ ADR-0001 から ADR-0011 はPhase 0、ADR-0012からADR-0014はPhase 1、ADR-001
 | [ADR-0015](0015-phase2-markdown-presentation-plan.md) | Phase 2 Markdown Presentation実装計画 |
 | [ADR-0016](0016-phase3-typora-editing-plan.md) | Phase 3 Typora-style Editing実装計画 |
 | [ADR-0017](0017-phase4-polish-plan.md) | Phase 4 Polish実装計画 |
+| [ADR-0018](0018-block-index.md) | revision 付き Block Index |
 
 ## Phase 0 実装時の参照順
 

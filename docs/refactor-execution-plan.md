@@ -5,7 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-27）
 
-**現在地: R3.25（Markdown 拡張契約）完了。次は R3.5（revision 付き BlockIndex）に着手する。**
+**現在地: R3.5（revision 付き BlockIndex）完了。次は R3.75（DocumentSession / FileService）に着手する。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -15,8 +15,8 @@
 | 4 | R2 前半（計測ハーネス分離） | 🔶 ほぼ完了（下記残タスクあり） |
 | 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
 | 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
-| 7 | R3.5 revision 付き BlockIndex | ⬜ 未着手 ← **現在地** |
-| 8 | R3.75 DocumentSession / FileService | ⬜ 未着手 |
+| 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
+| 8 | R3.75 DocumentSession / FileService | ⬜ 未着手 ← **現在地** |
 | 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 |
 | 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 |
 | 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 |
@@ -53,6 +53,39 @@
   API 試行（`crates/presentation/tests/markdown_features.rs`）。UI crate の変更は不要だった。
   副産物として、文書全体 parse 時に fenced code の marker がコードブロック全体を飲み込む
   marker 導出のバグを発見・修正（開始/終了 fence 行のみを marker とする）。
+
+### R3.5 の完了内容
+
+- ✅ `hane_markdown::BlockIndex`。top-level block が文書を tile し（block 間の空行は上の block に
+  属する）、stable `BlockId`・構文種別・解析 revision・`Confidence`（Formal/Provisional）を持つ。
+  絶対 offset ではなく byte 長を保持し、chunk（128 block）単位の合計だけを Fenwick tree に載せる
+  ため、block 内編集は1つの長さ更新で済み、後続 block へ書き込みが発生しない。設計判断は
+  ADR-0018。
+- ✅ 増分更新（`BlockIndex::update`）。編集はそれを含む block に吸収し、再解析の窓は
+  dirty run の前後1 block。窓の最後の block が既存の終端 block と同じ開始位置・種別で
+  終わったときに再同期成立とみなす（CommonMark の継続規則を再実装しない）。不一致なら
+  窓を後ろへ伸ばし、256 KiB / 512 block で打ち切って後続を保守的に `Provisional` へ落とす。
+  invalidation は必ず接尾辞なので開始 ordinal を1つ持つだけで表現する。
+- ✅ publish 優先順位（`BlockIndexState`）。新しい revision 優先、同一 revision では Formal が
+  Provisional に勝ち、逆は起きない。古い候補は破棄、受理した候補は現在 revision へ持ち上げてから
+  publish し、履歴が無く rebase できない候補は stale のまま publish しない。遅れて到着した
+  背景 job の結果は ADR-0005 の部分 publish 規則どおり rebase して publish する。
+- ✅ UI 配線。`EditorView` が `BlockIndexState` を持ち、入力経路で増分更新、背景 job（旧
+  `schedule_block_context` を `schedule_document_parse` へ改称）が line context と Formal 索引を
+  同時に生成する。`EditorView::block_at_line` で各行の正式/暫定 block を取得できる。
+  副産物として、前の文書向けに走っていた背景 job が新しい文書へ publish しうる問題を
+  document generation で塞いだ。
+- ✅ 計測。`BlockIndexUpdate` が更新時間・再解析 byte 数・invalidate block 数を返し、
+  instrument build は metrics CSV の `block_index` record（3列追加）へ出力する。
+  `hane-bench` に再現シナリオを追加。100k block の文書で打鍵 median 2.5 µs / p95 4.2 µs、
+  block 分割 median 5.4 µs / p95 6.4 µs、1編集の再解析は 1 KiB 未満、invalidate 0。
+
+### R3.5 の残メモ（R4A で回収する）
+
+- 🔶 UI は依然として行描画で、fenced/table の line context も `BlockContextIndex` から取っている。
+  BlockIndex と二重に持っている状態は R4A（`fenced_code_context` / `table_context` 撤廃）で解消する。
+- 🔶 背景の全文解析は `full_text()` の String を作る。100 MB 文書での CPU / RSS 影響は
+  R4C 前の実測で確認する。
 
 ### R2 前半の残タスク
 

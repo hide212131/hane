@@ -100,3 +100,16 @@ startupに触れる変更では、静穏状態で再測定して絶対gateと相
 `local_parse_time`、`full_parse_time`、cache hit/miss、block-index update timeを独立した指標としては
 まだ出力しない。これらはR0時点では「未実装」を基準状態として記録し、BlockIndexやcacheを
 導入する該当フェーズで追加する。
+
+### R3.5で追加した指標
+
+BlockIndex導入に伴い、metrics CSVへ `block_index` record と3列を追加した。
+
+| 列 | 内容 |
+|---|---|
+| `block_index_update_ms` | 1回の増分更新（rebase + 窓の再解析 + splice）にかかった時間 |
+| `reparsed_bytes` | その更新が再解析したbyte数 |
+| `invalidated_blocks` | 再同期できず暫定扱いへ落としたblock数 |
+
+`scripts/aggregate_phase0_metrics.py` はこの3列を他の指標と同じ分布表に出力する。
+R0基準線には該当値がないため、R3.5の測定値が以降の比較原本になる。

@@ -18,6 +18,13 @@ LATENCY_COLUMNS = {
     "layout": ("paint", "layout_ms"),
     "startup": ("ready", "startup_ms"),
     "file_open": ("ready", "file_open_ms"),
+    "block_index_update": ("block_index", "block_index_update_ms"),
+}
+
+# Counts, not durations: reported with their own unit.
+COUNT_COLUMNS = {
+    "block_index_reparsed_bytes": ("block_index", "reparsed_bytes", "bytes"),
+    "block_index_invalidated_blocks": ("block_index", "invalidated_blocks", "blocks"),
 }
 
 
@@ -73,6 +80,9 @@ def main() -> None:
                             "layout",
                         }:
                             samples[("100 MB input combined", metric)].append(value)
+                for metric, (record_type, column, _) in COUNT_COLUMNS.items():
+                    if row["record_type"] == record_type and row.get(column):
+                        samples[(scenario, metric)].append(float(row[column]))
                 if row["record_type"] == "input" and row["input_event_kind"] == "ime_commit":
                     if row["keystroke_to_model_ms"]:
                         samples[(scenario, "ime_commit_to_model")].append(float(row["keystroke_to_model_ms"]))
@@ -101,7 +111,7 @@ def main() -> None:
         "| Scenario / metric | Samples | Median | p95 | p99 | Max | Unit |",
         "|---|---:|---:|---:|---:|---:|---|",
     ]
-    metric_order = list(LATENCY_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame", "memory_load", "memory_ready", "memory_visible_layout", "memory_idle_30s"]
+    metric_order = list(LATENCY_COLUMNS) + list(COUNT_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame", "memory_load", "memory_ready", "memory_visible_layout", "memory_idle_30s"]
     for scenario in sorted({scenario for scenario, _ in samples}):
         for metric in metric_order:
             values = samples.get((scenario, metric), [])
@@ -109,6 +119,8 @@ def main() -> None:
                 continue
             count, median, p95, p99, maximum = distribution(values)
             unit = "bytes" if metric.startswith("memory_") else "ms"
+            if metric in COUNT_COLUMNS:
+                unit = COUNT_COLUMNS[metric][2]
             label = metric
             lines.append(
                 f"| {scenario} — {label} | {count} | {median:.3f} | {p95:.3f} | {p99:.3f} | {maximum:.3f} | {unit} |"

@@ -1,5 +1,13 @@
 //! CommonMark parsing with source-byte ranges.
 
+mod block_index;
+mod block_store;
+
+pub use block_index::{
+    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
+    PublishOutcome, RESYNC_BLOCK_BUDGET, RESYNC_BYTE_BUDGET,
+};
+
 use hane_document::{LineId, Revision, RopeBuffer, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 

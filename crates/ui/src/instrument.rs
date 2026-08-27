@@ -5,6 +5,7 @@
 //! single place.
 
 use hane_editor::InputMeasurement;
+use hane_markdown::BlockIndexUpdate;
 use hane_metrics::{DurationDistribution, FrameMetrics};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -122,7 +123,7 @@ impl Phase0MetricsOutput {
             .open(path)?;
         writeln!(
             file,
-            "record_type,scenario,sequence,input_event_kind,keystroke_to_model_ms,keystroke_to_frame_ms,frame_interval_ms,layout_ms,startup_ms,file_open_ms,rss_bytes,input_source,refresh_rate_hz,background_job"
+            "record_type,scenario,sequence,input_event_kind,keystroke_to_model_ms,keystroke_to_frame_ms,frame_interval_ms,layout_ms,startup_ms,file_open_ms,rss_bytes,input_source,refresh_rate_hz,background_job,block_index_update_ms,reparsed_bytes,invalidated_blocks"
         )?;
         Ok(Some(Self {
             file,
@@ -151,6 +152,7 @@ impl Phase0MetricsOutput {
             Some(startup),
             Some(file_open),
             rss_bytes,
+            None,
         )
     }
 
@@ -166,6 +168,7 @@ impl Phase0MetricsOutput {
             None,
             None,
             rss_bytes,
+            None,
         )
     }
 
@@ -178,7 +181,7 @@ impl Phase0MetricsOutput {
             return Ok(());
         }
         self.row(
-            "paint", None, "", None, None, interval, layout, None, None, None,
+            "paint", None, "", None, None, interval, layout, None, None, None, None,
         )
     }
 
@@ -197,6 +200,28 @@ impl Phase0MetricsOutput {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    /// One incremental `BlockIndex` update: how long it took, how many bytes it
+    /// had to re-parse, and how many blocks it could only invalidate.
+    pub(crate) fn block_index(&mut self, update: &BlockIndexUpdate) -> io::Result<()> {
+        if !self.recording() {
+            return Ok(());
+        }
+        self.row(
+            "block_index",
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(*update),
         )
     }
 
@@ -217,15 +242,24 @@ impl Phase0MetricsOutput {
         startup: Option<Duration>,
         file_open: Option<Duration>,
         rss_bytes: Option<u64>,
+        block_index: Option<BlockIndexUpdate>,
     ) -> io::Result<()> {
         fn milliseconds(value: Option<Duration>) -> String {
             value.map_or_else(String::new, |value| {
                 format!("{:.6}", value.as_secs_f64() * 1_000.0)
             })
         }
+        let (block_index_update, reparsed_bytes, invalidated_blocks) =
+            block_index.map_or((None, String::new(), String::new()), |update| {
+                (
+                    Some(update.elapsed),
+                    update.reparsed_bytes.to_string(),
+                    update.invalidated_blocks.to_string(),
+                )
+            });
         writeln!(
             self.file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             csv(record_type),
             csv(&self.scenario),
             sequence.map_or_else(String::new, |value| value.to_string()),
@@ -240,6 +274,9 @@ impl Phase0MetricsOutput {
             csv(&self.input_source),
             csv(&self.refresh_rate_hz),
             self.background_job,
+            milliseconds(block_index_update),
+            reparsed_bytes,
+            invalidated_blocks,
         )?;
         self.file.flush()
     }

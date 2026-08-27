@@ -18,7 +18,10 @@ use hane_document::{
     TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
-use hane_markdown::{BlockContextIndex, local_block_context, parse_block_context};
+use hane_markdown::{
+    BlockContextIndex, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
+    local_block_context, parse_block_context,
+};
 use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockWeight, HeightIndex, LineContext, VisualOffset};
 use std::collections::HashMap;
@@ -81,7 +84,12 @@ pub struct EditorView {
     background_presentation_generation: u64,
     line_cache: HashMap<usize, hane_presentation::VisualBlock>,
     block_context: Option<BlockContextIndex>,
-    block_context_job_running: bool,
+    /// Markdown block boundaries for the current revision. Updated incrementally
+    /// on the input path and republished by the background parse; the publish
+    /// priority between the two lives in `BlockIndexState`.
+    block_index: BlockIndexState,
+    document_parse_job_running: bool,
+    document_generation: u64,
     persistent_state: PersistentState,
     save_generation: u64,
     save_job_running: bool,
@@ -129,7 +137,9 @@ impl EditorView {
             background_presentation_generation: 0,
             line_cache: HashMap::new(),
             block_context: None,
-            block_context_job_running: false,
+            block_index: BlockIndexState::new(),
+            document_parse_job_running: false,
+            document_generation: 0,
             persistent_state,
             save_generation: 0,
             save_job_running: false,
@@ -168,14 +178,26 @@ impl EditorView {
         &self.editor
     }
 
+    /// Block that owns a physical source line, with the confidence the index has
+    /// in it. `None` while no index is published yet, or for a line in a document
+    /// that holds no Markdown block at all.
+    pub fn block_at_line(&self, line: usize) -> Option<IndexedBlock> {
+        block_at_line(self.block_index.index()?, self.editor.document(), line)
+    }
+
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
+        // Keep block boundaries current without waiting for the background parse:
+        // this re-parses only the edited window, never the document.
+        if let Some(update) = self.block_index.apply_edits(self.editor.document()) {
+            self.record_block_index_update(&update);
+        }
         let lines = self.editor.document().line_count();
         if lines != self.heights.len() {
             self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
             self.line_cache.clear();
         }
         self.scroll_cursor_into_view();
-        self.schedule_block_context(cx);
+        self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
         cx.notify();
     }
@@ -343,6 +365,10 @@ impl EditorView {
                 self.scroll_y = 0.0;
                 self.line_cache.clear();
                 self.block_context = None;
+                self.block_index = BlockIndexState::new();
+                // A parse job started for the previous document must not publish
+                // into this one; revisions alone cannot tell them apart.
+                self.document_generation = self.document_generation.wrapping_add(1);
                 self.persistent_state.remember(path);
                 if let Err(error) = self.persistent_state.save() {
                     self.status = Some(format!("Opened; recent files failed: {error}"));
@@ -350,7 +376,7 @@ impl EditorView {
                     self.status = Some("Opened".to_owned());
                 }
                 cx.add_recent_document(path);
-                self.schedule_block_context(cx);
+                self.schedule_document_parse(cx);
             }
             Err(error) => self.status = Some(format!("Open failed: {error}")),
         }
@@ -397,50 +423,71 @@ impl EditorView {
         cx.notify();
     }
 
-    fn schedule_block_context(&mut self, cx: &mut Context<Self>) {
+    /// Coalesced background job producing the formal, document-wide parse: the
+    /// fenced/table line context the line presenter still consumes, and the
+    /// formal `BlockIndex`. One job at a time; a result that no longer matches
+    /// the document revision is re-scheduled instead of published.
+    fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
         let revision = self.editor.document().revision();
-        if self
+        let context_is_current = self
             .block_context
             .as_ref()
-            .is_some_and(|index| index.revision == revision)
-        {
+            .is_some_and(|index| index.revision == revision);
+        if context_is_current && !self.block_index.needs_formal_parse(self.editor.document()) {
             return;
         }
-        if self.block_context_job_running {
+        if self.document_parse_job_running {
             return;
         }
-        self.block_context_job_running = true;
+        self.document_parse_job_running = true;
+        let generation = self.document_generation;
         let snapshot = self.editor.document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
             let current = view
                 .update(cx, |view, _| {
-                    block_context_revision_is_current(view.editor.document().revision(), revision)
+                    view.document_generation == generation
+                        && block_context_revision_is_current(
+                            view.editor.document().revision(),
+                            revision,
+                        )
                 })
                 .unwrap_or(false);
             if !current {
                 let _ = view.update(cx, |view, cx| {
-                    view.block_context_job_running = false;
-                    view.schedule_block_context(cx);
+                    view.document_parse_job_running = false;
+                    view.schedule_document_parse(cx);
                 });
                 return;
             }
-            let index = cx
+            let (context, index) = cx
                 .background_executor()
-                .spawn(async move { parse_block_context(&snapshot) })
+                .spawn(async move {
+                    let context = parse_block_context(&snapshot);
+                    let index = BlockIndex::from_buffer(&snapshot);
+                    (context, index)
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.block_context_job_running = false;
+                view.document_parse_job_running = false;
+                if view.document_generation != generation {
+                    view.schedule_document_parse(cx);
+                    return;
+                }
+                // The index carries its own staleness rule, so it can still be
+                // rebased onto edits the context index has to be re-run for.
+                view.block_index
+                    .publish(index, IndexSource::Formal, view.editor.document());
                 if block_context_revision_is_current(
                     view.editor.document().revision(),
-                    index.revision,
+                    context.revision,
                 ) {
-                    view.background_presentation_generation = index.revision.0 + 1;
-                    view.block_context = Some(index);
+                    view.background_presentation_generation = context.revision.0 + 1;
+                    view.block_context = Some(context);
                     view.line_cache.clear();
                     cx.notify();
                 } else {
-                    view.schedule_block_context(cx);
+                    view.schedule_document_parse(cx);
                 }
             });
         })
@@ -595,6 +642,14 @@ impl EditorView {
     }
 }
 
+/// Resolves a physical source line to the block that owns it. Every byte belongs
+/// to exactly one block, so the line's start offset is enough; this is the seam
+/// the block-based renderer will pull on in R4A.
+fn block_at_line(index: &BlockIndex, document: &RopeBuffer, line: usize) -> Option<IndexedBlock> {
+    let range = document.line_range(LineId(line)).ok()?;
+    index.block_at(range.start)
+}
+
 fn edit_affects_range(delta: RevisionDelta, range: SourceRange) -> bool {
     let edit = delta.edited_source_range_before;
     if edit.is_empty() {
@@ -693,6 +748,14 @@ impl EditorView {
         Ok(())
     }
 
+    fn record_block_index_update(&mut self, update: &BlockIndexUpdate) {
+        if let Some(output) = &mut self.instrumentation.metrics_output
+            && let Err(error) = output.block_index(update)
+        {
+            eprintln!("could not write block index metrics: {error}");
+        }
+    }
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         measurements: &[InputMeasurement],
@@ -739,6 +802,8 @@ impl EditorView {
 impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
 
+    fn record_block_index_update(&mut self, _update: &BlockIndexUpdate) {}
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         _measurements: &[InputMeasurement],
@@ -752,7 +817,7 @@ impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
         self.theme = resolve_theme(self.persistent_state.settings.theme, window.appearance());
-        self.schedule_block_context(cx);
+        self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
             .max(self.theme.line_height);
@@ -1161,6 +1226,48 @@ mod tests {
             true,
             true,
         ));
+    }
+
+    #[test]
+    fn every_line_resolves_to_its_markdown_block() {
+        let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
+        let mut document = RopeBuffer::from_text(source);
+        let mut index = BlockIndex::from_buffer(&document);
+        let kinds = (0..document.line_count())
+            .map(|line| block_at_line(&index, &document, line).map(|block| block.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(hane_markdown::NodeKind::Heading(1)),
+                Some(hane_markdown::NodeKind::Heading(1)),
+                Some(hane_markdown::NodeKind::Paragraph),
+                Some(hane_markdown::NodeKind::Paragraph),
+                Some(hane_markdown::NodeKind::Paragraph),
+                Some(hane_markdown::NodeKind::CodeBlock),
+                Some(hane_markdown::NodeKind::CodeBlock),
+                Some(hane_markdown::NodeKind::CodeBlock),
+                Some(hane_markdown::NodeKind::CodeBlock),
+                Some(hane_markdown::NodeKind::Paragraph),
+                Some(hane_markdown::NodeKind::Paragraph),
+            ],
+            "each line reports the block it sits in"
+        );
+
+        // After an edit the incremental index still answers for every line, and
+        // the fenced block still owns its interior lines.
+        let base = document.revision();
+        document.edit(SourceRange::empty(9), "extra ").unwrap();
+        let deltas = document.deltas_since(base).unwrap();
+        index.update(&document, &deltas);
+        assert_eq!(
+            block_at_line(&index, &document, 6).map(|block| block.kind),
+            Some(hane_markdown::NodeKind::CodeBlock)
+        );
+        assert!(
+            (0..document.line_count())
+                .all(|line| block_at_line(&index, &document, line).is_some())
+        );
     }
 
     #[test]
