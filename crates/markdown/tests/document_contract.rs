@@ -1,5 +1,5 @@
 use hane_document::{Revision, RopeBuffer, SourceRange, TextBuffer};
-use hane_markdown::{NodeKind, parse_block_context, parse_document};
+use hane_markdown::{BlockIndex, NodeKind, parse_document};
 
 fn node_count(source: &str, kind: NodeKind) -> usize {
     parse_document(
@@ -53,14 +53,20 @@ fn reference_links_and_escaped_markers_have_unambiguous_parse_contracts() {
     );
 }
 
+/// Block kind of the block owning a physical line, the way the renderer asks.
+fn kind_at_line(index: &BlockIndex, buffer: &RopeBuffer, line: usize) -> Option<NodeKind> {
+    let range = buffer.line_range(hane_document::LineId(line)).ok()?;
+    index.block_at(range.start).map(|block| block.kind)
+}
+
 #[test]
-fn table_and_fence_context_follow_document_revisions() {
+fn block_kinds_follow_document_revisions() {
     let mut buffer =
         RopeBuffer::from_text("before\n| Name | 値 |\n|:---|---:|\n| 羽 | 3 |\nafter\n");
-    let initial = parse_block_context(&buffer);
-    assert_eq!(initial.revision, Revision(0));
+    let initial = BlockIndex::from_buffer(&buffer);
+    assert_eq!(initial.revision(), Revision(0));
     for line in 1..=3 {
-        assert_eq!(initial.line_is_table(line), Some(true));
+        assert_eq!(kind_at_line(&initial, &buffer, line), Some(NodeKind::Table));
     }
 
     let insertion = buffer
@@ -70,17 +76,24 @@ fn table_and_fence_context_follow_document_revisions() {
     buffer
         .edit(SourceRange::empty(insertion.0), "```\n")
         .unwrap();
-    let after_open = parse_block_context(&buffer);
-    assert_eq!(after_open.revision, Revision(1));
-    assert_ne!(initial.revision, buffer.revision());
-    assert_eq!(after_open.line_is_fenced(4), Some(true));
+    let after_open = BlockIndex::from_buffer(&buffer);
+    assert_eq!(after_open.revision(), Revision(1));
+    assert_ne!(initial.revision(), buffer.revision());
+    assert_eq!(
+        kind_at_line(&after_open, &buffer, 4),
+        Some(NodeKind::CodeBlock),
+        "the table rows now sit inside the opened fence"
+    );
 
     buffer
         .edit(SourceRange::new(insertion.0, insertion.0 + 4), "")
         .unwrap();
-    let after_close = parse_block_context(&buffer);
-    assert_eq!(after_close.revision, Revision(2));
-    assert_eq!(after_close.line_is_fenced(4), Some(false));
+    let after_close = BlockIndex::from_buffer(&buffer);
+    assert_eq!(after_close.revision(), Revision(2));
+    assert_eq!(
+        kind_at_line(&after_close, &buffer, 4),
+        Some(NodeKind::Table)
+    );
 }
 
 #[test]
@@ -94,12 +107,12 @@ fn stale_background_result_cannot_match_the_current_revision() {
         .edit(SourceRange::empty(buffer.len_bytes().0), "```\n")
         .unwrap();
 
-    let stale = parse_block_context(&snapshot);
-    let current = parse_block_context(&buffer);
-    assert_ne!(stale.revision, buffer.revision());
-    assert_eq!(current.revision, buffer.revision());
-    assert_eq!(stale.revision, Revision(0));
-    assert_eq!(current.revision, Revision(2));
+    let stale = BlockIndex::from_buffer(&snapshot);
+    let current = BlockIndex::from_buffer(&buffer);
+    assert_ne!(stale.revision(), buffer.revision());
+    assert_eq!(current.revision(), buffer.revision());
+    assert_eq!(stale.revision(), Revision(0));
+    assert_eq!(current.revision(), Revision(2));
 }
 
 #[test]
@@ -109,22 +122,22 @@ fn opening_fence_edit_changes_far_context_and_removal_restores_it() {
     source.push_str("after\n");
     let mut buffer = RopeBuffer::from_text(&source);
     assert_eq!(
-        parse_block_context(&buffer).line_is_fenced(2_050),
-        Some(false)
+        kind_at_line(&BlockIndex::from_buffer(&buffer), &buffer, 2_050),
+        Some(NodeKind::Paragraph)
     );
 
     let insertion = "before\n".len();
     buffer.edit(SourceRange::empty(insertion), "```\n").unwrap();
     assert_eq!(
-        parse_block_context(&buffer).line_is_fenced(2_050),
-        Some(true)
+        kind_at_line(&BlockIndex::from_buffer(&buffer), &buffer, 2_050),
+        Some(NodeKind::CodeBlock)
     );
 
     buffer
         .edit(SourceRange::new(insertion, insertion + 4), "")
         .unwrap();
     assert_eq!(
-        parse_block_context(&buffer).line_is_fenced(2_050),
-        Some(false)
+        kind_at_line(&BlockIndex::from_buffer(&buffer), &buffer, 2_050),
+        Some(NodeKind::Paragraph)
     );
 }

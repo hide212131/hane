@@ -5,9 +5,10 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
+use hane_markdown::IndexedBlock;
 use hane_presentation::{
-    BlockDisplay, BlockSurface, BlockTint, BlockWeight, InlineDisplay, LineContext, VisualBlock,
-    VisualOffset, present_polished_line,
+    BlockDisplay, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow, InlineDisplay,
+    VisualBlock, VisualLine, VisualOffset, block_line_span, present_block, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -16,31 +17,54 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
-pub(crate) fn presented_line(
+/// Presents the lines of one indexed Markdown block that reach `visible`.
+///
+/// A block is not bounded — a document without a blank line in it is a single
+/// paragraph — so only the lines inside the visible window are built; the rest
+/// are counted and stand in as space. Which lines are literal code or table
+/// syntax is decided in presentation, from the block kind; this crate never
+/// inspects the source for fences or pipes.
+pub(crate) fn presented_block(
     editor: &Editor,
-    line: usize,
-    context: LineContext,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
 ) -> Option<VisualBlock> {
-    let Ok(range) = editor.document().line_range(LineId(line)) else {
-        return None;
-    };
-    let source = editor.document().text(range).unwrap_or_default();
-    let disclosure = disclosure_for_line(editor, line, range);
-    let mut block = present_polished_line(
-        line as u64,
-        editor.document().revision(),
-        range,
-        &source,
+    let document = editor.document();
+    let span = block_line_span(document, block)?;
+    let window = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
+    let ranges = window
+        .clone()
+        .map(|line| document.line_range(LineId(line)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let texts = ranges
+        .iter()
+        .map(|range| document.text(*range).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let lines = window
+        .zip(&ranges)
+        .zip(&texts)
+        .map(|((line, range), text)| BlockLine {
+            line,
+            range: *range,
+            text,
+            disclosure: disclosure_for_line(editor, line, *range),
+        })
+        .collect::<Vec<_>>();
+    Some(present_block(
+        block,
+        document.revision(),
+        &BlockWindow {
+            trailing_blank_lines: trailing_blank_lines(document, &span),
+            span,
+            lines: &lines,
+        },
         DEFAULT_LINE_HEIGHT,
-        disclosure,
-        context,
-    );
-    while block.visual_text.ends_with(['\r', '\n']) {
-        block.visual_text.pop();
-    }
-    Some(block)
+    ))
 }
 
+/// Source range whose Markdown markers this line discloses: the caret's own
+/// position, the part of the selection that falls on the line, or the IME's
+/// marked range, which wins because composing text must stay visible.
 pub(crate) fn disclosure_for_line(
     editor: &Editor,
     line: usize,
@@ -78,7 +102,7 @@ const DEFAULT_LINE_HEIGHT: f32 = 26.0;
 /// [`BlockDisplay::font_scale`], so the UI never keys sizing off a Markdown kind.
 pub(crate) const BODY_FONT_SIZE: f32 = 14.0;
 
-pub(crate) fn block_font_size(block: &VisualBlock) -> f32 {
+pub(crate) fn block_font_size(block: &VisualLine) -> f32 {
     BODY_FONT_SIZE * block.display().font_scale
 }
 
@@ -111,10 +135,23 @@ fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
         })
 }
 
-pub(crate) fn line_element_from_block(
+/// Container for one Markdown block. The block is the virtualization unit, and
+/// in R4A its children are still one element per physical line, so caret,
+/// selection and IME keep addressing lines while scrolling is driven by blocks.
+pub(crate) fn block_element(block: &VisualBlock, children: impl IntoIterator<Item = Div>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(div().h(px(block.leading_space())))
+        .children(children)
+        .child(div().h(px(block.trailing_space())))
+}
+
+pub(crate) fn line_element(
     editor: &Editor,
     line: usize,
-    block: &VisualBlock,
+    block: &VisualLine,
     theme: Theme,
     resolver: &ResourceResolver,
 ) -> Div {
@@ -223,7 +260,7 @@ pub(crate) fn line_element_from_block(
     .children(elements)
 }
 
-fn clipped_visual_range(block: &VisualBlock, source: SourceRange) -> Option<Range<usize>> {
+fn clipped_visual_range(block: &VisualLine, source: SourceRange) -> Option<Range<usize>> {
     let clipped = SourceRange {
         start: source.start.max(block.source_range.start),
         end: source.end.min(block.source_range.end),
@@ -320,6 +357,21 @@ fn cursor_overlay(theme: Theme) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hane_markdown::BlockIndex;
+
+    /// Presents a document the way the renderer does: index first, then one
+    /// `present_block` call per block.
+    fn presented_lines(editor: &Editor) -> Vec<VisualLine> {
+        let index = BlockIndex::from_buffer(editor.document());
+        index
+            .blocks()
+            .flat_map(|block| {
+                presented_block(editor, &block, &(0..usize::MAX))
+                    .expect("block presents")
+                    .lines
+            })
+            .collect()
+    }
 
     #[test]
     fn shared_line_boundary_belongs_only_to_the_following_line() {
@@ -386,13 +438,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fenced_block_presents_every_line_as_literal_code() {
+        let editor = Editor::new("```rust\nlet x = **1**;\n```\n\nafter\n");
+        let lines = presented_lines(&editor);
+        for (line, visual) in lines.iter().enumerate().take(3) {
+            assert_eq!(
+                visual.display().surface,
+                BlockSurface::Code,
+                "line {line} is inside the fence"
+            );
+        }
+        // The literal `**1**` keeps its asterisks: nothing inside a fence is
+        // read as inline markup.
+        assert_eq!(lines[1].visual_text, "let x = **1**;");
+        // The blank line tiling folded into the code block is not code.
+        assert_eq!(lines[3].display().surface, BlockSurface::Default);
+        assert_eq!(lines[4].visual_text, "after");
+    }
+
+    #[test]
     fn phase3_line_discloses_only_the_active_construct() {
         let editor = Editor::new("# **bold** and _italic_");
-        let block = presented_line(&editor, 0, LineContext::Normal).unwrap();
+        let block = &presented_lines(&editor)[0];
         assert_eq!(block.visual_text, "# bold and italic");
         assert_eq!(block.disclosure, Some(SourceRange::empty(0)));
         assert_eq!(block.display().weight, BlockWeight::Semibold);
-        assert_eq!(block_font_size(&block), 24.0);
+        assert_eq!(block_font_size(block), 24.0);
         // Asserted through the render policy, not the Markdown style kind: the UI
         // only ever sees `InlineDisplay`.
         let bold = block.visual_text.find("bold").unwrap();

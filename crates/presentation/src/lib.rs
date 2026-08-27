@@ -1,10 +1,11 @@
-//! Local visual blocks, source mapping, and variable-height virtualization.
+//! Visual blocks and lines, source mapping, and variable-height virtualization.
 
 use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    MarkdownParse, NodeKind, is_delimited_inline, is_table_delimiter, parse_document,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeKind, is_delimited_inline,
+    is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 
@@ -275,10 +276,10 @@ impl StyleKind {
     }
 }
 
-/// Block-level context that a single source line sits in, resolved by the caller
-/// from the document-wide [`hane_markdown::BlockContextIndex`] (or its bounded
-/// fallback). Presentation owns the resulting display kind and style runs so the
-/// UI never re-derives fenced-code or table styling from raw source.
+/// Block-level context one physical source line is presented in, derived from
+/// the owning block's kind by [`block_line_context`]. Presentation owns the
+/// resulting display kind and style runs, so the UI never re-derives fenced-code
+/// or table styling from raw source.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LineContext {
     #[default]
@@ -287,19 +288,17 @@ pub enum LineContext {
     Table,
 }
 
-impl LineContext {
-    /// Resolves the per-line flags of a document context index into the display
-    /// context. Fenced code wins over table context: a line inside a fence is
-    /// literal, so its pipes must not be re-read as table syntax. The precedence
-    /// rule lives here so callers only forward the index lookups.
-    pub const fn from_document_context(fenced_code: bool, table: bool) -> Self {
-        if fenced_code {
-            Self::FencedCode
-        } else if table {
-            Self::Table
-        } else {
-            Self::Normal
-        }
+/// Display context for every physical line of a block.
+///
+/// Fenced code wins by construction: a line inside a code block is literal, so
+/// its pipes are never re-read as table syntax. This is the single seam where
+/// "which lines are literal" and "which lines are table syntax" is decided, and
+/// it reads only the block kind the index published.
+pub const fn block_line_context(kind: NodeKind) -> LineContext {
+    match kind {
+        NodeKind::CodeBlock => LineContext::FencedCode,
+        NodeKind::Table | NodeKind::TableHead | NodeKind::TableRow => LineContext::Table,
+        _ => LineContext::Normal,
     }
 }
 
@@ -425,9 +424,14 @@ pub struct ImagePresentation {
     pub destination: String,
 }
 
+/// One physical source line, presented. In R4A this is the compatibility layer
+/// inside a [`VisualBlock`]: cursor, selection and IME still address physical
+/// lines while virtualization moved to blocks. R4B replaces it with a layout
+/// line that can also carry a soft-wrapped fragment.
 #[derive(Clone, Debug, PartialEq)]
-pub struct VisualBlock {
-    pub block_id: u64,
+pub struct VisualLine {
+    /// Document line number this was presented from.
+    pub line_id: u64,
     pub source_range: SourceRange,
     pub revision: Revision,
     pub visual_text: String,
@@ -449,12 +453,12 @@ pub struct VisualBlock {
     pub image: Option<ImagePresentation>,
 }
 
-impl VisualBlock {
+impl VisualLine {
     pub fn height(&self) -> f32 {
         self.measured_height.unwrap_or(self.estimated_height)
     }
 
-    /// Render policy for this block. The UI draws from this alone and never
+    /// Render policy for this line. The UI draws from this alone and never
     /// matches on [`BlockKind`].
     pub fn display(&self) -> BlockDisplay {
         self.kind.display()
@@ -486,14 +490,263 @@ impl VisualBlock {
     }
 }
 
+/// One Markdown block as the renderer sees it, and the unit of virtualization.
+///
+/// A block spans every physical source line of its construct — a fenced code
+/// block including both fences, a table including its delimiter row, a paragraph
+/// including its continuation lines — plus the blank run that block tiling folds
+/// into it. Its [`VisualLine`]s are the R4A compatibility layer: element
+/// generation, height accounting and scrolling are driven by blocks, while
+/// caret, selection and IME still address physical lines.
+///
+/// A block has no size limit — a document with no blank line in it is one
+/// paragraph — so only the lines that reach the viewport are presented. The
+/// clipped lines are counted, not built, and stand in as plain line-height space
+/// above and below.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisualBlock {
+    /// Stable id from the block index; the cache key that survives typing.
+    pub id: BlockId,
+    pub kind: BlockKind,
+    /// Spans the whole construct, so it usually covers several lines.
+    pub source_range: SourceRange,
+    pub revision: Revision,
+    pub confidence: Confidence,
+    /// Document lines the whole block covers, presented or not.
+    pub span: Range<usize>,
+    /// The presented run of lines, a contiguous slice of `span`.
+    pub lines: Vec<VisualLine>,
+    /// Lines of `span` clipped above and below the presented run.
+    pub lines_before: usize,
+    pub lines_after: usize,
+    /// Height a clipped line stands in for.
+    pub line_height: f32,
+}
+
+impl VisualBlock {
+    /// Height of the whole block: what was presented, plus line height for what
+    /// was clipped.
+    pub fn height(&self) -> f32 {
+        let clipped = (self.lines_before + self.lines_after) as f32 * self.line_height;
+        clipped + self.lines.iter().map(VisualLine::height).sum::<f32>()
+    }
+
+    /// Space to leave above the presented lines, inside the block.
+    pub fn leading_space(&self) -> f32 {
+        self.lines_before as f32 * self.line_height
+    }
+
+    /// Space to leave below the presented lines, inside the block.
+    pub fn trailing_space(&self) -> f32 {
+        self.lines_after as f32 * self.line_height
+    }
+
+    /// Render policy for the block. As with a line, the UI applies this and never
+    /// matches on [`BlockKind`].
+    pub fn display(&self) -> BlockDisplay {
+        self.kind.display()
+    }
+
+    /// True when this presentation still describes what the index now says about
+    /// the block: same construct, same span, same confidence. A cached block that
+    /// fails this has to be presented again.
+    pub fn matches(&self, block: &IndexedBlock) -> bool {
+        self.id == block.id
+            && self.source_range == block.source_range
+            && self.confidence == block.confidence
+            && self.kind == block_display_kind(block.kind)
+    }
+
+    /// True when the presented run already covers `lines`, so a cached block can
+    /// be drawn for that viewport without presenting anything again.
+    pub fn covers(&self, lines: &Range<usize>) -> bool {
+        let presented = self.span.start + self.lines_before
+            ..self.span.start + self.lines_before + self.lines.len();
+        let wanted = lines.start.max(self.span.start)..lines.end.min(self.span.end);
+        wanted.is_empty() || (presented.start <= wanted.start && wanted.end <= presented.end)
+    }
+
+    /// Moves the block and every line in it onto `current`. Returns false when a
+    /// delta cannot be transformed, which is the caller's signal to re-present
+    /// rather than to display a block whose mapping no longer holds.
+    pub fn rebase(&mut self, deltas: &[RevisionDelta], current: Revision) -> bool {
+        let mut range = self.source_range;
+        for delta in deltas {
+            let Some(next) = delta.transform_range(range) else {
+                return false;
+            };
+            range = next;
+        }
+        if !self.lines.iter_mut().all(|line| line.rebase(deltas, current)) {
+            return false;
+        }
+        self.source_range = range;
+        self.revision = current;
+        true
+    }
+}
+
+/// Physical source lines a block covers.
+///
+/// A block ends where the next one begins, so its last byte is the newline of
+/// its last line — except for the block that owns the document end, which also
+/// owns the empty final line a trailing newline creates. That line holds no
+/// bytes but can hold the caret, so it has to be drawn.
+pub fn block_line_span(document: &RopeBuffer, block: &IndexedBlock) -> Option<Range<usize>> {
+    let first = document.line_for_offset(block.source_range.start).ok()?;
+    let last =
+        if block.source_range.is_empty() || block.source_range.end.0 >= document.len_bytes().0 {
+            document.line_for_offset(block.source_range.end).ok()?
+        } else {
+            document
+                .line_for_offset(SourceOffset(block.source_range.end.0 - 1))
+                .ok()?
+        };
+    Some(first.0..last.0 + 1)
+}
+
+/// Blank lines closing a block. Tiling folds the blank run between two blocks
+/// into the block above, and those lines are not part of the construct. Walks
+/// back from the block's end, so it reads the blank run and one line more.
+pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize {
+    span.clone()
+        .rev()
+        .take_while(|line| {
+            document
+                .line_range(hane_document::LineId(*line))
+                .ok()
+                .and_then(|range| document.text(range).ok())
+                .is_none_or(|text| text.trim().is_empty())
+        })
+        .count()
+}
+
+/// Initial height of every block in the index, from the line height alone.
+///
+/// Seeds the [`HeightIndex`] at block granularity, and is re-run whenever the
+/// block count changes, so it must not touch the rope: the index already counted
+/// each block's lines while it tiled them, and this is arithmetic over those
+/// counts. Measured heights replace these as blocks are drawn.
+pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32) -> Vec<f32> {
+    let mut counted = 0;
+    let mut heights = index
+        .blocks()
+        .map(|block| {
+            counted += block.line_count;
+            line_height * block.line_count as f32
+        })
+        .collect::<Vec<_>>();
+    // A document ending in a newline has one physical line more than its blocks
+    // account for — the empty last line, which the block above owns because that
+    // is where the caret goes.
+    if let Some(last) = heights.last_mut() {
+        let extra = document.line_count().saturating_sub(counted);
+        *last += line_height * extra as f32;
+    }
+    heights
+}
+
+/// One physical source line handed to [`present_block`].
+#[derive(Clone, Copy, Debug)]
+pub struct BlockLine<'a> {
+    /// Document line number. Becomes the presented line's [`VisualLine::line_id`].
+    pub line: usize,
+    pub range: SourceRange,
+    pub text: &'a str,
+    /// Source range whose Markdown markers this line currently discloses,
+    /// resolved by the caller from caret, selection and IME state.
+    pub disclosure: Option<SourceRange>,
+}
+
+/// Which lines of a block to present, and where they sit inside it.
+#[derive(Clone, Debug)]
+pub struct BlockWindow<'a> {
+    /// Document lines the whole block covers.
+    pub span: Range<usize>,
+    /// Blank lines closing the block. Tiling folds the blank run between two
+    /// blocks into the block above, and those lines are not part of the
+    /// construct — a blank line after a closing fence is not code.
+    pub trailing_blank_lines: usize,
+    /// The contiguous run inside `span` to present. Everything else is clipped.
+    pub lines: &'a [BlockLine<'a>],
+}
+
+/// Display kind for a whole block. Wider than [`presentation_block_kind`],
+/// which answers for a single node: a container node (a table, a list) does
+/// decide how its block looks even though its lines are presented one by one.
+fn block_display_kind(kind: NodeKind) -> BlockKind {
+    match kind {
+        NodeKind::Table | NodeKind::TableHead | NodeKind::TableRow => BlockKind::TableRow,
+        NodeKind::List { .. } | NodeKind::ListItem { .. } => BlockKind::ListItem,
+        other => presentation_block_kind(other).unwrap_or(BlockKind::Unsupported),
+    }
+}
+
+/// Presents the visible lines of one indexed Markdown block.
+///
+/// Every line is presented in the context its block kind implies, except the
+/// blank run closing the block. The trailing newline each line's visual text
+/// keeps for source-map fidelity is trimmed here, because the renderer draws one
+/// element per line.
+pub fn present_block(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+) -> VisualBlock {
+    let context = block_line_context(block.kind);
+    let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    let lines = window
+        .lines
+        .iter()
+        .map(|line| {
+            let context = if line.line < content_end {
+                context
+            } else {
+                LineContext::Normal
+            };
+            let mut presented = present_polished_line(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                context,
+            );
+            while presented.visual_text.ends_with(['\r', '\n']) {
+                presented.visual_text.pop();
+            }
+            presented
+        })
+        .collect::<Vec<_>>();
+    let lines_before = window
+        .lines
+        .first()
+        .map_or(0, |line| line.line.saturating_sub(window.span.start));
+    let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
+    VisualBlock {
+        id: block.id,
+        kind: block_display_kind(block.kind),
+        source_range: block.source_range,
+        revision,
+        confidence: block.confidence,
+        span: window.span.clone(),
+        lines,
+        lines_before,
+        lines_after,
+        line_height,
+    }
+}
+
 pub fn present_plain(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
-) -> VisualBlock {
-    VisualBlock {
-        block_id,
+) -> VisualLine {
+    VisualLine {
+        line_id,
         source_range: range,
         revision,
         visual_text: source.to_owned(),
@@ -522,13 +775,13 @@ pub fn present_plain(
 /// syntax: a construct with no specialized presenter, or one whose marker
 /// derivation fails to tile the source range, still round-trips its source.
 pub fn present_raw_source(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
-) -> VisualBlock {
-    let mut block = present_plain(block_id, revision, range, source);
+) -> VisualLine {
+    let mut block = present_plain(line_id, revision, range, source);
     block.kind = BlockKind::Unsupported;
     block.estimated_height = estimated_height(BlockKind::Unsupported, line_height);
     block
@@ -659,15 +912,15 @@ fn append_segment(
 /// Builds a native Markdown block with progressive disclosure. Markdown source
 /// remains authoritative; only marker ranges outside `disclosure` collapse.
 pub fn present_markdown_with_disclosure(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
     disclosure: Option<SourceRange>,
-) -> VisualBlock {
+) -> VisualLine {
     if source.is_empty() {
-        let mut block = present_plain(block_id, revision, range, source);
+        let mut block = present_plain(line_id, revision, range, source);
         block.estimated_height = line_height;
         return block;
     }
@@ -727,7 +980,7 @@ pub fn present_markdown_with_disclosure(
     // source range only partially covered, degrade to raw source rather than
     // hiding or dropping the uncovered bytes.
     if !segments_tile_range(range, &segments) {
-        return present_raw_source(block_id, revision, range, source, line_height);
+        return present_raw_source(line_id, revision, range, source, line_height);
     }
     let source_map = SourceMap { segments };
     let mut style_runs = parsed
@@ -753,8 +1006,8 @@ pub fn present_markdown_with_disclosure(
         })
         .collect::<Vec<_>>();
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
-    VisualBlock {
-        block_id,
+    VisualLine {
+        line_id,
         source_range: range,
         revision,
         visual_text: visual,
@@ -776,29 +1029,29 @@ pub fn present_markdown_with_disclosure(
 /// every display-kind and style-run decision here so the UI renders purely by
 /// [`BlockKind`]/[`StyleKind`] without re-inspecting the source.
 pub fn present_polished_line(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
     disclosure: Option<SourceRange>,
     context: LineContext,
-) -> VisualBlock {
+) -> VisualLine {
     // A fenced-code line has no disclosable inline markup; its content is literal,
     // so it stays a code block regardless of cursor position and wins over image
     // and table recognition that would otherwise mis-read the literal text.
     let mut block = if context == LineContext::FencedCode {
-        present_fenced_code_line(block_id, revision, range, source, line_height)
+        present_fenced_code_line(line_id, revision, range, source, line_height)
     } else if let Some(image) = parse_standalone_image(source)
         .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
     {
-        present_image(block_id, revision, range, source, line_height, image)
+        present_image(line_id, revision, range, source, line_height, image)
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
-        present_table_line(block_id, revision, range, source, line_height)
+        present_table_line(line_id, revision, range, source, line_height)
     } else {
-        present_markdown_with_disclosure(block_id, revision, range, source, line_height, disclosure)
+        present_markdown_with_disclosure(line_id, revision, range, source, line_height, disclosure)
     };
     block.context = context;
     block
@@ -807,13 +1060,13 @@ pub fn present_polished_line(
 /// Presents one line that the context index reports is inside a fenced code
 /// block. The source is shown verbatim (no marker hiding) and styled as code.
 fn present_fenced_code_line(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
-) -> VisualBlock {
-    let mut block = present_plain(block_id, revision, range, source);
+) -> VisualLine {
+    let mut block = present_plain(line_id, revision, range, source);
     block.kind = BlockKind::CodeBlock;
     block.estimated_height = estimated_height(BlockKind::CodeBlock, line_height);
     // Style the code content but not the trailing newline the visual text keeps
@@ -863,13 +1116,13 @@ fn parse_standalone_image(source: &str) -> Option<StandaloneImage<'_>> {
 }
 
 fn present_image(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
     image: StandaloneImage<'_>,
-) -> VisualBlock {
+) -> VisualLine {
     let mut segments = Vec::new();
     let base = range.start.0;
     if image.prefix_end > 2 {
@@ -906,8 +1159,8 @@ fn present_image(
             visibility: Visibility::Visible,
         });
     }
-    VisualBlock {
-        block_id,
+    VisualLine {
+        line_id,
         source_range: range,
         revision,
         visual_text: format!("{}{}", &source[..visual_prefix], image.alt),
@@ -930,15 +1183,15 @@ fn present_image(
 }
 
 fn present_table_line(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
-) -> VisualBlock {
+) -> VisualLine {
     if is_table_delimiter(source) {
-        return VisualBlock {
-            block_id,
+        return VisualLine {
+            line_id,
             source_range: range,
             revision,
             visual_text: String::new(),
@@ -1002,8 +1255,8 @@ fn present_table_line(
         );
     }
     let visual_len = visual.len();
-    VisualBlock {
-        block_id,
+    VisualLine {
+        line_id,
         source_range: range,
         revision,
         visual_text: visual,
@@ -1023,16 +1276,16 @@ fn present_table_line(
 }
 
 pub fn present_markdown(
-    block_id: u64,
+    line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
     line_height: f32,
-) -> VisualBlock {
-    present_markdown_with_disclosure(block_id, revision, range, source, line_height, None)
+) -> VisualLine {
+    present_markdown_with_disclosure(line_id, revision, range, source, line_height, None)
 }
 
-pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualBlock> {
+pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualLine> {
     let mut blocks = Vec::with_capacity(buffer.line_count());
     for line in 0..buffer.line_count() {
         let Ok(range) = buffer.line_range(hane_document::LineId(line)) else {
@@ -1126,9 +1379,11 @@ impl HeightIndex {
     }
 }
 
+/// A scroll position expressed against a block rather than a pixel offset, so it
+/// survives a rebuild of the height index.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollAnchor {
-    pub block_id: u64,
+    pub block: BlockId,
     pub intra_block_y: f32,
     pub visual_position_hint: Option<VisualOffset>,
 }
@@ -1138,7 +1393,7 @@ pub fn anchored_scroll_y(
     blocks: &[VisualBlock],
     heights: &HeightIndex,
 ) -> Option<f32> {
-    let index = blocks.iter().position(|b| b.block_id == anchor.block_id)?;
+    let index = blocks.iter().position(|block| block.id == anchor.block)?;
     Some(heights.prefix_sum(index) + anchor.intra_block_y.clamp(0.0, blocks[index].height()))
 }
 

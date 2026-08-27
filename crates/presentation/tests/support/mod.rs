@@ -6,14 +6,17 @@
 //! text, SourceMap round-tripping, disclosure, and the bytes a save would write.
 //!
 //! Adding a Markdown feature means adding a fixture here rather than a bespoke
-//! test per layer. The harness itself makes exactly the three calls `EditorView`
-//! makes — `parse_block_context`, [`LineContext::from_document_context`], and
-//! [`present_polished_line`] — and has no per-feature branch, so a fixture that
-//! passes is also evidence that the feature needs nothing from the UI crate.
+//! test per layer. The harness itself makes exactly the two calls `EditorView`
+//! makes — a [`BlockIndex`] for the block boundaries, then [`present_block`] per
+//! block — and has no per-feature branch, so a fixture that passes is also
+//! evidence that the feature needs nothing from the UI crate.
 
 use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
-use hane_markdown::{MarkdownTree, NodeKind, parse_block_context, parse_document};
-use hane_presentation::{BlockKind, LineContext, VisualBlock, present_polished_line};
+use hane_markdown::{BlockIndex, MarkdownTree, NodeKind, parse_document};
+use hane_presentation::{
+    BlockKind, BlockLine, BlockWindow, VisualLine, block_line_context, block_line_span,
+    present_block, trailing_blank_lines,
+};
 
 const LINE_HEIGHT: f32 = 26.0;
 
@@ -120,35 +123,75 @@ fn verify_markers(fixture: &MarkdownFixture, markers: &[SourceRange]) {
     );
 }
 
-/// Presents one line the way `EditorView` does: context from the document-wide
-/// index, then a single presentation call.
-fn present_line(
-    buffer: &RopeBuffer,
-    context: &hane_markdown::BlockContextIndex,
-    line: usize,
-    disclosure: Option<SourceRange>,
-) -> (SourceRange, String, VisualBlock) {
-    let range = buffer.line_range(LineId(line)).expect("line in range");
-    let source = buffer.text(range).expect("line text");
-    let line_context = LineContext::from_document_context(
-        context.line_is_fenced(line).unwrap_or(false),
-        context.line_is_table(line).unwrap_or(false),
-    );
-    let block = present_polished_line(
-        line as u64,
-        buffer.revision(),
-        range,
-        &source,
-        LINE_HEIGHT,
-        disclosure,
-        line_context,
-    );
-    assert_eq!(block.context, line_context, "presented context is recorded");
-    (range, source, block)
+/// Presents the whole document the way `EditorView` does: block boundaries from
+/// the index, then one [`present_block`] call per block. `cursor`, when given,
+/// discloses markers on the line that owns it, using the editor's ownership rule
+/// — a boundary belongs to the following line, and the document end to the last.
+fn present_document(buffer: &RopeBuffer, cursor: Option<usize>) -> Vec<VisualLine> {
+    let index = BlockIndex::from_buffer(buffer);
+    let count = buffer.line_count();
+    let ranges = (0..count)
+        .map(|line| buffer.line_range(LineId(line)).expect("line in range"))
+        .collect::<Vec<_>>();
+    let texts = ranges
+        .iter()
+        .map(|range| buffer.text(*range).expect("line text"))
+        .collect::<Vec<_>>();
+    let mut presented = Vec::with_capacity(count);
+    let mut line = 0;
+    while line < count {
+        let block = index
+            .block_at(ranges[line].start)
+            .expect("every line belongs to a block");
+        let mut end = line + 1;
+        while end < count && index.ordinal_at(ranges[end].start) == Some(block.ordinal) {
+            end += 1;
+        }
+        let block_lines = (line..end)
+            .map(|at| BlockLine {
+                line: at,
+                range: ranges[at],
+                text: &texts[at],
+                disclosure: cursor
+                    .filter(|cursor| {
+                        ranges[at].start.0 <= *cursor
+                            && (*cursor < ranges[at].end.0
+                                || (at + 1 == count && *cursor == ranges[at].end.0))
+                    })
+                    .map(SourceRange::empty),
+            })
+            .collect::<Vec<_>>();
+        let span = block_line_span(buffer, &block).expect("block spans lines");
+        let visual = present_block(
+            &block,
+            buffer.revision(),
+            &BlockWindow {
+                trailing_blank_lines: trailing_blank_lines(buffer, &span),
+                span,
+                lines: &block_lines,
+            },
+            LINE_HEIGHT,
+        );
+        assert_eq!(
+            visual.lines.len(),
+            block_lines.len(),
+            "presented block covers every line it was given"
+        );
+        // Trailing blank lines tiling folded into the block are presented as
+        // normal text; every other line carries the block's own context.
+        assert!(
+            visual.lines.iter().zip(&block_lines).all(|(visual, line)| {
+                visual.context == block_line_context(block.kind) || line.text.trim().is_empty()
+            }),
+            "presented context follows the block kind"
+        );
+        presented.extend(visual.lines);
+        line = end;
+    }
+    presented
 }
 
 fn verify_lines(fixture: &MarkdownFixture, buffer: &RopeBuffer) {
-    let context = parse_block_context(buffer);
     let lines = buffer.line_count();
     assert_eq!(
         fixture.block_kinds.len(),
@@ -162,21 +205,22 @@ fn verify_lines(fixture: &MarkdownFixture, buffer: &RopeBuffer) {
         "{}: expected visual lines must cover every line",
         fixture.name
     );
-    for line in 0..lines {
-        let (range, source, block) = present_line(buffer, &context, line, None);
+    let presented = present_document(buffer, None);
+    for (line, block) in presented.iter().enumerate() {
+        let range = buffer.line_range(LineId(line)).expect("line in range");
+        let source = buffer.text(range).expect("line text");
         assert_eq!(
             block.kind, fixture.block_kinds[line],
             "{}: line {line} display kind",
             fixture.name
         );
         assert_eq!(
-            block.visual_text.trim_end_matches(['\r', '\n']),
-            fixture.visual_lines[line],
+            block.visual_text, fixture.visual_lines[line],
             "{}: line {line} visual text",
             fixture.name
         );
         assert_eq!(
-            segment_source(&block, fixture.source),
+            segment_source(block, fixture.source),
             source,
             "{}: line {line} segments dropped source bytes",
             fixture.name
@@ -191,7 +235,7 @@ fn verify_lines(fixture: &MarkdownFixture, buffer: &RopeBuffer) {
 
 /// Concatenates the source the block's mapping segments claim, in order. Equal
 /// to the block's own source exactly when the segments tile it.
-fn segment_source(block: &VisualBlock, document: &str) -> String {
+fn segment_source(block: &VisualLine, document: &str) -> String {
     block
         .source_map
         .segments
@@ -207,19 +251,15 @@ fn segment_source(block: &VisualBlock, document: &str) -> String {
 /// caret lands where it was put, and every other boundary must canonicalize to a
 /// stable position under both affinities.
 fn verify_disclosure_and_saved_bytes(fixture: &MarkdownFixture, buffer: &RopeBuffer) {
-    let context = parse_block_context(buffer);
     let lines = buffer.line_count();
     for cursor in (0..=fixture.source.len()).filter(|at| fixture.source.is_char_boundary(*at)) {
+        let presented = present_document(buffer, Some(cursor));
         let mut saved = String::with_capacity(fixture.source.len());
-        for line in 0..lines {
+        for (line, block) in presented.iter().enumerate() {
             let range = buffer.line_range(LineId(line)).expect("line in range");
-            // Same ownership rule the editor uses: a boundary belongs to the
-            // following line, and the document end belongs to the last line.
             let owns_cursor = range.start.0 <= cursor
                 && (cursor < range.end.0 || (line + 1 == lines && cursor == range.end.0));
-            let disclosure = owns_cursor.then(|| SourceRange::empty(cursor));
-            let (_, _, block) = present_line(buffer, &context, line, disclosure);
-            saved.push_str(&segment_source(&block, fixture.source));
+            saved.push_str(&segment_source(block, fixture.source));
 
             if owns_cursor {
                 let offset = SourceOffset(cursor);

@@ -8,7 +8,7 @@ pub use block_index::{
     PublishOutcome, RESYNC_BLOCK_BUDGET, RESYNC_BYTE_BUDGET,
 };
 
-use hane_document::{LineId, Revision, RopeBuffer, SourceRange, TextBuffer};
+use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 /// Markdown *syntax* kind, as written in the source.
@@ -199,49 +199,14 @@ pub struct MarkdownParse {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FenceDelimiter {
-    pub marker: u8,
-    pub len: usize,
+struct FenceDelimiter {
+    marker: u8,
+    len: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockContextIndex {
-    pub revision: Revision,
-    fenced_lines: Vec<bool>,
-    table_lines: Vec<bool>,
-}
-
-impl BlockContextIndex {
-    pub fn line_is_fenced(&self, line: usize) -> Option<bool> {
-        self.fenced_lines.get(line).copied()
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.fenced_lines.len()
-    }
-
-    pub fn line_is_table(&self, line: usize) -> Option<bool> {
-        self.table_lines.get(line).copied()
-    }
-}
-
-pub fn is_pipe_row(source: &str) -> bool {
-    let content = source.trim_end_matches(['\r', '\n']);
-    content.matches('|').count() >= 2
-        && (content.trim_start().starts_with('|') || content.trim_end().ends_with('|'))
-}
-
-pub fn is_table_delimiter(source: &str) -> bool {
-    let content = source.trim_end_matches(['\r', '\n']).trim();
-    let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
-    cells.len() >= 2
-        && cells.iter().all(|cell| {
-            let trimmed = cell.trim().trim_matches(':');
-            trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')
-        })
-}
-
-pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
+/// Opening or closing fence of a fenced code block, if this line is one. Used by
+/// marker derivation to bound the fence delimiters it hides.
+fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
     let trimmed = source.trim_start_matches(' ');
     if source.len() - trimmed.len() > 3 {
         return None;
@@ -258,114 +223,139 @@ pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
     (len >= 3).then_some(FenceDelimiter { marker, len })
 }
 
-/// Fenced-code and table classification for a contiguous window of source lines.
-/// The window is assumed to start outside any open fence; callers that need this
-/// to hold exactly (the whole-document background job) start at line 0, while the
-/// bounded fallback accepts the approximation inherent to a lookback window.
-fn scan_block_context(lines: &[String]) -> (Vec<bool>, Vec<bool>) {
-    let mut fenced_lines = Vec::with_capacity(lines.len());
-    let mut pipe_rows = Vec::with_capacity(lines.len());
-    let mut table_delimiters = Vec::with_capacity(lines.len());
-    let mut fence: Option<FenceDelimiter> = None;
-    for source in lines {
-        let delimiter = fence_delimiter(source);
-        pipe_rows.push(is_pipe_row(source));
-        table_delimiters.push(is_table_delimiter(source));
-        fenced_lines.push(fence.is_some() || delimiter.is_some());
-        if let Some(delimiter) = delimiter {
-            fence = match fence {
-                Some(open) if open.marker == delimiter.marker && delimiter.len >= open.len => None,
-                None => Some(delimiter),
-                current => current,
-            };
-        }
-    }
-    let mut table_lines = vec![false; pipe_rows.len()];
-    for delimiter in 1..pipe_rows.len() {
-        if !table_delimiters[delimiter] || !pipe_rows[delimiter - 1] {
-            continue;
-        }
-        table_lines[delimiter - 1] = true;
-        table_lines[delimiter] = true;
-        let mut row = delimiter + 1;
-        while row < pipe_rows.len() && pipe_rows[row] && !table_delimiters[row] {
-            table_lines[row] = true;
-            row += 1;
-        }
-    }
-    (fenced_lines, table_lines)
+pub fn is_table_delimiter(source: &str) -> bool {
+    let content = source.trim_end_matches(['\r', '\n']).trim();
+    let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let trimmed = cell.trim().trim_matches(':');
+            trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')
+        })
 }
 
-fn line_source(buffer: &RopeBuffer, line: usize) -> String {
-    buffer
-        .line_range(LineId(line))
-        .ok()
-        .and_then(|range| buffer.text(range).ok())
-        .unwrap_or_default()
-}
+/// Lines scanned before the viewport when recovering block boundaries without a
+/// published [`BlockIndex`]. Bounds the fallback so visible parsing never depends
+/// on total document size.
+pub const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
 
-/// Builds document-wide fenced-block context from a shared Rope snapshot.
-/// This is intended for a single coalesced background job, never an input path.
-pub fn parse_block_context(buffer: &RopeBuffer) -> BlockContextIndex {
-    let lines = (0..buffer.line_count())
-        .map(|line| line_source(buffer, line))
-        .collect::<Vec<_>>();
-    let (fenced_lines, table_lines) = scan_block_context(&lines);
-    BlockContextIndex {
-        revision: buffer.revision(),
-        fenced_lines,
-        table_lines,
-    }
-}
-
-/// Lines scanned before the viewport when recovering fence/table state without
-/// the background index. Bounds the fallback so visible parsing never depends on
-/// total document size.
-pub const LOCAL_CONTEXT_LOOKBACK: usize = 2_048;
-
-/// Fenced-code and table context for a viewport, computed from a bounded window.
-/// Indexed by absolute document line; lines outside the scanned window return
-/// `None`.
+/// Block boundaries for one viewport, parsed from a bounded window.
+///
+/// Used only while no document-wide [`BlockIndex`] is published — during the
+/// first frames after a document is opened, and after an edit history gap drops
+/// the published index. The window starts a fixed number of lines above the
+/// viewport, so a construct that opens further above (a very long fenced block)
+/// is not seen; that is the approximation the bound buys, and it is why every
+/// block reported here is [`Confidence::Provisional`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalBlockContext {
-    base_line: usize,
-    fenced_lines: Vec<bool>,
-    table_lines: Vec<bool>,
+pub struct LocalBlockIndex {
+    revision: Revision,
+    window: SourceRange,
+    /// Block kinds with their absolute source ranges and line counts, tiling
+    /// `window`.
+    blocks: Vec<(NodeKind, SourceRange, usize)>,
 }
 
-impl LocalBlockContext {
-    pub fn line_is_fenced(&self, line: usize) -> Option<bool> {
-        line.checked_sub(self.base_line)
-            .and_then(|index| self.fenced_lines.get(index).copied())
+impl LocalBlockIndex {
+    pub fn revision(&self) -> Revision {
+        self.revision
     }
 
-    pub fn line_is_table(&self, line: usize) -> Option<bool> {
-        line.checked_sub(self.base_line)
-            .and_then(|index| self.table_lines.get(index).copied())
+    /// Source range this index was parsed from. Offsets outside it have no block.
+    pub fn window(&self) -> SourceRange {
+        self.window
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    fn indexed(&self, ordinal: usize) -> IndexedBlock {
+        let (kind, source_range, line_count) = self.blocks[ordinal];
+        IndexedBlock {
+            ordinal,
+            // Keyed by start offset rather than a counter: the window is
+            // re-parsed on every scroll, and an offset keeps a block's cache
+            // entry addressable across those re-parses.
+            id: BlockId(source_range.start.0 as u64),
+            kind,
+            source_range,
+            revision: self.revision,
+            confidence: Confidence::Provisional,
+            line_count,
+        }
+    }
+
+    /// Block owning `offset`, or `None` when the offset lies outside the window.
+    pub fn block_at(&self, offset: SourceOffset) -> Option<IndexedBlock> {
+        let ordinal = self
+            .blocks
+            .partition_point(|(_, range, _)| range.end.0 <= offset.0)
+            .min(self.blocks.len().checked_sub(1)?);
+        let block = self.indexed(ordinal);
+        (block.source_range.start <= offset && offset <= block.source_range.end).then_some(block)
+    }
+
+    /// Blocks overlapping `range`, in document order.
+    pub fn blocks_in(&self, range: SourceRange) -> impl Iterator<Item = IndexedBlock> + '_ {
+        let first = self
+            .blocks
+            .partition_point(|(_, span, _)| span.end.0 <= range.start.0);
+        (first..self.blocks.len())
+            .take_while(move |ordinal| {
+                *ordinal == first || self.blocks[*ordinal].1.start.0 < range.end.0
+            })
+            .map(|ordinal| self.indexed(ordinal))
     }
 }
 
-/// Single bounded synchronous fallback used only while the background
-/// [`BlockContextIndex`] is stale. Scans a lookback window before `visible.start`
-/// to recover fence and table state, then classifies the visible lines. Never
-/// scans the whole document, so it is safe on the visible-parse path.
-pub fn local_block_context(
-    buffer: &RopeBuffer,
-    visible: std::ops::Range<usize>,
-) -> LocalBlockContext {
+/// Single bounded synchronous parse used only while no [`BlockIndex`] is
+/// published. Reads a window that starts [`LOCAL_BLOCK_LOOKBACK`] lines above
+/// `visible` and ends one line below it, and tiles that window into blocks the
+/// same way the formal index tiles the document. Never reads the whole document,
+/// so it is safe on the visible-render path.
+pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -> LocalBlockIndex {
     let line_count = buffer.line_count();
-    let base_line = visible.start.saturating_sub(LOCAL_CONTEXT_LOOKBACK);
-    // Include one line past the viewport so a header row whose delimiter sits
-    // just below the last visible line is still recognized as a table.
-    let scan_end = visible.end.saturating_add(1).min(line_count);
-    let lines = (base_line..scan_end)
-        .map(|line| line_source(buffer, line))
-        .collect::<Vec<_>>();
-    let (fenced_lines, table_lines) = scan_block_context(&lines);
-    LocalBlockContext {
-        base_line,
-        fenced_lines,
-        table_lines,
+    let revision = buffer.revision();
+    let empty = |window| LocalBlockIndex {
+        revision,
+        window,
+        blocks: Vec::new(),
+    };
+    if line_count == 0 {
+        return empty(SourceRange::empty(0));
+    }
+    let first_line = visible.start.saturating_sub(LOCAL_BLOCK_LOOKBACK);
+    // One line past the viewport, so a construct whose closing line sits just
+    // below the last visible line is still parsed as part of the same block.
+    let last_line = visible.end.min(line_count - 1);
+    let (Ok(start), Ok(end)) = (
+        buffer.line_range(LineId(first_line)),
+        buffer.line_range(LineId(last_line)),
+    ) else {
+        return empty(SourceRange::empty(0));
+    };
+    let window = SourceRange::new(start.start.0, end.end.0);
+    let Ok(text) = buffer.text(window) else {
+        return empty(window);
+    };
+    let parsed = parse_document(revision, window, &text);
+    let mut offset = window.start.0;
+    let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
+        .into_iter()
+        .map(|(kind, length, lines)| {
+            let range = SourceRange::new(offset, offset + length);
+            offset += length;
+            (kind, range, lines)
+        })
+        .collect();
+    LocalBlockIndex {
+        revision,
+        window,
+        blocks,
     }
 }
 
@@ -768,29 +758,45 @@ mod tests {
     }
 
     #[test]
-    fn background_context_tracks_fences_longer_than_local_overscan() {
-        let mut source = String::from("```rust\n");
-        source.push_str(&"inside\n".repeat(2_100));
+    fn local_index_sees_a_fence_that_opens_inside_the_lookback_window() {
+        let mut source = String::from("intro\n```rust\n");
+        source.push_str(&"inside\n".repeat(2_000));
         source.push_str("```\nafter\n");
         let buffer = RopeBuffer::from_text(&source);
-        let index = parse_block_context(&buffer);
-        assert_eq!(index.revision, Revision(0));
-        assert_eq!(index.line_count(), buffer.line_count());
-        assert_eq!(index.line_is_fenced(2_050), Some(true));
-        assert_eq!(index.line_is_fenced(2_102), Some(false));
+        let local = local_block_index(&buffer, 1_900..1_910);
+        let line = buffer.line_range(LineId(1_905)).unwrap();
+        assert_eq!(
+            local.block_at(line.start).map(|block| block.kind),
+            Some(NodeKind::CodeBlock),
+            "a line inside the fence resolves to the code block"
+        );
+        assert!(
+            local
+                .block_at(line.start)
+                .is_some_and(|block| block.confidence == Confidence::Provisional),
+            "every locally parsed block is provisional"
+        );
     }
 
     #[test]
-    fn background_context_tracks_gfm_pipe_tables() {
+    fn local_index_resolves_gfm_pipe_tables() {
         let buffer = RopeBuffer::from_text(
-            "before\n| Name | 値 |\n|:---|---:|\n| 羽 | 3 |\n| 鳥 | 4 |\nafter\n",
+            "before\n| Name | 値 |\n|:---|---:|\n| 羽 | 3 |\n| 鳥 | 4 |\n\nafter\n",
         );
-        let index = parse_block_context(&buffer);
-        assert_eq!(index.line_is_table(0), Some(false));
+        let local = local_block_index(&buffer, 0..buffer.line_count());
+        let kind = |line: usize| {
+            local
+                .block_at(buffer.line_range(LineId(line)).unwrap().start)
+                .map(|block| block.kind)
+        };
+        assert_eq!(kind(0), Some(NodeKind::Paragraph));
         for line in 1..=4 {
-            assert_eq!(index.line_is_table(line), Some(true));
+            assert_eq!(kind(line), Some(NodeKind::Table), "line {line} is table");
         }
-        assert_eq!(index.line_is_table(5), Some(false));
+        // The blank line closing the table belongs to the table block, the way
+        // tiling assigns every blank run to the block above it.
+        assert_eq!(kind(5), Some(NodeKind::Table));
+        assert_eq!(kind(6), Some(NodeKind::Paragraph));
     }
 
     #[test]
@@ -846,26 +852,35 @@ mod tests {
     }
 
     #[test]
-    fn local_fallback_matches_background_index_on_the_visible_window() {
+    fn local_index_agrees_with_the_formal_index_on_the_visible_window() {
         let buffer = RopeBuffer::from_text(
             "intro\n```rust\ncode\n```\n| Name | 値 |\n|:---|---:|\n| 羽 | 3 |\ntail\n",
         );
-        let background = parse_block_context(&buffer);
-        let local = local_block_context(&buffer, 0..buffer.line_count());
+        let formal = BlockIndex::from_buffer(&buffer);
+        let local = local_block_index(&buffer, 0..buffer.line_count());
         for line in 0..buffer.line_count() {
-            assert_eq!(local.line_is_fenced(line), background.line_is_fenced(line));
-            assert_eq!(local.line_is_table(line), background.line_is_table(line));
+            let at = buffer.line_range(LineId(line)).unwrap().start;
+            assert_eq!(
+                local.block_at(at).map(|block| block.kind),
+                formal.block_at(at).map(|block| block.kind),
+                "line {line} resolves to the same block kind"
+            );
         }
     }
 
     #[test]
-    fn local_fallback_returns_none_outside_the_scanned_window() {
+    fn local_index_covers_only_the_scanned_window() {
         let mut source = String::from("head\n");
         source.push_str(&"body\n".repeat(4_000));
         let buffer = RopeBuffer::from_text(&source);
-        let local = local_block_context(&buffer, 3_500..3_510);
-        assert_eq!(local.line_is_fenced(3_505), Some(false));
-        // Far above the lookback window is not scanned.
-        assert_eq!(local.line_is_fenced(0), None);
+        let local = local_block_index(&buffer, 3_500..3_510);
+        let visible = buffer.line_range(LineId(3_505)).unwrap();
+        assert_eq!(
+            local.block_at(visible.start).map(|block| block.kind),
+            Some(NodeKind::Paragraph)
+        );
+        // Far above the lookback window is not parsed at all.
+        assert!(local.window().start.0 > 0);
+        assert_eq!(local.block_at(SourceOffset(0)), None);
     }
 }

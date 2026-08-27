@@ -3,8 +3,8 @@ use crate::capture::InputCapture;
 #[cfg(feature = "instrument")]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{
-    block_font_size, disclosure_for_line, inline_display_for, line_element_from_block,
-    presented_line,
+    block_element, block_font_size, disclosure_for_line, inline_display_for, line_element,
+    presented_block,
 };
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
@@ -18,22 +18,29 @@ use hane_document::{
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
-    BlockContextIndex, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    local_block_context, parse_block_context,
+    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
+    local_block_index,
 };
 use hane_metrics::FrameMetrics;
-use hane_presentation::{BlockWeight, HeightIndex, LineContext, VisualOffset};
+use hane_presentation::{
+    BlockWeight, HeightIndex, VisualBlock, VisualLine, VisualOffset, block_heights, block_line_span,
+};
 use hane_session::{
     DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService, RecentFiles,
     SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId,
     SessionSet, SessionViewState, Settings, StateStores, run_save_job,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
+
+/// Blocks kept presented on each side of the viewport, so scrolling back a
+/// screen does not re-present what was just drawn.
+const BLOCK_CACHE_MARGIN: usize = 64;
 
 fn scroll_y_for_cursor(
     scroll_y: f32,
@@ -87,13 +94,33 @@ pub struct EditorView {
     #[cfg(feature = "instrument")]
     pub(crate) instrumentation: Instrumentation,
     background_presentation_generation: u64,
-    line_cache: HashMap<usize, hane_presentation::VisualBlock>,
-    block_context: Option<BlockContextIndex>,
+    /// Presented blocks, keyed by the index's stable block id so an entry
+    /// survives typing elsewhere in the document.
+    block_cache: HashMap<BlockId, VisualBlock>,
+    /// Physical line to the block that drew it, rebuilt each frame. Mouse hit
+    /// testing addresses lines, so it needs the reverse of the render mapping.
+    line_owners: HashMap<usize, (BlockId, usize)>,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
     block_index: BlockIndexState,
+    /// What one entry of `heights` measures. Blocks as soon as an index is
+    /// published, physical lines until then.
+    granularity: Granularity,
     document_parse_job_running: bool,
+}
+
+/// The unit `heights` is keyed by.
+///
+/// Block granularity is the R4A target and the steady state. Line granularity is
+/// the startup path: a document-wide index costs a full parse, so the first
+/// frames after a document is opened are laid out per line, with block kinds for
+/// the viewport coming from a bounded local parse. The renderer itself always
+/// draws whole blocks; only what a height entry measures differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Granularity {
+    Blocks,
+    Lines,
 }
 
 impl EditorView {
@@ -135,9 +162,10 @@ impl EditorView {
             #[cfg(feature = "instrument")]
             instrumentation: Instrumentation::from_environment(),
             background_presentation_generation: 0,
-            line_cache: HashMap::new(),
-            block_context: None,
+            block_cache: HashMap::new(),
+            line_owners: HashMap::new(),
             block_index: BlockIndexState::new(),
+            granularity: Granularity::Lines,
             document_parse_job_running: false,
         }
     }
@@ -212,10 +240,11 @@ impl EditorView {
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
         let lines = self.sessions.active().editor().document().line_count();
+        self.granularity = Granularity::Lines;
         self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
         self.scroll_y = self.sessions.active().view_state().scroll_y;
-        self.line_cache.clear();
-        self.block_context = None;
+        self.block_cache.clear();
+        self.line_owners.clear();
         self.block_index = BlockIndexState::new();
     }
 
@@ -248,11 +277,7 @@ impl EditorView {
         {
             self.record_block_index_update(&update);
         }
-        let lines = self.editor().document().line_count();
-        if lines != self.heights.len() {
-            self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
-            self.line_cache.clear();
-        }
+        self.resync_heights();
         self.scroll_cursor_into_view();
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
@@ -520,29 +545,19 @@ impl EditorView {
     pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.settings.theme = self.settings.theme.next();
         self.theme = resolve_theme(self.settings.theme, window.appearance());
-        self.heights = HeightIndex::new(std::iter::repeat_n(
-            self.theme.line_height,
-            self.editor().document().line_count(),
-        ));
-        self.line_cache.clear();
+        self.block_cache.clear();
+        self.heights = HeightIndex::new(self.item_heights());
         self.store_settings();
         cx.notify();
     }
 
-    /// Coalesced background job producing the formal, document-wide parse: the
-    /// fenced/table line context the line presenter still consumes, and the
-    /// formal `BlockIndex`. One job at a time; a result that no longer matches
-    /// the document revision is re-scheduled instead of published.
+    /// Coalesced background job producing the formal, document-wide `BlockIndex`.
+    /// One job at a time; a result that no longer matches the document revision
+    /// is rebased or re-scheduled rather than published stale.
     fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        let revision = self.sessions.active().editor().document().revision();
-        let context_is_current = self
-            .block_context
-            .as_ref()
-            .is_some_and(|index| index.revision == revision);
-        if context_is_current
-            && !self
-                .block_index
-                .needs_formal_parse(self.sessions.active().editor().document())
+        if !self
+            .block_index
+            .needs_formal_parse(self.sessions.active().editor().document())
         {
             return;
         }
@@ -551,6 +566,8 @@ impl EditorView {
         }
         self.document_parse_job_running = true;
         let key = self.document_key();
+        let revision = self.sessions.active().editor().document().revision();
+        let line_height = self.theme.line_height;
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -570,12 +587,16 @@ impl EditorView {
                 });
                 return;
             }
-            let (context, index) = cx
+            // Sizing the height index is proportional to the block count, so it
+            // is done here rather than on the main thread: for a 100 MB document
+            // that is tens of milliseconds that would otherwise land in one
+            // frame.
+            let (index, heights) = cx
                 .background_executor()
                 .spawn(async move {
-                    let context = parse_block_context(&snapshot);
                     let index = BlockIndex::from_buffer(&snapshot);
-                    (context, index)
+                    let heights = HeightIndex::new(block_heights(&snapshot, &index, line_height));
+                    (index, heights)
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
@@ -584,22 +605,22 @@ impl EditorView {
                     view.schedule_document_parse(cx);
                     return;
                 }
-                // The index carries its own staleness rule, so it can still be
-                // rebased onto edits the context index has to be re-run for.
                 let document = view.sessions.active().editor().document();
                 view.block_index
                     .publish(index, IndexSource::Formal, document);
-                if block_context_revision_is_current(
-                    view.editor().document().revision(),
-                    context.revision,
-                ) {
-                    view.background_presentation_generation = context.revision.0 + 1;
-                    view.block_context = Some(context);
-                    view.line_cache.clear();
-                    cx.notify();
+                view.background_presentation_generation = revision.0 + 1;
+                // Formal boundaries can disagree with what the bounded local
+                // parse showed, so every cached presentation is re-derived once.
+                view.block_cache.clear();
+                let (granularity, len) = view.desired_layout();
+                if granularity == Granularity::Blocks && len == heights.len() {
+                    view.install_heights(granularity, heights);
                 } else {
-                    view.schedule_document_parse(cx);
+                    // The parse was rebased onto edits made while it ran, so the
+                    // block count moved and the prepared heights no longer fit.
+                    view.resync_heights();
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -631,6 +652,14 @@ impl EditorView {
         cx.notify();
     }
 
+    /// The presented line under a mouse event, from the mapping the last frame
+    /// recorded. Only rendered lines can be clicked, so a miss means the frame
+    /// moved under the pointer and there is nothing to do.
+    fn rendered_line(&self, line: usize) -> Option<VisualLine> {
+        let (id, at) = self.line_owners.get(&line)?;
+        self.block_cache.get(id)?.lines.get(*at).cloned()
+    }
+
     fn on_line_mouse_down(
         &mut self,
         line: usize,
@@ -639,12 +668,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        let Some(block) = self
-            .line_cache
-            .get(&line)
-            .cloned()
-            .or_else(|| presented_line(self.editor(), line, LineContext::Normal))
-        else {
+        let Some(block) = self.rendered_line(line) else {
             return;
         };
         let visual_offset = visual_offset_at_x(&block, event.position.x, self.theme, window);
@@ -675,12 +699,7 @@ impl EditorView {
         if !event.dragging() {
             return;
         }
-        let Some(block) = self
-            .line_cache
-            .get(&line)
-            .cloned()
-            .or_else(|| presented_line(self.editor(), line, LineContext::Normal))
-        else {
+        let Some(block) = self.rendered_line(line) else {
             return;
         };
         let visual = visual_offset_at_x(&block, event.position.x, self.theme, window);
@@ -696,10 +715,27 @@ impl EditorView {
 
     fn scroll_cursor_into_view(&mut self) {
         let editor = self.sessions.active().editor();
-        let Ok(line) = editor.document().line_for_offset(editor.selection().active) else {
+        let cursor = editor.selection().active;
+        let Ok(line) = editor.document().line_for_offset(cursor) else {
             return;
         };
-        let top = self.heights.prefix_sum(line.0);
+        // The caret still sits on a physical line, so at block granularity its
+        // top is the block's top plus the lines above it inside the block.
+        let top = match self.granularity {
+            Granularity::Lines => self.heights.prefix_sum(line.0),
+            Granularity::Blocks => {
+                let Some(block) = self
+                    .current_index()
+                    .and_then(|index| index.block_at(cursor))
+                else {
+                    return;
+                };
+                let first = block_line_span(editor.document(), &block)
+                    .map_or(line.0, |span| span.start);
+                self.heights.prefix_sum(block.ordinal)
+                    + (line.0.saturating_sub(first)) as f32 * self.theme.line_height
+            }
+        };
         self.scroll_y = scroll_y_for_cursor(
             self.scroll_y,
             top,
@@ -708,44 +744,235 @@ impl EditorView {
         );
     }
 
-    fn cached_line(
-        &mut self,
-        line: usize,
-        context: LineContext,
-    ) -> Option<hane_presentation::VisualBlock> {
-        let current_revision = self.editor().document().revision();
-        if let Some(mut block) = self.line_cache.remove(&line) {
-            let editor = self.sessions.active().editor();
-            let expected_disclosure = editor
+    /// The published index, but only while it describes the current revision.
+    /// Between an edit and the incremental update that follows it, and after an
+    /// edit history gap drops the index, there is none.
+    fn current_index(&self) -> Option<&BlockIndex> {
+        self.block_index
+            .index()
+            .filter(|index| index.revision() == self.editor().document().revision())
+            .filter(|index| !index.is_empty())
+    }
+
+    /// What `heights` should measure, and how many entries it needs.
+    fn desired_layout(&self) -> (Granularity, usize) {
+        self.current_index().map_or_else(
+            || (Granularity::Lines, self.editor().document().line_count()),
+            |index| (Granularity::Blocks, index.len()),
+        )
+    }
+
+    /// Initial height of every entry, from the line height alone. Measured
+    /// heights replace these as blocks are drawn; R4C keeps them across rebuilds.
+    fn item_heights(&self) -> Vec<f32> {
+        let line_height = self.theme.line_height;
+        let (granularity, len) = self.desired_layout();
+        match granularity {
+            Granularity::Lines => vec![line_height; len],
+            Granularity::Blocks => {
+                let document = self.sessions.active().editor().document();
+                let index = self
+                    .current_index()
+                    .expect("block granularity has an index");
+                block_heights(document, index, line_height)
+            }
+        }
+    }
+
+    /// Keeps `heights` keyed to the same thing the renderer enumerates. Rebuilds
+    /// only when the unit or the count changed — an edit inside one block leaves
+    /// both alone. The scroll position is carried across on the source offset at
+    /// the top of the viewport, so a rebuild does not move the document under the
+    /// reader.
+    fn resync_heights(&mut self) {
+        let (granularity, len) = self.desired_layout();
+        if granularity == self.granularity && len == self.heights.len() {
+            return;
+        }
+        let heights = HeightIndex::new(self.item_heights());
+        self.install_heights(granularity, heights);
+    }
+
+    /// Swaps in a height index, keeping the reader where they were: the scroll
+    /// position is carried across on the source offset at the top of the
+    /// viewport, read before the swap and resolved after it.
+    fn install_heights(&mut self, granularity: Granularity, heights: HeightIndex) {
+        let anchor = self.top_source_offset();
+        self.granularity = granularity;
+        self.heights = heights;
+        self.scroll_y = anchor.map_or(self.scroll_y, |offset| self.scroll_for_offset(offset));
+    }
+
+    /// Source offset of the item currently at the top of the viewport.
+    fn top_source_offset(&self) -> Option<SourceOffset> {
+        if self.heights.is_empty() {
+            return None;
+        }
+        let item = self.heights.block_at_y(self.scroll_y);
+        match self.granularity {
+            Granularity::Lines => self
+                .editor()
                 .document()
-                .line_range(LineId(line))
+                .line_range(LineId(item))
                 .ok()
-                .and_then(|range| disclosure_for_line(editor, line, range));
-            let reusable = if block.revision == current_revision {
-                block.disclosure == expected_disclosure
-            } else if let Ok(deltas) = editor.document().deltas_since(block.revision) {
+                .map(|range| range.start),
+            Granularity::Blocks => self
+                .current_index()
+                .and_then(|index| index.block(item))
+                .map(|block| block.source_range.start),
+        }
+    }
+
+    fn scroll_for_offset(&self, offset: SourceOffset) -> f32 {
+        let item = match self.granularity {
+            Granularity::Lines => self
+                .editor()
+                .document()
+                .line_for_offset(offset)
+                .map(|line| line.0)
+                .ok(),
+            Granularity::Blocks => self
+                .current_index()
+                .and_then(|index| index.ordinal_at(offset)),
+        };
+        item.map_or(self.scroll_y, |item| self.heights.prefix_sum(item))
+    }
+
+    /// The blocks covering the viewport. `visible` is a range of height entries,
+    /// which at block granularity are ordinals and until an index exists are
+    /// physical lines.
+    fn visible_blocks(&self, visible: Range<usize>) -> Vec<IndexedBlock> {
+        match self.granularity {
+            Granularity::Blocks => {
+                let Some(index) = self.current_index() else {
+                    return Vec::new();
+                };
+                visible.filter_map(|ordinal| index.block(ordinal)).collect()
+            }
+            Granularity::Lines => {
+                let document = self.sessions.active().editor().document();
+                let last_line = document.line_count().saturating_sub(1);
+                let first = visible.start.min(last_line);
+                let last = visible.end.saturating_sub(1).min(last_line);
+                let (Ok(first_range), Ok(last_range)) = (
+                    document.line_range(LineId(first)),
+                    document.line_range(LineId(last)),
+                ) else {
+                    return Vec::new();
+                };
+                // One bounded parse of the viewport neighborhood, never the
+                // document: this runs on the render path.
+                let local = local_block_index(document, first..last + 1);
+                let span = SourceRange::new(
+                    first_range.start.0,
+                    last_range.end.0.max(first_range.start.0),
+                );
+                let blocks = local.blocks_in(span).collect::<Vec<_>>();
+                if blocks.is_empty() {
+                    // A document with no Markdown block at all still has a line
+                    // to draw the caret on.
+                    let empty = IndexedBlock {
+                        ordinal: 0,
+                        id: BlockId(first_range.start.0 as u64),
+                        kind: hane_markdown::NodeKind::Paragraph,
+                        source_range: SourceRange::new(first_range.start.0, last_range.end.0),
+                        revision: document.revision(),
+                        confidence: hane_markdown::Confidence::Provisional,
+                        line_count: last - first + 1,
+                    };
+                    return vec![empty];
+                }
+                blocks
+            }
+        }
+    }
+
+    /// Document lines the viewport shows, which is what each block presents the
+    /// intersection with.
+    ///
+    /// At line granularity the visible range already is that window. At block
+    /// granularity it has to be read back out of the scroll geometry, because a
+    /// block can be taller than the viewport — a document with no blank line in
+    /// it is one block. Lines are line-height tall except for images, so this is
+    /// exact wherever it matters and the overscan absorbs the rest.
+    fn visible_line_window(&self, blocks: &[IndexedBlock], items: &Range<usize>) -> Range<usize> {
+        match self.granularity {
+            Granularity::Lines => items.clone(),
+            Granularity::Blocks => {
+                let document = self.sessions.active().editor().document();
+                let line_height = self.theme.line_height.max(1.0);
+                let top = (self.scroll_y - self.theme.overscan).max(0.0);
+                let bottom = self.scroll_y + self.viewport_height + self.theme.overscan;
+                let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+                    return 0..0;
+                };
+                let (Some(first_span), Some(last_span)) = (
+                    block_line_span(document, first),
+                    block_line_span(document, last),
+                ) else {
+                    return 0..0;
+                };
+                let into_block = |y: f32, ordinal: usize| {
+                    ((y - self.heights.prefix_sum(ordinal)) / line_height).max(0.0)
+                };
+                let start = first_span.start
+                    + into_block(top, first.ordinal).floor() as usize;
+                let end =
+                    last_span.start + into_block(bottom, last.ordinal).ceil() as usize + 1;
+                let start = start.min(first_span.end.saturating_sub(1));
+                start..end.max(start + 1).min(last_span.end)
+            }
+        }
+    }
+
+    /// Presents the part of a block that reaches `visible`, reusing the cached
+    /// presentation when the document has not touched it, the index still
+    /// describes it the same way, and it already covers the wanted lines.
+    fn cached_block(
+        &mut self,
+        block: &IndexedBlock,
+        visible: &Range<usize>,
+    ) -> Option<VisualBlock> {
+        let revision = self.editor().document().revision();
+        if let Some(mut cached) = self.block_cache.remove(&block.id) {
+            let editor = self.sessions.active().editor();
+            let reusable = if cached.revision == revision {
+                true
+            } else if let Ok(deltas) = editor.document().deltas_since(cached.revision) {
                 !deltas
                     .iter()
-                    .any(|delta| edit_affects_range(*delta, block.source_range))
-                    && block.rebase(&deltas, current_revision)
-                    && block.disclosure == expected_disclosure
-                    && editor
-                        .document()
-                        .line_range(LineId(line))
-                        .is_ok_and(|range| range == block.source_range)
+                    .any(|delta| edit_affects_range(*delta, cached.source_range))
+                    && cached.rebase(&deltas, revision)
             } else {
                 false
             };
-            // A cached block records the context it was presented with, so the
-            // check is an equality test rather than a re-derivation of the kind.
-            if reusable && block.context == context {
-                self.line_cache.insert(line, block.clone());
-                return Some(block);
+            if reusable
+                && cached.matches(block)
+                && cached.covers(visible)
+                && self.disclosures_are_current(&cached)
+            {
+                self.block_cache.insert(block.id, cached.clone());
+                return Some(cached);
             }
         }
-        let block = presented_line(self.sessions.active().editor(), line, context)?;
-        self.line_cache.insert(line, block.clone());
-        Some(block)
+        let presented = presented_block(self.sessions.active().editor(), block, visible)?;
+        self.block_cache.insert(block.id, presented.clone());
+        Some(presented)
+    }
+
+    /// True while every line of a cached block still discloses what the caret,
+    /// selection and IME say it should. Cheap: a block holds a handful of lines.
+    fn disclosures_are_current(&self, block: &VisualBlock) -> bool {
+        let editor = self.sessions.active().editor();
+        block.lines.iter().all(|line| {
+            let expected = editor
+                .document()
+                .line_range(LineId(line.line_id as usize))
+                .ok()
+                .filter(|range| *range == line.source_range)
+                .and_then(|range| disclosure_for_line(editor, line.line_id as usize, range));
+            expected == line.disclosure
+        })
     }
 }
 
@@ -934,45 +1161,67 @@ impl Render for EditorView {
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
-        let cache_start = visible.start.saturating_sub(128);
-        let cache_end = (visible.end + 128).min(self.heights.len());
-        self.line_cache
-            .retain(|line, _| cache_start <= *line && *line < cache_end);
-        let document = self.sessions.active().editor().document();
-        let background_context = self.block_context.as_ref().filter(|index| {
-            index.revision == document.revision() && index.line_count() == document.line_count()
-        });
-        // Prefer the formal document-wide index; only fall back to a single
-        // bounded scan of the viewport neighborhood while that index is stale.
-        let local_context = background_context
-            .is_none()
-            .then(|| local_block_context(document, visible.clone()));
-        let contexts = visible
-            .clone()
-            .map(|line| {
-                let fenced = background_context
-                    .and_then(|index| index.line_is_fenced(line))
-                    .or_else(|| local_context.as_ref().and_then(|c| c.line_is_fenced(line)))
-                    .unwrap_or(false);
-                let table = background_context
-                    .and_then(|index| index.line_is_table(line))
-                    .or_else(|| local_context.as_ref().and_then(|c| c.line_is_table(line)))
-                    .unwrap_or(false);
-                LineContext::from_document_context(fenced, table)
+        let blocks = self.visible_blocks(visible.clone());
+        // Keep a margin of presentations around the viewport so scrolling back
+        // does not re-present, and drop the rest.
+        let retained = self
+            .current_index()
+            .map(|index| {
+                (visible.start.saturating_sub(BLOCK_CACHE_MARGIN)..visible.end + BLOCK_CACHE_MARGIN)
+                    .filter_map(|ordinal| index.block(ordinal))
+                    .map(|block| block.id)
+                    .collect::<HashSet<_>>()
             })
-            .collect::<Vec<_>>();
-        let mut rendered_lines = Vec::with_capacity(visible.len());
-        for (line, context) in visible.clone().zip(contexts) {
-            if let Some(block) = self.cached_line(line, context) {
-                rendered_lines.push((line, block));
+            .unwrap_or_else(|| blocks.iter().map(|block| block.id).collect());
+        self.block_cache.retain(|id, _| retained.contains(id));
+
+        let lines = self.visible_line_window(&blocks, &visible);
+        let mut rendered = Vec::with_capacity(blocks.len());
+        for block in &blocks {
+            if let Some(visual) = self.cached_block(block, &lines) {
+                rendered.push((block.ordinal, visual));
             }
         }
-        for (line, block) in &rendered_lines {
-            self.heights.update(*line, block.height());
+        // Height entries follow whatever the index is keyed by: one per block
+        // once the document has been parsed, one per physical line until then.
+        let mut first_item = usize::MAX;
+        let mut last_item = 0;
+        self.line_owners.clear();
+        for (ordinal, visual) in &rendered {
+            match self.granularity {
+                Granularity::Blocks => {
+                    if *ordinal < self.heights.len() {
+                        self.heights.update(*ordinal, visual.height());
+                    }
+                    first_item = first_item.min(*ordinal);
+                    last_item = last_item.max(ordinal + 1);
+                }
+                Granularity::Lines => {
+                    for line in &visual.lines {
+                        let at = line.line_id as usize;
+                        if at < self.heights.len() {
+                            self.heights.update(at, line.height());
+                        }
+                        first_item = first_item.min(at);
+                        last_item = last_item.max(at + 1);
+                    }
+                }
+            }
+            for (at, line) in visual.lines.iter().enumerate() {
+                self.line_owners
+                    .insert(line.line_id as usize, (visual.id, at));
+            }
         }
-        let top_space = self.heights.prefix_sum(visible.start);
+        // Blocks are drawn whole, so the rendered span can start above the
+        // viewport; the spacers have to match what was actually drawn.
+        let items = if first_item < last_item {
+            first_item..last_item
+        } else {
+            visible.clone()
+        };
+        let top_space = self.heights.prefix_sum(items.start);
         let bottom_space =
-            (self.heights.total_height() - self.heights.prefix_sum(visible.end)).max(0.0);
+            (self.heights.total_height() - self.heights.prefix_sum(items.end)).max(0.0);
         let revision = self.editor().document().revision().0;
         let bytes = self.editor().document().len_bytes().0;
         let p95 = self
@@ -1022,17 +1271,22 @@ impl Render for EditorView {
                         .flex_col()
                         .w_full()
                         .child(div().h(px(top_space)))
-                        .children(rendered_lines.into_iter().map(|(line, block)| {
-                            line_element_from_block(editor, line, &block, self.theme, &resolver)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |view, event, window, cx| {
-                                        view.on_line_mouse_down(line, event, window, cx)
-                                    }),
-                                )
-                                .on_mouse_move(cx.listener(move |view, event, window, cx| {
-                                    view.on_line_mouse_move(line, event, window, cx)
-                                }))
+                        // One element per Markdown block, not per physical line:
+                        // what is generated scales with visible blocks.
+                        .children(rendered.into_iter().map(|(_, visual)| {
+                            block_element(&visual, visual.lines.iter().map(|visual_line| {
+                                let line = visual_line.line_id as usize;
+                                line_element(editor, line, visual_line, self.theme, &resolver)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |view, event, window, cx| {
+                                            view.on_line_mouse_down(line, event, window, cx)
+                                        }),
+                                    )
+                                    .on_mouse_move(cx.listener(move |view, event, window, cx| {
+                                        view.on_line_mouse_move(line, event, window, cx)
+                                    }))
+                            }))
                         }))
                         .child(div().h(px(bottom_space))),
                 ),
@@ -1123,7 +1377,7 @@ impl EditorView {
 }
 
 fn visual_offset_at_x(
-    block: &hane_presentation::VisualBlock,
+    block: &VisualLine,
     position_x: gpui::Pixels,
     theme: Theme,
     window: &mut Window,
@@ -1184,7 +1438,7 @@ fn visual_offset_at_x(
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
-    block: &hane_presentation::VisualBlock,
+    block: &VisualLine,
     visual_offset: usize,
 ) -> SourceOffset {
     block
@@ -1206,33 +1460,48 @@ mod tests {
     use super::*;
     use hane_document::LineId;
 
+    /// Presents a whole document the way `render` does: index first, then one
+    /// `presented_block` call per block.
+    fn presented_lines(editor: &Editor) -> Vec<VisualLine> {
+        let index = BlockIndex::from_buffer(editor.document());
+        index
+            .blocks()
+            .flat_map(|block| {
+                presented_block(editor, &block, &(0..usize::MAX))
+                    .expect("block presents")
+                    .lines
+            })
+            .collect()
+    }
+
     #[test]
     fn visual_click_positions_map_back_to_source_offsets() {
         let editor = Editor::new("ab🙂\n\n**bold**");
+        let lines = presented_lines(&editor);
 
-        let first = presented_line(&editor, 0, LineContext::Normal).unwrap();
+        let first = &lines[0];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, &first, 2),
+            source_offset_for_visual_position(&editor, 0, first, 2),
             SourceOffset(2)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, &first, first.visual_text.len()),
+            source_offset_for_visual_position(&editor, 0, first, first.visual_text.len()),
             SourceOffset(6)
         );
 
-        let empty = presented_line(&editor, 1, LineContext::Normal).unwrap();
+        let empty = &lines[1];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 1, &empty, 0),
+            source_offset_for_visual_position(&editor, 1, empty, 0),
             SourceOffset(7)
         );
 
-        let bold = presented_line(&editor, 2, LineContext::Normal).unwrap();
+        let bold = &lines[2];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, &bold, 0),
+            source_offset_for_visual_position(&editor, 2, bold, 0),
             SourceOffset(10)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, &bold, bold.visual_text.len()),
+            source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len()),
             SourceOffset(14)
         );
     }
@@ -1289,14 +1558,87 @@ mod tests {
     }
 
     #[test]
-    fn local_fallback_tracks_fenced_code_open_and_close_markers() {
+    fn local_fallback_resolves_the_fenced_block_before_a_formal_index_exists() {
         let editor = Editor::new("before\n```rust\nlet answer = 42;\n```\nafter\n");
-        let context = local_block_context(editor.document(), 0..6);
-        assert_eq!(context.line_is_fenced(0), Some(false));
+        let document = editor.document();
+        let local = local_block_index(document, 0..6);
+        let kind = |line: usize| {
+            local
+                .block_at(document.line_range(LineId(line)).unwrap().start)
+                .map(|block| block.kind)
+        };
+        assert_eq!(kind(0), Some(hane_markdown::NodeKind::Paragraph));
         for inside in 1..=3 {
-            assert_eq!(context.line_is_fenced(inside), Some(true));
+            assert_eq!(kind(inside), Some(hane_markdown::NodeKind::CodeBlock));
         }
-        assert_eq!(context.line_is_fenced(4), Some(false));
+        assert_eq!(kind(4), Some(hane_markdown::NodeKind::Paragraph));
+    }
+
+    #[test]
+    fn a_block_taller_than_the_viewport_presents_only_the_visible_lines() {
+        // No blank line anywhere, so CommonMark reads the whole document as a
+        // single paragraph: the block is the document, and clipping is the only
+        // thing keeping element generation bounded.
+        let editor = Editor::new(&"短い段落です。\n".repeat(100_000));
+        let index = BlockIndex::from_buffer(editor.document());
+        assert_eq!(index.len(), 1, "the whole document is one block");
+        let lines = editor.document().line_count();
+
+        let block = index.block(0).unwrap();
+        let visual = presented_block(&editor, &block, &(40_000..40_050)).unwrap();
+        assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
+        assert_eq!(visual.lines_before, 40_000);
+        assert_eq!(visual.lines_after, lines - 40_050);
+        // The clipped lines still account for their height, so the scroll range
+        // does not depend on what has been drawn.
+        assert_eq!(visual.height(), lines as f32 * 26.0);
+        assert_eq!(visual.leading_space(), 40_000.0 * 26.0);
+        assert!(visual.covers(&(40_010..40_040)));
+        assert!(!visual.covers(&(39_000..39_050)));
+    }
+
+    #[test]
+    fn one_block_covers_every_physical_line_of_its_construct() {
+        let source = "# title\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let spans = index
+            .blocks()
+            .map(|block| {
+                block_line_span(editor.document(), &block).expect("block spans lines")
+            })
+            .collect::<Vec<_>>();
+
+        // Three blocks for nine lines: virtualization is driven by the three,
+        // not by the nine.
+        assert_eq!(spans, vec![0..2, 2..7, 7..9]);
+        assert_eq!(
+            spans.last().map(|span| span.end),
+            Some(editor.document().line_count()),
+            "the empty final line a trailing newline creates is still drawn"
+        );
+        // Every line is drawn exactly once.
+        assert_eq!(
+            spans.iter().map(std::ops::Range::len).sum::<usize>(),
+            editor.document().line_count()
+        );
+    }
+
+    #[test]
+    fn a_presented_block_carries_all_of_its_lines() {
+        let editor = Editor::new("```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n");
+        let index = BlockIndex::from_buffer(editor.document());
+        let code = presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX)).unwrap();
+        assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
+        assert_eq!(code.source_range, index.block(0).unwrap().source_range);
+        assert_eq!(
+            code.height(),
+            code.lines.iter().map(VisualLine::height).sum::<f32>()
+        );
+        assert!(
+            code.matches(&index.block(0).unwrap()),
+            "a freshly presented block matches the index it came from"
+        );
     }
 
     #[test]

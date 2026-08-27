@@ -113,3 +113,20 @@ BlockIndex導入に伴い、metrics CSVへ `block_index` record と3列を追加
 
 `scripts/aggregate_phase0_metrics.py` はこの3列を他の指標と同じ分布表に出力する。
 R0基準線には該当値がないため、R3.5の測定値が以降の比較原本になる。
+
+### R4Aで追加した指標
+
+ブロック単位の仮想化に伴い、`hane-bench buffer` へ `block height index rebuild` を追加した。
+10万ブロックの文書で、ブロック数が変わる編集のたびに走る高さ索引の作り直しを測る。
+
+| 項目 | 値 |
+|---|---:|
+| block height index rebuild（10万ブロック, 30 samples） | median 0.635 ms / p95 0.671 ms |
+
+参考値として、同じ再構築を rope の行解決で行った初期実装は median 21.1 ms だった。
+行数を `IndexedBlock::line_count` として索引に持たせたことでこの差が出ている。
+
+R4A時点で未実施のまま残る計測は、GUI経由の `keystroke_to_paint` と scroll frame interval の
+比較である。window が前面でない環境ではOS側の throttle が支配的で、同条件の25秒計測でも
+frame 数が145〜1304と振れるため判定に使えない。アプリ内計測の `layout_ms` は
+100 MB / 10万段落とも基準線以下だった（中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。

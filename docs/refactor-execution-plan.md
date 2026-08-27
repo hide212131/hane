@@ -5,7 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-28）
 
-**現在地: R3.75（DocumentSession / FileService）完了。次は R4A（ブロック単位の仮想化・描画）に着手する。**
+**現在地: R4A（ブロック単位の仮想化・描画）完了。次は R4B（Block→LayoutLine→Run）に着手する。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -17,8 +17,8 @@
 | 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
 | 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
 | 8 | R3.75 DocumentSession / FileService | ✅ 完了 |
-| 9 | R4A ブロック仮想化・描画 | ⬜ 未着手 ← **現在地** |
-| 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 |
+| 9 | R4A ブロック仮想化・描画 | ✅ 完了 |
+| 10 | R4B Block→LayoutLine→Run | ⬜ 未着手 ← **現在地** |
 | 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 |
 | 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
@@ -117,6 +117,53 @@
 - ✅ 性能。`hane-bench buffer` は R3.5 記録と同水準（打鍵時 block index median 3 µs / p95 4 µs、
   block 分割 median 5 µs / p95 7 µs、再解析 980 bytes 以下、invalidate 0）。
 
+### R4A の完了内容
+
+- ✅ 型を「ブロック」と「行」に分離。従来の1行単位 `VisualBlock` を `VisualLine` へ改名し、
+  `VisualBlock` を Markdown ブロックの単位として作り直した。`BlockId`・表示種別・複数行に
+  またがる `source_range`・revision・`Confidence` と、その中の `VisualLine` を持つ。
+  R4A の互換レイヤはこの `lines` で、カーソル・選択・IME・クリックは物理行を指したまま。
+  設計判断は ADR-0020。
+- ✅ 表示文脈をブロック種別だけから決める。`presentation::block_line_context` が唯一の判定点で、
+  `BlockContextIndex` / `parse_block_context` / `LocalBlockContext` / `local_block_context` と
+  行走査（`scan_block_context` / `is_pipe_row`）を削除。`crates/ui` はフェンスもパイプも見ない。
+  ブロック末尾の空行列（タイル化が上のブロックへ寄せた分）だけは Normal で描くため、
+  閉じ fence 直後の空行はコード背景にならず、コードブロック内部の空行はコードのまま。
+- ✅ 正式 `BlockIndex` が無い間の境界を `hane_markdown::local_block_index` に置き換え。
+  viewport の上に固定行数の lookback を取った窓を `parse_document` で解析してタイル化する。
+  100 MB 文書で 1 回 0.25〜0.44 ms、全ブロック `Provisional`。
+- ✅ ブロック単位の仮想化。`render` はブロックを反復し、`HeightIndex` は 1 エントリ 1 ブロック。
+  正式索引が無い起動直後だけ行粒度で持ち、粒度切替は viewport 上端の source offset を
+  掛け直すので読んでいる位置が動かない。
+- ✅ 可視行でのクリップ。ブロックに大きさの上限は無く、空行を含まない文書は1段落になる
+  （`paragraphs_100k.md` は10万行で1ブロック）。`present_block` は viewport と交差する行だけを
+  構築し、上下の行数を `lines_before` / `lines_after` として高さに算入する。
+- ✅ ブロックの行数を索引が持つ（`IndexedBlock::line_count`）。タイル化時に数えるので
+  高さ索引の再構築が rope 走査を伴わない。10万ブロックで 21.1 ms → 0.635 ms（行単位だった
+  従来の再構築 20万行 約1.5 ms より速い）。`hane-bench buffer` に
+  `block height index rebuild` シナリオを追加。
+- ✅ 正式索引公開時の高さ索引構築（100 MB・約265万ブロックで約 39 ms）を全文解析と同じ
+  背景 job へ移し、main thread は差し替えるだけにした。
+- ✅ 契約。`block_line_counts_tile_the_document_through_edits`（増分更新後も行数が文書を
+  タイルする）、`a_block_taller_than_the_viewport_presents_only_the_visible_lines`、
+  `one_block_covers_every_physical_line_of_its_construct` を追加。R3.25 の fixture harness は
+  `BlockIndex` → `present_block` の 2 呼び出しへ更新し、`EditorView` と同じ経路を保った。
+  fixture の期待値は変更していない。
+- ✅ 検証。`cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` 緑。
+  `hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致
+  （画面キャプチャ比較。100 MB / 10万段落・1ブロック文書でも正しく描画される）。
+
+### R4A の残メモ
+
+- 🔶 GUI の `keystroke_to_paint` / scroll frame interval の master 比較は未実施。window が
+  前面でない環境では OS 側の throttle に支配され、frame 数が同条件で 145〜1304 と振れるため
+  判定に使えなかった。アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下
+  （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R2 前半の残タスクと同じ枠で回収する。
+- 🔶 ブロック内の行位置とスクロール位置の対応は行高一定を仮定している。画像行を含む
+  ブロックでは可視行の見積もりが1〜2行ずれうる（overscan が吸収する）。正確な対応は
+  R4B の `LayoutLine` が持つ。
+- 🔶 ブロック数が変わる編集では `HeightIndex` を作り直す。差分 splice は R4C の担当。
+
 ### R3.75 の残メモ
 
 - 🔶 GUI 経由の `keystroke_to_paint` 実測（instrument build + 入力注入）は未実施。R2 前半の
@@ -124,12 +171,12 @@
 - 🔶 外部変更の検出は `FileEvent` を受け取る API までで、ファイル監視そのものは未実装。
   filer 実装時に watcher を足す。
 
-### R3.5 の残メモ（R4A で回収する）
+### R3.5 の残メモ
 
-- 🔶 UI は依然として行描画で、fenced/table の line context も `BlockContextIndex` から取っている。
-  BlockIndex と二重に持っている状態は R4A（`fenced_code_context` / `table_context` 撤廃）で解消する。
+- ✅ ブロック境界の二重管理は R4A で解消した（`BlockContextIndex` 系を削除）。
 - 🔶 背景の全文解析は `full_text()` の String を作る。100 MB 文書での CPU / RSS 影響は
-  R4C 前の実測で確認する。
+  R4C 前の実測で確認する。R4A 時点の実測では `BlockIndex::from_buffer` が 100 MB で
+  約 1.16 秒（背景 job・1回）。
 
 ### R2 前半の残タスク
 
@@ -157,7 +204,7 @@
 6. **R3.25 — Markdown機能拡張用の解析・表示APIを確定**
 7. **R3.5 — revision付き `BlockIndex` を導入**
 8. **R3.75 — `DocumentSession` / `FileService` を `EditorView` から分離**
-9. **R4A — ブロック単位の仮想化・描画へ移行**
+9. **R4A — ブロック単位の仮想化・描画へ移行**（完了）
 10. **R4B — `Block → LayoutLine → Run` とvisual座標移動を実装**
 11. **R4C — レイアウトキャッシュと差分更新を実装**
 12. **R2 後半 — スクリプト統合、環境変数整理、歴史文書移動**
@@ -172,7 +219,9 @@
   実態に合わせられるようR4C完了後に行う。
 - R3からR3.5までで、Markdown解析・表示契約・ブロック境界を順に確定する。
 - R3.75でファイル状態と永続化を描画責務から分離し、ファイラー実装の土台を作る。
-- R4AからR4Cは、仮想化、visual座標系、差分キャッシュの順に独立して導入する。
+- R4AからR4Cは、仮想化、visual座標系、差分キャッシュの順に独立して導入する。R4Aで
+  ブロック境界が唯一の表示文脈になり、要素生成が可視ブロック数（ブロック内では可視行数）に
+  比例するようになった。
 - R5は構造変更が完了した後の実装を正として、型、公開API、ドキュメントを整理する。
 
 ## 依存関係

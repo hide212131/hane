@@ -202,6 +202,8 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 - [x] フェンス/表文脈を `hane-markdown` の有界同期フォールバック（`local_block_context`）へ一元化。
       `ui::view::fence_before_line` / `local_table_context` / `render` 内インラインフェンスループを
       廃止し、背景 `BlockContextIndex` ＋1か所だけのフォールバックに統一。
+      （R4A でこの行走査そのものを廃止し、`BlockIndex` / `local_block_index` の
+      ブロック種別へ置き換えた。）
 
 **完了条件**: Markdown の意味解析が pulldown-cmark の1経路、マーカ字句解析が
 `hane-markdown` の1経路のみ。R0.5 の往復・構文 fixture が緑。解析は依然バックグラウンドで、
@@ -289,20 +291,35 @@ block 分割 median 5.4 µs / p95 6.4 µs、1編集あたりの再解析は 1 Ki
 
 **目的**: R3.5 の BlockIndex を使い、「1物理行=1ブロック」を Markdown ブロック単位へ移す。
 
-- [ ] `VisualBlock` を Markdown ブロック（Heading/Paragraph/List/Quote/Code/Image/Table）単位に。
+- [x] `VisualBlock` を Markdown ブロック（Heading/Paragraph/List/Quote/Code/Image/Table）単位に。
       1ブロックが**複数行にまたがる source_range** を保持し、
       `style_runs` / `revision` を保持（RFP §9）。
-- [ ] `EditorView::render` / `cached_line` を「行イテレート」から「ブロックイテレート」へ改修。
+      従来の1行単位の型は `VisualLine` へ改名し、`VisualBlock.lines` として内側に入れた。
+- [x] `EditorView::render` / `cached_line` を「行イテレート」から「ブロックイテレート」へ改修。
       `HeightIndex` はブロック高さで駆動。可変高さ仮想スクロールをブロック粒度で実装（RFP §10）。
-- [ ] UI の `fenced_code_context` / `table_context` / `local_table_context` を撤廃し、
-      正式/暫定 BlockIndex の block kind だけを消費する。
-- [ ] block source range 内の物理行を描画する互換レイヤを設け、R4A ではカーソル・選択・IME の
+      正式 `BlockIndex` が無い起動直後だけ行粒度で高さを持ち、粒度切替は viewport 上端の
+      source offset を掛け直して行う。
+- [x] UI の `fenced_code_context` / `table_context` / `local_table_context` を撤廃し、
+      正式/暫定 BlockIndex の block kind だけを消費する。表示文脈の決定は
+      `presentation::block_line_context` の1か所。行走査版の `parse_block_context` /
+      `local_block_context` は削除し、境界付きの `local_block_index` へ置き換えた。
+- [x] block source range 内の物理行を描画する互換レイヤを設け、R4A ではカーソル・選択・IME の
       既存挙動を維持したまま仮想化の単位だけを変更する。
+- [x] ブロックには大きさの上限が無い（空行の無い文書は1段落）ため、`present_block` は
+      viewport と交差する行だけを構築し、残りは行数として高さに算入する。
+- [x] ブロックの行数を `IndexedBlock::line_count` としてタイル化時に数える。高さ索引の
+      再構築が rope 走査を伴わなくなり、10万ブロックで 21.1 ms → 0.635 ms。
+- [x] 正式索引公開時の高さ索引構築（100 MB で約 39 ms）を全文解析と同じ背景 job へ移す。
 
 **完了条件**: 画面外の GPUI 要素が block 数に比例して生成されない。100 MB / 10万段落で
 入力遅延とスクロールが R0 の許容範囲内。R0.5 の既存編集契約がすべて緑。
 
----
+**達成状況**: 要素生成は可視ブロック数（ブロック内では可視行数）に比例する。R0.5 を含む
+`cargo test --workspace` と `cargo clippy --workspace --all-targets -- -D warnings` は緑。
+`hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致（画面キャプチャ比較）。
+GUI の `keystroke_to_paint` / scroll interval の正式比較は、window が前面でない環境では
+OS 側の throttle に支配されるため未実施（R2 前半の残タスクと同じ枠で回収する）。
+アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下だった。
 
 ## Phase R4B — Block → LayoutLine → Run レイアウト（P0・高リスク）
 

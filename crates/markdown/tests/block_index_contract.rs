@@ -124,3 +124,60 @@ fn block_identity_survives_editing_so_caches_stay_warm() {
     assert_eq!(index.block(100).unwrap().revision, buffer.revision());
     assert_ne!(index.block(150).unwrap().revision, buffer.revision());
 }
+
+/// Line counts are what the block-driven height index is built from, so they
+/// have to keep tiling the document through incremental updates — otherwise the
+/// scroll range drifts away from the text.
+#[test]
+fn block_line_counts_tile_the_document_through_edits() {
+    let mut buffer = RopeBuffer::from_text(
+        "# title\n\npara one\ncontinued\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n",
+    );
+    let mut index = BlockIndex::from_buffer(&buffer);
+
+    let check = |index: &BlockIndex, buffer: &RopeBuffer, what: &str| {
+        for block in index.blocks() {
+            let first = buffer.line_for_offset(block.source_range.start).unwrap();
+            let last = if block.source_range.end.0 >= buffer.len_bytes().0 {
+                buffer.line_count() - 1
+            } else {
+                buffer
+                    .line_for_offset(SourceOffset(block.source_range.end.0 - 1))
+                    .unwrap()
+                    .0
+            };
+            let span = last + 1 - first.0;
+            // The block owning the document end also owns the empty last line a
+            // trailing newline creates, which no block counts.
+            let expected = if block.ordinal + 1 == index.len() {
+                span - 1
+            } else {
+                span
+            };
+            assert_eq!(
+                block.line_count, expected,
+                "{what}: block {} covers {expected} lines",
+                block.ordinal
+            );
+        }
+        let counted: usize = index.blocks().map(|block| block.line_count).sum();
+        assert_eq!(
+            counted + 1,
+            buffer.line_count(),
+            "{what}: counts tile every line but the empty last one"
+        );
+    };
+    check(&index, &buffer, "full parse");
+
+    // Typing inside a block, then splitting one in two, then joining two back.
+    let at = index.block(2).unwrap().source_range.start.0 + 4;
+    type_at(&mut buffer, &mut index, at, "x");
+    check(&index, &buffer, "after typing");
+    type_at(&mut buffer, &mut index, at, "\n\n");
+    check(&index, &buffer, "after splitting a block");
+    let base = buffer.revision();
+    buffer.edit(SourceRange::new(at, at + 2), "").unwrap();
+    let deltas = buffer.deltas_since(base).unwrap();
+    index.update(&buffer, &deltas);
+    check(&index, &buffer, "after joining the blocks back");
+}

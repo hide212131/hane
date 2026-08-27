@@ -69,6 +69,14 @@ pub struct IndexedBlock {
     /// revision means the block's text has not changed since.
     pub revision: Revision,
     pub confidence: Confidence,
+    /// Physical source lines the block covers.
+    ///
+    /// Counted as the newlines in the block's bytes, plus one when the block does
+    /// not end in a newline. Defined that way the counts are additive under
+    /// concatenation, so merging blocks needs no re-count — and the empty last
+    /// line of a document that ends in a newline belongs to no block, which is
+    /// what `hane_presentation::block_heights` accounts for.
+    pub line_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +84,7 @@ struct Entry {
     id: BlockId,
     kind: NodeKind,
     revision: Revision,
+    lines: usize,
 }
 
 /// What one incremental update did. Reported so the caller can measure update
@@ -94,12 +103,23 @@ pub struct BlockIndexUpdate {
     pub elapsed: Duration,
 }
 
+/// One tiled block: its kind, its byte length, and the physical lines it covers.
+pub(crate) type TiledBlock = (NodeKind, usize, usize);
+
 /// Tiles one parsed slice into block spans covering `range` exactly: each
 /// top-level block runs from its own start to the next block's start, the first
 /// starts at `range.start`, and the last ends at `range.end`. Returns no block
 /// when the slice parses to nothing, which is the caller's signal that the slice
 /// is blank.
-fn tiled_blocks(tree: &MarkdownTree, range: SourceRange) -> Vec<(NodeKind, usize)> {
+///
+/// Line counts are taken here because this is the one place that already holds
+/// the block's bytes; resolving them from the rope later costs a traversal per
+/// block, which the input path cannot afford.
+pub(crate) fn tiled_blocks(
+    tree: &MarkdownTree,
+    range: SourceRange,
+    source: &str,
+) -> Vec<TiledBlock> {
     let starts = tree
         .children(MarkdownTree::ROOT)
         .iter()
@@ -120,7 +140,10 @@ fn tiled_blocks(tree: &MarkdownTree, range: SourceRange) -> Vec<(NodeKind, usize
                 .get(index + 1)
                 .map_or(range.end.0, |(_, next)| *next)
                 .max(start);
-            (*kind, end - start)
+            let slice = &source[start - range.start.0..end - range.start.0];
+            let newlines = slice.bytes().filter(|byte| *byte == b'\n').count();
+            let lines = newlines + usize::from(!slice.ends_with('\n'));
+            (*kind, end - start, lines)
         })
         .collect()
 }
@@ -142,18 +165,21 @@ impl BlockIndex {
     pub fn build(revision: Revision, source: &str) -> Self {
         let range = SourceRange::new(0, source.len());
         let parsed = parse_document(revision, range, source);
-        let blocks = tiled_blocks(&parsed.tree, range);
+        let blocks = tiled_blocks(&parsed.tree, range, source);
         let next_id = blocks.len() as u64;
-        let store = BlockStore::new(blocks.into_iter().enumerate().map(|(index, (kind, length))| {
-            (
-                Entry {
-                    id: BlockId(index as u64),
-                    kind,
-                    revision,
-                },
-                length,
-            )
-        }));
+        let store = BlockStore::new(blocks.into_iter().enumerate().map(
+            |(index, (kind, length, lines))| {
+                (
+                    Entry {
+                        id: BlockId(index as u64),
+                        kind,
+                        revision,
+                        lines,
+                    },
+                    length,
+                )
+            },
+        ));
         Self {
             revision,
             store,
@@ -218,6 +244,7 @@ impl BlockIndex {
             source_range,
             revision: entry.revision,
             confidence: self.confidence(ordinal),
+            line_count: entry.lines,
         }
     }
 
@@ -327,7 +354,7 @@ impl BlockIndex {
             };
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
-            let blocks = tiled_blocks(&parsed.tree, window);
+            let blocks = tiled_blocks(&parsed.tree, window, &text);
             // Re-synchronized when the window's last parsed block lands exactly
             // on the boundary and kind the index already has for the untouched
             // block that closes the window. Everything after that boundary is
@@ -336,7 +363,7 @@ impl BlockIndex {
             let tail_start = self.span(window_last).start.0;
             let tail_kind = self.store.get(window_last).map(|(entry, _)| entry.kind);
             let resynchronized = window.end.0 == buffer.len_bytes().0
-                || blocks.last().is_some_and(|(kind, length)| {
+                || blocks.last().is_some_and(|(kind, length, _)| {
                     Some(*kind) == tail_kind && window.end.0 - *length == tail_start
                 });
             let can_grow = window_last + 1 < self.len()
@@ -410,11 +437,19 @@ impl BlockIndex {
             return;
         };
         entry.revision = revision;
-        self.store.set_payload(first, entry);
         if first == last {
+            self.store.set_payload(first, entry);
             self.store.set_length(first, length);
             return;
         }
+        // Line counts are additive under concatenation, so a merged run carries
+        // the sum. The edit itself may have added or removed newlines; the window
+        // re-parse that follows in the same update replaces the count exactly.
+        entry.lines = (first..=last)
+            .filter_map(|ordinal| self.store.get(ordinal))
+            .map(|(entry, _)| entry.lines)
+            .sum();
+        self.store.set_payload(first, entry);
         self.store.splice(first..last + 1, &[(entry, length)]);
         if let Some(from) = self.provisional_from {
             self.provisional_from = Some(if from <= first {
@@ -434,7 +469,7 @@ impl BlockIndex {
     fn splice_window(
         &mut self,
         window: Range<usize>,
-        blocks: &[(NodeKind, usize)],
+        blocks: &[TiledBlock],
         revision: Revision,
     ) -> usize {
         let window_start = self.store.start(window.start);
@@ -457,7 +492,7 @@ impl BlockIndex {
             .collect::<Vec<_>>();
         let new_offsets = blocks
             .iter()
-            .scan(0, |start, (_, length)| {
+            .scan(0, |start, (_, length, _)| {
                 let span = (*start, *start + length);
                 *start = span.1;
                 Some(span)
@@ -485,7 +520,7 @@ impl BlockIndex {
         let entries = blocks
             .iter()
             .zip(&ids)
-            .map(|((kind, _), id)| Entry {
+            .map(|((kind, _, lines), id)| Entry {
                 id: id.unwrap_or_else(|| {
                     let id = BlockId(self.next_id);
                     self.next_id += 1;
@@ -493,6 +528,7 @@ impl BlockIndex {
                 }),
                 kind: *kind,
                 revision,
+                lines: *lines,
             })
             .collect::<Vec<_>>();
         if blocks.is_empty() {
@@ -500,23 +536,28 @@ impl BlockIndex {
             // above, keeping the tiling intact; with no block above, the document
             // holds no block at all.
             let bytes: usize = existing.iter().map(|(_, _, _, length)| length).sum();
+            let lines: usize = existing.iter().map(|(_, entry, _, _)| entry.lines).sum();
             self.store.splice(window.clone(), &[]);
             if window.start > 0 {
                 let above = window.start - 1;
                 self.store
                     .set_length(above, self.store.length(above) + bytes);
+                if let Some((mut entry, _)) = self.store.get(above) {
+                    entry.lines += lines;
+                    self.store.set_payload(above, entry);
+                }
             }
         } else if blocks.len() == window.len() {
             // Same block count: rewrite the slots in place, so an edit that does
             // not change the window's structure never re-chunks the store.
-            for (offset, (entry, (_, length))) in entries.iter().zip(blocks).enumerate() {
+            for (offset, (entry, (_, length, _))) in entries.iter().zip(blocks).enumerate() {
                 self.store.set_payload(window.start + offset, *entry);
                 self.store.set_length(window.start + offset, *length);
             }
         } else {
             let items = entries
                 .into_iter()
-                .zip(blocks.iter().map(|(_, length)| *length))
+                .zip(blocks.iter().map(|(_, length, _)| *length))
                 .collect::<Vec<_>>();
             self.store.splice(window.clone(), &items);
         }

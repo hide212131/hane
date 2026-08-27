@@ -3,7 +3,7 @@
 use hane_document::{RopeBuffer, SourceRange, TextBuffer};
 use hane_markdown::BlockIndex;
 use hane_metrics::percentile;
-use hane_presentation::{HeightIndex, present_markdown};
+use hane_presentation::{HeightIndex, block_heights, present_markdown};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -204,6 +204,27 @@ pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
         heights.update(index, 22.0 + (iteration % 5) as f32);
         let visible = heights.visible_range((iteration * 137) as f32, 720.0, 260.0);
         std::hint::black_box(visible);
+        samples.push(start.elapsed());
+    }
+    distribution(&samples)
+}
+
+/// Rebuilding the block-driven height index on a document of `blocks`
+/// paragraphs. This is the one cost R4A adds to the input path: an edit that
+/// changes the number of blocks re-keys the height index, and every entry has to
+/// be sized from the lines its block covers.
+pub fn run_block_heights_scenario(blocks: usize, iterations: usize) -> Distribution {
+    let mut source = String::new();
+    for paragraph in 0..blocks {
+        source.push_str(&format!("paragraph {paragraph} with a few words in it\n\n"));
+    }
+    let buffer = RopeBuffer::from_text(&source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = std::time::Instant::now();
+        let heights = HeightIndex::new(block_heights(&buffer, &index, 26.0));
+        std::hint::black_box(heights.total_height());
         samples.push(start.elapsed());
     }
     distribution(&samples)
