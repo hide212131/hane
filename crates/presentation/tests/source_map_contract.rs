@@ -51,6 +51,69 @@ fn every_editable_source_boundary_round_trips_when_its_construct_is_disclosed() 
 }
 
 #[test]
+fn unsupported_and_edge_constructs_never_lose_source() {
+    // Constructs Hane does not specialize yet (raw HTML, autolinks, footnote and
+    // reference-link references, task-list checkboxes, backslash escapes, HTML
+    // entities). The display contract guarantees the presented block reproduces
+    // the source verbatim: concatenating segment source ranges in order rebuilds
+    // the original bytes, and every boundary round-trips.
+    let fixtures = [
+        "<div class=\"note\">raw html</div>",
+        "see <https://example.com> now",
+        "footnote ref[^1] here",
+        "[label][ref] link",
+        "- [ ] 未対応タスク",
+        r"escaped \*not emphasis\* text",
+        "A &amp; B entity",
+        "pipes | without | delimiter",
+    ];
+
+    for source in fixtures {
+        let base = 100;
+        let range = SourceRange::new(base, base + source.len());
+        let block = present_markdown_with_disclosure(1, Revision(4), range, source, 26.0, None);
+
+        let reconstructed: String = block
+            .source_map
+            .segments
+            .iter()
+            .filter(|segment| !segment.source_range.is_empty())
+            .map(|segment| &source[segment.source_range.start.0 - base..segment.source_range.end.0 - base])
+            .collect();
+        assert_eq!(
+            reconstructed, source,
+            "segments dropped source bytes for {source:?}"
+        );
+
+        for relative in char_boundaries(source) {
+            let source_offset = SourceOffset(base + relative);
+            let disclosed = present_markdown_with_disclosure(
+                1,
+                Revision(4),
+                range,
+                source,
+                26.0,
+                Some(SourceRange::empty(source_offset.0)),
+            );
+            let visual = disclosed
+                .source_map
+                .source_to_visual(source_offset, Bias::After)
+                .unwrap_or_else(|| panic!("missing source mapping at {relative} in {source:?}"))
+                .visual_offset;
+            assert_eq!(
+                disclosed
+                    .source_map
+                    .visual_to_source(visual, Bias::After)
+                    .unwrap()
+                    .source_offset,
+                source_offset,
+                "source→visual→source mismatch at {relative} in {source:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn hidden_and_synthesized_positions_normalize_idempotently() {
     let source = "**日本🙂** and [link](target)";
     let range = SourceRange::new(50, 50 + source.len());

@@ -5,7 +5,8 @@
 
 ## 進捗ステータス（最終更新: 2026-08-27）
 
-**現在地: R3.25（Markdown 拡張契約）着手中。表示契約の漏れ解消（UI の block-kind パッチ撤去）まで完了。**
+**現在地: R3.25（Markdown 拡張契約）着手中。表示契約の漏れ解消（UI の block-kind パッチ撤去）と
+`Unsupported` raw-source fallback の契約化まで完了。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -28,7 +29,11 @@
 - ✅ 表示契約の漏れ解消（第一段）: fenced-code の表示決定を `presentation::present_polished_line`
   へ集約し、UI 側（`ui::line`）の `block.kind = CodeBlock` 直接パッチと style run 手注入を撤去。
   UI へ渡す block 文脈を型付き `LineContext`（Normal/FencedCode/Table）に統一。
-- ⬜ `Unsupported` / raw-source fallback を正式な表示契約に含める（未実装構文でも source を失わない）。
+- ✅ `Unsupported` / raw-source fallback を正式な表示契約に含める（未実装構文でも source を失わない）。
+  `presentation::BlockKind::Unsupported` と `present_raw_source` を追加し、`present_markdown_with_disclosure`
+  は marker 導出が source range を tile できない場合に raw-source へ降格。契約テスト
+  `unsupported_and_edge_constructs_never_lose_source`（raw HTML / autolink / footnote 参照 /
+  task list / escape / entity）で source 復元と往復を固定。
 - ⬜ parser 構文種別 / presentation 表示種別 / UI 描画方針の型分離を明示（`markdown::BlockKind` と
   `presentation::BlockKind` の役割整理）。
 - ⬜ flat `blocks`/`spans` に代わる block/inline node ツリー（親子・順序・source range）。

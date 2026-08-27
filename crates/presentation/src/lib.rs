@@ -221,6 +221,10 @@ pub enum BlockKind {
     Image,
     TableRow,
     TableDelimiter,
+    /// A source line whose Markdown construct has no specialized presenter yet, or
+    /// whose marker derivation failed to tile the source range. Rendered verbatim
+    /// as plain text so the source is never lost. See [`present_raw_source`].
+    Unsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,6 +312,25 @@ pub fn present_plain(
     }
 }
 
+/// Raw-source fallback presentation. Shows the block source verbatim through a
+/// single visible segment so no source byte is hidden or dropped, and marks the
+/// block [`BlockKind::Unsupported`] so the UI renders it as plain text without
+/// inferring structure. This is the formal display contract for unimplemented
+/// syntax: a construct with no specialized presenter, or one whose marker
+/// derivation fails to tile the source range, still round-trips its source.
+pub fn present_raw_source(
+    block_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+) -> VisualBlock {
+    let mut block = present_plain(block_id, revision, range, source);
+    block.kind = BlockKind::Unsupported;
+    block.estimated_height = estimated_height(BlockKind::Unsupported, line_height);
+    block
+}
+
 fn presentation_block_kind(kind: MarkdownBlockKind) -> BlockKind {
     match kind {
         MarkdownBlockKind::Paragraph => BlockKind::Paragraph,
@@ -370,6 +393,25 @@ fn marker_is_disclosed(
                 && marker.end <= block.source_range.end
                 && range_touches(block.source_range, disclosure)
         })
+}
+
+/// Returns true when `segments` tile `range` contiguously, so every source byte
+/// of the block belongs to exactly one mapping segment (empty synthesized
+/// segments are ignored). Enforces the "source is never lost" display contract:
+/// a false result means marker derivation left a gap or overlap and the caller
+/// must fall back to raw-source presentation.
+fn segments_tile_range(range: SourceRange, segments: &[MappingSegment]) -> bool {
+    let mut cursor = range.start.0;
+    for segment in segments {
+        if segment.source_range.is_empty() {
+            continue;
+        }
+        if segment.source_range.start.0 != cursor {
+            return false;
+        }
+        cursor = segment.source_range.end.0;
+    }
+    cursor == range.end.0
 }
 
 fn append_segment(
@@ -460,6 +502,12 @@ pub fn present_markdown_with_disclosure(
             visual_range: VisualRange::new(0, visual.len()),
             visibility: Visibility::Visible,
         });
+    }
+    // Contract guard: if marker derivation for an unsupported construct left the
+    // source range only partially covered, degrade to raw source rather than
+    // hiding or dropping the uncovered bytes.
+    if !segments_tile_range(range, &segments) {
+        return present_raw_source(block_id, revision, range, source, line_height);
     }
     let source_map = SourceMap { segments };
     let mut style_runs = parsed
@@ -1097,6 +1145,37 @@ mod tests {
         );
         assert_eq!(active.visual_text, source);
         assert_eq!(active.kind, BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn raw_source_fallback_preserves_every_byte_as_plain_text() {
+        let source = "<div class=\"note\">未対応 &amp; raw</div>";
+        let range = SourceRange::new(12, 12 + source.len());
+        let block = present_raw_source(9, Revision(3), range, source, 26.0);
+        assert_eq!(block.kind, BlockKind::Unsupported);
+        assert_eq!(block.visual_text, source);
+        assert!(block.style_runs.is_empty());
+        assert_eq!(block.source_map.segments.len(), 1);
+        assert_eq!(block.source_map.segments[0].visibility, Visibility::Visible);
+        for relative in 0..=source.len() {
+            if !source.is_char_boundary(relative) {
+                continue;
+            }
+            let offset = SourceOffset(12 + relative);
+            let visual = block
+                .source_map
+                .source_to_visual(offset, Bias::After)
+                .unwrap()
+                .visual_offset;
+            assert_eq!(
+                block
+                    .source_map
+                    .visual_to_source(visual, Bias::After)
+                    .unwrap()
+                    .source_offset,
+                offset
+            );
+        }
     }
 
     #[test]
