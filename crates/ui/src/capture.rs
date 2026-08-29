@@ -1,3 +1,9 @@
+#![allow(
+    clippy::ignored_unit_patterns,
+    clippy::redundant_closure_for_method_calls,
+    reason = "GPUI capture callbacks mirror the framework's unit and callback conventions"
+)]
+
 use crate::view::EditorView;
 use gpui::{
     App, Bounds, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, IntoElement,

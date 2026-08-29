@@ -1,3 +1,12 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::cast_possible_truncation,
+    clippy::redundant_closure_for_method_calls,
+    clippy::needless_pass_by_value,
+    reason = "line rendering keeps GPUI-facing arguments and run assembly together"
+)]
+
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{

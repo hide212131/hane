@@ -1,10 +1,11 @@
 //! Offline fixtures, benchmark scenarios, environment capture, and report rendering.
 
-// Scenario/report helpers prioritize readable fixtures and deterministic reporting;
-// their short-lived values and formatting are intentionally not production APIs.
 #![allow(
-    clippy::pedantic,
-    reason = "offline benchmark fixtures intentionally favor legible deterministic scenario construction"
+    clippy::must_use_candidate,
+    clippy::cast_precision_loss,
+    clippy::format_push_string,
+    clippy::map_unwrap_or,
+    reason = "offline fixture construction and report formatting use deliberate benchmark-oriented trade-offs"
 )]
 
 use hane_document::{LineId, RopeBuffer, SourceRange, TextBuffer};
@@ -23,6 +24,7 @@ use std::time::Duration;
 
 pub type Distribution = DurationDistribution;
 
+#[must_use]
 pub fn distribution(samples: &[Duration]) -> Distribution {
     duration_distribution(samples.iter().copied())
 }
@@ -104,6 +106,11 @@ pub const FIXTURES: &[Fixture] = &[
     },
 ];
 
+/// Generates all benchmark fixtures below `root`.
+///
+/// # Errors
+///
+/// Returns an I/O error if a fixture directory or file cannot be created or written.
 pub fn generate_fixtures(root: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(root)?;
     let mut paths = Vec::new();
@@ -124,6 +131,12 @@ pub fn generate_fixtures(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Measures edits in a generated buffer.
+///
+/// # Panics
+///
+/// Panics only if the generated valid UTF-8 source has no character boundary.
+#[must_use]
 pub fn run_buffer_edit_scenario(bytes: usize, iterations: usize) -> Distribution {
     let pattern = "paragraph **bold** 日本語 🙂\n";
     let mut source = String::with_capacity(bytes);
@@ -157,6 +170,11 @@ pub fn run_buffer_edit_scenario(bytes: usize, iterations: usize) -> Distribution
     distribution(&samples)
 }
 
+/// Measures repeated document opens.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be opened or read.
 pub fn run_file_open_scenario(path: &Path, iterations: usize) -> io::Result<Distribution> {
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -169,6 +187,7 @@ pub fn run_file_open_scenario(path: &Path, iterations: usize) -> io::Result<Dist
     Ok(distribution(&samples))
 }
 
+#[must_use]
 pub fn run_presentation_scenario(iterations: usize) -> Distribution {
     let source = "これは **重要な日本語🙂** を含む active block です。";
     let range = SourceRange::new(0, source.len());
@@ -188,6 +207,7 @@ pub fn run_presentation_scenario(iterations: usize) -> Distribution {
     distribution(&samples)
 }
 
+#[must_use]
 pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
     let mut heights = HeightIndex::new((0..blocks).map(|index| 20.0 + (index % 7) as f32));
     let mut samples = Vec::with_capacity(iterations);
@@ -206,6 +226,7 @@ pub fn run_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
 /// each frame: rows are built for the visible lines of every visible block, and
 /// their wrap points and heights decided. Text measurement is the fixed-advance
 /// stand-in, so this is the layout cost without the font behind it.
+#[must_use]
 pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distribution {
     let mut source = String::new();
     for paragraph in 0..blocks {
@@ -267,6 +288,7 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
 
 /// Building the block-driven height index for a document of `blocks`
 /// paragraphs, as the background formal-index job does at publication time.
+#[must_use]
 pub fn run_block_heights_scenario(blocks: usize, iterations: usize) -> Distribution {
     let mut source = String::new();
     for paragraph in 0..blocks {
@@ -287,6 +309,7 @@ pub fn run_block_heights_scenario(blocks: usize, iterations: usize) -> Distribut
 /// Alternating one block split/join in the middle of an existing height index.
 /// The item count stays stable across each pair so every sample measures only
 /// the structural edit, not construction of another document-sized index.
+#[must_use]
 pub fn run_height_splice_scenario(blocks: usize, iterations: usize) -> Distribution {
     let mut heights = HeightIndex::new(std::iter::repeat_n(26.0, blocks));
     let middle = blocks / 2;
@@ -315,6 +338,7 @@ pub struct BlockIndexMeasurement {
 /// Incremental block-index updates on a document of `blocks` paragraphs.
 /// `structural` chooses between typing inside one block and edits that split a
 /// block in two, which is the case that has to re-chunk the index.
+#[must_use]
 pub fn run_block_index_scenario(
     blocks: usize,
     iterations: usize,
@@ -351,6 +375,7 @@ pub fn run_block_index_scenario(
     measurement
 }
 
+#[must_use]
 pub fn markdown_report(environment: &Environment, scenarios: &[(&str, Distribution)]) -> String {
     let mut report = format!(
         "# Hane Performance Report\n\n- Git: `{}`\n- Profile: `{}`\n- Rust: `{}`\n- GPUI: `{}`\n- OS: `{}`\n- CPU: `{}`\n- RSS: `{}` bytes\n\n| Scenario | Samples | Median (ms) | p95 (ms) | p99 (ms) | Max (ms) |\n|---|---:|---:|---:|---:|---:|\n",

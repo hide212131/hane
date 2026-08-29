@@ -1,11 +1,10 @@
 //! GPUI adapter for the editor core. Only visible lines plus bounded overscan are rendered.
 
-// GPUI's ownership, pixel-coordinate, callback, and palette APIs require patterns
-// that pedantic normally discourages; keeping this boundary explicit avoids leaking
-// those exceptions into the editor core.
+// Some GPUI assertion macro expansions report their source span in `core`; retain
+// the layout module's exact-comparison policy at the crate boundary for that case.
 #![allow(
-    clippy::pedantic,
-    reason = "the GPUI integration boundary intentionally follows GPUI callback and pixel-coordinate conventions"
+    clippy::float_cmp,
+    reason = "GPUI geometry assertions require exact comparisons and macro expansion cannot be scoped to the call site"
 )]
 
 mod actions;

@@ -1,18 +1,5 @@
 //! UI-independent UTF-8 source buffer and edit primitives.
 
-// Query-style value objects are deliberately lightweight; callers may invoke these
-// accessors solely for their validation or conversion side effects in generic code.
-#![allow(
-    clippy::must_use_candidate,
-    reason = "the public buffer API includes intentionally discardable query helpers"
-)]
-// `Buffer` documents its error contract at the trait level, rather than repeating it
-// on each required method.
-#![allow(
-    clippy::missing_errors_doc,
-    reason = "the Buffer trait has one shared error contract"
-)]
-
 use ropey::{Rope, RopeSlice};
 use std::collections::VecDeque;
 use std::fmt;
@@ -47,6 +34,7 @@ pub struct SourceRange {
 }
 
 impl SourceRange {
+    #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
         Self {
             start: SourceOffset(start),
@@ -54,22 +42,27 @@ impl SourceRange {
         }
     }
 
+    #[must_use]
     pub const fn empty(offset: usize) -> Self {
         Self::new(offset, offset)
     }
 
+    #[must_use]
     pub const fn len_bytes(self) -> usize {
         self.end.0 - self.start.0
     }
 
+    #[must_use]
     pub const fn is_empty(self) -> bool {
         self.start.0 == self.end.0
     }
 
+    #[must_use]
     pub const fn as_usize(self) -> Range<usize> {
         self.start.0..self.end.0
     }
 
+    #[must_use]
     pub fn intersects(self, other: Self) -> bool {
         self.start.0 < other.end.0 && other.start.0 < self.end.0
     }
@@ -121,6 +114,7 @@ pub struct RevisionDelta {
 }
 
 impl RevisionDelta {
+    #[must_use]
     pub fn transform_offset(self, offset: SourceOffset, bias: Bias) -> Option<SourceOffset> {
         let before = self.edited_source_range_before;
         if offset.0 < before.start.0 || (offset.0 == before.start.0 && bias == Bias::Before) {
@@ -135,6 +129,7 @@ impl RevisionDelta {
         })
     }
 
+    #[must_use]
     pub fn transform_range(self, range: SourceRange) -> Option<SourceRange> {
         if range.intersects(self.edited_source_range_before) {
             return None;
@@ -170,6 +165,16 @@ impl fmt::Display for BufferSlice<'_> {
     }
 }
 
+/// Common operations over the revision-tracked UTF-8 source buffer.
+///
+/// # Errors
+///
+/// Methods returning [`BufferError`] reject offsets or ranges outside the buffer,
+/// invalid UTF-8 boundaries, and unavailable revision history as applicable.
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "the shared TextBuffer error contract is documented on the trait"
+)]
 pub trait TextBuffer {
     fn len_bytes(&self) -> ByteLen;
     fn len_chars(&self) -> CharLen;
@@ -203,14 +208,21 @@ impl Default for RopeBuffer {
 }
 
 impl RopeBuffer {
+    #[must_use]
     pub fn new() -> Self {
         Self::from_text("")
     }
 
+    #[must_use]
     pub fn from_text(text: &str) -> Self {
         Self::from_rope(Rope::from_str(text))
     }
 
+    /// Builds a buffer from a UTF-8 reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error produced while reading the source.
     pub fn from_reader(reader: impl io::Read) -> io::Result<Self> {
         Ok(Self::from_rope(Rope::from_reader(reader)?))
     }
@@ -224,12 +236,17 @@ impl RopeBuffer {
         }
     }
 
+    #[must_use]
     pub fn full_text(&self) -> String {
         self.rope.to_string()
     }
 
     /// Writes the current Rope without first materializing the full document as
     /// one contiguous `String`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error produced while writing a source chunk.
     pub fn write_to(&self, mut writer: impl io::Write) -> io::Result<()> {
         for chunk in self.rope.chunks() {
             writer.write_all(chunk.as_bytes())?;
@@ -237,10 +254,16 @@ impl RopeBuffer {
         Ok(())
     }
 
+    #[must_use]
     pub fn line_count(&self) -> usize {
         self.rope.len_lines()
     }
 
+    /// Resolves an anchor created at `from` to the current revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError`] when the anchor is invalid or revision history is unavailable.
     pub fn resolve_anchor(
         &self,
         anchor: Anchor,
@@ -264,6 +287,11 @@ impl RopeBuffer {
         Ok(offset)
     }
 
+    /// Returns the edits after `revision` in chronological order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::RevisionHistoryUnavailable`] when the requested revision is absent.
     pub fn deltas_since(&self, revision: Revision) -> Result<Vec<RevisionDelta>, BufferError> {
         if revision == self.revision {
             return Ok(Vec::new());

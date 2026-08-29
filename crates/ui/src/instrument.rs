@@ -1,3 +1,8 @@
+#![allow(
+    clippy::struct_excessive_bools,
+    reason = "independent instrumentation switches map directly to environment configuration"
+)]
+
 //! Measurement/instrumentation scaffolding, compiled only under the
 //! `instrument` feature. Product builds contain none of this code, so the
 //! shipping binary carries no CSV output, synthetic input, or development

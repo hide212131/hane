@@ -1,3 +1,8 @@
+#![allow(
+    clippy::unreadable_literal,
+    reason = "ARGB literals intentionally retain their contiguous channel representation"
+)]
+
 use gpui::WindowAppearance;
 use hane_session::ThemePreference;
 

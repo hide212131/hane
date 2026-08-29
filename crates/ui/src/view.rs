@@ -1,3 +1,20 @@
+#![allow(
+    clippy::single_match_else,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_many_lines,
+    clippy::map_unwrap_or,
+    clippy::doc_markdown,
+    clippy::needless_pass_by_value,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::semicolon_if_nothing_returned,
+    clippy::unused_self,
+    reason = "GPUI view callbacks and pixel geometry require these local framework-bound conventions"
+)]
+
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -358,6 +375,11 @@ impl EditorView {
         }
     }
 
+    /// Opens `path` as the first editor session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the document or persisted state cannot be read.
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         let started = Instant::now();
@@ -385,6 +407,7 @@ impl EditorView {
         Ok(view)
     }
 
+    #[must_use]
     pub fn editor(&self) -> &Editor {
         self.sessions.active().editor()
     }
@@ -398,6 +421,7 @@ impl EditorView {
         self.sessions.sessions()
     }
 
+    #[must_use]
     pub fn active_session(&self) -> &DocumentSession {
         self.sessions.active()
     }
@@ -458,6 +482,7 @@ impl EditorView {
     /// Block that owns a physical source line, with the confidence the index has
     /// in it. `None` while no index is published yet, or for a line in a document
     /// that holds no Markdown block at all.
+    #[must_use]
     pub fn block_at_line(&self, line: usize) -> Option<IndexedBlock> {
         block_at_line(self.block_index.index()?, self.editor().document(), line)
     }
@@ -1637,6 +1662,11 @@ impl EditorView {
     }
 
     #[cfg(feature = "instrument")]
+    /// Moves the cursor for an instrumentation run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError`] when `offset` is not a valid source boundary.
     pub fn set_cursor_offset_for_measurement(
         &mut self,
         offset: usize,
@@ -1651,6 +1681,11 @@ impl EditorView {
     }
 
     #[cfg(feature = "instrument")]
+    /// Moves the cursor down for an instrumentation run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError`] when an editor command cannot be applied.
     pub fn move_cursor_down_for_development(
         &mut self,
         count: usize,
