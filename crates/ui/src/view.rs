@@ -852,11 +852,11 @@ impl EditorView {
                             .set_view_state(SessionViewState { scroll_y });
                     }
                     self.sessions.apply_open(into, loaded);
+                    self.remember_recent(path);
+                    cx.add_recent_document(path);
                     if is_latest_request {
                         self.on_document_replaced();
                         self.status = Some("Opened".to_owned());
-                        self.remember_recent(path);
-                        cx.add_recent_document(path);
                         self.schedule_document_parse(cx);
                     } else {
                         // The session now holds the loaded document and is
