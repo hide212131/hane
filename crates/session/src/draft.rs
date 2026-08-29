@@ -36,7 +36,7 @@ impl DraftId {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos() as u64);
         let sequence = DRAFT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        Self(nanos.wrapping_add(sequence))
+        Self(nanos ^ sequence)
     }
 
     fn file_name(self) -> String {

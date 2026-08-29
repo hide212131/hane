@@ -2322,16 +2322,15 @@ impl EditorView {
                         view.open_work_folder_entry(&path, cx);
                     }))
             });
-        let drafts = self
-            .work_folder_drafts
-            .keys()
-            .copied()
+        let mut draft_ids: Vec<SessionId> = self.work_folder_drafts.keys().copied().collect();
+        draft_ids.sort_by_key(|id| id.0);
+        let drafts = draft_ids
+            .into_iter()
             .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
-            .enumerate()
-            .map(|(index, (id, session))| {
+            .map(|(id, session)| {
                 let is_active = active_id == id;
                 div()
-                    .id(("work-folder-draft", index))
+                    .id(("work-folder-draft", id.0 as usize))
                     .px_2()
                     .py_1()
                     .rounded_sm()
