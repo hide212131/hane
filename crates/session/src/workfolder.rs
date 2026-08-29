@@ -117,12 +117,24 @@ fn walk(dir: &Path, entries: &mut Vec<WorkFolderEntry>) -> io::Result<()> {
         let path = item.path();
         let file_type = item.file_type()?;
         if file_type.is_dir() {
+            // `.hane` is where Hane keeps its own state for this work folder
+            // (the unnamed-note recovery journal, for instance): never a
+            // directory of the user's own notes.
+            if is_hidden(&path) {
+                continue;
+            }
             walk(&path, entries)?;
         } else if file_type.is_file() && is_markdown(&path) {
             entries.push(WorkFolderEntry::new(path));
         }
     }
     Ok(())
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -168,6 +180,23 @@ mod tests {
                 .entry_for_path(&root.join("nested/TODO.md"))
                 .is_some()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hidden_directories_such_as_the_recovery_journal_are_not_scanned() {
+        let root = temporary_directory("workfolder-hidden");
+        fs::create_dir_all(root.join(".hane/drafts")).unwrap();
+        fs::write(root.join("Meeting.md"), "# Meeting\n").unwrap();
+        fs::write(root.join(".hane/drafts/0000000000000001.md"), "draft\n").unwrap();
+
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let names: Vec<&str> = work_folder
+            .entries()
+            .iter()
+            .map(WorkFolderEntry::name)
+            .collect();
+        assert_eq!(names, ["Meeting"]);
         fs::remove_dir_all(root).unwrap();
     }
 

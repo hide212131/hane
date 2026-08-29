@@ -28,6 +28,7 @@
 //! `PathBuf`, never writes a file, and never reaches for the process working
 //! directory.
 
+mod draft;
 mod identity;
 mod resource;
 mod service;
@@ -36,6 +37,7 @@ mod store;
 pub mod testing;
 mod workfolder;
 
+pub use draft::{DraftId, DraftStore, OsDraftStore, RecoveredDraft};
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
 pub use resource::ResourceResolver;
 pub use service::{
