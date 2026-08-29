@@ -122,8 +122,16 @@ impl DraftStore for OsDraftStore {
         };
         let mut drafts = Vec::new();
         for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            // One unreadable entry (a permission error on a single file, a
+            // race with another process removing it) must not sacrifice
+            // every other draft in the directory: skip it and keep going,
+            // rather than letting `?` here abort the whole recovery and lose
+            // drafts that were perfectly readable.
+            let Ok(entry) = entry else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
                 continue;
             }
             let path = entry.path();
@@ -135,7 +143,9 @@ impl DraftStore for OsDraftStore {
                 // user dropped in here by hand: not a draft, skip it.
                 continue;
             };
-            let text = fs::read_to_string(&path)?;
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
             drafts.push(RecoveredDraft { id, text });
         }
         Ok(drafts)
@@ -224,5 +234,40 @@ mod tests {
         let a = DraftId::generate();
         let b = DraftId::generate();
         assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_that_fails_to_read_is_skipped_without_losing_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("draft-partial-failure");
+        fs::create_dir_all(&root).unwrap();
+        let readable = DraftId::generate();
+        OsDraftStore.write(&root, readable, "keep me").unwrap();
+        let unreadable = DraftId(readable.0.wrapping_add(1));
+        let unreadable_path = drafts_dir(&root).join(unreadable.file_name());
+        fs::write(&unreadable_path, "lost to a permission error").unwrap();
+        fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root ignores permission bits entirely; skip the
+        // assertion in that case rather than asserting on a premise that
+        // does not hold, but still exercise `recover` so the test is not a
+        // silent no-op under a normal, non-root run.
+        let permission_actually_blocks_reads = fs::read_to_string(&unreadable_path).is_err();
+        let recovered = OsDraftStore.recover(&root);
+
+        // Restore permissions before any assertion can fail the test early,
+        // so cleanup always succeeds.
+        fs::set_permissions(&unreadable_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        if permission_actually_blocks_reads {
+            let recovered = recovered.unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].id, readable);
+            assert_eq!(recovered[0].text, "keep me");
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

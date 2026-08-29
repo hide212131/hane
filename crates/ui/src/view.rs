@@ -488,13 +488,25 @@ impl EditorView {
                 // to the first real note below can still reuse it.
                 let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
-                self.status = None;
 
+                // A recovery failure must not look like the drafts were
+                // simply gone: `OsDraftStore::recover` already keeps
+                // whatever individual files it could read, so surface the
+                // error instead of silently falling back to an empty list
+                // and clearing status as if nothing happened.
                 let mut last_recovered = None;
-                for draft in drafts.unwrap_or_default() {
-                    let id = self.sessions.open_untitled(&draft.text, "Untitled");
-                    self.work_folder_drafts.insert(id, draft.id);
-                    last_recovered = Some(id);
+                match drafts {
+                    Ok(drafts) => {
+                        self.status = None;
+                        for draft in drafts {
+                            let id = self.sessions.open_untitled(&draft.text, "Untitled");
+                            self.work_folder_drafts.insert(id, draft.id);
+                            last_recovered = Some(id);
+                        }
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("Could not recover unsaved drafts: {error}"));
+                    }
                 }
 
                 if let Some(path) = first {
@@ -649,6 +661,12 @@ impl EditorView {
     /// is an unnamed note in the current work folder. Kept separate from
     /// `schedule_autosave` because an unnamed note has no path to write to
     /// yet and must not wait for one to earn crash safety.
+    ///
+    /// The scheduled save targets the session it was armed for by id, not
+    /// whichever session is active when the timer fires: switching to
+    /// another note within the debounce window must not cancel the write, or
+    /// edits made just before switching away are lost on a crash until the
+    /// draft is revisited and edited again.
     fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
         let Some(&draft_id) = self.work_folder_drafts.get(&id) else {
@@ -667,10 +685,10 @@ impl EditorView {
             gpui::Timer::after(Duration::from_millis(750)).await;
             let text = view
                 .read_with(cx, |view, _| {
-                    let current = view.sessions.active_id() == id
-                        && view.sessions.active().revision() == revision
-                        && view.work_folder_drafts.contains_key(&id);
-                    current.then(|| view.sessions.active().editor().document().full_text())
+                    let session = view.sessions.get(id)?;
+                    let current =
+                        session.revision() == revision && view.work_folder_drafts.contains_key(&id);
+                    current.then(|| session.editor().document().full_text())
                 })
                 .ok()
                 .flatten();
@@ -2905,5 +2923,102 @@ mod tests {
         assert!(blocks.range_eq(0..flat.len(), &flat));
         assert_eq!(blocks.get(126), flat.get(126).copied());
         assert_eq!(blocks.get(130), flat.get(130).copied());
+    }
+
+    fn draft_test_root(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "hane-draft-save-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    // Regression test for the P1 review finding on `schedule_draft_save`:
+    // switching to another note within the 750ms debounce window used to
+    // cancel the pending write outright, because the timer only saved when
+    // its own session was still the active one. Typing into an unnamed note
+    // and switching away before the timer fires must still journal what was
+    // typed.
+    #[gpui::test]
+    fn draft_save_survives_switching_sessions_within_the_debounce_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("switch");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Start the first unnamed note and type into it.
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("today I thought about this design")
+                .unwrap();
+            view.after_input(cx);
+            // Switch away to a second unnamed note before the debounce timer
+            // for the first one fires.
+            view.new_work_folder_note(cx);
+        });
+
+        // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
+        // not the deterministic test dispatcher), so the test has to wait for
+        // real time to pass rather than fast-forwarding a virtual clock. The
+        // spawned task must run once first to reach its `Timer::after` await
+        // and register with the real clock before that wait is worth doing.
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(900));
+        cx.run_until_parked();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].text, "today I thought about this design");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the P2 review finding on `finish_work_folder_scan`:
+    // a `DraftStore::recover` failure used to be swallowed via
+    // `drafts.unwrap_or_default()`, leaving `status` at `None` exactly as if
+    // there had simply been no drafts to recover. The error must be visible.
+    #[gpui::test]
+    fn a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("recovery-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+        });
+
+        let status = view.read_with(cx, |view, _| view.status.clone());
+        assert!(
+            status.is_some_and(|status| status.contains("recover")),
+            "expected the drafts-recovery error to be surfaced in status"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
