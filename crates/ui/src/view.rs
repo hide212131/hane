@@ -845,25 +845,37 @@ impl EditorView {
                     // take over what is on screen.
                     let is_latest_request = self.latest_open_target.as_deref() == Some(path);
                     let previously_active = self.sessions.active_id();
-                    if is_latest_request {
-                        let scroll_y = self.scroll_y;
-                        self.sessions
-                            .active_mut()
-                            .set_view_state(SessionViewState { scroll_y });
-                    }
-                    self.sessions.apply_open(into, loaded);
-                    self.remember_recent(path);
-                    cx.add_recent_document(path);
-                    if is_latest_request {
-                        self.on_document_replaced();
-                        self.status = Some("Opened".to_owned());
-                        self.schedule_document_parse(cx);
+                    // `ReuseActive` always targets whatever session was active
+                    // when the request was made, so a stale completion here
+                    // can name the very session a newer, already-applied
+                    // completion put on screen. Overwriting it would corrupt
+                    // what the user is now looking at with no way back, so a
+                    // stale result that targets the current active session is
+                    // discarded instead of applied.
+                    if !is_latest_request && into == Some(previously_active) {
+                        self.status =
+                            Some("A newer document is open; this load was discarded".to_owned());
                     } else {
-                        // The session now holds the loaded document and is
-                        // ready to be reused instantly next time it is
-                        // selected, but it must not visibly replace whatever
-                        // the user has since switched to.
-                        self.sessions.activate(previously_active);
+                        if is_latest_request {
+                            let scroll_y = self.scroll_y;
+                            self.sessions
+                                .active_mut()
+                                .set_view_state(SessionViewState { scroll_y });
+                        }
+                        self.sessions.apply_open(into, loaded);
+                        self.remember_recent(path);
+                        cx.add_recent_document(path);
+                        if is_latest_request {
+                            self.on_document_replaced();
+                            self.status = Some("Opened".to_owned());
+                            self.schedule_document_parse(cx);
+                        } else {
+                            // The session now holds the loaded document and is
+                            // ready to be reused instantly next time it is
+                            // selected, but it must not visibly replace
+                            // whatever the user has since switched to.
+                            self.sessions.activate(previously_active);
+                        }
                     }
                 }
             }
