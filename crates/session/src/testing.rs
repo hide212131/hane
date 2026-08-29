@@ -2,6 +2,7 @@
 
 use crate::identity::{FileIdentity, FileStamp};
 use crate::service::{FileService, LoadedFile, SavedFile};
+use crate::workfolder::{WorkFolder, WorkFolderScanner};
 use hane_document::RopeBuffer;
 use std::collections::HashMap;
 use std::io;
@@ -101,4 +102,44 @@ impl FileService for MemoryFileService {
 
 fn canonical(path: &Path) -> PathBuf {
     FileIdentity::lexical(path).canonical_path().to_path_buf()
+}
+
+/// A work folder that lives in a map, keyed by root. Lets tests exercise
+/// sidebar/discovery logic without touching the real filesystem.
+#[derive(Debug, Default)]
+pub struct MemoryWorkFolderScanner {
+    roots: Mutex<HashMap<PathBuf, Vec<PathBuf>>>,
+}
+
+impl MemoryWorkFolderScanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seeds a work folder with the given Markdown paths, as if they already
+    /// existed on disk when the folder was opened. Registering a root with no
+    /// paths models an empty directory.
+    pub fn seed(&self, root: impl Into<PathBuf>, paths: impl IntoIterator<Item = PathBuf>) {
+        self.roots
+            .lock()
+            .expect("roots lock")
+            .insert(root.into(), paths.into_iter().collect());
+    }
+}
+
+impl WorkFolderScanner for MemoryWorkFolderScanner {
+    fn scan(&self, root: &Path) -> io::Result<WorkFolder> {
+        let roots = self.roots.lock().expect("roots lock");
+        let paths = roots
+            .get(root)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such work folder"))?;
+        Ok(WorkFolder::new(
+            root.to_path_buf(),
+            paths
+                .iter()
+                .cloned()
+                .map(crate::workfolder::WorkFolderEntry::new)
+                .collect(),
+        ))
+    }
 }

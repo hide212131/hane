@@ -34,6 +34,7 @@ mod service;
 mod session;
 mod store;
 pub mod testing;
+mod workfolder;
 
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
 pub use resource::ResourceResolver;
@@ -49,3 +50,4 @@ pub use store::{
     FileStateStore, MemoryStateStore, RecentFiles, RecentFilesRepository, Settings,
     SettingsRepository, StateStores, ThemePreference,
 };
+pub use workfolder::{OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderScanner};
