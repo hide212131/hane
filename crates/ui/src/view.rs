@@ -42,10 +42,10 @@ use hane_presentation::{
     block_heights, block_line_span, layout_block,
 };
 use hane_session::{
-    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService,
-    OsWorkFolderScanner, RecentFiles, SaveDecision, SaveFailure, SaveIntent, SaveOutcome,
-    SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores,
-    WorkFolder, WorkFolderScanner, run_save_job,
+    DocumentSession, DraftId, DraftStore, FileService, LoadedFile, OpenDecision, OpenPolicy,
+    OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDraft, SaveDecision,
+    SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet,
+    SessionViewState, Settings, StateStores, WorkFolder, WorkFolderScanner, run_save_job,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -110,6 +110,11 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Where a not-yet-named work-folder note's content is journalled, so a
+    /// crash before it earns a real filename never loses it. Removed once the
+    /// session it belongs to gets a real path or closes.
+    draft_store: Arc<dyn DraftStore>,
+    work_folder_drafts: HashMap<SessionId, DraftId>,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -370,6 +375,8 @@ impl EditorView {
             settings,
             recent,
             work_folder: None,
+            draft_store: Arc::new(OsDraftStore),
+            work_folder_drafts: HashMap::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
             focus_handle: cx.focus_handle(),
@@ -440,10 +447,16 @@ impl EditorView {
 
     fn begin_work_folder_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.status = Some("Opening work folder…".to_owned());
+        let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
+            let scan_root = root.clone();
             let scanned = cx
                 .background_executor()
-                .spawn(async move { OsWorkFolderScanner.scan(&root) })
+                .spawn(async move {
+                    let work_folder = OsWorkFolderScanner.scan(&scan_root);
+                    let drafts = draft_store.recover(&scan_root);
+                    (work_folder, drafts)
+                })
                 .await;
             let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
         })
@@ -453,10 +466,14 @@ impl EditorView {
 
     fn finish_work_folder_scan(
         &mut self,
-        scanned: std::io::Result<WorkFolder>,
+        scanned: (
+            std::io::Result<WorkFolder>,
+            std::io::Result<Vec<RecoveredDraft>>,
+        ),
         cx: &mut Context<Self>,
     ) {
-        match scanned {
+        let (work_folder, drafts) = scanned;
+        match work_folder {
             Err(error) => {
                 self.status = Some(format!("Could not open work folder: {error}"));
             }
@@ -465,14 +482,32 @@ impl EditorView {
                     .entries()
                     .first()
                     .map(|entry| entry.path().to_path_buf());
+                // The window still holds the empty untitled session `new`
+                // created above; it stays clean and in place while any
+                // recovered drafts are installed alongside it, so switching
+                // to the first real note below can still reuse it.
+                let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
                 self.status = None;
+
+                let mut last_recovered = None;
+                for draft in drafts.unwrap_or_default() {
+                    let id = self.sessions.open_untitled(&draft.text, "Untitled");
+                    self.work_folder_drafts.insert(id, draft.id);
+                    last_recovered = Some(id);
+                }
+
                 if let Some(path) = first {
-                    // The window still holds the empty untitled session `new`
-                    // created and it is clean, so this replaces it in place
-                    // through the same background-loading path as any other
-                    // open, instead of leaving a spare empty session around.
+                    // Opening the first entry replaces whichever session is
+                    // active through the same background-loading path as any
+                    // other open, instead of leaving a spare empty session
+                    // around; that must be the original clean one, not
+                    // whichever draft was installed last.
+                    self.sessions.activate(initial_session);
                     self.open_path(&path, cx);
+                } else if last_recovered.is_some() {
+                    self.on_document_replaced();
+                    self.schedule_document_parse(cx);
                 }
             }
         }
@@ -576,6 +611,7 @@ impl EditorView {
         self.scroll_cursor_into_view();
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
+        self.schedule_draft_save(cx);
         cx.notify();
     }
 
@@ -606,6 +642,89 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    /// Journals the active session's text into the recovery drafts on the
+    /// same debounce cadence as autosave: a no-op unless the active session
+    /// is an unnamed note in the current work folder. Kept separate from
+    /// `schedule_autosave` because an unnamed note has no path to write to
+    /// yet and must not wait for one to earn crash safety.
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        let id = self.sessions.active_id();
+        let Some(&draft_id) = self.work_folder_drafts.get(&id) else {
+            return;
+        };
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let revision = self.sessions.active().revision();
+        let draft_store = self.draft_store.clone();
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(750)).await;
+            let text = view
+                .read_with(cx, |view, _| {
+                    let current = view.sessions.active_id() == id
+                        && view.sessions.active().revision() == revision
+                        && view.work_folder_drafts.contains_key(&id);
+                    current.then(|| view.sessions.active().editor().document().full_text())
+                })
+                .ok()
+                .flatten();
+            if let Some(text) = text {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Issue #5: starts a brand-new, unnamed note in the current work folder.
+    /// No filename prompt: it opens blank and ready for input immediately,
+    /// and is journalled into the recovery drafts as soon as it holds
+    /// anything, so a crash before it earns a real name never loses it.
+    pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
+        if self.work_folder.is_none() {
+            return;
+        }
+        let scroll_y = self.scroll_y;
+        self.sessions
+            .active_mut()
+            .set_view_state(SessionViewState { scroll_y });
+        let id = self.sessions.open_untitled("", "Untitled");
+        self.work_folder_drafts.insert(id, DraftId::generate());
+        self.on_document_replaced();
+        self.schedule_document_parse(cx);
+        self.status = None;
+        cx.notify();
+    }
+
+    /// A note stops being a draft once it earns a real path, whether through
+    /// the (future) H1-derived rename or a manual Save As. The recovery
+    /// journal entry is removed on a background thread; a failure here just
+    /// leaves a harmless leftover file, never lost content.
+    fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(draft_id) = self.work_folder_drafts.remove(&id) else {
+            return;
+        };
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let draft_store = self.draft_store.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = draft_store.remove(&root, draft_id);
+            })
+            .detach();
     }
 
     pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
@@ -683,12 +802,14 @@ impl EditorView {
                 self.status = Some("Saved".to_owned());
                 self.remember_recent(path);
                 cx.add_recent_document(path);
+                self.retire_work_folder_draft(id, cx);
             }
             SaveOutcome::SavedStale => {
                 self.status = Some("Saved snapshot; newer edits pending".to_owned());
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.schedule_autosave(cx);
+                self.retire_work_folder_draft(id, cx);
             }
             SaveOutcome::Conflict => {
                 self.status = Some(
@@ -2162,9 +2283,24 @@ impl EditorView {
     /// The Markdown list for the sidebar, when this window was opened onto a
     /// work folder. Every entry switches into it on click, reusing an
     /// already-open session or loading it lazily; nothing here reads a file.
+    /// A `+` above the list starts a brand-new unnamed note, and any unnamed
+    /// note already open (freshly created, or recovered from a crash) is
+    /// listed below the named ones so it stays reachable while it has no
+    /// file of its own yet.
     fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         let work_folder = self.work_folder.as_ref()?;
+        let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
+        let new_note_button = div()
+            .id("work-folder-new-note")
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
+            .child("+")
+            .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx)));
         let entries = work_folder
             .entries()
             .iter()
@@ -2186,6 +2322,28 @@ impl EditorView {
                         view.open_work_folder_entry(&path, cx);
                     }))
             });
+        let drafts = self
+            .work_folder_drafts
+            .keys()
+            .copied()
+            .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
+            .enumerate()
+            .map(|(index, (id, session))| {
+                let is_active = active_id == id;
+                div()
+                    .id(("work-folder-draft", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_active, |element| {
+                        element.bg(rgb(self.theme.sidebar_active_background))
+                    })
+                    .child(draft_preview(session))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate_session(id, cx);
+                    }))
+            });
         Some(
             div()
                 .id("work-folder-sidebar")
@@ -2199,8 +2357,22 @@ impl EditorView {
                 .p_2()
                 .bg(rgb(self.theme.sidebar_background))
                 .text_color(rgb(self.theme.sidebar_foreground))
-                .children(entries),
+                .child(new_note_button)
+                .children(entries)
+                .children(drafts),
         )
+    }
+}
+
+/// A short label for an unnamed note in the sidebar: its first non-blank
+/// line (an H1 marker stripped, since that will become its title), or a
+/// placeholder for a note that is still completely empty.
+fn draft_preview(session: &DocumentSession) -> String {
+    let text = session.editor().document().full_text();
+    let first_line = text.lines().map(str::trim).find(|line| !line.is_empty());
+    match first_line {
+        Some(line) => line.trim_start_matches('#').trim().to_owned(),
+        None => "Untitled note".to_owned(),
     }
 }
 

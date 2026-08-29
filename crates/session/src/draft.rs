@@ -44,7 +44,9 @@ impl DraftId {
     }
 
     fn from_file_name(name: &str) -> Option<Self> {
-        u64::from_str_radix(name.strip_suffix(".md")?, 16).ok().map(Self)
+        u64::from_str_radix(name.strip_suffix(".md")?, 16)
+            .ok()
+            .map(Self)
     }
 }
 
@@ -158,7 +160,9 @@ mod tests {
         let root = temporary_directory("draft-roundtrip");
         fs::create_dir_all(&root).unwrap();
         let id = DraftId::generate();
-        OsDraftStore.write(&root, id, "today I thought about this design").unwrap();
+        OsDraftStore
+            .write(&root, id, "today I thought about this design")
+            .unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.len(), 1);
