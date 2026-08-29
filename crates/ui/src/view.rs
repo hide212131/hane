@@ -2042,6 +2042,24 @@ impl EditorView {
     }
 }
 
+/// The header's status line, combining a persistent `draft_recovery_warning`
+/// with whatever transient `status` is current. Neither may swallow the
+/// other: the warning has to survive `open_path` cycling `status` through
+/// "Opening…"/"Opened" right after the scan that raised it, but a later
+/// status the user needs for data safety (a save failure, a conflict) must
+/// stay visible too, since this view only re-scans a work folder once at
+/// startup and an unconditional priority for the warning would otherwise
+/// hide every status for the rest of the session. `None` when neither is
+/// set, so the caller can fall back to its own default line.
+fn header_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
+    match (warning, status) {
+        (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
+        (Some(warning), None) => Some(warning.to_owned()),
+        (None, Some(status)) => Some(status.to_owned()),
+        (None, None) => None,
+    }
+}
+
 #[cfg(not(any(feature = "instrument", feature = "timing-probe")))]
 impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
@@ -2225,14 +2243,12 @@ impl Render for EditorView {
         } else {
             ""
         };
-        // A draft-recovery warning outranks every other status line: it
-        // reports unsaved content that might otherwise be lost, so it must
-        // stay visible through whatever transient "Opening…"/"Opened"
-        // messages the rest of the window is cycling through.
-        let status = self.draft_recovery_warning.clone().unwrap_or_else(|| {
-            self.status.clone().unwrap_or_else(|| {
-                format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
-            })
+        let status = header_status_line(
+            self.draft_recovery_warning.as_deref(),
+            self.status.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
         });
 
         let root = div()
@@ -3145,6 +3161,84 @@ mod tests {
                     .is_some_and(|warning| warning.contains("recover")),
                 "expected the recovery warning to survive the first note's open completing, got {:?}",
                 view.draft_recovery_warning
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn header_status_line_combines_warning_and_status_without_dropping_either() {
+        assert_eq!(header_status_line(None, None), None);
+        assert_eq!(
+            header_status_line(Some("2 drafts could not be recovered"), None),
+            Some("2 drafts could not be recovered".to_owned())
+        );
+        assert_eq!(
+            header_status_line(None, Some("Opened")),
+            Some("Opened".to_owned())
+        );
+        // Regression for the P1 review finding: an unconditional priority for
+        // the warning would permanently hide a later, safety-relevant status
+        // (a save failure, a conflict) once a work folder has raised a
+        // recovery warning, since this view only re-scans a work folder once
+        // at startup. Both must show.
+        assert_eq!(
+            header_status_line(
+                Some("2 drafts could not be recovered"),
+                Some("Save failed: disk full")
+            ),
+            Some("2 drafts could not be recovered · Save failed: disk full".to_owned())
+        );
+    }
+
+    // Regression test for the P1 review finding on the header status line: a
+    // save failure that happens after a draft-recovery warning was raised
+    // must still reach the user, not be hidden behind the warning for the
+    // rest of the session.
+    #[gpui::test]
+    fn a_save_failure_after_a_draft_recovery_warning_is_still_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("warning-then-save-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+            // A save failure arriving well after the recovery warning was
+            // raised (a later autosave, a manual save, a conflict) must not
+            // be swallowed by the warning that is still sitting in
+            // `draft_recovery_warning`.
+            view.status = Some("Save failed: disk full".to_owned());
+        });
+
+        view.read_with(cx, |view, _| {
+            let combined = header_status_line(
+                view.draft_recovery_warning.as_deref(),
+                view.status.as_deref(),
+            );
+            assert!(
+                combined
+                    .as_deref()
+                    .is_some_and(|line| line.contains("Save failed")),
+                "expected the save failure to still be visible, got {combined:?}"
+            );
+            assert!(
+                combined
+                    .as_deref()
+                    .is_some_and(|line| line.contains("recover")),
+                "expected the recovery warning to still be visible too, got {combined:?}"
             );
         });
 
