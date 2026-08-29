@@ -111,7 +111,7 @@ BlockIndex導入に伴い、metrics CSVへ `block_index` record と3列を追加
 | `reparsed_bytes` | その更新が再解析したbyte数 |
 | `invalidated_blocks` | 再同期できず暫定扱いへ落としたblock数 |
 
-`scripts/aggregate_phase0_metrics.py` はこの3列を他の指標と同じ分布表に出力する。
+`scripts/aggregate_metrics.py` はこの3列を他の指標と同じ分布表に出力する。
 R0基準線には該当値がないため、R3.5の測定値が以降の比較原本になる。
 
 ### R4Aで追加した指標
@@ -141,3 +141,17 @@ median 0.002 ms / p95 0.003 ms / p99 0.004 ms。全体構築も p95 0.177 msだ�
 最終 instrument build の 100 MB ASCII 入力（各30 samples）は独立2回で p95/p99
 3.55/4.41 ms、4.58/4.60 ms。100 MB 改行入力10 samples は 1.97/1.97 msで、R0 の入力基準と
 16/33 ms絶対gateを通過した。
+
+### R2 instrument 比較
+
+`timing-probe`（CSV観測のみ）と `instrument`（CSV・合成入力・開発操作を含む）を、同じ外部入力で
+各30 samples、実行順を反転して2回測定した。`keystroke_to_frame_ms` の差は次のとおり。
+
+| ケース | 1回目 p95 / p99差 | 2回目 p95 / p99差 |
+|---|---:|---:|
+| normal ASCII | +17.1% / +85.3% | -36.8% / +9.8% |
+| 100 MB input at start | +14.3% / +341.8% | -1.4% / +2.9% |
+
+1回目の外れ値は順序を反転した2回目で再現しなかった。R0の「同条件で2回連続して15%超なら回帰」規則を
+満たさないため、instrument化による回帰はなしと判定する。raw CSVと集計結果は
+`target/r2/{timing-probe,instrument}-{1,2}/` に保存した。

@@ -6,7 +6,8 @@ license.workspace = true
 
 [features]
 default = []
-instrument = []
+timing-probe = []
+instrument = ["timing-probe"]
 
 [dependencies]
 hane-document.workspace = true

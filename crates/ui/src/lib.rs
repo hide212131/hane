@@ -3,7 +3,7 @@
 mod actions;
 mod capture;
 mod input;
-#[cfg(feature = "instrument")]
+#[cfg(any(feature = "instrument", feature = "timing-probe"))]
 mod instrument;
 mod line;
 mod shape;

@@ -27,7 +27,7 @@ Phase 2はこれまでと同じく、設計判断、実装、単体テスト、�
 7. blockの推定高さを`HeightIndex`へ反映し、見出し等の可変高さでも仮想scrollとcursor追従を維持する。
 8. Unicode、nested inline、source identity、編集後cache invalidation、選択、IMEを自動テストする。
 9. Phase 1と同じ測定条件で入力、scroll、startup、RSSを再測定する。
-10. `docs/phase2/report.md`に結果、Pass/Fail、Phase 3判断を記録する。
+10. `docs/history/phase2/report.md`に結果、Pass/Fail、Phase 3判断を記録する。
 
 ## Phase 2での非目標
 

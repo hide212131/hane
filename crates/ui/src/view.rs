@@ -1,6 +1,6 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
-#[cfg(feature = "instrument")]
+#[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
 use crate::shape::WindowShaper;
@@ -90,7 +90,7 @@ pub struct EditorView {
     pub(crate) metrics: FrameMetrics,
     status: Option<String>,
     theme: Theme,
-    #[cfg(feature = "instrument")]
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
     pub(crate) instrumentation: Instrumentation,
     background_presentation_generation: u64,
     /// Presented blocks, keyed by the index's stable block id so an entry
@@ -342,7 +342,7 @@ impl EditorView {
             metrics: FrameMetrics::new(METRICS_CAPACITY),
             status: None,
             theme,
-            #[cfg(feature = "instrument")]
+            #[cfg(any(feature = "instrument", feature = "timing-probe"))]
             instrumentation: Instrumentation::from_environment(),
             background_presentation_generation: 0,
             block_cache: HashMap::new(),
@@ -359,13 +359,13 @@ impl EditorView {
     }
 
     pub fn open(path: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
-        #[cfg(feature = "instrument")]
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         let started = Instant::now();
         let files: Arc<dyn FileService> = Arc::new(OsFileService);
         // The first document is read before the window exists, so this one read
         // is synchronous by construction; every later one goes to a thread.
         let loaded = files.load(path)?;
-        #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
+        #[cfg_attr(not(any(feature = "instrument", feature = "timing-probe")), allow(unused_mut))]
         let mut view = Self::from_sessions(
             SessionSet::with_loaded(loaded),
             files,
@@ -374,7 +374,7 @@ impl EditorView {
         );
         view.remember_recent(path);
         cx.add_recent_document(path);
-        #[cfg(feature = "instrument")]
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         {
             view.instrumentation.file_open_time = started.elapsed();
             view.instrumentation.load_rss_bytes = hane_metrics::process_memory_bytes();
@@ -1463,13 +1463,13 @@ impl EditorView {
                 block.revision,
             )
         {
-            #[cfg(feature = "instrument")]
+            #[cfg(any(feature = "instrument", feature = "timing-probe"))]
             {
                 self.instrumentation.layout_cache_hits += 1;
             }
             return cached.layout.clone();
         }
-        #[cfg(feature = "instrument")]
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         {
             self.instrumentation.layout_cache_misses += 1;
         }
@@ -1575,13 +1575,14 @@ impl Focusable for EditorView {
     }
 }
 
-#[cfg(feature = "instrument")]
+#[cfg(any(feature = "instrument", feature = "timing-probe"))]
 impl EditorView {
     pub fn arm_startup_timing(&mut self, process_started: Instant) {
         self.instrumentation.process_started = process_started;
         self.instrumentation.ready_armed = true;
     }
 
+    #[cfg(feature = "instrument")]
     pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>) {
         if let Some(output) = &mut self.instrumentation.metrics_output
             && let Err(error) = output.memory("memory_idle_30s", rss_bytes)
@@ -1590,6 +1591,7 @@ impl EditorView {
         }
     }
 
+    #[cfg(feature = "instrument")]
     pub fn apply_phase0_background_presentation(
         &mut self,
         generation: u64,
@@ -1599,10 +1601,12 @@ impl EditorView {
         cx.notify();
     }
 
+    #[cfg(feature = "instrument")]
     pub fn enable_display_linked_scroll_measurement(&mut self) {
         self.instrumentation.display_linked_scroll_direction = Some(1.0);
     }
 
+    #[cfg(feature = "instrument")]
     fn apply_phase1_scroll_frame(&mut self) {
         let direction = self
             .instrumentation
@@ -1622,6 +1626,7 @@ impl EditorView {
     }
 
     pub(crate) fn step_measurement_scroll(&mut self, window: &mut Window) {
+        #[cfg(feature = "instrument")]
         if self
             .instrumentation
             .display_linked_scroll_direction
@@ -1630,8 +1635,11 @@ impl EditorView {
             self.apply_phase1_scroll_frame();
             window.request_animation_frame();
         }
+        #[cfg(not(feature = "instrument"))]
+        let _ = window;
     }
 
+    #[cfg(feature = "instrument")]
     pub fn set_cursor_offset_for_measurement(
         &mut self,
         offset: usize,
@@ -1645,6 +1653,7 @@ impl EditorView {
         Ok(())
     }
 
+    #[cfg(feature = "instrument")]
     pub fn move_cursor_down_for_development(
         &mut self,
         count: usize,
@@ -1714,7 +1723,7 @@ impl EditorView {
     }
 }
 
-#[cfg(not(feature = "instrument"))]
+#[cfg(not(any(feature = "instrument", feature = "timing-probe")))]
 impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
 

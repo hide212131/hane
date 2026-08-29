@@ -93,7 +93,7 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 
 - [x] `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` が緑であることを確認・記録。
       結果と実行環境は `docs/baseline/README.md` に保存。
-- [x] 現行の性能数値（1/10/100 MB, 10万段落）を `measure_phase*` で採取し
+- [x] 現行の性能数値（1/10/100 MB, 10万段落）を当時の `measure_phase*` で採取し
       `docs/refactor-plan.md` の付録か `docs/baseline/` に固定保存（回帰比較の原本）。
 - [x] 10万段落 fixture を UI 性能シナリオへ追加し、先頭・中央・末尾での入力、
       スクロール、入力しながらのスクロールを採取する。
@@ -167,9 +167,10 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
       app 側の合成入力ハーネスは `crates/app/src/instrument.rs` へ分離。既定 `cargo build -p hane`
       には CSV・合成入力・開発操作 API が含まれない（optional 依存 markdown/metrics/presentation/document
       も instrument 配下）。
-- [ ] `keystroke_to_paint` 等の低オーバーヘッド timing hook は製品と同じ入力・paint 経路に残す。
+- [x] `keystroke_to_paint` 等の低オーバーヘッド timing hook は製品と同じ入力・paint 経路に残す。
       instrument on/off の差を R0 基準線で測り、計測ビルドだけ別の挙動にならないことを確認する。
-      （コード上は `FrameMetrics` 記録を両ビルドの同一 paint 経路に維持済み。on/off の実測比較は未実施。）
+      `timing-probe`（CSV観測のみ）と `instrument`（合成入力等を含む）を同一入力で2回比較し、
+      一時的な15%超過は逆順の再測定で再現しなかったため、R0の判定規則により回帰なしとした。
 - [x] `HANE_*` 環境変数を1か所（`ui::instrument::InstrumentationConfig::from_environment`）で解釈するよう集約。
       `PHASE0/1/2_AUTOSCROLL` → `HANE_AUTOSCROLL`、`PHASE0_BACKGROUND_PRESENTATION` → `HANE_BACKGROUND_PRESENTATION`、
       `PHASE0_NO_FOCUS` → `HANE_NO_FOCUS` に統一。`scripts/` も追従（計測ビルドは `--features instrument`）。
@@ -177,9 +178,9 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
       オフライン集計/フィクスチャ=`benchmark` に線引きし、重複 `Distribution`/`percentile` を統合。
       `benchmark::Distribution` は `metrics::DurationDistribution` の type alias とし、percentile 計算は
       `metrics::duration_distribution` の1実装だけを使う。
-- [ ] **P1** スクリプトを引数化して統合：`scripts/measure.sh <scenario>` /
+- [x] **P1** スクリプトを引数化して統合：`scripts/measure.sh <scenario>` /
       `scripts/capture.sh <scenario>` の2本に集約し、`measure_phase*` / `capture_phase*` を廃止。
-- [ ] **P2** 歴史的ドキュメントを整理：`docs/phase*/report.md` と実装計画 ADR を
+- [x] **P2** 歴史的ドキュメントを整理：`docs/phase*/report.md` と実装計画 ADR を
       `docs/history/` へ移動し、`docs/adr/README.md` に「現行 vs 歴史」の索引を明記。
 
 **完了条件**: 既定 `cargo build -p hane` に合成入力・CSV・開発操作用 API が含まれない。
@@ -319,8 +320,8 @@ block 分割 median 5.4 µs / p95 6.4 µs、1編集あたりの再解析は 1 Ki
 **達成状況**: 要素生成は可視ブロック数（ブロック内では可視行数）に比例する。R0.5 を含む
 `cargo test --workspace` と `cargo clippy --workspace --all-targets -- -D warnings` は緑。
 `hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致（画面キャプチャ比較）。
-GUI の `keystroke_to_paint` / scroll interval の正式比較は、window が前面でない環境では
-OS 側の throttle に支配されるため未実施（R2 前半の残タスクと同じ枠で回収する）。
+GUI の `keystroke_to_paint` / scroll interval の master 比較は、window が前面でない環境では
+OS 側の throttle に支配されるため未実施。R2のinstrument比較とは別に、R4のGUI確認として残す。
 アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下だった。
 
 ## Phase R4B — Block → LayoutLine → Run レイアウト（P0・高リスク）

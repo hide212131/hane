@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 ///
 /// Both the UI (CSV output) and the app harness (synthetic input) read the
 /// same configuration, so variable names live in exactly one function.
+#[cfg_attr(feature = "timing-probe", allow(dead_code))]
 #[derive(Clone, Debug)]
 pub struct InstrumentationConfig {
     pub metrics_csv: Option<PathBuf>,
@@ -69,7 +70,8 @@ impl InstrumentationConfig {
     }
 }
 
-/// Runtime measurement state carried by `EditorView` only in instrument builds.
+/// Runtime measurement state carried by `EditorView` in timing-probe builds.
+#[cfg_attr(feature = "timing-probe", allow(dead_code))]
 pub(crate) struct Instrumentation {
     pub(crate) metrics_output: Option<Phase0MetricsOutput>,
     pub(crate) process_started: Instant,

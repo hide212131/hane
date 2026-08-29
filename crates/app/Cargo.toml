@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+timing-probe = ["hane-ui/timing-probe"]
 instrument = [
     "dep:hane-document",
     "dep:hane-markdown",

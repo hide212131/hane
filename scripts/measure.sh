@@ -3,12 +3,14 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 workspace_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-results_dir=${1:-"$workspace_dir/target/phase0/ui"}
+scenario=${1:?"usage: scripts/measure.sh <scenario> [results-dir]"}
+results_dir=${2:-"$workspace_dir/target/measure/$scenario"}
 binary="$workspace_dir/target/release/hane"
 fixtures="$workspace_dir/target/fixtures"
 helper="$script_dir/phase0_input.swift"
 warmup=${HANE_MEASUREMENT_WARMUP:-5}
 samples=${HANE_MEASUREMENT_SAMPLES:-30}
+measurement_feature=${HANE_MEASUREMENT_FEATURE:-instrument}
 refresh_rate=${HANE_REFRESH_RATE_HZ:-"variable (CGDisplayMode reports 0)"}
 original_input_source=$($helper current-source)
 ascii_source=${HANE_ASCII_INPUT_SOURCE:-com.apple.keylayout.ABC}
@@ -16,7 +18,14 @@ japanese_source=${HANE_JAPANESE_INPUT_SOURCE:-com.apple.inputmethod.Kotoeri.Roma
 
 mkdir -p "$results_dir"
 cargo run --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
-cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features instrument
+case "$measurement_feature" in
+    instrument|timing-probe) ;;
+    *)
+        echo "HANE_MEASUREMENT_FEATURE must be instrument or timing-probe" >&2
+        exit 2
+        ;;
+esac
+cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features "$measurement_feature"
 
 app_pid=""
 cleanup() {
@@ -166,26 +175,54 @@ while ! python3 -c 'import sys; stream=open(sys.argv[1],"rb"); stream.seek(int(s
     paragraphs_middle_offset=$((paragraphs_middle_offset - 1))
 done
 
-startup_series "empty warm startup" "$results_dir/startup_warm" false
-if /usr/sbin/purge >/dev/null 2>&1; then
-    startup_series "empty cold startup" "$results_dir/startup_cold" true
-else
-    startup_series "empty cold startup (OS cache not purged)" "$results_dir/startup_cold_unpurged" false
-fi
-input_scenario "normal ASCII input" normal_ascii ascii "$fixtures/japanese.md" 0
-input_scenario "real Japanese IME composition to commit" ime ime "$fixtures/japanese.md" 0
-input_scenario "100 MB input at start" hundred_start ascii "$fixtures/markdown_100mb.md" 0
-input_scenario "100 MB input at middle" hundred_middle ascii "$fixtures/markdown_100mb.md" "$middle_offset"
-input_scenario "100 MB input at end" hundred_end ascii "$fixtures/markdown_100mb.md" "$hundred_size"
-input_scenario "100 MB scroll only" scroll scroll "$fixtures/markdown_100mb.md" 0
-input_scenario "100 MB input while scrolling" scroll_input scroll-input "$fixtures/markdown_100mb.md" 0
-input_scenario "100k paragraphs input at start" paragraphs_start ascii "$fixtures/paragraphs_100k.md" 0
-input_scenario "100k paragraphs input at middle" paragraphs_middle ascii "$fixtures/paragraphs_100k.md" "$paragraphs_middle_offset"
-input_scenario "100k paragraphs input at end" paragraphs_end ascii "$fixtures/paragraphs_100k.md" "$paragraphs_size"
-input_scenario "100k paragraphs scroll only" paragraphs_scroll scroll "$fixtures/paragraphs_100k.md" 0
-input_scenario "100k paragraphs input while scrolling" paragraphs_scroll_input scroll-input "$fixtures/paragraphs_100k.md" 0
-input_scenario "input during background presentation update" background_input ascii "$fixtures/japanese.md" 0 1
-memory_scenario "memory 10 MB" memory_10mb "$fixtures/markdown_10mb.md"
-memory_scenario "memory 100 MB" memory_100mb "$fixtures/markdown_100mb.md"
+run_startup() {
+    startup_series "empty warm startup" "$results_dir/startup_warm" false
+    if /usr/sbin/purge >/dev/null 2>&1; then
+        startup_series "empty cold startup" "$results_dir/startup_cold" true
+    else
+        startup_series "empty cold startup (OS cache not purged)" "$results_dir/startup_cold_unpurged" false
+    fi
+}
 
-python3 "$script_dir/aggregate_phase0_metrics.py" "$results_dir" "$results_dir/results.md"
+run_input() {
+    input_scenario "normal ASCII input" normal_ascii ascii "$fixtures/japanese.md" 0
+    input_scenario "real Japanese IME composition to commit" ime ime "$fixtures/japanese.md" 0
+    input_scenario "100 MB input at start" hundred_start ascii "$fixtures/markdown_100mb.md" 0
+    input_scenario "100 MB input at middle" hundred_middle ascii "$fixtures/markdown_100mb.md" "$middle_offset"
+    input_scenario "100 MB input at end" hundred_end ascii "$fixtures/markdown_100mb.md" "$hundred_size"
+    input_scenario "100 MB scroll only" scroll scroll "$fixtures/markdown_100mb.md" 0
+    input_scenario "100 MB input while scrolling" scroll_input scroll-input "$fixtures/markdown_100mb.md" 0
+    input_scenario "100k paragraphs input at start" paragraphs_start ascii "$fixtures/paragraphs_100k.md" 0
+    input_scenario "100k paragraphs input at middle" paragraphs_middle ascii "$fixtures/paragraphs_100k.md" "$paragraphs_middle_offset"
+    input_scenario "100k paragraphs input at end" paragraphs_end ascii "$fixtures/paragraphs_100k.md" "$paragraphs_size"
+    input_scenario "100k paragraphs scroll only" paragraphs_scroll scroll "$fixtures/paragraphs_100k.md" 0
+    input_scenario "100k paragraphs input while scrolling" paragraphs_scroll_input scroll-input "$fixtures/paragraphs_100k.md" 0
+    input_scenario "input during background presentation update" background_input ascii "$fixtures/japanese.md" 0 1
+}
+
+run_memory() {
+    memory_scenario "memory 10 MB" memory_10mb "$fixtures/markdown_10mb.md"
+    memory_scenario "memory 100 MB" memory_100mb "$fixtures/markdown_100mb.md"
+}
+
+run_comparison() {
+    # These scenarios need no app-side development operation, so the probe and
+    # instrument binaries receive identical externally injected input.
+    input_scenario "normal ASCII input" normal_ascii ascii "$fixtures/japanese.md" 0
+    input_scenario "100 MB input at start" hundred_start ascii "$fixtures/markdown_100mb.md" 0
+}
+
+case "$scenario" in
+    all) run_startup; run_input; run_memory ;;
+    startup) run_startup ;;
+    input) run_input ;;
+    memory) run_memory ;;
+    comparison) run_comparison ;;
+    *)
+        echo "unknown scenario: $scenario" >&2
+        echo "available scenarios: all, startup, input, memory, comparison" >&2
+        exit 2
+        ;;
+esac
+
+python3 "$script_dir/aggregate_metrics.py" "$results_dir" "$results_dir/results.md"

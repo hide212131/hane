@@ -5,14 +5,14 @@
 
 ## 進捗ステータス（最終更新: 2026-08-29）
 
-**現在地: R2 後半（計測スクリプト・文書整理）。metrics/benchmark 統合まで完了。**
+**現在地: R2 完了。R5（型・API・ドキュメント整理）が次の作業。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
 | 1 | R0 基準線の確立 | ✅ 完了（タグ `refactor-baseline` = `0111cdc`） |
 | 2 | R0.5 契約テスト固定 | ✅ 完了 |
 | 3 | R1 死蔵・重複コード削除 | ✅ 完了 |
-| 4 | R2 前半（計測ハーネス分離） | 🔶 ほぼ完了（下記残タスクあり） |
+| 4 | R2 前半（計測ハーネス分離） | ✅ 完了 |
 | 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
 | 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
 | 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
@@ -20,7 +20,7 @@
 | 9 | R4A ブロック仮想化・描画 | ✅ 完了 |
 | 10 | R4B Block→LayoutLine→Run | ✅ 完了 |
 | 11 | R4C レイアウトキャッシュ・差分更新 | ✅ 完了 |
-| 12 | R2 後半（スクリプト統合・文書整理） | 🔶 進行中 ← **現在地** |
+| 12 | R2 後半（スクリプト統合・文書整理） | ✅ 完了 |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
 
 ### R3.25 の完了内容
@@ -204,8 +204,8 @@
   入力 p95 が 5.47 ms → 21.49 ms に悪化したため棄却。GPUI native text element を維持する。
 - 🔶 GUI の画面キャプチャ比較と `keystroke_to_paint` 実測は未実施。この環境では window を
   前面にできず、`CGWindowListCopyWindowInfo` も screen recording 権限が無いため window を
-  取得できなかった（25 秒の autoscroll で paint record 2 件）。R4A・R2 前半の残タスクと
-  同じ枠で回収する。折り返し・caret・選択の目視確認もそこに含める。
+  取得できなかった（25 秒の autoscroll で paint record 2 件）。折り返し・caret・選択の目視確認と
+  ともに、R4のGUI確認として回収する。
 - 🔶 `HeightIndex` の初期値は折り返しを知らない（`block_heights` は行数 × 行高）。描画された
   ブロックから実測値へ置き換わるので、スクロール範囲は読み進めるにつれて正確になる。
   ブロック内の可視行の見積もりは、そのブロックを一度描いていれば実測の平均行高を使う。
@@ -235,15 +235,15 @@
 - 🔶 GUI の `keystroke_to_paint` / scroll frame interval の master 比較は未実施。window が
   前面でない環境では OS 側の throttle に支配され、frame 数が同条件で 145〜1304 と振れるため
   判定に使えなかった。アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下
-  （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R2 前半の残タスクと同じ枠で回収する。
+  （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R4のGUI確認として回収する。
 - ✅ ブロック内の行位置とスクロール位置の対応は R4B の `LayoutLine` が持つようになった
   （描画済みブロックは実測の平均行高、未描画は行高一定の見積もり）。
 - ✅ ブロック数が変わる編集の `HeightIndex` 差分 splice と scroll anchoring は R4C で実装した。
 
 ### R3.75 の残メモ
 
-- 🔶 GUI 経由の `keystroke_to_paint` 実測（instrument build + 入力注入）は未実施。R2 前半の
-  残タスクと同じ枠で回収する。
+- 🔶 Session機能を含むGUI経由の `keystroke_to_paint` 実測は未実施。R2のinstrument比較とは別に、
+  session/filer作業時のGUI確認として回収する。
 - 🔶 外部変更の検出は `FileEvent` を受け取る API までで、ファイル監視そのものは未実装。
   filer 実装時に watcher を足す。
 
@@ -254,10 +254,12 @@
   R4C 前の実測で確認する。R4A 時点の実測では `BlockIndex::from_buffer` が 100 MB で
   約 1.16 秒（背景 job・1回）。
 
-### R2 前半の残タスク
+### R2 前半の完了確認
 
-- 🔶 `keystroke_to_paint` timing hook の instrument on/off 実測比較が未実施
-  （コード上は両ビルド同一 paint 経路に維持済み）。
+- ✅ `keystroke_to_paint` timing hook の instrument on/off 実測比較。CSV観測のみの
+  `timing-probe` と完全な `instrument` を同じ外部入力で比較した。1回目の normal ASCII p95
+  は +17.1% だったが、逆順の2回目は -36.8% で再現せず、100 MB p95 は +14.3% / -1.4%。
+  100 MB p99 の1回目 +341.8% も2回目は +2.9% であり、R0の「同条件で2回連続」の回帰条件を満たさない。
 
 ### R2 後半に回すタスク（計画上 R4C 完了後）
 
@@ -265,8 +267,9 @@
   runtime の rolling window・percentile・duration distribution・RSS は `hane-metrics`、fixture・
   benchmark scenario・環境採取・report 描画は `hane-benchmark`。benchmark 独自 `Distribution` と
   percentile 計算を削除し、`DurationDistribution` の type alias に統一した。
-- ⬜ スクリプト引数化統合（`scripts/measure.sh <scenario>` 等）。
-- ⬜ 歴史文書の `docs/history/` 移動と ADR 索引整備。
+- ✅ スクリプト引数化統合。`scripts/measure.sh` は `all` / `startup` / `input` / `memory`、
+  `scripts/capture.sh` は `editor` / `cursor-boundary` / `cursor-scroll` を引数で選ぶ。
+- ✅ 歴史文書を `docs/history/` へ移動し、`docs/adr/README.md` に現行・歴史の索引を整備。
 
 > 各フェーズの詳細チェックボックスは `docs/refactor-plan.md` が正。
 > このステータス欄はフェーズを着手・完了するたびに更新する（状態と「最終更新」日付、

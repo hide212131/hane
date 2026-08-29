@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Hane Phase 0 UI CSV samples into the ADR-0009 Markdown table."""
+"""Aggregate Hane UI CSV samples into the ADR-0009 Markdown table."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def main() -> None:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--profile", default="release")
-    parser.add_argument("--phase", default="0")
+    parser.add_argument("--label", default="UI")
     args = parser.parse_args()
 
     samples: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -96,7 +96,7 @@ def main() -> None:
                     samples[(scenario, "memory_ready")].append(float(row["rss_bytes"]))
 
     lines = [
-        f"# Phase {args.phase} UI measurement results",
+        f"# {args.label} measurement results",
         "",
         f"- Git: `{command('git', 'rev-parse', 'HEAD')}`",
         f"- Profile: `{args.profile}`",

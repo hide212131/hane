@@ -29,7 +29,7 @@ Phase 1 は Phase 0 と同じく、設計判断、実装、単体テスト、実
 7. selectionとIME marked rangeを文字範囲へ正確に描画する。
 8. Unicode、連続入力grouping、IME、cache invalidation、巨大文書を自動テストする。
 9. Phase 0と同じ測定条件で入力、scroll、startup、RSSを再測定する。
-10. `docs/phase1/report.md` に結果、Pass/Fail、Phase 2判断を記録する。
+10. `docs/history/phase1/report.md` に結果、Pass/Fail、Phase 2判断を記録する。
 
 ## Phase 1での非目標
 

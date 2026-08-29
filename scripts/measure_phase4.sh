@@ -1,9 +1,0 @@
-#!/bin/sh
-set -eu
-
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-workspace_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-results_dir=${1:-"$workspace_dir/target/phase4/ui"}
-
-"$script_dir/measure_phase0.sh" "$results_dir"
-python3 "$script_dir/aggregate_phase0_metrics.py" --phase 4 "$results_dir" "$results_dir/results.md"
