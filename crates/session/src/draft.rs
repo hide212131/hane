@@ -58,6 +58,17 @@ pub struct RecoveredDraft {
     pub text: String,
 }
 
+/// The outcome of a recovery pass: every draft that could be read, plus how
+/// many entries in the recovery directory looked like a draft (or might have
+/// been one) but could not be read. `failed` being nonzero must be visible to
+/// the user — an unreadable draft is unsaved content that recovery could not
+/// bring back, not a draft that never existed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecoveredDrafts {
+    pub drafts: Vec<RecoveredDraft>,
+    pub failed: usize,
+}
+
 /// The filesystem boundary for the unnamed-note recovery journal.
 ///
 /// Every method blocks, and every caller runs them off the input path, the
@@ -71,10 +82,12 @@ pub trait DraftStore: Send + Sync + 'static {
     /// filename or its session closed clean. Already-missing is not an error.
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()>;
 
-    /// Every draft left over from a previous run, in no particular order. A
-    /// work folder with no recovery directory yet recovers to nothing, not
-    /// an error.
-    fn recover(&self, root: &Path) -> io::Result<Vec<RecoveredDraft>>;
+    /// Every draft left over from a previous run, in no particular order,
+    /// plus a count of entries that could not be read. A work folder with no
+    /// recovery directory yet recovers to nothing, not an error; a directory
+    /// that cannot be listed at all (a permission error on `.hane/drafts`
+    /// itself) still is.
+    fn recover(&self, root: &Path) -> io::Result<RecoveredDrafts>;
 }
 
 fn drafts_dir(root: &Path) -> PathBuf {
@@ -113,22 +126,31 @@ impl DraftStore for OsDraftStore {
         }
     }
 
-    fn recover(&self, root: &Path) -> io::Result<Vec<RecoveredDraft>> {
+    fn recover(&self, root: &Path) -> io::Result<RecoveredDrafts> {
         let dir = drafts_dir(root);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RecoveredDrafts::default());
+            }
             Err(error) => return Err(error),
         };
         let mut drafts = Vec::new();
+        let mut failed = 0;
         for entry in entries {
             // One unreadable entry (a permission error on a single file, a
             // race with another process removing it) must not sacrifice
             // every other draft in the directory: skip it and keep going,
             // rather than letting `?` here abort the whole recovery and lose
-            // drafts that were perfectly readable.
-            let Ok(entry) = entry else { continue };
+            // drafts that were perfectly readable. It is still lost content,
+            // though, so it counts toward `failed` rather than disappearing
+            // silently: the caller surfaces that count to the user.
+            let Ok(entry) = entry else {
+                failed += 1;
+                continue;
+            };
             let Ok(file_type) = entry.file_type() else {
+                failed += 1;
                 continue;
             };
             if !file_type.is_file() {
@@ -140,15 +162,17 @@ impl DraftStore for OsDraftStore {
             };
             let Some(id) = DraftId::from_file_name(name) else {
                 // Stray `.tmp` from an interrupted write, or something the
-                // user dropped in here by hand: not a draft, skip it.
+                // user dropped in here by hand: not a draft, so its absence
+                // from the result is not a failure.
                 continue;
             };
             let Ok(text) = fs::read_to_string(&path) else {
+                failed += 1;
                 continue;
             };
             drafts.push(RecoveredDraft { id, text });
         }
-        Ok(drafts)
+        Ok(RecoveredDrafts { drafts, failed })
     }
 }
 
@@ -161,7 +185,9 @@ mod tests {
     fn a_folder_with_no_recovery_directory_recovers_to_nothing() {
         let root = temporary_directory("draft-none");
         fs::create_dir_all(&root).unwrap();
-        assert!(OsDraftStore.recover(&root).unwrap().is_empty());
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert!(recovered.drafts.is_empty());
+        assert_eq!(recovered.failed, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -175,9 +201,13 @@ mod tests {
             .unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].id, id);
-        assert_eq!(recovered[0].text, "today I thought about this design");
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].id, id);
+        assert_eq!(
+            recovered.drafts[0].text,
+            "today I thought about this design"
+        );
+        assert_eq!(recovered.failed, 0);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -191,8 +221,8 @@ mod tests {
         OsDraftStore.write(&root, id, "first, then more").unwrap();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].text, "first, then more");
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.drafts[0].text, "first, then more");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -205,7 +235,9 @@ mod tests {
         OsDraftStore.write(&root, id, "gone once named").unwrap();
         OsDraftStore.remove(&root, id).unwrap();
 
-        assert!(OsDraftStore.recover(&root).unwrap().is_empty());
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert!(recovered.drafts.is_empty());
+        assert_eq!(recovered.failed, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -225,7 +257,11 @@ mod tests {
         fs::write(dir.join("not-a-draft.txt"), "ignore me").unwrap();
         fs::write(dir.join("0000000000000001.tmp"), "interrupted write").unwrap();
 
-        assert!(OsDraftStore.recover(&root).unwrap().is_empty());
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert!(recovered.drafts.is_empty());
+        // Neither file is even shaped like a draft, so their absence is not
+        // reported as a failure: there was nothing here to lose.
+        assert_eq!(recovered.failed, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -238,7 +274,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_draft_that_fails_to_read_is_skipped_without_losing_the_others() {
+    fn a_draft_that_fails_to_read_is_counted_as_failed_without_losing_the_others() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = temporary_directory("draft-partial-failure");
@@ -263,9 +299,13 @@ mod tests {
 
         if permission_actually_blocks_reads {
             let recovered = recovered.unwrap();
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].id, readable);
-            assert_eq!(recovered[0].text, "keep me");
+            assert_eq!(recovered.drafts.len(), 1);
+            assert_eq!(recovered.drafts[0].id, readable);
+            assert_eq!(recovered.drafts[0].text, "keep me");
+            // The unreadable draft must not vanish without a trace: it is
+            // reported as a failure so the caller can tell the user one
+            // draft could not be recovered.
+            assert_eq!(recovered.failed, 1);
         }
 
         fs::remove_dir_all(root).unwrap();

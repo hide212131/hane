@@ -43,7 +43,7 @@ use hane_presentation::{
 };
 use hane_session::{
     DocumentSession, DraftId, DraftStore, FileService, LoadedFile, OpenDecision, OpenPolicy,
-    OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDraft, SaveDecision,
+    OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision,
     SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet,
     SessionViewState, Settings, StateStores, WorkFolder, WorkFolderScanner, run_save_job,
 };
@@ -468,7 +468,7 @@ impl EditorView {
         &mut self,
         scanned: (
             std::io::Result<WorkFolder>,
-            std::io::Result<Vec<RecoveredDraft>>,
+            std::io::Result<RecoveredDrafts>,
         ),
         cx: &mut Context<Self>,
     ) {
@@ -492,17 +492,24 @@ impl EditorView {
                 // A recovery failure must not look like the drafts were
                 // simply gone: `OsDraftStore::recover` already keeps
                 // whatever individual files it could read, so surface the
-                // error instead of silently falling back to an empty list
+                // error (or, short of that, how many entries could not be
+                // read) instead of silently falling back to an empty list
                 // and clearing status as if nothing happened.
                 let mut last_recovered = None;
                 match drafts {
                     Ok(drafts) => {
-                        self.status = None;
-                        for draft in drafts {
+                        for draft in drafts.drafts {
                             let id = self.sessions.open_untitled(&draft.text, "Untitled");
                             self.work_folder_drafts.insert(id, draft.id);
                             last_recovered = Some(id);
                         }
+                        self.status = (drafts.failed > 0).then(|| {
+                            format!(
+                                "{} unsaved draft{} could not be recovered",
+                                drafts.failed,
+                                if drafts.failed == 1 { "" } else { "s" }
+                            )
+                        });
                     }
                     Err(error) => {
                         self.status = Some(format!("Could not recover unsaved drafts: {error}"));
@@ -2498,6 +2505,7 @@ mod tests {
     use super::*;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
+    use hane_session::RecoveredDraft;
 
     #[test]
     fn layout_cache_key_rejects_each_geometry_input_independently() {
@@ -2981,8 +2989,11 @@ mod tests {
         cx.run_until_parked();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].text, "today I thought about this design");
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(
+            recovered.drafts[0].text,
+            "today I thought about this design"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -3018,6 +3029,60 @@ mod tests {
             status.is_some_and(|status| status.contains("recover")),
             "expected the drafts-recovery error to be surfaced in status"
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the follow-up P2 finding: a per-file recovery
+    // failure (as opposed to the whole directory being unreadable) must also
+    // be visible, not just silently drop the one draft that could not be
+    // read while saying nothing about it. The drafts that *were* readable
+    // must still come back.
+    #[gpui::test]
+    fn a_partial_draft_recovery_failure_is_surfaced_while_readable_drafts_still_recover(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("partial-recovery-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        let readable = RecoveredDraft {
+            id: DraftId::generate(),
+            text: "kept".to_owned(),
+        };
+        let partial = RecoveredDrafts {
+            drafts: vec![readable.clone()],
+            failed: 1,
+        };
+
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan((Ok(work_folder), Ok(partial)), cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.status
+                    .as_deref()
+                    .is_some_and(|status| status.contains('1')),
+                "expected the one unreadable draft to be surfaced in status, got {:?}",
+                view.status
+            );
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|id| *id == readable.id),
+                "the readable draft must still be recovered as a session"
+            );
+        });
 
         std::fs::remove_dir_all(&root).unwrap();
     }
