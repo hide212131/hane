@@ -115,6 +115,12 @@ pub struct EditorView {
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
     work_folder_drafts: HashMap<SessionId, DraftId>,
+    /// A draft-recovery failure from the last work-folder scan, if any. Kept
+    /// apart from `status`: opening the work folder's first note runs right
+    /// after the scan and drives `status` through "Opening…" and "Opened" in
+    /// the same update cycle, which would otherwise blank out the warning
+    /// before the user ever saw it. Cleared only by the next scan's outcome.
+    draft_recovery_warning: Option<String>,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -377,6 +383,7 @@ impl EditorView {
             work_folder: None,
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
+            draft_recovery_warning: None,
             loading_paths: HashSet::new(),
             latest_open_target: None,
             focus_handle: cx.focus_handle(),
@@ -494,27 +501,29 @@ impl EditorView {
                 // whatever individual files it could read, so surface the
                 // error (or, short of that, how many entries could not be
                 // read) instead of silently falling back to an empty list
-                // and clearing status as if nothing happened.
+                // and clearing status as if nothing happened. This goes into
+                // `draft_recovery_warning`, not `status`: opening the first
+                // note below drives `status` through "Opening…" and
+                // "Opened" in this same update cycle, which would otherwise
+                // blank the warning out before it was ever shown.
                 let mut last_recovered = None;
-                match drafts {
+                self.draft_recovery_warning = match drafts {
                     Ok(drafts) => {
                         for draft in drafts.drafts {
                             let id = self.sessions.open_untitled(&draft.text, "Untitled");
                             self.work_folder_drafts.insert(id, draft.id);
                             last_recovered = Some(id);
                         }
-                        self.status = (drafts.failed > 0).then(|| {
+                        (drafts.failed > 0).then(|| {
                             format!(
                                 "{} unsaved draft{} could not be recovered",
                                 drafts.failed,
                                 if drafts.failed == 1 { "" } else { "s" }
                             )
-                        });
+                        })
                     }
-                    Err(error) => {
-                        self.status = Some(format!("Could not recover unsaved drafts: {error}"));
-                    }
-                }
+                    Err(error) => Some(format!("Could not recover unsaved drafts: {error}")),
+                };
 
                 if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
@@ -2216,8 +2225,14 @@ impl Render for EditorView {
         } else {
             ""
         };
-        let status = self.status.clone().unwrap_or_else(|| {
-            format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
+        // A draft-recovery warning outranks every other status line: it
+        // reports unsaved content that might otherwise be lost, so it must
+        // stay visible through whatever transient "Opening…"/"Opened"
+        // messages the rest of the window is cycling through.
+        let status = self.draft_recovery_warning.clone().unwrap_or_else(|| {
+            self.status.clone().unwrap_or_else(|| {
+                format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
+            })
         });
 
         let root = div()
@@ -3024,10 +3039,10 @@ mod tests {
             view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
         });
 
-        let status = view.read_with(cx, |view, _| view.status.clone());
+        let warning = view.read_with(cx, |view, _| view.draft_recovery_warning.clone());
         assert!(
-            status.is_some_and(|status| status.contains("recover")),
-            "expected the drafts-recovery error to be surfaced in status"
+            warning.is_some_and(|warning| warning.contains("recover")),
+            "expected the drafts-recovery error to be surfaced as a warning"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -3070,17 +3085,66 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert!(
-                view.status
+                view.draft_recovery_warning
                     .as_deref()
-                    .is_some_and(|status| status.contains('1')),
-                "expected the one unreadable draft to be surfaced in status, got {:?}",
-                view.status
+                    .is_some_and(|warning| warning.contains('1')),
+                "expected the one unreadable draft to be surfaced as a warning, got {:?}",
+                view.draft_recovery_warning
             );
             assert!(
                 view.work_folder_drafts
                     .values()
                     .any(|id| *id == readable.id),
                 "the readable draft must still be recovered as a session"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the P2 review finding that the recovery warning
+    // was overwritten within the same update cycle: when the work folder has
+    // a named note, `finish_work_folder_scan` immediately opens it via
+    // `open_path`, which drives `status` through "Opening…" and then
+    // "Opened" once the background read completes. The warning has to
+    // survive that, not just the synchronous part of the scan.
+    #[gpui::test]
+    fn a_draft_recovery_warning_survives_opening_the_first_named_note(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("warning-survives-open");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Meeting.md"), "# Meeting\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert_eq!(work_folder.entries().len(), 1);
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+        });
+
+        // Let the background read `open_path` kicked off run to completion,
+        // driving `status` to "Opened" the same way a real work-folder open
+        // does.
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status.as_deref(), Some("Opened"));
+            assert!(
+                view.draft_recovery_warning
+                    .as_deref()
+                    .is_some_and(|warning| warning.contains("recover")),
+                "expected the recovery warning to survive the first note's open completing, got {:?}",
+                view.draft_recovery_warning
             );
         });
 
