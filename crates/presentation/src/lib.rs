@@ -357,7 +357,7 @@ pub enum BlockKind {
     TableDelimiter,
     /// A source line whose Markdown construct has no specialized presenter yet, or
     /// whose marker derivation failed to tile the source range. Rendered verbatim
-    /// as plain text so the source is never lost. See [`present_raw_source`].
+    /// as plain text so the source is never lost through the raw-source fallback.
     Unsupported,
 }
 
@@ -716,9 +716,9 @@ pub struct BlockWindow<'a> {
     pub lines: &'a [BlockLine<'a>],
 }
 
-/// Display kind for a whole block. Wider than [`presentation_block_kind`],
-/// which answers for a single node: a container node (a table, a list) does
-/// decide how its block looks even though its lines are presented one by one.
+/// Display kind for a whole block. The syntax-display table distinguishes a
+/// container node (a table, a list) that decides its block appearance from a
+/// node that contributes a display kind while presenting one physical line.
 fn block_display_kind(kind: NodeKind) -> BlockKind {
     syntax_display(kind).indexed_block
 }

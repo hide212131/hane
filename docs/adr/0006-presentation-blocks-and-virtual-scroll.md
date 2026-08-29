@@ -1,7 +1,8 @@
 # ADR-0006: Presentation Block と可変高さ仮想スクロール
 
-> **Amended (R5):** 現行のブロック単位仮想化は ADR-0020、layout/caching は ADR-0021/0022 と
-> [architecture](../architecture.md) を正とする。
+> **Amended (R5):** 現行のブロック単位仮想化は [ADR-0020](0020-block-virtualization.md)、
+> layout/caching は [ADR-0021](0021-layout-lines-and-visual-coordinates.md) /
+> [ADR-0022](0022-layout-cache-invalidation.md) と [architecture](../architecture.md) を正とする。
 
 ## ステータス
 

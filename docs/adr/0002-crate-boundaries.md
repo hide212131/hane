@@ -1,7 +1,8 @@
 # ADR-0002: Crate 境界と依存方向
 
 > **Amended (R5):** 現行の crate graph と追加された `session` / `layout` 境界は
-> [architecture](../architecture.md) を正とする。本 ADR は当時の判断記録として保持する。
+> [architecture](../architecture.md)、[ADR-0019](0019-document-session-and-file-service.md)、
+> [ADR-0021](0021-layout-lines-and-visual-coordinates.md) を正とする。本 ADR は当時の判断記録として保持する。
 
 ## ステータス
 

@@ -1,7 +1,7 @@
 # ADR-0008: Markdown 解析方針
 
-> **Amended (R5):** 現行の revision 付き `BlockIndex` と表示境界は ADR-0018 および
-> [architecture](../architecture.md) を正とする。
+> **Amended (R5):** 現行の revision 付き `BlockIndex` と表示境界は
+> [ADR-0018](0018-block-index.md) および [architecture](../architecture.md) を正とする。
 
 ## ステータス
 

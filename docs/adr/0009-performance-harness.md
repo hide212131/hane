@@ -1,7 +1,7 @@
 # ADR-0009: Performance Harness と測定基準
 
 > **Amended (R5):** 現行の `metrics` / `benchmark` 分離と統合 script は
-> [architecture](../architecture.md) および baseline 文書を正とする。
+> [architecture](../architecture.md) および [baseline 文書](../baseline/README.md) を正とする。
 
 ## ステータス
 

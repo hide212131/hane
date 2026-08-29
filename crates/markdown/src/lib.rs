@@ -284,23 +284,6 @@ pub struct LocalBlockIndex {
 }
 
 impl LocalBlockIndex {
-    pub fn revision(&self) -> Revision {
-        self.revision
-    }
-
-    /// Source range this index was parsed from. Offsets outside it have no block.
-    pub fn window(&self) -> SourceRange {
-        self.window
-    }
-
-    pub fn len(&self) -> usize {
-        self.blocks.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     fn indexed(&self, ordinal: usize) -> IndexedBlock {
         let (kind, source_range, line_count) = self.blocks[ordinal];
         IndexedBlock {
@@ -341,7 +324,7 @@ impl LocalBlockIndex {
 }
 
 /// Single bounded synchronous parse used only while no [`BlockIndex`] is
-/// published. Reads a window that starts [`LOCAL_BLOCK_LOOKBACK`] lines above
+/// published. Reads a window that starts `LOCAL_BLOCK_LOOKBACK` lines above
 /// `visible` and ends one line below it, and tiles that window into blocks the
 /// same way the formal index tiles the document. Never reads the whole document,
 /// so it is safe on the visible-render path.
@@ -908,7 +891,7 @@ mod tests {
             Some(NodeKind::Paragraph)
         );
         // Far above the lookback window is not parsed at all.
-        assert!(local.window().start.0 > 0);
+        assert!(local.window.start.0 > 0);
         assert_eq!(local.block_at(SourceOffset(0)), None);
     }
 }

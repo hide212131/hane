@@ -69,8 +69,9 @@ rg -n '^(pub (struct|enum|trait|type|const|fn|mod|use)|    pub fn )' crates/*/sr
 This snapshot remains a comparison point, not a compatibility promise. R5 deliberately narrowed
 only APIs with no cross-crate product, benchmark, or integration-test consumer:
 
-- `hane-markdown`: the incremental-parser budgets and local fallback lookback are implementation
-  details; `has_delimiter_markers` replaces the misleading `is_delimited_inline` name.
+- `hane-markdown`: the incremental-parser budgets, local fallback lookback, and unused
+  `LocalBlockIndex::{revision, window, len, is_empty}` accessors are implementation details;
+  `has_delimiter_markers` replaces the misleading `is_delimited_inline` name.
 - `hane-presentation`: `layout` is now private and reached through its existing root re-exports;
   plain/raw fallback presenters and the obsolete line-by-line paragraph helper are private.
 - `hane-session`: `atomic_write_bytes` is private to state persistence and the unused
