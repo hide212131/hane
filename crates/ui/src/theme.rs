@@ -1,7 +1,7 @@
 use gpui::WindowAppearance;
 use hane_session::ThemePreference;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Theme {
     pub line_height: f32,
     pub line_horizontal_padding: f32,

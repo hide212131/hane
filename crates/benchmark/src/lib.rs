@@ -1,8 +1,8 @@
-//! Reproducible fixtures and latency aggregation shared by project phases.
+//! Offline fixtures, benchmark scenarios, environment capture, and report rendering.
 
 use hane_document::{LineId, RopeBuffer, SourceRange, TextBuffer};
 use hane_markdown::BlockIndex;
-use hane_metrics::percentile;
+use hane_metrics::{DurationDistribution, duration_distribution};
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockLine, BlockWindow, HeightIndex, block_heights, block_line_span, layout_block,
@@ -14,28 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Distribution {
-    pub samples: usize,
-    pub median: Duration,
-    pub p95: Duration,
-    pub p99: Duration,
-    pub max: Duration,
-}
+pub type Distribution = DurationDistribution;
 
 pub fn distribution(samples: &[Duration]) -> Distribution {
-    if samples.is_empty() {
-        return Distribution::default();
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    Distribution {
-        samples: sorted.len(),
-        median: percentile(sorted.iter().copied(), 0.50).unwrap(),
-        p95: percentile(sorted.iter().copied(), 0.95).unwrap(),
-        p99: percentile(sorted.iter().copied(), 0.99).unwrap(),
-        max: *sorted.last().unwrap(),
-    }
+    duration_distribution(samples.iter().copied())
 }
 
 #[derive(Clone, Debug)]
@@ -276,10 +258,8 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
     distribution(&samples)
 }
 
-/// Rebuilding the block-driven height index on a document of `blocks`
-/// paragraphs. This is the one cost R4A adds to the input path: an edit that
-/// changes the number of blocks re-keys the height index, and every entry has to
-/// be sized from the lines its block covers.
+/// Building the block-driven height index for a document of `blocks`
+/// paragraphs, as the background formal-index job does at publication time.
 pub fn run_block_heights_scenario(blocks: usize, iterations: usize) -> Distribution {
     let mut source = String::new();
     for paragraph in 0..blocks {
@@ -291,6 +271,26 @@ pub fn run_block_heights_scenario(blocks: usize, iterations: usize) -> Distribut
     for _ in 0..iterations {
         let start = std::time::Instant::now();
         let heights = HeightIndex::new(block_heights(&buffer, &index, 26.0));
+        std::hint::black_box(heights.total_height());
+        samples.push(start.elapsed());
+    }
+    distribution(&samples)
+}
+
+/// Alternating one block split/join in the middle of an existing height index.
+/// The item count stays stable across each pair so every sample measures only
+/// the structural edit, not construction of another document-sized index.
+pub fn run_height_splice_scenario(blocks: usize, iterations: usize) -> Distribution {
+    let mut heights = HeightIndex::new(std::iter::repeat_n(26.0, blocks));
+    let middle = blocks / 2;
+    let mut samples = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let start = std::time::Instant::now();
+        if iteration % 2 == 0 {
+            heights.splice(middle..middle + 1, [26.0, 26.0]);
+        } else {
+            heights.splice(middle..middle + 2, [26.0]);
+        }
         std::hint::black_box(heights.total_height());
         samples.push(start.elapsed());
     }

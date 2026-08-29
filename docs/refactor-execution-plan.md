@@ -3,9 +3,9 @@
 `docs/refactor-plan.md` に定義された各フェーズを、依存関係と手戻りの少なさを基準に並べた
 実施計画。フェーズ番号順ではなく、後続作業の前提を先に確定できる順序を採用する。
 
-## 進捗ステータス（最終更新: 2026-08-28）
+## 進捗ステータス（最終更新: 2026-08-29）
 
-**現在地: R4B（Block→LayoutLine→Run）完了。次は R4C（レイアウトキャッシュ・差分更新）に着手する。**
+**現在地: R2 後半（計測スクリプト・文書整理）。metrics/benchmark 統合まで完了。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -19,8 +19,8 @@
 | 8 | R3.75 DocumentSession / FileService | ✅ 完了 |
 | 9 | R4A ブロック仮想化・描画 | ✅ 完了 |
 | 10 | R4B Block→LayoutLine→Run | ✅ 完了 |
-| 11 | R4C レイアウトキャッシュ・差分更新 | ⬜ 未着手 ← **現在地** |
-| 12 | R2 後半（スクリプト統合・文書整理） | ⬜ 未着手（計画上 R4C 後） |
+| 11 | R4C レイアウトキャッシュ・差分更新 | ✅ 完了 |
+| 12 | R2 後半（スクリプト統合・文書整理） | 🔶 進行中 ← **現在地** |
 | 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
 
 ### R3.25 の完了内容
@@ -200,8 +200,8 @@
 
 ### R4B の残メモ
 
-- 🔶 レイアウトは1フレームに1回テキストを shape し、GPUI も描画時に shape する。可視行の
-  shape が二重になっている。解消は R4C（cache entry に shape 結果を持たせる）。
+- 🔶 可視行の二重 shape 解消として cached `ShapedLine` の custom paint を試したが、100 MB
+  入力 p95 が 5.47 ms → 21.49 ms に悪化したため棄却。GPUI native text element を維持する。
 - 🔶 GUI の画面キャプチャ比較と `keystroke_to_paint` 実測は未実施。この環境では window を
   前面にできず、`CGWindowListCopyWindowInfo` も screen recording 権限が無いため window を
   取得できなかった（25 秒の autoscroll で paint record 2 件）。R4A・R2 前半の残タスクと
@@ -209,6 +209,26 @@
 - 🔶 `HeightIndex` の初期値は折り返しを知らない（`block_heights` は行数 × 行高）。描画された
   ブロックから実測値へ置き換わるので、スクロール範囲は読み進めるにつれて正確になる。
   ブロック内の可視行の見積もりは、そのブロックを一度描いていれば実測の平均行高を使う。
+
+### R4C の実施済み・残メモ
+
+- ✅ `LayoutCacheEntry` に layout result と font revision を持たせ、幅・document revision と合わせた
+  再利用キーを1か所にした。theme/font、幅、編集、画像高さの invalidation 規則は ADR-0022。
+- ✅ 非交差 block の presentation/layout rebase を維持し、block split/join 時は stable id と
+  `line_count` を `BlockIndexUpdate` の置換区間だけ比較する。通常文字入力は高さ索引を更新せず、
+  split/join 時だけ同じ区間を `HeightIndex::splice` する。外側の実測高さは残る。
+- ✅ `HeightIndex` と UI の `HeightBlock` メタデータ列を 128 block chunk に変更。10万 block 中央の
+  local splice は median 0.002 ms / p95 0.003 ms、全体構築も p95 0.177 ms（旧 0.671 ms）。
+- ✅ splice は viewport 上端 id を挿入小区間だけで解決し、可視 block の実測高さ更新は同じ ordinal
+  で anchor する。どちらも全 block の id 検索を行わない。
+- ✅ instrument CSV に `layout_cache_hits` / `layout_cache_misses` / `relayout_blocks` を追加。
+- ✅ 10 MB autoscroll で 293 paint、cache hit 5,772 / miss 438。layout median 1.27 ms、
+  p95 1.77 ms。100 MB は RSS 282.8 MB で 350 MB gate 内、再描画は 18 hit / 0 relayout。
+- ✅ cached `ShapedLine` custom paint の性能回帰を同一 R4B build と比較して特定し、棄却した。
+  native text element 復帰後、入力ごとの全 `BlockIndex` 走査も検出して置換区間同期へ修正した。
+- ✅ 最終版の独立2回の 100 MB・30 ASCII入力は p95/p99 3.55/4.41 ms と 4.58/4.60 ms。
+  R0 4.98/7.65 ms と再採取 R4B 7.33/7.38 ms の双方以下。100 MB 改行入力10回も
+  1.97/1.97 ms。15% 相対 gate、16/33 ms 絶対 gate とも Pass。
 
 ### R4A の残メモ
 
@@ -218,7 +238,7 @@
   （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R2 前半の残タスクと同じ枠で回収する。
 - ✅ ブロック内の行位置とスクロール位置の対応は R4B の `LayoutLine` が持つようになった
   （描画済みブロックは実測の平均行高、未描画は行高一定の見積もり）。
-- 🔶 ブロック数が変わる編集では `HeightIndex` を作り直す。差分 splice は R4C の担当。
+- ✅ ブロック数が変わる編集の `HeightIndex` 差分 splice と scroll anchoring は R4C で実装した。
 
 ### R3.75 の残メモ
 
@@ -241,7 +261,10 @@
 
 ### R2 後半に回すタスク（計画上 R4C 完了後）
 
-- ⬜ `metrics` と `benchmark` の役割再定義・`Distribution`/`percentile` 統合。
+- ✅ `metrics` と `benchmark` の役割再定義・`Distribution`/`percentile` 統合。
+  runtime の rolling window・percentile・duration distribution・RSS は `hane-metrics`、fixture・
+  benchmark scenario・環境採取・report 描画は `hane-benchmark`。benchmark 独自 `Distribution` と
+  percentile 計算を削除し、`DurationDistribution` の type alias に統一した。
 - ⬜ スクリプト引数化統合（`scripts/measure.sh <scenario>` 等）。
 - ⬜ 歴史文書の `docs/history/` 移動と ADR 索引整備。
 

@@ -78,6 +78,8 @@ pub(crate) struct Instrumentation {
     pub(crate) ready_reported: bool,
     pub(crate) ready_armed: bool,
     pub(crate) display_linked_scroll_direction: Option<f32>,
+    pub(crate) layout_cache_hits: usize,
+    pub(crate) layout_cache_misses: usize,
 }
 
 impl Instrumentation {
@@ -95,6 +97,8 @@ impl Instrumentation {
             ready_reported: false,
             ready_armed: false,
             display_linked_scroll_direction: None,
+            layout_cache_hits: 0,
+            layout_cache_misses: 0,
         }
     }
 }
@@ -123,7 +127,7 @@ impl Phase0MetricsOutput {
             .open(path)?;
         writeln!(
             file,
-            "record_type,scenario,sequence,input_event_kind,keystroke_to_model_ms,keystroke_to_frame_ms,frame_interval_ms,layout_ms,startup_ms,file_open_ms,rss_bytes,input_source,refresh_rate_hz,background_job,block_index_update_ms,reparsed_bytes,invalidated_blocks"
+            "record_type,scenario,sequence,input_event_kind,keystroke_to_model_ms,keystroke_to_frame_ms,frame_interval_ms,layout_ms,startup_ms,file_open_ms,rss_bytes,input_source,refresh_rate_hz,background_job,block_index_update_ms,reparsed_bytes,invalidated_blocks,layout_cache_hits,layout_cache_misses,relayout_blocks"
         )?;
         Ok(Some(Self {
             file,
@@ -153,6 +157,7 @@ impl Phase0MetricsOutput {
             Some(file_open),
             rss_bytes,
             None,
+            None,
         )
     }
 
@@ -169,6 +174,7 @@ impl Phase0MetricsOutput {
             None,
             rss_bytes,
             None,
+            None,
         )
     }
 
@@ -176,12 +182,24 @@ impl Phase0MetricsOutput {
         &mut self,
         interval: Option<Duration>,
         layout: Option<Duration>,
+        layout_cache: (usize, usize),
     ) -> io::Result<()> {
         if !self.recording() {
             return Ok(());
         }
         self.row(
-            "paint", None, "", None, None, interval, layout, None, None, None, None,
+            "paint",
+            None,
+            "",
+            None,
+            None,
+            interval,
+            layout,
+            None,
+            None,
+            None,
+            None,
+            Some(layout_cache),
         )
     }
 
@@ -195,6 +213,7 @@ impl Phase0MetricsOutput {
             measurement.kind.as_str(),
             Some(measurement.keystroke_to_model()),
             measurement.keystroke_to_frame(),
+            None,
             None,
             None,
             None,
@@ -222,6 +241,7 @@ impl Phase0MetricsOutput {
             None,
             None,
             Some(*update),
+            None,
         )
     }
 
@@ -243,6 +263,7 @@ impl Phase0MetricsOutput {
         file_open: Option<Duration>,
         rss_bytes: Option<u64>,
         block_index: Option<BlockIndexUpdate>,
+        layout_cache: Option<(usize, usize)>,
     ) -> io::Result<()> {
         fn milliseconds(value: Option<Duration>) -> String {
             value.map_or_else(String::new, |value| {
@@ -257,9 +278,13 @@ impl Phase0MetricsOutput {
                     update.invalidated_blocks.to_string(),
                 )
             });
+        let (layout_hits, layout_misses) = layout_cache.map_or_else(
+            || (String::new(), String::new()),
+            |(hits, misses)| (hits.to_string(), misses.to_string()),
+        );
         writeln!(
             self.file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             csv(record_type),
             csv(&self.scenario),
             sequence.map_or_else(String::new, |value| value.to_string()),
@@ -277,6 +302,9 @@ impl Phase0MetricsOutput {
             milliseconds(block_index_update),
             reparsed_bytes,
             invalidated_blocks,
+            layout_hits,
+            layout_misses,
+            layout_misses,
         )?;
         self.file.flush()
     }

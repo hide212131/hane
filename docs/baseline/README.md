@@ -130,3 +130,14 @@ R4A時点で未実施のまま残る計測は、GUI経由の `keystroke_to_paint
 比較である。window が前面でない環境ではOS側の throttle が支配的で、同条件の25秒計測でも
 frame 数が145〜1304と振れるため判定に使えない。アプリ内計測の `layout_ms` は
 100 MB / 10万段落とも基準線以下だった（中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。
+
+### R4Cで追加した指標
+
+paint record に `layout_cache_hits`、`layout_cache_misses`、`relayout_blocks` を追加した。
+高さ索引と対応メタデータは 128 block chunk の差分 splice とし、`hane-bench buffer` に
+`block height index local splice` を追加した。10万 block 中央の split/join 200 samples は
+median 0.002 ms / p95 0.003 ms / p99 0.004 ms。全体構築も p95 0.177 msだった。
+
+最終 instrument build の 100 MB ASCII 入力（各30 samples）は独立2回で p95/p99
+3.55/4.41 ms、4.58/4.60 ms。100 MB 改行入力10 samples は 1.97/1.97 msで、R0 の入力基準と
+16/33 ms絶対gateを通過した。

@@ -173,8 +173,10 @@ RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。�
 - [x] `HANE_*` 環境変数を1か所（`ui::instrument::InstrumentationConfig::from_environment`）で解釈するよう集約。
       `PHASE0/1/2_AUTOSCROLL` → `HANE_AUTOSCROLL`、`PHASE0_BACKGROUND_PRESENTATION` → `HANE_BACKGROUND_PRESENTATION`、
       `PHASE0_NO_FOCUS` → `HANE_NO_FOCUS` に統一。`scripts/` も追従（計測ビルドは `--features instrument`）。
-- [ ] `metrics` と `benchmark` の役割を再定義：ランタイム計測=`metrics`、
+- [x] `metrics` と `benchmark` の役割を再定義：ランタイム計測=`metrics`、
       オフライン集計/フィクスチャ=`benchmark` に線引きし、重複 `Distribution`/`percentile` を統合。
+      `benchmark::Distribution` は `metrics::DurationDistribution` の type alias とし、percentile 計算は
+      `metrics::duration_distribution` の1実装だけを使う。
 - [ ] **P1** スクリプトを引数化して統合：`scripts/measure.sh <scenario>` /
       `scripts/capture.sh <scenario>` の2本に集約し、`measure_phase*` / `capture_phase*` を廃止。
 - [ ] **P2** 歴史的ドキュメントを整理：`docs/phase*/report.md` と実装計画 ADR を
@@ -346,11 +348,18 @@ OS 側の throttle に支配されるため未実施（R2 前半の残タスク�
 
 **目的**: RFP §9/§20 の「変更されたブロックだけ再レイアウト」を実際の描画経路で成立させる。
 
-- [ ] VisualBlock または別の cache entry に layout result、幅、theme/font revision、document revision を保持する。
-- [ ] 編集、viewport 幅、theme/font、画像高さの変化ごとに invalidation 条件を明文化する。
-- [ ] 非交差ブロックは BlockIndex とともに rebase し、shape/layout result を再利用する。
-- [ ] 実測高さ更新時の HeightIndex 差分更新と scroll anchoring を実装する。
-- [ ] cache hit/miss、再レイアウト block 数、`keystroke_to_paint` を CI/定期性能試験で比較する。
+- [x] VisualBlock または別の cache entry に layout result、幅、theme/font revision、document revision を保持する。
+- [x] 編集、viewport 幅、theme/font、画像高さの変化ごとに invalidation 条件を明文化する。
+      （ADR-0022）
+- [x] 非交差ブロックは BlockIndex とともに rebase し、shape/layout result を再利用する。
+- [x] 実測高さ更新時の HeightIndex 差分更新と scroll anchoring を実装する。
+      `BlockIndexUpdate` の置換区間だけを同期し、HeightIndex は 128 block chunk 単位で splice する。
+      10万 block の中央 split/join は median 0.002 ms / p95 0.003 ms。
+- [x] cache hit/miss、再レイアウト block 数、`keystroke_to_paint` を CI/定期性能試験で比較する。
+      instrument CSV に3指標を追加。cached `ShapedLine` の custom paint は入力 p95 を
+      5.47 ms → 21.49 ms に悪化させたため棄却し、GPUI native text element を維持する（ADR-0022）。
+      最終版の独立2回の 100 MB p95/p99 は 3.55/4.41 ms と 4.58/4.60 msで、R0 の
+      4.98/7.65 ms と再採取 R4B の 7.33/7.38 ms の双方以下。絶対 16/33 ms gateも通過。
 
 **完了条件**: 非交差ブロックの編集で画面内の無関係な shape/layout が再実行されない。
 100 MB / 10万段落の p95/p99 とメモリが R0 の許容範囲内。

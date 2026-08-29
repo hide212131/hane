@@ -102,11 +102,15 @@ pub struct EditorView {
     /// Rows for each presented block, keyed like `block_cache`. Kept across
     /// frames so scrolling back, or typing in another block, does not re-shape
     /// text that has not changed.
-    layout_cache: HashMap<BlockId, BlockLayout>,
+    layout_cache: HashMap<BlockId, LayoutCacheEntry>,
     /// Width of the text column the rows were laid out for. A change to it
     /// invalidates every layout, which is why it is recorded rather than
     /// recomputed.
     content_width: f32,
+    /// Hash of the window font properties used by `WindowShaper`. Width and
+    /// document revision live in each cache entry; this is the remaining global
+    /// invalidation generation.
+    layout_font_revision: u64,
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
@@ -117,6 +121,10 @@ pub struct EditorView {
     /// What one entry of `heights` measures. Blocks as soon as an index is
     /// published, physical lines until then.
     granularity: Granularity,
+    /// Identity and cheap height input aligned with a block-granularity height
+    /// index. This lets an incremental BlockIndex update splice only its changed
+    /// run while retaining measured heights on both sides.
+    height_blocks: HeightBlocks,
     document_parse_job_running: bool,
 }
 
@@ -140,6 +148,162 @@ pub(crate) struct CaretGeometry {
 enum Granularity {
     Blocks,
     Lines,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeightBlock {
+    id: BlockId,
+    line_count: usize,
+}
+
+const HEIGHT_BLOCK_CHUNK_TARGET: usize = 128;
+
+#[derive(Clone, Debug, Default)]
+struct HeightBlocks {
+    chunks: Vec<Vec<HeightBlock>>,
+    counts: Vec<usize>,
+    len: usize,
+}
+
+impl FromIterator<HeightBlock> for HeightBlocks {
+    fn from_iter<T: IntoIterator<Item = HeightBlock>>(iter: T) -> Self {
+        let blocks = iter.into_iter().collect::<Vec<_>>();
+        let chunks = blocks
+            .chunks(HEIGHT_BLOCK_CHUNK_TARGET)
+            .map(<[HeightBlock]>::to_vec)
+            .collect();
+        let mut this = Self {
+            chunks,
+            counts: Vec::new(),
+            len: blocks.len(),
+        };
+        this.retree();
+        this
+    }
+}
+
+impl HeightBlocks {
+    fn retree(&mut self) {
+        self.counts.clear();
+        self.counts.push(0);
+        self.counts
+            .extend(self.chunks.iter().map(|chunk| chunk.len()));
+        for index in 1..self.counts.len() {
+            let parent = index + (index & index.wrapping_neg());
+            if parent < self.counts.len() {
+                self.counts[parent] += self.counts[index];
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.counts.clear();
+        self.len = 0;
+    }
+
+    fn locate(&self, ordinal: usize) -> Option<(usize, usize)> {
+        if ordinal >= self.len {
+            return None;
+        }
+        let mut chunk = 0;
+        let mut before = 0;
+        let mut step = 1;
+        while step << 1 < self.counts.len() {
+            step <<= 1;
+        }
+        while step > 0 {
+            let next = chunk + step;
+            if next < self.counts.len() && before + self.counts[next] <= ordinal {
+                chunk = next;
+                before += self.counts[next];
+            }
+            step >>= 1;
+        }
+        Some((chunk, ordinal - before))
+    }
+
+    fn locate_insert(&self, ordinal: usize) -> (usize, usize) {
+        self.locate(ordinal).unwrap_or_else(|| {
+            self.chunks
+                .last()
+                .map_or((0, 0), |chunk| (self.chunks.len() - 1, chunk.len()))
+        })
+    }
+
+    fn get(&self, ordinal: usize) -> Option<HeightBlock> {
+        let (chunk, slot) = self.locate(ordinal)?;
+        self.chunks.get(chunk)?.get(slot).copied()
+    }
+
+    fn range_eq(&self, range: Range<usize>, blocks: &[HeightBlock]) -> bool {
+        range.len() == blocks.len()
+            && blocks
+                .iter()
+                .enumerate()
+                .all(|(at, block)| self.get(range.start + at).as_ref() == Some(block))
+    }
+
+    fn splice(&mut self, range: Range<usize>, blocks: &[HeightBlock]) {
+        let (first_chunk, first_slot) = self.locate_insert(range.start);
+        let (last_chunk, last_slot) = self.locate_insert(range.end);
+        let mut merged = Vec::with_capacity(blocks.len() + 2 * HEIGHT_BLOCK_CHUNK_TARGET);
+        if let Some(chunk) = self.chunks.get(first_chunk) {
+            merged.extend_from_slice(&chunk[..first_slot.min(chunk.len())]);
+        }
+        merged.extend_from_slice(blocks);
+        if let Some(chunk) = self.chunks.get(last_chunk) {
+            merged.extend_from_slice(&chunk[last_slot.min(chunk.len())..]);
+        }
+        let replacement = merged
+            .chunks(HEIGHT_BLOCK_CHUNK_TARGET)
+            .map(<[HeightBlock]>::to_vec)
+            .collect::<Vec<_>>();
+        let end_chunk = (last_chunk + 1).min(self.chunks.len());
+        self.chunks
+            .splice(first_chunk.min(end_chunk)..end_chunk, replacement);
+        self.len = self.len - range.len() + blocks.len();
+        self.retree();
+    }
+}
+
+fn rebase_ordinal_after_splice(
+    ordinal: usize,
+    anchor_id: Option<BlockId>,
+    replaced: Range<usize>,
+    inserted: &[HeightBlock],
+    new_len: usize,
+) -> usize {
+    if new_len == 0 {
+        return 0;
+    }
+    if ordinal < replaced.start {
+        return ordinal;
+    }
+    if ordinal >= replaced.end {
+        return (ordinal - replaced.len() + inserted.len()).min(new_len - 1);
+    }
+    anchor_id
+        .and_then(|id| inserted.iter().position(|block| block.id == id))
+        .map_or(replaced.start.min(new_len - 1), |at| replaced.start + at)
+}
+
+#[derive(Clone, Debug)]
+struct LayoutCacheEntry {
+    layout: BlockLayout,
+    font_revision: u64,
+}
+
+impl LayoutCacheEntry {
+    fn is_valid(&self, width: f32, font_revision: u64, revision: Revision) -> bool {
+        self.layout.width == width
+            && self.font_revision == font_revision
+            && self.layout.revision == revision
+    }
 }
 
 impl EditorView {
@@ -185,9 +349,11 @@ impl EditorView {
             line_owners: HashMap::new(),
             layout_cache: HashMap::new(),
             content_width: 0.0,
+            layout_font_revision: 0,
             caret_geometry: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
+            height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
         }
     }
@@ -264,6 +430,7 @@ impl EditorView {
         let lines = self.sessions.active().editor().document().line_count();
         self.granularity = Granularity::Lines;
         self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
+        self.height_blocks.clear();
         self.scroll_y = self.sessions.active().view_state().scroll_y;
         self.block_cache.clear();
         self.line_owners.clear();
@@ -300,8 +467,12 @@ impl EditorView {
             .apply_edits(self.sessions.active().editor().document())
         {
             self.record_block_index_update(&update);
+            if !self.apply_height_index_update(&update) {
+                self.resync_heights();
+            }
+        } else {
+            self.resync_heights();
         }
-        self.resync_heights();
         self.scroll_cursor_into_view();
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
@@ -842,11 +1013,15 @@ impl EditorView {
             .filter(|block| block.matches(&indexed) && block.covers(&window))
             .filter(|block| self.disclosures_are_current(block));
         if let Some(block) = drawn
-            && let Some(layout) = self.layout_cache.get(&indexed.id).filter(|layout| {
-                layout.width == self.content_width && layout.revision == block.revision
+            && let Some(entry) = self.layout_cache.get(&indexed.id).filter(|entry| {
+                entry.is_valid(
+                    self.content_width,
+                    self.layout_font_revision,
+                    block.revision,
+                )
             })
         {
-            return Some((block.clone(), layout.clone()));
+            return Some((block.clone(), entry.layout.clone()));
         }
         let visual = presented_block(self.editor(), &indexed, &window)?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -911,8 +1086,14 @@ impl EditorView {
                 let row = self
                     .layout_cache
                     .get(&block.id)
-                    .filter(|layout| layout.revision == editor.document().revision())
-                    .and_then(|layout| layout.row_bounds_for_source(cursor));
+                    .filter(|entry| {
+                        entry.is_valid(
+                            self.content_width,
+                            self.layout_font_revision,
+                            editor.document().revision(),
+                        )
+                    })
+                    .and_then(|entry| entry.layout.row_bounds_for_source(cursor));
                 match row {
                     Some((y, height)) => (block_top + y, height),
                     None => {
@@ -962,11 +1143,9 @@ impl EditorView {
         }
     }
 
-    /// Keeps `heights` keyed to the same thing the renderer enumerates. Rebuilds
-    /// only when the unit or the count changed — an edit inside one block leaves
-    /// both alone. The scroll position is carried across on the source offset at
-    /// the top of the viewport, so a rebuild does not move the document under the
-    /// reader.
+    /// Keeps `heights` keyed to the same thing the renderer enumerates. This is
+    /// the full synchronization path used for startup and index publication;
+    /// input uses `apply_height_index_update` to touch only its parse window.
     fn resync_heights(&mut self) {
         let (granularity, len) = self.desired_layout();
         if granularity == self.granularity && len == self.heights.len() {
@@ -981,9 +1160,99 @@ impl EditorView {
     /// viewport, read before the swap and resolved after it.
     fn install_heights(&mut self, granularity: Granularity, heights: HeightIndex) {
         let anchor = self.top_source_offset();
+        let intra = (!self.heights.is_empty()).then(|| {
+            let item = self.heights.block_at_y(self.scroll_y);
+            self.scroll_y - self.heights.prefix_sum(item)
+        });
         self.granularity = granularity;
         self.heights = heights;
-        self.scroll_y = anchor.map_or(self.scroll_y, |offset| self.scroll_for_offset(offset));
+        self.height_blocks = if granularity == Granularity::Blocks {
+            self.current_index()
+                .map(|index| {
+                    index
+                        .blocks()
+                        .map(|block| HeightBlock {
+                            id: block.id,
+                            line_count: block.line_count,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HeightBlocks::default()
+        };
+        self.scroll_y = anchor.map_or(self.scroll_y, |offset| {
+            let top = self.scroll_for_offset(offset);
+            let item = self.heights.block_at_y(top);
+            let inside = intra
+                .zip(self.heights.height(item))
+                .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
+            top + inside
+        });
+    }
+
+    /// Applies the small splice reported by the incremental block index. The
+    /// common case (typing without changing block boundaries or line count)
+    /// compares a handful of entries and leaves the height tree untouched.
+    fn apply_height_index_update(&mut self, update: &BlockIndexUpdate) -> bool {
+        if self.granularity != Granularity::Blocks {
+            return false;
+        }
+        let first = update.first_replaced_block;
+        let old_end = first.saturating_add(update.replaced_blocks);
+        if old_end > self.height_blocks.len() {
+            return false;
+        }
+        let Some(index) = self.current_index() else {
+            return false;
+        };
+        if index.len()
+            != self.height_blocks.len() - update.replaced_blocks + update.inserted_blocks
+        {
+            return false;
+        }
+        let next = (first..first + update.inserted_blocks)
+            .filter_map(|ordinal| index.block(ordinal))
+            .map(|block| HeightBlock {
+                id: block.id,
+                line_count: block.line_count,
+            })
+            .collect::<Vec<_>>();
+        if next.len() != update.inserted_blocks {
+            return false;
+        }
+        if self.height_blocks.range_eq(first..old_end, &next) {
+            return true;
+        }
+        let old_top = (!self.heights.is_empty()).then(|| {
+            let ordinal = self.heights.block_at_y(self.scroll_y);
+            let id = self.height_blocks.get(ordinal).map(|block| block.id);
+            let intra = self.scroll_y - self.heights.prefix_sum(ordinal);
+            (id, ordinal, intra)
+        });
+        self.heights.splice(
+            first..old_end,
+            next
+                .iter()
+                .map(|block| self.theme.line_height * block.line_count as f32),
+        );
+        self.height_blocks.splice(first..old_end, &next);
+
+        if let Some((id, old_ordinal, intra)) = old_top {
+            let ordinal = rebase_ordinal_after_splice(
+                old_ordinal,
+                id,
+                first..old_end,
+                &next,
+                self.heights.len(),
+            );
+            let inside = self
+                .heights
+                .height(ordinal)
+                .map_or(0.0, |height| intra.clamp(0.0, height));
+            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+        }
+        true
     }
 
     /// Source offset of the item currently at the top of the viewport.
@@ -1007,18 +1276,30 @@ impl EditorView {
     }
 
     fn scroll_for_offset(&self, offset: SourceOffset) -> f32 {
-        let item = match self.granularity {
+        match self.granularity {
             Granularity::Lines => self
                 .editor()
                 .document()
                 .line_for_offset(offset)
                 .map(|line| line.0)
-                .ok(),
-            Granularity::Blocks => self
-                .current_index()
-                .and_then(|index| index.ordinal_at(offset)),
-        };
-        item.map_or(self.scroll_y, |item| self.heights.prefix_sum(item))
+                .ok()
+                .map_or(self.scroll_y, |line| self.heights.prefix_sum(line)),
+            Granularity::Blocks => {
+                let document = self.editor().document();
+                let Some(block) = self
+                    .current_index()
+                    .and_then(|index| index.block_at(offset))
+                else {
+                    return self.scroll_y;
+                };
+                let first_line = block_line_span(document, &block).map_or(0, |span| span.start);
+                let line = document
+                    .line_for_offset(offset)
+                    .map_or(first_line, |line| line.0);
+                self.heights.prefix_sum(block.ordinal)
+                    + line.saturating_sub(first_line) as f32 * self.drawn_line_height(&block)
+            }
+        }
     }
 
     /// The blocks covering the viewport. `visible` is a range of height entries,
@@ -1113,8 +1394,11 @@ impl EditorView {
     fn drawn_line_height(&self, block: &IndexedBlock) -> f32 {
         self.layout_cache
             .get(&block.id)
-            .filter(|layout| layout.width == self.content_width)
-            .and_then(BlockLayout::average_line_height)
+            .filter(|entry| {
+                entry.layout.width == self.content_width
+                    && entry.font_revision == self.layout_font_revision
+            })
+            .and_then(|entry| entry.layout.average_line_height())
             .unwrap_or(self.theme.line_height)
             .max(1.0)
     }
@@ -1145,7 +1429,7 @@ impl EditorView {
                     && self
                         .layout_cache
                         .get_mut(&block.id)
-                        .is_none_or(|layout| layout.rebase(&deltas, revision))
+                        .is_none_or(|entry| entry.layout.rebase(&deltas, revision))
             } else {
                 false
             };
@@ -1173,13 +1457,30 @@ impl EditorView {
     ) -> BlockLayout {
         if reused
             && let Some(cached) = self.layout_cache.get(&block.id)
-            && cached.width == self.content_width
-            && cached.revision == block.revision
+            && cached.is_valid(
+                self.content_width,
+                self.layout_font_revision,
+                block.revision,
+            )
         {
-            return cached.clone();
+            #[cfg(feature = "instrument")]
+            {
+                self.instrumentation.layout_cache_hits += 1;
+            }
+            return cached.layout.clone();
+        }
+        #[cfg(feature = "instrument")]
+        {
+            self.instrumentation.layout_cache_misses += 1;
         }
         let layout = layout_block(block, self.content_width, shaper);
-        self.layout_cache.insert(block.id, layout.clone());
+        self.layout_cache.insert(
+            block.id,
+            LayoutCacheEntry {
+                layout: layout.clone(),
+                font_revision: self.layout_font_revision,
+            },
+        );
         layout
     }
 
@@ -1392,7 +1693,11 @@ impl EditorView {
             }
         }
         if let Some(output) = &mut instrumentation.metrics_output {
-            if let Err(error) = output.paint(interval, layout) {
+            let cache = (
+                instrumentation.layout_cache_hits,
+                instrumentation.layout_cache_misses,
+            );
+            if let Err(error) = output.paint(interval, layout, cache) {
                 eprintln!("could not write paint metrics: {error}");
             }
             for measurement in measurements {
@@ -1401,6 +1706,8 @@ impl EditorView {
                 }
             }
         }
+        instrumentation.layout_cache_hits = 0;
+        instrumentation.layout_cache_misses = 0;
         if !measurements.is_empty() {
             log_summary(&self.metrics);
         }
@@ -1425,7 +1732,15 @@ impl EditorView {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
-        self.theme = resolve_theme(self.settings.theme, window.appearance());
+        let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
+        if resolved_theme != self.theme {
+            self.theme = resolved_theme;
+            self.block_cache.clear();
+            self.layout_cache.clear();
+            let (granularity, _) = self.desired_layout();
+            let heights = HeightIndex::new(self.item_heights());
+            self.install_heights(granularity, heights);
+        }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
@@ -1437,6 +1752,14 @@ impl Render for EditorView {
             - 2.0 * self.theme.line_horizontal_padding)
             .max(1.0);
         let shaper = WindowShaper::new(window);
+        let font_revision = shaper.font_revision();
+        if font_revision != self.layout_font_revision {
+            self.layout_font_revision = font_revision;
+            self.layout_cache.clear();
+            let (granularity, _) = self.desired_layout();
+            let heights = HeightIndex::new(self.item_heights());
+            self.install_heights(granularity, heights);
+        }
         let max_scroll = (self.heights.total_height() - self.viewport_height).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
         let visible =
@@ -1472,6 +1795,11 @@ impl Render for EditorView {
         // room its rows actually need.
         let mut first_item = usize::MAX;
         let mut last_item = 0;
+        let height_anchor = (self.granularity == Granularity::Blocks && !self.heights.is_empty())
+            .then(|| {
+                let ordinal = self.heights.block_at_y(self.scroll_y);
+                (ordinal, self.scroll_y - self.heights.prefix_sum(ordinal))
+            });
         self.line_owners.clear();
         for (ordinal, visual, layout) in &rendered {
             match self.granularity {
@@ -1497,6 +1825,17 @@ impl Render for EditorView {
                 self.line_owners
                     .insert(line.line_id as usize, (visual.id, at));
             }
+        }
+        // Measuring wrapped rows can correct blocks above the viewport. Keep the
+        // same block and the same position inside it at the top instead of
+        // letting those corrections visibly move the document.
+        if let Some((old_ordinal, intra)) = height_anchor {
+            let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
+            let inside = self
+                .heights
+                .height(ordinal)
+                .map_or(0.0, |height| intra.clamp(0.0, height));
+            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
         }
         // Where the caret was drawn, for the IME candidate window. Only the
         // block that holds it can answer, and only while it is on screen.
@@ -1724,6 +2063,25 @@ mod tests {
     use super::*;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
+
+    #[test]
+    fn layout_cache_key_rejects_each_geometry_input_independently() {
+        let entry = LayoutCacheEntry {
+            layout: BlockLayout {
+                block: BlockId(7),
+                revision: Revision(3),
+                width: 640.0,
+                lines: Vec::new(),
+                leading_space: 0.0,
+                trailing_space: 0.0,
+            },
+            font_revision: 11,
+        };
+        assert!(entry.is_valid(640.0, 11, Revision(3)));
+        assert!(!entry.is_valid(639.0, 11, Revision(3)));
+        assert!(!entry.is_valid(640.0, 12, Revision(3)));
+        assert!(!entry.is_valid(640.0, 11, Revision(4)));
+    }
 
     /// Presents a whole document the way `render` does: index first, then one
     /// `presented_block` call per block.
@@ -2058,5 +2416,70 @@ mod tests {
     fn block_context_rejects_stale_revision() {
         assert!(block_context_revision_is_current(Revision(4), Revision(4)));
         assert!(!block_context_revision_is_current(Revision(5), Revision(4)));
+    }
+
+    #[test]
+    fn height_anchor_rebases_without_scanning_untouched_blocks() {
+        let inserted = [
+            HeightBlock {
+                id: BlockId(20),
+                line_count: 1,
+            },
+            HeightBlock {
+                id: BlockId(21),
+                line_count: 1,
+            },
+            HeightBlock {
+                id: BlockId(22),
+                line_count: 1,
+            },
+        ];
+        assert_eq!(
+            rebase_ordinal_after_splice(2, Some(BlockId(2)), 4..6, &inserted, 9),
+            2
+        );
+        assert_eq!(
+            rebase_ordinal_after_splice(7, Some(BlockId(7)), 4..6, &inserted, 9),
+            8
+        );
+        assert_eq!(
+            rebase_ordinal_after_splice(5, Some(BlockId(21)), 4..6, &inserted, 9),
+            5
+        );
+        assert_eq!(
+            rebase_ordinal_after_splice(5, Some(BlockId(99)), 4..6, &inserted, 9),
+            4
+        );
+    }
+
+    #[test]
+    fn height_block_metadata_splices_across_chunk_boundaries() {
+        let mut flat = (0..300)
+            .map(|id| HeightBlock {
+                id: BlockId(id),
+                line_count: id as usize % 5 + 1,
+            })
+            .collect::<Vec<_>>();
+        let mut blocks = flat.iter().copied().collect::<HeightBlocks>();
+        let inserted = [
+            HeightBlock {
+                id: BlockId(1_000),
+                line_count: 2,
+            },
+            HeightBlock {
+                id: BlockId(1_001),
+                line_count: 3,
+            },
+            HeightBlock {
+                id: BlockId(1_002),
+                line_count: 4,
+            },
+        ];
+        flat.splice(127..131, inserted);
+        blocks.splice(127..131, &inserted);
+        assert_eq!(blocks.len(), flat.len());
+        assert!(blocks.range_eq(0..flat.len(), &flat));
+        assert_eq!(blocks.get(126), flat.get(126).copied());
+        assert_eq!(blocks.get(130), flat.get(130).copied());
     }
 }

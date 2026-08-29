@@ -1,4 +1,4 @@
-//! Small, dependency-free rolling metrics primitives shared by the UI and benchmarks.
+//! Runtime timing, rolling-window, distribution, and process-memory primitives.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

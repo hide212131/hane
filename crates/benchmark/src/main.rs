@@ -1,7 +1,8 @@
 use hane_benchmark::{
     Environment, generate_fixtures, markdown_report, run_block_heights_scenario,
     run_block_index_scenario, run_block_layout_scenario, run_buffer_edit_scenario,
-    run_file_open_scenario, run_layout_scenario, run_presentation_scenario,
+    run_file_open_scenario, run_height_splice_scenario, run_layout_scenario,
+    run_presentation_scenario,
 };
 use std::path::Path;
 
@@ -28,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let typing_index = run_block_index_scenario(100_000, BLOCK_INDEX_EDITS, false);
             let structural_index = run_block_index_scenario(100_000, BLOCK_INDEX_EDITS, true);
             let block_heights = run_block_heights_scenario(100_000, 30);
+            let height_splice = run_height_splice_scenario(100_000, 200);
             let block_layout = run_block_layout_scenario(100_000, 200);
             print!(
                 "{}",
@@ -48,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             structural_index.update
                         ),
                         ("block height index rebuild", block_heights),
+                        ("block height index local splice", height_splice),
                         ("viewport block layout", block_layout),
                     ]
                 )

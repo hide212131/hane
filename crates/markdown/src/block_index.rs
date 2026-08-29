@@ -94,8 +94,12 @@ struct Entry {
 pub struct BlockIndexUpdate {
     pub revision: Revision,
     pub reparsed_bytes: usize,
+    /// First ordinal removed from the index by the window re-parse.
+    pub first_replaced_block: usize,
     /// Blocks removed from the index and replaced by the window re-parse.
     pub replaced_blocks: usize,
+    /// Blocks inserted at [`Self::first_replaced_block`].
+    pub inserted_blocks: usize,
     /// Blocks after the window that were conservatively marked
     /// [`Confidence::Provisional`] because the parse could not re-synchronize.
     pub invalidated_blocks: usize,
@@ -296,21 +300,25 @@ impl BlockIndex {
         let revision = buffer.revision();
         let finish = |index: &mut Self,
                       reparsed_bytes,
+                      first_replaced_block,
                       replaced_blocks,
+                      inserted_blocks,
                       invalidated_blocks,
                       resynchronized| {
             index.revision = revision;
             BlockIndexUpdate {
                 revision,
                 reparsed_bytes,
+                first_replaced_block,
                 replaced_blocks,
+                inserted_blocks,
                 invalidated_blocks,
                 resynchronized,
                 elapsed: started.elapsed(),
             }
         };
         if deltas.is_empty() {
-            return finish(self, 0, 0, 0, true);
+            return finish(self, 0, 0, 0, 0, 0, true);
         }
         // Only a document with no block at all indexes to nothing, so this
         // rebuild parses a blank (hence tiny) document.
@@ -319,15 +327,16 @@ impl BlockIndex {
             let bytes = rebuilt.covered_bytes();
             let blocks = rebuilt.len();
             *self = rebuilt;
-            return finish(self, bytes, blocks, 0, true);
+            return finish(self, bytes, 0, 0, blocks, 0, true);
         }
 
         let Some((dirty_first, dirty_last)) = self.absorb_edits(deltas, revision) else {
+            let replaced = self.len();
             let rebuilt = Self::build(revision, &buffer.full_text());
             let bytes = rebuilt.covered_bytes();
-            let blocks = rebuilt.len();
+            let inserted = rebuilt.len();
             *self = rebuilt;
-            return finish(self, bytes, blocks, 0, true);
+            return finish(self, bytes, 0, replaced, inserted, 0, true);
         };
 
         // The block before the dirty run joins the window: an edit can merge its
@@ -350,7 +359,15 @@ impl BlockIndex {
                         .map_or(window_first, |at| at.min(window_first)),
                 );
                 let invalidated = self.len() - window_first;
-                return finish(self, reparsed_bytes, 0, invalidated, false);
+                return finish(
+                    self,
+                    reparsed_bytes,
+                    window_first,
+                    0,
+                    0,
+                    invalidated,
+                    false,
+                );
             };
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
@@ -386,7 +403,15 @@ impl BlockIndex {
                 self.provisional_from = Some(self.provisional_from.map_or(from, |at| at.min(from)));
                 self.len() - from
             };
-            return finish(self, reparsed_bytes, replaced, invalidated, resynchronized);
+            return finish(
+                self,
+                reparsed_bytes,
+                window_first,
+                replaced,
+                inserted,
+                invalidated,
+                resynchronized,
+            );
         }
     }
 
@@ -777,7 +802,9 @@ mod tests {
 
         assert!(update.resynchronized);
         assert_eq!(update.invalidated_blocks, 0);
+        assert_eq!(update.first_replaced_block, 9_999);
         assert_eq!(update.replaced_blocks, 3);
+        assert_eq!(update.inserted_blocks, 3);
         assert!(
             update.reparsed_bytes < 200,
             "one keystroke re-parsed {} bytes",
@@ -805,6 +832,9 @@ mod tests {
         // Split "bravo" into two paragraphs.
         let update = apply(&mut index, &mut buffer, 12, "\n\nsplit");
         assert!(update.resynchronized);
+        assert_eq!(update.first_replaced_block, 0);
+        assert_eq!(update.replaced_blocks, 3);
+        assert_eq!(update.inserted_blocks, 4);
         assert_eq!(index.len(), 4);
         assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
         // The block after the split is untouched, so it keeps its id.

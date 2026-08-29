@@ -8,6 +8,7 @@
 use crate::line::{block_font_size, inline_display_for};
 use gpui::{FontStyle, FontWeight, TextRun, TextStyle, Window, WindowTextSystem, px};
 use hane_presentation::{BlockWeight, LineShaper, VisualLine};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -22,6 +23,15 @@ impl WindowShaper {
             text_system: window.text_system().clone(),
             style: window.text_style(),
         }
+    }
+
+    /// Stable key for every font property that can change wrapping or glyph x
+    /// positions. Color and other paint-only text style fields are deliberately
+    /// excluded, so a palette change does not discard valid geometry.
+    pub(crate) fn font_revision(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.style.font().hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Font runs for one stretch of a line's visual text, split where the inline

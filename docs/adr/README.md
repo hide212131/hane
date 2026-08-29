@@ -33,6 +33,7 @@ Phase 2以降の実装判断を記録する。ADR-0018以降は `docs/refactor-p
 | [ADR-0019](0019-document-session-and-file-service.md) | DocumentSession と File I/O 境界 |
 | [ADR-0020](0020-block-virtualization.md) | ブロック単位の仮想化と描画 |
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
+| [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 
 ## Phase 0 実装時の参照順
 
