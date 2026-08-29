@@ -1574,7 +1574,15 @@ impl HeightIndex {
             }
             bit >>= 1;
         }
-        chunk = chunk.min(self.chunks.len() - 1);
+        // A `target` equal to the whole height — where a viewport at the end of
+        // the document lands, since `y` is clamped to it — lets the descent walk
+        // past the last chunk. Step back onto that chunk and take its total back
+        // out of `sum`, or the scan below starts from a running height that
+        // already covers the chunk and returns its first entry.
+        if chunk >= self.chunks.len() {
+            chunk = self.chunks.len() - 1;
+            sum -= self.chunks[chunk].total;
+        }
         let ordinal = Self::tree_prefix(&self.counts, chunk);
         for (slot, height) in self.chunks[chunk].heights.iter().enumerate() {
             if target < sum + height {
@@ -1641,6 +1649,32 @@ mod tests {
         assert_eq!(h.total_height(), 70.0);
         assert_eq!(h.block_at_y(15.0), 0);
     }
+    #[test]
+    fn the_last_block_stays_visible_when_the_viewport_reaches_the_end() {
+        // Measured heights of the README's blocks: the viewport plus overscan
+        // reaches past the total height well before the scroll limit, so the
+        // whole tail of the document depends on this.
+        let heights = HeightIndex::new([
+            68.9, 216.0, 104.0, 63.7, 208.0, 63.7, 78.0, 52.0, 63.7, 52.0, 235.3, 52.0, 115.7,
+            63.7, 52.0, 314.8, 52.0, 63.7, 52.0, 63.7, 52.0, 52.0, 145.6, 130.0,
+        ]);
+        let total = heights.total_height();
+        assert_eq!(heights.block_at_y(total), 23);
+        assert_eq!(heights.block_at_y(total + 500.0), 23);
+        let visible = heights.visible_range(1480.6, 693.0, 260.0);
+        assert_eq!(visible.end, 24);
+        assert!(visible.start < visible.end);
+    }
+
+    #[test]
+    fn the_last_block_stays_visible_across_a_chunk_boundary() {
+        // More entries than one chunk holds, so the descent ends on a chunk the
+        // running height has already been carried past.
+        let heights = HeightIndex::new(vec![10.0; 300]);
+        assert_eq!(heights.block_at_y(3000.0), 299);
+        assert_eq!(heights.visible_range(2900.0, 100.0, 0.0), 290..300);
+    }
+
     #[test]
     fn height_splice_preserves_measurements_outside_the_changed_blocks() {
         let mut h = HeightIndex::new([11.0, 22.0, 33.0, 44.0]);

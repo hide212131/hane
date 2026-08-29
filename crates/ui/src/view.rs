@@ -77,6 +77,11 @@ fn content_top_for_scroll(scroll_y: f32) -> f32 {
     -scroll_y
 }
 
+fn clamp_scroll_y(scroll_y: f32, content_height: f32, viewport_height: f32) -> f32 {
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    scroll_y.clamp(0.0, max_scroll)
+}
+
 fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
     current == candidate
 }
@@ -871,8 +876,11 @@ impl EditorView {
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(px(self.theme.line_height));
-        let max = (self.heights.total_height() - self.viewport_height).max(0.0);
-        self.scroll_y = (self.scroll_y - f32::from(delta.y)).clamp(0.0, max);
+        self.scroll_y = clamp_scroll_y(
+            self.scroll_y - f32::from(delta.y),
+            self.heights.total_height(),
+            self.viewport_height,
+        );
         cx.notify();
     }
 
@@ -1801,8 +1809,11 @@ impl Render for EditorView {
             let heights = HeightIndex::new(self.item_heights());
             self.install_heights(granularity, heights);
         }
-        let max_scroll = (self.heights.total_height() - self.viewport_height).max(0.0);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        self.scroll_y = clamp_scroll_y(
+            self.scroll_y,
+            self.heights.total_height(),
+            self.viewport_height,
+        );
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
@@ -1878,6 +1889,14 @@ impl Render for EditorView {
                 .map_or(0.0, |height| intra.clamp(0.0, height));
             self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
         }
+        // A newly measured block can shrink at the old bottom. Anchoring
+        // preserves its block-relative position, which can now sit below the
+        // new scroll limit and move all content above the viewport.
+        self.scroll_y = clamp_scroll_y(
+            self.scroll_y,
+            self.heights.total_height(),
+            self.viewport_height,
+        );
         // Where the caret was drawn, for the IME candidate window. Only the
         // block that holds it can answer, and only while it is on screen.
         let caret = self.editor().selection().active;
@@ -2198,6 +2217,13 @@ mod tests {
         assert_eq!(scroll_y, 136.0);
         assert_eq!(content_top_for_scroll(scroll_y), -136.0);
         assert_eq!(cursor_top - scroll_y, 696.0);
+    }
+
+    #[test]
+    fn height_remeasurement_cannot_leave_scroll_position_below_new_bottom() {
+        // This is the position retained by the height anchor after a block at
+        // the old bottom shrinks from 1,000px to 600px.
+        assert_eq!(clamp_scroll_y(600.0, 600.0, 300.0), 300.0);
     }
 
     #[test]
