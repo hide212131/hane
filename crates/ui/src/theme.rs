@@ -23,6 +23,10 @@ pub(crate) struct Theme {
     pub quote_foreground: u32,
     pub media_background: u32,
     pub table_background: u32,
+    pub sidebar_width: f32,
+    pub sidebar_background: u32,
+    pub sidebar_foreground: u32,
+    pub sidebar_active_background: u32,
 }
 
 pub(crate) const DEFAULT_THEME: Theme = Theme {
@@ -41,6 +45,10 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     quote_foreground: 0x6b6259,
     media_background: 0xf3f0eb,
     table_background: 0xf5f2ed,
+    sidebar_width: 220.0,
+    sidebar_background: 0xf0ede7,
+    sidebar_foreground: 0x262626,
+    sidebar_active_background: 0xe0dcd3,
 };
 
 pub(crate) const DARK_THEME: Theme = Theme {
@@ -59,6 +67,10 @@ pub(crate) const DARK_THEME: Theme = Theme {
     quote_foreground: 0xaaa39a,
     media_background: 0x292a2d,
     table_background: 0x27282b,
+    sidebar_width: 220.0,
+    sidebar_background: 0x18191b,
+    sidebar_foreground: 0xe8e5df,
+    sidebar_active_background: 0x2c2d30,
 };
 
 pub(crate) fn resolve_theme(preference: ThemePreference, appearance: WindowAppearance) -> Theme {

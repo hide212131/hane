@@ -25,7 +25,7 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -42,9 +42,10 @@ use hane_presentation::{
     block_heights, block_line_span, layout_block,
 };
 use hane_session::{
-    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService, RecentFiles,
-    SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId,
-    SessionSet, SessionViewState, Settings, StateStores, run_save_job,
+    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService,
+    OsWorkFolderScanner, RecentFiles, SaveDecision, SaveFailure, SaveIntent, SaveOutcome,
+    SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores,
+    WorkFolder, WorkFolderScanner, run_save_job,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -105,6 +106,10 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     recent: RecentFiles,
+    /// The Markdown index of the directory this window was opened onto, if
+    /// any. `None` keeps single-file editing exactly as it was: no sidebar,
+    /// no folder concept anywhere else in the view.
+    work_folder: Option<WorkFolder>,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -357,6 +362,7 @@ impl EditorView {
             stores,
             settings,
             recent,
+            work_folder: None,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -404,6 +410,55 @@ impl EditorView {
         );
         view.remember_recent(path);
         cx.add_recent_document(path);
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+        {
+            view.instrumentation.file_open_time = started.elapsed();
+            view.instrumentation.load_rss_bytes = hane_metrics::process_memory_bytes();
+        }
+        Ok(view)
+    }
+
+    /// Opens `root` as a work folder: its Markdown files are indexed for the
+    /// sidebar and the first one (if any) is loaded as the active session, the
+    /// same way `open` loads a single file synchronously before the window
+    /// exists. An empty folder starts from one empty untitled note instead of
+    /// failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the folder cannot be scanned or its first
+    /// document cannot be read.
+    pub fn open_work_folder(root: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
+        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+        let started = Instant::now();
+        let work_folder = OsWorkFolderScanner.scan(root)?;
+        let files: Arc<dyn FileService> = Arc::new(OsFileService);
+        let first = work_folder
+            .entries()
+            .first()
+            .map(|entry| entry.path().to_path_buf());
+        let stores = StateStores::from_environment();
+        #[cfg_attr(
+            not(any(feature = "instrument", feature = "timing-probe")),
+            allow(unused_mut)
+        )]
+        let mut view = match &first {
+            // The first note is read before the window exists, matching the
+            // single-file synchronous read in `open`; every later switch goes
+            // to a background thread through `open_work_folder_entry`.
+            Some(path) => {
+                let loaded = files.load(path)?;
+                let mut view =
+                    Self::from_sessions(SessionSet::with_loaded(loaded), files, stores, cx);
+                view.remember_recent(path);
+                cx.add_recent_document(path);
+                view
+            }
+            None => {
+                Self::from_sessions(SessionSet::with_untitled("", "Untitled"), files, stores, cx)
+            }
+        };
+        view.work_folder = Some(work_folder);
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
         {
             view.instrumentation.file_open_time = started.elapsed();
@@ -699,7 +754,18 @@ impl EditorView {
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        match self.sessions.open_decision(path, OpenPolicy::ReuseActive) {
+        self.open_with_policy(path, OpenPolicy::ReuseActive, cx);
+    }
+
+    /// Opens a work folder sidebar entry: an already-open note is reused, and
+    /// an unloaded one is loaded into a session of its own, so switching notes
+    /// never asks the user to save whatever else happens to be open.
+    pub fn open_work_folder_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.open_with_policy(path, OpenPolicy::NewSession, cx);
+    }
+
+    fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        match self.sessions.open_decision(path, policy) {
             OpenDecision::Reject(_) => {
                 self.status = Some("Save current changes before opening another file".to_owned());
                 cx.notify();
@@ -1796,8 +1862,17 @@ impl Render for EditorView {
             .max(self.theme.line_height);
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
-        // read once per frame and every layout is keyed by it.
+        // read once per frame and every layout is keyed by it. A sidebar takes
+        // its width out of the same window, so it must be subtracted here too,
+        // not just in the element tree, or wrapping would be computed for a
+        // column wider than what is actually drawn.
+        let sidebar_width = if self.work_folder.is_some() {
+            self.theme.sidebar_width
+        } else {
+            0.0
+        };
         self.content_width = (f32::from(window.viewport_size().width)
+            - sidebar_width
             - 2.0 * self.theme.line_horizontal_padding)
             .max(1.0);
         let shaper = WindowShaper::new(window);
@@ -1944,19 +2019,25 @@ impl Render for EditorView {
         let root = div()
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(rgb(self.theme.editor_background))
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.focus_handle(cx));
         let root = install_action_listeners(root, cx)
             .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .children(self.work_folder_sidebar(cx));
+        let main_column = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
             .child(self.header_element(status, cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
         let editor = self.sessions.active().editor();
-        let rendered = root.child(
+        let main_column = main_column.child(
             div()
                 .relative()
                 .flex_1()
@@ -2013,8 +2094,55 @@ impl Render for EditorView {
                         .child(div().h(px(bottom_space))),
                 ),
         );
+        let rendered = root.child(main_column);
         self.metrics.record_layout(layout_started.elapsed());
         rendered
+    }
+}
+
+impl EditorView {
+    /// The Markdown list for the sidebar, when this window was opened onto a
+    /// work folder. Every entry switches into it on click, reusing an
+    /// already-open session or loading it lazily; nothing here reads a file.
+    fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let work_folder = self.work_folder.as_ref()?;
+        let active_path = self.sessions.active().path();
+        let entries = work_folder
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let is_active = active_path == Some(entry.path());
+                let path = entry.path().to_path_buf();
+                div()
+                    .id(("work-folder-entry", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_active, |element| {
+                        element.bg(rgb(self.theme.sidebar_active_background))
+                    })
+                    .child(entry.name().to_owned())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.open_work_folder_entry(&path, cx);
+                    }))
+            });
+        Some(
+            div()
+                .id("work-folder-sidebar")
+                .flex_none()
+                .w(px(self.theme.sidebar_width))
+                .h_full()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .bg(rgb(self.theme.sidebar_background))
+                .text_color(rgb(self.theme.sidebar_foreground))
+                .children(entries),
+        )
     }
 }
 
