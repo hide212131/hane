@@ -11,8 +11,8 @@ const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、
 
 fn main() {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
-#[cfg(any(feature = "instrument", feature = "timing-probe"))]
-let process_started = std::time::Instant::now();
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+    let process_started = std::time::Instant::now();
     #[cfg(feature = "instrument")]
     let config = hane_ui::InstrumentationConfig::from_environment();
     #[cfg(feature = "instrument")]

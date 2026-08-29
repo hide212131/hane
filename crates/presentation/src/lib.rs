@@ -1,6 +1,42 @@
 //! Visual blocks and lines, source mapping, and variable-height virtualization.
 
-pub mod layout;
+// Presentation query values are frequently inspected only while composing a frame.
+#![allow(
+    clippy::must_use_candidate,
+    reason = "frame-composition query APIs are intentionally discardable"
+)]
+#![allow(
+    clippy::missing_panics_doc,
+    reason = "layout invariant panics are documented by their enforcing assertion"
+)]
+#![allow(
+    clippy::doc_markdown,
+    reason = "rendering documentation uses established Markdown terminology as prose"
+)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "layout coordinates intentionally convert bounded counts between pixel and index representations"
+)]
+#![allow(
+    clippy::float_cmp,
+    reason = "layout tests and exact zero-width checks require deterministic float equality"
+)]
+#![allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the trait implementation signature follows its related non-Copy API"
+)]
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "the layout API owns its input to keep call sites uniform"
+)]
+#![allow(
+    clippy::struct_excessive_bools,
+    reason = "the display policy mirrors independent Markdown presentation flags"
+)]
+
+mod layout;
 pub mod testing;
 
 pub use layout::{
@@ -12,7 +48,7 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeKind, is_delimited_inline,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeKind, has_delimiter_markers,
     is_table_delimiter, parse_document,
 };
 use std::ops::Range;
@@ -223,6 +259,7 @@ pub struct InlineDisplay {
 }
 
 impl InlineDisplay {
+    #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self {
             bold: self.bold || other.bold,
@@ -303,11 +340,7 @@ pub enum LineContext {
 /// "which lines are literal" and "which lines are table syntax" is decided, and
 /// it reads only the block kind the index published.
 pub const fn block_line_context(kind: NodeKind) -> LineContext {
-    match kind {
-        NodeKind::CodeBlock => LineContext::FencedCode,
-        NodeKind::Table | NodeKind::TableHead | NodeKind::TableRow => LineContext::Table,
-        _ => LineContext::Normal,
-    }
+    syntax_display(kind).line_context
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -585,7 +618,11 @@ impl VisualBlock {
             };
             range = next;
         }
-        if !self.lines.iter_mut().all(|line| line.rebase(deltas, current)) {
+        if !self
+            .lines
+            .iter_mut()
+            .all(|line| line.rebase(deltas, current))
+        {
             return false;
         }
         self.source_range = range;
@@ -683,11 +720,7 @@ pub struct BlockWindow<'a> {
 /// which answers for a single node: a container node (a table, a list) does
 /// decide how its block looks even though its lines are presented one by one.
 fn block_display_kind(kind: NodeKind) -> BlockKind {
-    match kind {
-        NodeKind::Table | NodeKind::TableHead | NodeKind::TableRow => BlockKind::TableRow,
-        NodeKind::List { .. } | NodeKind::ListItem { .. } => BlockKind::ListItem,
-        other => presentation_block_kind(other).unwrap_or(BlockKind::Unsupported),
-    }
+    syntax_display(kind).indexed_block
 }
 
 /// Presents the visible lines of one indexed Markdown block.
@@ -747,12 +780,7 @@ pub fn present_block(
     }
 }
 
-pub fn present_plain(
-    line_id: u64,
-    revision: Revision,
-    range: SourceRange,
-    source: &str,
-) -> VisualLine {
+fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &str) -> VisualLine {
     VisualLine {
         line_id,
         source_range: range,
@@ -782,7 +810,7 @@ pub fn present_plain(
 /// inferring structure. This is the formal display contract for unimplemented
 /// syntax: a construct with no specialized presenter, or one whose marker
 /// derivation fails to tile the source range, still round-trips its source.
-pub fn present_raw_source(
+fn present_raw_source(
     line_id: u64,
     revision: Revision,
     range: SourceRange,
@@ -800,29 +828,86 @@ pub fn present_raw_source(
 /// structural container (list, table) or a construct with no presenter yet, in
 /// which case the raw-source fallback applies. This function is the single seam
 /// between the parser vocabulary and the display vocabulary.
-fn presentation_block_kind(kind: NodeKind) -> Option<BlockKind> {
-    match kind {
-        NodeKind::Paragraph => Some(BlockKind::Paragraph),
-        NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
-        NodeKind::CodeBlock => Some(BlockKind::CodeBlock),
-        NodeKind::Quote => Some(BlockKind::Quote),
-        NodeKind::ListItem { .. } => Some(BlockKind::ListItem),
-        NodeKind::Rule => Some(BlockKind::Rule),
-        _ => None,
-    }
+#[derive(Clone, Copy)]
+struct SyntaxDisplay {
+    /// The type a top-level indexed block displays as. Containers may choose a
+    /// display even when they do not represent a presentable tree node.
+    indexed_block: BlockKind,
+    /// The type a presentable tree node contributes to a line.
+    node_block: Option<BlockKind>,
+    inline_style: Option<StyleKind>,
+    line_context: LineContext,
 }
 
-/// Maps a parser syntax kind to the display kind for an inline run. `None` means
-/// the node carries no styling of its own.
-fn presentation_style_kind(kind: NodeKind) -> Option<StyleKind> {
+const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
+    let default = SyntaxDisplay {
+        indexed_block: BlockKind::Unsupported,
+        node_block: None,
+        inline_style: None,
+        line_context: LineContext::Normal,
+    };
     match kind {
-        NodeKind::Strong => Some(StyleKind::Bold),
-        NodeKind::Emphasis => Some(StyleKind::Italic),
-        NodeKind::Strikethrough => Some(StyleKind::Strikethrough),
-        NodeKind::InlineCode => Some(StyleKind::InlineCode),
-        NodeKind::Link => Some(StyleKind::Link),
-        NodeKind::CodeBlock => Some(StyleKind::CodeBlock),
-        _ => None,
+        NodeKind::Paragraph => SyntaxDisplay {
+            indexed_block: BlockKind::Paragraph,
+            node_block: Some(BlockKind::Paragraph),
+            ..default
+        },
+        NodeKind::Heading(level) => SyntaxDisplay {
+            indexed_block: BlockKind::Heading(level),
+            node_block: Some(BlockKind::Heading(level)),
+            ..default
+        },
+        NodeKind::CodeBlock => SyntaxDisplay {
+            indexed_block: BlockKind::CodeBlock,
+            node_block: Some(BlockKind::CodeBlock),
+            inline_style: Some(StyleKind::CodeBlock),
+            line_context: LineContext::FencedCode,
+        },
+        NodeKind::Quote => SyntaxDisplay {
+            indexed_block: BlockKind::Quote,
+            node_block: Some(BlockKind::Quote),
+            ..default
+        },
+        NodeKind::List { .. } => SyntaxDisplay {
+            indexed_block: BlockKind::ListItem,
+            ..default
+        },
+        NodeKind::ListItem { .. } => SyntaxDisplay {
+            indexed_block: BlockKind::ListItem,
+            node_block: Some(BlockKind::ListItem),
+            ..default
+        },
+        NodeKind::Table | NodeKind::TableHead | NodeKind::TableRow => SyntaxDisplay {
+            indexed_block: BlockKind::TableRow,
+            line_context: LineContext::Table,
+            ..default
+        },
+        NodeKind::Rule => SyntaxDisplay {
+            indexed_block: BlockKind::Rule,
+            node_block: Some(BlockKind::Rule),
+            ..default
+        },
+        NodeKind::Strong => SyntaxDisplay {
+            inline_style: Some(StyleKind::Bold),
+            ..default
+        },
+        NodeKind::Emphasis => SyntaxDisplay {
+            inline_style: Some(StyleKind::Italic),
+            ..default
+        },
+        NodeKind::Strikethrough => SyntaxDisplay {
+            inline_style: Some(StyleKind::Strikethrough),
+            ..default
+        },
+        NodeKind::InlineCode => SyntaxDisplay {
+            inline_style: Some(StyleKind::InlineCode),
+            ..default
+        },
+        NodeKind::Link => SyntaxDisplay {
+            inline_style: Some(StyleKind::Link),
+            ..default
+        },
+        _ => default,
     }
 }
 
@@ -859,7 +944,7 @@ fn marker_is_disclosed(
         || parsed
             .tree
             .iter()
-            .filter(|(_, node)| is_delimited_inline(node.kind))
+            .filter(|(_, node)| has_delimiter_markers(node.kind))
             .any(|(_, span)| {
                 span.source_range.start <= marker.start
                     && marker.end <= span.source_range.end
@@ -868,7 +953,7 @@ fn marker_is_disclosed(
         || parsed
             .tree
             .blocks()
-            .filter(|(_, node)| presentation_block_kind(node.kind).is_some())
+            .filter(|(_, node)| syntax_display(node.kind).node_block.is_some())
             .any(|(_, block)| {
                 marker.start == block.source_range.start
                     && marker.end <= block.source_range.end
@@ -936,7 +1021,7 @@ pub fn present_markdown_with_disclosure(
     let kind = parsed
         .tree
         .blocks()
-        .find_map(|(_, block)| presentation_block_kind(block.kind))
+        .find_map(|(_, block)| syntax_display(block.kind).node_block)
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
@@ -994,9 +1079,9 @@ pub fn present_markdown_with_disclosure(
     let mut style_runs = parsed
         .tree
         .iter()
-        .filter(|(_, node)| is_delimited_inline(node.kind))
+        .filter(|(_, node)| has_delimiter_markers(node.kind))
         .filter_map(|(_, span)| {
-            let style = presentation_style_kind(span.kind)?;
+            let style = syntax_display(span.kind).inline_style?;
             let clipped = SourceRange {
                 start: span.source_range.start.max(range.start),
                 end: span.source_range.end.min(range.end),
@@ -1293,19 +1378,6 @@ pub fn present_markdown(
     present_markdown_with_disclosure(line_id, revision, range, source, line_height, None)
 }
 
-pub fn paragraph_blocks(buffer: &RopeBuffer, line_height: f32) -> Vec<VisualLine> {
-    let mut blocks = Vec::with_capacity(buffer.line_count());
-    for line in 0..buffer.line_count() {
-        let Ok(range) = buffer.line_range(hane_document::LineId(line)) else {
-            continue;
-        };
-        let text = buffer.text(range).unwrap_or_default();
-        let block = present_markdown(line as u64, buffer.revision(), range, &text, line_height);
-        blocks.push(block);
-    }
-    blocks
-}
-
 /// Heights per leaf chunk. Structural edits rewrite at most the two boundary
 /// chunks plus their replacement instead of moving every following block.
 const HEIGHT_CHUNK_TARGET: usize = 128;
@@ -1363,7 +1435,8 @@ impl HeightIndex {
         self.counts.clear();
         self.sums.push(0.0);
         self.counts.push(0);
-        self.sums.extend(self.chunks.iter().map(|chunk| chunk.total));
+        self.sums
+            .extend(self.chunks.iter().map(|chunk| chunk.total));
         self.counts
             .extend(self.chunks.iter().map(|chunk| chunk.heights.len()));
         for index in 1..self.sums.len() {
@@ -1582,7 +1655,9 @@ mod tests {
     }
     #[test]
     fn chunked_height_index_matches_a_flat_model_across_boundaries() {
-        let mut flat = (0..300).map(|index| (index % 9 + 1) as f32).collect::<Vec<_>>();
+        let mut flat = (0..300)
+            .map(|index| (index % 9 + 1) as f32)
+            .collect::<Vec<_>>();
         let mut heights = HeightIndex::new(flat.iter().copied());
         for (range, inserted) in [
             (127..130, vec![41.0, 42.0, 43.0, 44.0]),

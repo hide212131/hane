@@ -1,5 +1,12 @@
 //! Offline fixtures, benchmark scenarios, environment capture, and report rendering.
 
+// Scenario/report helpers prioritize readable fixtures and deterministic reporting;
+// their short-lived values and formatting are intentionally not production APIs.
+#![allow(
+    clippy::pedantic,
+    reason = "offline benchmark fixtures intentionally favor legible deterministic scenario construction"
+)]
+
 use hane_document::{LineId, RopeBuffer, SourceRange, TextBuffer};
 use hane_markdown::BlockIndex;
 use hane_metrics::{DurationDistribution, duration_distribution};

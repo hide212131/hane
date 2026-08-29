@@ -1,5 +1,30 @@
 //! GPUI-independent editor commands, cursor/selection, and IME transactions.
 
+// The editor exposes lightweight commands and query methods whose results are
+// intentionally optional to retain ergonomic event-handler call sites.
+#![allow(
+    clippy::must_use_candidate,
+    reason = "editor commands and queries are intentionally discardable at event boundaries"
+)]
+// Error semantics are documented by each public type/trait contract instead of
+// repeating the same prose on delegated editor operations.
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "editor error contracts are defined on their enclosing abstractions"
+)]
+#![allow(
+    clippy::missing_panics_doc,
+    reason = "the panic precondition is described with the relevant editor invariant"
+)]
+#![allow(
+    clippy::map_unwrap_or,
+    reason = "the explicit map followed by fallback is clearer for cursor transformation"
+)]
+#![allow(
+    clippy::assigning_clones,
+    reason = "replacement of IME marked text intentionally makes ownership explicit"
+)]
+
 mod history;
 mod ime;
 mod movement;

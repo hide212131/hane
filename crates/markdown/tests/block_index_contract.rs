@@ -1,6 +1,11 @@
 //! Contract for the revision-tracked block index: what edits cost, what survives
 //! them, and which parse result is allowed to reach the display.
 
+#![allow(
+    clippy::format_push_string,
+    reason = "the fixture intentionally appends an interpolated source fragment"
+)]
+
 use hane_document::{RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_markdown::{
     BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, NodeKind,
@@ -15,7 +20,12 @@ fn document_of(paragraphs: usize) -> RopeBuffer {
     RopeBuffer::from_text(&source)
 }
 
-fn type_at(buffer: &mut RopeBuffer, index: &mut BlockIndex, at: usize, text: &str) -> BlockIndexUpdate {
+fn type_at(
+    buffer: &mut RopeBuffer,
+    index: &mut BlockIndex,
+    at: usize,
+    text: &str,
+) -> BlockIndexUpdate {
     let base = buffer.revision();
     buffer.edit(SourceRange::empty(at), text).unwrap();
     let deltas = buffer.deltas_since(base).unwrap();
@@ -37,7 +47,11 @@ fn local_editing_costs_the_same_in_a_small_and_a_large_document() {
             assert_eq!(update.invalidated_blocks, 0);
             reparsed += update.reparsed_bytes;
         }
-        assert_eq!(index.len(), paragraphs, "typing did not change the structure");
+        assert_eq!(
+            index.len(),
+            paragraphs,
+            "typing did not change the structure"
+        );
         assert_eq!(index.covered_bytes(), buffer.len_bytes().0);
         costs.push(reparsed);
     }
@@ -69,14 +83,21 @@ fn an_edit_whose_effect_reaches_far_marks_the_tail_provisional_instead_of_guessi
     let last = index.block(index.len() - 1).unwrap();
     assert_eq!(last.confidence, Confidence::Provisional);
     assert_eq!(last.source_range.end.0, buffer.len_bytes().0);
-    assert!(index.block_at(SourceOffset(buffer.len_bytes().0 / 2)).is_some());
+    assert!(
+        index
+            .block_at(SourceOffset(buffer.len_bytes().0 / 2))
+            .is_some()
+    );
     assert!(index.has_provisional_blocks());
 
     // The formal parse that follows sees one code block swallowing the document.
     let formal = BlockIndex::from_buffer(&buffer);
     assert!(!formal.has_provisional_blocks());
     assert_eq!(formal.block(0).unwrap().kind, NodeKind::CodeBlock);
-    assert_eq!(formal.block(0).unwrap().source_range.end.0, buffer.len_bytes().0);
+    assert_eq!(
+        formal.block(0).unwrap().source_range.end.0,
+        buffer.len_bytes().0
+    );
 }
 
 #[test]
@@ -114,7 +135,12 @@ fn block_identity_survives_editing_so_caches_stay_warm() {
     let before = index.blocks().map(|block| block.id).collect::<Vec<_>>();
     let target = index.block(100).unwrap();
 
-    type_at(&mut buffer, &mut index, target.source_range.start.0 + 5, "日本語");
+    type_at(
+        &mut buffer,
+        &mut index,
+        target.source_range.start.0 + 5,
+        "日本語",
+    );
 
     let after = index.blocks().map(|block| block.id).collect::<Vec<_>>();
     assert_eq!(before, after, "editing inside a block keeps every block id");

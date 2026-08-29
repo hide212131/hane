@@ -1,4 +1,4 @@
-use crate::identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
+use crate::identity::{ExternalChange, FilePresence, FileStamp, FileState};
 use crate::resource::ResourceResolver;
 use crate::service::{LoadedFile, OverwriteGuard, SaveFailure, SavedFile};
 use hane_document::{Revision, RopeBuffer, TextBuffer};
@@ -600,10 +600,4 @@ impl SessionSet {
             })
             .collect()
     }
-}
-
-/// Convenience for the common case: build the identity for a path that has no
-/// file behind it yet.
-pub fn untitled_target(path: &Path) -> FileIdentity {
-    FileIdentity::lexical(path)
 }

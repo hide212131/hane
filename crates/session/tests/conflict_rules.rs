@@ -3,6 +3,11 @@
 //! as it exists: open a file that is already open, rename the file under the
 //! caret, delete it, or let someone else edit it while the session is dirty.
 
+#![allow(
+    clippy::float_cmp,
+    reason = "the fixture asserts exact serialization of deterministic ratios"
+)]
+
 use hane_session::testing::MemoryFileService;
 use hane_session::{
     CloseDecision, DocumentSession, FileEvent, FileEventOutcome, FileService, OpenDecision,

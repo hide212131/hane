@@ -1,3 +1,8 @@
+#![allow(
+    clippy::map_unwrap_or,
+    reason = "the assertion keeps its mapped fallback explicit"
+)]
+
 use hane_document::SourceOffset;
 use hane_editor::{Editor, EditorCommand, Selection};
 use unicode_segmentation::UnicodeSegmentation;

@@ -1,5 +1,20 @@
 //! Runtime timing, rolling-window, distribution, and process-memory primitives.
 
+// Sampling/query methods are intentionally usable as discardable instrumentation
+// probes, so forcing every caller to bind their result is not useful.
+#![allow(
+    clippy::must_use_candidate,
+    reason = "instrumentation queries may intentionally discard sampled values"
+)]
+// Percentile conversion is range-checked by its caller; the float-to-index
+// conversion is the documented nearest-rank calculation.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "percentile calculation intentionally converts bounded floating-point ranks to indices"
+)]
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -14,7 +29,7 @@ pub fn process_memory_bytes() -> Option<u64> {
             libc::mach_task_self_,
             libc::MACH_TASK_BASIC_INFO,
             info.as_mut_ptr().cast(),
-            &mut count,
+            &raw mut count,
         )
     };
     if status != libc::KERN_SUCCESS {
@@ -54,10 +69,10 @@ pub fn duration_distribution(values: impl IntoIterator<Item = Duration>) -> Dura
     sorted.sort_unstable();
     DurationDistribution {
         samples: sorted.len(),
-        median: percentile(sorted.iter().copied(), 0.50).unwrap(),
-        p95: percentile(sorted.iter().copied(), 0.95).unwrap(),
-        p99: percentile(sorted.iter().copied(), 0.99).unwrap(),
-        max: *sorted.last().unwrap(),
+        median: percentile(sorted.iter().copied(), 0.50).unwrap_or_default(),
+        p95: percentile(sorted.iter().copied(), 0.95).unwrap_or_default(),
+        p99: percentile(sorted.iter().copied(), 0.99).unwrap_or_default(),
+        max: sorted.last().copied().unwrap_or_default(),
     }
 }
 
@@ -68,6 +83,11 @@ pub struct RollingWindow<T> {
 }
 
 impl<T> RollingWindow<T> {
+    /// Creates a rolling window with the specified capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "rolling-window capacity must be non-zero");
         Self {

@@ -5,7 +5,7 @@
 
 ## 進捗ステータス（最終更新: 2026-08-29）
 
-**現在地: R2 完了。R5（型・API・ドキュメント整理）が次の作業。**
+**現在地: R5 完了。**
 
 | 実施順 | フェーズ | 状態 |
 |---|---|---|
@@ -21,7 +21,7 @@
 | 10 | R4B Block→LayoutLine→Run | ✅ 完了 |
 | 11 | R4C レイアウトキャッシュ・差分更新 | ✅ 完了 |
 | 12 | R2 後半（スクリプト統合・文書整理） | ✅ 完了 |
-| 13 | R5 型・API・ドキュメント整理 | ⬜ 未着手 |
+| 13 | R5 型・API・ドキュメント整理 | ✅ 完了 |
 
 ### R3.25 の完了内容
 
@@ -270,6 +270,105 @@
 - ✅ スクリプト引数化統合。`scripts/measure.sh` は `all` / `startup` / `input` / `memory`、
   `scripts/capture.sh` は `editor` / `cursor-boundary` / `cursor-scroll` を引数で選ぶ。
 - ✅ 歴史文書を `docs/history/` へ移動し、`docs/adr/README.md` に現行・歴史の索引を整備。
+
+### R5 の調査・方針決定（2026-08-29）
+
+この節は実装前の調査記録であり、R5 のチェック項目を完了扱いにはしない。R5 実装はこの方針を
+入力として別作業で行い、その後の最終レビューもさらに分ける。
+
+#### 1. 型と変換責務
+
+- 計画作成時の `markdown::BlockKind` / `InlineKind` は既に `markdown::NodeKind` へ統合済み。
+  現在は `NodeKind`（構文）、`presentation::BlockKind` / `StyleKind`（表示種別）、
+  `BlockDisplay` / `InlineDisplay`（描画方針）の3層であり、この分離は維持する。parser と
+  presentation の型を再統合したり、UI へ構文種別を渡したりしない。
+- 現在の変換点は `block_line_context`、`block_display_kind`、`presentation_block_kind`、
+  `presentation_style_kind` に分散している。presentation 内部に非公開の変換表
+  （構文 node の block 表示、indexed top-level block の表示、inline style、line context）を1つ置き、
+  各経路はそこを参照する。table/list の container と表示対象 node の違いは変換表の別フィールドで
+  明示し、無理に同じ `Option<BlockKind>` へ潰さない。
+- delimiter の有無は parser の字句契約なので markdown 側に残す。ただし
+  `is_delimited_inline` は `CodeBlock` も含むため、実態に合う `has_delimiter_markers` 相当へ改名する。
+- UI の製品コードに `NodeKind` が1か所あるが、Markdown 分岐ではなく、空文書を描くために
+  `IndexedBlock` を手組みする fallback である。fallback block の生成を markdown API 側へ寄せ、
+  UI から `NodeKind` の参照を無くす。UI の test-only assertion は構文索引の契約確認なので許容する。
+
+#### 2. style 境界分割
+
+- 計画にある `visual_offset_at_x` は R4B で `BlockLayout` / `LineShaper` に置換済みで、現存しない。
+  現在の重複は `ui::line::line_segments` と `ui::shape::WindowShaper::runs` がそれぞれ
+  style run の始終端を収集・clamp・sort・dedup している部分である。
+- 共有 helper は presentation の公開 API には追加せず、`ui` の非公開 module に置く。入力範囲と
+  境界 offset 群を受け、UTF-8 byte range を clamp・整列・重複除去して連続 range へ分割するだけの
+  helper とする。描画側は selection / IME / caret の境界も渡し、shape 側は style 境界だけを渡す。
+  各 range の選択状態や `InlineDisplay`、GPUI `TextRun` への変換はそれぞれの利用側に残す。
+- helper 単体で、範囲外境界、同一境界、空 range、soft-wrap で切られた style run、UTF-8 文字境界を
+  固定する。R4B の source↔point 契約テストも回帰ゲートにする。
+
+#### 3. pedantic と公開 API
+
+- `cargo clippy --workspace --all-targets --all-features -- -W clippy::pedantic` の調査結果は
+  warning diagnostic 360行（lib/test の重複を含む）。多い順に `must_use` 178件
+  （method 149 + function 29）、`# Errors` 36件、数値変換、float 比較、`# Panics` 13件など。
+  crate別 diagnostic は document 30 / metrics 19 / markdown 42 / editor 33 /
+  presentation 75 / session 67 / benchmark 21 / ui 73。既定 feature と all-features で件数は同じ。
+- 完了ゲートは既定 feature と all-features の両方について
+  `cargo clippy --workspace --all-targets [--all-features] -- -D warnings -W clippy::pedantic` とする。
+  workspace/crate 全体の `allow(clippy::pedantic)` は使わない。機械的な `must_use`・doc・表記は修正し、
+  数値変換、float 比較、bool をまとめた表示 policy など、表現を変える方が契約を曖昧にする箇所だけ
+  理由付きの最小範囲 `allow` を認める。`cargo clippy --fix` の一括適用はしない。
+- R0 の API snapshot は互換性維持リストではなく差分の比較元として使う。R3〜R4 で追加された
+  `BlockIndex` / session / layout の crate 間 API は必要なため維持し、内部専用・未使用だけを削る。
+  調査時点で確定した削減候補は次のとおり。
+  - markdown: 外部利用のない `RESYNC_*` / `LOCAL_BLOCK_LOOKBACK` の再 export と、
+    `LocalBlockIndex` の外部未使用 accessor。
+  - presentation: 二重到達経路になっている公開 `layout` module（root re-export は維持）、
+    製品・benchmark から利用されない `present_plain` / `present_raw_source` / `paragraph_blocks`、
+    内部化できる変換関数。直接呼び出している integration test は公開入口経由の契約テストへ移す。
+  - session: session 内部だけが使う `atomic_write_bytes` と、未使用の `untitled_target`。
+  - `testing` module は integration test と benchmark が crate 境界越しに利用しているため今回は維持する。
+- 実装前、実装後の公開宣言一覧を `docs/baseline/public-api.md` と同じ方法で採取し、各削除と追加に
+  理由を付ける。`cargo-public-api` はこの環境に未導入なので、R5 の必須条件には追加しない。
+
+#### 4. 文書
+
+- README は利用者向け機能を保ち、開発者向けに現行 crate 構造、標準検証 command、統合済み
+  `scripts/measure.sh` / `scripts/capture.sh`、基準線・ADR・リファクタリング計画への入口を追加する。
+- ADR は過去の判断本文を現行実装に合わせて無言で書き換えない。`docs/architecture.md` に現在の
+  crate 依存、`DocumentSession → BlockIndex → VisualBlock → BlockLayout → LayoutLine → run` の流れ、
+  cache / revision 境界をまとめ、README と ADR index から参照する。
+- ADR index は「現行」一括ではなく active / superseded・amended / history を区別する。少なくとも
+  ADR-0002（crate graph）、0004（`VisualBlock` の旧形）、0006（Phase 0 block model）、
+  0008（full-text snapshot と現行 BlockIndex）、0009（metrics/benchmark と統合 script）に
+  現行化注記と後続 ADR / architecture 文書へのリンクを足す。0020〜0022 の現行判断は維持する。
+
+#### 実装順とゲート
+
+1. 公開 API の実装前一覧を固定する。
+2. 構文→表示変換と UI fallback を整理し、Markdown feature / source-map 契約を通す。
+3. 非公開の境界分割 helper を導入し、layout / UI 契約を通す。
+4. 明確な内部 API を private 化・削除し、全 workspace test を通す。
+5. pedantic を crate ごとに解消し、既定 feature / all-features の両ゲートを通す。
+6. 現行 architecture 文書、README、ADR index / 注記、API 差分を更新する。
+
+R5 は型名の大規模変更や挙動変更を含めない。各段階で `cargo test --workspace` と
+`cargo test --workspace --all-features`、通常の `clippy -D warnings` を維持し、最後に R0.5 契約、
+API diff、pedantic をまとめて確認する。
+
+### R5 実装内容（2026-08-29）
+
+- ✅ 構文→表示の変換を presentation 内部の `SyntaxDisplay` 表に集約。`NodeKind` / `BlockKind` /
+  `StyleKind` の3層分離を維持し、delimiter 判定を `has_delimiter_markers` に改名した。
+- ✅ UI fallback は `IndexedBlock::provisional_paragraph` を利用し、製品コードから `NodeKind` の
+  直接参照を除去した。
+- ✅ `ui::ranges::partition` に style/selection/IME/caret の境界分割を集約し、範囲外・重複・空範囲・
+  UTF-8 byte offset を単体テストで固定した。
+- ✅ 公開面を縮小（markdown の parser budget export、presentation の二重 `layout` module と内部
+  presenter、session の内部 atomic-write helper / unused helper）。理由は
+  `docs/baseline/public-api.md` の R5 diff に記録した。
+- ✅ `docs/architecture.md`、README、ADR index と ADR-0002/0004/0006/0008/0009 の現行化注記を追加。
+- ✅ 実装ゲート: default / all-features の workspace・all-targets で pedantic clippy を含む
+  `-D warnings` は成功。pedantic の設計上意図的な例外は、各責務境界に `reason` 付きで局所化した。
 
 > 各フェーズの詳細チェックボックスは `docs/refactor-plan.md` が正。
 > このステータス欄はフェーズを着手・完了するたびに更新する（状態と「最終更新」日付、

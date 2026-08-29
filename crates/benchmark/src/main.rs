@@ -1,3 +1,8 @@
+#![allow(
+    clippy::items_after_statements,
+    reason = "the CLI-local report helper stays next to its only invocation"
+)]
+
 use hane_benchmark::{
     Environment, generate_fixtures, markdown_report, run_block_heights_scenario,
     run_block_index_scenario, run_block_layout_scenario, run_buffer_edit_scenario,

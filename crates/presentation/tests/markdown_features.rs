@@ -8,6 +8,11 @@
 //! a save would write — without a single feature-specific branch outside this
 //! table, which is what shows the constructs need nothing from the UI crate.
 
+#![allow(
+    clippy::doc_markdown,
+    reason = "fixture descriptions use Markdown names as prose"
+)]
+
 mod support;
 
 use hane_markdown::NodeKind;

@@ -62,4 +62,16 @@ Apache-2.0
 
 ## 開発者向け
 
-ベンチマーク、パフォーマンス測定、画面キャプチャの手順や、各開発フェーズのレポートは [docs/](docs/) を参照してください。
+現在の crate 構造とデータフローは [architecture](docs/architecture.md) を参照してください。
+
+標準の検証は次のとおりです。
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+計測は `scripts/measure.sh all`（`startup` / `input` / `memory` も指定可）、画面キャプチャは
+`scripts/capture.sh editor`（`cursor-boundary` / `cursor-scroll` も指定可）で実行します。
+性能基準線は [docs/baseline/](docs/baseline/)、設計判断は [ADR index](docs/adr/README.md)、
+リファクタリングの進捗は [実施計画](docs/refactor-execution-plan.md) を正とします。

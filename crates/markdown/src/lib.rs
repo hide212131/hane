@@ -1,11 +1,39 @@
 //! CommonMark parsing with source-byte ranges.
 
+// Parsed syntax values are routinely inspected without retaining their result
+// in streaming and background-index call sites.
+#![allow(
+    clippy::must_use_candidate,
+    reason = "syntax query APIs are intentionally discardable during incremental parsing"
+)]
+#![allow(
+    clippy::doc_markdown,
+    reason = "crate documentation uses established Markdown terminology as prose"
+)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "block-store indices are bounded by the in-memory source representation"
+)]
+#![allow(
+    clippy::format_push_string,
+    reason = "test fixture construction intentionally appends formatted fragments"
+)]
+#![allow(
+    clippy::items_after_statements,
+    reason = "a local parser helper stays beside its only call site"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "the formal event-to-block translation is deliberately kept as one audited table"
+)]
+
 mod block_index;
 mod block_store;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
-    PublishOutcome, RESYNC_BLOCK_BUDGET, RESYNC_BYTE_BUDGET,
+    PublishOutcome,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
@@ -236,7 +264,7 @@ pub fn is_table_delimiter(source: &str) -> bool {
 /// Lines scanned before the viewport when recovering block boundaries without a
 /// published [`BlockIndex`]. Bounds the fallback so visible parsing never depends
 /// on total document size.
-pub const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
+const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
 
 /// Block boundaries for one viewport, parsed from a bounded window.
 ///
@@ -367,7 +395,7 @@ fn absolute_range(base: usize, range: std::ops::Range<usize>) -> SourceRange {
 /// place because marker derivation and presentation must agree on exactly which
 /// nodes carry delimiters; `CodeBlock` is included because presentation styles it
 /// as an inline run even though its fence markers are derived block-side.
-pub const fn is_delimited_inline(kind: NodeKind) -> bool {
+pub const fn has_delimiter_markers(kind: NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::Strong
@@ -462,7 +490,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
     }
     for (_, span) in tree
         .iter()
-        .filter(|(_, node)| is_delimited_inline(node.kind))
+        .filter(|(_, node)| has_delimiter_markers(node.kind))
     {
         let start = span.source_range.start.0;
         let end = span.source_range.end.0;

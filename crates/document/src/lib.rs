@@ -1,5 +1,18 @@
 //! UI-independent UTF-8 source buffer and edit primitives.
 
+// Query-style value objects are deliberately lightweight; callers may invoke these
+// accessors solely for their validation or conversion side effects in generic code.
+#![allow(
+    clippy::must_use_candidate,
+    reason = "the public buffer API includes intentionally discardable query helpers"
+)]
+// `Buffer` documents its error contract at the trait level, rather than repeating it
+// on each required method.
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "the Buffer trait has one shared error contract"
+)]
+
 use ropey::{Rope, RopeSlice};
 use std::collections::VecDeque;
 use std::fmt;
@@ -255,8 +268,13 @@ impl RopeBuffer {
         if revision == self.revision {
             return Ok(Vec::new());
         }
-        let first = self.deltas.front().map(|d| d.from_revision);
-        if first.is_none() || revision < first.unwrap() || revision > self.revision {
+        let Some(first) = self.deltas.front().map(|delta| delta.from_revision) else {
+            return Err(BufferError::RevisionHistoryUnavailable {
+                from: revision,
+                to: self.revision,
+            });
+        };
+        if revision < first || revision > self.revision {
             return Err(BufferError::RevisionHistoryUnavailable {
                 from: revision,
                 to: self.revision,
@@ -359,7 +377,7 @@ impl TextBuffer for RopeBuffer {
             to_revision: self.revision,
             edited_source_range_before: range,
             edited_source_range_after: range_after,
-            byte_delta: replacement.len() as isize - range.len_bytes() as isize,
+            byte_delta: replacement.len().cast_signed() - range.len_bytes().cast_signed(),
         };
         self.deltas.push_back(delta);
         if self.deltas.len() > self.delta_capacity {

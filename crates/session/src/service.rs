@@ -134,7 +134,7 @@ fn stamp_from_metadata(metadata: Option<fs::Metadata>) -> Option<FileStamp> {
     metadata.map(|metadata| FileStamp::new(metadata.len(), metadata.modified().ok()))
 }
 
-pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write(path, |writer| writer.write_all(bytes))
 }
 

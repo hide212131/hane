@@ -6,6 +6,7 @@
 //! use, so hit testing, the caret and the painted text cannot drift apart.
 
 use crate::line::{block_font_size, inline_display_for};
+use crate::ranges::partition;
 use gpui::{FontStyle, FontWeight, TextRun, TextStyle, Window, WindowTextSystem, px};
 use hane_presentation::{BlockWeight, LineShaper, VisualLine};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -38,7 +39,7 @@ impl WindowShaper {
     /// display policy changes. Lengths are relative to the stretch, which is what
     /// the text system expects.
     fn runs(&self, line: &VisualLine, fragment: &Range<usize>) -> Vec<TextRun> {
-        let mut boundaries = vec![fragment.start, fragment.end];
+        let mut boundaries = Vec::new();
         for run in &line.style_runs {
             for at in [run.visual_range.start.0, run.visual_range.end.0] {
                 if fragment.start < at && at < fragment.end {
@@ -46,16 +47,10 @@ impl WindowShaper {
                 }
             }
         }
-        boundaries.sort_unstable();
-        boundaries.dedup();
         let semibold = line.display().weight == BlockWeight::Semibold;
-        boundaries
-            .windows(2)
-            .filter_map(|pair| {
-                let range = pair[0]..pair[1];
-                if range.is_empty() {
-                    return None;
-                }
+        partition(fragment.clone(), boundaries)
+            .into_iter()
+            .map(|range| {
                 let inline = inline_display_for(&range, &line.style_runs);
                 let mut font = self.style.font();
                 if semibold || inline.bold {
@@ -71,14 +66,14 @@ impl WindowShaper {
                 if inline.monospace {
                     font.family = "ui-monospace".into();
                 }
-                Some(TextRun {
+                TextRun {
                     len: range.len(),
                     font,
                     color: self.style.color,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
-                })
+                }
             })
             .collect()
     }

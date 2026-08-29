@@ -32,12 +32,12 @@ use std::time::{Duration, Instant};
 /// re-synchronization boundary before it gives up and invalidates the tail.
 /// Bounds the input path: an edit that cannot re-synchronize costs a fixed
 /// amount of work rather than an amount proportional to the document.
-pub const RESYNC_BYTE_BUDGET: usize = 256 * 1024;
+const RESYNC_BYTE_BUDGET: usize = 256 * 1024;
 
 /// Blocks a single incremental update may pull into the re-parse window. Guards
 /// documents made of very many tiny blocks, where the byte budget alone would
 /// still allow a long walk.
-pub const RESYNC_BLOCK_BUDGET: usize = 512;
+const RESYNC_BLOCK_BUDGET: usize = 512;
 
 /// Identifies a block across edits. A block keeps its id while its kind survives
 /// a re-parse of the window it sits in, so caches keyed by block id stay warm
@@ -77,6 +77,28 @@ pub struct IndexedBlock {
     /// line of a document that ends in a newline belongs to no block, which is
     /// what `hane_presentation::block_heights` accounts for.
     pub line_count: usize,
+}
+
+impl IndexedBlock {
+    /// Builds the provisional paragraph used when a bounded viewport parse sees
+    /// no Markdown block. This keeps UI fallback construction out of the UI
+    /// crate, which must not depend on parser syntax vocabulary.
+    #[must_use]
+    pub fn provisional_paragraph(
+        revision: Revision,
+        source_range: SourceRange,
+        line_count: usize,
+    ) -> Self {
+        Self {
+            ordinal: 0,
+            id: BlockId(source_range.start.0 as u64),
+            kind: NodeKind::Paragraph,
+            source_range,
+            revision,
+            confidence: Confidence::Provisional,
+            line_count,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,15 +381,7 @@ impl BlockIndex {
                         .map_or(window_first, |at| at.min(window_first)),
                 );
                 let invalidated = self.len() - window_first;
-                return finish(
-                    self,
-                    reparsed_bytes,
-                    window_first,
-                    0,
-                    0,
-                    invalidated,
-                    false,
-                );
+                return finish(self, reparsed_bytes, window_first, 0, 0, invalidated, false);
             };
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
@@ -743,7 +757,12 @@ mod tests {
         buffer.deltas_since(base).unwrap()
     }
 
-    fn apply(index: &mut BlockIndex, buffer: &mut RopeBuffer, at: usize, replacement: &str) -> BlockIndexUpdate {
+    fn apply(
+        index: &mut BlockIndex,
+        buffer: &mut RopeBuffer,
+        at: usize,
+        replacement: &str,
+    ) -> BlockIndexUpdate {
         let deltas = edit(buffer, SourceRange::empty(at), replacement);
         index.update(buffer, &deltas)
     }
@@ -776,7 +795,9 @@ mod tests {
         );
         // The document end belongs to the last block; past it is out of range.
         assert_eq!(
-            index.block_at(SourceOffset(source.len())).map(|b| b.ordinal),
+            index
+                .block_at(SourceOffset(source.len()))
+                .map(|b| b.ordinal),
             Some(index.len() - 1)
         );
         assert_eq!(index.block_at(SourceOffset(source.len() + 1)), None);
@@ -798,7 +819,12 @@ mod tests {
         assert_eq!(index.len(), 20_000);
         let ids = index.blocks().map(|block| block.id).collect::<Vec<_>>();
         let target = index.block(10_000).unwrap();
-        let update = apply(&mut index, &mut buffer, target.source_range.start.0 + 4, "!");
+        let update = apply(
+            &mut index,
+            &mut buffer,
+            target.source_range.start.0 + 4,
+            "!",
+        );
 
         assert!(update.resynchronized);
         assert_eq!(update.invalidated_blocks, 0);
@@ -820,7 +846,10 @@ mod tests {
         assert_eq!(index.block(0).unwrap().revision, Revision(0));
         assert_eq!(index.block(10_000).unwrap().revision, buffer.revision());
         assert_eq!(index.revision(), buffer.revision());
-        assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(&index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
     }
 
     #[test]
@@ -836,7 +865,10 @@ mod tests {
         assert_eq!(update.replaced_blocks, 3);
         assert_eq!(update.inserted_blocks, 4);
         assert_eq!(index.len(), 4);
-        assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(&index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
         // The block after the split is untouched, so it keeps its id.
         assert_eq!(index.block(3).unwrap().id, last_id);
 
@@ -845,7 +877,10 @@ mod tests {
         let update = index.update(&buffer, &deltas);
         assert!(update.resynchronized);
         assert_eq!(index.len(), 3);
-        assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(&index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
         assert_eq!(index.block(2).unwrap().id, last_id);
     }
 
@@ -892,7 +927,10 @@ mod tests {
 
         let update = apply(&mut index, &mut buffer, 9, "```\n");
         assert!(update.resynchronized);
-        assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(&index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
         assert!(!index.has_provisional_blocks());
     }
 
@@ -960,7 +998,10 @@ mod tests {
         let update = index.update(&buffer, &deltas);
         assert!(update.resynchronized);
         assert_eq!(index.revision(), buffer.revision());
-        assert_eq!(structure(&index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(&index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
     }
 
     #[test]
@@ -974,9 +1015,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(overlapping, vec![1]);
         assert_eq!(
-            index
-                .blocks_in(SourceRange::new(0, source.len()))
-                .count(),
+            index.blocks_in(SourceRange::new(0, source.len())).count(),
             index.len()
         );
         assert_eq!(
@@ -1023,7 +1062,11 @@ mod tests {
             NodeKind::Heading(1)
         );
         assert_eq!(
-            state.publish(BlockIndex::from_buffer(&buffer), IndexSource::Formal, &buffer),
+            state.publish(
+                BlockIndex::from_buffer(&buffer),
+                IndexSource::Formal,
+                &buffer
+            ),
             PublishOutcome::Published
         );
         assert_eq!(state.source(), Some(IndexSource::Formal));
@@ -1049,7 +1092,10 @@ mod tests {
         let index = state.index().unwrap();
         assert_eq!(index.revision(), buffer.revision());
         assert_eq!(index.covered_bytes(), buffer.len_bytes().0);
-        assert_eq!(structure(index), structure(&BlockIndex::from_buffer(&buffer)));
+        assert_eq!(
+            structure(index),
+            structure(&BlockIndex::from_buffer(&buffer))
+        );
         // Rebasing re-parsed only the edited windows, so it is not a formal
         // parse of the current revision.
         assert_eq!(state.source(), Some(IndexSource::Provisional));

@@ -1,5 +1,8 @@
 # ADR-0004: Source と Visual の位置対応モデル
 
+> **Amended (R5):** 現行の source↔visual↔point の責務は
+> [architecture](../architecture.md) と ADR-0021 を正とする。
+
 ## ステータス
 
 承認済み

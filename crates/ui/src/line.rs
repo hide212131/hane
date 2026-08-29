@@ -1,3 +1,4 @@
+use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
     Div, FontWeight, IntoElement, ObjectFit, ParentElement, Styled, StyledImage, div, img,
@@ -310,34 +311,28 @@ fn line_segments(
     marked: Option<Range<usize>>,
     style_runs: &[hane_presentation::StyleRun],
 ) -> Vec<LineSegment> {
-    let clamp = |offset: usize| offset.clamp(bounds.start, bounds.end);
-    let mut boundaries = vec![bounds.start, bounds.end];
-    boundaries.extend(cursor.map(clamp));
+    let mut boundaries = Vec::new();
+    boundaries.extend(cursor);
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
-        boundaries.push(clamp(range.start));
-        boundaries.push(clamp(range.end));
+        boundaries.push(range.start);
+        boundaries.push(range.end);
     }
     for run in style_runs {
-        boundaries.push(clamp(run.visual_range.start.0));
-        boundaries.push(clamp(run.visual_range.end.0));
+        boundaries.push(run.visual_range.start.0);
+        boundaries.push(run.visual_range.end.0);
     }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .windows(2)
-        .map(|pair| {
-            let range = pair[0]..pair[1];
-            LineSegment {
-                selected: selected.as_ref().is_some_and(|selected| {
-                    range.start >= selected.start && range.end <= selected.end
-                }),
-                marked: marked
-                    .as_ref()
-                    .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
-                cursor_before: cursor == Some(range.start),
-                display: inline_display_for(&range, style_runs),
-                visual_range: range.clone(),
-            }
+    partition(bounds, boundaries)
+        .into_iter()
+        .map(|range| LineSegment {
+            selected: selected
+                .as_ref()
+                .is_some_and(|selected| range.start >= selected.start && range.end <= selected.end),
+            marked: marked
+                .as_ref()
+                .is_some_and(|marked| range.start >= marked.start && range.end <= marked.end),
+            cursor_before: cursor == Some(range.start),
+            display: inline_display_for(&range, style_runs),
+            visual_range: range.clone(),
         })
         .collect()
 }

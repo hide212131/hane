@@ -285,7 +285,9 @@ mod tests {
     }
 
     fn items(count: usize) -> Vec<(u32, usize)> {
-        (0..count).map(|value| (value as u32, value % 7 + 1)).collect()
+        (0..count)
+            .map(|value| (value as u32, value % 7 + 1))
+            .collect()
     }
 
     #[test]
@@ -313,11 +315,20 @@ mod tests {
             "the document end belongs to the last block"
         );
         assert_eq!(
-            store.iter_from(0).map(|(_, payload, _, _)| payload).collect::<Vec<_>>(),
-            items.iter().map(|(payload, _)| *payload).collect::<Vec<_>>()
+            store
+                .iter_from(0)
+                .map(|(_, payload, _, _)| payload)
+                .collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|(payload, _)| *payload)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
-            store.iter_from(1_500).map(|(ordinal, _, _, _)| ordinal).next(),
+            store
+                .iter_from(1_500)
+                .map(|(ordinal, _, _, _)| ordinal)
+                .next(),
             Some(1_500)
         );
         assert_eq!(store.iter_from(items.len()).next(), None);

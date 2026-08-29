@@ -365,7 +365,10 @@ impl EditorView {
         // The first document is read before the window exists, so this one read
         // is synchronous by construction; every later one goes to a thread.
         let loaded = files.load(path)?;
-        #[cfg_attr(not(any(feature = "instrument", feature = "timing-probe")), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "instrument", feature = "timing-probe")),
+            allow(unused_mut)
+        )]
         let mut view = Self::from_sessions(
             SessionSet::with_loaded(loaded),
             files,
@@ -1206,8 +1209,7 @@ impl EditorView {
         let Some(index) = self.current_index() else {
             return false;
         };
-        if index.len()
-            != self.height_blocks.len() - update.replaced_blocks + update.inserted_blocks
+        if index.len() != self.height_blocks.len() - update.replaced_blocks + update.inserted_blocks
         {
             return false;
         }
@@ -1232,8 +1234,7 @@ impl EditorView {
         });
         self.heights.splice(
             first..old_end,
-            next
-                .iter()
+            next.iter()
                 .map(|block| self.theme.line_height * block.line_count as f32),
         );
         self.height_blocks.splice(first..old_end, &next);
@@ -1335,15 +1336,11 @@ impl EditorView {
                 if blocks.is_empty() {
                     // A document with no Markdown block at all still has a line
                     // to draw the caret on.
-                    let empty = IndexedBlock {
-                        ordinal: 0,
-                        id: BlockId(first_range.start.0 as u64),
-                        kind: hane_markdown::NodeKind::Paragraph,
-                        source_range: SourceRange::new(first_range.start.0, last_range.end.0),
-                        revision: document.revision(),
-                        confidence: hane_markdown::Confidence::Provisional,
-                        line_count: last - first + 1,
-                    };
+                    let empty = IndexedBlock::provisional_paragraph(
+                        document.revision(),
+                        SourceRange::new(first_range.start.0, last_range.end.0),
+                        last - first + 1,
+                    );
                     return vec![empty];
                 }
                 blocks

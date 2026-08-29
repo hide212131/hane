@@ -63,3 +63,19 @@ R0時点（HEAD `3efbaac`）のworkspace crate公開面。`cargo-public-api`は�
 ```sh
 rg -n '^(pub (struct|enum|trait|type|const|fn|mod|use)|    pub fn )' crates/*/src
 ```
+
+## R5 implementation diff (2026-08-29)
+
+This snapshot remains a comparison point, not a compatibility promise. R5 deliberately narrowed
+only APIs with no cross-crate product, benchmark, or integration-test consumer:
+
+- `hane-markdown`: the incremental-parser budgets and local fallback lookback are implementation
+  details; `has_delimiter_markers` replaces the misleading `is_delimited_inline` name.
+- `hane-presentation`: `layout` is now private and reached through its existing root re-exports;
+  plain/raw fallback presenters and the obsolete line-by-line paragraph helper are private.
+- `hane-session`: `atomic_write_bytes` is private to state persistence and the unused
+  `untitled_target` helper was removed from the crate surface.
+
+The only addition is `IndexedBlock::provisional_paragraph`, the Markdown-owned construction path
+for the UI's empty-viewport fallback. It removes the UI's direct dependency on `NodeKind` while
+keeping fallback semantics unchanged.

@@ -375,12 +375,14 @@ OS 側の throttle に支配されるため未実施。R2のinstrument比較と�
 
 **目的**: 重複語彙とボイラープレートを削り、公開面を最小化。
 
-- [ ] `markdown::BlockKind`/`InlineKind` と `presentation::BlockKind`/`StyleKind` の関係を再整理。
-      変換関数（`presentation_block_kind` / `presentation_style_kind` 等）の重複を削減。
-- [ ] `line_segments` / `visual_offset_at_x` のスタイル境界分割ロジック（現状ほぼ同型が複数）を
-      1つの共有ヘルパへ統合。
-- [ ] clippy pedantic を通し、`pub` 過多・未使用エクスポートを整理（R0 の API スナップショットと diff）。
-- [ ] README / ADR を現行構造に合わせて更新。
+- [x] `markdown::NodeKind` と `presentation::BlockKind` / `StyleKind` の3層分離は維持し、
+      presentation 内の構文→block/style/context 変換を1つの非公開変換表へ集約する。
+      delimiter 判定の命名と、UI の空文書 fallback に残る `NodeKind` 参照も整理する。
+- [x] `ui::line::line_segments` / `ui::shape::WindowShaper::runs` のスタイル境界収集を、
+      `ui` 内の1つの非公開 range 分割 helper へ統合する。
+- [x] clippy pedantic を既定 feature / all-features の workspace・all-targets で通し、`pub` 過多・
+      未使用エクスポートを整理する（R0 の API スナップショットと理由付き diff）。
+- [x] 現行 architecture 文書を追加し、README / ADR index と陳腐化した ADR の現行化注記を更新する。
 
 **完了条件**: 公開 API が意図的に絞られ、clippy pedantic 緑、ドキュメントが実装と一致。
 

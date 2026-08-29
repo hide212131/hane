@@ -6,6 +6,12 @@
 //! rows tile their line, that a point maps back to the offset it came from, and
 //! that vertical movement aims at an x rather than at a grapheme column.
 
+#![allow(
+    clippy::float_cmp,
+    clippy::cast_precision_loss,
+    reason = "layout fixtures assert exact deterministic pixel geometry"
+)]
+
 use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
