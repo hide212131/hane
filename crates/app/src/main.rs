@@ -36,14 +36,7 @@ fn main() {
                     cx.new(|cx| {
                         #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
                         let mut view = match path.as_deref() {
-                            Some(path) if path.is_dir() => EditorView::open_work_folder(path, cx)
-                                .unwrap_or_else(|error| {
-                                    EditorView::new(
-                                        &format!("Could not open {}: {error}", path.display()),
-                                        path.display().to_string(),
-                                        cx,
-                                    )
-                                }),
+                            Some(path) if path.is_dir() => EditorView::open_work_folder(path, cx),
                             Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| {
                                 EditorView::new(
                                     &format!("Could not open {}: {error}", path.display()),

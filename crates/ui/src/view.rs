@@ -110,6 +110,13 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Paths with a background read in flight, so a second click on a note
+    /// that has not finished loading yet does not start a second read.
+    loading_paths: HashSet<PathBuf>,
+    /// The path most recently asked to be opened, whether or not it has
+    /// finished loading yet. A load that lands after a newer request must
+    /// not switch what is on screen away from that newer request.
+    latest_open_target: Option<PathBuf>,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -363,6 +370,8 @@ impl EditorView {
             settings,
             recent,
             work_folder: None,
+            loading_paths: HashSet::new(),
+            latest_open_target: None,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -418,53 +427,56 @@ impl EditorView {
         Ok(view)
     }
 
-    /// Opens `root` as a work folder: its Markdown files are indexed for the
-    /// sidebar and the first one (if any) is loaded as the active session, the
-    /// same way `open` loads a single file synchronously before the window
-    /// exists. An empty folder starts from one empty untitled note instead of
-    /// failing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error when the folder cannot be scanned or its first
-    /// document cannot be read.
-    pub fn open_work_folder(root: &Path, cx: &mut Context<Self>) -> std::io::Result<Self> {
-        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
-        let started = Instant::now();
-        let work_folder = OsWorkFolderScanner.scan(root)?;
-        let files: Arc<dyn FileService> = Arc::new(OsFileService);
-        let first = work_folder
-            .entries()
-            .first()
-            .map(|entry| entry.path().to_path_buf());
-        let stores = StateStores::from_environment();
-        #[cfg_attr(
-            not(any(feature = "instrument", feature = "timing-probe")),
-            allow(unused_mut)
-        )]
-        let mut view = match &first {
-            // The first note is read before the window exists, matching the
-            // single-file synchronous read in `open`; every later switch goes
-            // to a background thread through `open_work_folder_entry`.
-            Some(path) => {
-                let loaded = files.load(path)?;
-                let mut view =
-                    Self::from_sessions(SessionSet::with_loaded(loaded), files, stores, cx);
-                view.remember_recent(path);
-                cx.add_recent_document(path);
-                view
+    /// Opens `root` as a work folder. The window is created immediately with
+    /// an empty untitled session; the directory scan and the first note's
+    /// load both happen on a background thread, so a folder with many entries
+    /// or a large first document never delays the window from appearing, the
+    /// same way every later switch does not block on I/O.
+    pub fn open_work_folder(root: &Path, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new("", "Untitled", cx);
+        view.begin_work_folder_scan(root.to_path_buf(), cx);
+        view
+    }
+
+    fn begin_work_folder_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.status = Some("Opening work folder…".to_owned());
+        cx.spawn(async move |view, cx| {
+            let scanned = cx
+                .background_executor()
+                .spawn(async move { OsWorkFolderScanner.scan(&root) })
+                .await;
+            let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_work_folder_scan(
+        &mut self,
+        scanned: std::io::Result<WorkFolder>,
+        cx: &mut Context<Self>,
+    ) {
+        match scanned {
+            Err(error) => {
+                self.status = Some(format!("Could not open work folder: {error}"));
             }
-            None => {
-                Self::from_sessions(SessionSet::with_untitled("", "Untitled"), files, stores, cx)
+            Ok(work_folder) => {
+                let first = work_folder
+                    .entries()
+                    .first()
+                    .map(|entry| entry.path().to_path_buf());
+                self.work_folder = Some(work_folder);
+                self.status = None;
+                if let Some(path) = first {
+                    // The window still holds the empty untitled session `new`
+                    // created and it is clean, so this replaces it in place
+                    // through the same background-loading path as any other
+                    // open, instead of leaving a spare empty session around.
+                    self.open_path(&path, cx);
+                }
             }
-        };
-        view.work_folder = Some(work_folder);
-        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
-        {
-            view.instrumentation.file_open_time = started.elapsed();
-            view.instrumentation.load_rss_bytes = hane_metrics::process_memory_bytes();
         }
-        Ok(view)
+        cx.notify();
     }
 
     #[must_use]
@@ -765,6 +777,10 @@ impl EditorView {
     }
 
     fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        // Whichever path was asked for most recently is what the user wants
+        // to see; a load that lands after a newer request must not steal
+        // focus back to what it was asked for.
+        self.latest_open_target = Some(path.to_path_buf());
         match self.sessions.open_decision(path, policy) {
             OpenDecision::Reject(_) => {
                 self.status = Some("Save current changes before opening another file".to_owned());
@@ -776,6 +792,15 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Load { into } => {
+                if !self.loading_paths.insert(path.to_path_buf()) {
+                    // Already loading this path: the in-flight read will
+                    // apply once it lands, and `latest_open_target` above is
+                    // enough to make it win if nothing newer was requested
+                    // meanwhile. Starting a second read here is what used to
+                    // produce two sessions for one file.
+                    cx.notify();
+                    return;
+                }
                 self.status = Some("Opening…".to_owned());
                 let files = self.files.clone();
                 let path = path.to_path_buf();
@@ -802,6 +827,7 @@ impl EditorView {
         loaded: std::io::Result<LoadedFile>,
         cx: &mut Context<Self>,
     ) {
+        self.loading_paths.remove(path);
         match loaded {
             Err(error) => self.status = Some(format!("Open failed: {error}")),
             Ok(loaded) => {
@@ -813,12 +839,32 @@ impl EditorView {
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
                 } else {
+                    // A newer request may have been made and even resolved
+                    // while this one was in flight; only the load that still
+                    // matches what was most recently asked for is allowed to
+                    // take over what is on screen.
+                    let is_latest_request = self.latest_open_target.as_deref() == Some(path);
+                    let previously_active = self.sessions.active_id();
+                    if is_latest_request {
+                        let scroll_y = self.scroll_y;
+                        self.sessions
+                            .active_mut()
+                            .set_view_state(SessionViewState { scroll_y });
+                    }
                     self.sessions.apply_open(into, loaded);
-                    self.on_document_replaced();
-                    self.status = Some("Opened".to_owned());
-                    self.remember_recent(path);
-                    cx.add_recent_document(path);
-                    self.schedule_document_parse(cx);
+                    if is_latest_request {
+                        self.on_document_replaced();
+                        self.status = Some("Opened".to_owned());
+                        self.remember_recent(path);
+                        cx.add_recent_document(path);
+                        self.schedule_document_parse(cx);
+                    } else {
+                        // The session now holds the loaded document and is
+                        // ready to be reused instantly next time it is
+                        // selected, but it must not visibly replace whatever
+                        // the user has since switched to.
+                        self.sessions.activate(previously_active);
+                    }
                 }
             }
         }
