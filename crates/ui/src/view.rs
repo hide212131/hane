@@ -25,7 +25,7 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -42,9 +42,10 @@ use hane_presentation::{
     block_heights, block_line_span, layout_block,
 };
 use hane_session::{
-    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService, RecentFiles,
-    SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId,
-    SessionSet, SessionViewState, Settings, StateStores, run_save_job,
+    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService,
+    OsWorkFolderScanner, RecentFiles, SaveDecision, SaveFailure, SaveIntent, SaveOutcome,
+    SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores,
+    WorkFolder, WorkFolderScanner, run_save_job,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -105,6 +106,17 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     recent: RecentFiles,
+    /// The Markdown index of the directory this window was opened onto, if
+    /// any. `None` keeps single-file editing exactly as it was: no sidebar,
+    /// no folder concept anywhere else in the view.
+    work_folder: Option<WorkFolder>,
+    /// Paths with a background read in flight, so a second click on a note
+    /// that has not finished loading yet does not start a second read.
+    loading_paths: HashSet<PathBuf>,
+    /// The path most recently asked to be opened, whether or not it has
+    /// finished loading yet. A load that lands after a newer request must
+    /// not switch what is on screen away from that newer request.
+    latest_open_target: Option<PathBuf>,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -357,6 +369,9 @@ impl EditorView {
             stores,
             settings,
             recent,
+            work_folder: None,
+            loading_paths: HashSet::new(),
+            latest_open_target: None,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -410,6 +425,58 @@ impl EditorView {
             view.instrumentation.load_rss_bytes = hane_metrics::process_memory_bytes();
         }
         Ok(view)
+    }
+
+    /// Opens `root` as a work folder. The window is created immediately with
+    /// an empty untitled session; the directory scan and the first note's
+    /// load both happen on a background thread, so a folder with many entries
+    /// or a large first document never delays the window from appearing, the
+    /// same way every later switch does not block on I/O.
+    pub fn open_work_folder(root: &Path, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new("", "Untitled", cx);
+        view.begin_work_folder_scan(root.to_path_buf(), cx);
+        view
+    }
+
+    fn begin_work_folder_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.status = Some("Opening work folder…".to_owned());
+        cx.spawn(async move |view, cx| {
+            let scanned = cx
+                .background_executor()
+                .spawn(async move { OsWorkFolderScanner.scan(&root) })
+                .await;
+            let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_work_folder_scan(
+        &mut self,
+        scanned: std::io::Result<WorkFolder>,
+        cx: &mut Context<Self>,
+    ) {
+        match scanned {
+            Err(error) => {
+                self.status = Some(format!("Could not open work folder: {error}"));
+            }
+            Ok(work_folder) => {
+                let first = work_folder
+                    .entries()
+                    .first()
+                    .map(|entry| entry.path().to_path_buf());
+                self.work_folder = Some(work_folder);
+                self.status = None;
+                if let Some(path) = first {
+                    // The window still holds the empty untitled session `new`
+                    // created and it is clean, so this replaces it in place
+                    // through the same background-loading path as any other
+                    // open, instead of leaving a spare empty session around.
+                    self.open_path(&path, cx);
+                }
+            }
+        }
+        cx.notify();
     }
 
     #[must_use]
@@ -699,7 +766,22 @@ impl EditorView {
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        match self.sessions.open_decision(path, OpenPolicy::ReuseActive) {
+        self.open_with_policy(path, OpenPolicy::ReuseActive, cx);
+    }
+
+    /// Opens a work folder sidebar entry: an already-open note is reused, and
+    /// an unloaded one is loaded into a session of its own, so switching notes
+    /// never asks the user to save whatever else happens to be open.
+    pub fn open_work_folder_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.open_with_policy(path, OpenPolicy::NewSession, cx);
+    }
+
+    fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        // Whichever path was asked for most recently is what the user wants
+        // to see; a load that lands after a newer request must not steal
+        // focus back to what it was asked for.
+        self.latest_open_target = Some(path.to_path_buf());
+        match self.sessions.open_decision(path, policy) {
             OpenDecision::Reject(_) => {
                 self.status = Some("Save current changes before opening another file".to_owned());
                 cx.notify();
@@ -710,6 +792,15 @@ impl EditorView {
                 cx.notify();
             }
             OpenDecision::Load { into } => {
+                if !self.loading_paths.insert(path.to_path_buf()) {
+                    // Already loading this path: the in-flight read will
+                    // apply once it lands, and `latest_open_target` above is
+                    // enough to make it win if nothing newer was requested
+                    // meanwhile. Starting a second read here is what used to
+                    // produce two sessions for one file.
+                    cx.notify();
+                    return;
+                }
                 self.status = Some("Opening…".to_owned());
                 let files = self.files.clone();
                 let path = path.to_path_buf();
@@ -736,6 +827,7 @@ impl EditorView {
         loaded: std::io::Result<LoadedFile>,
         cx: &mut Context<Self>,
     ) {
+        self.loading_paths.remove(path);
         match loaded {
             Err(error) => self.status = Some(format!("Open failed: {error}")),
             Ok(loaded) => {
@@ -747,12 +839,44 @@ impl EditorView {
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
                 } else {
-                    self.sessions.apply_open(into, loaded);
-                    self.on_document_replaced();
-                    self.status = Some("Opened".to_owned());
-                    self.remember_recent(path);
-                    cx.add_recent_document(path);
-                    self.schedule_document_parse(cx);
+                    // A newer request may have been made and even resolved
+                    // while this one was in flight; only the load that still
+                    // matches what was most recently asked for is allowed to
+                    // take over what is on screen.
+                    let is_latest_request = self.latest_open_target.as_deref() == Some(path);
+                    let previously_active = self.sessions.active_id();
+                    // `ReuseActive` always targets whatever session was active
+                    // when the request was made, so a stale completion here
+                    // can name the very session a newer, already-applied
+                    // completion put on screen. Overwriting it would corrupt
+                    // what the user is now looking at with no way back, so a
+                    // stale result that targets the current active session is
+                    // discarded instead of applied.
+                    if !is_latest_request && into == Some(previously_active) {
+                        self.status =
+                            Some("A newer document is open; this load was discarded".to_owned());
+                    } else {
+                        if is_latest_request {
+                            let scroll_y = self.scroll_y;
+                            self.sessions
+                                .active_mut()
+                                .set_view_state(SessionViewState { scroll_y });
+                        }
+                        self.sessions.apply_open(into, loaded);
+                        self.remember_recent(path);
+                        cx.add_recent_document(path);
+                        if is_latest_request {
+                            self.on_document_replaced();
+                            self.status = Some("Opened".to_owned());
+                            self.schedule_document_parse(cx);
+                        } else {
+                            // The session now holds the loaded document and is
+                            // ready to be reused instantly next time it is
+                            // selected, but it must not visibly replace
+                            // whatever the user has since switched to.
+                            self.sessions.activate(previously_active);
+                        }
+                    }
                 }
             }
         }
@@ -1796,8 +1920,17 @@ impl Render for EditorView {
             .max(self.theme.line_height);
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
-        // read once per frame and every layout is keyed by it.
+        // read once per frame and every layout is keyed by it. A sidebar takes
+        // its width out of the same window, so it must be subtracted here too,
+        // not just in the element tree, or wrapping would be computed for a
+        // column wider than what is actually drawn.
+        let sidebar_width = if self.work_folder.is_some() {
+            self.theme.sidebar_width
+        } else {
+            0.0
+        };
         self.content_width = (f32::from(window.viewport_size().width)
+            - sidebar_width
             - 2.0 * self.theme.line_horizontal_padding)
             .max(1.0);
         let shaper = WindowShaper::new(window);
@@ -1944,19 +2077,25 @@ impl Render for EditorView {
         let root = div()
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(rgb(self.theme.editor_background))
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.focus_handle(cx));
         let root = install_action_listeners(root, cx)
             .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .children(self.work_folder_sidebar(cx));
+        let main_column = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
             .child(self.header_element(status, cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
         let editor = self.sessions.active().editor();
-        let rendered = root.child(
+        let main_column = main_column.child(
             div()
                 .relative()
                 .flex_1()
@@ -2013,8 +2152,55 @@ impl Render for EditorView {
                         .child(div().h(px(bottom_space))),
                 ),
         );
+        let rendered = root.child(main_column);
         self.metrics.record_layout(layout_started.elapsed());
         rendered
+    }
+}
+
+impl EditorView {
+    /// The Markdown list for the sidebar, when this window was opened onto a
+    /// work folder. Every entry switches into it on click, reusing an
+    /// already-open session or loading it lazily; nothing here reads a file.
+    fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let work_folder = self.work_folder.as_ref()?;
+        let active_path = self.sessions.active().path();
+        let entries = work_folder
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let is_active = active_path == Some(entry.path());
+                let path = entry.path().to_path_buf();
+                div()
+                    .id(("work-folder-entry", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_active, |element| {
+                        element.bg(rgb(self.theme.sidebar_active_background))
+                    })
+                    .child(entry.name().to_owned())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.open_work_folder_entry(&path, cx);
+                    }))
+            });
+        Some(
+            div()
+                .id("work-folder-sidebar")
+                .flex_none()
+                .w(px(self.theme.sidebar_width))
+                .h_full()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .bg(rgb(self.theme.sidebar_background))
+                .text_color(rgb(self.theme.sidebar_foreground))
+                .children(entries),
+        )
     }
 }
 
