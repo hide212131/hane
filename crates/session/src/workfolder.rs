@@ -51,8 +51,35 @@ pub struct WorkFolder {
 
 impl WorkFolder {
     pub(crate) fn new(root: PathBuf, mut entries: Vec<WorkFolderEntry>) -> Self {
-        entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        Self::sort(&mut entries);
         Self { root, entries }
+    }
+
+    fn sort(entries: &mut [WorkFolderEntry]) {
+        entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    }
+
+    /// Adds a note this app itself just created to the index, so it appears
+    /// in the sidebar without waiting for the next full rescan. A path
+    /// already present (a race with a rescan that beat this call) is left
+    /// alone rather than duplicated.
+    pub fn insert(&mut self, path: PathBuf) {
+        if self.entries.iter().any(|entry| entry.path == path) {
+            return;
+        }
+        self.entries.push(WorkFolderEntry::new(path));
+        Self::sort(&mut self.entries);
+    }
+
+    /// Follows a rename this app itself just performed, keeping the index in
+    /// sync instead of leaving a stale entry at a path that no longer exists.
+    /// A `from` the folder was not scanned with (already renamed, or never
+    /// present) is a no-op.
+    pub fn rename(&mut self, from: &Path, to: &Path) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == from) {
+            *entry = WorkFolderEntry::new(to.to_path_buf());
+            Self::sort(&mut self.entries);
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -153,6 +180,72 @@ fn is_markdown(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::service::temporary_directory;
+
+    #[test]
+    fn inserting_a_new_note_adds_it_in_sorted_position_without_a_rescan() {
+        let mut folder = WorkFolder::new(
+            PathBuf::from("/notes"),
+            vec![
+                WorkFolderEntry::new(PathBuf::from("/notes/Alpha.md")),
+                WorkFolderEntry::new(PathBuf::from("/notes/Zeta.md")),
+            ],
+        );
+        folder.insert(PathBuf::from("/notes/Mid.md"));
+        let names: Vec<&str> = folder.entries().iter().map(WorkFolderEntry::name).collect();
+        assert_eq!(names, ["Alpha", "Mid", "Zeta"]);
+    }
+
+    #[test]
+    fn inserting_an_already_present_path_does_not_duplicate_it() {
+        let mut folder = WorkFolder::new(
+            PathBuf::from("/notes"),
+            vec![WorkFolderEntry::new(PathBuf::from("/notes/Alpha.md"))],
+        );
+        folder.insert(PathBuf::from("/notes/Alpha.md"));
+        assert_eq!(folder.len(), 1);
+    }
+
+    #[test]
+    fn renaming_an_entry_follows_the_note_to_its_new_path_and_resorts() {
+        let mut folder = WorkFolder::new(
+            PathBuf::from("/notes"),
+            vec![
+                WorkFolderEntry::new(PathBuf::from("/notes/Alpha.md")),
+                WorkFolderEntry::new(PathBuf::from("/notes/Zeta.md")),
+            ],
+        );
+        folder.rename(Path::new("/notes/Alpha.md"), Path::new("/notes/Omega.md"));
+        let names: Vec<&str> = folder.entries().iter().map(WorkFolderEntry::name).collect();
+        assert_eq!(names, ["Omega", "Zeta"]);
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Alpha.md"))
+                .is_none()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Omega.md"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renaming_a_path_the_folder_was_not_scanned_with_is_a_no_op() {
+        let mut folder = WorkFolder::new(
+            PathBuf::from("/notes"),
+            vec![WorkFolderEntry::new(PathBuf::from("/notes/Alpha.md"))],
+        );
+        folder.rename(
+            Path::new("/notes/Missing.md"),
+            Path::new("/notes/Renamed.md"),
+        );
+        assert_eq!(folder.len(), 1);
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Alpha.md"))
+                .is_some()
+        );
+    }
 
     #[test]
     fn an_empty_directory_scans_to_an_empty_work_folder() {

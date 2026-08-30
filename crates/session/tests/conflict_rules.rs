@@ -498,6 +498,46 @@ fn an_h1_driven_rename_carries_the_auto_title_and_leaves_the_document_untouched(
 }
 
 #[test]
+fn h1_create_defers_while_a_manual_save_as_is_still_in_flight() {
+    // Regression test for a review finding: while a manual Save As is in
+    // flight, `path()` is still `None` (it is only set once the write
+    // lands), which used to look exactly like a still-untitled note ready
+    // for its H1-derived `CreateNew`. Queuing behind the Save As let its
+    // landing be mistaken for the H1 write completing, then replayed the
+    // H1 write on top of whatever the Save As produced.
+    let service = MemoryFileService::new();
+    let mut sessions = SessionSet::with_untitled("# LangChain4j\n", "Untitled");
+    assert!(!sessions.active().should_defer_h1_create());
+
+    let decision = sessions
+        .active_mut()
+        .request_save(SaveIntent::To("/notes/chosen-name.md".into()));
+    assert!(matches!(decision, SaveDecision::Write(_)));
+    assert_eq!(
+        sessions.active().path(),
+        None,
+        "not set until the write lands"
+    );
+    assert!(
+        sessions.active().should_defer_h1_create(),
+        "a save in flight must defer the H1-derived create, even though `path()` is still None"
+    );
+
+    assert!(matches!(
+        complete(sessions.active_mut(), &service, decision),
+        SaveOutcome::Saved
+    ));
+    assert_eq!(
+        sessions.active().path(),
+        Some(Path::new("/notes/chosen-name.md"))
+    );
+    assert!(
+        sessions.active().should_defer_h1_create(),
+        "now named through Save As, so H1 must never take over the filename"
+    );
+}
+
+#[test]
 fn stopping_auto_naming_clears_the_tracked_title() {
     let service = service_with(&[("/notes/LangChain4j.md", "# LangChain4j\n")]);
     let mut sessions = opened(&service, "/notes/LangChain4j.md");

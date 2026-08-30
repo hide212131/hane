@@ -128,18 +128,16 @@ impl FileService for OsFileService {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        // `fs::rename` overwrites an existing destination on most platforms;
-        // this boundary must not, so the destination is checked first. A
-        // race between the check and the rename is possible but narrow, and
-        // failing the caller's own retry loop is the same outcome as losing
-        // the race outright: no file is silently clobbered.
-        if fs::symlink_metadata(to).is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "rename target already exists",
-            ));
-        }
-        fs::rename(from, to)
+        // `fs::rename` overwrites an existing destination on most platforms,
+        // and this boundary must not: checking `to` first and then renaming
+        // is two steps with a race between them, so another process creating
+        // `to` in between would still get silently clobbered. `hard_link`
+        // does not have that gap: the underlying `link` syscall itself fails
+        // atomically when `to` already exists, with nothing written. Once the
+        // link exists, `from` is unlinked; if that second step fails, `from`
+        // and `to` are both left in place rather than either being lost.
+        fs::hard_link(from, to)?;
+        fs::remove_file(from)
     }
 }
 

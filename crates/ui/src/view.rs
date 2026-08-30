@@ -832,13 +832,15 @@ impl EditorView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.title_sync_in_flight.remove(&id);
-                let already_named = view
+                // A session that no longer exists (closed, or replaced while
+                // the probe was running) defers the same as one that reports
+                // `should_defer_h1_create`; `retry_title_sync` picks this
+                // back up once whatever holds the slot finishes.
+                let should_skip = view
                     .sessions
                     .get(id)
-                    .is_none_or(|session| session.path().is_some());
-                if already_named {
-                    // Closed, replaced, or already named by another route
-                    // (e.g. a manual Save As) while the probe was running.
+                    .is_none_or(DocumentSession::should_defer_h1_create);
+                if should_skip {
                     return;
                 }
                 view.title_sync_pending.insert(id, title.clone());
@@ -935,6 +937,9 @@ impl EditorView {
                 if let Some(session) = self.sessions.get_mut(id) {
                     session.note_auto_named(title);
                 }
+                if let Some(folder) = self.work_folder.as_mut() {
+                    folder.rename(&from, &target);
+                }
                 self.recent.rename(&from, &target);
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
                     self.status = Some(format!("Recent files failed: {error}"));
@@ -999,12 +1004,18 @@ impl EditorView {
     }
 
     /// Marks a session auto-managed once its H1-derived first write has
-    /// actually landed, not merely been requested.
-    fn apply_pending_title_sync(&mut self, id: SessionId) {
-        if let Some(title) = self.title_sync_pending.remove(&id)
-            && let Some(session) = self.sessions.get_mut(id)
-        {
+    /// actually landed, not merely been requested, and adds the new note to
+    /// the work folder index so it appears in the sidebar without waiting
+    /// for the next full rescan.
+    fn apply_pending_title_sync(&mut self, id: SessionId, path: &Path) {
+        let Some(title) = self.title_sync_pending.remove(&id) else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(id) {
             session.note_auto_named(title);
+        }
+        if let Some(folder) = self.work_folder.as_mut() {
+            folder.insert(path.to_path_buf());
         }
     }
 
@@ -1100,7 +1111,7 @@ impl EditorView {
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id);
+                self.apply_pending_title_sync(id, path);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
@@ -1109,7 +1120,7 @@ impl EditorView {
                 cx.add_recent_document(path);
                 self.schedule_autosave(cx);
                 self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id);
+                self.apply_pending_title_sync(id, path);
                 self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {
@@ -3563,6 +3574,18 @@ mod tests {
             );
             assert_eq!(view.active_session().auto_title(), Some("LangChain4j"));
             assert!(!view.active_session().is_dirty());
+            // The sidebar renders `work_folder.entries()`; a note created
+            // from its H1 must appear there right away, without waiting for
+            // a full rescan, or it is unreachable once the user switches
+            // away from it.
+            assert!(
+                view.work_folder
+                    .as_ref()
+                    .unwrap()
+                    .entry_for_path(&root.join("LangChain4j.md"))
+                    .is_some(),
+                "the new note must appear in the work folder index"
+            );
         });
         assert_eq!(
             std::fs::read_to_string(root.join("LangChain4j.md")).unwrap(),
@@ -3620,6 +3643,22 @@ mod tests {
             assert_eq!(
                 view.active_session().auto_title(),
                 Some("LangChain4j Agent")
+            );
+            // The sidebar index must follow the rename too: otherwise it
+            // keeps showing the old name (which no longer exists on disk)
+            // and drops the new one until the folder is reopened.
+            let folder = view.work_folder.as_ref().unwrap();
+            assert!(
+                folder
+                    .entry_for_path(&root.join("LangChain4j.md"))
+                    .is_none(),
+                "the stale pre-rename path must not linger in the sidebar"
+            );
+            assert!(
+                folder
+                    .entry_for_path(&root.join("LangChain4j Agent.md"))
+                    .is_some(),
+                "the renamed note must be reachable from the sidebar"
             );
         });
         assert!(!root.join("LangChain4j.md").exists());

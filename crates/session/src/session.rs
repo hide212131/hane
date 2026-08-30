@@ -309,6 +309,23 @@ impl DocumentSession {
         self.in_flight.is_some()
     }
 
+    /// Whether an H1-derived "create the note's first file" write should be
+    /// skipped this cycle rather than attempted or queued: the session
+    /// already has a file (through this or some other route), or a write —
+    /// including a manual Save As that has not landed yet, which is why
+    /// `path()` alone is not enough — already holds the save slot.
+    ///
+    /// Queuing behind that other write instead of skipping would risk two
+    /// failure modes once it lands: its own completion could be mistaken for
+    /// this H1 write landing (marking a file the user named some other way
+    /// as auto-managed), and this write would still run afterwards, silently
+    /// moving the session onto a second, unwanted file. Skipping is safe
+    /// either way: the caller re-decides fresh once that other write is done.
+    #[must_use]
+    pub fn should_defer_h1_create(&self) -> bool {
+        self.file.path().is_some() || self.save_in_flight()
+    }
+
     /// Decides what a save request means right now. At most one write runs at a
     /// time; a request that arrives during a write replaces the queued target,
     /// so a burst of autosaves collapses to one follow-up write.
