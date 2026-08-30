@@ -33,7 +33,7 @@ macro_rules! command_actions {
             root
         }
 
-        pub fn register_key_bindings(cx: &mut App) {
+        fn register_core_key_bindings(cx: &mut App) {
             cx.bind_keys([
                 $(KeyBinding::new($key, $action, Some("HaneEditor"))),+
             ]);
@@ -41,12 +41,36 @@ macro_rules! command_actions {
     };
 }
 
+/// Registers this platform's key bindings. Most bindings use `secondary-`,
+/// which gpui resolves to `cmd` on macOS and `ctrl` elsewhere, so one binding
+/// list covers both without touching macOS behavior. A few Windows/Linux
+/// conventions (`ctrl-y` for redo, `ctrl-home`/`ctrl-end` for document
+/// bounds) have no macOS equivalent and are layered on top instead.
+pub fn register_key_bindings(cx: &mut App) {
+    register_core_key_bindings(cx);
+    register_secondary_platform_key_bindings(cx);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_secondary_platform_key_bindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-y", Redo, Some("HaneEditor")),
+        KeyBinding::new("ctrl-home", DocumentStart, Some("HaneEditor")),
+        KeyBinding::new("ctrl-end", DocumentEnd, Some("HaneEditor")),
+        KeyBinding::new("ctrl-shift-home", SelectDocumentStart, Some("HaneEditor")),
+        KeyBinding::new("ctrl-shift-end", SelectDocumentEnd, Some("HaneEditor")),
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+fn register_secondary_platform_key_bindings(_cx: &mut App) {}
+
 command_actions! {
-    Open ("cmd-o") => open_action |view, _window, cx| { view.prompt_open(cx); },
-    OpenFolder ("cmd-shift-o") => open_folder_action |view, _window, cx| { view.prompt_open_work_folder(cx); },
-    Save ("cmd-s") => save |view, _window, cx| { view.save_or_prompt(cx); },
-    SaveAs ("cmd-shift-s") => save_as |view, _window, cx| { view.prompt_save_as(cx); },
-    ToggleAutosave ("cmd-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
+    Open ("secondary-o") => open_action |view, _window, cx| { view.prompt_open(cx); },
+    OpenFolder ("secondary-shift-o") => open_folder_action |view, _window, cx| { view.prompt_open_work_folder(cx); },
+    Save ("secondary-s") => save |view, _window, cx| { view.save_or_prompt(cx); },
+    SaveAs ("secondary-shift-s") => save_as |view, _window, cx| { view.prompt_save_as(cx); },
+    ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     Newline ("enter") => newline |view, _window, cx| {
         if view.editor().ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);
@@ -67,29 +91,29 @@ command_actions! {
     SelectRight ("shift-right") => select_right |view, _window, cx| { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); },
     SelectUp ("shift-up") => select_up |view, window, cx| { view.move_vertical(false, true, window, cx); },
     SelectDown ("shift-down") => select_down |view, window, cx| { view.move_vertical(true, true, window, cx); },
-    SelectAll ("cmd-a") => select_all |view, _window, cx| { view.dispatch(EditorCommand::SelectAll, cx); },
+    SelectAll ("secondary-a") => select_all |view, _window, cx| { view.dispatch(EditorCommand::SelectAll, cx); },
     Home ("home") => home |view, _window, cx| { view.dispatch(EditorCommand::MoveToLineStart { extend: false }, cx); },
     End ("end") => end |view, _window, cx| { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); },
     SelectHome ("shift-home") => select_home |view, _window, cx| { view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx); },
     SelectEnd ("shift-end") => select_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx); },
-    DocumentStart ("cmd-up") => document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: false }, cx); },
-    DocumentEnd ("cmd-down") => document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx); },
-    SelectDocumentStart ("cmd-shift-up") => select_document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: true }, cx); },
-    SelectDocumentEnd ("cmd-shift-down") => select_document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx); },
-    Undo ("cmd-z") => undo |view, _window, cx| { view.dispatch(EditorCommand::Undo, cx); },
-    Redo ("cmd-shift-z") => redo |view, _window, cx| { view.dispatch(EditorCommand::Redo, cx); },
-    Copy ("cmd-c") => copy |view, _window, cx| {
+    DocumentStart ("secondary-up") => document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: false }, cx); },
+    DocumentEnd ("secondary-down") => document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx); },
+    SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: true }, cx); },
+    SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx); },
+    Undo ("secondary-z") => undo |view, _window, cx| { view.dispatch(EditorCommand::Undo, cx); },
+    Redo ("secondary-shift-z") => redo |view, _window, cx| { view.dispatch(EditorCommand::Redo, cx); },
+    Copy ("secondary-c") => copy |view, _window, cx| {
         if let Ok(text) = view.editor().selected_text() && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     },
-    Cut ("cmd-x") => cut |view, _window, cx| {
+    Cut ("secondary-x") => cut |view, _window, cx| {
         if let Ok(text) = view.editor().selected_text() && !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             view.dispatch(EditorCommand::Backspace, cx);
         }
     },
-    Paste ("cmd-v") => paste |view, _window, cx| {
+    Paste ("secondary-v") => paste |view, _window, cx| {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             view.dispatch(EditorCommand::Insert(&text), cx);
         }

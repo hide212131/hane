@@ -17,8 +17,8 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 ## 動作環境
 
-- macOS
-- [Rust](https://www.rust-lang.org/tools/install)（ビルドに必要）
+- macOS — ソースからビルドして利用します。[Rust](https://www.rust-lang.org/tools/install) が必要です。
+- Windows 11 x64 — GitHub Actions（`.github/workflows/windows-release.yml`）でビルドした `hane-windows-x64.zip` を展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
@@ -45,19 +45,20 @@ cargo run --release -p hane
 
 ## 使い方
 
-起動したら Markdown を入力・編集するだけです。主なキーボードショートカット:
+起動したら Markdown を入力・編集するだけです。主なキーボードショートカット（macOS / Windows・Linux）:
 
-| 操作 | ショートカット |
-| --- | --- |
-| カーソル移動 | 矢印キー / Home / End |
-| 選択 | Shift + 矢印キー |
-| 全選択 | Command + A |
-| コピー / 切り取り / 貼り付け | Command + C / X / V |
-| 元に戻す / やり直す | Command + Z / Command + Shift + Z |
-| 開く | Command + O |
-| フォルダを開く（work folder mode） | Command + Shift + O |
-| 保存 / 名前を付けて保存 | Command + S / Command + Shift + S |
-| 自動保存の切り替え | Command + Option + A |
+| 操作 | macOS | Windows / Linux |
+| --- | --- | --- |
+| カーソル移動 | 矢印キー / Home / End | 矢印キー / Home / End |
+| 選択 | Shift + 矢印キー | Shift + 矢印キー |
+| 文頭・文末へ移動 | Command + ↑ / ↓ | Ctrl + Home / End（Ctrl + ↑ / ↓ も可） |
+| 全選択 | Command + A | Ctrl + A |
+| コピー / 切り取り / 貼り付け | Command + C / X / V | Ctrl + C / X / V |
+| 元に戻す / やり直す | Command + Z / Command + Shift + Z | Ctrl + Z / Ctrl + Y（Ctrl + Shift + Z も可） |
+| 開く | Command + O | Ctrl + O |
+| フォルダを開く（work folder mode） | Command + Shift + O | Ctrl + Shift + O |
+| 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |
+| 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |
 
 テーマや自動保存は、ヘッダーの設定からも変更できます。
 

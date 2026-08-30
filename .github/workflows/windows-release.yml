@@ -1,0 +1,41 @@
+name: Windows release build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build hane-windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked -p hane
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $staging = "staging/hane-windows-x64"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item target/release/hane.exe "$staging/hane.exe"
+          Copy-Item README.md "$staging/README.md"
+          Copy-Item LICENSE "$staging/LICENSE" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$staging/*" -DestinationPath "hane-windows-x64.zip" -Force
+
+      - name: Upload portable build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hane-windows-x64
+          path: hane-windows-x64.zip
+          if-no-files-found: error
