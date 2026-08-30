@@ -25,7 +25,7 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -126,6 +126,9 @@ pub struct EditorView {
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
     work_folder_drafts: HashMap<SessionId, DraftId>,
+    /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
+    /// the life of the view; dropping it would cancel the hook.
+    _quit_subscription: Subscription,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -393,6 +396,15 @@ impl EditorView {
             theme.line_height,
             sessions.active().editor().document().line_count(),
         ));
+        // The 750ms draft-save debounce (`schedule_draft_save`) can still be
+        // pending when the app quits; this hook flushes whatever it would
+        // have written so an unnamed note typed just before quitting is not
+        // lost.
+        let quit_subscription =
+            cx.on_app_quit(|view: &mut Self, _cx| {
+                view.flush_pending_drafts();
+                std::future::ready(())
+            });
         Self {
             sessions,
             files,
@@ -402,6 +414,7 @@ impl EditorView {
             work_folder: None,
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
+            _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
@@ -738,6 +751,29 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    /// Writes every pending unnamed-note draft synchronously, bypassing the
+    /// debounce in `schedule_draft_save`. Called from the app-quit hook
+    /// registered in `from_sessions`: a normal quit gives a `schedule_draft_save`
+    /// timer no chance to fire if it was armed less than 750ms earlier, so
+    /// without this an unnamed note's last few keystrokes would only survive
+    /// a crash (recovered from whatever the debounce last wrote) but not a
+    /// clean exit.
+    fn flush_pending_drafts(&self) {
+        if self.work_folder_drafts.is_empty() {
+            return;
+        }
+        let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
+            return;
+        };
+        for (&id, &draft_id) in &self.work_folder_drafts {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let text = session.editor().document().full_text();
+            let _ = self.draft_store.write(root, draft_id, &text);
+        }
     }
 
     /// Issue #6: arms the debounce timer that keeps a work-folder note's
@@ -1201,6 +1237,59 @@ impl EditorView {
             _ => {}
         })
         .detach();
+    }
+
+    /// Prompts for a directory and switches this window into work-folder mode
+    /// on it, the GUI entry point for what a startup CLI argument already
+    /// does through `EditorView::open_work_folder`. Guards on dirty state the
+    /// same way `prompt_open` does: switching folders discards whichever
+    /// sessions are open in this window.
+    pub(crate) fn prompt_open_work_folder(&mut self, cx: &mut Context<Self>) {
+        if self.sessions.active().is_dirty() {
+            self.status = Some("Save current changes before opening a folder".to_owned());
+            cx.notify();
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Work Folder".into()),
+        });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(root) = paths.into_iter().next() {
+                    let _ = view.update(cx, |view, cx| view.switch_to_work_folder(root, cx));
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(format!("Open Folder failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    /// Resets this window to a single fresh untitled session and begins
+    /// scanning `root` as a work folder — the runtime equivalent of the
+    /// startup path through `open_work_folder`. Every previously open
+    /// session, and any state keyed by its id, is discarded rather than kept
+    /// around: a work folder switch is a new window's worth of state, not
+    /// another document alongside the old ones.
+    fn switch_to_work_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.sessions = SessionSet::with_untitled("", "Untitled");
+        self.work_folder = None;
+        self.work_folder_drafts.clear();
+        self.draft_recovery_warning = None;
+        self.title_sync_pending.clear();
+        self.title_sync_in_flight.clear();
+        self.loading_paths.clear();
+        self.latest_open_target = None;
+        self.on_document_replaced();
+        self.begin_work_folder_scan(root, cx);
     }
 
     /// Opens a path the way a filer will: the session set decides whether this
@@ -3310,6 +3399,115 @@ mod tests {
         assert_eq!(
             recovered.drafts[0].text,
             "today I thought about this design"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #2 follow-up: `prompt_open_work_folder` is the GUI entry point
+    // for switching into work-folder mode at runtime (previously only
+    // reachable via a startup CLI argument). `switch_to_work_folder` is the
+    // part of it that does not depend on the native folder picker: it must
+    // drop whatever was open before and start fresh on the new root, rather
+    // than leaving stale sessions or per-session bookkeeping (like an old
+    // folder's unnamed-draft mapping) behind.
+    #[gpui::test]
+    fn switch_to_work_folder_discards_previous_sessions_and_opens_the_new_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("switch-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("switch-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(old_work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("draft in the old folder")
+                .unwrap();
+            view.after_input(cx);
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.work_folder_drafts.len()),
+            1
+        );
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.work_folder_drafts.is_empty(),
+                "the old folder's draft bookkeeping must not leak into the new one"
+            );
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path())
+            );
+            assert_eq!(view.sessions().count(), 1);
+            assert_eq!(
+                view.editor().document().full_text().trim(),
+                "# New"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #2 follow-up: `schedule_draft_save` only writes 750ms after the
+    // last keystroke, so an app quit within that window used to lose
+    // whatever was typed since the previous write. `flush_pending_drafts` is
+    // what the app-quit hook calls to write the draft immediately instead of
+    // waiting on the debounce timer.
+    #[gpui::test]
+    fn flush_pending_drafts_writes_immediately_without_waiting_for_the_debounce(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("quit-flush");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("quitting before the debounce fires")
+                .unwrap();
+            view.after_input(cx);
+            // No `Timer::after(750ms)` wait: the flush must not depend on it.
+            view.flush_pending_drafts();
+        });
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(
+            recovered.drafts[0].text,
+            "quitting before the debounce fires"
         );
 
         std::fs::remove_dir_all(&root).unwrap();

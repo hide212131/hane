@@ -13,6 +13,7 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - **Recent Files** — 最近開いたファイルにすぐアクセスできます。
 - **設定の保存** — テーマや自動保存などの設定は次回起動時も引き継がれます。
 - **テーマ** — system / light / dark のテーマを切り替えられます。
+- **Work folder mode** — フォルダを指定すると、配下の Markdown 一覧をサイドバーから選んですぐ編集できます。`+` を押すだけでファイル名を聞かれずに新しいメモを書き始められ、最初の H1 がファイル名になります。
 
 ## 動作環境
 
@@ -31,6 +32,9 @@ cargo run -p hane
 
 # ファイルを指定して起動
 cargo run -p hane -- path/to/document.md
+
+# フォルダを指定して work folder mode で起動
+cargo run -p hane -- path/to/work-folder
 ```
 
 快適に使うにはリリースビルドをおすすめします。
@@ -51,10 +55,19 @@ cargo run --release -p hane
 | コピー / 切り取り / 貼り付け | Command + C / X / V |
 | 元に戻す / やり直す | Command + Z / Command + Shift + Z |
 | 開く | Command + O |
+| フォルダを開く（work folder mode） | Command + Shift + O |
 | 保存 / 名前を付けて保存 | Command + S / Command + Shift + S |
 | 自動保存の切り替え | Command + Option + A |
 
 テーマや自動保存は、ヘッダーの設定からも変更できます。
+
+### Work folder mode
+
+起動時にディレクトリを引数として渡すか、起動後に Command + Shift + O でフォルダを選ぶと、その配下の Markdown 一覧が左サイドバーに表示されます。一覧からメモを選ぶと保存ダイアログを挟まずすぐ編集でき、`+` を押すとファイル名を聞かれない空のメモがその場で開きます。
+
+新規メモは最初の H1（`# ...`）がファイル名になり、自動命名対象のメモは以後 H1 を変更するとファイル名も追従します。ファイル名と H1 が最初から異なる既存の Markdown は、自動命名対象と判断されないため勝手にリネームされません。
+
+H1 をまだ付けていない新規メモは `.hane/drafts` にバックグラウンドで保存されるため、アプリを終了・クラッシュさせても内容を失いません。
 
 ## ライセンス
 

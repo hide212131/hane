@@ -43,6 +43,7 @@ macro_rules! command_actions {
 
 command_actions! {
     Open ("cmd-o") => open_action |view, _window, cx| { view.prompt_open(cx); },
+    OpenFolder ("cmd-shift-o") => open_folder_action |view, _window, cx| { view.prompt_open_work_folder(cx); },
     Save ("cmd-s") => save |view, _window, cx| { view.save_or_prompt(cx); },
     SaveAs ("cmd-shift-s") => save_as |view, _window, cx| { view.prompt_save_as(cx); },
     ToggleAutosave ("cmd-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
