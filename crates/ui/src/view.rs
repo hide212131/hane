@@ -42,10 +42,10 @@ use hane_presentation::{
     block_heights, block_line_span, layout_block,
 };
 use hane_session::{
-    DocumentSession, FileService, LoadedFile, OpenDecision, OpenPolicy, OsFileService,
-    OsWorkFolderScanner, RecentFiles, SaveDecision, SaveFailure, SaveIntent, SaveOutcome,
-    SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores,
-    WorkFolder, WorkFolderScanner, run_save_job,
+    DocumentSession, DraftId, DraftStore, FileService, LoadedFile, OpenDecision, OpenPolicy,
+    OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision,
+    SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet,
+    SessionViewState, Settings, StateStores, WorkFolder, WorkFolderScanner, run_save_job,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -110,6 +110,17 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Where a not-yet-named work-folder note's content is journalled, so a
+    /// crash before it earns a real filename never loses it. Removed once the
+    /// session it belongs to gets a real path or closes.
+    draft_store: Arc<dyn DraftStore>,
+    work_folder_drafts: HashMap<SessionId, DraftId>,
+    /// A draft-recovery failure from the last work-folder scan, if any. Kept
+    /// apart from `status`: opening the work folder's first note runs right
+    /// after the scan and drives `status` through "Opening…" and "Opened" in
+    /// the same update cycle, which would otherwise blank out the warning
+    /// before the user ever saw it. Cleared only by the next scan's outcome.
+    draft_recovery_warning: Option<String>,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -370,6 +381,9 @@ impl EditorView {
             settings,
             recent,
             work_folder: None,
+            draft_store: Arc::new(OsDraftStore),
+            work_folder_drafts: HashMap::new(),
+            draft_recovery_warning: None,
             loading_paths: HashSet::new(),
             latest_open_target: None,
             focus_handle: cx.focus_handle(),
@@ -440,10 +454,16 @@ impl EditorView {
 
     fn begin_work_folder_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.status = Some("Opening work folder…".to_owned());
+        let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
+            let scan_root = root.clone();
             let scanned = cx
                 .background_executor()
-                .spawn(async move { OsWorkFolderScanner.scan(&root) })
+                .spawn(async move {
+                    let work_folder = OsWorkFolderScanner.scan(&scan_root);
+                    let drafts = draft_store.recover(&scan_root);
+                    (work_folder, drafts)
+                })
                 .await;
             let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
         })
@@ -453,10 +473,14 @@ impl EditorView {
 
     fn finish_work_folder_scan(
         &mut self,
-        scanned: std::io::Result<WorkFolder>,
+        scanned: (
+            std::io::Result<WorkFolder>,
+            std::io::Result<RecoveredDrafts>,
+        ),
         cx: &mut Context<Self>,
     ) {
-        match scanned {
+        let (work_folder, drafts) = scanned;
+        match work_folder {
             Err(error) => {
                 self.status = Some(format!("Could not open work folder: {error}"));
             }
@@ -465,14 +489,53 @@ impl EditorView {
                     .entries()
                     .first()
                     .map(|entry| entry.path().to_path_buf());
+                // The window still holds the empty untitled session `new`
+                // created above; it stays clean and in place while any
+                // recovered drafts are installed alongside it, so switching
+                // to the first real note below can still reuse it.
+                let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
-                self.status = None;
+
+                // A recovery failure must not look like the drafts were
+                // simply gone: `OsDraftStore::recover` already keeps
+                // whatever individual files it could read, so surface the
+                // error (or, short of that, how many entries could not be
+                // read) instead of silently falling back to an empty list
+                // and clearing status as if nothing happened. This goes into
+                // `draft_recovery_warning`, not `status`: opening the first
+                // note below drives `status` through "Opening…" and
+                // "Opened" in this same update cycle, which would otherwise
+                // blank the warning out before it was ever shown.
+                let mut last_recovered = None;
+                self.draft_recovery_warning = match drafts {
+                    Ok(drafts) => {
+                        for draft in drafts.drafts {
+                            let id = self.sessions.open_untitled(&draft.text, "Untitled");
+                            self.work_folder_drafts.insert(id, draft.id);
+                            last_recovered = Some(id);
+                        }
+                        (drafts.failed > 0).then(|| {
+                            format!(
+                                "{} unsaved draft{} could not be recovered",
+                                drafts.failed,
+                                if drafts.failed == 1 { "" } else { "s" }
+                            )
+                        })
+                    }
+                    Err(error) => Some(format!("Could not recover unsaved drafts: {error}")),
+                };
+
                 if let Some(path) = first {
-                    // The window still holds the empty untitled session `new`
-                    // created and it is clean, so this replaces it in place
-                    // through the same background-loading path as any other
-                    // open, instead of leaving a spare empty session around.
+                    // Opening the first entry replaces whichever session is
+                    // active through the same background-loading path as any
+                    // other open, instead of leaving a spare empty session
+                    // around; that must be the original clean one, not
+                    // whichever draft was installed last.
+                    self.sessions.activate(initial_session);
                     self.open_path(&path, cx);
+                } else if last_recovered.is_some() {
+                    self.on_document_replaced();
+                    self.schedule_document_parse(cx);
                 }
             }
         }
@@ -576,6 +639,7 @@ impl EditorView {
         self.scroll_cursor_into_view();
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
+        self.schedule_draft_save(cx);
         cx.notify();
     }
 
@@ -606,6 +670,95 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    /// Journals the active session's text into the recovery drafts on the
+    /// same debounce cadence as autosave: a no-op unless the active session
+    /// is an unnamed note in the current work folder. Kept separate from
+    /// `schedule_autosave` because an unnamed note has no path to write to
+    /// yet and must not wait for one to earn crash safety.
+    ///
+    /// The scheduled save targets the session it was armed for by id, not
+    /// whichever session is active when the timer fires: switching to
+    /// another note within the debounce window must not cancel the write, or
+    /// edits made just before switching away are lost on a crash until the
+    /// draft is revisited and edited again.
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        let id = self.sessions.active_id();
+        let Some(&draft_id) = self.work_folder_drafts.get(&id) else {
+            return;
+        };
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let revision = self.sessions.active().revision();
+        let draft_store = self.draft_store.clone();
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(750)).await;
+            let text = view
+                .read_with(cx, |view, _| {
+                    let session = view.sessions.get(id)?;
+                    let current =
+                        session.revision() == revision && view.work_folder_drafts.contains_key(&id);
+                    current.then(|| session.editor().document().full_text())
+                })
+                .ok()
+                .flatten();
+            if let Some(text) = text {
+                let _ = cx
+                    .background_executor()
+                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Issue #5: starts a brand-new, unnamed note in the current work folder.
+    /// No filename prompt: it opens blank and ready for input immediately,
+    /// and is journalled into the recovery drafts as soon as it holds
+    /// anything, so a crash before it earns a real name never loses it.
+    pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
+        if self.work_folder.is_none() {
+            return;
+        }
+        let scroll_y = self.scroll_y;
+        self.sessions
+            .active_mut()
+            .set_view_state(SessionViewState { scroll_y });
+        let id = self.sessions.open_untitled("", "Untitled");
+        self.work_folder_drafts.insert(id, DraftId::generate());
+        self.on_document_replaced();
+        self.schedule_document_parse(cx);
+        self.status = None;
+        cx.notify();
+    }
+
+    /// A note stops being a draft once it earns a real path, whether through
+    /// the (future) H1-derived rename or a manual Save As. The recovery
+    /// journal entry is removed on a background thread; a failure here just
+    /// leaves a harmless leftover file, never lost content.
+    fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(draft_id) = self.work_folder_drafts.remove(&id) else {
+            return;
+        };
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let draft_store = self.draft_store.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = draft_store.remove(&root, draft_id);
+            })
+            .detach();
     }
 
     pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
@@ -683,12 +836,14 @@ impl EditorView {
                 self.status = Some("Saved".to_owned());
                 self.remember_recent(path);
                 cx.add_recent_document(path);
+                self.retire_work_folder_draft(id, cx);
             }
             SaveOutcome::SavedStale => {
                 self.status = Some("Saved snapshot; newer edits pending".to_owned());
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.schedule_autosave(cx);
+                self.retire_work_folder_draft(id, cx);
             }
             SaveOutcome::Conflict => {
                 self.status = Some(
@@ -1887,6 +2042,24 @@ impl EditorView {
     }
 }
 
+/// The header's status line, combining a persistent `draft_recovery_warning`
+/// with whatever transient `status` is current. Neither may swallow the
+/// other: the warning has to survive `open_path` cycling `status` through
+/// "Opening…"/"Opened" right after the scan that raised it, but a later
+/// status the user needs for data safety (a save failure, a conflict) must
+/// stay visible too, since this view only re-scans a work folder once at
+/// startup and an unconditional priority for the warning would otherwise
+/// hide every status for the rest of the session. `None` when neither is
+/// set, so the caller can fall back to its own default line.
+fn header_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
+    match (warning, status) {
+        (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
+        (Some(warning), None) => Some(warning.to_owned()),
+        (None, Some(status)) => Some(status.to_owned()),
+        (None, None) => None,
+    }
+}
+
 #[cfg(not(any(feature = "instrument", feature = "timing-probe")))]
 impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
@@ -2070,7 +2243,11 @@ impl Render for EditorView {
         } else {
             ""
         };
-        let status = self.status.clone().unwrap_or_else(|| {
+        let status = header_status_line(
+            self.draft_recovery_warning.as_deref(),
+            self.status.as_deref(),
+        )
+        .unwrap_or_else(|| {
             format!("rev {revision} · {bytes} bytes · frame p95 {p95:.2} ms{background}{dirty}")
         });
 
@@ -2162,9 +2339,24 @@ impl EditorView {
     /// The Markdown list for the sidebar, when this window was opened onto a
     /// work folder. Every entry switches into it on click, reusing an
     /// already-open session or loading it lazily; nothing here reads a file.
+    /// A `+` above the list starts a brand-new unnamed note, and any unnamed
+    /// note already open (freshly created, or recovered from a crash) is
+    /// listed below the named ones so it stays reachable while it has no
+    /// file of its own yet.
     fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         let work_folder = self.work_folder.as_ref()?;
+        let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
+        let new_note_button = div()
+            .id("work-folder-new-note")
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
+            .child("+")
+            .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx)));
         let entries = work_folder
             .entries()
             .iter()
@@ -2186,6 +2378,27 @@ impl EditorView {
                         view.open_work_folder_entry(&path, cx);
                     }))
             });
+        let mut draft_ids: Vec<SessionId> = self.work_folder_drafts.keys().copied().collect();
+        draft_ids.sort_by_key(|id| id.0);
+        let drafts = draft_ids
+            .into_iter()
+            .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
+            .map(|(id, session)| {
+                let is_active = active_id == id;
+                div()
+                    .id(("work-folder-draft", id.0 as usize))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_active, |element| {
+                        element.bg(rgb(self.theme.sidebar_active_background))
+                    })
+                    .child(draft_preview(session))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate_session(id, cx);
+                    }))
+            });
         Some(
             div()
                 .id("work-folder-sidebar")
@@ -2199,8 +2412,22 @@ impl EditorView {
                 .p_2()
                 .bg(rgb(self.theme.sidebar_background))
                 .text_color(rgb(self.theme.sidebar_foreground))
-                .children(entries),
+                .child(new_note_button)
+                .children(entries)
+                .children(drafts),
         )
+    }
+}
+
+/// A short label for an unnamed note in the sidebar: its first non-blank
+/// line (an H1 marker stripped, since that will become its title), or a
+/// placeholder for a note that is still completely empty.
+fn draft_preview(session: &DocumentSession) -> String {
+    let text = session.editor().document().full_text();
+    let first_line = text.lines().map(str::trim).find(|line| !line.is_empty());
+    match first_line {
+        Some(line) => line.trim_start_matches('#').trim().to_owned(),
+        None => "Untitled note".to_owned(),
     }
 }
 
@@ -2309,6 +2536,7 @@ mod tests {
     use super::*;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
+    use hane_session::RecoveredDraft;
 
     #[test]
     fn layout_cache_key_rejects_each_geometry_input_independently() {
@@ -2734,5 +2962,286 @@ mod tests {
         assert!(blocks.range_eq(0..flat.len(), &flat));
         assert_eq!(blocks.get(126), flat.get(126).copied());
         assert_eq!(blocks.get(130), flat.get(130).copied());
+    }
+
+    fn draft_test_root(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "hane-draft-save-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    // Regression test for the P1 review finding on `schedule_draft_save`:
+    // switching to another note within the 750ms debounce window used to
+    // cancel the pending write outright, because the timer only saved when
+    // its own session was still the active one. Typing into an unnamed note
+    // and switching away before the timer fires must still journal what was
+    // typed.
+    #[gpui::test]
+    fn draft_save_survives_switching_sessions_within_the_debounce_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("switch");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Start the first unnamed note and type into it.
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("today I thought about this design")
+                .unwrap();
+            view.after_input(cx);
+            // Switch away to a second unnamed note before the debounce timer
+            // for the first one fires.
+            view.new_work_folder_note(cx);
+        });
+
+        // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
+        // not the deterministic test dispatcher), so the test has to wait for
+        // real time to pass rather than fast-forwarding a virtual clock. The
+        // spawned task must run once first to reach its `Timer::after` await
+        // and register with the real clock before that wait is worth doing.
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(900));
+        cx.run_until_parked();
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(
+            recovered.drafts[0].text,
+            "today I thought about this design"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the P2 review finding on `finish_work_folder_scan`:
+    // a `DraftStore::recover` failure used to be swallowed via
+    // `drafts.unwrap_or_default()`, leaving `status` at `None` exactly as if
+    // there had simply been no drafts to recover. The error must be visible.
+    #[gpui::test]
+    fn a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("recovery-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+        });
+
+        let warning = view.read_with(cx, |view, _| view.draft_recovery_warning.clone());
+        assert!(
+            warning.is_some_and(|warning| warning.contains("recover")),
+            "expected the drafts-recovery error to be surfaced as a warning"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the follow-up P2 finding: a per-file recovery
+    // failure (as opposed to the whole directory being unreadable) must also
+    // be visible, not just silently drop the one draft that could not be
+    // read while saying nothing about it. The drafts that *were* readable
+    // must still come back.
+    #[gpui::test]
+    fn a_partial_draft_recovery_failure_is_surfaced_while_readable_drafts_still_recover(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("partial-recovery-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        let readable = RecoveredDraft {
+            id: DraftId::generate(),
+            text: "kept".to_owned(),
+        };
+        let partial = RecoveredDrafts {
+            drafts: vec![readable.clone()],
+            failed: 1,
+        };
+
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan((Ok(work_folder), Ok(partial)), cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.draft_recovery_warning
+                    .as_deref()
+                    .is_some_and(|warning| warning.contains('1')),
+                "expected the one unreadable draft to be surfaced as a warning, got {:?}",
+                view.draft_recovery_warning
+            );
+            assert!(
+                view.work_folder_drafts
+                    .values()
+                    .any(|id| *id == readable.id),
+                "the readable draft must still be recovered as a session"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Regression test for the P2 review finding that the recovery warning
+    // was overwritten within the same update cycle: when the work folder has
+    // a named note, `finish_work_folder_scan` immediately opens it via
+    // `open_path`, which drives `status` through "Opening…" and then
+    // "Opened" once the background read completes. The warning has to
+    // survive that, not just the synchronous part of the scan.
+    #[gpui::test]
+    fn a_draft_recovery_warning_survives_opening_the_first_named_note(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("warning-survives-open");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Meeting.md"), "# Meeting\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        assert_eq!(work_folder.entries().len(), 1);
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+        });
+
+        // Let the background read `open_path` kicked off run to completion,
+        // driving `status` to "Opened" the same way a real work-folder open
+        // does.
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status.as_deref(), Some("Opened"));
+            assert!(
+                view.draft_recovery_warning
+                    .as_deref()
+                    .is_some_and(|warning| warning.contains("recover")),
+                "expected the recovery warning to survive the first note's open completing, got {:?}",
+                view.draft_recovery_warning
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn header_status_line_combines_warning_and_status_without_dropping_either() {
+        assert_eq!(header_status_line(None, None), None);
+        assert_eq!(
+            header_status_line(Some("2 drafts could not be recovered"), None),
+            Some("2 drafts could not be recovered".to_owned())
+        );
+        assert_eq!(
+            header_status_line(None, Some("Opened")),
+            Some("Opened".to_owned())
+        );
+        // Regression for the P1 review finding: an unconditional priority for
+        // the warning would permanently hide a later, safety-relevant status
+        // (a save failure, a conflict) once a work folder has raised a
+        // recovery warning, since this view only re-scans a work folder once
+        // at startup. Both must show.
+        assert_eq!(
+            header_status_line(
+                Some("2 drafts could not be recovered"),
+                Some("Save failed: disk full")
+            ),
+            Some("2 drafts could not be recovered · Save failed: disk full".to_owned())
+        );
+    }
+
+    // Regression test for the P1 review finding on the header status line: a
+    // save failure that happens after a draft-recovery warning was raised
+    // must still reach the user, not be hidden behind the warning for the
+    // rest of the session.
+    #[gpui::test]
+    fn a_save_failure_after_a_draft_recovery_warning_is_still_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("warning-then-save-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+            // A save failure arriving well after the recovery warning was
+            // raised (a later autosave, a manual save, a conflict) must not
+            // be swallowed by the warning that is still sitting in
+            // `draft_recovery_warning`.
+            view.status = Some("Save failed: disk full".to_owned());
+        });
+
+        view.read_with(cx, |view, _| {
+            let combined = header_status_line(
+                view.draft_recovery_warning.as_deref(),
+                view.status.as_deref(),
+            );
+            assert!(
+                combined
+                    .as_deref()
+                    .is_some_and(|line| line.contains("Save failed")),
+                "expected the save failure to still be visible, got {combined:?}"
+            );
+            assert!(
+                combined
+                    .as_deref()
+                    .is_some_and(|line| line.contains("recover")),
+                "expected the recovery warning to still be visible too, got {combined:?}"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

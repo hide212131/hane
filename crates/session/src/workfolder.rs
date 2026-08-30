@@ -106,23 +106,41 @@ impl WorkFolderScanner for OsWorkFolderScanner {
             ));
         }
         let mut entries = Vec::new();
-        walk(root, &mut entries)?;
+        walk(root, root, &mut entries)?;
         Ok(WorkFolder::new(root.to_path_buf(), entries))
     }
 }
 
-fn walk(dir: &Path, entries: &mut Vec<WorkFolderEntry>) -> io::Result<()> {
+fn walk(root: &Path, dir: &Path, entries: &mut Vec<WorkFolderEntry>) -> io::Result<()> {
     for item in fs::read_dir(dir)? {
         let item = item?;
         let path = item.path();
         let file_type = item.file_type()?;
         if file_type.is_dir() {
-            walk(&path, entries)?;
+            // `.hane` directly under the work folder root is where Hane
+            // keeps its own state for this work folder (the unnamed-note
+            // recovery journal, for instance): never a directory of the
+            // user's own notes. Only that one directory is excluded, so
+            // dotfile directories the user actually keeps notes in (`.notes`,
+            // `.github`, and the like) are still scanned, the same as before
+            // the recovery journal existed.
+            if is_root_hane_directory(root, &path) {
+                continue;
+            }
+            walk(root, &path, entries)?;
         } else if file_type.is_file() && is_markdown(&path) {
             entries.push(WorkFolderEntry::new(path));
         }
     }
     Ok(())
+}
+
+fn is_root_hane_directory(root: &Path, path: &Path) -> bool {
+    path.parent() == Some(root)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".hane")
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -168,6 +186,49 @@ mod tests {
                 .entry_for_path(&root.join("nested/TODO.md"))
                 .is_some()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_root_recovery_journal_directory_is_not_scanned() {
+        let root = temporary_directory("workfolder-hidden");
+        fs::create_dir_all(root.join(".hane/drafts")).unwrap();
+        fs::write(root.join("Meeting.md"), "# Meeting\n").unwrap();
+        fs::write(root.join(".hane/drafts/0000000000000001.md"), "draft\n").unwrap();
+
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let names: Vec<&str> = work_folder
+            .entries()
+            .iter()
+            .map(WorkFolderEntry::name)
+            .collect();
+        assert_eq!(names, ["Meeting"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dotfile_directories_other_than_the_root_recovery_journal_are_still_scanned() {
+        // Only `.hane` directly under the work folder root is Hane's own
+        // state; a user keeping notes under a dotfile directory of their own
+        // (`.notes`, `.github`, and so on) must not have them disappear from
+        // the work folder just because the recovery journal also lives under
+        // a dot-prefixed name.
+        let root = temporary_directory("workfolder-dotfile-notes");
+        fs::create_dir_all(root.join(".notes")).unwrap();
+        fs::create_dir_all(root.join(".github")).unwrap();
+        fs::create_dir_all(root.join("nested/.hane")).unwrap();
+        fs::write(root.join(".notes/foo.md"), "# foo\n").unwrap();
+        fs::write(root.join(".github/ISSUE_TEMPLATE.md"), "# template\n").unwrap();
+        fs::write(root.join("nested/.hane/not-a-draft.md"), "# nope\n").unwrap();
+
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let mut names: Vec<&str> = work_folder
+            .entries()
+            .iter()
+            .map(WorkFolderEntry::name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["ISSUE_TEMPLATE", "foo", "not-a-draft"]);
         fs::remove_dir_all(root).unwrap();
     }
 
