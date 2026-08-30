@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(feature = "instrument")),
+    windows_subsystem = "windows"
+)]
+
 #[cfg(not(feature = "instrument"))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
