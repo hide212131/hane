@@ -271,7 +271,7 @@ fn a_rename_moves_the_session_without_touching_the_document() {
     type_into(sessions.active_mut(), "unsaved");
     let generation = sessions.active().generation();
 
-    service.rename("/notes/a.md", "/archive/a.md");
+    service.rename_externally("/notes/a.md", "/archive/a.md");
     let outcomes = sessions.apply_file_event(&FileEvent::Renamed {
         from: "/notes/a.md".into(),
         to: "/archive/a.md".into(),
@@ -412,4 +412,98 @@ fn switching_sessions_keeps_each_documents_own_state() {
     assert!(sessions.active().is_dirty());
     assert_eq!(sessions.active().view_state().scroll_y, 120.0);
     assert_eq!(sessions.active().path(), Some(Path::new("/notes/a.md")));
+}
+
+#[test]
+fn create_new_gives_an_untitled_note_its_first_h1_derived_name() {
+    let service = MemoryFileService::new();
+    let mut sessions = SessionSet::with_untitled("# LangChain4j\n", "Untitled");
+    type_into(sessions.active_mut(), "");
+
+    let decision = sessions
+        .active_mut()
+        .request_save(SaveIntent::CreateNew("/notes/LangChain4j.md".into()));
+    assert!(matches!(
+        complete(sessions.active_mut(), &service, decision),
+        SaveOutcome::Saved
+    ));
+    assert_eq!(
+        sessions.active().path(),
+        Some(Path::new("/notes/LangChain4j.md"))
+    );
+    assert_eq!(
+        sessions.active().auto_title(),
+        None,
+        "not marked until the caller says so"
+    );
+    sessions
+        .active_mut()
+        .note_auto_named("LangChain4j".to_owned());
+    assert_eq!(sessions.active().auto_title(), Some("LangChain4j"));
+}
+
+#[test]
+fn create_new_refuses_to_overwrite_a_name_that_already_exists() {
+    let service = service_with(&[("/notes/LangChain4j.md", "someone else's note\n")]);
+    let mut sessions = SessionSet::with_untitled("# LangChain4j\n", "Untitled");
+
+    let decision = sessions
+        .active_mut()
+        .request_save(SaveIntent::CreateNew("/notes/LangChain4j.md".into()));
+    assert!(matches!(
+        complete(sessions.active_mut(), &service, decision),
+        SaveOutcome::Conflict
+    ));
+    assert_eq!(
+        service.contents("/notes/LangChain4j.md").as_deref(),
+        Some("someone else's note\n"),
+        "an automatically picked name must never clobber an existing file"
+    );
+}
+
+#[test]
+fn an_h1_driven_rename_carries_the_auto_title_and_leaves_the_document_untouched() {
+    let service = service_with(&[("/notes/LangChain4j.md", "# LangChain4j\n")]);
+    let mut sessions = opened(&service, "/notes/LangChain4j.md");
+    sessions
+        .active_mut()
+        .note_auto_named("LangChain4j".to_owned());
+    type_into(sessions.active_mut(), "unsaved edit");
+
+    service
+        .rename(
+            Path::new("/notes/LangChain4j.md"),
+            Path::new("/notes/LangChain4j Agent.md"),
+        )
+        .unwrap();
+    let outcomes = sessions.apply_file_event(&FileEvent::Renamed {
+        from: "/notes/LangChain4j.md".into(),
+        to: "/notes/LangChain4j Agent.md".into(),
+    });
+    assert_eq!(
+        outcomes,
+        vec![(sessions.active_id(), FileEventOutcome::Renamed)]
+    );
+    sessions
+        .active_mut()
+        .note_auto_named("LangChain4j Agent".to_owned());
+
+    let session = sessions.active();
+    assert_eq!(
+        session.path(),
+        Some(Path::new("/notes/LangChain4j Agent.md"))
+    );
+    assert_eq!(session.auto_title(), Some("LangChain4j Agent"));
+    assert!(session.is_dirty(), "a rename never touches the document");
+}
+
+#[test]
+fn stopping_auto_naming_clears_the_tracked_title() {
+    let service = service_with(&[("/notes/LangChain4j.md", "# LangChain4j\n")]);
+    let mut sessions = opened(&service, "/notes/LangChain4j.md");
+    sessions
+        .active_mut()
+        .note_auto_named("LangChain4j".to_owned());
+    sessions.active_mut().stop_auto_naming();
+    assert_eq!(sessions.active().auto_title(), None);
 }

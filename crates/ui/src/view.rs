@@ -42,10 +42,11 @@ use hane_presentation::{
     block_heights, block_line_span, layout_block,
 };
 use hane_session::{
-    DocumentSession, DraftId, DraftStore, FileService, LoadedFile, OpenDecision, OpenPolicy,
-    OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision,
-    SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet,
-    SessionViewState, Settings, StateStores, WorkFolder, WorkFolderScanner, run_save_job,
+    DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
+    OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles,
+    RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile,
+    SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction, WorkFolder,
+    WorkFolderScanner, decide_title_sync, extract_h1_title, run_save_job, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -96,6 +97,16 @@ struct DocumentKey {
     generation: u64,
 }
 
+/// One H1-driven rename attempt's outcome-handling context, bundled so
+/// `finish_title_rename` takes one argument instead of five.
+struct TitleRenameAttempt {
+    id: SessionId,
+    ticket: SaveTicket,
+    from: PathBuf,
+    target: PathBuf,
+    title: String,
+}
+
 pub struct EditorView {
     /// Every open document. Holding a set rather than one editor is what lets a
     /// filer add and switch documents without the renderer changing.
@@ -121,6 +132,14 @@ pub struct EditorView {
     /// the same update cycle, which would otherwise blank out the warning
     /// before the user ever saw it. Cleared only by the next scan's outcome.
     draft_recovery_warning: Option<String>,
+    /// The title an in-flight create-or-rename write is for, so `finish_save`
+    /// can mark the session auto-managed once the write actually lands
+    /// rather than when it was merely requested.
+    title_sync_pending: HashMap<SessionId, String>,
+    /// Sessions with an H1-driven filename probe or rename in flight, so a
+    /// second debounce firing before the first completes is skipped instead
+    /// of racing it into a duplicate file.
+    title_sync_in_flight: HashSet<SessionId>,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -384,6 +403,8 @@ impl EditorView {
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             draft_recovery_warning: None,
+            title_sync_pending: HashMap::new(),
+            title_sync_in_flight: HashSet::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
             focus_handle: cx.focus_handle(),
@@ -640,6 +661,7 @@ impl EditorView {
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
+        self.schedule_title_sync(cx);
         cx.notify();
     }
 
@@ -718,6 +740,221 @@ impl EditorView {
         .detach();
     }
 
+    /// Issue #6: arms the debounce timer that keeps a work-folder note's
+    /// filename following its first H1. A no-op outside a work folder.
+    fn schedule_title_sync(&mut self, cx: &mut Context<Self>) {
+        if self.work_folder.is_none() {
+            return;
+        }
+        let id = self.sessions.active_id();
+        let generation = self.sessions.active().generation();
+        let revision = self.sessions.active().revision();
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(Duration::from_millis(750)).await;
+            let _ = view.update(cx, |view, cx| {
+                view.run_title_sync(id, generation, revision, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Decides, for the session the timer was armed for, whether its H1
+    /// should create, rename, or stop auto-managing its filename — recomputed
+    /// fresh against the document as it stands now, since edits may have
+    /// landed while the timer was pending.
+    fn run_title_sync(
+        &mut self,
+        id: SessionId,
+        generation: u64,
+        revision: Revision,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title_sync_in_flight.contains(&id) {
+            // Another probe or write for this session is already running; the
+            // next edit re-arms this timer, so nothing is lost by skipping.
+            return;
+        }
+        let Some(root) = self
+            .work_folder
+            .as_ref()
+            .map(|folder| folder.root().to_path_buf())
+        else {
+            return;
+        };
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        if session.generation() != generation || session.revision() != revision {
+            return; // superseded by a later keystroke or a document replacement
+        }
+        let text = session.editor().document().full_text();
+        let extracted = extract_h1_title(&text);
+        let current_stem = session
+            .path()
+            .and_then(Path::file_stem)
+            .and_then(|stem| stem.to_str());
+        let action = decide_title_sync(session.auto_title(), current_stem, extracted.as_deref());
+        match action {
+            TitleSyncAction::None => {}
+            TitleSyncAction::StopTracking => {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.stop_auto_naming();
+                }
+            }
+            TitleSyncAction::CreateNamed(title) => self.begin_title_create(id, root, title, cx),
+            TitleSyncAction::Rename(title) => self.begin_title_rename(id, root, title, cx),
+        }
+    }
+
+    /// Picks a collision-free `<title>.md` under `root` in the background,
+    /// then writes the still-untitled session's content there for the first
+    /// time through the same save machinery as any other write.
+    fn begin_title_create(
+        &mut self,
+        id: SessionId,
+        root: PathBuf,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.title_sync_in_flight.insert(id);
+        let files = self.files.clone();
+        let probe_title = title.clone();
+        cx.spawn(async move |view, cx| {
+            let probe_files = files.clone();
+            let probe_root = root.clone();
+            let candidate = cx
+                .background_executor()
+                .spawn(async move {
+                    unique_markdown_filename(&probe_title, |name| {
+                        probe_files.stamp(&probe_root.join(name)).is_some()
+                    })
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.title_sync_in_flight.remove(&id);
+                let already_named = view
+                    .sessions
+                    .get(id)
+                    .is_none_or(|session| session.path().is_some());
+                if already_named {
+                    // Closed, replaced, or already named by another route
+                    // (e.g. a manual Save As) while the probe was running.
+                    return;
+                }
+                view.title_sync_pending.insert(id, title.clone());
+                view.save_session(id, SaveIntent::CreateNew(root.join(&candidate)), cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Picks a collision-free `<title>.md` under `root` in the background,
+    /// then renames the session's current file to it. `DocumentSession`'s own
+    /// `apply_file_event` is what actually moves the session, the same path a
+    /// filer-originated rename would take, so a rename that lands after the
+    /// file already moved on for some other reason is safely ignored.
+    fn begin_title_rename(
+        &mut self,
+        id: SessionId,
+        root: PathBuf,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return;
+        };
+        let Some(from) = session.path().map(Path::to_path_buf) else {
+            return;
+        };
+        // Reserved synchronously, before any `await`: a concurrent autosave
+        // that fires in the same tick must see the slot already taken and
+        // queue behind it, not race the rename to the filesystem. A `None`
+        // here means a write is already in flight; the rename is skipped for
+        // now rather than racing that write instead, and the next debounce
+        // (armed by any further edit) tries again.
+        let Some(ticket) = session.begin_rename() else {
+            return;
+        };
+        self.title_sync_in_flight.insert(id);
+        let files = self.files.clone();
+        let probe_title = title.clone();
+        let probe_from = from.clone();
+        cx.spawn(async move |view, cx| {
+            let probe_files = files.clone();
+            let probe_root = root.clone();
+            let rename_from = from.clone();
+            let (target, rename_result) = cx
+                .background_executor()
+                .spawn(async move {
+                    let candidate = unique_markdown_filename(&probe_title, |name| {
+                        let candidate = probe_root.join(name);
+                        candidate != probe_from && probe_files.stamp(&candidate).is_some()
+                    });
+                    let target = probe_root.join(candidate);
+                    let result = probe_files.rename(&rename_from, &target);
+                    (target, result)
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.title_sync_in_flight.remove(&id);
+                let attempt = TitleRenameAttempt {
+                    id,
+                    ticket,
+                    from,
+                    target,
+                    title,
+                };
+                view.finish_title_rename(attempt, rename_result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_title_rename(
+        &mut self,
+        attempt: TitleRenameAttempt,
+        result: std::io::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        let TitleRenameAttempt {
+            id,
+            ticket,
+            from,
+            target,
+            title,
+        } = attempt;
+        if let Ok(()) = result {
+            let outcomes = self.sessions.apply_file_event(&FileEvent::Renamed {
+                from: from.clone(),
+                to: target.clone(),
+            });
+            let applied = outcomes.iter().any(|(session_id, outcome)| {
+                *session_id == id && *outcome == FileEventOutcome::Renamed
+            });
+            if applied {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.note_auto_named(title);
+                }
+                self.recent.rename(&from, &target);
+                if let Err(error) = self.stores.recent_files().store(&self.recent) {
+                    self.status = Some(format!("Recent files failed: {error}"));
+                }
+            }
+        }
+        // The picked name may have been raced away, or the file may have
+        // moved on for some other reason; either way the save slot the
+        // rename reserved must be released so anything it queued behind
+        // itself (an autosave that arrived in the meantime) now runs against
+        // whichever path the session actually ended up at.
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.finish_rename(ticket);
+            if let Some(pending) = session.take_pending_save() {
+                self.save_session(id, pending, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Issue #5: starts a brand-new, unnamed note in the current work folder.
     /// No filename prompt: it opens blank and ready for input immediately,
     /// and is journalled into the recovery drafts as soon as it holds
@@ -759,6 +996,32 @@ impl EditorView {
                 let _ = draft_store.remove(&root, draft_id);
             })
             .detach();
+    }
+
+    /// Marks a session auto-managed once its H1-derived first write has
+    /// actually landed, not merely been requested.
+    fn apply_pending_title_sync(&mut self, id: SessionId) {
+        if let Some(title) = self.title_sync_pending.remove(&id)
+            && let Some(session) = self.sessions.get_mut(id)
+        {
+            session.note_auto_named(title);
+        }
+    }
+
+    /// Re-decides title sync for a session right after one of its writes
+    /// lands. `begin_title_rename` defers instead of racing a save that is
+    /// still in flight (see `DocumentSession::begin_rename`), so the rename
+    /// it deferred needs a prompt to try again once that save is done,
+    /// rather than waiting on the next keystroke to re-arm the debounce —
+    /// which may never come, if the H1 edit that wanted the rename was the
+    /// document's last edit before the autosave it lost the race to.
+    fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let generation = session.generation();
+        let revision = session.revision();
+        self.run_title_sync(id, generation, revision, cx);
     }
 
     pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
@@ -837,6 +1100,8 @@ impl EditorView {
                 self.remember_recent(path);
                 cx.add_recent_document(path);
                 self.retire_work_folder_draft(id, cx);
+                self.apply_pending_title_sync(id);
+                self.retry_title_sync(id, cx);
             }
             SaveOutcome::SavedStale => {
                 self.status = Some("Saved snapshot; newer edits pending".to_owned());
@@ -844,16 +1109,26 @@ impl EditorView {
                 cx.add_recent_document(path);
                 self.schedule_autosave(cx);
                 self.retire_work_folder_draft(id, cx);
+                self.apply_pending_title_sync(id);
+                self.retry_title_sync(id, cx);
             }
             SaveOutcome::Conflict => {
                 self.status = Some(
                     "Save refused: the file changed on disk. Save As, or save again to overwrite"
                         .to_owned(),
                 );
+                // The candidate name this was for was raced away; drop it
+                // rather than let a later, unrelated write consume it.
+                self.title_sync_pending.remove(&id);
             }
-            SaveOutcome::Failed(error) => self.status = Some(format!("Save failed: {error}")),
+            SaveOutcome::Failed(error) => {
+                self.status = Some(format!("Save failed: {error}"));
+                self.title_sync_pending.remove(&id);
+            }
             // The document this write belonged to is gone; nothing to report.
-            SaveOutcome::Superseded => {}
+            SaveOutcome::Superseded => {
+                self.title_sync_pending.remove(&id);
+            }
         }
         if let Some(pending) = self
             .sessions
@@ -3241,6 +3516,162 @@ mod tests {
                 "expected the recovery warning to still be visible too, got {combined:?}"
             );
         });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
+    /// and friends) to fire, the same way `draft_save_survives_switching_…`
+    /// above does: they run on a real `gpui::Timer`, not the deterministic
+    /// test dispatcher, so real time has to pass.
+    fn settle_debounce(cx: &mut gpui::TestAppContext) {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(900));
+        cx.run_until_parked();
+    }
+
+    // Issue #6: an unnamed work-folder note earns its filename from the
+    // first H1 it is given, with no filename prompt.
+    #[gpui::test]
+    fn a_new_notes_first_h1_names_its_file(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("# LangChain4j").unwrap();
+            view.after_input(cx);
+        });
+
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().path(),
+                Some(root.join("LangChain4j.md").as_path())
+            );
+            assert_eq!(view.active_session().auto_title(), Some("LangChain4j"));
+            assert!(!view.active_session().is_dirty());
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("LangChain4j.md")).unwrap(),
+            "# LangChain4j"
+        );
+        assert!(
+            OsDraftStore.recover(&root).unwrap().drafts.is_empty(),
+            "the recovery draft must be retired once the note has a real file"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #6: editing the H1 of an auto-managed note renames its file to
+    // follow, without ever touching the document content.
+    #[gpui::test]
+    fn editing_an_auto_managed_h1_renames_the_file(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-rename");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("# LangChain4j").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.update(cx, |view, cx| {
+            // Append " Agent" to the H1.
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" Agent").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().path(),
+                Some(root.join("LangChain4j Agent.md").as_path())
+            );
+            assert_eq!(
+                view.active_session().auto_title(),
+                Some("LangChain4j Agent")
+            );
+        });
+        assert!(!root.join("LangChain4j.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("LangChain4j Agent.md")).unwrap(),
+            "# LangChain4j Agent"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #6: a file that existed before it was opened must never be
+    // auto-renamed just because its H1 is edited — only notes this app
+    // itself named from an H1 are auto-managed.
+    #[gpui::test]
+    fn an_existing_files_h1_is_never_auto_renamed(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-existing");
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("2026-08-29-meeting.md");
+        std::fs::write(&existing, "# AI推進室 定例会").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.open_work_folder_entry(&existing, cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" 変更").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(existing.as_path()));
+            assert_eq!(view.active_session().auto_title(), None);
+        });
+        assert!(existing.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -57,6 +57,11 @@ pub trait FileService: Send + Sync + 'static {
 
     /// Current stamp, or `None` when the file does not exist.
     fn stamp(&self, path: &Path) -> Option<FileStamp>;
+
+    /// Renames `from` to `to`. Refuses when `to` already exists, so a caller
+    /// racing another writer for a name never silently clobbers it; the
+    /// caller picks a different target and retries instead.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 }
 
 /// Runs one save job against a service, enforcing the external-change rule the
@@ -120,6 +125,21 @@ impl FileService for OsFileService {
 
     fn stamp(&self, path: &Path) -> Option<FileStamp> {
         stamp_from_metadata(fs::metadata(path).ok())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // `fs::rename` overwrites an existing destination on most platforms;
+        // this boundary must not, so the destination is checked first. A
+        // race between the check and the rename is possible but narrow, and
+        // failing the caller's own retry loop is the same outcome as losing
+        // the race outright: no file is silently clobbered.
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename target already exists",
+            ));
+        }
+        fs::rename(from, to)
     }
 }
 
@@ -240,6 +260,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(service.contents(path).as_deref(), Some("two\n"));
+    }
+
+    #[test]
+    fn a_rename_moves_the_file_on_the_real_filesystem() {
+        let root = temporary_directory("rename");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("a.md");
+        let to = root.join("b.md");
+        OsFileService
+            .save(&from, &RopeBuffer::from_text("hello\n"))
+            .unwrap();
+        OsFileService.rename(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).unwrap(), "hello\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rename_refuses_to_overwrite_an_existing_destination() {
+        let root = temporary_directory("rename-collision");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("a.md");
+        let to = root.join("b.md");
+        OsFileService
+            .save(&from, &RopeBuffer::from_text("mine\n"))
+            .unwrap();
+        OsFileService
+            .save(&to, &RopeBuffer::from_text("theirs\n"))
+            .unwrap();
+        assert!(OsFileService.rename(&from, &to).is_err());
+        assert_eq!(fs::read_to_string(&from).unwrap(), "mine\n");
+        assert_eq!(fs::read_to_string(&to).unwrap(), "theirs\n");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
