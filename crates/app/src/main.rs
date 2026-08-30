@@ -60,6 +60,16 @@ fn main() {
             window
                 .update(cx, |view, window, cx| {
                     window.focus(&view.focus_handle(cx));
+                    // `Context::on_app_quit` (registered inside `EditorView`)
+                    // only fires on an actual app-quit event, which closing
+                    // this window does not always raise on its own; flushing
+                    // here too means an unnamed note's last keystrokes still
+                    // survive the window simply being closed.
+                    let view_handle = cx.entity();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        let _ = view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
+                        true
+                    });
                 })
                 .expect("focus editor");
             cx.activate(true);

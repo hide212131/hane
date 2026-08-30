@@ -150,6 +150,14 @@ pub struct EditorView {
     /// finished loading yet. A load that lands after a newer request must
     /// not switch what is on screen away from that newer request.
     latest_open_target: Option<PathBuf>,
+    /// Bumped every time `switch_to_work_folder` replaces `sessions` and
+    /// `work_folder` wholesale. A background read started against the
+    /// previous folder (or single-file state) carries the generation it was
+    /// requested under; `finish_open` discards a result whose generation no
+    /// longer matches instead of merging a stale file into whatever folder
+    /// is open now, since `into`/`latest_open_target` alone cannot tell a
+    /// same-named stale request in the new folder apart from one in the old.
+    work_folder_generation: u64,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -420,6 +428,7 @@ impl EditorView {
             title_sync_in_flight: HashSet::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
+            work_folder_generation: 0,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -755,12 +764,14 @@ impl EditorView {
 
     /// Writes every pending unnamed-note draft synchronously, bypassing the
     /// debounce in `schedule_draft_save`. Called from the app-quit hook
-    /// registered in `from_sessions`: a normal quit gives a `schedule_draft_save`
-    /// timer no chance to fire if it was armed less than 750ms earlier, so
-    /// without this an unnamed note's last few keystrokes would only survive
-    /// a crash (recovered from whatever the debounce last wrote) but not a
-    /// clean exit.
-    fn flush_pending_drafts(&self) {
+    /// registered in `from_sessions` and from `switch_to_work_folder`, and
+    /// public so `main.rs` can also call it from a window-close hook: a
+    /// normal quit — or closing the window, which on some platforms does not
+    /// raise an app-quit event at all — gives a `schedule_draft_save` timer
+    /// no chance to fire if it was armed less than 750ms earlier, so without
+    /// this an unnamed note's last few keystrokes would only survive a crash
+    /// (recovered from whatever the debounce last wrote), not a clean exit.
+    pub fn flush_pending_drafts(&self) {
         if self.work_folder_drafts.is_empty() {
             return;
         }
@@ -1280,6 +1291,11 @@ impl EditorView {
     /// around: a work folder switch is a new window's worth of state, not
     /// another document alongside the old ones.
     fn switch_to_work_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // Whatever `schedule_draft_save` still owed the old folder's unnamed
+        // notes must land before their `work_folder_drafts` entries are
+        // dropped below, or the same debounce gap `flush_pending_drafts` was
+        // added to close on quit would reopen here.
+        self.flush_pending_drafts();
         self.sessions = SessionSet::with_untitled("", "Untitled");
         self.work_folder = None;
         self.work_folder_drafts.clear();
@@ -1288,6 +1304,11 @@ impl EditorView {
         self.title_sync_in_flight.clear();
         self.loading_paths.clear();
         self.latest_open_target = None;
+        // Any background read still in flight for the old folder (or for
+        // single-file state) is now for a session that no longer exists;
+        // bumping this makes `finish_open` discard it instead of merging a
+        // stale file into the sessions just installed above.
+        self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
         self.on_document_replaced();
         self.begin_work_folder_scan(root, cx);
     }
@@ -1334,6 +1355,7 @@ impl EditorView {
                 self.status = Some("Opening…".to_owned());
                 let files = self.files.clone();
                 let path = path.to_path_buf();
+                let generation = self.work_folder_generation;
                 cx.spawn(async move |view, cx| {
                     let loaded = cx
                         .background_executor()
@@ -1342,7 +1364,9 @@ impl EditorView {
                             async move { files.load(&path) }
                         })
                         .await;
-                    let _ = view.update(cx, |view, cx| view.finish_open(into, &path, loaded, cx));
+                    let _ = view.update(cx, |view, cx| {
+                        view.finish_open(into, generation, &path, loaded, cx);
+                    });
                 })
                 .detach();
                 cx.notify();
@@ -1353,11 +1377,23 @@ impl EditorView {
     fn finish_open(
         &mut self,
         into: Option<SessionId>,
+        generation: u64,
         path: &Path,
         loaded: std::io::Result<LoadedFile>,
         cx: &mut Context<Self>,
     ) {
         self.loading_paths.remove(path);
+        if generation != self.work_folder_generation {
+            // `switch_to_work_folder` replaced `sessions`/`work_folder` while
+            // this read was in flight. `into` and `latest_open_target` only
+            // protect against staleness within one folder (or single-file
+            // state); neither can tell this read apart from a same-path
+            // request made after the switch, so the generation counter is
+            // what keeps a file that belongs to a folder that is no longer
+            // open from being merged into the one that replaced it.
+            cx.notify();
+            return;
+        }
         match loaded {
             Err(error) => self.status = Some(format!("Open failed: {error}")),
             Ok(loaded) => {
@@ -3463,6 +3499,78 @@ mod tests {
             assert_eq!(
                 view.editor().document().full_text().trim(),
                 "# New"
+            );
+        });
+
+        // The old folder's unnamed draft must have been flushed before its
+        // `work_folder_drafts` entry was dropped, or switching away loses it
+        // exactly the way a quit inside the debounce window used to.
+        let old_recovered = OsDraftStore.recover(&old_root).unwrap();
+        assert_eq!(old_recovered.drafts.len(), 1);
+        assert_eq!(old_recovered.drafts[0].text, "draft in the old folder");
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #2 follow-up: a background read started via `open_work_folder_entry`
+    // (`OpenPolicy::NewSession`, `into: None`) that is still in flight when the
+    // user switches to a different work folder used to have no staleness guard
+    // at all: `finish_open`'s check only discarded a stale `ReuseActive` result
+    // that targeted the *current* active session, which a `None` target can
+    // never match. The result was a session for a file from the old folder
+    // getting merged into the new folder's `SessionSet` once the read landed.
+    // `work_folder_generation` closes that gap.
+    #[gpui::test]
+    fn a_stale_new_session_read_from_a_replaced_work_folder_is_discarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-read-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let stale_path = old_root.join("Stale.md");
+        std::fs::write(&stale_path, "# Stale\n").unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("stale-read-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        // Simulate the sidebar-entry read that was in flight before the
+        // switch: capture the generation it was requested under, exactly as
+        // `open_with_policy` does, without waiting for it to complete.
+        let generation_at_request =
+            view.update(cx, |view, _cx| {
+                view.work_folder = Some(old_work_folder);
+                view.work_folder_generation
+            });
+        let loaded = OsFileService.load(&stale_path).unwrap();
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.finish_open(None, generation_at_request, &stale_path, Ok(loaded), cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions().count(),
+                1,
+                "a read from the replaced folder must not add a session to the new one"
+            );
+            assert!(
+                view.sessions().all(|session| session.file().path() != Some(stale_path.as_path())),
+                "the stale file must not appear in any session"
             );
         });
 
