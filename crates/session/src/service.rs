@@ -294,6 +294,27 @@ mod tests {
     }
 
     #[test]
+    fn japanese_filenames_and_paths_round_trip_on_the_real_filesystem() {
+        let root = temporary_directory("日本語フォルダ");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("日本語タイトル.md");
+        let source = "# 日本語タイトル\n\n日本語の文章をHaneで気持ちよく編集する\n";
+        let saved = OsFileService
+            .save(&path, &RopeBuffer::from_text(source))
+            .unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        assert!(saved.identity.is_same_file(&loaded.identity));
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+        let renamed = root.join("改題した日本語タイトル.md");
+        OsFileService.rename(&path, &renamed).unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), source);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_guarded_save_recreates_a_file_that_was_deleted() {
         let service = MemoryFileService::new();
         let path = Path::new("/notes/a.md");
