@@ -1250,13 +1250,22 @@ impl EditorView {
         .detach();
     }
 
+    /// Whether any open session — not just the active one — has unsaved
+    /// edits. The work-folder sidebar deliberately keeps more than one
+    /// session open at a time (`open_work_folder_entry` gives every visited
+    /// note its own session), so a dirty background session is exactly as
+    /// real a reason to block a switch as a dirty active one.
+    fn has_unsaved_sessions(&self) -> bool {
+        self.sessions.sessions().any(DocumentSession::is_dirty)
+    }
+
     /// Prompts for a directory and switches this window into work-folder mode
     /// on it, the GUI entry point for what a startup CLI argument already
     /// does through `EditorView::open_work_folder`. Guards on dirty state the
     /// same way `prompt_open` does: switching folders discards whichever
     /// sessions are open in this window.
     pub(crate) fn prompt_open_work_folder(&mut self, cx: &mut Context<Self>) {
-        if self.sessions.active().is_dirty() {
+        if self.has_unsaved_sessions() {
             self.status = Some("Save current changes before opening a folder".to_owned());
             cx.notify();
             return;
@@ -1270,7 +1279,21 @@ impl EditorView {
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(paths))) => {
                 if let Some(root) = paths.into_iter().next() {
-                    let _ = view.update(cx, |view, cx| view.switch_to_work_folder(root, cx));
+                    let _ = view.update(cx, |view, cx| {
+                        // Re-checked here, not just before the (blocking,
+                        // but still async from GPUI's perspective) picker
+                        // was shown: an autosave or draft-save timer armed
+                        // before the prompt could still land while it was
+                        // open, and a background session's edit is not
+                        // guarded by anything else in between.
+                        if view.has_unsaved_sessions() {
+                            view.status =
+                                Some("Save current changes before opening a folder".to_owned());
+                            cx.notify();
+                        } else {
+                            view.switch_to_work_folder(root, cx);
+                        }
+                    });
                 }
             }
             Ok(Err(error)) => {
@@ -3576,6 +3599,60 @@ mod tests {
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // PR review finding: `prompt_open_work_folder`'s guard originally checked
+    // only `self.sessions.active().is_dirty()`, but the work-folder sidebar
+    // deliberately keeps more than one session open at once
+    // (`open_work_folder_entry` gives every visited note its own session), so
+    // a dirty *background* session was not guarded against at all — switching
+    // folders would silently discard it along with every other open session.
+    #[gpui::test]
+    fn a_dirty_background_session_blocks_opening_a_different_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("dirty-background-guard");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Dirty the first (soon to be backgrounded) session, then open a
+            // second note so the dirty one is no longer active.
+            view.editor_mut().insert_text("unsaved in the background").unwrap();
+            view.after_input(cx);
+            view.new_work_folder_note(cx);
+            assert!(!view.sessions.active().is_dirty());
+            assert_eq!(view.sessions().count(), 2);
+        });
+
+        view.update(cx, |view, cx| {
+            view.prompt_open_work_folder(cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder"),
+                "a dirty background session must block the switch even though the active one is clean"
+            );
+            assert_eq!(
+                view.sessions().count(),
+                2,
+                "the guard must fire before anything about the open sessions changes"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // Issue #2 follow-up: `schedule_draft_save` only writes 750ms after the
