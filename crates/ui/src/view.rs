@@ -25,7 +25,7 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -126,6 +126,9 @@ pub struct EditorView {
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
     work_folder_drafts: HashMap<SessionId, DraftId>,
+    /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
+    /// the life of the view; dropping it would cancel the hook.
+    _quit_subscription: Subscription,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -147,6 +150,14 @@ pub struct EditorView {
     /// finished loading yet. A load that lands after a newer request must
     /// not switch what is on screen away from that newer request.
     latest_open_target: Option<PathBuf>,
+    /// Bumped every time `switch_to_work_folder` replaces `sessions` and
+    /// `work_folder` wholesale. A background read started against the
+    /// previous folder (or single-file state) carries the generation it was
+    /// requested under; `finish_open` discards a result whose generation no
+    /// longer matches instead of merging a stale file into whatever folder
+    /// is open now, since `into`/`latest_open_target` alone cannot tell a
+    /// same-named stale request in the new folder apart from one in the old.
+    work_folder_generation: u64,
     pub(crate) focus_handle: FocusHandle,
     heights: HeightIndex,
     scroll_y: f32,
@@ -393,6 +404,15 @@ impl EditorView {
             theme.line_height,
             sessions.active().editor().document().line_count(),
         ));
+        // The 750ms draft-save debounce (`schedule_draft_save`) can still be
+        // pending when the app quits; this hook flushes whatever it would
+        // have written so an unnamed note typed just before quitting is not
+        // lost.
+        let quit_subscription =
+            cx.on_app_quit(|view: &mut Self, _cx| {
+                view.flush_pending_drafts();
+                std::future::ready(())
+            });
         Self {
             sessions,
             files,
@@ -402,11 +422,13 @@ impl EditorView {
             work_folder: None,
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
+            _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
+            work_folder_generation: 0,
             focus_handle: cx.focus_handle(),
             heights,
             scroll_y: 0.0,
@@ -738,6 +760,31 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    /// Writes every pending unnamed-note draft synchronously, bypassing the
+    /// debounce in `schedule_draft_save`. Called from the app-quit hook
+    /// registered in `from_sessions` and from `switch_to_work_folder`, and
+    /// public so `main.rs` can also call it from a window-close hook: a
+    /// normal quit — or closing the window, which on some platforms does not
+    /// raise an app-quit event at all — gives a `schedule_draft_save` timer
+    /// no chance to fire if it was armed less than 750ms earlier, so without
+    /// this an unnamed note's last few keystrokes would only survive a crash
+    /// (recovered from whatever the debounce last wrote), not a clean exit.
+    pub fn flush_pending_drafts(&self) {
+        if self.work_folder_drafts.is_empty() {
+            return;
+        }
+        let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
+            return;
+        };
+        for (&id, &draft_id) in &self.work_folder_drafts {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let text = session.editor().document().full_text();
+            let _ = self.draft_store.write(root, draft_id, &text);
+        }
     }
 
     /// Issue #6: arms the debounce timer that keeps a work-folder note's
@@ -1203,6 +1250,92 @@ impl EditorView {
         .detach();
     }
 
+    /// Whether any open session — not just the active one — has unsaved
+    /// edits. The work-folder sidebar deliberately keeps more than one
+    /// session open at a time (`open_work_folder_entry` gives every visited
+    /// note its own session), so a dirty background session is exactly as
+    /// real a reason to block a switch as a dirty active one.
+    fn has_unsaved_sessions(&self) -> bool {
+        self.sessions.sessions().any(DocumentSession::is_dirty)
+    }
+
+    /// Prompts for a directory and switches this window into work-folder mode
+    /// on it, the GUI entry point for what a startup CLI argument already
+    /// does through `EditorView::open_work_folder`. Guards on dirty state the
+    /// same way `prompt_open` does: switching folders discards whichever
+    /// sessions are open in this window.
+    pub(crate) fn prompt_open_work_folder(&mut self, cx: &mut Context<Self>) {
+        if self.has_unsaved_sessions() {
+            self.status = Some("Save current changes before opening a folder".to_owned());
+            cx.notify();
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Work Folder".into()),
+        });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(root) = paths.into_iter().next() {
+                    let _ = view.update(cx, |view, cx| {
+                        // Re-checked here, not just before the (blocking,
+                        // but still async from GPUI's perspective) picker
+                        // was shown: an autosave or draft-save timer armed
+                        // before the prompt could still land while it was
+                        // open, and a background session's edit is not
+                        // guarded by anything else in between.
+                        if view.has_unsaved_sessions() {
+                            view.status =
+                                Some("Save current changes before opening a folder".to_owned());
+                            cx.notify();
+                        } else {
+                            view.switch_to_work_folder(root, cx);
+                        }
+                    });
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(format!("Open Folder failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    /// Resets this window to a single fresh untitled session and begins
+    /// scanning `root` as a work folder — the runtime equivalent of the
+    /// startup path through `open_work_folder`. Every previously open
+    /// session, and any state keyed by its id, is discarded rather than kept
+    /// around: a work folder switch is a new window's worth of state, not
+    /// another document alongside the old ones.
+    fn switch_to_work_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // Whatever `schedule_draft_save` still owed the old folder's unnamed
+        // notes must land before their `work_folder_drafts` entries are
+        // dropped below, or the same debounce gap `flush_pending_drafts` was
+        // added to close on quit would reopen here.
+        self.flush_pending_drafts();
+        self.sessions = SessionSet::with_untitled("", "Untitled");
+        self.work_folder = None;
+        self.work_folder_drafts.clear();
+        self.draft_recovery_warning = None;
+        self.title_sync_pending.clear();
+        self.title_sync_in_flight.clear();
+        self.loading_paths.clear();
+        self.latest_open_target = None;
+        // Any background read still in flight for the old folder (or for
+        // single-file state) is now for a session that no longer exists;
+        // bumping this makes `finish_open` discard it instead of merging a
+        // stale file into the sessions just installed above.
+        self.work_folder_generation = self.work_folder_generation.wrapping_add(1);
+        self.on_document_replaced();
+        self.begin_work_folder_scan(root, cx);
+    }
+
     /// Opens a path the way a filer will: the session set decides whether this
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
@@ -1245,6 +1378,7 @@ impl EditorView {
                 self.status = Some("Opening…".to_owned());
                 let files = self.files.clone();
                 let path = path.to_path_buf();
+                let generation = self.work_folder_generation;
                 cx.spawn(async move |view, cx| {
                     let loaded = cx
                         .background_executor()
@@ -1253,7 +1387,9 @@ impl EditorView {
                             async move { files.load(&path) }
                         })
                         .await;
-                    let _ = view.update(cx, |view, cx| view.finish_open(into, &path, loaded, cx));
+                    let _ = view.update(cx, |view, cx| {
+                        view.finish_open(into, generation, &path, loaded, cx);
+                    });
                 })
                 .detach();
                 cx.notify();
@@ -1264,11 +1400,23 @@ impl EditorView {
     fn finish_open(
         &mut self,
         into: Option<SessionId>,
+        generation: u64,
         path: &Path,
         loaded: std::io::Result<LoadedFile>,
         cx: &mut Context<Self>,
     ) {
         self.loading_paths.remove(path);
+        if generation != self.work_folder_generation {
+            // `switch_to_work_folder` replaced `sessions`/`work_folder` while
+            // this read was in flight. `into` and `latest_open_target` only
+            // protect against staleness within one folder (or single-file
+            // state); neither can tell this read apart from a same-path
+            // request made after the switch, so the generation counter is
+            // what keeps a file that belongs to a folder that is no longer
+            // open from being merged into the one that replaced it.
+            cx.notify();
+            return;
+        }
         match loaded {
             Err(error) => self.status = Some(format!("Open failed: {error}")),
             Ok(loaded) => {
@@ -3310,6 +3458,241 @@ mod tests {
         assert_eq!(
             recovered.drafts[0].text,
             "today I thought about this design"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #2 follow-up: `prompt_open_work_folder` is the GUI entry point
+    // for switching into work-folder mode at runtime (previously only
+    // reachable via a startup CLI argument). `switch_to_work_folder` is the
+    // part of it that does not depend on the native folder picker: it must
+    // drop whatever was open before and start fresh on the new root, rather
+    // than leaving stale sessions or per-session bookkeeping (like an old
+    // folder's unnamed-draft mapping) behind.
+    #[gpui::test]
+    fn switch_to_work_folder_discards_previous_sessions_and_opens_the_new_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("switch-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("switch-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("New.md"), "# New\n").unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(old_work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("draft in the old folder")
+                .unwrap();
+            view.after_input(cx);
+        });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.work_folder_drafts.len()),
+            1
+        );
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.work_folder_drafts.is_empty(),
+                "the old folder's draft bookkeeping must not leak into the new one"
+            );
+            assert_eq!(
+                view.work_folder.as_ref().map(WorkFolder::root),
+                Some(new_root.as_path())
+            );
+            assert_eq!(view.sessions().count(), 1);
+            assert_eq!(
+                view.editor().document().full_text().trim(),
+                "# New"
+            );
+        });
+
+        // The old folder's unnamed draft must have been flushed before its
+        // `work_folder_drafts` entry was dropped, or switching away loses it
+        // exactly the way a quit inside the debounce window used to.
+        let old_recovered = OsDraftStore.recover(&old_root).unwrap();
+        assert_eq!(old_recovered.drafts.len(), 1);
+        assert_eq!(old_recovered.drafts[0].text, "draft in the old folder");
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #2 follow-up: a background read started via `open_work_folder_entry`
+    // (`OpenPolicy::NewSession`, `into: None`) that is still in flight when the
+    // user switches to a different work folder used to have no staleness guard
+    // at all: `finish_open`'s check only discarded a stale `ReuseActive` result
+    // that targeted the *current* active session, which a `None` target can
+    // never match. The result was a session for a file from the old folder
+    // getting merged into the new folder's `SessionSet` once the read landed.
+    // `work_folder_generation` closes that gap.
+    #[gpui::test]
+    fn a_stale_new_session_read_from_a_replaced_work_folder_is_discarded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let old_root = draft_test_root("stale-read-old");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let stale_path = old_root.join("Stale.md");
+        std::fs::write(&stale_path, "# Stale\n").unwrap();
+        let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+
+        let new_root = draft_test_root("stale-read-new");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        // Simulate the sidebar-entry read that was in flight before the
+        // switch: capture the generation it was requested under, exactly as
+        // `open_with_policy` does, without waiting for it to complete.
+        let generation_at_request =
+            view.update(cx, |view, _cx| {
+                view.work_folder = Some(old_work_folder);
+                view.work_folder_generation
+            });
+        let loaded = OsFileService.load(&stale_path).unwrap();
+
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.finish_open(None, generation_at_request, &stale_path, Ok(loaded), cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions().count(),
+                1,
+                "a read from the replaced folder must not add a session to the new one"
+            );
+            assert!(
+                view.sessions().all(|session| session.file().path() != Some(stale_path.as_path())),
+                "the stale file must not appear in any session"
+            );
+        });
+
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // PR review finding: `prompt_open_work_folder`'s guard originally checked
+    // only `self.sessions.active().is_dirty()`, but the work-folder sidebar
+    // deliberately keeps more than one session open at once
+    // (`open_work_folder_entry` gives every visited note its own session), so
+    // a dirty *background* session was not guarded against at all — switching
+    // folders would silently discard it along with every other open session.
+    #[gpui::test]
+    fn a_dirty_background_session_blocks_opening_a_different_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("dirty-background-guard");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Dirty the first (soon to be backgrounded) session, then open a
+            // second note so the dirty one is no longer active.
+            view.editor_mut().insert_text("unsaved in the background").unwrap();
+            view.after_input(cx);
+            view.new_work_folder_note(cx);
+            assert!(!view.sessions.active().is_dirty());
+            assert_eq!(view.sessions().count(), 2);
+        });
+
+        view.update(cx, |view, cx| {
+            view.prompt_open_work_folder(cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.status.as_deref(),
+                Some("Save current changes before opening a folder"),
+                "a dirty background session must block the switch even though the active one is clean"
+            );
+            assert_eq!(
+                view.sessions().count(),
+                2,
+                "the guard must fire before anything about the open sessions changes"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #2 follow-up: `schedule_draft_save` only writes 750ms after the
+    // last keystroke, so an app quit within that window used to lose
+    // whatever was typed since the previous write. `flush_pending_drafts` is
+    // what the app-quit hook calls to write the draft immediately instead of
+    // waiting on the debounce timer.
+    #[gpui::test]
+    fn flush_pending_drafts_writes_immediately_without_waiting_for_the_debounce(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("quit-flush");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut()
+                .insert_text("quitting before the debounce fires")
+                .unwrap();
+            view.after_input(cx);
+            // No `Timer::after(750ms)` wait: the flush must not depend on it.
+            view.flush_pending_drafts();
+        });
+
+        let recovered = OsDraftStore.recover(&root).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(
+            recovered.drafts[0].text,
+            "quitting before the debounce fires"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
