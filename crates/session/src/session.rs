@@ -26,6 +26,13 @@ pub enum SaveIntent {
     To(PathBuf),
     /// Retry after the user confirmed the overwrite of an external change.
     Overwrite,
+    /// First write for a session with no file yet, at a path the caller
+    /// picked without asking the user (an H1-derived filename). Unlike `To`,
+    /// which follows a dialog that already confirmed an overwrite, this
+    /// refuses if anything already exists at the target: the name was picked
+    /// automatically, so a collision means the caller's candidate was
+    /// already stale and must be recomputed, not written over.
+    CreateNew(PathBuf),
 }
 
 /// One accepted write, ready to hand to the I/O boundary.
@@ -143,6 +150,12 @@ pub struct DocumentSession {
     save_sequence: u64,
     pending_save: Option<SaveIntent>,
     view: SessionViewState,
+    /// The title this session's current filename was derived from, when the
+    /// filename is auto-managed from the document's H1 (issue #6). `None`
+    /// for a session whose name is not (or is no longer) auto-managed: a
+    /// file opened from disk, or one where the filename has drifted away
+    /// from what auto-naming last set it to.
+    auto_title: Option<String>,
 }
 
 impl DocumentSession {
@@ -168,6 +181,7 @@ impl DocumentSession {
             save_sequence: 0,
             pending_save: None,
             view: SessionViewState::default(),
+            auto_title: None,
         }
     }
 
@@ -240,6 +254,29 @@ impl DocumentSession {
         self.in_flight = None;
         self.pending_save = None;
         self.view = SessionViewState::default();
+        self.auto_title = None;
+    }
+
+    /// The title this session's current filename was derived from, if the
+    /// filename is currently auto-managed.
+    pub fn auto_title(&self) -> Option<&str> {
+        self.auto_title.as_deref()
+    }
+
+    /// Records that the current filename was just derived from `title`,
+    /// after a successful create-or-rename write for it. Called only once
+    /// the write actually landed, so a failed or superseded write never
+    /// marks a session auto-managed for a name it does not have.
+    pub fn note_auto_named(&mut self, title: String) {
+        self.auto_title = Some(title);
+    }
+
+    /// Stops auto-managing this session's filename: the current name has
+    /// drifted away from what auto-naming last derived it from (an external
+    /// rename, or the user renaming it another way), so further H1 edits
+    /// must not resume renaming it.
+    pub fn stop_auto_naming(&mut self) {
+        self.auto_title = None;
     }
 
     /// Records that the document was edited. Arms a fresh autosave window and
@@ -272,6 +309,23 @@ impl DocumentSession {
         self.in_flight.is_some()
     }
 
+    /// Whether an H1-derived "create the note's first file" write should be
+    /// skipped this cycle rather than attempted or queued: the session
+    /// already has a file (through this or some other route), or a write —
+    /// including a manual Save As that has not landed yet, which is why
+    /// `path()` alone is not enough — already holds the save slot.
+    ///
+    /// Queuing behind that other write instead of skipping would risk two
+    /// failure modes once it lands: its own completion could be mistaken for
+    /// this H1 write landing (marking a file the user named some other way
+    /// as auto-managed), and this write would still run afterwards, silently
+    /// moving the session onto a second, unwanted file. Skipping is safe
+    /// either way: the caller re-decides fresh once that other write is done.
+    #[must_use]
+    pub fn should_defer_h1_create(&self) -> bool {
+        self.file.path().is_some() || self.save_in_flight()
+    }
+
     /// Decides what a save request means right now. At most one write runs at a
     /// time; a request that arrives during a write replaces the queued target,
     /// so a burst of autosaves collapses to one follow-up write.
@@ -302,6 +356,7 @@ impl DocumentSession {
                 };
                 (path.clone(), guard)
             }
+            SaveIntent::CreateNew(path) => (path.clone(), OverwriteGuard::ExpectStamp(None)),
         };
         if self.in_flight.is_some() {
             self.pending_save = Some(intent);
@@ -352,6 +407,36 @@ impl DocumentSession {
 
     pub fn take_pending_save(&mut self) -> Option<SaveIntent> {
         self.pending_save.take()
+    }
+
+    /// Reserves the save slot for a rename: not itself a write, but one that
+    /// must not run at the same time as one, or a concurrent autosave can
+    /// write new content to the path being renamed away from and resurrect
+    /// it after the rename has already moved the file. `None` means a write
+    /// is already in flight; the caller skips renaming this cycle and tries
+    /// again on the next debounce instead of racing it.
+    pub fn begin_rename(&mut self) -> Option<SaveTicket> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        self.save_sequence = self.save_sequence.wrapping_add(1);
+        let ticket = SaveTicket {
+            generation: self.generation,
+            sequence: self.save_sequence,
+            revision: self.revision(),
+        };
+        self.in_flight = Some(ticket);
+        Some(ticket)
+    }
+
+    /// Releases the slot reserved by `begin_rename`, once the rename has
+    /// landed (or failed). A save queued while the rename held the slot is
+    /// left in `pending_save` for the caller to drain with
+    /// `take_pending_save`, the same as after any other write.
+    pub fn finish_rename(&mut self, ticket: SaveTicket) {
+        if self.in_flight == Some(ticket) {
+            self.in_flight = None;
+        }
     }
 
     /// Compares the session's recorded stamp with what the disk reports now.

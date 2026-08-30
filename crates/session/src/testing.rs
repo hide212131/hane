@@ -40,7 +40,10 @@ impl MemoryFileService {
             .remove(&canonical(path.as_ref()));
     }
 
-    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) {
+    /// Simulates a rename done by something other than this session, e.g. a
+    /// filer or an external editor — as opposed to `FileService::rename`,
+    /// which is the session's own boundary for renaming a file it owns.
+    pub fn rename_externally(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) {
         let mut files = self.files.lock().expect("files lock");
         if let Some(entry) = files.remove(&canonical(from.as_ref())) {
             files.insert(canonical(to.as_ref()), entry);
@@ -97,6 +100,21 @@ impl FileService for MemoryFileService {
             .map(|(contents, version)| {
                 FileStamp::new((contents.len() as u64) ^ (version << 32), None)
             })
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut files = self.files.lock().expect("files lock");
+        if files.contains_key(&canonical(to)) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename target already exists",
+            ));
+        }
+        let Some(entry) = files.remove(&canonical(from)) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such file"));
+        };
+        files.insert(canonical(to), entry);
+        Ok(())
     }
 }
 
