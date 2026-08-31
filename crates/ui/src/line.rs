@@ -200,7 +200,7 @@ pub(crate) fn row_element(
         )
         .child(
             img(resolved)
-                .max_w(px(640.))
+                .max_w(px(layout.width.min(640.0)))
                 .h(px((row.height - 32.0).max(1.0)))
                 .object_fit(ObjectFit::Contain),
         )
