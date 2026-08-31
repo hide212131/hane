@@ -16,8 +16,8 @@ use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuf
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
-    BlockLayout, BlockLine, BlockWindow, LineWrap, VerticalMove, VisualBlock, block_line_span,
-    layout_block, present_block, trailing_blank_lines,
+    BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove, VisualBlock,
+    block_line_span, layout_block, present_block, trailing_blank_lines,
 };
 
 const LINE_HEIGHT: f32 = 26.0;
@@ -287,6 +287,109 @@ fn the_first_and_last_row_report_the_block_edge() {
         VerticalMove::PastEdge,
         "moving down from the last row leaves the block"
     );
+}
+
+/// A row's painted text never runs past the column it was laid out against;
+/// otherwise a soft-wrap "row" is a lie and the viewport would need a
+/// horizontal scrollbar to read it.
+fn assert_rows_fit_the_column(block: &VisualBlock, layout: &BlockLayout, shaper: &FixedAdvanceShaper) {
+    for row in &layout.lines {
+        let line = &block.lines[row.line];
+        let width = shaper.x_for_offset(line, row.line_visual_range.clone(), row.line_visual_range.end);
+        assert!(
+            width <= WIDTH + f32::EPSILON,
+            "row {row:?} measures {width} wide, past the {WIDTH} column"
+        );
+    }
+}
+
+#[test]
+fn a_long_unbroken_ascii_token_wraps_instead_of_widening_the_column() {
+    // No whitespace anywhere: a URL or a long identifier is one "word" as far
+    // as ordinary wrapping is concerned.
+    let source = "https://example.com/very/long/path/segment/that/keeps/going/and/going\n";
+    let (block, layout) = laid_out(source).into_iter().next().expect("one block");
+    let shaper = shaper();
+    assert_rows_fit_the_column(&block, &layout, &shaper);
+    let rows: Vec<_> = layout.lines.iter().filter(|row| row.line == 0).collect();
+    assert!(
+        rows.len() > 1,
+        "an unbroken token wider than the column must still split across rows"
+    );
+    // Rows still tile the physical line's source range, wherever the split fell.
+    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows.last().unwrap().source_range.end,
+        block.lines[0].source_range.end
+    );
+}
+
+#[test]
+fn long_japanese_text_without_spaces_wraps_at_the_column() {
+    let source = "これはとても長い日本語の文章であり空白がまったくないので通常の折り返しでは一語として扱われてしまう可能性がある\n";
+    let (block, layout) = laid_out(source).into_iter().next().expect("one block");
+    let shaper = shaper();
+    assert_rows_fit_the_column(&block, &layout, &shaper);
+    let rows: Vec<_> = layout.lines.iter().filter(|row| row.line == 0).collect();
+    assert!(
+        rows.len() > 1,
+        "space-less Japanese prose wider than the column must still wrap"
+    );
+    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows.last().unwrap().source_range.end,
+        block.lines[0].source_range.end
+    );
+}
+
+#[test]
+fn mixed_script_and_emoji_wrap_without_panicking_or_splitting_a_char_boundary() {
+    let source = "helloこんにちは🎉world混在テキストsegment🚀another\n";
+    let (block, layout) = laid_out(source).into_iter().next().expect("one block");
+    let shaper = shaper();
+    assert_rows_fit_the_column(&block, &layout, &shaper);
+    let rows: Vec<_> = layout.lines.iter().filter(|row| row.line == 0).collect();
+    // Rows tile the line's source range with no gap or overlap, and every
+    // boundary the layout picked lands on a char boundary (a byte-split emoji
+    // or kana would already have panicked the string slicing above).
+    for pair in rows.windows(2) {
+        assert_eq!(pair[0].source_range.end, pair[1].source_range.start);
+    }
+    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows.last().unwrap().source_range.end,
+        block.lines[0].source_range.end
+    );
+}
+
+#[test]
+fn narrowing_the_column_rewraps_without_changing_the_source_it_covers() {
+    let shaper = shaper();
+    let blocks = present(WRAPPED, None);
+    let block = &blocks[0];
+    let wide = layout_block(block, WIDTH, &shaper);
+    let narrow = layout_block(block, WIDTH / 2.0, &shaper);
+    assert!(
+        narrow.lines.len() > wide.lines.len(),
+        "a narrower column must produce at least as many rows, strictly more here"
+    );
+    // Both layouts cover exactly the block's source range: narrowing rewraps
+    // rows, it does not drop or duplicate source.
+    for layout in [&wide, &narrow] {
+        assert_eq!(
+            layout.lines.first().map(|row| row.source_range.start),
+            Some(block.source_range.start)
+        );
+        assert_eq!(
+            layout.lines.last().map(|row| row.source_range.end),
+            Some(block.source_range.end)
+        );
+        for pair in layout.lines.windows(2) {
+            if pair[0].line == pair[1].line {
+                assert_eq!(pair[0].source_range.end, pair[1].source_range.start);
+            }
+        }
+    }
 }
 
 #[test]

@@ -84,6 +84,14 @@ fn clamp_scroll_y(scroll_y: f32, content_height: f32, viewport_height: f32) -> f
     scroll_y.clamp(0.0, max_scroll)
 }
 
+/// The width layout wraps against: the window viewport, minus whatever the
+/// sidebar takes and the padding on both sides of a line. Row painting and
+/// `layout_block` must agree on this number, or a row could measure narrower
+/// than what is actually drawn and clip.
+fn text_column_width(viewport_width: f32, sidebar_width: f32, padding: f32) -> f32 {
+    (viewport_width - sidebar_width - 2.0 * padding).max(1.0)
+}
+
 fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
     current == candidate
 }
@@ -2542,10 +2550,11 @@ impl Render for EditorView {
         } else {
             0.0
         };
-        self.content_width = (f32::from(window.viewport_size().width)
-            - sidebar_width
-            - 2.0 * self.theme.line_horizontal_padding)
-            .max(1.0);
+        self.content_width = text_column_width(
+            f32::from(window.viewport_size().width),
+            sidebar_width,
+            self.theme.line_horizontal_padding,
+        );
         let shaper = WindowShaper::new(window);
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
@@ -2994,6 +3003,15 @@ mod tests {
         assert!(!entry.is_valid(639.0, 11, Revision(3)));
         assert!(!entry.is_valid(640.0, 12, Revision(3)));
         assert!(!entry.is_valid(640.0, 11, Revision(4)));
+    }
+
+    #[test]
+    fn text_column_width_subtracts_sidebar_and_both_paddings() {
+        assert_eq!(text_column_width(1000.0, 0.0, 12.0), 1000.0 - 24.0);
+        assert_eq!(text_column_width(1000.0, 240.0, 12.0), 1000.0 - 240.0 - 24.0);
+        // Never collapses to zero or negative, even on a tiny window: a row
+        // still needs a positive width to lay out against.
+        assert_eq!(text_column_width(10.0, 240.0, 12.0), 1.0);
     }
 
     /// Presents a whole document the way `render` does: index first, then one
