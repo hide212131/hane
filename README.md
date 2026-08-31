@@ -87,6 +87,16 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+Windows の開発環境を再現する場合は、PowerShell で次を実行します。`-Install` は
+winget 経由で LLVM と Visual Studio C++ Build Tools を導入し、`-Verify` はテスト、
+フォーマット、clippy、Windows バイナリのビルドまで実行します。ターゲットはホストの
+x64 / ARM64 を自動判定し、必要なら `-Architecture x64` または `-Architecture arm64` で
+明示できます。
+
+```powershell
+.\scripts\setup-windows-dev.ps1 -Install -Verify
+```
+
 計測は `scripts/measure.sh all`（`startup` / `input` / `memory` も指定可）、画面キャプチャは
 `scripts/capture.sh editor`（`cursor-boundary` / `cursor-scroll` も指定可）で実行します。
 性能基準線は [docs/baseline/](docs/baseline/)、設計判断は [ADR index](docs/adr/README.md)、
