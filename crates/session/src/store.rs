@@ -45,6 +45,13 @@ impl ThemePreference {
 pub struct Settings {
     pub autosave: bool,
     pub theme: ThemePreference,
+    /// The folder an ordinary launch (no path argument, e.g. no Explorer
+    /// "Open with Hane" target) opens automatically. `None` until the
+    /// first-run folder picker or a settings screen sets one; a launch with
+    /// an explicit path argument never reads or writes this field, so it
+    /// stays a one-off open rather than changing what "ordinary launch"
+    /// means.
+    pub default_folder: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -52,6 +59,7 @@ impl Default for Settings {
         Self {
             autosave: true,
             theme: ThemePreference::System,
+            default_folder: None,
         }
     }
 }
@@ -190,6 +198,8 @@ impl SettingsRepository for FileStateStore {
                     settings.autosave = value != "false";
                 } else if let Some(value) = line.strip_prefix("theme=") {
                     settings.theme = ThemePreference::parse(value);
+                } else if let Some(value) = line.strip_prefix("default_folder=") {
+                    settings.default_folder = Some(PathBuf::from(unescape_line(value)));
                 }
             }
         }
@@ -198,15 +208,17 @@ impl SettingsRepository for FileStateStore {
 
     fn store(&self, settings: &Settings) -> io::Result<()> {
         fs::create_dir_all(&self.root)?;
-        atomic_write_bytes(
-            &self.root.join("settings.conf"),
-            format!(
-                "autosave={}\ntheme={}\n",
-                settings.autosave,
-                settings.theme.as_str()
-            )
-            .as_bytes(),
-        )
+        let mut contents = format!(
+            "autosave={}\ntheme={}\n",
+            settings.autosave,
+            settings.theme.as_str()
+        );
+        if let Some(folder) = &settings.default_folder {
+            contents.push_str("default_folder=");
+            contents.push_str(&escape_line(&folder.to_string_lossy()));
+            contents.push('\n');
+        }
+        atomic_write_bytes(&self.root.join("settings.conf"), contents.as_bytes())
     }
 }
 
@@ -368,12 +380,22 @@ mod tests {
         let settings = Settings {
             autosave: false,
             theme: ThemePreference::Dark,
+            default_folder: Some(PathBuf::from("C:\\notes")),
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
             SettingsRepository::load(&FileStateStore::at(&root)),
             settings
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_folder_is_absent_until_set() {
+        let root = temporary_directory("state");
+        let store = FileStateStore::at(&root);
+        SettingsRepository::store(&store, &Settings::default()).unwrap();
+        assert_eq!(SettingsRepository::load(&store).default_folder, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -387,6 +409,7 @@ mod tests {
                 .store(&Settings {
                     autosave: false,
                     theme: ThemePreference::Light,
+                    default_folder: None,
                 })
                 .unwrap();
         }
