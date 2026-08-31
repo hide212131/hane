@@ -2403,7 +2403,9 @@ dependencies = [
  "hane-markdown",
  "hane-metrics",
  "hane-presentation",
+ "hane-session",
  "hane-ui",
+ "winreg",
 ]
 
 [[package]]

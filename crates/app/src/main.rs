@@ -6,16 +6,68 @@
 #[cfg(not(feature = "instrument"))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use hane_session::StateStores;
 use hane_ui::{EditorView, register_key_bindings};
 use std::path::PathBuf;
+
+#[cfg(target_os = "windows")]
+mod context_menu;
 
 #[cfg(feature = "instrument")]
 mod instrument;
 
 const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、Undo / Redo、Markdown記号の段階表示に加えて、画像、表、保存、自動保存、Recent Files、themeを試せます。\n\n![Hane feather](assets/phase4-feather.svg)\n\n| Feature | Status |\n|:---|---:|\n| Typora-style editing | ✓ |\n| Atomic autosave | ✓ |\n| Light / Dark theme | ✓ |\n\n## Polish\n\n画像と表も元Markdownを唯一の正として保持します。行へカーソルを移動するとsourceを編集できます。\n";
 
+#[cfg(target_os = "windows")]
+fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
+    if flag == "--register-context-menu" {
+        let exe = std::env::current_exe().expect("resolve current exe path");
+        context_menu::register(&exe).expect("register Explorer context menu");
+        println!("Registered \"Haneで開く\" in Explorer's folder context menu.");
+        true
+    } else if flag == "--unregister-context-menu" {
+        context_menu::unregister().expect("unregister Explorer context menu");
+        println!("Removed \"Haneで開く\" from Explorer's folder context menu.");
+        true
+    } else {
+        false
+    }
+}
+
 fn main() {
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    #[cfg(target_os = "windows")]
+    if let Some(flag) = std::env::args_os().nth(1) {
+        if run_context_menu_flag(&flag) {
+            return;
+        }
+    }
+
+    // A path argument (typed manually, or supplied by Explorer's "Open with
+    // Hane") opens that folder for this launch only; it deliberately bypasses
+    // `default_folder` on both ends, so it neither reads nor overwrites the
+    // folder an ordinary launch opens.
+    let cli_path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Without a CLI path, an ordinary launch opens the saved default folder;
+    // `needs_default_prompt` is set when there isn't one yet (first run, or
+    // the saved folder no longer exists), so the window can prompt for one
+    // once it is open.
+    let mut needs_default_prompt = false;
+    let path = match cli_path {
+        Some(cli_path) => Some(cli_path),
+        None => {
+            let default_folder = StateStores::from_environment()
+                .settings()
+                .load()
+                .default_folder;
+            match default_folder {
+                Some(folder) if folder.is_dir() => Some(folder),
+                _ => {
+                    needs_default_prompt = true;
+                    None
+                }
+            }
+        }
+    };
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
     let process_started = std::time::Instant::now();
     #[cfg(feature = "instrument")]
@@ -75,6 +127,9 @@ fn main() {
                         let _ = view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
                         true
                     });
+                    if needs_default_prompt {
+                        view.prompt_default_work_folder(cx);
+                    }
                 })
                 .expect("focus editor");
             cx.activate(true);

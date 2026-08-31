@@ -1320,6 +1320,41 @@ impl EditorView {
         .detach();
     }
 
+    /// First-run startup prompt, shown when no default folder is configured
+    /// yet. Unlike `prompt_open_work_folder`, the chosen directory is saved
+    /// as the default folder so ordinary launches open it automatically from
+    /// then on; a folder passed on the command line (e.g. Explorer's "Open
+    /// with Hane") never goes through this path, so it never changes the
+    /// default. No unsaved-session guard is needed here: this only runs
+    /// against the fresh untitled window startup creates before any prompt.
+    pub fn prompt_default_work_folder(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a Default Folder".into()),
+        });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(root) = paths.into_iter().next() {
+                    let _ = view.update(cx, |view, cx| {
+                        view.settings.default_folder = Some(root.clone());
+                        view.store_settings();
+                        view.switch_to_work_folder(root, cx);
+                    });
+                }
+            }
+            Ok(Err(error)) => {
+                let _ = view.update(cx, |view, cx| {
+                    view.status = Some(format!("Choose Default Folder failed: {error}"));
+                    cx.notify();
+                });
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
     /// Resets this window to a single fresh untitled session and begins
     /// scanning `root` as a work folder — the runtime equivalent of the
     /// startup path through `open_work_folder`. Every previously open

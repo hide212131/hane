@@ -22,6 +22,8 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。
 
+引数なしで `hane.exe` を起動すると、既定フォルダ（未設定なら初回にフォルダ選択ダイアログが開き、選んだフォルダが以後の既定フォルダになります）を開きます。エクスプローラーでフォルダを右クリックし「Haneで開く」を選ぶと、そのフォルダだけをその起動時に開き、既定フォルダは変更されません。「Haneで開く」をコンテキストメニューに追加・削除するには、`hane.exe --register-context-menu` / `hane.exe --unregister-context-menu` を実行します（現在のユーザーのみに登録され、管理者権限は不要です）。
+
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
 ## インストールと起動
