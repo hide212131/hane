@@ -20,6 +20,8 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - macOS — ソースからビルドして利用します。[Rust](https://www.rust-lang.org/tools/install) が必要です。
 - Windows 11 x64 — GitHub Actions（`.github/workflows/windows-release.yml`）でビルドした `hane-windows-x64.zip` を展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
+Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。
+
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
 ## インストールと起動
@@ -64,7 +66,7 @@ cargo run --release -p hane
 
 ### Work folder mode
 
-起動時にディレクトリを引数として渡すか、起動後に Command + Shift + O でフォルダを選ぶと、その配下の Markdown 一覧が左サイドバーに表示されます。一覧からメモを選ぶと保存ダイアログを挟まずすぐ編集でき、`+` を押すとファイル名を聞かれない空のメモがその場で開きます。
+起動時にディレクトリを引数として渡すか、起動後に Command + Shift + O（Windows / Linux は Ctrl + Shift + O）でフォルダを選ぶと、その配下の Markdown 一覧が左サイドバーに表示されます。一覧からメモを選ぶと保存ダイアログを挟まずすぐ編集でき、`+` を押すとファイル名を聞かれない空のメモがその場で開きます。
 
 新規メモは最初の H1（`# ...`）がファイル名になり、自動命名対象のメモは以後 H1 を変更するとファイル名も追従します。ファイル名と H1 が最初から異なる既存の Markdown は、自動命名対象と判断されないため勝手にリネームされません。
 
