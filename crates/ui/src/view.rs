@@ -416,11 +416,10 @@ impl EditorView {
         // pending when the app quits; this hook flushes whatever it would
         // have written so an unnamed note typed just before quitting is not
         // lost.
-        let quit_subscription =
-            cx.on_app_quit(|view: &mut Self, _cx| {
-                view.flush_pending_drafts();
-                std::future::ready(())
-            });
+        let quit_subscription = cx.on_app_quit(|view: &mut Self, _cx| {
+            view.flush_pending_drafts();
+            std::future::ready(())
+        });
         Self {
             sessions,
             files,
@@ -3008,7 +3007,10 @@ mod tests {
     #[test]
     fn text_column_width_subtracts_sidebar_and_both_paddings() {
         assert_eq!(text_column_width(1000.0, 0.0, 12.0), 1000.0 - 24.0);
-        assert_eq!(text_column_width(1000.0, 240.0, 12.0), 1000.0 - 240.0 - 24.0);
+        assert_eq!(
+            text_column_width(1000.0, 240.0, 12.0),
+            1000.0 - 240.0 - 24.0
+        );
         // Never collapses to zero or negative, even on a tiny window: a row
         // still needs a positive width to lay out against.
         assert_eq!(text_column_width(10.0, 240.0, 12.0), 1.0);
@@ -3542,10 +3544,7 @@ mod tests {
                 Some(new_root.as_path())
             );
             assert_eq!(view.sessions().count(), 1);
-            assert_eq!(
-                view.editor().document().full_text().trim(),
-                "# New"
-            );
+            assert_eq!(view.editor().document().full_text().trim(), "# New");
         });
 
         // The old folder's unnamed draft must have been flushed before its
@@ -3564,9 +3563,7 @@ mod tests {
     // install directory on Windows) whenever the active session had no file
     // yet. With a Work Folder open, the dialog should start there instead.
     #[gpui::test]
-    fn save_as_on_an_unnamed_note_starts_in_the_active_work_folder(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn save_as_on_an_unnamed_note_starts_in_the_active_work_folder(cx: &mut gpui::TestAppContext) {
         let root = draft_test_root("save-as-unnamed");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
@@ -3628,11 +3625,10 @@ mod tests {
         // Simulate the sidebar-entry read that was in flight before the
         // switch: capture the generation it was requested under, exactly as
         // `open_with_policy` does, without waiting for it to complete.
-        let generation_at_request =
-            view.update(cx, |view, _cx| {
-                view.work_folder = Some(old_work_folder);
-                view.work_folder_generation
-            });
+        let generation_at_request = view.update(cx, |view, _cx| {
+            view.work_folder = Some(old_work_folder);
+            view.work_folder_generation
+        });
         let loaded = OsFileService.load(&stale_path).unwrap();
 
         view.update(cx, |view, cx| {
@@ -3651,7 +3647,8 @@ mod tests {
                 "a read from the replaced folder must not add a session to the new one"
             );
             assert!(
-                view.sessions().all(|session| session.file().path() != Some(stale_path.as_path())),
+                view.sessions()
+                    .all(|session| session.file().path() != Some(stale_path.as_path())),
                 "the stale file must not appear in any session"
             );
         });
@@ -3667,9 +3664,7 @@ mod tests {
     // a dirty *background* session was not guarded against at all — switching
     // folders would silently discard it along with every other open session.
     #[gpui::test]
-    fn a_dirty_background_session_blocks_opening_a_different_folder(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn a_dirty_background_session_blocks_opening_a_different_folder(cx: &mut gpui::TestAppContext) {
         let root = draft_test_root("dirty-background-guard");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
@@ -3687,7 +3682,9 @@ mod tests {
             view.work_folder = Some(work_folder);
             // Dirty the first (soon to be backgrounded) session, then open a
             // second note so the dirty one is no longer active.
-            view.editor_mut().insert_text("unsaved in the background").unwrap();
+            view.editor_mut()
+                .insert_text("unsaved in the background")
+                .unwrap();
             view.after_input(cx);
             view.new_work_folder_note(cx);
             assert!(!view.sessions.active().is_dirty());

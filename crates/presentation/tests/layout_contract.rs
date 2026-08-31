@@ -292,10 +292,18 @@ fn the_first_and_last_row_report_the_block_edge() {
 /// A row's painted text never runs past the column it was laid out against;
 /// otherwise a soft-wrap "row" is a lie and the viewport would need a
 /// horizontal scrollbar to read it.
-fn assert_rows_fit_the_column(block: &VisualBlock, layout: &BlockLayout, shaper: &FixedAdvanceShaper) {
+fn assert_rows_fit_the_column(
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    shaper: &FixedAdvanceShaper,
+) {
     for row in &layout.lines {
         let line = &block.lines[row.line];
-        let width = shaper.x_for_offset(line, row.line_visual_range.clone(), row.line_visual_range.end);
+        let width = shaper.x_for_offset(
+            line,
+            row.line_visual_range.clone(),
+            row.line_visual_range.end,
+        );
         assert!(
             width <= WIDTH + f32::EPSILON,
             "row {row:?} measures {width} wide, past the {WIDTH} column"
@@ -317,7 +325,10 @@ fn a_long_unbroken_ascii_token_wraps_instead_of_widening_the_column() {
         "an unbroken token wider than the column must still split across rows"
     );
     // Rows still tile the physical line's source range, wherever the split fell.
-    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows[0].source_range.start,
+        block.lines[0].source_range.start
+    );
     assert_eq!(
         rows.last().unwrap().source_range.end,
         block.lines[0].source_range.end
@@ -335,7 +346,10 @@ fn long_japanese_text_without_spaces_wraps_at_the_column() {
         rows.len() > 1,
         "space-less Japanese prose wider than the column must still wrap"
     );
-    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows[0].source_range.start,
+        block.lines[0].source_range.start
+    );
     assert_eq!(
         rows.last().unwrap().source_range.end,
         block.lines[0].source_range.end
@@ -355,7 +369,10 @@ fn mixed_script_and_emoji_wrap_without_panicking_or_splitting_a_char_boundary() 
     for pair in rows.windows(2) {
         assert_eq!(pair[0].source_range.end, pair[1].source_range.start);
     }
-    assert_eq!(rows[0].source_range.start, block.lines[0].source_range.start);
+    assert_eq!(
+        rows[0].source_range.start,
+        block.lines[0].source_range.start
+    );
     assert_eq!(
         rows.last().unwrap().source_range.end,
         block.lines[0].source_range.end
