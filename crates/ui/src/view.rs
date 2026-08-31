@@ -1204,7 +1204,13 @@ impl EditorView {
             .active()
             .file()
             .directory()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf())
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
         let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
         cx.spawn(async move |view, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
@@ -3534,6 +3540,42 @@ mod tests {
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    // Issue #28: Save As on an unnamed note used to fall back to `"."`
+    // (resolved against the process's current directory, e.g. the app's own
+    // install directory on Windows) whenever the active session had no file
+    // yet. With a Work Folder open, the dialog should start there instead.
+    #[gpui::test]
+    fn save_as_on_an_unnamed_note_starts_in_the_active_work_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("save-as-unnamed");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.prompt_save_as(cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_new_path_selection(|directory| {
+            assert_eq!(directory, root.as_path());
+            None
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // Issue #2 follow-up: a background read started via `open_work_folder_entry`
