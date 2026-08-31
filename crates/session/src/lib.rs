@@ -40,7 +40,10 @@ mod workfolder;
 
 pub use draft::{DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts};
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
-pub use naming::{TitleSyncAction, decide_title_sync, extract_h1_title, unique_markdown_filename};
+pub use naming::{
+    TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
+    unique_markdown_filename,
+};
 pub use resource::ResourceResolver;
 pub use service::{
     FileService, LoadedFile, OsFileService, OverwriteGuard, SaveFailure, SavedFile, run_save_job,
@@ -54,4 +57,7 @@ pub use store::{
     FileStateStore, MemoryStateStore, RecentFiles, RecentFilesRepository, Settings,
     SettingsRepository, StateStores, ThemePreference,
 };
-pub use workfolder::{OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderScanner};
+pub use workfolder::{
+    OsWorkFolderScanner, WorkFolder, WorkFolderEntry, WorkFolderFolder, WorkFolderNode,
+    WorkFolderScanner,
+};

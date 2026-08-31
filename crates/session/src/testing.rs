@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Default)]
 pub struct MemoryFileService {
     files: Mutex<HashMap<PathBuf, (String, u64)>>,
+    directories: Mutex<std::collections::HashSet<PathBuf>>,
     clock: AtomicU64,
 }
 
@@ -56,6 +57,15 @@ impl MemoryFileService {
             .expect("files lock")
             .get(&canonical(path.as_ref()))
             .map(|(contents, _)| contents.clone())
+    }
+
+    /// Whether `create_dir` has been called for `path` (or an ancestor of it
+    /// implied a directory that has since been created directly).
+    pub fn directory_exists(&self, path: impl AsRef<Path>) -> bool {
+        self.directories
+            .lock()
+            .expect("directories lock")
+            .contains(&canonical(path.as_ref()))
     }
 }
 
@@ -116,17 +126,28 @@ impl FileService for MemoryFileService {
         files.insert(canonical(to), entry);
         Ok(())
     }
+
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.directories
+            .lock()
+            .expect("directories lock")
+            .insert(canonical(path));
+        Ok(())
+    }
 }
 
 fn canonical(path: &Path) -> PathBuf {
     FileIdentity::lexical(path).canonical_path().to_path_buf()
 }
 
+/// One seeded work folder's Markdown files and empty folders.
+type SeededWorkFolder = (Vec<PathBuf>, Vec<PathBuf>);
+
 /// A work folder that lives in a map, keyed by root. Lets tests exercise
 /// sidebar/discovery logic without touching the real filesystem.
 #[derive(Debug, Default)]
 pub struct MemoryWorkFolderScanner {
-    roots: Mutex<HashMap<PathBuf, Vec<PathBuf>>>,
+    roots: Mutex<HashMap<PathBuf, SeededWorkFolder>>,
 }
 
 impl MemoryWorkFolderScanner {
@@ -141,23 +162,44 @@ impl MemoryWorkFolderScanner {
         self.roots
             .lock()
             .expect("roots lock")
-            .insert(root.into(), paths.into_iter().collect());
+            .entry(root.into())
+            .or_default()
+            .0 = paths.into_iter().collect();
+    }
+
+    /// Seeds a work folder with the given empty folders, as if they already
+    /// existed on disk with nothing in them when the folder was opened.
+    pub fn seed_folders(
+        &self,
+        root: impl Into<PathBuf>,
+        folders: impl IntoIterator<Item = PathBuf>,
+    ) {
+        self.roots
+            .lock()
+            .expect("roots lock")
+            .entry(root.into())
+            .or_default()
+            .1 = folders.into_iter().collect();
     }
 }
 
 impl WorkFolderScanner for MemoryWorkFolderScanner {
     fn scan(&self, root: &Path) -> io::Result<WorkFolder> {
         let roots = self.roots.lock().expect("roots lock");
-        let paths = roots
+        let (files, folders) = roots
             .get(root)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such work folder"))?;
-        Ok(WorkFolder::new(
+        let mut work_folder = WorkFolder::new(
             root.to_path_buf(),
-            paths
+            files
                 .iter()
                 .cloned()
                 .map(crate::workfolder::WorkFolderEntry::new)
                 .collect(),
-        ))
+        );
+        for folder in folders {
+            work_folder.insert_folder(folder.clone());
+        }
+        Ok(work_folder)
     }
 }
