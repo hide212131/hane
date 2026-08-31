@@ -269,12 +269,30 @@ fn state_directory() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("HANE_STATE_DIR") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        return Ok(home.join("Library/Application Support/Hane"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("AppData/Local"))
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
+        return Ok(root.join("Hane"));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    #[cfg(target_os = "macos")]
-    return Ok(home.join("Library/Application Support/Hane"));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     Ok(std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"))
