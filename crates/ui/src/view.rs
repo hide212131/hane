@@ -2699,9 +2699,7 @@ impl Render for EditorView {
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.focus_handle(cx));
-        let root = install_action_listeners(root, cx)
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
-            .children(self.work_folder_sidebar(cx));
+        let root = install_action_listeners(root, cx).children(self.work_folder_sidebar(cx));
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
@@ -2717,6 +2715,7 @@ impl Render for EditorView {
                 .relative()
                 .flex_1()
                 .overflow_hidden()
+                .on_scroll_wheel(cx.listener(Self::on_scroll))
                 .child(InputCapture { input: cx.entity() })
                 .child(
                     div()

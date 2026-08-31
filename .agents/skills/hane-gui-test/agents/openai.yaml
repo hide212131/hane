@@ -1,0 +1,3 @@
+interface:
+  display_name: "Hane GUI Test"
+  short_description: "Verify Hane's native GPUI behavior"
