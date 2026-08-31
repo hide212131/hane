@@ -18,7 +18,7 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 ## 動作環境
 
 - macOS — ソースからビルドして利用します。[Rust](https://www.rust-lang.org/tools/install) が必要です。
-- Windows 11 x64 — GitHub Actions（`.github/workflows/windows-release.yml`）でビルドした `hane-windows-x64.zip` を展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
+- Windows 11 x64 — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` をダウンロードし、展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-windows-x64.zip)することもできます。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
