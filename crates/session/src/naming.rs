@@ -136,6 +136,24 @@ pub fn unique_markdown_filename(stem: &str, taken: impl Fn(&str) -> bool) -> Str
     }
 }
 
+/// Picks a folder name for `stem` that `taken` (probing full folder names)
+/// reports as free, appending " 2", " 3", … on a collision. Deterministic and
+/// never overwrites an existing folder.
+#[must_use]
+pub fn unique_folder_name(stem: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(stem) {
+        return stem.to_owned();
+    }
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{stem} {suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 /// What, if anything, a freshly extracted title should do to a session's
 /// filename. Pure decision: no filesystem access, so it can be recomputed
 /// cheaply every time the debounce timer fires.

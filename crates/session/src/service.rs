@@ -62,6 +62,11 @@ pub trait FileService: Send + Sync + 'static {
     /// racing another writer for a name never silently clobbers it; the
     /// caller picks a different target and retries instead.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Creates `path` as a directory, including any missing parent
+    /// directories. Creating a directory that already exists is not an
+    /// error, the same as `std::fs::create_dir_all`.
+    fn create_dir(&self, path: &Path) -> io::Result<()>;
 }
 
 /// Runs one save job against a service, enforcing the external-change rule the
@@ -138,6 +143,10 @@ impl FileService for OsFileService {
         // and `to` are both left in place rather than either being lost.
         fs::hard_link(from, to)?;
         fs::remove_file(from)
+    }
+
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir_all(path)
     }
 }
 

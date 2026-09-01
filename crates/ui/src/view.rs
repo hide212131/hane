@@ -17,6 +17,7 @@
 
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
+use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
@@ -46,7 +47,8 @@ use hane_session::{
     OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles,
     RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile,
     SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction, WorkFolder,
-    WorkFolderScanner, decide_title_sync, extract_h1_title, run_save_job, unique_markdown_filename,
+    WorkFolderNode, WorkFolderScanner, decide_title_sync, extract_h1_title, run_save_job,
+    unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -105,6 +107,16 @@ struct DocumentKey {
     generation: u64,
 }
 
+/// A not-yet-named work-folder note's recovery-journal id and the folder it
+/// will be created in once its first H1 lands. Recorded per draft, rather
+/// than assumed to be the work folder root, so "new note" in a selected
+/// subfolder actually creates the file there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkFolderDraft {
+    draft_id: DraftId,
+    target_directory: PathBuf,
+}
+
 /// One H1-driven rename attempt's outcome-handling context, bundled so
 /// `finish_title_rename` takes one argument instead of five.
 struct TitleRenameAttempt {
@@ -133,7 +145,21 @@ pub struct EditorView {
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
     draft_store: Arc<dyn DraftStore>,
-    work_folder_drafts: HashMap<SessionId, DraftId>,
+    work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
+    /// The folder the sidebar currently has selected, used as the target
+    /// directory for the next "new note" or "new folder". `None` means the
+    /// work folder root.
+    selected_folder: Option<PathBuf>,
+    /// Folders the sidebar tree currently shows expanded. The work folder
+    /// root itself is always shown expanded and is not tracked here.
+    expanded_folders: HashSet<PathBuf>,
+    /// Folder paths reserved by a `new_work_folder_folder` call whose
+    /// `create_dir` is still in flight. `work_folder`'s tree is not updated
+    /// until that background write completes, so a name picked from the
+    /// tree alone would let a second "new folder" click before the first
+    /// finishes reserve the same name; this set is checked alongside the
+    /// tree so the second click picks the next name instead.
+    pending_new_folders: HashSet<PathBuf>,
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
@@ -429,6 +455,9 @@ impl EditorView {
             work_folder: None,
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
+            selected_folder: None,
+            expanded_folders: HashSet::new(),
+            pending_new_folders: HashSet::new(),
             _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
@@ -543,6 +572,7 @@ impl EditorView {
                 // created above; it stays clean and in place while any
                 // recovered drafts are installed alongside it, so switching
                 // to the first real note below can still reuse it.
+                let root = work_folder.root().to_path_buf();
                 let initial_session = self.sessions.active_id();
                 self.work_folder = Some(work_folder);
 
@@ -561,7 +591,17 @@ impl EditorView {
                     Ok(drafts) => {
                         for draft in drafts.drafts {
                             let id = self.sessions.open_untitled(&draft.text, "Untitled");
-                            self.work_folder_drafts.insert(id, draft.id);
+                            // The journal does not record which folder a
+                            // draft was destined for, so a recovered draft
+                            // falls back to the work folder root rather than
+                            // wherever it was selected before the crash.
+                            self.work_folder_drafts.insert(
+                                id,
+                                WorkFolderDraft {
+                                    draft_id: draft.id,
+                                    target_directory: root.clone(),
+                                },
+                            );
                             last_recovered = Some(id);
                         }
                         (drafts.failed > 0).then(|| {
@@ -736,7 +776,7 @@ impl EditorView {
     /// draft is revisited and edited again.
     fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
         let id = self.sessions.active_id();
-        let Some(&draft_id) = self.work_folder_drafts.get(&id) else {
+        let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
             return;
         };
         let Some(root) = self
@@ -785,12 +825,12 @@ impl EditorView {
         let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
             return;
         };
-        for (&id, &draft_id) in &self.work_folder_drafts {
+        for (&id, draft) in &self.work_folder_drafts {
             let Some(session) = self.sessions.get(id) else {
                 continue;
             };
             let text = session.editor().document().full_text();
-            let _ = self.draft_store.write(root, draft_id, &text);
+            let _ = self.draft_store.write(root, draft.draft_id, &text);
         }
     }
 
@@ -828,7 +868,7 @@ impl EditorView {
             // next edit re-arms this timer, so nothing is lost by skipping.
             return;
         }
-        let Some(root) = self
+        let Some(work_folder_root) = self
             .work_folder
             .as_ref()
             .map(|folder| folder.root().to_path_buf())
@@ -855,21 +895,33 @@ impl EditorView {
                     session.stop_auto_naming();
                 }
             }
-            TitleSyncAction::CreateNamed(title) => self.begin_title_create(id, root, title, cx),
-            TitleSyncAction::Rename(title) => self.begin_title_rename(id, root, title, cx),
+            TitleSyncAction::CreateNamed(title) => {
+                // The folder this note was started in, if it was started
+                // from a selected sidebar folder; otherwise the work folder
+                // root, the same as before folders existed.
+                let target_directory = self
+                    .work_folder_drafts
+                    .get(&id)
+                    .map(|draft| draft.target_directory.clone())
+                    .unwrap_or(work_folder_root);
+                self.begin_title_create(id, target_directory, title, cx);
+            }
+            TitleSyncAction::Rename(title) => self.begin_title_rename(id, title, cx),
         }
     }
 
-    /// Picks a collision-free `<title>.md` under `root` in the background,
-    /// then writes the still-untitled session's content there for the first
-    /// time through the same save machinery as any other write.
+    /// Picks a collision-free `<title>.md` under `target_directory` in the
+    /// background, then writes the still-untitled session's content there
+    /// for the first time through the same save machinery as any other
+    /// write.
     fn begin_title_create(
         &mut self,
         id: SessionId,
-        root: PathBuf,
+        target_directory: PathBuf,
         title: String,
         cx: &mut Context<Self>,
     ) {
+        let root = target_directory;
         self.title_sync_in_flight.insert(id);
         let files = self.files.clone();
         let probe_title = title.clone();
@@ -904,22 +956,22 @@ impl EditorView {
         .detach();
     }
 
-    /// Picks a collision-free `<title>.md` under `root` in the background,
-    /// then renames the session's current file to it. `DocumentSession`'s own
-    /// `apply_file_event` is what actually moves the session, the same path a
-    /// filer-originated rename would take, so a rename that lands after the
-    /// file already moved on for some other reason is safely ignored.
-    fn begin_title_rename(
-        &mut self,
-        id: SessionId,
-        root: PathBuf,
-        title: String,
-        cx: &mut Context<Self>,
-    ) {
+    /// Picks a collision-free `<title>.md` in the note's own directory in the
+    /// background, then renames the session's current file to it. The
+    /// directory is the file's current parent, not the work folder root, so
+    /// an H1-driven rename never moves a note out of the folder it lives in.
+    /// `DocumentSession`'s own `apply_file_event` is what actually moves the
+    /// session, the same path a filer-originated rename would take, so a
+    /// rename that lands after the file already moved on for some other
+    /// reason is safely ignored.
+    fn begin_title_rename(&mut self, id: SessionId, title: String, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get_mut(id) else {
             return;
         };
         let Some(from) = session.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(root) = from.parent().map(Path::to_path_buf) else {
             return;
         };
         // Reserved synchronously, before any `await`: a concurrent autosave
@@ -1014,23 +1066,130 @@ impl EditorView {
         cx.notify();
     }
 
+    /// The directory a new note or folder should be created in: the selected
+    /// sidebar folder if one is selected and still exists in the tree,
+    /// otherwise the work folder root. `None` outside a work folder.
+    fn target_directory_for_new_entry(&self) -> Option<PathBuf> {
+        let work_folder = self.work_folder.as_ref()?;
+        match &self.selected_folder {
+            Some(selected) if work_folder.children_at(selected).is_some() => Some(selected.clone()),
+            _ => Some(work_folder.root().to_path_buf()),
+        }
+    }
+
     /// Issue #5: starts a brand-new, unnamed note in the current work folder.
     /// No filename prompt: it opens blank and ready for input immediately,
     /// and is journalled into the recovery drafts as soon as it holds
     /// anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
-        if self.work_folder.is_none() {
+        let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
-        }
+        };
         let scroll_y = self.scroll_y;
         self.sessions
             .active_mut()
             .set_view_state(SessionViewState { scroll_y });
         let id = self.sessions.open_untitled("", "Untitled");
-        self.work_folder_drafts.insert(id, DraftId::generate());
+        self.work_folder_drafts.insert(
+            id,
+            WorkFolderDraft {
+                draft_id: DraftId::generate(),
+                target_directory,
+            },
+        );
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         self.status = None;
+        cx.notify();
+    }
+
+    /// Toggles a sidebar folder's expanded state and makes it the selected
+    /// target directory for the next new note or folder, both on the same
+    /// click: there is no separate disclosure control in this tree.
+    fn toggle_and_select_work_folder_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.expanded_folders.contains(&path) {
+            self.expanded_folders.remove(&path);
+        } else {
+            self.expanded_folders.insert(path.clone());
+        }
+        self.selected_folder = Some(path);
+        cx.notify();
+    }
+
+    /// Selects the work folder root as the target directory for the next new
+    /// note or folder. The root row has no expanded state of its own: its
+    /// children are always shown, so unlike a subfolder's row this only ever
+    /// selects, never toggles.
+    fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
+        self.selected_folder = None;
+        cx.notify();
+    }
+
+    /// Creates a new, empty subfolder inside the selected sidebar folder (the
+    /// work folder root if nothing is selected), named "New Folder" or, on a
+    /// collision with an existing sibling, "New Folder 2", "New Folder 3", …
+    /// Creation goes through `FileService::create_dir`, the filesystem
+    /// boundary, rather than touching `std::fs` from the UI directly. Once
+    /// created, the folder is added to the tree and shown expanded, so it is
+    /// immediately visible without waiting for a rescan.
+    pub fn new_work_folder_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(work_folder) = self.work_folder.as_ref() else {
+            return;
+        };
+        let Some(target_directory) = self.target_directory_for_new_entry() else {
+            return;
+        };
+        let siblings = work_folder
+            .children_at(&target_directory)
+            .unwrap_or_default();
+        let pending = &self.pending_new_folders;
+        let name = unique_folder_name("New Folder", |candidate| {
+            siblings.iter().any(|node| match node {
+                WorkFolderNode::Folder(folder) => folder.name() == candidate,
+                WorkFolderNode::File(_) => false,
+            }) || pending.contains(&target_directory.join(candidate))
+        });
+        let path = target_directory.join(&name);
+        // Reserved synchronously, before any `await`: the tree is not
+        // updated until `create_dir` finishes in the background, so a second
+        // "new folder" click landing before this one completes would
+        // otherwise see the same (empty) sibling list and pick the same
+        // name, silently losing one of the two folders since `create_dir`
+        // succeeds unconditionally on an already-existing directory.
+        self.pending_new_folders.insert(path.clone());
+        let files = self.files.clone();
+        let probe_path = path.clone();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { files.create_dir(&probe_path) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_new_work_folder_folder(path, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_new_work_folder_folder(
+        &mut self,
+        path: PathBuf,
+        result: std::io::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_new_folders.remove(&path);
+        match result {
+            Ok(()) => {
+                if let Some(folder) = self.work_folder.as_mut() {
+                    folder.insert_folder(path.clone());
+                }
+                self.expanded_folders.insert(path);
+                self.status = None;
+            }
+            Err(error) => {
+                self.status = Some(format!("New Folder failed: {error}"));
+            }
+        }
         cx.notify();
     }
 
@@ -1039,9 +1198,10 @@ impl EditorView {
     /// journal entry is removed on a background thread; a failure here just
     /// leaves a harmless leftover file, never lost content.
     fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(draft_id) = self.work_folder_drafts.remove(&id) else {
+        let Some(draft) = self.work_folder_drafts.remove(&id) else {
             return;
         };
+        let draft_id = draft.draft_id;
         let Some(root) = self
             .work_folder
             .as_ref()
@@ -1370,6 +1530,9 @@ impl EditorView {
         self.sessions = SessionSet::with_untitled("", "Untitled");
         self.work_folder = None;
         self.work_folder_drafts.clear();
+        self.selected_folder = None;
+        self.expanded_folders.clear();
+        self.pending_new_folders.clear();
         self.draft_recovery_warning = None;
         self.title_sync_pending.clear();
         self.title_sync_in_flight.clear();
@@ -2817,49 +2980,162 @@ impl Render for EditorView {
     }
 }
 
+/// One row of the flattened sidebar tree: a node together with how deeply it
+/// is nested, so indentation can be applied without recursive rendering.
+struct WorkFolderRow<'a> {
+    depth: usize,
+    node: &'a WorkFolderNode,
+}
+
+/// Flattens the tree into display order (depth-first, each level already
+/// sorted by `WorkFolder`/`WorkFolderFolder`), descending into a folder only
+/// when it is in `expanded`. The work folder root itself is always expanded.
+fn flatten_work_folder_tree<'a>(
+    nodes: &'a [WorkFolderNode],
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    out: &mut Vec<WorkFolderRow<'a>>,
+) {
+    for node in nodes {
+        out.push(WorkFolderRow { depth, node });
+        if let WorkFolderNode::Folder(folder) = node
+            && expanded.contains(folder.path())
+        {
+            flatten_work_folder_tree(folder.children(), depth + 1, expanded, out);
+        }
+    }
+}
+
 impl EditorView {
-    /// The Markdown list for the sidebar, when this window was opened onto a
-    /// work folder. Every entry switches into it on click, reusing an
+    /// The folder/file tree for the sidebar, when this window was opened onto
+    /// a work folder. A file switches into it on click, reusing an
     /// already-open session or loading it lazily; nothing here reads a file.
-    /// A `+` above the list starts a brand-new unnamed note, and any unnamed
-    /// note already open (freshly created, or recovered from a crash) is
-    /// listed below the named ones so it stays reachable while it has no
-    /// file of its own yet.
+    /// A folder toggles expanded/collapsed and becomes the selected target
+    /// directory for the next new note or folder, both on the same click. A
+    /// `+` above the tree starts a brand-new unnamed note and a folder icon
+    /// creates a new subfolder, both inside the selected folder (the work
+    /// folder root if nothing is selected). Any unnamed note already open
+    /// (freshly created, or recovered from a crash) is listed below the tree
+    /// so it stays reachable while it has no file of its own yet.
     fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
-        let new_note_button = div()
-            .id("work-folder-new-note")
+        let row_icon = |path: &'static str, color: u32| {
+            gpui::svg()
+                .path(path)
+                .flex_none()
+                .size_4()
+                .text_color(rgb(color))
+        };
+        let toolbar_button = |id: &'static str, icon_path: &'static str| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .bg(rgb(self.theme.code_background))
+                .child(row_icon(icon_path, self.theme.foreground))
+        };
+        let toolbar = div()
+            .id("work-folder-toolbar")
+            .flex()
+            .flex_row()
+            .gap_1()
+            .child(
+                toolbar_button("work-folder-new-note", icons::ICON_FILE_NEW)
+                    .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx))),
+            )
+            .child(
+                toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
+                    .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
+            );
+        let root_is_selected = self.selected_folder.is_none();
+        let root_row = div()
+            .id("work-folder-root")
             .px_2()
             .py_1()
             .rounded_sm()
             .cursor_pointer()
-            .bg(rgb(self.theme.code_background))
-            .text_color(rgb(self.theme.foreground))
-            .child("+")
-            .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx)));
-        let entries = work_folder
-            .entries()
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let is_active = active_path == Some(entry.path());
-                let path = entry.path().to_path_buf();
+            .when(root_is_selected, |element| {
+                element.bg(rgb(self.theme.sidebar_active_background))
+            })
+            .child(
                 div()
-                    .id(("work-folder-entry", index))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(is_active, |element| {
-                        element.bg(rgb(self.theme.sidebar_active_background))
-                    })
-                    .child(entry.name().to_owned())
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.open_work_folder_entry(&path, cx);
-                    }))
-            });
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child("\u{2228}")
+                    .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                    .child(work_folder_root_display_name(work_folder.root())),
+            )
+            .on_click(cx.listener(|view, _, _, cx| view.select_work_folder_root(cx)));
+        let mut rows = Vec::new();
+        // Depth starts at 1, not 0: the root itself is `root_row` above, so
+        // its direct children are visually indented one level under it.
+        flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
+        let tree = rows.into_iter().enumerate().map(|(index, row)| {
+            let indent = px(12.0 * row.depth as f32);
+            match row.node {
+                WorkFolderNode::File(entry) => {
+                    let is_active = active_path == Some(entry.path());
+                    let path = entry.path().to_path_buf();
+                    div()
+                        .id(("work-folder-entry", index))
+                        .pl(indent)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(is_active, |element| {
+                            element.bg(rgb(self.theme.sidebar_active_background))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(row_icon(icons::ICON_FILE, self.theme.sidebar_foreground))
+                                .child(entry.file_name().to_owned()),
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.open_work_folder_entry(&path, cx);
+                        }))
+                }
+                WorkFolderNode::Folder(folder) => {
+                    let is_selected = self.selected_folder.as_deref() == Some(folder.path());
+                    let is_expanded = self.expanded_folders.contains(folder.path());
+                    let path = folder.path().to_path_buf();
+                    let marker = if is_expanded { "\u{2228}" } else { "\u{203a}" };
+                    div()
+                        .id(("work-folder-folder", index))
+                        .pl(indent)
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(is_selected, |element| {
+                            element.bg(rgb(self.theme.sidebar_active_background))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(marker)
+                                .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                                .child(folder.name().to_owned()),
+                        )
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.toggle_and_select_work_folder_folder(path.clone(), cx);
+                        }))
+                }
+            }
+        });
         let mut draft_ids: Vec<SessionId> = self.work_folder_drafts.keys().copied().collect();
         draft_ids.sort_by_key(|id| id.0);
         let drafts = draft_ids
@@ -2894,11 +3170,21 @@ impl EditorView {
                 .p_2()
                 .bg(rgb(self.theme.sidebar_background))
                 .text_color(rgb(self.theme.sidebar_foreground))
-                .child(new_note_button)
-                .children(entries)
+                .child(toolbar)
+                .child(root_row)
+                .children(tree)
                 .children(drafts),
         )
     }
+}
+
+/// The sidebar label for the work folder root: its own directory name, or
+/// the full path if it has none (a filesystem root such as `/`).
+fn work_folder_root_display_name(root: &Path) -> String {
+    root.file_name().map_or_else(
+        || root.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// A short label for an unnamed note in the sidebar: its first non-blank
@@ -3870,7 +4156,7 @@ mod tests {
             assert!(
                 view.work_folder_drafts
                     .values()
-                    .any(|id| *id == readable.id),
+                    .any(|draft| draft.draft_id == readable.id),
                 "the readable draft must still be recovered as a session"
             );
         });
@@ -4069,6 +4355,277 @@ mod tests {
             OsDraftStore.recover(&root).unwrap().drafts.is_empty(),
             "the recovery draft must be retired once the note has a real file"
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39 review follow-up: once a subfolder has been selected, the
+    // root row must still be reachable and re-selectable — otherwise a note
+    // or folder started after visiting any subfolder is stuck targeting that
+    // subfolder until the work folder is reopened.
+    #[gpui::test]
+    fn selecting_the_work_folder_root_after_a_subfolder_restores_it_as_the_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("select-root-after-subfolder");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selected_folder.as_deref(),
+                Some(root.join("dev").as_path())
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            view.select_work_folder_root(cx);
+        });
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selected_folder, None,
+                "selecting the root row must clear the subfolder selection"
+            );
+            assert_eq!(
+                view.target_directory_for_new_entry(),
+                view.work_folder
+                    .as_ref()
+                    .map(|folder| folder.root().to_path_buf()),
+                "a new note/folder must now target the work folder root again"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39: "new folder" creates an empty subfolder through the
+    // filesystem boundary (`FileService::create_dir`), adds it to the work
+    // folder tree without a rescan, and shows it expanded.
+    #[gpui::test]
+    fn new_work_folder_folder_creates_a_folder_and_adds_it_to_the_tree_expanded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("new-folder");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_folder(cx);
+        });
+        cx.run_until_parked();
+
+        let expected = root.join("New Folder");
+        assert!(expected.is_dir(), "the folder must exist on disk");
+        view.read_with(cx, |view, _| {
+            let work_folder = view.work_folder.as_ref().unwrap();
+            let created = work_folder.children().iter().find_map(|node| match node {
+                WorkFolderNode::Folder(folder) if folder.path() == expected => Some(folder),
+                _ => None,
+            });
+            assert!(
+                created.is_some(),
+                "the new folder must appear in the tree without a rescan"
+            );
+            assert!(
+                view.expanded_folders.contains(&expected),
+                "a freshly created folder must show expanded"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39: creating a second folder with the same default name avoids
+    // clobbering the first one on disk, the same way `unique_markdown_filename`
+    // avoids collisions for notes.
+    #[gpui::test]
+    fn a_second_new_folder_with_the_same_name_does_not_collide(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("new-folder-collision");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_folder(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.new_work_folder_folder(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(root.join("New Folder").is_dir());
+        assert!(root.join("New Folder 2").is_dir());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39 review follow-up: two "new folder" clicks landing before the
+    // first click's background `create_dir` has completed must still pick
+    // two different names. The tree is not updated until each write
+    // finishes, so without a synchronous reservation both clicks would see
+    // the same empty sibling list and race for "New Folder" — and since
+    // `create_dir_all` succeeds even when the directory already exists,
+    // that race would silently lose one of the two folders instead of
+    // erroring.
+    #[gpui::test]
+    fn two_new_folder_clicks_before_the_first_completes_still_pick_different_names(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("new-folder-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            // Both calls run before either background `create_dir` has a
+            // chance to land, the same as two rapid clicks.
+            view.new_work_folder_folder(cx);
+            view.new_work_folder_folder(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(root.join("New Folder").is_dir());
+        assert!(
+            root.join("New Folder 2").is_dir(),
+            "the second concurrent click must not reuse the first click's name"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39: a note started while a subfolder is selected earns its
+    // filename inside that subfolder, not the work folder root, once its
+    // first H1 lands.
+    #[gpui::test]
+    fn a_new_notes_first_h1_names_its_file_inside_the_selected_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("h1-create-in-folder");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(root.join("dev"));
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.after_input(cx);
+        });
+
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().path(),
+                Some(root.join("dev/GPUI.md").as_path())
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("dev/GPUI.md")).unwrap(),
+            "# GPUI"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #39: an H1-driven rename must keep the note in the folder it
+    // already lives in, not pull it back to the work folder root — a
+    // regression that would otherwise appear once notes could live in
+    // subfolders at all.
+    #[gpui::test]
+    fn editing_an_auto_managed_h1_keeps_the_note_in_its_own_folder(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-rename-in-folder");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.selected_folder = Some(root.join("dev"));
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.update(cx, |view, cx| {
+            // Append " Notes" to the H1.
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" Notes").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().path(),
+                Some(root.join("dev/GPUI Notes.md").as_path()),
+                "the rename must stay inside dev/, not move to the work folder root"
+            );
+        });
 
         std::fs::remove_dir_all(&root).unwrap();
     }

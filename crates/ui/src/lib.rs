@@ -9,6 +9,7 @@
 
 mod actions;
 mod capture;
+mod icons;
 mod input;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 mod instrument;
@@ -20,6 +21,7 @@ mod theme;
 mod view;
 
 pub use actions::register_key_bindings;
+pub use icons::WorkFolderIcons;
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use view::EditorView;
