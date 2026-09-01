@@ -286,7 +286,7 @@ fn state_directory() -> io::Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        return Ok(home.join("Library/Application Support/Hane"));
+        Ok(home.join("Library/Application Support/Hane"))
     }
     #[cfg(target_os = "windows")]
     {
@@ -298,7 +298,7 @@ fn state_directory() -> io::Result<PathBuf> {
                     .map(|home| home.join("AppData/Local"))
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
-        return Ok(root.join("Hane"));
+        Ok(root.join("Hane"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let home = std::env::var_os("HOME")

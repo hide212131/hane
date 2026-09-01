@@ -128,7 +128,7 @@ fn main() {
                         // survive the window simply being closed.
                         let view_handle = cx.entity();
                         window.on_window_should_close(cx, move |_window, cx| {
-                            let _ = view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
+                            view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
                             true
                         });
                         if needs_default_prompt {
