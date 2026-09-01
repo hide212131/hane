@@ -7,7 +7,7 @@
 use gpui::Focusable;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_session::StateStores;
-use hane_ui::{EditorView, register_key_bindings};
+use hane_ui::{EditorView, WorkFolderIcons, register_key_bindings};
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
@@ -80,59 +80,63 @@ fn main() {
     };
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
-    Application::new().run(move |cx: &mut App| {
-        register_key_bindings(cx);
-        let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |_, cx| {
-                    cx.new(|cx| {
-                        #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
-                        let mut view = match path.as_deref() {
-                            Some(path) if path.is_dir() => EditorView::open_work_folder(path, cx),
-                            Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| {
-                                EditorView::new(
-                                    &format!("Could not open {}: {error}", path.display()),
-                                    path.display().to_string(),
-                                    cx,
-                                )
-                            }),
-                            None => EditorView::new(untitled_source, "Untitled", cx),
-                        };
-                        #[cfg(any(feature = "instrument", feature = "timing-probe"))]
-                        view.arm_startup_timing(process_started);
-                        view
+    Application::new()
+        .with_assets(WorkFolderIcons)
+        .run(move |cx: &mut App| {
+            register_key_bindings(cx);
+            let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        ..Default::default()
+                    },
+                    |_, cx| {
+                        cx.new(|cx| {
+                            #[cfg_attr(not(feature = "instrument"), allow(unused_mut))]
+                            let mut view = match path.as_deref() {
+                                Some(path) if path.is_dir() => {
+                                    EditorView::open_work_folder(path, cx)
+                                }
+                                Some(path) => EditorView::open(path, cx).unwrap_or_else(|error| {
+                                    EditorView::new(
+                                        &format!("Could not open {}: {error}", path.display()),
+                                        path.display().to_string(),
+                                        cx,
+                                    )
+                                }),
+                                None => EditorView::new(untitled_source, "Untitled", cx),
+                            };
+                            #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+                            view.arm_startup_timing(process_started);
+                            view
+                        })
+                    },
+                )
+                .expect("open Hane window");
+            #[cfg(feature = "instrument")]
+            instrument::apply(&window, &config, cx);
+            #[cfg(not(feature = "instrument"))]
+            {
+                window
+                    .update(cx, |view, window, cx| {
+                        window.focus(&view.focus_handle(cx));
+                        // `Context::on_app_quit` (registered inside `EditorView`)
+                        // only fires on an actual app-quit event, which closing
+                        // this window does not always raise on its own; flushing
+                        // here too means an unnamed note's last keystrokes still
+                        // survive the window simply being closed.
+                        let view_handle = cx.entity();
+                        window.on_window_should_close(cx, move |_window, cx| {
+                            let _ = view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
+                            true
+                        });
+                        if needs_default_prompt {
+                            view.prompt_default_work_folder(cx);
+                        }
                     })
-                },
-            )
-            .expect("open Hane window");
-        #[cfg(feature = "instrument")]
-        instrument::apply(&window, &config, cx);
-        #[cfg(not(feature = "instrument"))]
-        {
-            window
-                .update(cx, |view, window, cx| {
-                    window.focus(&view.focus_handle(cx));
-                    // `Context::on_app_quit` (registered inside `EditorView`)
-                    // only fires on an actual app-quit event, which closing
-                    // this window does not always raise on its own; flushing
-                    // here too means an unnamed note's last keystrokes still
-                    // survive the window simply being closed.
-                    let view_handle = cx.entity();
-                    window.on_window_should_close(cx, move |_window, cx| {
-                        let _ = view_handle.update(cx, |view, _cx| view.flush_pending_drafts());
-                        true
-                    });
-                    if needs_default_prompt {
-                        view.prompt_default_work_folder(cx);
-                    }
-                })
-                .expect("focus editor");
-            cx.activate(true);
-        }
-    });
+                    .expect("focus editor");
+                cx.activate(true);
+            }
+        });
 }

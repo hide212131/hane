@@ -17,6 +17,7 @@
 
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
+use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
@@ -3020,7 +3021,14 @@ impl EditorView {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
-        let toolbar_button = |id: &'static str, label: &'static str| {
+        let row_icon = |path: &'static str, color: u32| {
+            gpui::svg()
+                .path(path)
+                .flex_none()
+                .size_4()
+                .text_color(rgb(color))
+        };
+        let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
                 .id(id)
                 .px_2()
@@ -3028,8 +3036,7 @@ impl EditorView {
                 .rounded_sm()
                 .cursor_pointer()
                 .bg(rgb(self.theme.code_background))
-                .text_color(rgb(self.theme.foreground))
-                .child(label)
+                .child(row_icon(icon_path, self.theme.foreground))
         };
         let toolbar = div()
             .id("work-folder-toolbar")
@@ -3037,11 +3044,11 @@ impl EditorView {
             .flex_row()
             .gap_1()
             .child(
-                toolbar_button("work-folder-new-note", "+")
+                toolbar_button("work-folder-new-note", icons::ICON_FILE_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx))),
             )
             .child(
-                toolbar_button("work-folder-new-folder", "+ folder")
+                toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
         let root_is_selected = self.selected_folder.is_none();
@@ -3054,10 +3061,16 @@ impl EditorView {
             .when(root_is_selected, |element| {
                 element.bg(rgb(self.theme.sidebar_active_background))
             })
-            .child(format!(
-                "\u{2228} {}",
-                work_folder_root_display_name(work_folder.root())
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child("\u{2228}")
+                    .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                    .child(work_folder_root_display_name(work_folder.root())),
+            )
             .on_click(cx.listener(|view, _, _, cx| view.select_work_folder_root(cx)));
         let mut rows = Vec::new();
         // Depth starts at 1, not 0: the root itself is `root_row` above, so
@@ -3079,7 +3092,15 @@ impl EditorView {
                         .when(is_active, |element| {
                             element.bg(rgb(self.theme.sidebar_active_background))
                         })
-                        .child(entry.file_name().to_owned())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(row_icon(icons::ICON_FILE, self.theme.sidebar_foreground))
+                                .child(entry.file_name().to_owned()),
+                        )
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.open_work_folder_entry(&path, cx);
                         }))
@@ -3088,11 +3109,7 @@ impl EditorView {
                     let is_selected = self.selected_folder.as_deref() == Some(folder.path());
                     let is_expanded = self.expanded_folders.contains(folder.path());
                     let path = folder.path().to_path_buf();
-                    let marker = if is_expanded {
-                        "\u{2228} "
-                    } else {
-                        "\u{203a} "
-                    };
+                    let marker = if is_expanded { "\u{2228}" } else { "\u{203a}" };
                     div()
                         .id(("work-folder-folder", index))
                         .pl(indent)
@@ -3103,7 +3120,16 @@ impl EditorView {
                         .when(is_selected, |element| {
                             element.bg(rgb(self.theme.sidebar_active_background))
                         })
-                        .child(format!("{marker}{}", folder.name()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(marker)
+                                .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                                .child(folder.name().to_owned()),
+                        )
                         .on_click(cx.listener(move |view, _, _, cx| {
                             view.toggle_and_select_work_folder_folder(path.clone(), cx);
                         }))
