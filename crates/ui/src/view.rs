@@ -67,7 +67,6 @@ const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
 const SIDEBAR_PADDING: f32 = 8.0;
 const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
-const DISCLOSURE_SLOT_WIDTH: f32 = 14.0;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -3378,24 +3377,40 @@ impl EditorView {
                 .size_4()
                 .text_color(rgb(color))
         };
-        let disclosure_slot = |path: Option<&'static str>| {
-            div()
-                .flex_none()
-                .w(px(DISCLOSURE_SLOT_WIDTH))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .when_some(path, |slot, path| {
-                    slot.child(
-                        gpui::svg()
-                            .path(path)
-                            .flex_none()
-                            .w(px(12.0))
-                            .h(px(12.0))
-                            .text_color(rgb(self.theme.sidebar_foreground)),
+        // The leading slot of a row: normally the folder/file icon, sized so
+        // file and folder names start at the same x position. For folders,
+        // hovering the icon swaps it for the expand/collapse chevron in
+        // place, rather than reserving a separate chevron column up front.
+        let entry_icon = |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
+            let icon_slot = div().relative().flex_none().size_4();
+            match disclosure_path {
+                None => icon_slot.child(row_icon(icon_path, color)),
+                Some(disclosure_path) => icon_slot
+                    .group("work-folder-row-icon")
+                    .child(
+                        div()
+                            .group_hover("work-folder-row-icon", |style| style.invisible())
+                            .child(row_icon(icon_path, color)),
                     )
-                })
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .invisible()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .group_hover("work-folder-row-icon", |style| style.visible())
+                            .child(
+                                gpui::svg()
+                                    .path(disclosure_path)
+                                    .flex_none()
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .text_color(rgb(color)),
+                            ),
+                    ),
+            }
         };
         let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
@@ -3444,8 +3459,11 @@ impl EditorView {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(disclosure_slot(Some(icons::ICON_CHEVRON_DOWN)))
-                    .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                    .child(entry_icon(
+                        icons::ICON_FOLDER,
+                        None,
+                        self.theme.sidebar_foreground,
+                    ))
                     .child(work_folder_root_display_name(work_folder.root())),
             )
             .on_click(cx.listener(|view, _, _, cx| view.select_work_folder_root(cx)));
@@ -3478,9 +3496,9 @@ impl EditorView {
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .child(disclosure_slot(None))
-                                    .child(row_icon(
+                                    .child(entry_icon(
                                         icons::ICON_FILE,
+                                        None,
                                         self.theme.sidebar_foreground,
                                     ))
                                     .child(entry.file_name().to_owned()),
@@ -3515,9 +3533,9 @@ impl EditorView {
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
-                                    .child(disclosure_slot(Some(disclosure)))
-                                    .child(row_icon(
+                                    .child(entry_icon(
                                         icons::ICON_FOLDER,
+                                        Some(disclosure),
                                         self.theme.sidebar_foreground,
                                     ))
                                     .child(folder.name().to_owned()),
@@ -3556,8 +3574,11 @@ impl EditorView {
                             .flex_row()
                             .items_center()
                             .gap_1()
-                            .child(disclosure_slot(None))
-                            .child(row_icon(icons::ICON_FILE, self.theme.sidebar_foreground))
+                            .child(entry_icon(
+                                icons::ICON_FILE,
+                                None,
+                                self.theme.sidebar_foreground,
+                            ))
                             .child(draft_preview(session)),
                     )
                     .on_click(cx.listener(move |view, _, _, cx| {
