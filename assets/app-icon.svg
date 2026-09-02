@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Hane app icon</title>
+  <desc id="desc">The Hane blue feather on a warm off-white rounded square.</desc>
+  <rect x="24" y="24" width="464" height="464" rx="104" fill="#f3f0eb"/>
+  <g transform="translate(-129 47) scale(1.25)">
+    <path d="M430 42c-91 7-174 61-210 145 46-48 101-76 165-93-70 31-125 72-165 126l-34 39 17 12 31-43c46-5 91-25 126-59 37-36 61-80 70-127z" fill="#4d83a9"/>
+    <path d="M203 259c58-83 121-133 210-170" fill="none" stroke="#285b7c" stroke-width="9" stroke-linecap="round"/>
+  </g>
+</svg>
