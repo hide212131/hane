@@ -18,7 +18,9 @@ jobs:
           ref: ui/resizable-panels-scrollbars
 
       - name: Apply panel changes
-        run: python3 scripts/apply-panel-ui-patch.py
+        run: |
+          python3 scripts/fix-panel-patch.py
+          python3 scripts/apply-panel-ui-patch.py
 
       - name: Format
         run: cargo fmt --all
@@ -32,9 +34,9 @@ jobs:
       - name: Commit patch and remove temporary helpers
         shell: bash
         run: |
-          rm .github/workflows/apply-panel-ui-patch.yml scripts/apply-panel-ui-patch.py
+          rm .github/workflows/apply-panel-ui-patch.yml scripts/apply-panel-ui-patch.py scripts/fix-panel-patch.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add crates/ui/src/view.rs crates/ui/src/icons.rs assets/icons/work-folder/chevron-right.svg assets/icons/work-folder/chevron-down.svg .github/workflows/apply-panel-ui-patch.yml scripts/apply-panel-ui-patch.py
+          git add crates/ui/src/view.rs crates/ui/src/icons.rs assets/icons/work-folder/chevron-right.svg assets/icons/work-folder/chevron-down.svg .github/workflows/apply-panel-ui-patch.yml scripts/apply-panel-ui-patch.py scripts/fix-panel-patch.py
           git commit -m "feat(ui): resize panels and add visible scrollbars"
           git push origin HEAD:ui/resizable-panels-scrollbars
