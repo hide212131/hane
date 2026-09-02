@@ -24,9 +24,10 @@ use crate::line::{block_element, disclosure_for_line, presented_block, row_eleme
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, PathPromptOptions, Render, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px, rgb,
+    App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
+    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
+    Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -57,6 +58,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
+const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+const MAIN_MIN_WIDTH: f32 = 280.0;
+const SIDEBAR_RESIZER_WIDTH: f32 = 5.0;
+const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
+const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
+const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
+const SIDEBAR_PADDING: f32 = 8.0;
+const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
+const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
+const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
+const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
+
+#[derive(Clone, Copy, Debug)]
+struct SidebarResizeDrag {
+    pointer_x: f32,
+    sidebar_width: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    pointer_y: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+}
 
 /// Blocks kept presented on each side of the viewport, so scrolling back a
 /// screen does not re-present what was just drawn.
@@ -84,6 +111,61 @@ fn content_top_for_scroll(scroll_y: f32) -> f32 {
 fn clamp_scroll_y(scroll_y: f32, content_height: f32, viewport_height: f32) -> f32 {
     let max_scroll = (content_height - viewport_height).max(0.0);
     scroll_y.clamp(0.0, max_scroll)
+}
+
+fn scrollbar_thumb_geometry(
+    viewport_height: f32,
+    content_height: f32,
+    scroll_y: f32,
+) -> Option<(f32, f32)> {
+    if viewport_height <= 0.0 || content_height <= viewport_height {
+        return None;
+    }
+    let max_scroll = content_height - viewport_height;
+    let thumb_height = (viewport_height * viewport_height / content_height)
+        .max(SCROLLBAR_MIN_THUMB_HEIGHT)
+        .min(viewport_height);
+    let travel = (viewport_height - thumb_height).max(0.0);
+    let top = if travel == 0.0 {
+        0.0
+    } else {
+        clamp_scroll_y(scroll_y, content_height, viewport_height) / max_scroll * travel
+    };
+    Some((top, thumb_height))
+}
+
+fn scroll_y_for_thumb_drag(
+    start_scroll_y: f32,
+    pointer_delta: f32,
+    viewport_height: f32,
+    content_height: f32,
+) -> f32 {
+    let Some((_, thumb_height)) =
+        scrollbar_thumb_geometry(viewport_height, content_height, start_scroll_y)
+    else {
+        return 0.0;
+    };
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    let travel = (viewport_height - thumb_height).max(0.0);
+    if travel == 0.0 {
+        0.0
+    } else {
+        (start_scroll_y + pointer_delta * max_scroll / travel).clamp(0.0, max_scroll)
+    }
+}
+
+fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: f32) -> f32 {
+    let available = (viewport_width - MAIN_MIN_WIDTH - SIDEBAR_RESIZER_WIDTH).max(80.0);
+    let minimum = SIDEBAR_MIN_WIDTH.min(available);
+    let maximum = SIDEBAR_MAX_WIDTH.min(available).max(minimum);
+    (start_width + pointer_delta).clamp(minimum, maximum)
+}
+
+fn sidebar_content_height(tree_rows: usize, draft_rows: usize) -> f32 {
+    2.0 * SIDEBAR_PADDING
+        + SIDEBAR_TOOLBAR_HEIGHT
+        + SIDEBAR_TOOLBAR_GAP
+        + (1 + tree_rows + draft_rows) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
 /// The width layout wraps against: the window viewport, minus whatever the
@@ -153,6 +235,16 @@ pub struct EditorView {
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
+    /// User-adjustable width of the work-folder sidebar.
+    sidebar_width: f32,
+    /// Active drag of the vertical divider between sidebar and editor.
+    sidebar_resize_drag: Option<SidebarResizeDrag>,
+    /// Native scroll state for the work-folder list; a custom thumb mirrors it.
+    sidebar_scroll: ScrollHandle,
+    /// Active drag of the sidebar's visible scrollbar thumb.
+    sidebar_scrollbar_drag: Option<ScrollbarDrag>,
+    /// Active drag of the editor's visible scrollbar thumb.
+    editor_scrollbar_drag: Option<ScrollbarDrag>,
     /// Folder paths reserved by a `new_work_folder_folder` call whose
     /// `create_dir` is still in flight. `work_folder`'s tree is not updated
     /// until that background write completes, so a name picked from the
@@ -457,6 +549,11 @@ impl EditorView {
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
             expanded_folders: HashSet::new(),
+            sidebar_width: theme.sidebar_width,
+            sidebar_resize_drag: None,
+            sidebar_scroll: ScrollHandle::new(),
+            sidebar_scrollbar_drag: None,
+            editor_scrollbar_drag: None,
             pending_new_folders: HashSet::new(),
             _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
@@ -2720,6 +2817,246 @@ impl EditorView {
     }
 }
 
+impl EditorView {
+    fn begin_sidebar_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_resize_drag = Some(SidebarResizeDrag {
+            pointer_x: f32::from(event.position.x),
+            sidebar_width: self.sidebar_width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn begin_editor_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        content_height: f32,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_scrollbar_drag = Some(ScrollbarDrag {
+            pointer_y: f32::from(event.position.y),
+            scroll_y: self.scroll_y,
+            viewport_height: self.viewport_height,
+            content_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn begin_sidebar_scrollbar_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        viewport_height: f32,
+        content_height: f32,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_scroll = (-f32::from(self.sidebar_scroll.offset().y))
+            .clamp(0.0, (content_height - viewport_height).max(0.0));
+        self.sidebar_scrollbar_drag = Some(ScrollbarDrag {
+            pointer_y: f32::from(event.position.y),
+            scroll_y: current_scroll,
+            viewport_height,
+            content_height,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn on_panel_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        if let Some(drag) = self.sidebar_resize_drag {
+            let delta = f32::from(event.position.x) - drag.pointer_x;
+            let next = sidebar_width_for_drag(
+                drag.sidebar_width,
+                delta,
+                f32::from(window.viewport_size().width),
+            );
+            if next != self.sidebar_width {
+                self.sidebar_width = next;
+                changed = true;
+            }
+        }
+        if let Some(drag) = self.editor_scrollbar_drag {
+            let delta = f32::from(event.position.y) - drag.pointer_y;
+            let next = scroll_y_for_thumb_drag(
+                drag.scroll_y,
+                delta,
+                drag.viewport_height,
+                drag.content_height,
+            );
+            if next != self.scroll_y {
+                self.scroll_y = next;
+                changed = true;
+            }
+        }
+        if let Some(drag) = self.sidebar_scrollbar_drag {
+            let delta = f32::from(event.position.y) - drag.pointer_y;
+            let next = scroll_y_for_thumb_drag(
+                drag.scroll_y,
+                delta,
+                drag.viewport_height,
+                drag.content_height,
+            );
+            self.sidebar_scroll.set_offset(point(px(0.0), px(-next)));
+            changed = true;
+        }
+        if changed {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn finish_panel_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let was_dragging = self.sidebar_resize_drag.take().is_some()
+            || self.sidebar_scrollbar_drag.take().is_some()
+            || self.editor_scrollbar_drag.take().is_some();
+        if was_dragging {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn sidebar_resizer(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("work-folder-resizer")
+            .flex_none()
+            .w(px(SIDEBAR_RESIZER_WIDTH))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(rgb(self.theme.sidebar_background))
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(rgb(self.theme.sidebar_active_background)),
+            )
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_sidebar_resize))
+    }
+
+    fn editor_scrollbar(
+        &self,
+        content_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let (top, thumb_height) =
+            scrollbar_thumb_geometry(self.viewport_height, content_height, self.scroll_y)?;
+        Some(
+            div()
+                .id("editor-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .right(px(0.0))
+                .w(px(SCROLLBAR_TRACK_WIDTH))
+                .h(px(self.viewport_height))
+                .bg(rgb(self.theme.code_background))
+                .child(
+                    div()
+                        .id("editor-scrollbar-thumb")
+                        .absolute()
+                        .top(px(top))
+                        .right(px((SCROLLBAR_TRACK_WIDTH - SCROLLBAR_THUMB_WIDTH) / 2.0))
+                        .w(px(SCROLLBAR_THUMB_WIDTH))
+                        .h(px(thumb_height))
+                        .rounded_sm()
+                        .cursor(CursorStyle::OpenHand)
+                        .bg(rgb(self.theme.quote_foreground))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, event, window, cx| {
+                                view.begin_editor_scrollbar_drag(event, content_height, window, cx);
+                            }),
+                        ),
+                ),
+        )
+    }
+
+    fn sidebar_scrollbar(
+        &self,
+        viewport_height: f32,
+        content_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let max_scroll = (content_height - viewport_height).max(0.0);
+        let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
+        let (top, thumb_height) =
+            scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
+        Some(
+            div()
+                .id("work-folder-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .right(px(0.0))
+                .w(px(SCROLLBAR_TRACK_WIDTH))
+                .h(px(viewport_height))
+                .bg(rgb(self.theme.sidebar_active_background))
+                .child(
+                    div()
+                        .id("work-folder-scrollbar-thumb")
+                        .absolute()
+                        .top(px(top))
+                        .right(px((SCROLLBAR_TRACK_WIDTH - SCROLLBAR_THUMB_WIDTH) / 2.0))
+                        .w(px(SCROLLBAR_THUMB_WIDTH))
+                        .h(px(thumb_height))
+                        .rounded_sm()
+                        .cursor(CursorStyle::OpenHand)
+                        .bg(rgb(self.theme.quote_foreground))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, event, window, cx| {
+                                view.begin_sidebar_scrollbar_drag(
+                                    event,
+                                    viewport_height,
+                                    content_height,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        ),
+                ),
+        )
+    }
+}
+
+#[cfg(test)]
+mod panel_layout_tests {
+    use super::*;
+
+    #[test]
+    fn scrollbar_thumb_tracks_scroll_fraction() {
+        let (top, height) = scrollbar_thumb_geometry(100.0, 400.0, 150.0).unwrap();
+        assert_eq!(height, 28.0);
+        assert_eq!(top, 36.0);
+        assert_eq!(scroll_y_for_thumb_drag(0.0, 72.0, 100.0, 400.0), 300.0);
+    }
+
+    #[test]
+    fn scrollbar_is_hidden_when_content_fits() {
+        assert_eq!(scrollbar_thumb_geometry(100.0, 100.0, 0.0), None);
+        assert_eq!(scrollbar_thumb_geometry(100.0, 80.0, 0.0), None);
+    }
+
+    #[test]
+    fn sidebar_width_drag_respects_panel_limits() {
+        assert_eq!(sidebar_width_for_drag(220.0, -500.0, 1200.0), 160.0);
+        assert_eq!(sidebar_width_for_drag(220.0, 500.0, 1200.0), 480.0);
+        assert_eq!(sidebar_width_for_drag(220.0, 40.0, 1200.0), 260.0);
+    }
+}
+
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
@@ -2743,7 +3080,7 @@ impl Render for EditorView {
         // not just in the element tree, or wrapping would be computed for a
         // column wider than what is actually drawn.
         let sidebar_width = if self.work_folder.is_some() {
-            self.theme.sidebar_width
+            self.sidebar_width + SIDEBAR_RESIZER_WIDTH
         } else {
             0.0
         };
@@ -2905,7 +3242,19 @@ impl Render for EditorView {
             .text_color(rgb(self.theme.foreground))
             .key_context("HaneEditor")
             .track_focus(&self.focus_handle(cx));
-        let root = install_action_listeners(root, cx).children(self.work_folder_sidebar(cx));
+        let sidebar_viewport_height = f32::from(window.viewport_size().height);
+        let sidebar = self.work_folder_sidebar(sidebar_viewport_height, cx);
+        let resizer = if self.work_folder.is_some() {
+            Some(self.sidebar_resizer(cx))
+        } else {
+            None
+        };
+        let root = install_action_listeners(root, cx)
+            .children(sidebar)
+            .children(resizer)
+            .on_mouse_move(cx.listener(Self::on_panel_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_drag))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag));
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
@@ -2916,6 +3265,7 @@ impl Render for EditorView {
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
         let editor = self.sessions.active().editor();
+        let editor_scrollbar = self.editor_scrollbar(self.heights.total_height(), cx);
         let main_column = main_column.child(
             div()
                 .relative()
@@ -2972,7 +3322,8 @@ impl Render for EditorView {
                             )
                         }))
                         .child(div().h(px(bottom_space))),
-                ),
+                )
+                .children(editor_scrollbar),
         );
         let rendered = root.child(main_column);
         self.metrics.record_layout(layout_started.elapsed());
@@ -3008,16 +3359,14 @@ fn flatten_work_folder_tree<'a>(
 
 impl EditorView {
     /// The folder/file tree for the sidebar, when this window was opened onto
-    /// a work folder. A file switches into it on click, reusing an
-    /// already-open session or loading it lazily; nothing here reads a file.
-    /// A folder toggles expanded/collapsed and becomes the selected target
-    /// directory for the next new note or folder, both on the same click. A
-    /// `+` above the tree starts a brand-new unnamed note and a folder icon
-    /// creates a new subfolder, both inside the selected folder (the work
-    /// folder root if nothing is selected). Any unnamed note already open
-    /// (freshly created, or recovered from a crash) is listed below the tree
-    /// so it stays reachable while it has no file of its own yet.
-    fn work_folder_sidebar(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+    /// a work folder. File and folder rows reserve the same disclosure slot,
+    /// so their file/folder icons line up and a folder does not shift when its
+    /// disclosure icon changes direction.
+    fn work_folder_sidebar(
+        &self,
+        sidebar_viewport_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
@@ -3028,11 +3377,50 @@ impl EditorView {
                 .size_4()
                 .text_color(rgb(color))
         };
+        // The leading slot of a row: normally the folder/file icon, sized so
+        // file and folder names start at the same x position. For folders,
+        // hovering the icon swaps it for the expand/collapse chevron in
+        // place, rather than reserving a separate chevron column up front.
+        let entry_icon =
+            |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
+                let icon_slot = div().relative().flex_none().size_4();
+                match disclosure_path {
+                    None => icon_slot.child(row_icon(icon_path, color)),
+                    Some(disclosure_path) => icon_slot
+                        .group("work-folder-row-icon")
+                        .child(
+                            div()
+                                .group_hover("work-folder-row-icon", |style| style.invisible())
+                                .child(row_icon(icon_path, color)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .invisible()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .group_hover("work-folder-row-icon", |style| style.visible())
+                                .child(
+                                    gpui::svg()
+                                        .path(disclosure_path)
+                                        .flex_none()
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .text_color(rgb(color)),
+                                ),
+                        ),
+                }
+            };
         let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
                 .id(id)
-                .px_2()
-                .py_1()
+                .w(px(24.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded_sm()
                 .cursor_pointer()
                 .bg(rgb(self.theme.code_background))
@@ -3040,9 +3428,13 @@ impl EditorView {
         };
         let toolbar = div()
             .id("work-folder-toolbar")
+            .h(px(SIDEBAR_TOOLBAR_HEIGHT))
+            .flex_none()
             .flex()
             .flex_row()
+            .items_center()
             .gap_1()
+            .mb(px(SIDEBAR_TOOLBAR_GAP))
             .child(
                 toolbar_button("work-folder-new-note", icons::ICON_FILE_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_note(cx))),
@@ -3054,8 +3446,8 @@ impl EditorView {
         let root_is_selected = self.selected_folder.is_none();
         let root_row = div()
             .id("work-folder-root")
-            .px_2()
-            .py_1()
+            .h(px(SIDEBAR_ROW_HEIGHT))
+            .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
             .rounded_sm()
             .cursor_pointer()
             .when(root_is_selected, |element| {
@@ -3063,81 +3455,105 @@ impl EditorView {
             })
             .child(
                 div()
+                    .h_full()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child("\u{2228}")
-                    .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
+                    .child(entry_icon(
+                        icons::ICON_FOLDER,
+                        None,
+                        self.theme.sidebar_foreground,
+                    ))
                     .child(work_folder_root_display_name(work_folder.root())),
             )
             .on_click(cx.listener(|view, _, _, cx| view.select_work_folder_root(cx)));
         let mut rows = Vec::new();
-        // Depth starts at 1, not 0: the root itself is `root_row` above, so
-        // its direct children are visually indented one level under it.
         flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
-        let tree = rows.into_iter().enumerate().map(|(index, row)| {
-            let indent = px(12.0 * row.depth as f32);
-            match row.node {
-                WorkFolderNode::File(entry) => {
-                    let is_active = active_path == Some(entry.path());
-                    let path = entry.path().to_path_buf();
-                    div()
-                        .id(("work-folder-entry", index))
-                        .pl(indent)
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .when(is_active, |element| {
-                            element.bg(rgb(self.theme.sidebar_active_background))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .child(row_icon(icons::ICON_FILE, self.theme.sidebar_foreground))
-                                .child(entry.file_name().to_owned()),
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.open_work_folder_entry(&path, cx);
-                        }))
+        let tree_row_count = rows.len();
+        let tree = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let left_padding = px(SIDEBAR_ROW_HORIZONTAL_PADDING + 12.0 * row.depth as f32);
+                match row.node {
+                    WorkFolderNode::File(entry) => {
+                        let is_active = active_path == Some(entry.path());
+                        let path = entry.path().to_path_buf();
+                        div()
+                            .id(("work-folder-entry", index))
+                            .h(px(SIDEBAR_ROW_HEIGHT))
+                            .pl(left_padding)
+                            .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .when(is_active, |element| {
+                                element.bg(rgb(self.theme.sidebar_active_background))
+                            })
+                            .child(
+                                div()
+                                    .h_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(entry_icon(
+                                        icons::ICON_FILE,
+                                        None,
+                                        self.theme.sidebar_foreground,
+                                    ))
+                                    .child(entry.file_name().to_owned()),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.open_work_folder_entry(&path, cx);
+                            }))
+                    }
+                    WorkFolderNode::Folder(folder) => {
+                        let is_selected = self.selected_folder.as_deref() == Some(folder.path());
+                        let is_expanded = self.expanded_folders.contains(folder.path());
+                        let path = folder.path().to_path_buf();
+                        let disclosure = if is_expanded {
+                            icons::ICON_CHEVRON_DOWN
+                        } else {
+                            icons::ICON_CHEVRON_RIGHT
+                        };
+                        div()
+                            .id(("work-folder-folder", index))
+                            .h(px(SIDEBAR_ROW_HEIGHT))
+                            .pl(left_padding)
+                            .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .when(is_selected, |element| {
+                                element.bg(rgb(self.theme.sidebar_active_background))
+                            })
+                            .child(
+                                div()
+                                    .h_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(entry_icon(
+                                        icons::ICON_FOLDER,
+                                        Some(disclosure),
+                                        self.theme.sidebar_foreground,
+                                    ))
+                                    .child(folder.name().to_owned()),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_and_select_work_folder_folder(path.clone(), cx);
+                            }))
+                    }
                 }
-                WorkFolderNode::Folder(folder) => {
-                    let is_selected = self.selected_folder.as_deref() == Some(folder.path());
-                    let is_expanded = self.expanded_folders.contains(folder.path());
-                    let path = folder.path().to_path_buf();
-                    let marker = if is_expanded { "\u{2228}" } else { "\u{203a}" };
-                    div()
-                        .id(("work-folder-folder", index))
-                        .pl(indent)
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .when(is_selected, |element| {
-                            element.bg(rgb(self.theme.sidebar_active_background))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .child(marker)
-                                .child(row_icon(icons::ICON_FOLDER, self.theme.sidebar_foreground))
-                                .child(folder.name().to_owned()),
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.toggle_and_select_work_folder_folder(path.clone(), cx);
-                        }))
-                }
-            }
-        });
+            })
+            .collect::<Vec<_>>();
         let mut draft_ids: Vec<SessionId> = self.work_folder_drafts.keys().copied().collect();
         draft_ids.sort_by_key(|id| id.0);
+        let draft_row_count = draft_ids
+            .iter()
+            .filter(|id| self.sessions.get(**id).is_some())
+            .count();
         let drafts = draft_ids
             .into_iter()
             .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
@@ -3145,35 +3561,64 @@ impl EditorView {
                 let is_active = active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
-                    .px_2()
-                    .py_1()
+                    .h(px(SIDEBAR_ROW_HEIGHT))
+                    .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                     .rounded_sm()
                     .cursor_pointer()
                     .when(is_active, |element| {
                         element.bg(rgb(self.theme.sidebar_active_background))
                     })
-                    .child(draft_preview(session))
+                    .child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(entry_icon(
+                                icons::ICON_FILE,
+                                None,
+                                self.theme.sidebar_foreground,
+                            ))
+                            .child(draft_preview(session)),
+                    )
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.activate_session(id, cx);
                     }))
-            });
+            })
+            .collect::<Vec<_>>();
+        let content_height = sidebar_content_height(tree_row_count, draft_row_count);
+        let scrollbar = self.sidebar_scrollbar(sidebar_viewport_height, content_height, cx);
         Some(
             div()
-                .id("work-folder-sidebar")
+                .id("work-folder-panel")
+                .relative()
                 .flex_none()
-                .w(px(self.theme.sidebar_width))
+                .w(px(self.sidebar_width))
                 .h_full()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
+                .overflow_hidden()
                 .bg(rgb(self.theme.sidebar_background))
-                .text_color(rgb(self.theme.sidebar_foreground))
-                .child(toolbar)
-                .child(root_row)
-                .children(tree)
-                .children(drafts),
+                .child(
+                    div()
+                        .id("work-folder-sidebar")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sidebar_scroll)
+                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .flex()
+                        .flex_col()
+                        .pt(px(SIDEBAR_PADDING))
+                        .pb(px(SIDEBAR_PADDING))
+                        .pl(px(SIDEBAR_PADDING))
+                        .pr(px(SIDEBAR_PADDING + SCROLLBAR_TRACK_WIDTH))
+                        .bg(rgb(self.theme.sidebar_background))
+                        .text_color(rgb(self.theme.sidebar_foreground))
+                        .child(toolbar)
+                        .child(root_row)
+                        .children(tree)
+                        .children(drafts),
+                )
+                .children(scrollbar),
         )
     }
 }
