@@ -26,18 +26,56 @@ for size in "${sizes[@]}"; do
 done
 
 python3 - "$icon_out" "${frame_args[@]}" <<'PY'
+import struct
 import sys
-from PIL import Image
+
+
+def png_dimensions(data: bytes) -> tuple[int, int]:
+    # PNG signature (8 bytes) + IHDR chunk length (4) + "IHDR" (4),
+    # followed by width(4) and height(4) as big-endian uint32.
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
+
 
 out_path = sys.argv[1]
-frames = [Image.open(path).convert("RGBA") for path in sys.argv[2:]]
-frames.sort(key=lambda im: im.size[0], reverse=True)
-frames[0].save(
-    out_path,
-    format="ICO",
-    sizes=[im.size for im in frames],
-    append_images=frames[1:],
-)
+frame_paths = sys.argv[2:]
+
+frames = []
+for path in frame_paths:
+    with open(path, "rb") as f:
+        data = f.read()
+    width, height = png_dimensions(data)
+    frames.append((width, height, data))
+
+# Largest first is conventional, but ICO readers don't require an order.
+frames.sort(key=lambda frame: frame[0], reverse=True)
+
+with open(out_path, "wb") as out:
+    # ICONDIR: reserved(2)=0, type(2)=1 (icon), count(2)
+    out.write(struct.pack("<HHH", 0, 1, len(frames)))
+
+    offset = 6 + 16 * len(frames)
+    for width, height, data in frames:
+        # ICONDIRENTRY: width/height as a single byte each, 0 means 256px.
+        entry_width = width if width < 256 else 0
+        entry_height = height if height < 256 else 0
+        out.write(
+            struct.pack(
+                "<BBBBHHII",
+                entry_width,
+                entry_height,
+                0,  # color count (0 = no palette, i.e. >=8bpp)
+                0,  # reserved
+                1,  # color planes
+                32,  # bits per pixel
+                len(data),
+                offset,
+            )
+        )
+        offset += len(data)
+
+    for _width, _height, data in frames:
+        out.write(data)
 PY
 
 echo "Wrote: $icon_out"
