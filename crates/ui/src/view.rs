@@ -3381,37 +3381,38 @@ impl EditorView {
         // file and folder names start at the same x position. For folders,
         // hovering the icon swaps it for the expand/collapse chevron in
         // place, rather than reserving a separate chevron column up front.
-        let entry_icon = |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
-            let icon_slot = div().relative().flex_none().size_4();
-            match disclosure_path {
-                None => icon_slot.child(row_icon(icon_path, color)),
-                Some(disclosure_path) => icon_slot
-                    .group("work-folder-row-icon")
-                    .child(
-                        div()
-                            .group_hover("work-folder-row-icon", |style| style.invisible())
-                            .child(row_icon(icon_path, color)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .invisible()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .group_hover("work-folder-row-icon", |style| style.visible())
-                            .child(
-                                gpui::svg()
-                                    .path(disclosure_path)
-                                    .flex_none()
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .text_color(rgb(color)),
-                            ),
-                    ),
-            }
-        };
+        let entry_icon =
+            |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
+                let icon_slot = div().relative().flex_none().size_4();
+                match disclosure_path {
+                    None => icon_slot.child(row_icon(icon_path, color)),
+                    Some(disclosure_path) => icon_slot
+                        .group("work-folder-row-icon")
+                        .child(
+                            div()
+                                .group_hover("work-folder-row-icon", |style| style.invisible())
+                                .child(row_icon(icon_path, color)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .invisible()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .group_hover("work-folder-row-icon", |style| style.visible())
+                                .child(
+                                    gpui::svg()
+                                        .path(disclosure_path)
+                                        .flex_none()
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .text_color(rgb(color)),
+                                ),
+                        ),
+                }
+            };
         let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
                 .id(id)
