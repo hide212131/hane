@@ -178,7 +178,9 @@ Issue 上の明示的なコマンドで始める。
 
 Issue 作成だけでは自動実装を始めない。誤作動と意図しないコスト消費を防ぐためである。
 
-Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の author association（`OWNER` / `MEMBER` などの write 権限相当）または repository permission を Actions 側で検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
+Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の実効権限を検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
+
+`author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに `GET /repos/{owner}/{repo}/collaborators/{username}/permission` などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
 
 ### Codex review
 
@@ -188,8 +190,9 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 
 - Actions が `@codex review` を投稿する際、投稿コメント（またはそれに紐づく Pull Request comment）に対象 head SHA を機械可読な形で記録する。
 - Codex の review／reaction を、その記録した head SHA に対応付けて状態管理に保存する。
-- Copilot judge が読む「Codex review 完了」は、記録した head SHA に一致する review／reaction が観測できた場合のみ true とする。
-- 一定時間内に対応する review／reaction を観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
+- Codex は手動レビューの実行中にリクエストコメントへ 👀 reaction を付け、その後にレビューを投稿する。この 👀 は実行中（running）を示すだけであり、完了とはみなさない。
+- Copilot judge が読む「Codex review 完了」は、記録した head SHA を対象とする submitted review、または指摘なしを示す終端 reaction（👍）のいずれかが観測できた場合のみ true とする。👀 のみの状態では起動しない。
+- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
 
 ### Copilot judge
 
@@ -259,7 +262,7 @@ GitHub Agentic Workflows の `merge-pull-request` safe output は現時点で ex
 
 ### Phase 2: Claude 実装
 
-- `/implement` コメント投稿者の author association / repository permission を検証し、owner / write 権限保持者以外は無視する。
+- `/implement` コメント投稿者の実効 repository permission（collaborator permission API、または `OWNER`）を検証し、write 権限保持者以外は無視する。
 - `/implement` から Claude Code を起動する。
 - Issue を実装して Pull Request を作れるところまで通す。
 - Claude に渡す Issue / comment を、信頼できる投稿者のものと untrusted input に分離する。
