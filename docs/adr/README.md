@@ -23,6 +23,7 @@
 | [ADR-0020](0020-block-virtualization.md) | ブロック単位の仮想化と描画 |
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
+| [ADR-0023](0023-ai-agent-development-workflow.md) | AI agent 開発の実装・レビュー・進行判断の分離 |
 
 ## Superseded / amended
 
