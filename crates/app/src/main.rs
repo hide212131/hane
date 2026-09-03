@@ -36,10 +36,10 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
 
 fn main() {
     #[cfg(target_os = "windows")]
-    if let Some(flag) = std::env::args_os().nth(1) {
-        if run_context_menu_flag(&flag) {
-            return;
-        }
+    if let Some(flag) = std::env::args_os().nth(1)
+        && run_context_menu_flag(&flag)
+    {
+        return;
     }
 
     // A path argument (typed manually, or supplied by Explorer's "Open with
