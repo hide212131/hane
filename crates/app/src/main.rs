@@ -36,10 +36,10 @@ fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
 
 fn main() {
     #[cfg(target_os = "windows")]
-    if let Some(flag) = std::env::args_os().nth(1) {
-        if run_context_menu_flag(&flag) {
-            return;
-        }
+    if let Some(flag) = std::env::args_os().nth(1)
+        && run_context_menu_flag(&flag)
+    {
+        return;
     }
 
     // A path argument (typed manually, or supplied by Explorer's "Open with
@@ -51,6 +51,7 @@ fn main() {
     // `needs_default_prompt` is set when there isn't one yet (first run, or
     // the saved folder no longer exists), so the window can prompt for one
     // once it is open.
+    #[cfg_attr(feature = "instrument", allow(unused_variables, unused_assignments))]
     let mut needs_default_prompt = false;
     let path = match cli_path {
         Some(cli_path) => Some(cli_path),
@@ -62,7 +63,10 @@ fn main() {
             match default_folder {
                 Some(folder) if folder.is_dir() => Some(folder),
                 _ => {
-                    needs_default_prompt = true;
+                    #[cfg_attr(feature = "instrument", allow(unused_assignments))]
+                    {
+                        needs_default_prompt = true;
+                    }
                     None
                 }
             }
