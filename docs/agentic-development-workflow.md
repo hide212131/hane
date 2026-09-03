@@ -37,35 +37,39 @@ Pull Request
   v
 CI + Codex review
   |
-  +-- Codex に修正候補あり --> Copilot pre-GUI routing
+  +-- CI fail -----------------> Copilot pre-GUI routing
   |                               +-- fix --> Claude Code fix --> push --> 全検証やり直し
   |                               +-- blocked --> human
-  |                               +-- continue-validation --+
-  |                                                        |
-  +-- Codex に指摘なし ------------------------------------+
-                                                           |
-                                                           v
-                                  GUI validation required? を trusted workflow で判定
-                                      |                    |
-                                      | no                 | yes
-                                      v                    v
-                               Copilot final judge   Local GUI validation
-                                                           |
-                                                           | pass / fail / blocked
-                                                           v
-                                                    Copilot final judge
-                                                           |
-                             +-----------------------------+-----------------------------+
-                             |                             |                             |
-                           fix                           ready                        blocked
-                             |                             |                             |
-                             v                             v                             v
-                    Claude Code fix             deterministic merge gate              human
-                             |
-                             +--> push --> 全検証やり直し
+  |
+  +-- CI pass + Codex に修正候補あり --> Copilot pre-GUI routing
+  |                                      +-- fix --> Claude Code fix --> push --> 全検証やり直し
+  |                                      +-- blocked --> human
+  |                                      +-- continue-validation --+
+  |                                                               |
+  +-- CI pass + Codex に指摘なし ---------------------------------+
+                                                                  |
+                                                                  v
+                                         GUI validation required? を trusted workflow で判定
+                                             |                    |
+                                             | no                 | yes
+                                             v                    v
+                                      Copilot final judge   Local GUI validation
+                                                                  |
+                                                                  | pass / fail / blocked
+                                                                  v
+                                                           Copilot final judge
+                                                                  |
+                                    +-----------------------------+-----------------------------+
+                                    |                             |                             |
+                                  fix                           ready                        blocked
+                                    |                             |                             |
+                                    v                             v                             v
+                           Claude Code fix             deterministic merge gate              human
+                                    |
+                                    +--> push --> 全検証やり直し
 ```
 
-Codex に明確な修正候補がある commit では、ローカル Mac の GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
+必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、ローカル Mac の GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
 
 ## 各 agent / validator の責務
 
@@ -153,7 +157,7 @@ trusted workflow は Pull Request の各 head SHA について、変更ファイ
 2. 同じ head SHA に対する Codex review が完了している。
 3. Codex に修正候補がある場合は、Copilot pre-GUI routing が `continue-validation` と判断している。
 
-CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
+必須 CI が終端的に失敗した commit は Local GUI validation を待たず、Copilot pre-GUI routing に送る。CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
 
 ### GitHub Copilot
 
@@ -176,13 +180,23 @@ Copilot は同じ judge の責務を、必要に応じて2つの checkpoint で�
 
 #### pre-GUI routing
 
-Codex が submitted review として修正候補を残した場合、GUI validation より先に起動する。ここでは次のいずれかを返す。
+次のいずれかの場合、GUI validation より先に起動する。
+
+- 対象 head SHA の必須 CI が終端的に失敗した。
+- Codex が submitted review として修正候補を残した。
+
+CI が失敗した場合は次のいずれかを返す。
+
+1. `fix`: Claude Code の修正 workflow を起動する。
+2. `blocked`: 人間の確認が必要な状態として停止する。
+
+CI が成功していて Codex に修正候補がある場合は次のいずれかを返す。
 
 1. `fix`: Claude Code の修正 workflow を起動する。
 2. `continue-validation`: Codex の指摘はこの commit の GUI validation を止める理由ではないと判断し、次の検証へ進める。
 3. `blocked`: 人間の確認が必要な状態として停止する。
 
-pre-GUI routing から直接 `ready-to-merge` には進まない。
+CI failure に対して `continue-validation` は返さない。pre-GUI routing から直接 `ready-to-merge` にも進まない。
 
 #### final judge
 
@@ -204,6 +218,7 @@ Actions 側では最低限、次を保証する。
 
 - 同じ event を二重処理しない。
 - CI、Codex review、GUI requirement classification、GUI validation、Copilot judge の対象 head SHA と現在の head SHA が一致することを確認する。
+- 必須 CI の終端失敗を検出した場合は、GUI validation を待たず Copilot pre-GUI routing を起動する。
 - 修正後は新しい head SHA に対して必要な検証と GUI requirement classification をすべてやり直す。
 - 古い SHA に対する review / classification / validation / judge を再利用しない。
 - 最大反復回数を設ける。
@@ -294,7 +309,7 @@ blocked
 merged
 ```
 
-pre-GUI routing 中も `waiting-judge` を使い、判定結果が `continue-validation` なら GUI requirement classification の結果に応じて `waiting-gui` または final judge へ進む。
+pre-GUI routing 中も `waiting-judge` を使う。CI failure または Codex findings に対して `fix` / `blocked` なら GUI へ進まない。Codex findings に対する判定結果が `continue-validation` の場合だけ、GUI requirement classification の結果に応じて `waiting-gui` または final judge へ進む。
 
 実装時には、機械可読な Pull Request comment または GitHub の別の永続領域に保存する。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
 
@@ -315,6 +330,16 @@ Issue 作成だけでは自動実装を始めない。誤作動と意図しな�
 Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の実効権限を検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
 
 `author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに `GET /repos/{owner}/{repo}/collaborators/{username}/permission` などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
+
+### CI
+
+必須 CI は現在の head SHA に対して評価する。
+
+- 必須 CI が成功した場合だけ GUI validation へ進める。
+- 必須 CI が `failure` などの終端失敗になった場合は GUI validation を起動せず、Copilot pre-GUI routing を起動する。
+- pre-GUI routing は CI failure に対して `fix` または `blocked` を返し、`continue-validation` / `ready` は許可しない。
+- CI がまだ実行中の場合は次へ進まない。
+- head SHA が変わった場合は古い CI 結果を使わない。
 
 ### Codex review
 
@@ -357,9 +382,11 @@ runner は要求に含まれる Pull Request 番号と head SHA を使い、そ�
 
 ### Copilot judge
 
-Codex outcome が `findings` の場合は、GUI validation より前に pre-GUI routing を起動する。
+対象 head SHA の必須 CI が失敗した場合は、GUI validation より前に pre-GUI routing を起動する。
 
-GUI validation が不要な Pull Request は、Codex review、CI、GUI requirement classification が同じ head SHA で揃い、必要な pre-GUI routing が済んだ後に final judge を起動する。
+CI が成功し、Codex outcome が `findings` の場合も、GUI validation より前に pre-GUI routing を起動する。
+
+GUI validation が不要な Pull Request は、Codex review、成功した CI、GUI requirement classification が同じ head SHA で揃い、必要な pre-GUI routing が済んだ後に final judge を起動する。
 
 GUI validation が必要な Pull Request は、同じ head SHA に対する GUI validation が `pass` / `fail` / `blocked` のいずれかの終端結果になった後に final judge を起動する。
 
@@ -459,6 +486,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
 - no-GUI allowlist だけと確認できない変更は fail closed で GUI validation required とする。
+- 必須 CI が失敗した場合は GUI を起動せず Copilot pre-GUI routing へ渡す。
 - CI 成功 + Codex review 処理完了後だけ Local GUI runner を起動する。
 - Pull Request の最新 head SHA を checkout して Hane を build / 起動する。
 - GUI シナリオを実行し、`pass` / `fail` / `blocked` と validated SHA を返す。
@@ -468,7 +496,8 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 5: Copilot judge
 
-- Codex に修正候補がある場合は GUI 前に pre-GUI routing を行い、`fix` / `continue-validation` / `blocked` を判断する。
+- 必須 CI が失敗した場合は GUI 前に pre-GUI routing を行い、`fix` / `blocked` を判断する。
+- Codex に修正候補がある場合も GUI 前に pre-GUI routing を行い、`fix` / `continue-validation` / `blocked` を判断する。
 - final judge では Codex review、GUI validation、CI、Pull Request を読み、`fix` / `ready` / `blocked` を判断する。
 - `fix` なら Claude 修正 workflow を dispatch する。
 - GUI validation が必要な Pull Request では、同じ head SHA の `pass` がなければ `ready` にしない。
