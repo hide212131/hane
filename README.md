@@ -17,8 +17,11 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 ## 動作環境
 
-- macOS — ソースからビルドして利用します。[Rust](https://www.rust-lang.org/tools/install) が必要です。
+- macOS Apple Silicon — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-macos-arm64.zip` をダウンロードし、展開して `hane` を実行します。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-macos-arm64.zip)することもできます。
+- macOS Intel — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-macos-x64.zip` をダウンロードし、展開して `hane` を実行します。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-macos-x64.zip)することもできます。
 - Windows 11 x64 — [最新の GitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` をダウンロードし、展開して `hane.exe` を実行するポータブル運用のみに対応しています（Rust のインストールは不要）。[ZIP を直接ダウンロード](https://github.com/hide212131/hane/releases/latest/download/hane-windows-x64.zip)することもできます。個人利用の動作確認段階（dogfooding）であり、正式な Windows サポートは今後の課題です。
+
+macOS 版は現在 Developer ID による署名と Apple の notarization には未対応です。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
 Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。
 
