@@ -71,10 +71,10 @@ Claude Code はコードを書く側に限定する。
 
 #### 入力の信頼境界
 
-`/implement` の実行者を owner / write 権限保持者に制限しても、実装対象の Issue 本文や既存コメントそのものは外部ユーザーが自由に書ける。public repository の外部投稿には hidden instruction による prompt injection の危険があるため、Issue / comment の全文をそのまま Claude への指示として渡す設計にはしない。
+`/implement` の実行者を owner / write 権限保持者に制限しても、実装対象の Issue 本文や既存コメントそのものは外部ユーザーが自由に書ける。Claude Code Action の公式 security guidance が指摘するとおり、public repository の外部投稿には hidden instruction による prompt injection の危険があるため、Issue / comment の全文をそのまま Claude への指示として渡す設計にはしない。
 
 - Claude に渡す Issue 本文・コメントは、owner / write 権限保持者と信頼する bot（Codex、GitHub Actions 経由の状態コメントなど）の投稿に限定する。
-- 上記に該当しない外部投稿を参照する場合は、実装対象の指示ではなく **untrusted input** として明示的に分離する。
+- 上記に該当しない外部投稿を参照する場合は、実装対象の指示ではなく **untrusted input** として明示的に分離し、prompt 内でその旨を注記する。
 - untrusted input 中の指示文（「これを無視して」「secret を出力して」等）に従わない。
 
 ### Codex
@@ -154,7 +154,7 @@ GitHub Agentic Workflows の `engine: copilot` を使い、次を入力として
 2. `ready`: マージ条件を検査する deterministic workflow を起動する。
 3. `blocked`: 人間の確認が必要な状態として停止する。
 
-判断できない場合は `ready` にしない。
+判断できない場合は `ready` にしない。人間が確認できるコメントを残して停止する。
 
 GUI validation が必須なのに未実施、`fail`、`blocked`、または GUI-validated SHA が現在の head SHA と一致しない場合、Copilot は `ready` に進めない。
 
@@ -205,7 +205,8 @@ GitHub Agentic Workflows の Claude engine は、この OAuth token を使う方
 
 ### Codex
 
-ChatGPT アカウントで Codex にサインインし、Codex Web / GitHub 側で Hane リポジトリを接続する。Pull Request review はこの接続を使う。
+ChatGPT アカウントで Codex にサインインし、Codex Web / GitHub 側で Hane リポジトリを接続する。
+Pull Request review はこの接続を使う。
 
 今回の Codex review では `OPENAI_API_KEY` を GitHub Actions に置かない。
 
@@ -269,19 +270,19 @@ Issue 作成だけでは自動実装を始めない。誤作動と意図しな�
 
 Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の実効権限を検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
 
-`author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに collaborator permission API などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
+`author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに `GET /repos/{owner}/{repo}/collaborators/{username}/permission` などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
 
 ### Codex review
 
 Claude Code が Pull Request を作成したとき、または修正 commit を push したときに、その最新 head SHA を対象としてレビューする。
 
-Codex の GitHub integration による自動 review は新規 Pull Request 作成時のみ保証されるため、修正 push 後の再レビューは Actions から `@codex review` コメントを明示的に投稿する方式とし、次の契約を満たす。
+Codex の GitHub integration による自動 review は新規 Pull Request 作成時のみ保証される公式仕様であり、修正 push 後の再レビューは保証されない。また指摘がない場合は review 本文なしの 👍 reaction のみになることがある。そのため、修正 push 後の再レビューは Actions から `@codex review` コメントを明示的に投稿する方式で行い、次の契約を満たす。
 
-- Actions が `@codex review` を投稿する際、対象 head SHA を機械可読な形で記録する。
+- Actions が `@codex review` を投稿する際、投稿コメント（またはそれに紐づく Pull Request comment）に対象 head SHA を機械可読な形で記録する。
 - Codex の review／reaction を、その記録した head SHA に対応付けて状態管理に保存する。
-- 実行中を示す reaction だけでは完了とみなさない。
-- 対象 SHA に対する submitted review、または指摘なしを示す終端状態を観測できた場合だけ完了とする。
-- 一定時間内に完了を観測できない、または head SHA の対応付けを判定できない場合は未完了として扱い、fail closed で `ready` に進めない。
+- Codex は手動レビューの実行中にリクエストコメントへ 👀 reaction を付け、その後にレビューを投稿する。この 👀 は実行中（running）を示すだけであり、完了とはみなさない。
+- Copilot judge が読む「Codex review 完了」は、記録した head SHA を対象とする submitted review、または指摘なしを示す終端 reaction（👍）のいずれかが観測できた場合のみ true とする。👀 のみの状態では起動しない。
+- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
 
 ### Local GUI validation
 
@@ -326,7 +327,7 @@ Copilot の `ready` は「マージしてよい」という最終権限ではな
 少なくとも次をすべて満たした場合だけマージする。
 
 - Copilot が最新 head SHA に対して `ready` と判断している。
-- Codex-reviewed SHA が最新 head SHA と一致する。
+- Codex review の対象 SHA が最新 head SHA と一致する。
 - 必須 CI が最新 head SHA で成功している。
 - `gui-validation-required` の場合、GUI result が `pass` である。
 - `gui-validation-required` の場合、GUI-validated SHA が最新 head SHA と一致する。
@@ -344,17 +345,16 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-`pull_request` トリガーで上記を実行する CI workflow と、branch protection / ruleset の required status checks を使う。merge gate が要求する check name は明示的なリストとし、空リストを成功扱いしない。
+現在は `pull_request` トリガーで上記の `cargo test` / `cargo clippy` を実行する CI workflow と、main branch の ruleset による required status checks が設定済みである。merge gate が要求する check name は明示的なリストとして定義し、空リストを許可しない。
 
-要求した check が0件、`missing`、`skipped`、または結果を取得できない場合は成功とみなさず、`blocked` として拒否する。
+- 要求した check が0件、`missing`、`skipped`、または結果が取得できない場合は成功とみなさず、`blocked` として拒否する。
+- branch protection / ruleset 側の required status checks と merge gate 側の期待値がずれないようにする。
 
-GitHub Agentic Workflows の merge safe output には依存せず、Copilot は `ready` 判定までを行い、通常の GitHub API を使う別の deterministic merge gate に渡す。
+GitHub Agentic Workflows の `merge-pull-request` safe output は現時点で experimental であり、デフォルト branch を対象とする merge に制約があるため、初期実装では直接採用しない。Copilot は `ready` 判定までを行い、通常の GitHub API を使う別の deterministic merge gate に渡す。
 
 ## セキュリティ
 
-GitHub Actions 側では次を守る。
-
-- OAuth token、Personal Access Token、API key は GitHub Actions Secrets に置く。
+- OAuth token、Personal Access Token、API key はすべて GitHub Actions Secrets に置く。
 - Secret を Issue、Pull Request、comment、agent prompt に展開しない。
 - Agentic Workflow の agent job は read-only を基本とする。
 - 書き込みは safe outputs と明示した worker workflow に限定する。
@@ -383,7 +383,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 2: Claude 実装
 
-- `/implement` コメント投稿者の実効 repository permission を検証し、write 権限保持者以外は無視する。
+- `/implement` コメント投稿者の実効 repository permission（collaborator permission API、または `OWNER`）を検証し、write 権限保持者以外は無視する。
 - `/implement` から Claude Code を起動する。
 - Issue を実装して Pull Request を作れるところまで通す。
 - Claude に渡す Issue / comment を、信頼できる投稿者のものと untrusted input に分離する。
