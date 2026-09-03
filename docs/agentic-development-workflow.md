@@ -37,9 +37,12 @@ Pull Request
   v
 CI + Codex review
   |
-  +-- CI fail -----------------> Copilot pre-GUI routing
-  |                               +-- fix --> Claude Code fix --> push --> 全検証やり直し
-  |                               +-- blocked --> human
+  +-- CI fail -----------------> atomic claim(PR, SHA, ci-failure)
+  |                               |
+  |                               +-- winner --> Copilot pre-GUI routing
+  |                               |              +-- fix --> Claude Code fix --> push --> 全検証やり直し
+  |                               |              +-- blocked --> human
+  |                               +-- loser --> no-op
   |
   +-- CI pass + Codex に修正候補あり --> Copilot pre-GUI routing
   |                                      +-- fix --> Claude Code fix --> push --> 全検証やり直し
@@ -157,7 +160,7 @@ trusted workflow は Pull Request の各 head SHA について、変更ファイ
 2. 同じ head SHA に対する Codex review が完了している。
 3. Codex に修正候補がある場合は、Copilot pre-GUI routing が `continue-validation` と判断している。
 
-必須 CI が終端的に失敗した commit は Local GUI validation を待たず、Copilot pre-GUI routing に送る。CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
+必須 CI が終端的に失敗した commit は Local GUI validation を待たず、Copilot pre-GUI routing に送る。ただし、並列 CI の複数ジョブが同じ head SHA で失敗しても pre-GUI routing を複数回起動しない。CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
 
 ### GitHub Copilot
 
@@ -217,8 +220,10 @@ Agent は判断するが、GitHub Actions が制御する。
 Actions 側では最低限、次を保証する。
 
 - 同じ event を二重処理しない。
+- event 単位の重複排除だけでなく、`Pull Request 番号 + head SHA + transition kind` 単位で状態遷移を原子的に一度だけ獲得できるようにする。
 - CI、Codex review、GUI requirement classification、GUI validation、Copilot judge の対象 head SHA と現在の head SHA が一致することを確認する。
-- 必須 CI の終端失敗を検出した場合は、GUI validation を待たず Copilot pre-GUI routing を起動する。
+- 必須 CI の終端失敗を検出した場合は、`(PR, head SHA, ci-failure)` の transition claim を compare-and-set 相当の方法で獲得した workflow だけが `waiting-judge` へ遷移して Copilot pre-GUI routing を起動する。後続の matrix job failure は claim 済みなら no-op とする。
+- 同じ head SHA について `waiting-judge` / `fix-requested` / `blocked` のいずれかへ既に進んでいる場合、別の CI failure event から同じ judge や Claude fix workflow を再 dispatch しない。
 - 修正後は新しい head SHA に対して必要な検証と GUI requirement classification をすべてやり直す。
 - 古い SHA に対する review / classification / validation / judge を再利用しない。
 - 最大反復回数を設ける。
@@ -227,7 +232,7 @@ Actions 側では最低限、次を保証する。
 
 ## head SHA を中心にした不変条件
 
-すべての検証結果と GUI requirement classification は Pull Request の head SHA に紐づける。
+すべての検証結果、GUI requirement classification、workflow transition claim は Pull Request の head SHA に紐づける。
 
 例として Pull Request head SHA が `A` のとき、次の結果だけを `A` の判定材料にできる。
 
@@ -239,9 +244,10 @@ PR head SHA = A
   +-- GUI requirement classification(A)
   +-- GUI validation(A)  # required の場合
   +-- Copilot judge(A)
+  +-- transition claims(A)
 ```
 
-途中で commit `B` が push された場合、`A` に対する Codex review、GUI requirement classification、GUI validation、Copilot judge は現在の判定には使わない。必要な処理を `B` に対してやり直す。
+途中で commit `B` が push された場合、`A` に対する Codex review、GUI requirement classification、GUI validation、Copilot judge、transition claim は現在の判定には使わない。必要な処理を `B` に対してやり直す。
 
 この SHA 一致確認は agent の文章判断に任せず、workflow 側でも機械的に確認する。
 
@@ -293,6 +299,7 @@ Hane は個人所有リポジトリなので、GitHub Agentic Workflows の Copi
 - GUI-validated SHA
 - GUI result: `pass` / `fail` / `blocked`
 - Copilot-judged SHA
+- transition claims: head SHA ごとの `ci-failure` 等の一度きり遷移記録
 - 現在の状態
 - fix iteration count
 
@@ -311,7 +318,9 @@ merged
 
 pre-GUI routing 中も `waiting-judge` を使う。CI failure または Codex findings に対して `fix` / `blocked` なら GUI へ進まない。Codex findings に対する判定結果が `continue-validation` の場合だけ、GUI requirement classification の結果に応じて `waiting-gui` または final judge へ進む。
 
-実装時には、機械可読な Pull Request comment または GitHub の別の永続領域に保存する。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
+状態遷移は読み取り後の無条件書き込みではなく、期待する current state / head SHA を条件にした compare-and-set 相当で行う。たとえば CI failure では、同じ `(PR, head SHA, ci-failure)` transition claim が未取得である場合だけ claim を作成して `waiting-judge` へ進める。並列イベントが同時に到着した場合、claim を取得できなかった側は状態を再読込して no-op とする。
+
+実装時には、原子的更新または排他が可能な永続領域を正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを transition claim の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
 
 ## トリガー
 
@@ -337,9 +346,11 @@ Hane は公開リポジトリであり、`/implement` コメントの文字列�
 
 - 必須 CI が成功した場合だけ GUI validation へ進める。
 - 必須 CI が `failure` などの終端失敗になった場合は GUI validation を起動せず、Copilot pre-GUI routing を起動する。
+- matrix の複数ジョブが同じ head SHA で失敗する可能性があるため、各失敗イベントはまず `(PR, head SHA, ci-failure)` transition claim の取得を原子的に試みる。
+- claim を最初に取得した workflow だけが `waiting-judge` へ遷移して pre-GUI routing を dispatch する。claim を取得できなかった後続イベントは no-op とする。
 - pre-GUI routing は CI failure に対して `fix` または `blocked` を返し、`continue-validation` / `ready` は許可しない。
 - CI がまだ実行中の場合は次へ進まない。
-- head SHA が変わった場合は古い CI 結果を使わない。
+- head SHA が変わった場合は古い CI 結果や transition claim を使わない。
 
 ### Codex review
 
@@ -382,7 +393,7 @@ runner は要求に含まれる Pull Request 番号と head SHA を使い、そ�
 
 ### Copilot judge
 
-対象 head SHA の必須 CI が失敗した場合は、GUI validation より前に pre-GUI routing を起動する。
+対象 head SHA の必須 CI が失敗した場合は、GUI validation より前に pre-GUI routing を起動する。ただし `(PR, head SHA, ci-failure)` transition claim を取得した workflow だけが起動できる。
 
 CI が成功し、Codex outcome が `findings` の場合も、GUI validation より前に pre-GUI routing を起動する。
 
@@ -402,7 +413,7 @@ Copilot が `fix` と判断した場合は、Claude Code に次の情報を渡�
 - GUI validation 結果がある場合はその結果
 - Copilot が修正必要と判断した理由
 
-Claude は修正、検証、push まで行う。push 後は以前の Codex review、GUI requirement classification、GUI validation、Copilot judge を再利用せず、新しい head SHA に対して必要な検証をすべてやり直す。
+Claude は修正、検証、push まで行う。push 後は以前の Codex review、GUI requirement classification、GUI validation、Copilot judge、transition claim を再利用せず、新しい head SHA に対して必要な検証をすべてやり直す。
 
 最大反復回数の初期値は **3回** とする。3回で収束しない場合は `blocked` とし、人間へ引き継ぐ。
 
@@ -486,7 +497,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
 - no-GUI allowlist だけと確認できない変更は fail closed で GUI validation required とする。
-- 必須 CI が失敗した場合は GUI を起動せず Copilot pre-GUI routing へ渡す。
+- 必須 CI が失敗した場合は GUI を起動せず Copilot pre-GUI routing へ渡す。この遷移は `(PR, head SHA, ci-failure)` transition claim を原子的に獲得した1つの workflow だけが実行する。
 - CI 成功 + Codex review 処理完了後だけ Local GUI runner を起動する。
 - Pull Request の最新 head SHA を checkout して Hane を build / 起動する。
 - GUI シナリオを実行し、`pass` / `fail` / `blocked` と validated SHA を返す。
@@ -496,7 +507,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 5: Copilot judge
 
-- 必須 CI が失敗した場合は GUI 前に pre-GUI routing を行い、`fix` / `blocked` を判断する。
+- 必須 CI が失敗した場合は GUI 前に pre-GUI routing を行い、`fix` / `blocked` を判断する。並列 CI からの複数失敗イベントでは、transition claim を取得した1件だけを処理する。
 - Codex に修正候補がある場合も GUI 前に pre-GUI routing を行い、`fix` / `continue-validation` / `blocked` を判断する。
 - final judge では Codex review、GUI validation、CI、Pull Request を読み、`fix` / `ready` / `blocked` を判断する。
 - `fix` なら Claude 修正 workflow を dispatch する。
