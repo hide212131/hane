@@ -17,8 +17,63 @@ permissions:
   contents: read
 
 jobs:
+  claim_trusted_ci_generation:
+    name: Reclaim trusted CI generation
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Reset generation and platform statuses to pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "::error::A different trusted CI generation owns ${TARGET_SHA}: ${latest_generation:-<unknown>}"
+              exit 1
+              ;;
+          esac
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$expected_generation" \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (macos-latest)' \
+            -f description='Trusted CI rerun pending' \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (windows-latest)' \
+            -f description='Trusted CI rerun pending' \
+            -f target_url="$run_url" >/dev/null
+
   test_macos:
     name: cargo test / clippy (macos-latest)
+    needs: claim_trusted_ci_generation
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: macos-latest
     permissions:
       contents: read
@@ -109,6 +164,8 @@ jobs:
 
   test_windows:
     name: cargo test / clippy (windows-latest)
+    needs: claim_trusted_ci_generation
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: windows-latest
     permissions:
       contents: read
