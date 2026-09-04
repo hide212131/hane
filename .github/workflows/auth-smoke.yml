@@ -37,6 +37,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check out repository
+        uses: actions/checkout@v5
+
       - name: Verify Claude authentication
         uses: anthropics/claude-code-action@v1
         with:
