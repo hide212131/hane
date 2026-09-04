@@ -23,11 +23,29 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 macOS 版は現在 Developer ID による署名と Apple の notarization には未対応です。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
-Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。
-
-引数なしで `hane.exe` を起動すると、既定フォルダ（未設定なら初回にフォルダ選択ダイアログが開き、選んだフォルダが以後の既定フォルダになります）を開きます。エクスプローラーでフォルダを右クリックし「Haneで開く」を選ぶと、そのフォルダだけをその起動時に開き、既定フォルダは変更されません。「Haneで開く」をコンテキストメニューに追加・削除するには、`hane.exe --register-context-menu` / `hane.exe --unregister-context-menu` を実行します（現在のユーザーのみに登録され、管理者権限は不要です）。
+Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。CLI の引数と Explorer のコンテキストメニュー連携については後述の「Windows CLI / Explorer 連携」を参照してください。
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
+
+### Windows CLI / Explorer 連携
+
+`hane.exe` は次のコマンド・パス引数に対応しています。
+
+```text
+hane.exe
+hane.exe path\to\document.md
+hane.exe path\to\folder
+hane.exe --register-context-menu
+hane.exe --unregister-context-menu
+```
+
+- `hane.exe` — 引数なしで起動すると、保存済みの既定フォルダを開きます。未設定の場合（初回起動時など）はフォルダ選択ダイアログが表示されます。
+- `hane.exe path\to\document.md` — Markdown ファイルのパスを渡すと、そのファイルを開きます。
+- `hane.exe path\to\folder` — フォルダのパスを渡すと、その起動に限り Work folder mode でそのフォルダを開きます。既定フォルダは変更されません。
+- `hane.exe --register-context-menu` — エクスプローラーのフォルダ右クリックメニューに「Haneで開く」を追加します。現在のユーザーのみに登録され、管理者権限は不要です。
+- `hane.exe --unregister-context-menu` — 上記で追加したコンテキストメニュー項目を削除します。
+
+現在のエクスプローラー連携はフォルダのみが対象です。ファイルの右クリックメニュー統合は未対応です。
 
 ## インストールと起動
 
