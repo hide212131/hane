@@ -3,6 +3,11 @@ name: CI
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Repository ref to validate with the trusted CI definition
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,7 +21,15 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out Pull Request
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v6
+
+      - name: Check out dispatched target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_ref }}
 
       - name: Install Rust toolchain
         run: rustup show
