@@ -258,12 +258,29 @@ jobs:
             gh api --paginate \
               "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
               --jq ".[] | select(.user.login == \"github-actions[bot]\" and ((.body // \"\") | contains(\"${marker}\"))) | [.id, .created_at] | @tsv" \
-              | head -n 1
+              | tail -n 1
           )"
 
           if [[ -n "$existing" ]]; then
             request_id="${existing%%$'\t'*}"
             request_created_at="${existing#*$'\t'}"
+            prior_error="$(
+              gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+                --jq ".[] | select(
+                  .context == \"hane/codex-review\"
+                  and .state == \"error\"
+                  and (.created_at // \"\") >= \"${request_created_at}\"
+                ) | .id" \
+                | head -n 1
+            )"
+
+            if [[ -n "$prior_error" ]]; then
+              echo "Previous Codex request ${request_id} for ${TARGET_SHA} ended without a recognized terminal result; issuing a fresh request."
+              existing=''
+            fi
+          fi
+
+          if [[ -n "$existing" ]]; then
             echo "Reusing Codex request comment ${request_id} for ${TARGET_SHA}."
           else
             body="$(cat <<EOF
