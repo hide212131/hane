@@ -9,6 +9,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-{0}', inputs.target_sha) || format('pull-request-ci-{0}', github.event.pull_request.head.sha) }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
