@@ -213,14 +213,10 @@ jobs:
           if [[ -n "$existing_url" ]]; then
             pr_url="$existing_url"
           else
-            body="$(cat <<EOF
-            Agentic implementation of #${ISSUE_NUMBER}.
-
-            Created by the Phase 2 \`/implement\` workflow tracked in #44.
-
-            The implementation was produced by Claude Code after the trigger actor was verified as having repository write access. Pull Request CI and the later review/GUI/judge phases remain responsible for validation and merge decisions.
-            EOF
-            )"
+            body="$(printf '%s\n\n%s\n\n%s\n' \
+              "Agentic implementation of #${ISSUE_NUMBER}." \
+              "Created by the Phase 2 /implement workflow tracked in #44." \
+              "The implementation was produced by Claude Code after the trigger actor was verified as having repository write, maintain, or admin access. Pull Request CI and the later review/GUI/judge phases remain responsible for validation and merge decisions.")"
             pr_url="$(
               gh pr create \
                 --repo "$REPOSITORY" \
