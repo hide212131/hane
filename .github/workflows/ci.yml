@@ -11,45 +11,26 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 jobs:
-  test:
-    name: cargo test / clippy (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  test_macos:
+    name: cargo test / clippy (macos-latest)
+    runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out Pull Request
         if: ${{ github.event_name == 'pull_request' }}
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Check out dispatched target
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.target_sha }}
-
-      - name: Mark dispatched target CI as pending
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TARGET_SHA: ${{ inputs.target_sha }}
-          CHECK_CONTEXT: cargo test / clippy (${{ matrix.os }})
-        run: |
-          set -euo pipefail
-          gh api \
-            --method POST \
-            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state=pending \
-            -f context="$CHECK_CONTEXT" \
-            -f description='Trusted CI is running' \
-            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            >/dev/null
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -60,19 +41,26 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Report dispatched target CI result
-        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+  report_macos:
+    name: Report macOS trusted CI status
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: test_macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Report result to target commit
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
-          CHECK_CONTEXT: cargo test / clippy (${{ matrix.os }})
-          JOB_STATUS: ${{ job.status }}
+          TEST_RESULT: ${{ needs.test_macos.result }}
         run: |
           set -euo pipefail
 
-          case "$JOB_STATUS" in
+          case "$TEST_RESULT" in
             success)
               state=success
               description='Trusted CI passed'
@@ -91,7 +79,78 @@ jobs:
             --method POST \
             "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state="$state" \
-            -f context="$CHECK_CONTEXT" \
+            -f context='cargo test / clippy (macos-latest)' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+  test_windows:
+    name: cargo test / clippy (windows-latest)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Pull Request
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out dispatched target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  report_windows:
+    name: Report Windows trusted CI status
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: test_windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Report result to target commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          TEST_RESULT: ${{ needs.test_windows.result }}
+        run: |
+          set -euo pipefail
+
+          case "$TEST_RESULT" in
+            success)
+              state=success
+              description='Trusted CI passed'
+              ;;
+            cancelled)
+              state=error
+              description='Trusted CI was cancelled'
+              ;;
+            *)
+              state=failure
+              description='Trusted CI failed'
+              ;;
+          esac
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='cargo test / clippy (windows-latest)' \
             -f description="$description" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
