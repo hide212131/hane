@@ -80,12 +80,20 @@ jobs:
 
           marker="Agentic implementation of #${ISSUE_NUMBER}."
           existing_url="$(
-            gh pr list \
-              --repo "$REPOSITORY" \
-              --state open \
-              --limit 1000 \
-              --json url,body \
-              --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .url" \
+            gh api --paginate \
+              "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+              | jq -r \
+                  --arg marker "$marker" \
+                  --arg repo "$REPOSITORY" \
+                  '
+                    .[]
+                    | select(
+                        .head.repo.full_name == $repo
+                        and (.user.login == "github-actions[bot]" or .user.login == "claude[bot]")
+                        and ((.body // "") | contains($marker))
+                      )
+                    | .html_url
+                  ' \
               | head -n 1
           )"
 
@@ -204,13 +212,17 @@ jobs:
 
           marker="Agentic implementation of #${ISSUE_NUMBER}."
           existing_url="$(
-            gh pr list \
-              --repo "$REPOSITORY" \
-              --state open \
-              --head "$BRANCH_NAME" \
-              --limit 100 \
-              --json url \
-              --jq '.[0].url // empty'
+            gh api --paginate \
+              "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+              | jq -r \
+                  --arg repo "$REPOSITORY" \
+                  --arg branch "$BRANCH_NAME" \
+                  '
+                    .[]
+                    | select(.head.repo.full_name == $repo and .head.ref == $branch)
+                    | .html_url
+                  ' \
+              | head -n 1
           )"
 
           if [[ -n "$existing_url" ]]; then
