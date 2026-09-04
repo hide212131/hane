@@ -275,8 +275,33 @@ jobs:
             )"
 
             if [[ -n "$prior_error" ]]; then
-              echo "Previous Codex request ${request_id} for ${TARGET_SHA} ended without a recognized terminal result; issuing a fresh request."
-              existing=''
+              short_prefix="${TARGET_SHA:0:10}"
+              late_clean_reaction="$(
+                gh api --paginate \
+                  -H 'Accept: application/vnd.github+json' \
+                  "repos/${REPOSITORY}/issues/comments/${request_id}/reactions?per_page=100" \
+                  --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "+1") | .id' \
+                  | head -n 1
+              )"
+              late_clean_comment="$(
+                gh api --paginate \
+                  "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+                  --jq ".[] | select(
+                    .user.login == \"chatgpt-codex-connector[bot]\"
+                    and .created_at >= \"${request_created_at}\"
+                    and ((.body // \"\") | contains(\"Codex Review: Didn't find any major issues\"))
+                    and ((.body // \"\") | contains(\"Reviewed commit:**\"))
+                    and ((.body // \"\") | contains(\"${short_prefix}\"))
+                  ) | .id" \
+                  | head -n 1
+              )"
+
+              if [[ -n "$late_clean_reaction" || -n "$late_clean_comment" ]]; then
+                echo "Late Codex clean evidence exists for request ${request_id}; reusing it instead of issuing a duplicate review."
+              else
+                echo "Previous Codex request ${request_id} for ${TARGET_SHA} ended without recognized terminal evidence; issuing a fresh request."
+                existing=''
+              fi
             fi
           fi
 
