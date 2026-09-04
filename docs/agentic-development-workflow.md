@@ -39,8 +39,11 @@ CI + Codex review
   |
   +-- CI fail -----------------> atomic transition + durable outbox(PR, SHA, ci-failure)
   |                               |
-  |                               +--> retryable dispatcher --> Copilot pre-GUI routing
-  |                                                       +-- fix --> Claude Code fix --> push --> 全検証やり直し
+  |                               +--> retryable dispatcher --> retryable receiver lease
+  |                                                           |
+  |                                                           v
+  |                                                  Copilot pre-GUI routing
+  |                                                       +-- fix --> durable worker request --> Claude Code fix --> push --> 全検証やり直し
   |                                                       +-- blocked --> human
   |
   +-- CI pass + Codex に修正候補あり --> Copilot pre-GUI routing
@@ -159,7 +162,7 @@ trusted workflow は Pull Request の各 head SHA について、変更ファイ
 2. 同じ head SHA に対する Codex review が完了している。
 3. Codex に修正候補がある場合は、Copilot pre-GUI routing が `continue-validation` と判断している。
 
-必須 CI が終端的に失敗した commit は Local GUI validation を待たず、Copilot pre-GUI routing に送る。ただし、並列 CI の複数ジョブが同じ head SHA で失敗しても同じ routing request は一度だけ作成し、配送失敗時は再試行できるようにする。CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
+必須 CI が終端的に失敗した commit は Local GUI validation を待たず、Copilot pre-GUI routing に送る。ただし、並列 CI の複数ジョブが同じ head SHA で失敗しても同じ routing request は一度だけ作成し、配送失敗や受信処理中の失敗時は再試行できるようにする。CI が失敗している commit、または Codex の指摘に対して Copilot が `fix` / `blocked` と判断した commit では GUI validation を走らせない。
 
 ### GitHub Copilot
 
@@ -223,9 +226,12 @@ Actions 側では最低限、次を保証する。
 - CI、Codex review、GUI requirement classification、GUI validation、Copilot judge の対象 head SHA と現在の head SHA が一致することを確認する。
 - 必須 CI の終端失敗を検出した場合は、状態を `waiting-judge` にする変更と `(PR, head SHA, ci-failure)` routing request の durable outbox 登録を同じ原子的更新で保存する。
 - outbox dispatcher は pending request を lease して配送する。dispatcher が cancel / crash した場合や dispatch が失敗した場合は、lease timeout 後に同じ request を別の実行が再取得して再試行できる。
-- dispatch API が成功した直後に応答を失うケースでは同じ request が再配送され得るため、受信側の pre-GUI routing workflow も stable transition ID をキーに原子的に実行権を取得し、同じ transition ID の judge / Claude fix を二重実行しない。
-- dispatcher は dispatch API 成功を確認した後だけ request を `dispatched` とし、受信側が処理完了を記録したら `processed` とする。一定回数の配送失敗や処理タイムアウト後は fail closed で `blocked` にして人間へ通知する。
-- 同じ head SHA について既存の pending / leased / dispatched / processed request がある別の CI failure event は新規 request を作らない。ただし既存 request が pending、lease expired、または未処理なら recovery worker が配送・再配送を継続できる。
+- dispatch API が成功した直後に応答を失うケースでは同じ request が再配送され得る。受信側は stable transition ID ごとに receiver processing record を持ち、`pending` / `leased` / `completed` / `processing-failed` の状態で管理する。
+- 受信 workflow は `pending` または期限切れ `leased` の processing record だけを期限付き lease で取得して実行する。cancel / crash / timeout が `completed` 記録前に起きた場合は lease expiry 後に再取得可能とし、永久 no-op にしない。`completed` 済みの transition ID だけを重複配送時の no-op とする。
+- Copilot judge の判断結果と、その結果から必要になる後続 worker request（例: Claude fix dispatch）も同じ原子的更新で durable outbox に記録する。judge が判断を保存した後、worker dispatch 前に落ちても recovery dispatcher が配送を継続できるようにする。
+- 後続 worker request にも親 transition ID から導出した stable child transition ID を付け、受信側を同じ lease / completed 契約で冪等かつ再試行可能にする。
+- routing request の配送成功は receiver の処理完了とは分離する。dispatcher は dispatch API 成功を確認したら配送状態を記録し、receiver processing が `completed` になった時点で routing request 全体を `processed` とする。一定回数の配送失敗や receiver processing の再試行上限超過は fail closed で `blocked` にして人間へ通知する。
+- 同じ head SHA について既存の pending / leased / dispatched / processed request がある別の CI failure event は新規 request を作らない。ただし既存 request が未処理、lease expired、または processing 未完了なら recovery worker が配送・受信処理を継続できる。
 - 修正後は新しい head SHA に対して必要な検証と GUI requirement classification をすべてやり直す。
 - 古い SHA に対する review / classification / validation / judge / routing request を再利用しない。
 - 最大反復回数を設ける。
@@ -247,9 +253,10 @@ PR head SHA = A
   +-- GUI validation(A)  # required の場合
   +-- Copilot judge(A)
   +-- routing requests(A)
+  +-- receiver processing(A)
 ```
 
-途中で commit `B` が push された場合、`A` に対する Codex review、GUI requirement classification、GUI validation、Copilot judge、routing request は現在の判定には使わない。必要な処理を `B` に対してやり直す。
+途中で commit `B` が push された場合、`A` に対する Codex review、GUI requirement classification、GUI validation、Copilot judge、routing request、receiver processing は現在の判定には使わない。必要な処理を `B` に対してやり直す。
 
 この SHA 一致確認は agent の文章判断に任せず、workflow 側でも機械的に確認する。
 
@@ -302,7 +309,8 @@ Hane は個人所有リポジトリなので、GitHub Agentic Workflows の Copi
 - GUI result: `pass` / `fail` / `blocked`
 - Copilot-judged SHA
 - routing requests: stable transition ID、head SHA、kind、delivery state、lease owner / expiry、attempt count
-- processed transition IDs: judge / worker の冪等化記録
+- receiver processing records: stable transition ID、processing state、lease owner / expiry、attempt count、completion result
+- child worker requests: parent transition ID から導出した stable child transition ID、delivery / processing state
 - 現在の状態
 - fix iteration count
 
@@ -323,9 +331,13 @@ pre-GUI routing 中も `waiting-judge` を使う。CI failure または Codex fi
 
 状態遷移は読み取り後の無条件書き込みではなく、期待する current state / head SHA を条件にした compare-and-set 相当で行う。CI failure では、同じ `(PR, head SHA, ci-failure)` routing request が存在しない場合だけ、`waiting-judge` への遷移と outbox request 作成を原子的に行う。並列イベントが同時に到着した場合、request を作成できなかった側は新規 dispatch をせず、既存 request の配送状態を尊重する。
 
-routing request の配送状態は少なくとも `pending` / `leased` / `dispatched` / `processed` / `delivery-failed` を持つ。`leased` は期限付きとし、dispatcher が停止した場合は lease expiry 後に再取得可能にする。受信側は stable transition ID を処理済みか原子的に確認してから judge や worker を起動し、重複配送を no-op にする。
+routing request の配送状態は少なくとも `pending` / `leased` / `dispatched` / `processed` / `delivery-failed` を持つ。`leased` は期限付きとし、dispatcher が停止した場合は lease expiry 後に再取得可能にする。
 
-実装時には、原子的更新または排他が可能な永続領域を状態と durable outbox の正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを状態や routing request の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
+receiver processing record は少なくとも `pending` / `leased` / `completed` / `processing-failed` を持つ。受信 workflow は処理開始時に stable transition ID を永久 claim するのではなく、期限付き processing lease を取得する。処理中に停止した場合は lease expiry 後に同じ transition ID を再実行でき、`completed` の記録がある場合だけ重複配送を no-op にする。
+
+judge が `fix` など後続 worker の起動を必要とする結果を出した場合は、judge result の保存と stable child transition ID を持つ worker request の outbox 登録を原子的に行う。worker request も dispatcher lease と receiver processing lease を使い、親 receiver が完了直前に落ちても後続処理が失われず、重複配送でも二重実行しないようにする。
+
+実装時には、原子的更新または排他が可能な永続領域を状態、durable outbox、receiver processing の正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを状態や routing request の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
 
 ## トリガー
 
@@ -354,7 +366,8 @@ Hane は公開リポジトリであり、`/implement` コメントの文字列�
 - matrix の複数ジョブが同じ head SHA で失敗する可能性があるため、各失敗イベントはまず `(PR, head SHA, ci-failure)` request の作成を原子的に試みる。
 - request を最初に作成した処理だけが `waiting-judge` への状態遷移も同時に保存する。後続イベントは同じ request を再作成しない。
 - dispatcher は pending request を期限付き lease で取得し、pre-GUI routing を dispatch する。dispatch に失敗した場合や dispatcher が停止した場合は再試行する。
-- dispatch 成功後の応答喪失による重複配送に備え、受信 workflow は stable transition ID で冪等化する。
+- dispatch 成功後の応答喪失による重複配送に備え、受信 workflow は stable transition ID の processing record を期限付き lease で取得する。`completed` 前の crash / cancel / timeout は lease expiry 後に再試行し、`completed` 済みだけを no-op にする。
+- judge result が `fix` の場合など後続 workflow が必要なら、その result と worker outbox request を原子的に保存し、worker dispatch 自体も再試行可能かつ stable child transition ID で冪等化する。
 - pre-GUI routing は CI failure に対して `fix` または `blocked` を返し、`continue-validation` / `ready` は許可しない。
 - CI がまだ実行中の場合は次へ進まない。
 - head SHA が変わった場合は古い CI 結果や routing request を使わない。
@@ -400,7 +413,7 @@ runner は要求に含まれる Pull Request 番号と head SHA を使い、そ�
 
 ### Copilot judge
 
-対象 head SHA の必須 CI が失敗した場合は、GUI validation より前に pre-GUI routing を起動する。起動要求は durable outbox から配送され、dispatcher の失敗時には再試行する。受信側は stable transition ID で冪等化する。
+対象 head SHA の必須 CI が失敗した場合は、GUI validation より前に pre-GUI routing を起動する。起動要求は durable outbox から配送され、dispatcher の失敗時には再試行する。受信側も processing lease を使い、`completed` 前に停止した処理を再試行できるようにする。
 
 CI が成功し、Codex outcome が `findings` の場合も、GUI validation より前に pre-GUI routing を起動する。
 
@@ -408,7 +421,9 @@ GUI validation が不要な Pull Request は、Codex review、成功した CI、
 
 GUI validation が必要な Pull Request は、同じ head SHA に対する GUI validation が `pass` / `fail` / `blocked` のいずれかの終端結果になった後に final judge を起動する。
 
-GitHub Agentic Workflows から許可する書き込みは必要最小限にする。Claude 修正 workflow を起動する場合は allowlist した `dispatch-workflow` を使う。
+Copilot の判断結果が後続 workflow を必要とする場合は、判断結果と worker outbox request を原子的に保存する。Claude 修正 workflow を起動する場合は allowlist した `dispatch-workflow` を使い、stable child transition ID と receiver processing lease で再試行可能かつ二重実行しないようにする。
+
+GitHub Agentic Workflows から許可する書き込みは必要最小限にする。
 
 ## 修正ループ
 
@@ -504,7 +519,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
 - no-GUI allowlist だけと確認できない変更は fail closed で GUI validation required とする。
-- 必須 CI が失敗した場合は GUI を起動せず Copilot pre-GUI routing へ渡す。この routing request は状態遷移と同時に durable outbox へ原子的に登録し、配送失敗時には再試行する。
+- 必須 CI が失敗した場合は GUI を起動せず Copilot pre-GUI routing へ渡す。この routing request は状態遷移と同時に durable outbox へ原子的に登録し、配送失敗・受信処理失敗のどちらも lease + retry で回復できるようにする。
 - CI 成功 + Codex review 処理完了後だけ Local GUI runner を起動する。
 - Pull Request の最新 head SHA を checkout して Hane を build / 起動する。
 - GUI シナリオを実行し、`pass` / `fail` / `blocked` と validated SHA を返す。
@@ -514,10 +529,10 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 5: Copilot judge
 
-- 必須 CI が失敗した場合は GUI 前に pre-GUI routing を行い、`fix` / `blocked` を判断する。並列 CI からは request を一度だけ作成し、dispatcher failure は lease + retry で回復する。重複配送は stable transition ID で受信側が no-op にする。
+- 必須 CI が失敗した場合は GUI 前に pre-GUI routing を行い、`fix` / `blocked` を判断する。並列 CI からは request を一度だけ作成し、dispatcher failure と receiver failure の両方を期限付き lease + retry で回復する。`completed` 済み transition ID だけを重複 no-op にする。
 - Codex に修正候補がある場合も GUI 前に pre-GUI routing を行い、`fix` / `continue-validation` / `blocked` を判断する。
 - final judge では Codex review、GUI validation、CI、Pull Request を読み、`fix` / `ready` / `blocked` を判断する。
-- `fix` なら Claude 修正 workflow を dispatch する。
+- `fix` など後続 workflow が必要な判断では、判断結果と stable child transition ID を持つ worker request を原子的に保存し、worker dispatch も durable outbox + receiver lease で回復可能にする。
 - GUI validation が必要な Pull Request では、同じ head SHA の `pass` がなければ `ready` にしない。
 
 ### Phase 6: deterministic merge gate
