@@ -53,7 +53,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      actions: read
+      actions: write
       id-token: write
 
     steps:
@@ -83,6 +83,7 @@ jobs:
             gh pr list \
               --repo "$REPOSITORY" \
               --state open \
+              --limit 1000 \
               --json url,body \
               --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .url" \
               | head -n 1
@@ -188,7 +189,7 @@ jobs:
             exit 1
           fi
 
-      - name: Open Pull Request
+      - name: Open or normalize Pull Request
         if: ${{ steps.existing.outputs.skip != 'true' }}
         id: pull_request
         shell: bash
@@ -201,20 +202,32 @@ jobs:
         run: |
           set -euo pipefail
 
+          marker="Agentic implementation of #${ISSUE_NUMBER}."
           existing_url="$(
             gh pr list \
               --repo "$REPOSITORY" \
               --state open \
               --head "$BRANCH_NAME" \
+              --limit 100 \
               --json url \
               --jq '.[0].url // empty'
           )"
 
           if [[ -n "$existing_url" ]]; then
             pr_url="$existing_url"
+            pr_number="${pr_url##*/}"
+            current_body="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.body // ""')"
+            if ! grep -Fq "$marker" <<< "$current_body"; then
+              updated_body="$(printf '%s\n\n%s\n' "$current_body" "$marker")"
+              gh api \
+                --method PATCH \
+                "repos/${REPOSITORY}/pulls/${pr_number}" \
+                -f body="$updated_body" \
+                >/dev/null
+            fi
           else
             body="$(printf '%s\n\n%s\n\n%s\n' \
-              "Agentic implementation of #${ISSUE_NUMBER}." \
+              "$marker" \
               "Created by the Phase 2 /implement workflow tracked in #44." \
               "The implementation was produced by Claude Code after the trigger actor was verified as having repository write, maintain, or admin access. Pull Request CI and the later review/GUI/judge phases remain responsible for validation and merge decisions.")"
             pr_url="$(
@@ -228,6 +241,19 @@ jobs:
           fi
 
           echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Pull Request CI for implementation branch
+        if: ${{ steps.existing.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml \
+            --repo "$REPOSITORY" \
+            --ref "$BRANCH_NAME"
 
       - name: Link Pull Request from issue
         if: ${{ steps.existing.outputs.skip != 'true' }}
