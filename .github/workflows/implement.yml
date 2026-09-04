@@ -265,7 +265,8 @@ jobs:
           set -euo pipefail
           gh workflow run ci.yml \
             --repo "$REPOSITORY" \
-            --ref "$BRANCH_NAME"
+            --ref main \
+            -f target_ref="$BRANCH_NAME"
 
       - name: Link Pull Request from issue
         if: ${{ steps.existing.outputs.skip != 'true' }}
