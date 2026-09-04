@@ -75,10 +75,13 @@ jobs:
           )"
           expected_generation="Trusted CI generation ${GENERATION_ID}"
 
-          if [[ "$latest_generation" != "$expected_generation" ]]; then
-            echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
-            exit 0
-          fi
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
 
           case "$TEST_RESULT" in
             success)
@@ -162,10 +165,13 @@ jobs:
           )"
           expected_generation="Trusted CI generation ${GENERATION_ID}"
 
-          if [[ "$latest_generation" != "$expected_generation" ]]; then
-            echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
-            exit 0
-          fi
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
 
           case "$TEST_RESULT" in
             success)
@@ -224,10 +230,13 @@ jobs:
           )"
           expected_generation="Trusted CI generation ${GENERATION_ID}"
 
-          if [[ "$latest_generation" != "$expected_generation" ]]; then
-            echo "A newer trusted CI generation owns finalization: ${latest_generation:-<unknown>}"
-            exit 0
-          fi
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns finalization: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
 
           macos_state="$(
             jq -r \
