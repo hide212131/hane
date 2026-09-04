@@ -4,13 +4,14 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      target_ref:
-        description: Repository ref to validate with the trusted CI definition
+      target_sha:
+        description: Commit SHA to validate with the trusted CI definition
         required: true
         type: string
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   test:
@@ -29,7 +30,26 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_sha }}
+
+      - name: Mark dispatched target CI as pending
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          CHECK_CONTEXT: cargo test / clippy (${{ matrix.os }})
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context="$CHECK_CONTEXT" \
+            -f description='Trusted CI is running' \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
 
       - name: Install Rust toolchain
         run: rustup show
@@ -39,3 +59,39 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Report dispatched target CI result
+        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          CHECK_CONTEXT: cargo test / clippy (${{ matrix.os }})
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          case "$JOB_STATUS" in
+            success)
+              state=success
+              description='Trusted CI passed'
+              ;;
+            cancelled)
+              state=error
+              description='Trusted CI was cancelled'
+              ;;
+            *)
+              state=failure
+              description='Trusted CI failed'
+              ;;
+          esac
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context="$CHECK_CONTEXT" \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
