@@ -13,8 +13,40 @@ permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Prepare trusted CI status
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Mark dispatched target CI as pending
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          for context in \
+            'cargo test / clippy (macos-latest)' \
+            'cargo test / clippy (windows-latest)'
+          do
+            gh api \
+              --method POST \
+              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=pending \
+              -f context="$context" \
+              -f description='Trusted CI is running' \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              >/dev/null
+          done
+
   test_macos:
     name: cargo test / clippy (macos-latest)
+    needs: prepare
     runs-on: macos-latest
     permissions:
       contents: read
@@ -86,6 +118,7 @@ jobs:
 
   test_windows:
     name: cargo test / clippy (windows-latest)
+    needs: prepare
     runs-on: windows-latest
     permissions:
       contents: read
