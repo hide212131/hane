@@ -41,20 +41,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" == issue_comment ]]; then
+          has_write_access() {
+            local actor="$1"
+            local permission
             permission="$(
               gh api \
                 -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/collaborators/${COMMENT_ACTOR}/permission" \
+                "repos/${REPOSITORY}/collaborators/${actor}/permission" \
                 --jq '.permission' 2>/dev/null || true
             )"
-            case "$permission" in
-              admin|maintain|write) ;;
-              *)
-                echo "::error::${COMMENT_ACTOR} is not authorized to request a Codex review."
-                exit 1
-                ;;
-            esac
+            [[ "$permission" == admin || "$permission" == maintain || "$permission" == write ]]
+          }
+
+          if [[ "$EVENT_NAME" == issue_comment ]]; then
+            if ! has_write_access "$COMMENT_ACTOR"; then
+              echo "::error::${COMMENT_ACTOR} is not authorized to request a Codex review."
+              exit 1
+            fi
             pr_number="$ISSUE_NUMBER"
           else
             pr_number="$EVENT_PR_NUMBER"
@@ -64,11 +67,28 @@ jobs:
           state="$(jq -r '.state' <<< "$pr")"
           draft="$(jq -r '.draft' <<< "$pr")"
           target_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          pr_author="$(jq -r '.user.login' <<< "$pr")"
 
           if [[ "$state" != open || "$draft" != false || -z "$target_sha" || "$target_sha" == null ]]; then
             echo "::error::Pull Request #${pr_number} is not an open, reviewable Pull Request."
             exit 1
           fi
+
+          if [[ "$head_repo" != "$REPOSITORY" ]]; then
+            echo "::error::Pull Request #${pr_number} is not a same-repository Pull Request; automated Codex review is fail-closed."
+            exit 1
+          fi
+
+          case "$pr_author" in
+            'github-actions[bot]'|'claude[bot]') ;;
+            *)
+              if ! has_write_access "$pr_author"; then
+                echo "::error::Pull Request author ${pr_author} is not trusted for automated Codex review."
+                exit 1
+              fi
+              ;;
+          esac
 
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
