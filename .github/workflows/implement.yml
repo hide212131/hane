@@ -53,8 +53,11 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-      actions: write
       id-token: write
+    outputs:
+      existing: ${{ steps.existing.outputs.skip }}
+      pr_url: ${{ steps.target.outputs.pr_url }}
+      target_sha: ${{ steps.target.outputs.target_sha }}
 
     steps:
       - name: Check Claude OAuth secret
@@ -103,42 +106,6 @@ jobs:
           else
             echo 'skip=false' >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Re-dispatch trusted CI for existing Pull Request
-        if: ${{ steps.existing.outputs.skip == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          PR_URL: ${{ steps.existing.outputs.url }}
-        run: |
-          set -euo pipefail
-
-          pr_number="${PR_URL##*/}"
-          target_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
-          if [[ -z "$target_sha" ]]; then
-            echo '::error::Could not resolve the existing implementation Pull Request head SHA.'
-            exit 1
-          fi
-
-          gh workflow run ci.yml \
-            --repo "$REPOSITORY" \
-            --ref main \
-            -f target_sha="$target_sha"
-
-      - name: Report existing Pull Request
-        if: ${{ steps.existing.outputs.skip == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          PR_URL: ${{ steps.existing.outputs.url }}
-        run: |
-          set -euo pipefail
-          gh issue comment "$ISSUE_NUMBER" \
-            --repo "$REPOSITORY" \
-            --body "An implementation Pull Request is already open; trusted CI was re-dispatched for its current head: ${PR_URL}"
 
       - name: Check out repository
         if: ${{ steps.existing.outputs.skip != 'true' }}
@@ -276,38 +243,114 @@ jobs:
 
           echo "url=$pr_url" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch Pull Request CI for implementation commit
-        if: ${{ steps.existing.outputs.skip != 'true' }}
+      - name: Resolve implementation Pull Request head
+        id: target
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          PR_URL: ${{ steps.pull_request.outputs.url }}
+          EXISTING_PR_URL: ${{ steps.existing.outputs.url }}
+          NEW_PR_URL: ${{ steps.pull_request.outputs.url }}
         run: |
           set -euo pipefail
 
-          pr_number="${PR_URL##*/}"
+          pr_url="${EXISTING_PR_URL:-${NEW_PR_URL:-}}"
+          if [[ -z "$pr_url" ]]; then
+            echo '::error::Could not resolve the implementation Pull Request URL.'
+            exit 1
+          fi
+
+          pr_number="${pr_url##*/}"
           target_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
           if [[ -z "$target_sha" ]]; then
             echo '::error::Could not resolve the implementation Pull Request head SHA.'
             exit 1
           fi
 
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+  dispatch_ci:
+    needs: implement
+    if: ${{ needs.implement.result == 'success' && needs.implement.outputs.target_sha != '' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ needs.implement.outputs.target_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write
+      statuses: write
+      issues: write
+    steps:
+      - name: Claim trusted CI generation and mark required statuses pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.implement.outputs.target_sha }}
+          GENERATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="Trusted CI generation ${GENERATION_ID}" \
+            -f target_url="$run_url" \
+            >/dev/null
+
+          for context in \
+            'cargo test / clippy (macos-latest)' \
+            'cargo test / clippy (windows-latest)'
+          do
+            gh api \
+              --method POST \
+              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=pending \
+              -f context="$context" \
+              -f description='Trusted CI is queued' \
+              -f target_url="$run_url" \
+              >/dev/null
+          done
+
+      - name: Dispatch trusted CI from main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.implement.outputs.target_sha }}
+          GENERATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
           gh workflow run ci.yml \
             --repo "$REPOSITORY" \
             --ref main \
-            -f target_sha="$target_sha"
+            -f target_sha="$TARGET_SHA" \
+            -f generation_id="$GENERATION_ID"
 
       - name: Link Pull Request from issue
-        if: ${{ steps.existing.outputs.skip != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          PR_URL: ${{ steps.pull_request.outputs.url }}
+          PR_URL: ${{ needs.implement.outputs.pr_url }}
+          EXISTING: ${{ needs.implement.outputs.existing }}
         run: |
           set -euo pipefail
+
+          if [[ "$EXISTING" == 'true' ]]; then
+            body="An implementation Pull Request is already open; trusted CI was re-dispatched for its current head: ${PR_URL}"
+          else
+            body="Phase 2 /implement created an implementation Pull Request and dispatched trusted CI: ${PR_URL}"
+          fi
+
           gh issue comment "$ISSUE_NUMBER" \
             --repo "$REPOSITORY" \
-            --body "Phase 2 /implement created an implementation Pull Request: ${PR_URL}"
+            --body "$body"
