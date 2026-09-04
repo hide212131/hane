@@ -53,6 +53,7 @@ jobs:
     concurrency:
       group: trusted-ci-status-${{ inputs.target_sha }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       statuses: write
@@ -139,6 +140,7 @@ jobs:
     concurrency:
       group: trusted-ci-status-${{ inputs.target_sha }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       statuses: write
