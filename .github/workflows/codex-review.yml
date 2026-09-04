@@ -283,6 +283,13 @@ jobs:
                   --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "+1") | .id' \
                   | head -n 1
               )"
+              in_flight_reaction="$(
+                gh api --paginate \
+                  -H 'Accept: application/vnd.github+json' \
+                  "repos/${REPOSITORY}/issues/comments/${request_id}/reactions?per_page=100" \
+                  --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "eyes") | .id' \
+                  | head -n 1
+              )"
               late_clean_comment="$(
                 gh api --paginate \
                   "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
@@ -295,11 +302,33 @@ jobs:
                   ) | .id" \
                   | head -n 1
               )"
+              codex_error_comment="$(
+                gh api --paginate \
+                  "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+                  --jq ".[] | select(
+                    .user.login == \"chatgpt-codex-connector[bot]\"
+                    and .created_at >= \"${request_created_at}\"
+                    and ((.body // \"\") | contains(\"Codex Review: Something went wrong\"))
+                  ) | .id" \
+                  | head -n 1
+              )"
+              request_epoch="$(date -d "$request_created_at" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              if [[ "$request_epoch" -gt 0 ]]; then
+                request_age_seconds=$((now_epoch - request_epoch))
+              else
+                request_age_seconds=999999
+              fi
 
               if [[ -n "$late_clean_reaction" || -n "$late_clean_comment" ]]; then
                 echo "Late Codex clean evidence exists for request ${request_id}; reusing it instead of issuing a duplicate review."
+              elif [[ -n "$codex_error_comment" ]]; then
+                echo "Codex explicitly failed request ${request_id}; issuing a fresh request."
+                existing=''
+              elif [[ -n "$in_flight_reaction" && "$request_age_seconds" -lt 1200 ]]; then
+                echo "Codex request ${request_id} still has a recent running reaction (${request_age_seconds}s old); preserving the in-flight request."
               else
-                echo "Previous Codex request ${request_id} for ${TARGET_SHA} ended without recognized terminal evidence; issuing a fresh request."
+                echo "Previous Codex request ${request_id} ended without recognized terminal evidence and is not recently in flight; issuing a fresh request."
                 existing=''
               fi
             fi
