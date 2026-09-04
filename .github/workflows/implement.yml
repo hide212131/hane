@@ -254,19 +254,27 @@ jobs:
 
           echo "url=$pr_url" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch Pull Request CI for implementation branch
+      - name: Dispatch Pull Request CI for implementation commit
         if: ${{ steps.existing.outputs.skip != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+          PR_URL: ${{ steps.pull_request.outputs.url }}
         run: |
           set -euo pipefail
+
+          pr_number="${PR_URL##*/}"
+          target_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+          if [[ -z "$target_sha" ]]; then
+            echo '::error::Could not resolve the implementation Pull Request head SHA.'
+            exit 1
+          fi
+
           gh workflow run ci.yml \
             --repo "$REPOSITORY" \
             --ref main \
-            -f target_ref="$BRANCH_NAME"
+            -f target_sha="$target_sha"
 
       - name: Link Pull Request from issue
         if: ${{ steps.existing.outputs.skip != 'true' }}
