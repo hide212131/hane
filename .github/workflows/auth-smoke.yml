@@ -85,3 +85,7 @@ jobs:
             echo "::error::Copilot inference completed without the expected smoke-test marker."
             exit 1
           fi
+
+# This workflow intentionally tests the production authentication choices documented
+# in docs/agentic-development-workflow.md. It does not test Codex because PR #49
+# already exercised the ChatGPT Codex GitHub integration repeatedly.
