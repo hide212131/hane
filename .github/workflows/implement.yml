@@ -104,6 +104,28 @@ jobs:
             echo 'skip=false' >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Re-dispatch trusted CI for existing Pull Request
+        if: ${{ steps.existing.outputs.skip == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_URL: ${{ steps.existing.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          pr_number="${PR_URL##*/}"
+          target_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+          if [[ -z "$target_sha" ]]; then
+            echo '::error::Could not resolve the existing implementation Pull Request head SHA.'
+            exit 1
+          fi
+
+          gh workflow run ci.yml \
+            --repo "$REPOSITORY" \
+            --ref main \
+            -f target_sha="$target_sha"
+
       - name: Report existing Pull Request
         if: ${{ steps.existing.outputs.skip == 'true' }}
         shell: bash
@@ -116,7 +138,7 @@ jobs:
           set -euo pipefail
           gh issue comment "$ISSUE_NUMBER" \
             --repo "$REPOSITORY" \
-            --body "An implementation Pull Request is already open: ${PR_URL}"
+            --body "An implementation Pull Request is already open; trusted CI was re-dispatched for its current head: ${PR_URL}"
 
       - name: Check out repository
         if: ${{ steps.existing.outputs.skip != 'true' }}
