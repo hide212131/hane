@@ -60,17 +60,6 @@ jobs:
       target_sha: ${{ steps.target.outputs.target_sha }}
 
     steps:
-      - name: Check Claude OAuth secret
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-            echo '::error::Repository secret CLAUDE_CODE_OAUTH_TOKEN is not configured.'
-            exit 1
-          fi
-
       - name: Avoid duplicate implementation Pull Requests
         id: existing
         shell: bash
@@ -105,6 +94,18 @@ jobs:
             echo 'skip=true' >> "$GITHUB_OUTPUT"
           else
             echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Claude OAuth secret
+        if: ${{ steps.existing.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+            echo '::error::Repository secret CLAUDE_CODE_OAUTH_TOKEN is not configured.'
+            exit 1
           fi
 
       - name: Check out repository
