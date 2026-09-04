@@ -51,7 +51,7 @@ jobs:
             case "$permission" in
               admin|maintain|write) ;;
               *)
-                echo "::error::/${COMMENT_ACTOR} is not authorized to request a Codex review."
+                echo "::error::${COMMENT_ACTOR} is not authorized to request a Codex review."
                 exit 1
                 ;;
             esac
@@ -216,6 +216,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          REQUEST_ID: ${{ steps.request.outputs.request_id }}
           REQUEST_CREATED_AT: ${{ steps.request.outputs.request_created_at }}
         run: |
           set -euo pipefail
@@ -262,13 +263,27 @@ jobs:
                   .user.login == \"chatgpt-codex-connector[bot]\"
                   and .created_at >= \"${REQUEST_CREATED_AT}\"
                   and ((.body // \"\") | contains(\"Codex Review: Didn't find any major issues\"))
-                  and ((.body // \"\") | contains(\"Reviewed commit:** \\\`${short_prefix}\\\`\"))
+                  and ((.body // \"\") | contains(\"Reviewed commit:**\"))
+                  and ((.body // \"\") | contains(\"${short_prefix}\"))
                 ) | .html_url" \
                 | tail -n 1
             )"
             if [[ -n "$clean_url" ]]; then
               outcome=clean
               evidence_url="$clean_url"
+              break
+            fi
+
+            clean_reaction="$(
+              gh api --paginate \
+                -H 'Accept: application/vnd.github+json' \
+                "repos/${REPOSITORY}/issues/comments/${REQUEST_ID}/reactions?per_page=100" \
+                --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "+1") | .id' \
+                | head -n 1
+            )"
+            if [[ -n "$clean_reaction" ]]; then
+              outcome=clean
+              evidence_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-${REQUEST_ID}"
               break
             fi
 
@@ -344,3 +359,22 @@ jobs:
               --body "Codex review for \`${TARGET_SHA}\` did not produce a recognized terminal result. The review remains fail-closed and must not be treated as complete."
             exit 1
           fi
+
+      - name: Mark controller failure as non-reviewed
+        if: ${{ failure() && steps.target.outputs.target_sha != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=error \
+            -f context='hane/codex-review' \
+            -f description="Codex review controller failed for ${short_sha}" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
