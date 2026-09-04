@@ -20,7 +20,8 @@ jobs:
     timeout-minutes: 15
     concurrency:
       group: codex-review-pr-${{ github.event.pull_request.number || github.event.issue.number }}
-      cancel-in-progress: true
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       issues: write
@@ -35,9 +36,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_CREATED_AT: ${{ github.event.comment.created_at }}
         run: |
           set -euo pipefail
 
@@ -59,8 +62,14 @@ jobs:
               exit 1
             fi
             pr_number="$ISSUE_NUMBER"
+            review_mode=manual
           else
             pr_number="$EVENT_PR_NUMBER"
+            if [[ "$EVENT_ACTION" == synchronize ]]; then
+              review_mode=manual
+            else
+              review_mode=automatic
+            fi
           fi
 
           pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
@@ -69,6 +78,7 @@ jobs:
           target_sha="$(jq -r '.head.sha' <<< "$pr")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
           pr_author="$(jq -r '.user.login' <<< "$pr")"
+          pr_updated_at="$(jq -r '.updated_at' <<< "$pr")"
 
           if [[ "$state" != open || "$draft" != false || -z "$target_sha" || "$target_sha" == null ]]; then
             echo "::error::Pull Request #${pr_number} is not an open, reviewable Pull Request."
@@ -90,10 +100,49 @@ jobs:
               ;;
           esac
 
+          if [[ "$EVENT_NAME" == issue_comment ]]; then
+            observed_since="$COMMENT_CREATED_AT"
+          else
+            observed_since="$pr_updated_at"
+          fi
+
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "review_mode=$review_mode" >> "$GITHUB_OUTPUT"
+          echo "observed_since=$observed_since" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse terminal result already stored for this SHA
+        id: terminal
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          latest="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+          )"
+          state="${latest%%$'\t'*}"
+          description="${latest#*$'\t'}"
+          short_sha="${TARGET_SHA:0:12}"
+          outcome=''
+
+          if [[ "$state" == success && "$description" == "Codex review clean for ${short_sha}" ]]; then
+            outcome=clean
+          elif [[ "$state" == failure && "$description" == "Codex findings for ${short_sha}" ]]; then
+            outcome=findings
+          fi
+
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+          if [[ -n "$outcome" ]]; then
+            echo "Reusing ${outcome} Codex result already stored on ${TARGET_SHA}."
+          fi
 
       - name: Mark Codex review pending
+        if: ${{ steps.terminal.outputs.outcome == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,6 +161,7 @@ jobs:
             >/dev/null
 
       - name: Reuse an already completed findings review
+        if: ${{ steps.terminal.outputs.outcome == '' }}
         id: existing
         shell: bash
         env:
@@ -150,7 +200,7 @@ jobs:
           fi
 
       - name: Publish reused findings result
-        if: ${{ steps.existing.outputs.outcome == 'findings' }}
+        if: ${{ steps.terminal.outputs.outcome == '' && steps.existing.outputs.outcome == 'findings' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -176,8 +226,8 @@ jobs:
             -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" \
             >/dev/null
 
-      - name: Find or create one Codex request for this SHA
-        if: ${{ steps.existing.outputs.outcome == '' }}
+      - name: Prepare authoritative Codex request or automatic observation
+        if: ${{ steps.terminal.outputs.outcome == '' && steps.existing.outputs.outcome == '' }}
         id: request
         shell: bash
         env:
@@ -185,13 +235,22 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          REVIEW_MODE: ${{ steps.target.outputs.review_mode }}
+          OBSERVED_SINCE: ${{ steps.target.outputs.observed_since }}
         run: |
           set -euo pipefail
 
           current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
           if [[ "$current_sha" != "$TARGET_SHA" ]]; then
-            echo '::error::Pull Request head changed before Codex review request creation.'
+            echo '::error::Pull Request head changed before Codex review observation began.'
             exit 1
+          fi
+
+          if [[ "$REVIEW_MODE" == automatic ]]; then
+            echo "Observing the Codex automatic review for ${TARGET_SHA}; no @codex request will be posted."
+            echo 'request_id=' >> "$GITHUB_OUTPUT"
+            echo "request_created_at=$OBSERVED_SINCE" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           marker="<!-- hane-codex-review-request sha=${TARGET_SHA} -->"
@@ -228,7 +287,7 @@ jobs:
           echo "request_created_at=$request_created_at" >> "$GITHUB_OUTPUT"
 
       - name: Wait for Codex terminal result
-        if: ${{ steps.existing.outputs.outcome == '' }}
+        if: ${{ steps.terminal.outputs.outcome == '' && steps.existing.outputs.outcome == '' }}
         id: result
         shell: bash
         env:
@@ -236,6 +295,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          REVIEW_MODE: ${{ steps.target.outputs.review_mode }}
           REQUEST_ID: ${{ steps.request.outputs.request_id }}
           REQUEST_CREATED_AT: ${{ steps.request.outputs.request_created_at }}
         run: |
@@ -294,17 +354,36 @@ jobs:
               break
             fi
 
-            clean_reaction="$(
-              gh api --paginate \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/issues/comments/${REQUEST_ID}/reactions?per_page=100" \
-                --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "+1") | .id' \
-                | head -n 1
-            )"
-            if [[ -n "$clean_reaction" ]]; then
-              outcome=clean
-              evidence_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-${REQUEST_ID}"
-              break
+            if [[ "$REVIEW_MODE" == manual && -n "$REQUEST_ID" ]]; then
+              clean_reaction="$(
+                gh api --paginate \
+                  -H 'Accept: application/vnd.github+json' \
+                  "repos/${REPOSITORY}/issues/comments/${REQUEST_ID}/reactions?per_page=100" \
+                  --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]" and .content == "+1") | .id' \
+                  | head -n 1
+              )"
+              if [[ -n "$clean_reaction" ]]; then
+                outcome=clean
+                evidence_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-${REQUEST_ID}"
+                break
+              fi
+            elif [[ "$REVIEW_MODE" == automatic ]]; then
+              clean_reaction="$(
+                gh api --paginate \
+                  -H 'Accept: application/vnd.github+json' \
+                  "repos/${REPOSITORY}/issues/${PR_NUMBER}/reactions?per_page=100" \
+                  --jq ".[] | select(
+                    .user.login == \"chatgpt-codex-connector[bot]\"
+                    and .content == \"+1\"
+                    and .created_at >= \"${REQUEST_CREATED_AT}\"
+                  ) | .id" \
+                  | head -n 1
+              )"
+              if [[ -n "$clean_reaction" ]]; then
+                outcome=clean
+                evidence_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}"
+                break
+              fi
             fi
 
             sleep 10
@@ -326,7 +405,7 @@ jobs:
           echo "evidence_url=$evidence_url" >> "$GITHUB_OUTPUT"
 
       - name: Publish Codex terminal result
-        if: ${{ steps.existing.outputs.outcome == '' }}
+        if: ${{ steps.terminal.outputs.outcome == '' && steps.existing.outputs.outcome == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
