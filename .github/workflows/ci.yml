@@ -8,56 +8,17 @@ on:
         description: Commit SHA to validate with the trusted CI definition
         required: true
         type: string
+      generation_id:
+        description: Trusted status generation claimed before dispatch
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  prepare:
-    name: Prepare trusted CI status
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      statuses: write
-    steps:
-      - name: Claim dispatched target status generation
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TARGET_SHA: ${{ inputs.target_sha }}
-        run: |
-          set -euo pipefail
-
-          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          gh api \
-            --method POST \
-            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state=pending \
-            -f context='hane/trusted-ci-generation' \
-            -f description="Trusted CI generation ${GITHUB_RUN_ID}" \
-            -f target_url="$run_url" \
-            >/dev/null
-
-          for context in \
-            'cargo test / clippy (macos-latest)' \
-            'cargo test / clippy (windows-latest)'
-          do
-            gh api \
-              --method POST \
-              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-              -f state=pending \
-              -f context="$context" \
-              -f description='Trusted CI is running' \
-              -f target_url="$run_url" \
-              >/dev/null
-          done
-
   test_macos:
     name: cargo test / clippy (macos-latest)
-    needs: prepare
     runs-on: macos-latest
     permissions:
       contents: read
@@ -89,6 +50,9 @@ jobs:
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     needs: test_macos
     runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
       statuses: write
@@ -99,18 +63,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
           TEST_RESULT: ${{ needs.test_macos.result }}
         run: |
           set -euo pipefail
 
-          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          latest_generation_url="$(
+          latest_generation="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
           )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
 
-          if [[ "$latest_generation_url" != "$run_url" ]]; then
-            echo "A newer trusted CI generation owns status publication: ${latest_generation_url:-<unknown>}"
+          if [[ "$latest_generation" != "$expected_generation" ]]; then
+            echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
             exit 0
           fi
 
@@ -135,27 +100,11 @@ jobs:
             -f state="$state" \
             -f context='cargo test / clippy (macos-latest)' \
             -f description="$description" \
-            -f target_url="$run_url" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
-
-          latest_generation_url="$(
-            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
-          )"
-          if [[ "$latest_generation_url" != "$run_url" && -n "$latest_generation_url" ]]; then
-            gh api \
-              --method POST \
-              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-              -f state=pending \
-              -f context='cargo test / clippy (macos-latest)' \
-              -f description='Newer trusted CI is running' \
-              -f target_url="$latest_generation_url" \
-              >/dev/null
-          fi
 
   test_windows:
     name: cargo test / clippy (windows-latest)
-    needs: prepare
     runs-on: windows-latest
     permissions:
       contents: read
@@ -187,6 +136,9 @@ jobs:
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     needs: test_windows
     runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
       statuses: write
@@ -197,18 +149,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
           TEST_RESULT: ${{ needs.test_windows.result }}
         run: |
           set -euo pipefail
 
-          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          latest_generation_url="$(
+          latest_generation="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
           )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
 
-          if [[ "$latest_generation_url" != "$run_url" ]]; then
-            echo "A newer trusted CI generation owns status publication: ${latest_generation_url:-<unknown>}"
+          if [[ "$latest_generation" != "$expected_generation" ]]; then
+            echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
             exit 0
           fi
 
@@ -233,20 +186,5 @@ jobs:
             -f state="$state" \
             -f context='cargo test / clippy (windows-latest)' \
             -f description="$description" \
-            -f target_url="$run_url" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
-
-          latest_generation_url="$(
-            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
-          )"
-          if [[ "$latest_generation_url" != "$run_url" && -n "$latest_generation_url" ]]; then
-            gh api \
-              --method POST \
-              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-              -f state=pending \
-              -f context='cargo test / clippy (windows-latest)' \
-              -f description='Newer trusted CI is running' \
-              -f target_url="$latest_generation_url" \
-              >/dev/null
-          fi
