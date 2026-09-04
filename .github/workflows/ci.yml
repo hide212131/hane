@@ -9,10 +9,6 @@ on:
         required: true
         type: string
 
-concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-{0}', inputs.target_sha) || format('pull-request-ci-{0}', github.event.pull_request.head.sha) }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -24,7 +20,7 @@ jobs:
       contents: read
       statuses: write
     steps:
-      - name: Mark dispatched target CI as pending
+      - name: Claim dispatched target status generation
         if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         env:
@@ -33,6 +29,17 @@ jobs:
           TARGET_SHA: ${{ inputs.target_sha }}
         run: |
           set -euo pipefail
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="Trusted CI generation ${GITHUB_RUN_ID}" \
+            -f target_url="$run_url" \
+            >/dev/null
 
           for context in \
             'cargo test / clippy (macos-latest)' \
@@ -44,7 +51,7 @@ jobs:
               -f state=pending \
               -f context="$context" \
               -f description='Trusted CI is running' \
-              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              -f target_url="$run_url" \
               >/dev/null
           done
 
@@ -96,6 +103,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          latest_generation_url="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+          )"
+
+          if [[ "$latest_generation_url" != "$run_url" ]]; then
+            echo "A newer trusted CI generation owns status publication: ${latest_generation_url:-<unknown>}"
+            exit 0
+          fi
+
           case "$TEST_RESULT" in
             success)
               state=success
@@ -117,8 +135,23 @@ jobs:
             -f state="$state" \
             -f context='cargo test / clippy (macos-latest)' \
             -f description="$description" \
-            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f target_url="$run_url" \
             >/dev/null
+
+          latest_generation_url="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+          )"
+          if [[ "$latest_generation_url" != "$run_url" && -n "$latest_generation_url" ]]; then
+            gh api \
+              --method POST \
+              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=pending \
+              -f context='cargo test / clippy (macos-latest)' \
+              -f description='Newer trusted CI is running' \
+              -f target_url="$latest_generation_url" \
+              >/dev/null
+          fi
 
   test_windows:
     name: cargo test / clippy (windows-latest)
@@ -168,6 +201,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          latest_generation_url="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+          )"
+
+          if [[ "$latest_generation_url" != "$run_url" ]]; then
+            echo "A newer trusted CI generation owns status publication: ${latest_generation_url:-<unknown>}"
+            exit 0
+          fi
+
           case "$TEST_RESULT" in
             success)
               state=success
@@ -189,5 +233,20 @@ jobs:
             -f state="$state" \
             -f context='cargo test / clippy (windows-latest)' \
             -f description="$description" \
-            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f target_url="$run_url" \
             >/dev/null
+
+          latest_generation_url="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .target_url // ""'
+          )"
+          if [[ "$latest_generation_url" != "$run_url" && -n "$latest_generation_url" ]]; then
+            gh api \
+              --method POST \
+              "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=pending \
+              -f context='cargo test / clippy (windows-latest)' \
+              -f description='Newer trusted CI is running' \
+              -f target_url="$latest_generation_url" \
+              >/dev/null
+          fi
