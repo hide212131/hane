@@ -190,3 +190,72 @@ jobs:
             -f description="$description" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
+
+  finalize_trusted_ci_generation:
+    name: Finalize trusted CI generation
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs:
+      - report_macos
+      - report_windows
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Finalize generation marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+
+          statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
+          latest_generation="$(
+            jq -r \
+              '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""' \
+              <<< "$statuses"
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          if [[ "$latest_generation" != "$expected_generation" ]]; then
+            echo "A newer trusted CI generation owns finalization: ${latest_generation:-<unknown>}"
+            exit 0
+          fi
+
+          macos_state="$(
+            jq -r \
+              '[.[] | select(.context == "cargo test / clippy (macos-latest)")] | max_by(.id) | .state // "missing"' \
+              <<< "$statuses"
+          )"
+          windows_state="$(
+            jq -r \
+              '[.[] | select(.context == "cargo test / clippy (windows-latest)")] | max_by(.id) | .state // "missing"' \
+              <<< "$statuses"
+          )"
+
+          if [[ "$macos_state" == success && "$windows_state" == success ]]; then
+            state=success
+            description="Trusted CI generation ${GENERATION_ID} passed"
+          elif [[ "$macos_state" == failure || "$windows_state" == failure ]]; then
+            state=failure
+            description="Trusted CI generation ${GENERATION_ID} failed"
+          else
+            state=error
+            description="Trusted CI generation ${GENERATION_ID} incomplete"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
