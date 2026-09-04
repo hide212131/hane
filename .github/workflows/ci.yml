@@ -219,6 +219,8 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
           GENERATION_ID: ${{ inputs.generation_id }}
+          MACOS_REPORT_RESULT: ${{ needs.report_macos.result }}
+          WINDOWS_REPORT_RESULT: ${{ needs.report_windows.result }}
         run: |
           set -euo pipefail
 
@@ -249,7 +251,10 @@ jobs:
               <<< "$statuses"
           )"
 
-          if [[ "$macos_state" == success && "$windows_state" == success ]]; then
+          if [[ "$MACOS_REPORT_RESULT" != success || "$WINDOWS_REPORT_RESULT" != success ]]; then
+            state=error
+            description="Trusted CI generation ${GENERATION_ID} incomplete"
+          elif [[ "$macos_state" == success && "$windows_state" == success ]]; then
             state=success
             description="Trusted CI generation ${GENERATION_ID} passed"
           elif [[ "$macos_state" == failure || "$windows_state" == failure ]]; then
