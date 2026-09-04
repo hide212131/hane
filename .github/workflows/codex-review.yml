@@ -65,10 +65,10 @@ jobs:
             review_mode=manual
           else
             pr_number="$EVENT_PR_NUMBER"
-            if [[ "$EVENT_ACTION" == synchronize ]]; then
-              review_mode=manual
-            else
+            if [[ "$EVENT_ACTION" == opened ]]; then
               review_mode=automatic
+            else
+              review_mode=manual
             fi
           fi
 
