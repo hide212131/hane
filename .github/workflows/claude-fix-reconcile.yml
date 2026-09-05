@@ -1,0 +1,135 @@
+name: Claude fix post-push reconciliation
+
+on:
+  workflow_run:
+    workflows: ["Claude automatic fix worker"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
+
+    steps:
+      - name: Reconcile trusted automatic-fix Pull Request heads
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # workflow_run fires only after the Claude worker has stopped mutating the PR.
+          # Give successfully-dispatched downstream workflows a short window to publish
+          # their exact-SHA pending state before deciding that recovery is needed.
+          if [[ "${{ github.event_name }}" == workflow_run ]]; then
+            sleep 15
+          fi
+
+          prs="$(
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+              | jq '[.[][] | select(.draft == false and .head.repo.full_name == .base.repo.full_name)]'
+          )"
+
+          jq -c '.[]' <<< "$prs" | while IFS= read -r pr; do
+            pr_number="$(jq -r '.number' <<< "$pr")"
+            head_sha="$(jq -r '.head.sha' <<< "$pr")"
+            pr_author="$(jq -r '.user.login' <<< "$pr")"
+            short_sha="${head_sha:0:12}"
+
+            # Hane is a personal repository. Human-authored automatic work is trusted
+            # only from the repository owner; bot-authored heads are accepted only when
+            # they carry the worker's exact commit marker below.
+            case "$pr_author" in
+              hide212131|'github-actions[bot]'|'claude[bot]') ;;
+              *) continue ;;
+            esac
+
+            commit="$(gh api "repos/${REPOSITORY}/commits/${head_sha}")"
+            message="$(jq -r '.commit.message' <<< "$commit")"
+            commit_actor="$(jq -r '.author.login // .committer.login // ""' <<< "$commit")"
+
+            if [[ "$message" != "Automatic Claude fix for Copilot routing decision on "* ]]; then
+              continue
+            fi
+            if [[ "$commit_actor" != 'github-actions[bot]' ]]; then
+              echo "::warning::PR #${pr_number} head ${head_sha} has an automatic-fix-looking message but unexpected actor '${commit_actor}'; skipping reconciliation."
+              continue
+            fi
+
+            statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
+
+            codex_latest="$(
+              jq -r \
+                '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv' \
+                <<< "$statuses"
+            )"
+            codex_state="${codex_latest%%$'\t'*}"
+            codex_description="${codex_latest#*$'\t'}"
+
+            if [[ ! ( "$codex_state" == success && "$codex_description" == "Codex review clean for ${short_sha}" ) &&
+                  ! ( "$codex_state" == failure && "$codex_description" == "Codex findings for ${short_sha}" ) &&
+                  "$codex_state" != pending ]]; then
+              echo "Re-dispatching Codex review for PR #${pr_number} head ${head_sha}."
+              gh workflow run codex-review.yml \
+                --repo "$REPOSITORY" \
+                --ref main \
+                -f pr_number="$pr_number" \
+                -f target_sha="$head_sha"
+            fi
+
+            generation_latest="$(
+              jq -r \
+                '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .target_url // ""] | @tsv' \
+                <<< "$statuses"
+            )"
+            ci_state="$(cut -f1 <<< "$generation_latest")"
+            ci_description="$(cut -f2 <<< "$generation_latest")"
+            ci_target_url="$(cut -f3 <<< "$generation_latest")"
+
+            if [[ "$ci_state" == success ]]; then
+              continue
+            fi
+
+            generation_id=""
+            if [[ "$ci_description" == 'Trusted CI generation '* ]]; then
+              generation_id="${ci_description#Trusted CI generation }"
+            fi
+            if [[ -z "$generation_id" ]]; then
+              generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
+            fi
+
+            # The Claude worker initially points the generation status at its own run.
+            # A real ci.yml reporter replaces that URL when it claims the generation.
+            # If that replacement never happened, the post-push dispatch may have been
+            # lost and it is safe to re-dispatch the same generation id.
+            if [[ "$ci_target_url" == *"/actions/runs/${{ github.event.workflow_run.id }}" ||
+                  -z "$ci_target_url" ||
+                  "$ci_state" == error || "$ci_state" == failure ]]; then
+              echo "Re-dispatching trusted CI generation ${generation_id} for ${head_sha}."
+              gh api \
+                --method POST \
+                "repos/${REPOSITORY}/statuses/${head_sha}" \
+                -f state=pending \
+                -f context='hane/trusted-ci-generation' \
+                -f description="Trusted CI generation ${generation_id}" \
+                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                >/dev/null
+
+              gh workflow run ci.yml \
+                --repo "$REPOSITORY" \
+                --ref main \
+                -f target_sha="$head_sha" \
+                -f generation_id="$generation_id"
+            fi
+          done
