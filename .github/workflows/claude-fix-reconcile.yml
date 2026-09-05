@@ -74,6 +74,21 @@ jobs:
             esac
           }
 
+          ci_run_is_active() {
+            local target_url="$1"
+            local run_id run run_name run_event run_status
+            if [[ ! "$target_url" =~ /actions/runs/([0-9]+)$ ]]; then
+              return 1
+            fi
+            run_id="${BASH_REMATCH[1]}"
+            run="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
+            [[ -n "$run" ]] || return 1
+            run_name="$(jq -r '.name // ""' <<< "$run")"
+            run_event="$(jq -r '.event // ""' <<< "$run")"
+            run_status="$(jq -r '.status // ""' <<< "$run")"
+            [[ "$run_name" == CI && "$run_event" == workflow_dispatch && "$run_status" != completed ]]
+          }
+
           prs="$(
             gh api --paginate --slurp "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
               | jq '[.[][] | select(.draft == false and .head.repo.full_name == .base.repo.full_name)]'
@@ -209,18 +224,23 @@ jobs:
 
             refreshed="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
             refreshed_latest="$(
-              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' <<< "$refreshed"
+              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // "", .target_url // ""] | @tsv' <<< "$refreshed"
             )"
             refreshed_state="$(cut -f1 <<< "$refreshed_latest")"
             refreshed_description="$(cut -f2 <<< "$refreshed_latest")"
             refreshed_created_at="$(cut -f3 <<< "$refreshed_latest")"
+            refreshed_target_url="$(cut -f4 <<< "$refreshed_latest")"
             refreshed_age="$(status_age_seconds "$refreshed_created_at")"
 
             should_dispatch_ci=false
             if [[ -z "$refreshed_state" || "$refreshed_state" == error ]]; then
               should_dispatch_ci=true
             elif [[ "$refreshed_state" == pending && "$refreshed_age" -ge 1800 ]]; then
-              should_dispatch_ci=true
+              if ci_run_is_active "$refreshed_target_url"; then
+                echo "Trusted CI for ${head_sha} is still active; preserving its aged lease."
+              else
+                should_dispatch_ci=true
+              fi
             fi
             [[ "$should_dispatch_ci" == true ]] || continue
 
