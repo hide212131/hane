@@ -1,4 +1,5 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci:{0}:{1}', inputs.target_sha, inputs.generation_id) || format('pr-ci:{0}', github.event.pull_request.number) }}
 
 on:
   pull_request:
@@ -76,7 +77,7 @@ jobs:
     if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: macos-latest
     concurrency:
-      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-macos', github.event.pull_request.number) }}
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pr-run-{0}-macos', github.run_id) }}
       cancel-in-progress: false
       queue: max
     permissions:
@@ -209,7 +210,7 @@ jobs:
     if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: windows-latest
     concurrency:
-      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-windows', github.event.pull_request.number) }}
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pr-run-{0}-windows', github.run_id) }}
       cancel-in-progress: false
       queue: max
     permissions:
