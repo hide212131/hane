@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 18
     concurrency:
-      group: copilot-routing-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: copilot-routing-serialized
       cancel-in-progress: false
       queue: max
     permissions:
@@ -50,23 +50,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          has_write_access() {
-            local actor="$1"
-            local permission
-            permission="$(
-              gh api \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/collaborators/${actor}/permission" \
-                --jq '.permission' 2>/dev/null || true
-            )"
-            [[ "$permission" == admin || "$permission" == maintain || "$permission" == write ]]
-          }
-
           echo 'skip=false' >> "$GITHUB_OUTPUT"
 
           case "$EVENT_NAME" in
             issue_comment)
-              if ! has_write_access "$COMMENT_ACTOR"; then
+              if [[ "$COMMENT_ACTOR" != hide212131 ]]; then
                 echo "::error::${COMMENT_ACTOR} is not authorized to request Copilot pre-GUI routing."
                 exit 1
               fi
@@ -107,12 +95,10 @@ jobs:
           fi
 
           case "$pr_author" in
-            'github-actions[bot]'|'claude[bot]') ;;
+            hide212131|'github-actions[bot]'|'claude[bot]') ;;
             *)
-              if ! has_write_access "$pr_author"; then
-                echo "::error::Pull Request author ${pr_author} is not trusted for automated Copilot routing."
-                exit 1
-              fi
+              echo "::error::Pull Request author ${pr_author} is not trusted for automated Copilot routing."
+              exit 1
               ;;
           esac
 
