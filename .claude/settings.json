@@ -1,12 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "allow": [
-      "Bash(cargo fmt *)",
-      "Bash(cargo check *)",
-      "Bash(cargo test *)",
-      "Bash(cargo clippy *)"
-    ],
     "deny": [
       "Read(./.env)",
       "Read(./.env.*)",
@@ -18,18 +12,5 @@
   },
   "env": {
     "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
-  },
-  "sandbox": {
-    "enabled": true,
-    "failIfUnavailable": true,
-    "autoAllowBashIfSandboxed": true,
-    "allowUnsandboxedCommands": false,
-    "network": {
-      "allowedDomains": [
-        "crates.io",
-        "index.crates.io",
-        "static.crates.io"
-      ]
-    }
   }
 }
