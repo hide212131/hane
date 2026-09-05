@@ -209,6 +209,21 @@ struct TitleRenameAttempt {
     title: String,
 }
 
+/// Which of the sidebar's two selection sources is currently shown
+/// highlighted. The two are tracked separately because they change on
+/// different events — the active session swaps whenever a file or draft is
+/// opened, while `selected_folder` only changes on an explicit folder/root
+/// click — so without this flag both could end up highlighted at once (see
+/// issue #47).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SidebarFocus {
+    /// A file or draft row is highlighted, driven by the active session.
+    #[default]
+    ActiveSession,
+    /// A folder or root row is highlighted, driven by `selected_folder`.
+    Folder,
+}
+
 pub struct EditorView {
     /// Every open document. Holding a set rather than one editor is what lets a
     /// filer add and switch documents without the renderer changing.
@@ -230,8 +245,15 @@ pub struct EditorView {
     work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
     /// The folder the sidebar currently has selected, used as the target
     /// directory for the next "new note" or "new folder". `None` means the
-    /// work folder root.
+    /// work folder root. This is independent of what the sidebar shows
+    /// highlighted (see `sidebar_focus`): opening a file leaves this
+    /// unchanged, so "select a folder, then create a note" keeps working
+    /// even though the folder row itself stops being highlighted.
     selected_folder: Option<PathBuf>,
+    /// Which selection source (`selected_folder` or the active session) the
+    /// sidebar currently highlights. Exclusive by construction, so a file and
+    /// a folder row can never both show as selected at once.
+    sidebar_focus: SidebarFocus,
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
@@ -548,6 +570,7 @@ impl EditorView {
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
+            sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
@@ -776,6 +799,10 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // Whatever the sidebar had highlighted before, the document on
+        // screen just changed to a specific file or draft, so that is what
+        // should be highlighted now instead.
+        self.sidebar_focus = SidebarFocus::ActiveSession;
         let lines = self.sessions.active().editor().document().line_count();
         self.granularity = Granularity::Lines;
         self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
@@ -1210,6 +1237,7 @@ impl EditorView {
             self.expanded_folders.insert(path.clone());
         }
         self.selected_folder = Some(path);
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -1219,6 +1247,7 @@ impl EditorView {
     /// selects, never toggles.
     fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
         self.selected_folder = None;
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -3443,7 +3472,8 @@ impl EditorView {
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
-        let root_is_selected = self.selected_folder.is_none();
+        let root_is_selected =
+            self.sidebar_focus == SidebarFocus::Folder && self.selected_folder.is_none();
         let root_row = div()
             .id("work-folder-root")
             .h(px(SIDEBAR_ROW_HEIGHT))
@@ -3478,7 +3508,8 @@ impl EditorView {
                 let left_padding = px(SIDEBAR_ROW_HORIZONTAL_PADDING + 12.0 * row.depth as f32);
                 match row.node {
                     WorkFolderNode::File(entry) => {
-                        let is_active = active_path == Some(entry.path());
+                        let is_active = self.sidebar_focus == SidebarFocus::ActiveSession
+                            && active_path == Some(entry.path());
                         let path = entry.path().to_path_buf();
                         div()
                             .id(("work-folder-entry", index))
@@ -3509,7 +3540,8 @@ impl EditorView {
                             }))
                     }
                     WorkFolderNode::Folder(folder) => {
-                        let is_selected = self.selected_folder.as_deref() == Some(folder.path());
+                        let is_selected = self.sidebar_focus == SidebarFocus::Folder
+                            && self.selected_folder.as_deref() == Some(folder.path());
                         let is_expanded = self.expanded_folders.contains(folder.path());
                         let path = folder.path().to_path_buf();
                         let disclosure = if is_expanded {
@@ -3558,7 +3590,8 @@ impl EditorView {
             .into_iter()
             .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
             .map(|(id, session)| {
-                let is_active = active_id == id;
+                let is_active =
+                    self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
                     .h(px(SIDEBAR_ROW_HEIGHT))
@@ -4851,6 +4884,71 @@ mod tests {
                     .as_ref()
                     .map(|folder| folder.root().to_path_buf()),
                 "a new note/folder must now target the work folder root again"
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #47: the sidebar must never show two rows selected at once.
+    // Opening a file after selecting a folder must move the highlight onto
+    // the file (even though `selected_folder` — the new-entry target — stays
+    // put), and explicitly selecting a folder while a file is open must move
+    // the highlight back onto the folder despite that file remaining the
+    // active session underneath.
+    #[gpui::test]
+    fn opening_a_file_and_selecting_a_folder_never_both_show_selected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-exclusive-selection");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let note = root.join("dev").join("note.md");
+        std::fs::write(&note, "# Note").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+        });
+
+        // Opening a file must move the highlight onto it, even though the
+        // folder just selected remains the target directory for new entries.
+        view.update(cx, |view, cx| {
+            view.open_work_folder_entry(&note, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert_eq!(
+                view.selected_folder.as_deref(),
+                Some(root.join("dev").as_path()),
+                "the folder selected earlier must still be the new-entry target"
+            );
+        });
+
+        // Explicitly reselecting the folder must move the highlight back,
+        // even though the file above is still the active session.
+        view.update(cx, |view, cx| {
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+            assert_eq!(
+                view.active_session().path(),
+                Some(note.as_path()),
+                "selecting the folder must not close the still-open file"
             );
         });
 
