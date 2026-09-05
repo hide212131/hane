@@ -30,19 +30,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          SOURCE_WORKFLOW: ${{ github.event.workflow_run.name }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
 
-          # workflow_run is emitted only after the producer has stopped changing state.
-          # Give a successfully delivered child workflow a short opportunity to claim
-          # its own pending status before deciding that delivery was lost.
           if [[ "$EVENT_NAME" == workflow_run ]]; then
             sleep 15
           fi
 
           now_epoch="$(date -u +%s)"
+          prefix='Automatic Claude fix for Copilot routing decision on '
 
           status_age_seconds() {
             local created_at="$1"
@@ -83,8 +79,6 @@ jobs:
             pr_author="$(jq -r '.user.login' <<< "$pr")"
             short_sha="${head_sha:0:12}"
 
-            # Hane is a personal repository. Trust the owner directly and the two
-            # controlled automation identities used by the repository workflows.
             case "$pr_author" in
               hide212131|'github-actions[bot]'|'claude[bot]') ;;
               *) continue ;;
@@ -92,11 +86,6 @@ jobs:
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
 
-            # Recover a lost Copilot fix -> Claude repository_dispatch. Controller
-            # failure statuses are transport failures, not new routing decisions, so
-            # inspect the latest semantic routing decision. A missing Claude state is
-            # eligible immediately; a pending/running state is eligible only after the
-            # same 55-minute lease used by the receiver has expired.
             routing_decision="$(
               jq -r \
                 --arg fix "Copilot routing: fix for ${short_sha}" \
@@ -139,60 +128,81 @@ jobs:
               dispatch_claude_fix "$pr_number" "$head_sha"
             fi
 
-            commit="$(gh api "repos/${REPOSITORY}/commits/${head_sha}")"
-            subject="$(jq -r '.commit.message | split("\n")[0]' <<< "$commit")"
-            commit_actor="$(jq -r '.author.login // .committer.login // ""' <<< "$commit")"
-
-            # The remaining reconciliation applies only to a current head that the
-            # trusted Claude-fix workflow itself committed and pushed.
-            prefix='Automatic Claude fix for Copilot routing decision on '
-            if [[ "$subject" != "${prefix}"* || "$commit_actor" != 'github-actions[bot]' ]]; then
-              continue
-            fi
-
-            old_short="${subject#${prefix}}"
-            if [[ ! "$old_short" =~ ^[0-9a-f]{12}$ ]]; then
-              echo "::warning::PR #${pr_number} automatic-fix commit has malformed predecessor marker '${old_short}'."
-              continue
-            fi
-
-            predecessor_matches="$(
-              gh api --paginate \
+            pr_commits="$(
+              gh api --paginate --slurp \
                 "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                --jq ".[] | select(.sha | startswith(\"${old_short}\")) | .sha"
+                | jq '[.[][] | {
+                    sha,
+                    subject: (.commit.message | split("\n")[0]),
+                    actor: (.author.login // .committer.login // "")
+                  }]'
             )"
-            predecessor_count="$(grep -c . <<< "$predecessor_matches" || true)"
-            if [[ "$predecessor_count" -ne 1 ]]; then
-              echo "::warning::Could not uniquely resolve predecessor ${old_short} for PR #${pr_number}; refusing completion repair."
+
+            # Repair completion bookkeeping for every trusted automatic-fix commit in
+            # the PR, not only for the current head. This survives a later manual or
+            # automation commit arriving before reconciliation.
+            jq -c '.[]' <<< "$pr_commits" | while IFS= read -r commit_record; do
+              fix_sha="$(jq -r '.sha' <<< "$commit_record")"
+              subject="$(jq -r '.subject' <<< "$commit_record")"
+              commit_actor="$(jq -r '.actor' <<< "$commit_record")"
+
+              if [[ "$subject" != "${prefix}"* || "$commit_actor" != 'github-actions[bot]' ]]; then
+                continue
+              fi
+
+              old_short="${subject#${prefix}}"
+              if [[ ! "$old_short" =~ ^[0-9a-f]{12}$ ]]; then
+                echo "::warning::PR #${pr_number} automatic-fix commit ${fix_sha} has malformed predecessor marker '${old_short}'."
+                continue
+              fi
+
+              predecessor_matches="$(
+                jq -r --arg short "$old_short" \
+                  '.[] | select(.sha | startswith($short)) | .sha' \
+                  <<< "$pr_commits"
+              )"
+              predecessor_count="$(grep -c . <<< "$predecessor_matches" || true)"
+              if [[ "$predecessor_count" -ne 1 ]]; then
+                echo "::warning::Could not uniquely resolve predecessor ${old_short} for PR #${pr_number}; refusing completion repair."
+                continue
+              fi
+              predecessor_sha="$(head -n 1 <<< "$predecessor_matches")"
+
+              predecessor_statuses="$(gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100")"
+              predecessor_completion="$(
+                jq -r \
+                  --arg desc "Claude fix completed for ${old_short}" \
+                  '[.[] | select(.context == "hane/claude-fix" and .state == "success" and .description == $desc)] | length' \
+                  <<< "$predecessor_statuses"
+              )"
+
+              if [[ "$predecessor_completion" -eq 0 ]]; then
+                echo "Repairing Claude completion state for predecessor ${predecessor_sha} -> ${fix_sha}."
+                gh api \
+                  --method POST \
+                  "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
+                  -f state=success \
+                  -f context='hane/claude-fix' \
+                  -f description="Claude fix completed for ${old_short}" \
+                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" \
+                  >/dev/null
+              fi
+            done
+
+            head_record="$(
+              jq -c --arg sha "$head_sha" \
+                '.[] | select(.sha == $sha)' \
+                <<< "$pr_commits"
+            )"
+            head_subject="$(jq -r '.subject // ""' <<< "${head_record:-{}}")"
+            head_actor="$(jq -r '.actor // ""' <<< "${head_record:-{}}")"
+
+            # Only a current head written by the Claude-fix workflow needs explicit
+            # downstream recovery; ordinary later commits trigger the normal PR flows.
+            if [[ "$head_subject" != "${prefix}"* || "$head_actor" != 'github-actions[bot]' ]]; then
               continue
             fi
-            predecessor_sha="$(head -n 1 <<< "$predecessor_matches")"
 
-            # A successful branch push is itself durable evidence that the old target
-            # completed its Claude edit. Repair completion bookkeeping if the worker
-            # failed after push, so the canonical 3-fix cap cannot be bypassed by a
-            # downstream dispatch/comment failure.
-            predecessor_statuses="$(gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100")"
-            predecessor_completion="$(
-              jq -r \
-                --arg desc "Claude fix completed for ${old_short}" \
-                '[.[] | select(.context == "hane/claude-fix" and .state == "success" and .description == $desc)] | length' \
-                <<< "$predecessor_statuses"
-            )"
-            if [[ "$predecessor_completion" -eq 0 ]]; then
-              echo "Repairing Claude completion state for predecessor ${predecessor_sha} -> ${head_sha}."
-              gh api \
-                --method POST \
-                "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
-                -f state=success \
-                -f context='hane/claude-fix' \
-                -f description="Claude fix completed for ${old_short}" \
-                -f target_url="https://github.com/${REPOSITORY}/commit/${head_sha}" \
-                >/dev/null
-            fi
-
-            # Re-fetch current-head statuses after any concurrently-started children
-            # had time to publish their own claims.
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
 
             codex_latest="$(
@@ -223,16 +233,18 @@ jobs:
 
             generation_latest="$(
               jq -r \
-                '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .target_url // "", .created_at // ""] | @tsv' \
+                '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' \
                 <<< "$statuses"
             )"
             ci_state="$(cut -f1 <<< "$generation_latest")"
             ci_description="$(cut -f2 <<< "$generation_latest")"
-            ci_target_url="$(cut -f3 <<< "$generation_latest")"
-            ci_created_at="$(cut -f4 <<< "$generation_latest")"
+            ci_created_at="$(cut -f3 <<< "$generation_latest")"
             ci_age="$(status_age_seconds "$ci_created_at")"
 
-            if [[ "$ci_state" == success ]]; then
+            # success and failure are both terminal CI outcomes. Reconciliation is for
+            # lost/expired delivery only; it must not turn a real test failure into a
+            # retry that can later overwrite the evidence.
+            if [[ "$ci_state" == success || "$ci_state" == failure ]]; then
               continue
             fi
 
@@ -245,12 +257,9 @@ jobs:
             fi
 
             should_dispatch_ci=false
-            if [[ -z "$ci_state" || "$ci_state" == error || "$ci_state" == failure ]]; then
+            if [[ -z "$ci_state" || "$ci_state" == error ]]; then
               should_dispatch_ci=true
             elif [[ "$ci_state" == pending && "$ci_age" -ge 1800 ]]; then
-              should_dispatch_ci=true
-            elif [[ "$EVENT_NAME" == workflow_run && "$SOURCE_WORKFLOW" == 'Claude automatic fix worker' &&
-                    "$ci_target_url" == *"/actions/runs/${SOURCE_RUN_ID}" ]]; then
               should_dispatch_ci=true
             fi
 
