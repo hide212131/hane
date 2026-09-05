@@ -45,6 +45,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -56,21 +57,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          has_write_access() {
-            local actor="$1"
-            local permission
-            permission="$(
-              gh api \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/collaborators/${actor}/permission" \
-                --jq '.permission' 2>/dev/null || true
-            )"
-            [[ "$permission" == admin || "$permission" == maintain || "$permission" == write ]]
-          }
-
           if [[ "$EVENT_NAME" == issue_comment ]]; then
-            if ! has_write_access "$COMMENT_ACTOR"; then
-              echo "::error::${COMMENT_ACTOR} is not authorized to request a Codex review."
+            if [[ "$COMMENT_ACTOR" != "$REPO_OWNER" ]]; then
+              echo "::error::Only repository owner ${REPO_OWNER} may request a Codex review."
               exit 1
             fi
             pr_number="$ISSUE_NUMBER"
@@ -111,12 +100,10 @@ jobs:
           fi
 
           case "$pr_author" in
-            'github-actions[bot]'|'claude[bot]') ;;
+            "$REPO_OWNER"|'github-actions[bot]'|'claude[bot]') ;;
             *)
-              if ! has_write_access "$pr_author"; then
-                echo "::error::Pull Request author ${pr_author} is not trusted for automated Codex review."
-                exit 1
-              fi
+              echo "::error::Pull Request author ${pr_author} is not a Hane automatic-review source."
+              exit 1
               ;;
           esac
 
