@@ -164,11 +164,13 @@ jobs:
               [[ "$predecessor_count" -eq 1 ]] || continue
               predecessor_sha="$(head -n 1 <<< "$predecessor_matches")"
 
-              completion_count="$(
+              completion_latest="$(
                 gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100" \
-                  --jq "[.[] | select(.context == \"hane/claude-fix\" and .state == \"success\" and .description == \"Claude fix completed for ${old_short}\")] | length"
+                  --jq '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
               )"
-              if [[ "$completion_count" -eq 0 ]]; then
+              completion_state="$(cut -f1 <<< "$completion_latest")"
+              completion_description="$(cut -f2 <<< "$completion_latest")"
+              if [[ "$completion_state" != success || "$completion_description" != "Claude fix completed for ${old_short}" ]]; then
                 gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
                   -f state=success -f context='hane/claude-fix' \
                   -f description="Claude fix completed for ${old_short}" \
