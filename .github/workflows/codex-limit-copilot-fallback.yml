@@ -168,7 +168,7 @@ jobs:
           copilot_review_state="$(cut -f3 <<< "$review")"
           findings_json="$(
             gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-              | jq "[.[][] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+              | jq "[.[][] | select(.pull_request_review_id == ${review_id}) | {path, line, body}]"
           )"
           finding_count="$(jq 'length' <<< "$findings_json")"
           if [[ "$finding_count" -gt 0 || "$copilot_review_state" == CHANGES_REQUESTED ]]; then

@@ -172,7 +172,7 @@ jobs:
             review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
             findings_json="$(
               gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-                | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+                | jq "[.[][] | select(.pull_request_review_id == ${review_id}) | {path, line, body}]"
             )"
           fi
 
