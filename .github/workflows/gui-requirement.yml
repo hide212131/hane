@@ -1,0 +1,328 @@
+name: GUI requirement classification
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull Request number to classify after a trusted automatic push (for example an automatic Claude fix)
+        required: true
+        type: string
+      target_sha:
+        description: Exact head SHA to classify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    if: >-
+      ${{
+        (
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.draft == false &&
+          (
+            (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+            github.event.label.name == 'gui-validation-required'
+          )
+        ) ||
+        github.event_name == 'workflow_dispatch'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: gui-requirement-pr-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+
+    steps:
+      - name: Resolve and authorize classification target
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+          DISPATCH_TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            pr_number="$DISPATCH_PR_NUMBER"
+          else
+            pr_number="$EVENT_PR_NUMBER"
+          fi
+
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Malformed Pull Request number."
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == workflow_dispatch && ! "$DISPATCH_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Malformed workflow_dispatch target SHA."
+            exit 1
+          fi
+
+          pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+          state="$(jq -r '.state' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha // ""' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          pr_author="$(jq -r '.user.login // ""' <<< "$pr")"
+
+          if [[ "$state" != open || "$draft" != false || ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Pull Request #${pr_number} is not an open, reviewable Pull Request with a valid head SHA."
+            exit 1
+          fi
+
+          if [[ "$head_repo" != "$REPOSITORY" ]]; then
+            echo "::error::Pull Request #${pr_number} is not a same-repository Pull Request; GUI requirement classification is fail-closed."
+            exit 1
+          fi
+
+          case "$pr_author" in
+            "$REPO_OWNER"|'github-actions[bot]'|'claude[bot]') ;;
+            *)
+              echo "::error::Pull Request author ${pr_author} is not trusted for automated GUI requirement classification."
+              exit 1
+              ;;
+          esac
+
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$head_sha" != "$DISPATCH_TARGET_SHA" ]]; then
+            echo "::error::Pull Request #${pr_number} head ${head_sha} no longer matches requested classification target ${DISPATCH_TARGET_SHA}; refusing stale request."
+            exit 1
+          fi
+
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Mark GUI requirement classification pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/gui-requirement' \
+            -f description="GUI requirement classification pending for ${short_sha} (v1)" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+      - name: Classify GUI requirement from changed files
+        id: classify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          expected_count="$(jq -r '.changed_files // -1' <<< "$pr")"
+          if [[ ! "$expected_count" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Pull Request #${PR_NUMBER} did not provide a valid changed_files count."
+            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          files_json="$(
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+              2>/tmp/gui-requirement-files.err
+          )"
+          files_status=$?
+          set -e
+
+          if [[ "$files_status" -ne 0 ]]; then
+            echo "::warning::Failed to list changed files for #${PR_NUMBER}: $(cat /tmp/gui-requirement-files.err)"
+            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! jq -e 'type == "array" and all(.[]; type == "array")' <<< "$files_json" >/dev/null; then
+            echo "::warning::Changed-file pagination returned malformed evidence for #${PR_NUMBER}."
+            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          actual_count="$(jq '[.[][]] | length' <<< "$files_json")"
+          valid_filename_count="$(
+            jq '[.[][] | select((.filename | type) == "string" and (.filename | length) > 0)] | length' \
+              <<< "$files_json"
+          )"
+
+          if [[ "$actual_count" -ne "$expected_count" || "$valid_filename_count" -ne "$actual_count" ]]; then
+            echo "::warning::Changed-file evidence is incomplete for #${PR_NUMBER}: expected=${expected_count}, fetched=${actual_count}, valid_filenames=${valid_filename_count}."
+            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$actual_count" -eq 0 ]]; then
+            echo "No changed files were reported for #${PR_NUMBER}; failing closed to required = true."
+            echo 'decision=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          all_allowlisted="$(
+            jq -r '
+              all(.[][];
+                ((.filename | startswith("docs/")) or
+                 (.filename | startswith(".github/")) or
+                 (((.filename | contains("/")) | not) and (.filename | endswith(".md"))))
+              )
+            ' <<< "$files_json"
+          )"
+
+          if [[ "$all_allowlisted" == true ]]; then
+            echo 'decision=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'decision=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-fetch trusted target immediately before publishing
+        id: recheck
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          current_sha="$(jq -r '.head.sha // ""' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          pr_author="$(jq -r '.user.login // ""' <<< "$pr")"
+          force_label="$(jq -r '[.labels[].name] | any(. == "gui-validation-required")' <<< "$pr")"
+
+          if [[ "$current_sha" != "$TARGET_SHA" ]]; then
+            echo 'result=stale' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" || ! "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'result=blocked' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$pr_author" in
+            "$REPO_OWNER"|'github-actions[bot]'|'claude[bot]') ;;
+            *)
+              echo 'result=blocked' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          echo 'result=ok' >> "$GITHUB_OUTPUT"
+          echo "force_label=$force_label" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GUI requirement classification
+        if: ${{ steps.recheck.outputs.result == 'ok' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          FILE_DECISION: ${{ steps.classify.outputs.decision }}
+          FORCE_LABEL: ${{ steps.recheck.outputs.force_label }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [[ "$FORCE_LABEL" == true ]]; then
+            decision=true
+          else
+            decision="$FILE_DECISION"
+          fi
+
+          case "$decision" in
+            true)
+              state=failure
+              description="GUI validation required (v1) for ${short_sha}"
+              ;;
+            false)
+              state=success
+              description="GUI validation not required (v1) for ${short_sha}"
+              ;;
+            *)
+              state=error
+              description="GUI requirement classification blocked for ${short_sha} (v1)"
+              ;;
+          esac
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='hane/gui-requirement' \
+            -f description="$description" \
+            -f target_url="$run_url" \
+            >/dev/null
+
+      - name: Publish invalidated classification result
+        if: ${{ steps.recheck.outputs.result == 'stale' || steps.recheck.outputs.result == 'blocked' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          RESULT: ${{ steps.recheck.outputs.result }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          if [[ "$RESULT" == stale ]]; then
+            description="GUI requirement classification stale for ${short_sha} (v1)"
+          else
+            description="GUI requirement classification blocked for ${short_sha} (v1)"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=error \
+            -f context='hane/gui-requirement' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+      - name: Mark controller failure as blocked
+        if: ${{ failure() && steps.target.outputs.target_sha != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=error \
+            -f context='hane/gui-requirement' \
+            -f description="GUI requirement classification controller failed for ${short_sha} (v1)" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
