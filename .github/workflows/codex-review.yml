@@ -231,9 +231,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          CODEX_GITHUB_TOKEN: ${{ secrets.CODEX_GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
-          REPO_OWNER: ${{ github.repository_owner }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
           REVIEW_MODE: ${{ steps.target.outputs.review_mode }}
@@ -258,7 +256,7 @@ jobs:
           existing="$(
             gh api --paginate \
               "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq ".[] | select(.user.login == \"${REPO_OWNER}\" and ((.body // \"\") | contains(\"${marker}\"))) | [.id, .created_at] | @tsv" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and ((.body // \"\") | contains(\"${marker}\"))) | [.id, .created_at] | @tsv" \
               | tail -n 1
           )"
 
@@ -341,17 +339,6 @@ jobs:
           if [[ -n "$existing" ]]; then
             echo "Reusing Codex request comment ${request_id} for ${TARGET_SHA}."
           else
-            if [[ -z "${CODEX_GITHUB_TOKEN:-}" ]]; then
-              echo "::error::CODEX_GITHUB_TOKEN secret is not configured; refusing to post the authoritative @codex review request."
-              exit 1
-            fi
-
-            pat_login="$(GH_TOKEN="$CODEX_GITHUB_TOKEN" gh api user --jq '.login' 2>/dev/null || true)"
-            if [[ -z "$pat_login" || "$pat_login" != "$REPO_OWNER" ]]; then
-              echo "::error::CODEX_GITHUB_TOKEN is not authenticated as repository owner ${REPO_OWNER} (got '${pat_login:-<unavailable>}'); refusing to post the authoritative @codex review request."
-              exit 1
-            fi
-
             body="$(cat <<EOF
           ${marker}
           @codex review
@@ -360,7 +347,7 @@ jobs:
           EOF
           )"
             response="$(
-              GH_TOKEN="$CODEX_GITHUB_TOKEN" gh api \
+              gh api \
                 --method POST \
                 "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
                 -f body="$body"
