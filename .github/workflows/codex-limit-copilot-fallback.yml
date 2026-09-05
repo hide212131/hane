@@ -17,7 +17,7 @@ jobs:
         && contains(github.event.comment.body, 'code reviews')
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     concurrency:
       group: codex-limit-copilot-fallback-pr-${{ github.event.issue.number }}
       cancel-in-progress: false
@@ -89,35 +89,68 @@ jobs:
 
           existing_review="$(
             gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-              --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url] | @tsv" \
+              --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url, .state] | @tsv" \
               | tail -n 1
           )"
 
           if [[ -z "$existing_review" ]]; then
-            request_payload="$(jq -n '{reviewers:["copilot-pull-request-reviewer[bot]"]}')"
-            gh api --method POST "repos/${REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
-              --input - <<< "$request_payload" >/dev/null
-            echo "Requested Copilot Code Review for ${target_sha} because Codex review usage is exhausted."
+            copilot_requested="$(
+              gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+                --jq '[.users[] | select(.login == "Copilot" or .login == "copilot-pull-request-reviewer[bot]")] | length'
+            )"
+            if [[ "$copilot_requested" -eq 0 ]]; then
+              request_payload="$(jq -n '{reviewers:["copilot-pull-request-reviewer[bot]"]}')"
+              set +e
+              request_output="$(
+                gh api --method POST "repos/${REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+                  --input - <<< "$request_payload" 2>&1
+              )"
+              request_status=$?
+              set -e
+              if [[ $request_status -ne 0 ]]; then
+                existing_review="$(
+                  gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+                    --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url, .state] | @tsv" \
+                    | tail -n 1
+                )"
+                copilot_requested="$(
+                  gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+                    --jq '[.users[] | select(.login == "Copilot" or .login == "copilot-pull-request-reviewer[bot]")] | length'
+                )"
+                if [[ -z "$existing_review" && "$copilot_requested" -eq 0 ]]; then
+                  printf '%s\n' "$request_output"
+                  echo "::error::Copilot Code Review request failed and no in-flight/existing review can be confirmed."
+                  exit 1
+                fi
+                echo "Copilot review was already in flight or completed while the request raced; continuing observation."
+              else
+                echo "Requested Copilot Code Review for ${target_sha} because Codex review usage is exhausted."
+              fi
+            else
+              echo "Copilot Code Review is already requested for PR #${PR_NUMBER}; continuing observation."
+            fi
           else
             echo "Reusing an existing exact-head Copilot Code Review for ${target_sha}."
           fi
 
-          review=''
-          for attempt in $(seq 1 60); do
-            current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
-            if [[ "$current_sha" != "$target_sha" ]]; then
-              echo "PR #${PR_NUMBER} moved to ${current_sha}; fallback review for ${target_sha} is stale."
-              exit 0
-            fi
+          review="$existing_review"
+          if [[ -z "$review" ]]; then
+            for attempt in $(seq 1 60); do
+              current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+              if [[ "$current_sha" != "$target_sha" ]]; then
+                echo "PR #${PR_NUMBER} moved to ${current_sha}; fallback review for ${target_sha} is stale."
+                exit 0
+              fi
 
-            review="$(
-              gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-                --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url] | @tsv" \
-                | tail -n 1
-            )"
-            [[ -n "$review" ]] && break
-            sleep 10
-          done
+              review="$(
+                gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+                  --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url, .state] | @tsv" \
+                  | tail -n 1
+              )"
+              [[ -n "$review" ]] && break
+              sleep 10
+            done
+          fi
 
           if [[ -z "$review" ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
@@ -128,15 +161,15 @@ jobs:
             exit 1
           fi
 
-          review_id="${review%%$'\t'*}"
-          review_url="${review#*$'\t'}"
-          review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
+          review_id="$(cut -f1 <<< "$review")"
+          review_url="$(cut -f2 <<< "$review")"
+          copilot_review_state="$(cut -f3 <<< "$review")"
           findings_json="$(
             gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
               | jq "[.[][] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
           )"
           finding_count="$(jq 'length' <<< "$findings_json")"
-          if [[ "$finding_count" -gt 0 || "$review_body" == *'Changes recommended'* ]]; then
+          if [[ "$finding_count" -gt 0 || "$copilot_review_state" == CHANGES_REQUESTED ]]; then
             fallback_outcome=findings
           else
             fallback_outcome=clean
