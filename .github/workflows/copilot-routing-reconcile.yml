@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: copilot-routing-pr-${{ matrix.pr_number }}
+      group: copilot-routing-serialized
       cancel-in-progress: false
     permissions:
       contents: write
@@ -78,18 +78,6 @@ jobs:
             echo '::error::COPILOT_GITHUB_TOKEN is not configured; routing reconciliation is fail-closed.'
             exit 1
           fi
-
-          has_write_access() {
-            local actor="$1"
-            local permission
-            permission="$(
-              gh api \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/collaborators/${actor}/permission" \
-                --jq '.permission' 2>/dev/null || true
-            )"
-            [[ "$permission" == admin || "$permission" == maintain || "$permission" == write ]]
-          }
 
           dispatch_claude_fix() {
             local target_sha="$1"
@@ -129,12 +117,10 @@ jobs:
           fi
 
           case "$pr_author" in
-            'github-actions[bot]'|'claude[bot]') ;;
+            hide212131|'github-actions[bot]'|'claude[bot]') ;;
             *)
-              if ! has_write_access "$pr_author"; then
-                echo "PR #${PR_NUMBER} author ${pr_author} is not trusted for routing recovery; skipping."
-                exit 0
-              fi
+              echo "PR #${PR_NUMBER} author ${pr_author} is outside the owner/bot automatic-routing trust boundary; skipping."
+              exit 0
               ;;
           esac
 
