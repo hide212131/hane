@@ -403,6 +403,47 @@ Codex review の結果を処理した後、trusted workflow が現在の head SH
 - 判定結果、対象 head SHA、判定に使った policy version を状態管理に保存する。
 - head SHA が変わったら判定を無効化してやり直す。
 
+#### 実装 (`.github/workflows/gui-requirement.yml`)
+
+Phase 4 のうち、ローカル Mac に依存しないこの分類器だけを実装する。GUI シナリオの実行、Copilot final judge、merge gate は対象外。
+
+トリガーと trusted-target 判定:
+
+- `pull_request_target`（`opened` / `synchronize` / `reopened` / `ready_for_review` / `labeled` / `unlabeled`）。`labeled` / `unlabeled` は `gui-validation-required` の付け外しだけを対象にし、それ以外のラベル操作では起動しない。head SHA が変わらなくてもラベルは分類への入力であるため、専用イベントとして扱う。
+- 信頼できる自動 push（Phase 6a Claude fix 等）が `GITHUB_TOKEN` で push した後の再分類のための `workflow_dispatch`（`pr_number` + 厳密な `target_sha` を要求）。
+- どちらのイベントでも、GitHub API から取得し直した Pull Request の `state` / `draft` / `head.repo.full_name` / `user.login` / 現在の `head.sha` を正本とし、Codex/Copilot の既存 controller と同じ信頼境界（open かつ非 draft、same-repository、author が repository owner または `github-actions[bot]` / `claude[bot]`）を強制する。イベント payload の head SHA ではなく、この再取得結果を分類対象 SHA とする。`workflow_dispatch` はさらに要求された `target_sha` と現在の head が一致することを要求し、不一致は publish せずに fail closed で終了する。
+
+分類ロジック（policy version `v1`）:
+
+1. Pull Request に `gui-validation-required` ラベルが付いていれば `required = true`。
+2. ラベルがない場合、`GET /pulls/{number}/files` を `--paginate` で全ページ取得する。取得自体が失敗した場合は `blocked` とし、`required = false` を推測しない。
+3. 変更ファイルが1件もない場合も証跡不足として `required = true` にfail closeする（`false` を推測しない）。
+4. 全ての変更ファイルが次の no-GUI allowlist に入る場合だけ `required = false`。1件でも外れる、またはパスを認識できない場合は `required = true`。
+   - `docs/**`（ADR、baseline 等を含むリポジトリのドキュメント一式）
+   - `.github/**`（CI / automation 専用ファイル。Hane のコンパイル済みデスクトップ runtime には含まれない）
+   - リポジトリ直下（`/` 直下、サブディレクトリなし）の `*.md`（例: `README.md`）
+   - Rust ソース、`Cargo.toml` / `Cargo.lock`、`assets/**` などのリソース、プラットフォーム統合ファイル、上記以外の未知のパスは対象外とし、個々の変更が無害に見えても `required = true` のままにする。
+
+publish 直前の再確認と冪等性:
+
+- 分類結果を publish する直前に Pull Request の現在の head SHA を再取得し、対象 SHA と一致しない場合は分類結果を publish せず、`hane/gui-requirement` に `stale` を示す `error` 状態だけを残す。
+- 分類は毎回 GitHub のラベルと変更ファイルから再計算するだけの決定的な処理であり、外部への副作用（コメント投稿や後続 dispatch）を持たない。そのため同じ SHA への重複イベントは単に同じ入力から同じ結果を再計算し、同じ commit status を上書きするだけで安全である。ラベルの追加・削除はそれ自体が別イベントとして再計算をトリガーするため、ラベル除去だけで `false` に固定されることはない。
+
+durable な表現（commit status, context `hane/gui-requirement`）:
+
+- `required = true` 完了 → `state = failure`, `description = "GUI validation required (v1) for <short_sha>"`
+- `required = false` 完了 → `state = success`, `description = "GUI validation not required (v1) for <short_sha>"`
+- 証跡不足・API 失敗などの `blocked` → `state = error`, `description = "GUI requirement classification blocked for <short_sha> (v1)"`
+- publish 直前の stale 検出 → `state = error`, `description = "GUI requirement classification stale for <short_sha> (v1)"`
+- controller 自体の失敗 → `state = error`, `description = "GUI requirement classification controller failed for <short_sha> (v1)"`
+
+`(v1)` は policy version であり、将来ポリシーを変更する場合は version を上げて記述文字列を変える。後続の merge gate はこの記述文字列から `required` と policy version を読み取り、一致しないバージョンの結果を信頼しない。
+
+自動 push との統合:
+
+- `claude-fix.yml` の自動修正 push は、新しい head SHA に対して `ci.yml` / `codex-review.yml` と同じタイミングで `gh workflow run gui-requirement.yml -f pr_number=... -f target_sha=<new_sha>` を dispatch する。
+- `claude-fix-reconcile.yml` は既存の Codex review 配送回復ロジックと同じ形で、自動修正 head の `hane/gui-requirement` 終端状態（成功の `false` または失敗の `true`）が存在しない場合に同じ `workflow_dispatch` を再試行する。この reconcile は `Copilot pre-GUI routing` / `Claude automatic fix worker` の `workflow_run` 完了イベントと `*/10 * * * *` の cron でも起動するため、配送失敗時も取りこぼさない。
+
 ### Local GUI validation
 
 GUI requirement classification が `required = true` で、対象 head SHA の CI が成功し、Codex outcome が `clean` または Copilot pre-GUI routing が `continue-validation` の場合、状態を `waiting-gui` にして Local GUI runner に検証を要求する。
