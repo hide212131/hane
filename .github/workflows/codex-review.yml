@@ -5,6 +5,16 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull Request number to re-review after a trusted automatic push (for example an automatic Claude fix)
+        required: true
+        type: string
+      target_sha:
+        description: Exact head SHA to review
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,12 +24,13 @@ jobs:
     if: >-
       ${{
         (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false) ||
-        (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.body == '/codex-review')
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.body == '/codex-review') ||
+        github.event_name == 'workflow_dispatch'
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: codex-review-pr-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: codex-review-pr-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
       cancel-in-progress: false
       queue: max
     permissions:
@@ -40,6 +51,8 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ACTOR: ${{ github.event.comment.user.login }}
           COMMENT_CREATED_AT: ${{ github.event.comment.created_at }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+          DISPATCH_TARGET_SHA: ${{ inputs.target_sha }}
         run: |
           set -euo pipefail
 
@@ -62,6 +75,9 @@ jobs:
             fi
             pr_number="$ISSUE_NUMBER"
             review_mode=manual
+          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            pr_number="$DISPATCH_PR_NUMBER"
+            review_mode=manual
           else
             pr_number="$EVENT_PR_NUMBER"
             if [[ "$EVENT_ACTION" == opened ]]; then
@@ -81,6 +97,11 @@ jobs:
 
           if [[ "$state" != open || "$draft" != false || -z "$target_sha" || "$target_sha" == null ]]; then
             echo "::error::Pull Request #${pr_number} is not an open, reviewable Pull Request."
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$target_sha" != "$DISPATCH_TARGET_SHA" ]]; then
+            echo "::error::Pull Request #${pr_number} head ${target_sha} no longer matches requested re-review target ${DISPATCH_TARGET_SHA}; refusing stale re-review."
             exit 1
           fi
 

@@ -30,7 +30,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       statuses: write
 
@@ -470,6 +470,34 @@ jobs:
             -f description="Copilot routing: blocked for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
+
+      - name: Dispatch Claude fix worker
+        if: >-
+          ${{
+            steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' &&
+            (
+              steps.terminal.outputs.outcome == 'fix' ||
+              (steps.evidence.outputs.missing_evidence == 'false' && steps.copilot.outputs.decision == 'fix' && steps.recheck.outputs.stale == 'false')
+            )
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          payload="$(
+            jq -n \
+              --argjson pr_number "$PR_NUMBER" \
+              --arg target_sha "$TARGET_SHA" \
+              '{event_type: "hane-claude-fix", client_payload: {pr_number: $pr_number, target_sha: $target_sha}}'
+          )"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/dispatches" \
+            --input - <<< "$payload"
 
       - name: Mark controller failure as blocked
         if: ${{ failure() && steps.target.outputs.target_sha != '' }}
