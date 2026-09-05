@@ -380,14 +380,12 @@ jobs:
             -f target_sha="$new_sha" -f generation_id="$generation_id"
           gh workflow run codex-review.yml --repo "$REPOSITORY" --ref main \
             -f pr_number="$PR_NUMBER" -f target_sha="$new_sha"
-          gh workflow run gui-requirement.yml --repo "$REPOSITORY" --ref main \
-            -f pr_number="$PR_NUMBER" -f target_sha="$new_sha"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=success -f context='hane/claude-fix' \
             -f description="Claude fix completed for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
-          comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI, review, and GUI requirement classification follow-up were dispatched for the new head."
+          comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI and review follow-up were dispatched for the new head."
           if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
             -f body="$comment_body" >/dev/null; then
             echo '::warning::Failed to publish successful-fix notification.'
