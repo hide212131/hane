@@ -34,18 +34,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          has_write_access() {
-            local actor="$1"
-            local permission
-            permission="$(
-              gh api \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/collaborators/${actor}/permission" \
-                --jq '.permission' 2>/dev/null || true
-            )"
-            [[ "$permission" == admin || "$permission" == maintain || "$permission" == write ]]
-          }
-
           if [[ -z "${PR_NUMBER:-}" || -z "${TARGET_SHA:-}" ]]; then
             echo '::error::Missing pr_number or target_sha in the hane-claude-fix dispatch payload.'
             exit 1
@@ -73,12 +61,10 @@ jobs:
           fi
 
           case "$pr_author" in
-            'github-actions[bot]'|'claude[bot]') ;;
+            hide212131|'github-actions[bot]'|'claude[bot]') ;;
             *)
-              if ! has_write_access "$pr_author"; then
-                echo "::error::Pull Request author ${pr_author} is not trusted for automatic Claude fix."
-                exit 1
-              fi
+              echo "::error::Pull Request author ${pr_author} is not trusted for automatic Claude fix."
+              exit 1
               ;;
           esac
 
