@@ -21,6 +21,7 @@ jobs:
       group: copilot-routing-serialized
       cancel-in-progress: false
     permissions:
+      actions: read
       contents: write
       pull-requests: read
       issues: write
@@ -78,6 +79,7 @@ jobs:
             local pr_number="$1"
             local pr state draft target_sha head_repo pr_author short_sha
             local statuses ci_latest ci_state ci_description ci_failure
+            local ordinary_ci ordinary_ci_status ordinary_ci_conclusion ordinary_ci_url
             local semantic_description routing_latest routing_state routing_description routing_created_at routing_age
             local codex_latest codex_state codex_description codex_findings codex_clean trigger_kind
             local review review_id review_url review_body findings_json
@@ -96,9 +98,9 @@ jobs:
               return 0
             fi
 
-            # Hane has one human developer. github-actions[bot] is Hane's own /implement PR creator.
+            # Hane has one human developer. These bots are repository-owned implementation automation.
             case "$pr_author" in
-              hide212131|'github-actions[bot]') ;;
+              hide212131|'github-actions[bot]'|'claude[bot]') ;;
               *) return 0 ;;
             esac
 
@@ -109,8 +111,19 @@ jobs:
             )"
             ci_state="$(cut -f1 <<< "$ci_latest")"
             ci_description="$(cut -f2 <<< "$ci_latest")"
+
+            ordinary_ci="$(
+              gh api "repos/${REPOSITORY}/actions/runs?head_sha=${target_sha}&per_page=100" \
+                --jq '[.workflow_runs[] | select(.name == "CI" and .event == "pull_request")] | max_by(.id) // {} | [.status // "", .conclusion // "", .html_url // ""] | @tsv'
+            )"
+            ordinary_ci_status="$(cut -f1 <<< "$ordinary_ci")"
+            ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
+            ordinary_ci_url="$(cut -f3 <<< "$ordinary_ci")"
+
             ci_failure=false
-            [[ "$ci_state" == failure ]] && ci_failure=true
+            if [[ "$ci_state" == failure || ( "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ) ]]; then
+              ci_failure=true
+            fi
 
             semantic_description="$(
               jq -r \
@@ -189,7 +202,13 @@ jobs:
             fi
 
             ci_evidence="$(
-              jq '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}]' <<< "$statuses"
+              jq \
+                --arg ordinary_status "$ordinary_ci_status" \
+                --arg ordinary_conclusion "$ordinary_ci_conclusion" \
+                --arg ordinary_url "$ordinary_ci_url" \
+                '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
+                 (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
+                <<< "$statuses"
             )"
             files_json="$(
               gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
