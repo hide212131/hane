@@ -94,8 +94,9 @@ jobs:
 
             # Recover a lost Copilot fix -> Claude repository_dispatch. Controller
             # failure statuses are transport failures, not new routing decisions, so
-            # inspect the latest semantic routing decision and deliver it exactly once
-            # when no Claude-fix state exists yet on this SHA.
+            # inspect the latest semantic routing decision. A missing Claude state is
+            # eligible immediately; a pending/running state is eligible only after the
+            # same 55-minute lease used by the receiver has expired.
             routing_decision="$(
               jq -r \
                 --arg fix "Copilot routing: fix for ${short_sha}" \
@@ -104,10 +105,37 @@ jobs:
                 '[.[] | select(.context == "hane/copilot-routing" and (.description == $fix or .description == $cont or .description == $blocked))] | max_by(.id) // {} | .description // ""' \
                 <<< "$statuses"
             )"
-            claude_state_count="$(jq '[.[] | select(.context == "hane/claude-fix")] | length' <<< "$statuses")"
+            claude_latest="$(
+              jq -r \
+                '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' \
+                <<< "$statuses"
+            )"
+            claude_description="${claude_latest%%$'\t'*}"
+            claude_created_at="${claude_latest#*$'\t'}"
+            claude_age="$(status_age_seconds "$claude_created_at")"
 
-            if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" && "$claude_state_count" -eq 0 ]]; then
-              echo "Recovering lost Claude fix dispatch for PR #${pr_number} head ${head_sha}."
+            recover_claude=false
+            if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" ]]; then
+              case "$claude_description" in
+                '')
+                  recover_claude=true
+                  ;;
+                "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
+                  if [[ "$claude_age" -ge 3300 ]]; then
+                    echo "Claude fix lease for ${head_sha} expired after ${claude_age}s; scheduling recovery."
+                    recover_claude=true
+                  fi
+                  ;;
+                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                  ;;
+                *)
+                  echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; fail-closed without redispatch."
+                  ;;
+              esac
+            fi
+
+            if [[ "$recover_claude" == true ]]; then
+              echo "Recovering Claude fix dispatch for PR #${pr_number} head ${head_sha}."
               dispatch_claude_fix "$pr_number" "$head_sha"
             fi
 
