@@ -1,4 +1,5 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci:{0}:{1}', inputs.target_sha, inputs.generation_id) || format('pr-ci:{0}', github.event.pull_request.number) }}
 
 on:
   pull_request:
