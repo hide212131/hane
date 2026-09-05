@@ -123,7 +123,10 @@ jobs:
                 "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
                   [[ "$claude_age" -ge 3300 ]] && recover_claude=true
                   ;;
-                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                "Claude fix controller failed for ${short_sha}")
+                  [[ "$claude_age" -ge 60 ]] && recover_claude=true
+                  ;;
+                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
                   ;;
                 *)
                   echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."
@@ -134,11 +137,13 @@ jobs:
             if [[ "$recover_claude" == true ]]; then
               echo "Recovering Claude fix for PR #${pr_number} head ${head_sha}."
               dispatch_claude_fix "$pr_number" "$head_sha"
+              continue
             fi
 
             pr_commits="$(
-              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                | jq '[.[][] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")} ]'
+              gh api --paginate "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
+                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")}' \
+                | jq -s '.'
             )"
 
             # A worker can push successfully and then fail before publishing completion.
@@ -171,9 +176,9 @@ jobs:
               fi
             done
 
-            head_record="$(jq -c --arg sha "$head_sha" '.[] | select(.sha == $sha)' <<< "$pr_commits")"
-            head_subject="$(jq -r '.subject // ""' <<< "${head_record:-{}}")"
-            head_actor="$(jq -r '.actor // ""' <<< "${head_record:-{}}")"
+            head_record="$(jq -c --arg sha "$head_sha" 'first(.[] | select(.sha == $sha)) // {}' <<< "$pr_commits")"
+            head_subject="$(jq -r '.subject // ""' <<< "$head_record")"
+            head_actor="$(jq -r '.actor // ""' <<< "$head_record")"
 
             # Only an automatic-fix head needs explicit downstream delivery recovery.
             # Ordinary pushes already trigger normal pull_request workflows.

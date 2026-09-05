@@ -115,7 +115,7 @@ jobs:
           created_at="${latest#*$'\t'}"
 
           case "$description" in
-            "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+            "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
               echo "Automatic fix for ${TARGET_SHA} already has a terminal result."
               exit 0
               ;;
@@ -129,6 +129,17 @@ jobs:
                 exit 0
               fi
               echo "Reclaiming expired Claude fix lease for ${TARGET_SHA}."
+              ;;
+            "Claude fix controller failed for ${short_sha}")
+              created_epoch="$(date -d "$created_at" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              age_seconds=999999
+              [[ "$created_epoch" -gt 0 ]] && age_seconds=$((now_epoch - created_epoch))
+              if [[ "$age_seconds" -lt 60 ]]; then
+                echo "Controller failure for ${TARGET_SHA} is still in retry backoff."
+                exit 0
+              fi
+              echo "Retrying previous controller failure for ${TARGET_SHA}."
               ;;
           esac
 
@@ -206,7 +217,7 @@ jobs:
             --arg codex_review_body "$review_body" \
             --argjson codex_findings "$findings_json" \
             --argjson ci_statuses "$ci_statuses" \
-            --arg copilot_fix_reason "$copilot_reason" \
+            --arg copilot_reason "$copilot_reason" \
             --argjson changed_files "$files_json" \
             '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_reason,changed_files:$changed_files}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
