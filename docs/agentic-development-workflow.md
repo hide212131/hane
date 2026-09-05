@@ -400,6 +400,7 @@ owner / write 権限保持者は、対象 Pull Request が open な same-reposit
 
 - `/codex-review` コメント投稿者の実効権限は `/implement` と同じ方法（collaborator permission API、または `OWNER`）で確認し、`write` / `maintain` / `admin` を持たない投稿者のコメントは無視する。
 - controller はレビューを要求する前に対象 Pull Request の現在の head SHA を解決し、以降の判定・記録の対象 SHA として確定する。対象が open な same-repository Pull Request でない場合は起動しない。
+- 加えて、対象 Pull Request の author 自身も信頼できる必要がある。author が `github-actions[bot]` または `claude[bot]` である場合を除き、author が現在 write / maintain / admin 権限を持たない場合は起動しない（`.github/workflows/codex-review.yml` の `Resolve and authorize review target`）。コメント投稿者が owner / write 権限保持者であっても、この author 側の条件を満たさない限り `/codex-review` は失敗する。
 - 確定した head SHA に対して、終端結果を示す `hane/codex-review` commit status（`clean` を示す成功、または `findings` を示す失敗のいずれか）がすでに存在する場合は、その結果を再利用し、新しい Codex request は発行しない。同じ終端 SHA に対して `/codex-review` を繰り返しても重複したレビュー要求は発行されない。
 - 再利用できる終端結果がない場合、controller はまず `hane/codex-review` に `pending` 状態を publish し、その後に確定した head SHA を明記した `@codex review` コメントを投稿する。このコメント投稿には [認証](#認証) の Codex の項で説明した、Codex に接続した repository owner 専用の `CODEX_GITHUB_TOKEN` を使う。
 - Codex はレビュー専用であり、コードを変更しない。
