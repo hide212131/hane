@@ -152,12 +152,29 @@ jobs:
           fi
 
           statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
+          ordinary_ci="$(
+            gh api "repos/${REPOSITORY}/actions/runs?head_sha=${TARGET_SHA}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "CI" and .event == "pull_request")] | max_by(.id) // {} | [.status // "", .conclusion // "", .html_url // ""] | @tsv'
+          )"
+          ordinary_ci_status="$(cut -f1 <<< "$ordinary_ci")"
+          ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
+          ordinary_ci_url="$(cut -f3 <<< "$ordinary_ci")"
+
           ci_statuses="$(
-            jq '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}]' <<< "$statuses"
+            jq \
+              --arg ordinary_status "$ordinary_ci_status" \
+              --arg ordinary_conclusion "$ordinary_ci_conclusion" \
+              --arg ordinary_url "$ordinary_ci_url" \
+              '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
+               (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
+              <<< "$statuses"
           )"
           ci_failure_count="$(
             jq '[.[] | select((.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) and .state == "failure")] | length' <<< "$statuses"
           )"
+          if [[ "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ]]; then
+            ci_failure_count=$((ci_failure_count + 1))
+          fi
           finding_count="$(jq 'length' <<< "$findings_json")"
 
           # A fix may be justified by Codex findings, by trusted CI failure, or both.
