@@ -79,6 +79,23 @@ jobs:
             exit 0
           fi
 
+          # The PR creator is immutable and does not prove who supplied the current
+          # branch tip. Verify the exact target commit itself maps to the owner or one
+          # of the controlled automation identities before exposing Claude credentials
+          # to code from that commit.
+          head_commit="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}")"
+          head_author="$(jq -r '.author.login // ""' <<< "$head_commit")"
+          head_committer="$(jq -r '.committer.login // ""' <<< "$head_commit")"
+          for actor in "$head_author" "$head_committer"; do
+            case "$actor" in
+              hide212131|'github-actions[bot]'|'claude[bot]') ;;
+              *)
+                echo "::error::Exact head ${TARGET_SHA} has untrusted GitHub provenance '${actor:-<unmapped>}'; refusing automatic Claude fix."
+                exit 1
+                ;;
+            esac
+          done
+
           echo 'skip=false' >> "$GITHUB_OUTPUT"
           echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
 
