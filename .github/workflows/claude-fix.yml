@@ -403,7 +403,7 @@ jobs:
             echo 'Do the following and nothing else:'
             echo '- Address the supplied Codex findings and the reason Copilot gave for requiring a fix.'
             echo '- Make the smallest correct change; do not refactor unrelated code.'
-            echo '- Run the relevant Hane checks for what you changed (for example cargo fmt, cargo check, cargo test, cargo clippy) using only the allowed Bash tool commands.'
+            echo '- Run the relevant Hane checks for what you changed. Use whatever normal development commands or network access are useful for implementing and validating the fix.'
             echo '- Leave the resulting changes in the working tree uncommitted. Do not run git commit, git push, git reset, or any other git history command yourself; the workflow verifies the head has not moved and then commits and pushes for you.'
             echo '- Do not approve, merge, bypass CI, or edit any commit status / check yourself.'
             echo
@@ -432,8 +432,7 @@ jobs:
           set +e
           claude -p "$(cat "$RUNNER_TEMP/hane-claude-fix-prompt.txt")" \
             --max-turns 80 \
-            --permission-mode acceptEdits \
-            --allowedTools "Bash(cargo fmt *),Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *)"
+            --permission-mode acceptEdits
           status=$?
           set -e
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
