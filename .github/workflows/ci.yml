@@ -78,7 +78,7 @@ jobs:
     runs-on: macos-latest
     concurrency:
       group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-macos', github.event.pull_request.number) }}
-      cancel-in-progress: false
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
       queue: max
     permissions:
       contents: read
@@ -211,7 +211,7 @@ jobs:
     runs-on: windows-latest
     concurrency:
       group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-windows', github.event.pull_request.number) }}
-      cancel-in-progress: false
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
       queue: max
     permissions:
       contents: read
