@@ -57,10 +57,10 @@ jobs:
             exit 0
           fi
 
-          # Hane has one human developer: hide212131.
-          # github-actions[bot] is allowed because /implement creates PRs through Hane's own workflow.
+          # Hane has one human developer: hide212131. The two bot identities below
+          # are repository-owned implementation automation, not additional developers.
           case "$pr_author" in
-            hide212131|'github-actions[bot]') ;;
+            hide212131|'github-actions[bot]'|'claude[bot]') ;;
             *)
               echo "::warning::PR #${PR_NUMBER} author ${pr_author} is not an automatic-fix source."
               exit 0
@@ -137,22 +137,32 @@ jobs:
               --jq ".[] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .commit_id == \"${TARGET_SHA}\") | [.id, .html_url] | @tsv" \
               | tail -n 1
           )"
-          if [[ -z "$review" ]]; then
-            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-              -f state=error -f context='hane/claude-fix' \
-              -f description="Claude fix blocked: missing evidence for ${short_sha}" \
-              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
-            exit 0
+
+          review_url=''
+          review_body=''
+          findings_json='[]'
+          if [[ -n "$review" ]]; then
+            review_id="${review%%$'\t'*}"
+            review_url="${review#*$'\t'}"
+            review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
+            findings_json="$(
+              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
+                | jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+            )"
           fi
 
-          review_id="${review%%$'\t'*}"
-          review_url="${review#*$'\t'}"
-          review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
-          findings_json="$(
-            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-              | jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+          statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
+          ci_statuses="$(
+            jq '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}]' <<< "$statuses"
           )"
-          if [[ "$(jq 'length' <<< "$findings_json")" -eq 0 ]]; then
+          ci_failure_count="$(
+            jq '[.[] | select((.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) and .state == "failure")] | length' <<< "$statuses"
+          )"
+          finding_count="$(jq 'length' <<< "$findings_json")"
+
+          # A fix may be justified by Codex findings, by trusted CI failure, or both.
+          # CI-only fix routes are valid even when the Codex review is clean.
+          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: missing evidence for ${short_sha}" \
@@ -162,7 +172,7 @@ jobs:
 
           copilot_reason="$(
             gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq ".[] | select((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) | .body" \
+              --jq ".[] | select(((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) or ((.body // \"\") | contains(\"Copilot pre-GUI routing recovery for \`${TARGET_SHA}\`: **fix**\"))) | .body" \
               | tail -n 1
           )"
           files_json="$(
@@ -178,9 +188,10 @@ jobs:
             --arg codex_review_url "$review_url" \
             --arg codex_review_body "$review_body" \
             --argjson codex_findings "$findings_json" \
+            --argjson ci_statuses "$ci_statuses" \
             --arg copilot_fix_reason "$copilot_reason" \
             --argjson changed_files "$files_json" \
-            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,copilot_fix_reason:$copilot_fix_reason,changed_files:$changed_files}' \
+            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_fix_reason,changed_files:$changed_files}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -223,7 +234,7 @@ jobs:
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
-          Fix the Codex findings and the Copilot fix reason in the evidence below.
+          Fix the Codex findings, trusted CI failures, and Copilot fix reason present in the evidence below.
           Use the repository normally: inspect code, run shell commands, Cargo, tests, linters, package managers,
           searches and network tools when useful. Make the smallest correct fix.
           Leave the final changes in the working tree uncommitted. The workflow owns commit and push.
@@ -264,16 +275,17 @@ jobs:
             exit 0
           fi
 
-          # GITHUB_TOKEN cannot push workflow-file changes. Claude may still make them;
-          # publish the exact patch for the sole developer to apply.
+          # GITHUB_TOKEN cannot push workflow-file changes. Claude may still make them.
+          # If any workflow is touched, publish the complete generated fix so the sole
+          # developer can reproduce all of Claude's edits, not just the workflow subset.
           if [[ -n "$(git status --porcelain -- .github/workflows)" ]]; then
-            git add -A .github/workflows
-            git diff --cached --binary -- .github/workflows > "$RUNNER_TEMP/hane-workflow-fix.patch"
-            git reset -- .github/workflows >/dev/null
+            git add -A
+            git diff --cached --binary > "$RUNNER_TEMP/hane-workflow-fix.patch"
+            git reset >/dev/null
 
             {
               echo "Automatic Claude fix for \`${TARGET_SHA}\` includes \`.github/workflows/**\` changes."
-              echo "Apply this exact patch as the repository owner:"
+              echo "Apply this complete generated patch as the repository owner:"
               echo
               echo '```diff'
               cat "$RUNNER_TEMP/hane-workflow-fix.patch"
@@ -305,7 +317,7 @@ jobs:
           git commit -m "$(cat <<EOF
           Automatic Claude fix for Copilot routing decision on ${short_sha}
 
-          Addresses Codex findings and the Copilot pre-GUI routing \"fix\" decision recorded on ${TARGET_SHA}.
+          Addresses the Copilot pre-GUI routing \"fix\" decision recorded on ${TARGET_SHA}.
           EOF
           )"
           new_sha="$(git rev-parse HEAD)"
