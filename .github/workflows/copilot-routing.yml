@@ -266,7 +266,7 @@ jobs:
           findings_json="$(
             gh api --paginate --slurp \
               "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-              --jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+              | jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
           )"
 
           finding_count="$(jq 'length' <<< "$findings_json")"
@@ -279,7 +279,7 @@ jobs:
           files_json="$(
             gh api --paginate --slurp \
               "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-              --jq '[.[][] | {filename, status, additions, deletions}]'
+              | jq '[.[][] | {filename, status, additions, deletions}]'
           )"
           pr_title="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.title')"
 
