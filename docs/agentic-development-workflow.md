@@ -279,6 +279,14 @@ Pull Request review はこの接続を使う。
 
 今回の Codex review では `OPENAI_API_KEY` を GitHub Actions に置かない。
 
+Codex の GitHub integration は `@codex review` コメントの投稿者が Codex に接続された GitHub アカウントであることを要求し、`github-actions[bot]` からの明示的なレビュー依頼コメントは受け付けない。そのため、修正 push 後に Actions から明示的に投稿する `@codex review` コメントだけは、repository owner（Codex に接続した GitHub ユーザー）が所有する fine-grained Personal Access Token を GitHub Actions Secret `CODEX_GITHUB_TOKEN` として保存し、そのコメント投稿1箇所に限定して使う。
+
+- 通常の読み取り、status 公開、stale SHA 判定、review 結果検出、controller failure 処理など、それ以外のすべての操作は引き続き `GITHUB_TOKEN` を使う。
+- `CODEX_GITHUB_TOKEN` が未設定の場合、明示的な `@codex review` コメントは投稿せず fail closed とする。
+- コメント投稿前に、その PAT で認証された GitHub login が `github.repository_owner` と一致することを確認し、一致しない場合も fail closed とする。
+- 明示的レビュー依頼コメントの重複投稿防止（marker 再利用）は、投稿者を `github-actions[bot]` ではなく repository owner として判定する。
+- `CODEX_GITHUB_TOKEN` は上記のコメント投稿以外の API 呼び出しには使わない。
+
 ### Local GUI validator
 
 Local GUI validator はローカル macOS 上で動かす。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
