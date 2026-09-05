@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: copilot-routing-reconcile
+      group: copilot-routing-serialized
       cancel-in-progress: false
     permissions:
       contents: write
