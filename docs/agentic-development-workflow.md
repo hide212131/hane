@@ -14,7 +14,7 @@ Hane の Issue から実装、レビュー、実アプリ検証、修正、マ�
 1つの agent に実装、レビュー、実アプリ検証、進行判断をすべて任せない。
 
 - **Claude Code** は実装を担当する。
-- **Codex** は Pull Request のコードレビューを担当する。
+- **Codex** は Pull Request のコードレビューを担当する。ただし Codex の code review 使用量上限に達したことが明示的に報告された場合に限り、trusted workflow が対象 exact head SHA の review を GitHub Copilot Code Review に置き換える（詳細は下記「Codex」節を参照）。
 - **Local GUI validator** はローカル macOS 上で Hane を起動し、実アプリの GUI 挙動を検証する。
 - **GitHub Copilot** は Codex の指摘、GUI validation、Pull Request、CI の状態を読み、次の処理を判断する。
 - **GitHub Actions** はトリガー、権限、状態遷移、最終的な機械的チェックを担当する。
@@ -111,7 +111,35 @@ Codex はレビュー側に限定する。
 
 Codex review は ChatGPT の Codex と GitHub の連携を使う。GitHub Agentic Workflows の `engine: codex` は使わない。後者は API key 認証となり、今回の「ChatGPT のサブスクリプションで Codex を使う」という方針と異なるためである。
 
-Codex を Copilot Review に置き換える案は当面採用しない。
+Codex review を Copilot judge の推論で恒常的に代替する案は当面採用しない。ただし次の narrow な使用量上限 fallback は例外として本番導入済みである。
+
+#### Codex 使用量上限時の Copilot review fallback
+
+`chatgpt-codex-connector[bot]` が Pull Request コメントで **Codex の code review 使用量上限** に達したことを明示的に報告した場合に限り、trusted workflow（`codex-limit-copilot-fallback.yml`）がその exact head SHA の review を GitHub Copilot Code Review に置き換える。
+
+- 対象は次のいずれかの文言を含む `chatgpt-codex-connector[bot]` からのコメントのみとする。
+  - `You have reached your Codex usage limits for code reviews.`
+  - `Codex usage limits have been reached for code reviews.`
+- これは Codex の **一般的な失敗** に対する fallback ではない。timeout、結果不明、controller error、証跡不備、判定できない状態はこれまでどおり fail closed のままとし、Copilot への置き換えは行わない。
+- fallback が有効なのは、対象 Pull Request が open かつ non-draft、同一リポジトリ、かつ信頼できる author（`/implement` を起動できる owner / write 権限保持者、または `github-actions[bot]` / `claude[bot]` などの信頼した自動化経路）が作成した場合に限る。条件を満たさない場合は何もせず終了する。
+- fallback は常に現在の exact head SHA に紐づく。処理中に PR の head SHA が変わった場合、その fallback は stale として扱い進めない。
+- 対象 SHA にすでに `copilot-pull-request-reviewer[bot]` の exact-head review があれば、新たに review を要求せずそれを再利用する。対象 SHA の `hane/codex-review` がすでに `clean` / `findings` の終端状態であれば、fallback 自体が不要と判断してそのまま終了する。
+
+##### 記録される context（provenance と互換性）
+
+- `hane/review-source` は、その SHA の review を実際にどちらが行ったかを記録する。Copilot fallback を使った場合は `Review source: Copilot fallback for <short-sha>` を記録する。
+- `hane/codex-review` は既存の後続 phase が消費する **互換 context** として維持し、review の実施者が Copilot であっても `clean` / `findings` の終端 semantics をそのまま設定する（context 名は変えない）。
+- そのため、review の provenance（実際の実施者）を知りたい後続処理や運用者は、`hane/codex-review` の文言だけから実施者を推測せず、`hane/review-source` を確認する必要がある。
+
+##### 後続処理への接続
+
+- Copilot fallback が `findings` を返した場合、または対象 SHA の CI が失敗している場合、この workflow 自身が `hane/copilot-routing` に `fix` を記録し、Claude fix workflow を dispatch する。既存の終端 `hane/copilot-routing` 結果（`fix` / `blocked` / `continue-validation` のいずれか）がすでにあれば、新たな判断はせずそれを再利用する。fallback 経路が新規に記録するのは `fix` のみであり、`continue-validation` を新たに生成することはない。
+- Claude fix の証跡収集（`claude-fix.yml`）は `hane/review-source` の fallback marker を検知すると、review の参照元を `chatgpt-codex-connector[bot]` ではなく `copilot-pull-request-reviewer[bot]` に切り替え、その exact-head review 本文と inline comment（finding）を読む。
+- fallback の結果が `clean` で CI も成功している場合は、通常の Codex clean review と同じ経路（GUI validation 要否判定などの既存ルール）で処理を継続する。
+
+##### 実運用実績
+
+この fallback は #69 で実装した。PR #60 の head `c878cec39731af036f537506138f34a8828bb053` で、Codex の使用量上限到達を観測し、exact head に対する Copilot Code Review が clean で完了し、`hane/review-source` に Copilot fallback が記録され、互換 context `hane/codex-review` も終端 `clean` になったことをライブで確認済みである。
 
 ### Local GUI validator
 
@@ -309,7 +337,8 @@ Hane は個人所有リポジトリなので、GitHub Agentic Workflows の Copi
 - 対象 Pull Request 番号
 - current head SHA
 - Codex-reviewed SHA
-- Codex outcome: `clean` / `findings`
+- Codex outcome: `clean` / `findings`（`hane/codex-review` に記録する互換 context。実施者が Codex か Copilot fallback かは含まない）
+- review source: `codex` / `copilot-fallback`（`hane/review-source` に記録する provenance）
 - GUI-classified SHA
 - GUI validation required?
 - GUI requirement classification source / policy version
@@ -392,7 +421,8 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 - Codex review の完了は、記録した head SHA を対象とする submitted review、または指摘なしを示す終端 reaction（👍）のいずれかが観測できた場合のみ true とする。👀 のみの状態では次へ進まない。
 - 👍 の場合は Codex outcome を `clean` とする。submitted review があり、同じ review に inline comment / suggestion がある場合は `findings` とする。
 - `findings` の場合は Local GUI validation を直接起動せず、まず Copilot pre-GUI routing を起動する。
-- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
+- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。timeout、結果不明、controller error、証跡不備はすべてこの fail closed 経路であり、Copilot への置き換え対象ではない。
+- 例外は「Codex 使用量上限時の Copilot review fallback」節で定義した narrow なケースのみである。`chatgpt-codex-connector[bot]` が code review 使用量上限到達を明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換え、`hane/codex-review` に終端 `clean` / `findings` を、`hane/review-source` に provenance を記録する。
 
 ### GUI requirement classification
 
@@ -522,6 +552,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - Pull Request の最新 head SHA に Codex review を実行する。
 - review 完了と `clean` / `findings` を head SHA と対応付けて次の処理へ渡せるようにする。
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
+- Codex の code review 使用量上限を `chatgpt-codex-connector[bot]` が明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換える（#69 で実装、PR #60 head `c878cec39731af036f537506138f34a8828bb053` でライブ確認済み）。詳細は「Codex」節の「Codex 使用量上限時の Copilot review fallback」を参照。
 
 ### Phase 4: Local GUI validation
 
