@@ -13,8 +13,10 @@ jobs:
       ${{
         github.event.issue.pull_request
         && github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
-        && contains(github.event.comment.body, 'Codex usage limits')
-        && contains(github.event.comment.body, 'code reviews')
+        && (
+          contains(github.event.comment.body, 'You have reached your Codex usage limits for code reviews.')
+          || contains(github.event.comment.body, 'Codex usage limits have been reached for code reviews.')
+        )
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
