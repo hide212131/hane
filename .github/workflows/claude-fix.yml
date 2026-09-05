@@ -211,7 +211,7 @@ jobs:
               echo "Claude fix already completed for ${TARGET_SHA}; skipping duplicate worker."
               proceed=false
               ;;
-            "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}")
+            "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
               echo "Claude fix for ${TARGET_SHA} already reached a terminal blocked/error state; skipping."
               proceed=false
               ;;
@@ -410,7 +410,7 @@ jobs:
             echo '```evidence'
             cat "$RUNNER_TEMP/hane-claude-fix-evidence.json"
             echo '```'
-          } > fix_prompt.txt
+          } > "$RUNNER_TEMP/hane-claude-fix-prompt.txt"
 
       - name: Set up Node.js
         if: ${{ steps.target.outputs.skip != 'true' && steps.routing.outputs.ok == 'true' && steps.cap.outputs.blocked == 'false' && steps.lease.outputs.proceed == 'true' && steps.evidence.outputs.missing_evidence == 'false' }}
@@ -430,7 +430,7 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set +e
-          claude -p "$(cat fix_prompt.txt)" \
+          claude -p "$(cat "$RUNNER_TEMP/hane-claude-fix-prompt.txt")" \
             --max-turns 80 \
             --permission-mode acceptEdits \
             --allowedTools "Bash(cargo fmt *),Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *)"
