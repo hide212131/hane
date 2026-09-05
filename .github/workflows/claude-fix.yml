@@ -110,7 +110,7 @@ jobs:
 
           latest="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+              --jq "[.[] | select(.context == \"hane/copilot-routing\" and .state == \"failure\" and .description == \"Copilot routing: fix for ${short_sha}\")] | max_by(.id) // {} | [.state // \"\", .description // \"\"] | @tsv"
           )"
           state="${latest%%$'\t'*}"
           description="${latest#*$'\t'}"
@@ -118,7 +118,7 @@ jobs:
           if [[ "$state" == failure && "$description" == "Copilot routing: fix for ${short_sha}" ]]; then
             echo 'ok=true' >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::No terminal Copilot routing 'fix' result found on ${TARGET_SHA} (state='${state}', description='${description}'); refusing automatic Claude fix."
+            echo "::warning::No semantic Copilot routing 'fix' result found on ${TARGET_SHA} (state='${state}', description='${description}'); refusing automatic Claude fix."
             echo 'ok=false' >> "$GITHUB_OUTPUT"
           fi
 
@@ -318,9 +318,9 @@ jobs:
               codex_findings: $codex_findings,
               copilot_fix_reason: $copilot_fix_reason,
               changed_files: $changed_files
-            }' > evidence.json
+            }' > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
-          finding_count="$(jq '.codex_findings | length' evidence.json)"
+          finding_count="$(jq '.codex_findings | length' "$RUNNER_TEMP/hane-claude-fix-evidence.json")"
           if [[ "$finding_count" -eq 0 ]]; then
             echo "::warning::No exact-SHA Codex findings available for ${TARGET_SHA}; missing evidence."
             echo 'missing_evidence=true' >> "$GITHUB_OUTPUT"
@@ -408,7 +408,7 @@ jobs:
             echo '- Do not approve, merge, bypass CI, or edit any commit status / check yourself.'
             echo
             echo '```evidence'
-            cat evidence.json
+            cat "$RUNNER_TEMP/hane-claude-fix-evidence.json"
             echo '```'
           } > fix_prompt.txt
 
