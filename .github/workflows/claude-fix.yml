@@ -102,8 +102,11 @@ jobs:
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: max iterations for ${short_sha}" \
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
-            gh issue comment "$PR_NUMBER" --repo "$REPOSITORY" \
-              --body "Automatic Claude fix stopped after 3 completed fixes. Human review is required."
+            comment_body='Automatic Claude fix stopped after 3 completed fixes. Human review is required.'
+            if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$comment_body" >/dev/null; then
+              echo '::warning::Failed to publish max-iteration notification.'
+            fi
             exit 0
           fi
 
@@ -367,8 +370,11 @@ jobs:
             -f state=success -f context='hane/claude-fix' \
             -f description="Claude fix completed for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
-          gh issue comment "$PR_NUMBER" --repo "$REPOSITORY" \
-            --body "Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI and Codex review were dispatched for the new head."
+          comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI and review follow-up were dispatched for the new head."
+          if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$comment_body" >/dev/null; then
+            echo '::warning::Failed to publish successful-fix notification.'
+          fi
           echo 'published=true' >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow fix patch
@@ -392,12 +398,15 @@ jobs:
           short_sha="${TARGET_SHA:0:12}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           artifact_name="hane-workflow-fix-${TARGET_SHA}"
-          gh issue comment "$PR_NUMBER" --repo "$REPOSITORY" \
-            --body "Automatic Claude fix for \`${TARGET_SHA}\` includes \`.github/workflows/**\` changes. The complete binary-capable patch is saved as artifact \`${artifact_name}\` on ${run_url}. Apply it as the repository owner with \`git apply --binary\`."
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix blocked: workflow patch requires owner for ${short_sha}" \
             -f target_url="$run_url" >/dev/null
+          comment_body="Automatic Claude fix for \`${TARGET_SHA}\` includes \`.github/workflows/**\` changes. The complete binary-capable patch is saved as artifact \`${artifact_name}\` on ${run_url}. Apply it as the repository owner with \`git apply --binary\`."
+          if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$comment_body" >/dev/null; then
+            echo '::warning::Failed to publish workflow-fix handoff notification.'
+          fi
 
       - name: Publish Claude execution failure
         if: ${{ steps.target.outputs.proceed == 'true' && steps.claude.outputs.exit_code != '0' }}
@@ -424,6 +433,17 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
+          latest="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+          )"
+          latest_description="$(cut -f2 <<< "$latest")"
+          case "$latest_description" in
+            "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+              echo "Existing Claude fix terminal state '${latest_description}' is authoritative; not overwriting it with controller failure."
+              exit 0
+              ;;
+          esac
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix controller failed for ${short_sha}" \
