@@ -191,43 +191,49 @@ jobs:
                 <<< "$statuses"
             )"
             ci_state="$(cut -f1 <<< "$generation_latest")"
-            ci_description="$(cut -f2 <<< "$generation_latest")"
             ci_created_at="$(cut -f3 <<< "$generation_latest")"
             ci_age="$(status_age_seconds "$ci_created_at")"
 
-            # Both success and genuine test failure are terminal. Only lost/error or an
-            # expired pending delivery is retried. This job is serialized, so one expired
-            # lease can produce at most one replacement dispatch at a time.
+            # Both success and genuine test failure are terminal. For every other candidate,
+            # re-read exact-head state immediately before claiming recovery so a just-pushed
+            # worker cannot race the reconciler through the brief missing-status window.
             [[ "$ci_state" == success || "$ci_state" == failure ]] && continue
 
-            should_dispatch_ci=false
+            recovery_candidate=false
             if [[ -z "$ci_state" || "$ci_state" == error ]]; then
-              should_dispatch_ci=true
+              recovery_candidate=true
             elif [[ "$ci_state" == pending && "$ci_age" -ge 1800 ]]; then
-              # Refresh after acquiring the reconciler-wide concurrency lock so an older
-              # observation cannot create a duplicate replacement generation.
-              refreshed="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
-              refreshed_latest="$(
-                jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .created_at // ""] | @tsv' <<< "$refreshed"
-              )"
-              refreshed_state="$(cut -f1 <<< "$refreshed_latest")"
-              refreshed_created_at="$(cut -f2 <<< "$refreshed_latest")"
-              refreshed_age="$(status_age_seconds "$refreshed_created_at")"
-              [[ "$refreshed_state" == pending && "$refreshed_age" -ge 1800 ]] && should_dispatch_ci=true
+              recovery_candidate=true
             fi
+            [[ "$recovery_candidate" == true ]] || continue
 
-            if [[ "$should_dispatch_ci" == true ]]; then
-              generation_id=""
-              [[ "$ci_description" == 'Trusted CI generation '* ]] && generation_id="${ci_description#Trusted CI generation }"
-              [[ -n "$generation_id" ]] || generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
+            refreshed="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
+            refreshed_latest="$(
+              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' <<< "$refreshed"
+            )"
+            refreshed_state="$(cut -f1 <<< "$refreshed_latest")"
+            refreshed_description="$(cut -f2 <<< "$refreshed_latest")"
+            refreshed_created_at="$(cut -f3 <<< "$refreshed_latest")"
+            refreshed_age="$(status_age_seconds "$refreshed_created_at")"
 
-              gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
-                -f state=pending -f context='hane/trusted-ci-generation' \
-                -f description="Trusted CI generation ${generation_id}" \
-                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
-
-              echo "Recovering trusted CI generation ${generation_id} for ${head_sha}."
-              gh workflow run ci.yml --repo "$REPOSITORY" --ref main \
-                -f target_sha="$head_sha" -f generation_id="$generation_id"
+            should_dispatch_ci=false
+            if [[ -z "$refreshed_state" || "$refreshed_state" == error ]]; then
+              should_dispatch_ci=true
+            elif [[ "$refreshed_state" == pending && "$refreshed_age" -ge 1800 ]]; then
+              should_dispatch_ci=true
             fi
+            [[ "$should_dispatch_ci" == true ]] || continue
+
+            generation_id=""
+            [[ "$refreshed_description" == 'Trusted CI generation '* ]] && generation_id="${refreshed_description#Trusted CI generation }"
+            [[ -n "$generation_id" ]] || generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
+
+            gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
+              -f state=pending -f context='hane/trusted-ci-generation' \
+              -f description="Trusted CI generation ${generation_id}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+            echo "Recovering trusted CI generation ${generation_id} for ${head_sha}."
+            gh workflow run ci.yml --repo "$REPOSITORY" --ref main \
+              -f target_sha="$head_sha" -f generation_id="$generation_id"
           done
