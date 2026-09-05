@@ -17,14 +17,17 @@ jobs:
   reconcile:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: claude-fix-reconcile-serialized
+      cancel-in-progress: false
     permissions:
       actions: write
-      contents: read
+      contents: write
       pull-requests: read
       statuses: write
 
     steps:
-      - name: Reconcile trusted routing and automatic-fix transitions
+      - name: Reconcile trusted automatic-fix transitions
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -38,7 +41,7 @@ jobs:
           fi
 
           now_epoch="$(date -u +%s)"
-          prefix='Automatic Claude fix for Copilot routing decision on '
+          fix_prefix='Automatic Claude fix for Copilot routing decision on '
 
           status_age_seconds() {
             local created_at="$1"
@@ -59,17 +62,20 @@ jobs:
               jq -n \
                 --argjson pr_number "$pr_number" \
                 --arg target_sha "$target_sha" \
-                '{event_type: "hane-claude-fix", client_payload: {pr_number: $pr_number, target_sha: $target_sha}}'
+                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}'
             )"
-            gh api \
-              --method POST \
-              "repos/${REPOSITORY}/dispatches" \
-              --input - <<< "$payload"
+            gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$payload"
+          }
+
+          is_trusted_pr_author() {
+            case "$1" in
+              hide212131|'github-actions[bot]'|'claude[bot]') return 0 ;;
+              *) return 1 ;;
+            esac
           }
 
           prs="$(
-            gh api --paginate --slurp \
-              "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
               | jq '[.[][] | select(.draft == false and .head.repo.full_name == .base.repo.full_name)]'
           )"
 
@@ -79,24 +85,16 @@ jobs:
             pr_author="$(jq -r '.user.login' <<< "$pr")"
             short_sha="${head_sha:0:12}"
 
-            case "$pr_author" in
-              hide212131|'github-actions[bot]'|'claude[bot]') ;;
-              *) continue ;;
-            esac
+            is_trusted_pr_author "$pr_author" || continue
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
-
             routing_decision="$(
-              jq -r \
-                --arg fix "Copilot routing: fix for ${short_sha}" \
-                --arg cont "Copilot routing: continue-validation for ${short_sha}" \
-                --arg blocked "Copilot routing: blocked for ${short_sha}" \
-                '[.[] | select(.context == "hane/copilot-routing" and (.description == $fix or .description == $cont or .description == $blocked))] | max_by(.id) // {} | .description // ""' \
+              jq -r --arg fix "Copilot routing: fix for ${short_sha}" \
+                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | .description // ""' \
                 <<< "$statuses"
             )"
             claude_latest="$(
-              jq -r \
-                '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' \
+              jq -r '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' \
                 <<< "$statuses"
             )"
             claude_description="${claude_latest%%$'\t'*}"
@@ -106,134 +104,90 @@ jobs:
             recover_claude=false
             if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" ]]; then
               case "$claude_description" in
-                '')
-                  recover_claude=true
-                  ;;
+                '') recover_claude=true ;;
                 "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
-                  if [[ "$claude_age" -ge 3300 ]]; then
-                    echo "Claude fix lease for ${head_sha} expired after ${claude_age}s; scheduling recovery."
-                    recover_claude=true
-                  fi
+                  [[ "$claude_age" -ge 3300 ]] && recover_claude=true
                   ;;
                 "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix controller failed for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
                   ;;
                 *)
-                  echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; fail-closed without redispatch."
+                  echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."
                   ;;
               esac
             fi
 
             if [[ "$recover_claude" == true ]]; then
-              echo "Recovering Claude fix dispatch for PR #${pr_number} head ${head_sha}."
+              echo "Recovering Claude fix for PR #${pr_number} head ${head_sha}."
               dispatch_claude_fix "$pr_number" "$head_sha"
             fi
 
             pr_commits="$(
-              gh api --paginate --slurp \
-                "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                | jq '[.[][] | {
-                    sha,
-                    subject: (.commit.message | split("\n")[0]),
-                    actor: (.author.login // .committer.login // "")
-                  }]'
+              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
+                | jq '[.[][] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")} ]'
             )"
 
-            # Repair completion bookkeeping for every trusted automatic-fix commit in
-            # the PR, not only for the current head. This survives a later manual or
-            # automation commit arriving before reconciliation.
+            # A worker can push successfully and then fail before publishing completion.
+            # Repair the old target-SHA completion evidence from trusted automatic-fix commits.
             jq -c '.[]' <<< "$pr_commits" | while IFS= read -r commit_record; do
               fix_sha="$(jq -r '.sha' <<< "$commit_record")"
               subject="$(jq -r '.subject' <<< "$commit_record")"
-              commit_actor="$(jq -r '.actor' <<< "$commit_record")"
+              actor="$(jq -r '.actor' <<< "$commit_record")"
+              [[ "$actor" == 'github-actions[bot]' && "$subject" == "${fix_prefix}"* ]] || continue
 
-              if [[ "$subject" != "${prefix}"* || "$commit_actor" != 'github-actions[bot]' ]]; then
-                continue
-              fi
-
-              old_short="${subject#${prefix}}"
-              if [[ ! "$old_short" =~ ^[0-9a-f]{12}$ ]]; then
-                echo "::warning::PR #${pr_number} automatic-fix commit ${fix_sha} has malformed predecessor marker '${old_short}'."
-                continue
-              fi
+              old_short="${subject#${fix_prefix}}"
+              [[ "$old_short" =~ ^[0-9a-f]{12}$ ]] || continue
 
               predecessor_matches="$(
-                jq -r --arg short "$old_short" \
-                  '.[] | select(.sha | startswith($short)) | .sha' \
-                  <<< "$pr_commits"
+                jq -r --arg short "$old_short" '.[] | select(.sha|startswith($short)) | .sha' <<< "$pr_commits"
               )"
               predecessor_count="$(grep -c . <<< "$predecessor_matches" || true)"
-              if [[ "$predecessor_count" -ne 1 ]]; then
-                echo "::warning::Could not uniquely resolve predecessor ${old_short} for PR #${pr_number}; refusing completion repair."
-                continue
-              fi
+              [[ "$predecessor_count" -eq 1 ]] || continue
               predecessor_sha="$(head -n 1 <<< "$predecessor_matches")"
 
-              predecessor_statuses="$(gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100")"
-              predecessor_completion="$(
-                jq -r \
-                  --arg desc "Claude fix completed for ${old_short}" \
-                  '[.[] | select(.context == "hane/claude-fix" and .state == "success" and .description == $desc)] | length' \
-                  <<< "$predecessor_statuses"
+              completion_count="$(
+                gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100" \
+                  --jq "[.[] | select(.context == \"hane/claude-fix\" and .state == \"success\" and .description == \"Claude fix completed for ${old_short}\")] | length"
               )"
-
-              if [[ "$predecessor_completion" -eq 0 ]]; then
-                echo "Repairing Claude completion state for predecessor ${predecessor_sha} -> ${fix_sha}."
-                gh api \
-                  --method POST \
-                  "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
-                  -f state=success \
-                  -f context='hane/claude-fix' \
+              if [[ "$completion_count" -eq 0 ]]; then
+                gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
+                  -f state=success -f context='hane/claude-fix' \
                   -f description="Claude fix completed for ${old_short}" \
-                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" \
-                  >/dev/null
+                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null
               fi
             done
 
-            head_record="$(
-              jq -c --arg sha "$head_sha" \
-                '.[] | select(.sha == $sha)' \
-                <<< "$pr_commits"
-            )"
+            head_record="$(jq -c --arg sha "$head_sha" '.[] | select(.sha == $sha)' <<< "$pr_commits")"
             head_subject="$(jq -r '.subject // ""' <<< "${head_record:-{}}")"
             head_actor="$(jq -r '.actor // ""' <<< "${head_record:-{}}")"
 
-            # Only a current head written by the Claude-fix workflow needs explicit
-            # downstream recovery; ordinary later commits trigger the normal PR flows.
-            if [[ "$head_subject" != "${prefix}"* || "$head_actor" != 'github-actions[bot]' ]]; then
+            # Only an automatic-fix head needs explicit downstream delivery recovery.
+            # Ordinary pushes already trigger normal pull_request workflows.
+            if [[ "$head_actor" != 'github-actions[bot]' || "$head_subject" != "${fix_prefix}"* ]]; then
               continue
             fi
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
 
             codex_latest="$(
-              jq -r \
-                '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' \
+              jq -r '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' \
                 <<< "$statuses"
             )"
             codex_state="$(cut -f1 <<< "$codex_latest")"
             codex_description="$(cut -f2 <<< "$codex_latest")"
             codex_created_at="$(cut -f3 <<< "$codex_latest")"
             codex_age="$(status_age_seconds "$codex_created_at")"
-
             codex_terminal=false
-            if [[ "$codex_state" == success && "$codex_description" == "Codex review clean for ${short_sha}" ]]; then
-              codex_terminal=true
-            elif [[ "$codex_state" == failure && "$codex_description" == "Codex findings for ${short_sha}" ]]; then
-              codex_terminal=true
-            fi
+            [[ "$codex_state" == success && "$codex_description" == "Codex review clean for ${short_sha}" ]] && codex_terminal=true
+            [[ "$codex_state" == failure && "$codex_description" == "Codex findings for ${short_sha}" ]] && codex_terminal=true
 
             if [[ "$codex_terminal" != true && ! ( "$codex_state" == pending && "$codex_age" -lt 1200 ) ]]; then
-              echo "Re-dispatching Codex review for PR #${pr_number} head ${head_sha}."
-              gh workflow run codex-review.yml \
-                --repo "$REPOSITORY" \
-                --ref main \
-                -f pr_number="$pr_number" \
-                -f target_sha="$head_sha"
+              echo "Recovering Codex review delivery for PR #${pr_number} head ${head_sha}."
+              gh workflow run codex-review.yml --repo "$REPOSITORY" --ref main \
+                -f pr_number="$pr_number" -f target_sha="$head_sha"
             fi
 
             generation_latest="$(
-              jq -r \
-                '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' \
+              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' \
                 <<< "$statuses"
             )"
             ci_state="$(cut -f1 <<< "$generation_latest")"
@@ -241,43 +195,39 @@ jobs:
             ci_created_at="$(cut -f3 <<< "$generation_latest")"
             ci_age="$(status_age_seconds "$ci_created_at")"
 
-            # success and failure are both terminal CI outcomes. Reconciliation is for
-            # lost/expired delivery only; it must not turn a real test failure into a
-            # retry that can later overwrite the evidence.
-            if [[ "$ci_state" == success || "$ci_state" == failure ]]; then
-              continue
-            fi
-
-            generation_id=""
-            if [[ "$ci_description" == 'Trusted CI generation '* ]]; then
-              generation_id="${ci_description#Trusted CI generation }"
-            fi
-            if [[ -z "$generation_id" ]]; then
-              generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
-            fi
+            # Both success and genuine test failure are terminal. Only lost/error or an
+            # expired pending delivery is retried. This job is serialized, so one expired
+            # lease can produce at most one replacement dispatch at a time.
+            [[ "$ci_state" == success || "$ci_state" == failure ]] && continue
 
             should_dispatch_ci=false
             if [[ -z "$ci_state" || "$ci_state" == error ]]; then
               should_dispatch_ci=true
             elif [[ "$ci_state" == pending && "$ci_age" -ge 1800 ]]; then
-              should_dispatch_ci=true
+              # Refresh after acquiring the reconciler-wide concurrency lock so an older
+              # observation cannot create a duplicate replacement generation.
+              refreshed="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
+              refreshed_latest="$(
+                jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .created_at // ""] | @tsv' <<< "$refreshed"
+              )"
+              refreshed_state="$(cut -f1 <<< "$refreshed_latest")"
+              refreshed_created_at="$(cut -f2 <<< "$refreshed_latest")"
+              refreshed_age="$(status_age_seconds "$refreshed_created_at")"
+              [[ "$refreshed_state" == pending && "$refreshed_age" -ge 1800 ]] && should_dispatch_ci=true
             fi
 
             if [[ "$should_dispatch_ci" == true ]]; then
-              echo "Re-dispatching trusted CI generation ${generation_id} for ${head_sha}."
-              gh api \
-                --method POST \
-                "repos/${REPOSITORY}/statuses/${head_sha}" \
-                -f state=pending \
-                -f context='hane/trusted-ci-generation' \
-                -f description="Trusted CI generation ${generation_id}" \
-                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-                >/dev/null
+              generation_id=""
+              [[ "$ci_description" == 'Trusted CI generation '* ]] && generation_id="${ci_description#Trusted CI generation }"
+              [[ -n "$generation_id" ]] || generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
 
-              gh workflow run ci.yml \
-                --repo "$REPOSITORY" \
-                --ref main \
-                -f target_sha="$head_sha" \
-                -f generation_id="$generation_id"
+              gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
+                -f state=pending -f context='hane/trusted-ci-generation' \
+                -f description="Trusted CI generation ${generation_id}" \
+                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+              echo "Recovering trusted CI generation ${generation_id} for ${head_sha}."
+              gh workflow run ci.yml --repo "$REPOSITORY" --ref main \
+                -f target_sha="$head_sha" -f generation_id="$generation_id"
             fi
           done
