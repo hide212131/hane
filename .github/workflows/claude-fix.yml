@@ -131,6 +131,14 @@ jobs:
               echo "Reclaiming expired Claude fix lease for ${TARGET_SHA}."
               ;;
             "Claude fix controller failed for ${short_sha}")
+              created_epoch="$(date -d "$created_at" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              age_seconds=999999
+              [[ "$created_epoch" -gt 0 ]] && age_seconds=$((now_epoch - created_epoch))
+              if [[ "$age_seconds" -lt 60 ]]; then
+                echo "Controller failure for ${TARGET_SHA} is still in retry backoff."
+                exit 0
+              fi
               echo "Retrying previous controller failure for ${TARGET_SHA}."
               ;;
           esac
