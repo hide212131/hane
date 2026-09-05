@@ -1,12 +1,35 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
       "Bash(cargo fmt *)",
-      "Bash(echo \"---FMT_EXIT:$?\")",
-      "Bash(sed 's/:[0-9]*:$//')",
-      "Bash(perl -0pi -e 's/\\(\\\\n\\(\\\\s+\\)invalid: false,\\\\n\\\\s+disclosure\\)/\\\\n$2invalid: false,\\\\n$2context: LineContext::Normal,\\\\n$2disclosure/g' crates/presentation/src/lib.rs)",
       "Bash(cargo check *)",
-      "Bash(perl -pi -e 's/presented_line\\\\\\(\\(&self\\\\.editor|&editor\\), \\(\\\\w+|\\\\d+\\), false, false\\\\\\)/presented_line\\($1, $2, LineContext::Normal\\)/g' crates/ui/src/view.rs)"
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)"
     ]
+  },
+  "env": {
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "network": {
+      "allowedDomains": [
+        "crates.io",
+        "index.crates.io",
+        "static.crates.io"
+      ]
+    }
   }
 }
