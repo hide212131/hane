@@ -17,10 +17,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-dispatch-{0}', github.run_id) }}
-  cancel-in-progress: true
-
 jobs:
   claim_trusted_ci_generation:
     name: Reclaim trusted CI generation
