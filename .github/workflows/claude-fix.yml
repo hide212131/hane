@@ -146,9 +146,20 @@ jobs:
               ;;
           esac
 
+          review_source='codex'
+          review_bot='chatgpt-codex-connector[bot]'
+          fallback_marker="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq "[.[] | select(.context == \"hane/review-source\" and .state == \"success\" and .description == \"Review source: Copilot fallback for ${short_sha}\")] | max_by(.id) // {} | .description // \"\""
+          )"
+          if [[ "$fallback_marker" == "Review source: Copilot fallback for ${short_sha}" ]]; then
+            review_source='copilot-fallback'
+            review_bot='copilot-pull-request-reviewer[bot]'
+          fi
+
           review="$(
             gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
-              --jq ".[] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .commit_id == \"${TARGET_SHA}\") | [.id, .html_url] | @tsv" \
+              --jq ".[] | select(.user.login == \"${review_bot}\" and .commit_id == \"${TARGET_SHA}\") | [.id, .html_url] | @tsv" \
               | tail -n 1
           )"
 
@@ -161,7 +172,7 @@ jobs:
             review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
             findings_json="$(
               gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-                | jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+                | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
             )"
           fi
 
@@ -191,8 +202,8 @@ jobs:
           fi
           finding_count="$(jq 'length' <<< "$findings_json")"
 
-          # A fix may be justified by Codex findings, by trusted CI failure, or both.
-          # CI-only fix routes are valid even when the Codex review is clean.
+          # A fix may be justified by reviewer findings, by trusted CI failure, or both.
+          # CI-only fix routes are valid even when the reviewer is clean.
           if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
@@ -216,13 +227,17 @@ jobs:
             --argjson pr_number "$PR_NUMBER" \
             --arg target_sha "$TARGET_SHA" \
             --arg pr_title "$pr_title" \
+            --arg review_source "$review_source" \
+            --arg review_url "$review_url" \
+            --arg review_body "$review_body" \
+            --argjson review_findings "$findings_json" \
             --arg codex_review_url "$review_url" \
             --arg codex_review_body "$review_body" \
             --argjson codex_findings "$findings_json" \
             --argjson ci_statuses "$ci_statuses" \
             --arg copilot_reason "$copilot_reason" \
             --argjson changed_files "$files_json" \
-            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_reason,changed_files:$changed_files}' \
+            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_reason,changed_files:$changed_files}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -265,7 +280,7 @@ jobs:
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
-          Fix the Codex findings, trusted CI failures, and Copilot fix reason present in the evidence below.
+          Fix the reviewer findings, trusted CI failures, and Copilot fix reason present in the evidence below.
           Use the repository normally: inspect code, run shell commands, Cargo, tests, linters, package managers,
           searches and network tools when useful. Make the smallest correct fix.
           Leave the final changes in the working tree uncommitted. The workflow owns commit and push.
