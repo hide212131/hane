@@ -75,6 +75,10 @@ jobs:
     needs: claim_trusted_ci_generation
     if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: macos-latest
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-macos', github.event.pull_request.number) }}
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       statuses: write
@@ -204,6 +208,10 @@ jobs:
     needs: claim_trusted_ci_generation
     if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
     runs-on: windows-latest
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pull-request-ci-{0}-windows', github.event.pull_request.number) }}
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       statuses: write
