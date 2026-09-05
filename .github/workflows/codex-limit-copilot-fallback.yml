@@ -23,7 +23,7 @@ jobs:
       queue: max
     permissions:
       actions: read
-      contents: read
+      contents: write
       issues: write
       pull-requests: write
       statuses: write
@@ -235,6 +235,14 @@ jobs:
               -f body="$comment_body" >/dev/null; then
               echo '::warning::Failed to publish fallback routing explanation; commit statuses remain authoritative.'
             fi
+
+            dispatch_payload="$(
+              jq -n \
+                --argjson pr_number "$PR_NUMBER" \
+                --arg target_sha "$target_sha" \
+                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}'
+            )"
+            gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$dispatch_payload"
           else
             comment_body="Codex review usage limit reached for \`${target_sha}\`; Copilot fallback review completed clean with exact-head evidence."
             if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
