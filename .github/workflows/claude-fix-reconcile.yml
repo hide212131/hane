@@ -74,19 +74,19 @@ jobs:
             esac
           }
 
-          ci_run_is_active() {
-            local target_url="$1"
-            local run_id run run_name run_event run_status
-            if [[ ! "$target_url" =~ /actions/runs/([0-9]+)$ ]]; then
-              return 1
-            fi
-            run_id="${BASH_REMATCH[1]}"
-            run="$(gh api "repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
-            [[ -n "$run" ]] || return 1
-            run_name="$(jq -r '.name // ""' <<< "$run")"
-            run_event="$(jq -r '.event // ""' <<< "$run")"
-            run_status="$(jq -r '.status // ""' <<< "$run")"
-            [[ "$run_name" == CI && "$run_event" == workflow_dispatch && "$run_status" != completed ]]
+          ci_generation_run_is_active() {
+            local target_sha="$1"
+            local generation_id="$2"
+            local expected_title active_run
+            [[ -n "$generation_id" ]] || return 1
+            expected_title="trusted-ci:${target_sha}:${generation_id}"
+            active_run="$(
+              gh api --paginate \
+                "repos/${REPOSITORY}/actions/workflows/ci.yml/runs?event=workflow_dispatch&per_page=100" \
+                --jq ".workflow_runs[] | select(.display_title == \"${expected_title}\" and .status != \"completed\") | .id" \
+                | head -n 1
+            )"
+            [[ -n "$active_run" ]]
           }
 
           prs="$(
@@ -224,28 +224,33 @@ jobs:
 
             refreshed="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
             refreshed_latest="$(
-              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // "", .target_url // ""] | @tsv' <<< "$refreshed"
+              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' <<< "$refreshed"
             )"
             refreshed_state="$(cut -f1 <<< "$refreshed_latest")"
             refreshed_description="$(cut -f2 <<< "$refreshed_latest")"
             refreshed_created_at="$(cut -f3 <<< "$refreshed_latest")"
-            refreshed_target_url="$(cut -f4 <<< "$refreshed_latest")"
             refreshed_age="$(status_age_seconds "$refreshed_created_at")"
+
+            generation_id=""
+            if [[ "$refreshed_description" == 'Trusted CI generation '* ]]; then
+              generation_id="${refreshed_description#Trusted CI generation }"
+              generation_id="${generation_id% passed}"
+              generation_id="${generation_id% failed}"
+              generation_id="${generation_id% incomplete}"
+            fi
 
             should_dispatch_ci=false
             if [[ -z "$refreshed_state" || "$refreshed_state" == error ]]; then
               should_dispatch_ci=true
             elif [[ "$refreshed_state" == pending && "$refreshed_age" -ge 1800 ]]; then
-              if ci_run_is_active "$refreshed_target_url"; then
-                echo "Trusted CI for ${head_sha} is still active; preserving its aged lease."
+              if ci_generation_run_is_active "$head_sha" "$generation_id"; then
+                echo "Trusted CI generation ${generation_id} for ${head_sha} is queued or running; preserving its lease."
               else
                 should_dispatch_ci=true
               fi
             fi
             [[ "$should_dispatch_ci" == true ]] || continue
 
-            generation_id=""
-            [[ "$refreshed_description" == 'Trusted CI generation '* ]] && generation_id="${refreshed_description#Trusted CI generation }"
             [[ -n "$generation_id" ]] || generation_id="reconcile-${GITHUB_RUN_ID}-${short_sha}"
 
             gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
