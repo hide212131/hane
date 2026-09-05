@@ -1,0 +1,244 @@
+name: Codex limit Copilot review fallback
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  fallback:
+    if: >-
+      ${{
+        github.event.issue.pull_request
+        && github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
+        && contains(github.event.comment.body, 'Codex usage limits have been reached for code reviews')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: codex-limit-copilot-fallback-pr-${{ github.event.issue.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Replace limited Codex review with Copilot review
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          LIMIT_CREATED_AT: ${{ github.event.comment.created_at }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          target_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          pr_author="$(jq -r '.user.login' <<< "$pr")"
+          short_sha="${target_sha:0:12}"
+
+          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" ]]; then
+            echo "Codex limit comment belongs to a PR that is no longer an open, reviewable, same-repository PR."
+            exit 0
+          fi
+
+          case "$pr_author" in
+            "$REPO_OWNER"|'github-actions[bot]'|'claude[bot]') ;;
+            *)
+              echo "::error::PR author ${pr_author} is not a Hane automatic-review source."
+              exit 1
+              ;;
+          esac
+
+          latest_review_status="$(
+            gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv'
+          )"
+          review_state="$(cut -f1 <<< "$latest_review_status")"
+          review_description="$(cut -f2 <<< "$latest_review_status")"
+          review_created_at="$(cut -f3 <<< "$latest_review_status")"
+
+          case "$review_description" in
+            "Codex review pending for ${short_sha}"|"Codex review result unknown for ${short_sha}"|"Codex review controller failed for ${short_sha}") ;;
+            "Codex review clean for ${short_sha}"|"Codex findings for ${short_sha}")
+              echo "Exact head ${target_sha} already has a terminal review result; fallback is unnecessary."
+              exit 0
+              ;;
+            *)
+              echo "::error::The exact head does not have a Codex review state eligible for limit fallback: '${review_description}'."
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$review_created_at" && "$review_created_at" > "$LIMIT_CREATED_AT" && "$review_state" == pending ]]; then
+            echo "::error::Codex pending state is newer than the usage-limit comment; refusing ambiguous fallback."
+            exit 1
+          fi
+
+          existing_review="$(
+            gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+              --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url] | @tsv" \
+              | tail -n 1
+          )"
+
+          if [[ -z "$existing_review" ]]; then
+            request_payload="$(jq -n '{reviewers:["copilot-pull-request-reviewer[bot]"]}')"
+            gh api --method POST "repos/${REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+              --input - <<< "$request_payload" >/dev/null
+            echo "Requested Copilot Code Review for ${target_sha} because Codex review usage is exhausted."
+          else
+            echo "Reusing an existing exact-head Copilot Code Review for ${target_sha}."
+          fi
+
+          review=''
+          for attempt in $(seq 1 60); do
+            current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+            if [[ "$current_sha" != "$target_sha" ]]; then
+              echo "PR #${PR_NUMBER} moved to ${current_sha}; fallback review for ${target_sha} is stale."
+              exit 0
+            fi
+
+            review="$(
+              gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+                --jq ".[] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url] | @tsv" \
+                | tail -n 1
+            )"
+            [[ -n "$review" ]] && break
+            sleep 10
+          done
+
+          if [[ -z "$review" ]]; then
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=error -f context='hane/review-source' \
+              -f description="Copilot fallback review unavailable for ${short_sha}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+            echo "::error::Copilot did not submit an exact-head review within the fallback synchronization window."
+            exit 1
+          fi
+
+          review_id="${review%%$'\t'*}"
+          review_url="${review#*$'\t'}"
+          review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
+          findings_json="$(
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
+              | jq "[.[][] | select(.user.login == \"copilot-pull-request-reviewer[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+          )"
+          finding_count="$(jq 'length' <<< "$findings_json")"
+          if [[ "$finding_count" -gt 0 || "$review_body" == *'Changes recommended'* ]]; then
+            fallback_outcome=findings
+          else
+            fallback_outcome=clean
+          fi
+
+          # The original Codex controller owns hane/codex-review until it leaves pending.
+          # Publish the fallback terminal result only afterwards so the limited controller
+          # cannot overwrite a valid Copilot result with its final unknown/controller error.
+          for attempt in $(seq 1 70); do
+            current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+            [[ "$current_sha" == "$target_sha" ]] || exit 0
+            latest_review_status="$(
+              gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100" \
+                --jq '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+            )"
+            review_state="$(cut -f1 <<< "$latest_review_status")"
+            review_description="$(cut -f2 <<< "$latest_review_status")"
+            [[ "$review_state" != pending ]] && break
+            sleep 10
+          done
+
+          if [[ "$review_state" == pending ]]; then
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=error -f context='hane/review-source' \
+              -f description="Copilot fallback waiting on Codex controller for ${short_sha}" \
+              -f target_url="$review_url" >/dev/null
+            echo "::error::Codex controller did not leave pending state; fallback remains fail-closed."
+            exit 1
+          fi
+
+          current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          [[ "$current_sha" == "$target_sha" ]] || exit 0
+
+          gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+            -f state=success -f context='hane/review-source' \
+            -f description="Review source: Copilot fallback for ${short_sha}" \
+            -f target_url="$review_url" >/dev/null
+
+          # hane/codex-review is the existing compatibility context consumed by later phases.
+          # hane/review-source records that Copilot, not Codex, produced this terminal result.
+          if [[ "$fallback_outcome" == findings ]]; then
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=failure -f context='hane/codex-review' \
+              -f description="Codex findings for ${short_sha}" \
+              -f target_url="$review_url" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=success -f context='hane/codex-review' \
+              -f description="Codex review clean for ${short_sha}" \
+              -f target_url="$review_url" >/dev/null
+          fi
+
+          statuses="$(gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100")"
+          trusted_ci_state="$(
+            jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | .state // ""' <<< "$statuses"
+          )"
+          ordinary_ci="$(
+            gh api "repos/${REPOSITORY}/actions/runs?head_sha=${target_sha}&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "CI" and .event == "pull_request")] | max_by(.id) // {} | [.status // "", .conclusion // ""] | @tsv'
+          )"
+          ordinary_ci_status="$(cut -f1 <<< "$ordinary_ci")"
+          ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
+          ci_failure=false
+          if [[ "$trusted_ci_state" == failure || ( "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ) ]]; then
+            ci_failure=true
+          fi
+
+          if [[ "$fallback_outcome" == findings || "$ci_failure" == true ]]; then
+            latest_routing="$(
+              gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100" \
+                --jq '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+            )"
+            routing_description="$(cut -f2 <<< "$latest_routing")"
+            case "$routing_description" in
+              "Copilot routing: fix for ${short_sha}"|"Copilot routing: blocked for ${short_sha}"|"Copilot routing: continue-validation for ${short_sha}")
+                echo "Reusing terminal Copilot routing result '${routing_description}'."
+                exit 0
+                ;;
+            esac
+
+            reason="Codex review was unavailable because its code-review usage limit was reached; Copilot fallback review"
+            if [[ "$fallback_outcome" == findings && "$ci_failure" == true ]]; then
+              reason+=" found ${finding_count} finding(s), and CI is failing."
+            elif [[ "$fallback_outcome" == findings ]]; then
+              reason+=" found ${finding_count} finding(s) requiring a fix."
+            else
+              reason+=" was clean, but CI is failing and requires a fix."
+            fi
+
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=failure -f context='hane/copilot-routing' \
+              -f description="Copilot routing: fix for ${short_sha}" \
+              -f target_url="$review_url" >/dev/null
+
+            comment_body="Copilot pre-GUI routing for \`${target_sha}\`: **fix** — ${reason}"
+            if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$comment_body" >/dev/null; then
+              echo '::warning::Failed to publish fallback routing explanation; commit statuses remain authoritative.'
+            fi
+          else
+            comment_body="Codex review usage limit reached for \`${target_sha}\`; Copilot fallback review completed clean with exact-head evidence."
+            if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$comment_body" >/dev/null; then
+              echo '::warning::Failed to publish clean fallback explanation; commit statuses remain authoritative.'
+            fi
+          fi
