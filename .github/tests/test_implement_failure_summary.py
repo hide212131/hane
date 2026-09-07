@@ -121,6 +121,21 @@ class FailureSummaryTests(unittest.TestCase):
         self.assertNotIn("show_full_output: true", WORKFLOW)
         self.assertNotIn("--dangerously", WORKFLOW)
 
+    def test_progress_observer_is_bound_to_implement_lifecycle(self):
+        self.assertNotIn("\n  progress:\n", WORKFLOW)
+        start_name = "      - name: Follow Claude's public progress\n"
+        action_name = "      - name: Implement issue with Claude Code\n"
+        stop_name = "      - name: Stop Claude's public progress observer\n"
+        start = WORKFLOW.split(start_name, 1)[1].split(action_name, 1)[0]
+        stop = WORKFLOW.split(stop_name, 1)[1].split("      - name:", 1)[0]
+        self.assertIn("steps.existing.outputs.skip != 'true'", start)
+        self.assertIn("python3 -I -u .github/scripts/watch_claude_progress.py &", start)
+        self.assertIn("RUNNER_TEMP/claude-progress.pid", start)
+        self.assertIn("always() && steps.existing.outputs.skip != 'true'", stop)
+        self.assertIn("kill -KILL", stop)
+        self.assertIn("RUNNER_TEMP/claude-progress.pid", stop)
+        self.assertNotIn("timeout-minutes: 65", WORKFLOW)
+
 
 if __name__ == "__main__":
     unittest.main()

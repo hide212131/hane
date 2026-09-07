@@ -65,10 +65,11 @@ Action の実行記録を読む。`execution_file` 出力がない場合は、�
 ### 採用する方法と理由
 
 2026-09-07 の要望により、終了時の診断だけでなく、Claude が何をしたかを実行中にも
-表示する。`Implement issue with Claude` と同じ実行画面に `Claude progress log`
-という読み取り専用の並列ジョブを置き、既に公開されている Claude の Issue コメントから
-進捗の文章とチェックリストの差分を表示する。見る場所は、このジョブの
-`Follow Claude's public progress` ステップである。元の Claude 実行ステップへの挿入ではない。
+表示する。`Implement issue with Claude` の `implement` ジョブが concurrency の枠を
+取得した後、同じ runner 上で `Claude progress log` の監視処理をバックグラウンド起動する。
+既に公開されている Claude の Issue コメントから進捗の文章とチェックリストの差分を表示し、
+見る場所は同じジョブの `Follow Claude's public progress` ステップ出力である。
+実装ジョブの queue 待ち中に監視を開始しないため、監視が Claude の開始を遅らせない。
 
 [使用した Action の出力処理](https://github.com/anthropics/claude-code-action/blob/9c5ddab2e6d17b83ea679153b31f1d5f023cf636/base-action/src/run-claude-sdk.ts)
 は、全文表示をしない場合、初期化と最終結果以外をログから省く。
@@ -102,10 +103,11 @@ Claude には、開始、設計を読んだ後、実装後、検証の前後、p
 
 ### 読み取り範囲と制約
 
-監視ジョブも既存の `authorize` 成功後だけ起動する。別の GitHub-hosted runner で、
-元イベントの `github.sha` にある監視スクリプトを読み、対象ブランチのコードや設定は実行しない。
-権限は `contents: read` / `actions: read` / `issues: read` のみで、checkout に認証を残さない。
-Claude 用の認証情報は渡さず、コメント・status の書き込みや再実行も行わない。
+監視処理は既存の `authorize` 成功後、`implement` ジョブが concurrency の枠を取得して
+checkout と allowlist 構築を終えた後だけ起動する。元イベントの `github.sha` にある
+監視スクリプトを読み、対象ブランチのコードや設定は実行しない。実装ジョブと同じ runner・
+job token を使うが、監視スクリプトの API 操作はコメントとジョブの読み取りだけで、
+コメント・status の書き込みや再実行は行わない。Claude 用の OAuth 認証情報は渡さない。
 
 コメントは対象 Issue、公式の Claude bot / App の ID、実装ジョブの開始・終了時刻で絞る。
 run ID と attempt の識別行、または正確な実行リンクを優先する。
@@ -122,10 +124,11 @@ run ID と attempt の識別行、または正確な実行リンクを優先す�
 
 1応答は8 MiB、ページ取得は5ページ、1コメントは100行・1行400文字、実行全体は4,000行を上限とする。
 API 取得が5回続けて失敗したら理由を固定文で表示して監視だけ終了する。
-監視は63分を上限とし、ジョブ自体にも65分の制限を置く。
-監視ジョブは `continue-on-error: true` とし、既存の CI dispatch は引き続き `implement` だけに依存する。
+監視は63分を上限とし、実装ジョブ自体の60分の制限内で停止処理を行う。
+監視の終了・取得失敗は実装の成否を変更せず、既存の CI dispatch は引き続き `implement` だけに依存する。
 監視を成功扱いにして実装の失敗を消したり、表示の失敗を根拠に実装を再依頼したりしない。
-追加で hosted runner の1ジョブ分を使うため、同時実行枠が不足する環境では待ち時間が増え得る。
+監視は実装ジョブ内のバックグラウンド処理であり、追加の hosted runner や別ジョブの
+queue 待ちは発生しない。Claude の終了後は停止ステップでプロセスを回収する。
 
 今回の対象は `/implement` の経路だけであり、別の Claude 自動修正 workflow への適用は含めない。
 マージ前・開始済みの古い実行には後から表示を追加できない。マージ後の新しい `/implement` で確認する。
