@@ -122,24 +122,31 @@ class FailureSummaryTests(unittest.TestCase):
         self.assertNotIn("show_full_output: true", WORKFLOW)
         self.assertNotIn("--dangerously", WORKFLOW)
 
-    def test_progress_observer_is_bound_to_implement_lifecycle(self):
-        self.assertNotIn("\n  progress:\n", WORKFLOW)
-        start_name = "      - name: Follow Claude's public progress\n"
+    def test_progress_observer_is_dispatched_after_implement_starts(self):
+        self.assertIn("repository_dispatch:", WORKFLOW)
+        self.assertIn("types: [claude-progress-start]", WORKFLOW)
+        progress = WORKFLOW.split("  progress:\n", 1)[1].split("  implement:\n", 1)[0]
+        self.assertIn("github.event_name == 'repository_dispatch'", progress)
+        self.assertIn("github.event.action == 'claude-progress-start'", progress)
+        self.assertIn("github.event.client_payload.repository == github.repository", progress)
+        self.assertIn("timeout-minutes: 65", progress)
+        self.assertIn("continue-on-error: true", progress)
+        self.assertIn("actions: read", progress)
+        self.assertIn("IMPLEMENTATION_RUN_ID: ${{ github.event.client_payload.implementation_run_id }}", progress)
+        self.assertNotIn("python3 -I -u .github/scripts/watch_claude_progress.py &", progress)
+
+        start_name = "      - name: Start Claude's public progress observer\n"
         action_name = "      - name: Implement issue with Claude Code\n"
-        stop_name = "      - name: Stop Claude's public progress observer\n"
         start = WORKFLOW.split(start_name, 1)[1].split(action_name, 1)[0]
-        stop = WORKFLOW.split(stop_name, 1)[1].split("      - name:", 1)[0]
         self.assertIn("steps.existing.outputs.skip != 'true'", start)
-        self.assertIn("python3 -I -u .github/scripts/watch_claude_progress.py &", start)
-        self.assertIn("RUNNER_TEMP/claude-progress.pid", start)
-        self.assertIn("always() && steps.existing.outputs.skip != 'true'", stop)
-        self.assertIn("CLAUDE_OUTCOME: ${{ steps.claude.outcome }}", stop)
-        self.assertIn("case \"${CLAUDE_OUTCOME:-}\" in", stop)
-        self.assertIn("Claude 実装ステップが終了しました", stop)
-        self.assertLess(stop.index("Claude 実装ステップが終了しました"), stop.index('kill "$pid"'))
-        self.assertIn("kill -KILL", stop)
-        self.assertIn("RUNNER_TEMP/claude-progress.pid", stop)
-        self.assertNotIn("timeout-minutes: 65", WORKFLOW)
+        self.assertIn('"repos/${REPOSITORY}/dispatches"', start)
+        self.assertIn("-f event_type='claude-progress-start'", start)
+        self.assertIn('client_payload[implementation_run_id]', start)
+        self.assertIn('client_payload[implementation_run_attempt]', start)
+        self.assertIn(">/dev/null 2>&1", start)
+        self.assertIn("observer の起動通知に失敗しました。実装は継続します。", start)
+        self.assertNotIn("python3 -I -u .github/scripts/watch_claude_progress.py &", WORKFLOW)
+        self.assertNotIn("claude-progress.pid", WORKFLOW)
 
 
 if __name__ == "__main__":
