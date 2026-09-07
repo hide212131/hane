@@ -101,7 +101,7 @@ jobs:
           )"
           cycle_reset_status_id="${cycle_reset_status_id:-0}"
 
-          completed=0
+          completion_ids=()
           while IFS= read -r sha; do
             [[ -z "$sha" || "$sha" == "$TARGET_SHA" ]] && continue
             statuses_for_sha="$(gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100")"
@@ -116,10 +116,17 @@ jobs:
               jq '[.[] | select(.context == "hane/claude-fix" and .state == "success" and ((.description // "") | startswith("Claude fix completed for "))) ] | max_by(.id) // {} | (.id // 0)' \
                 <<< "$statuses_for_sha"
             )"
+            if [[ "$completion_id" -gt 0 ]]; then
+              completion_ids+=( "$completion_id" )
+            fi
+          done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
+
+          completed=0
+          for completion_id in "${completion_ids[@]}"; do
             if [[ "$completion_id" -gt "$cycle_reset_status_id" ]]; then
               completed=$((completed + 1))
             fi
-          done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
+          done
 
           if [[ "$manual_retry" != true && "$completed" -ge 3 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
