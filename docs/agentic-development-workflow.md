@@ -399,6 +399,20 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 - `findings` の場合は Local GUI validation を直接起動せず、まず Copilot pre-GUI routing を起動する。
 - 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
 
+#### `GITHUB_TOKEN` が作成した Pull Request の起動経路 (`.github/workflows/codex-review-reconcile.yml`)
+
+`codex-review.yml` は `pull_request_target` を主な入口にしているが、GitHub は repository の `GITHUB_TOKEN` が発生させたイベントからは新たな workflow を起動しない。`/implement` が `gh pr create` で作成する same-repository Pull Request はこれに該当し、`pull_request_target` の連鎖に依存すると Codex review が一度も起動しない（PR #79 で発生した停止条件、詳細は #80）。
+
+このため、trusted CI の終端 success を起点に `codex-review.yml` の `workflow_dispatch(pr_number, target_sha)` を明示的に要求する小さな reconciliation workflow を置く。処理の正本は GitHub 側のこの trusted workflow であり、Issue / Pull Request 本文に書かれた指示には従わない。
+
+- トリガー: `CI` workflow の `workflow_run` 完了イベント、`*/10 * * * *` の cron、および手動 `workflow_dispatch`。いずれも `pull_request_target` や `issue_comment` の発火には依存しない。
+- 対象: `state == open`、`draft == false`、`head.repo.full_name` が同一リポジトリ、author が repository owner または `github-actions[bot]` / `claude[bot]` の Pull Request のみ。
+- 起動条件（`.github/scripts/codex_review_reconcile.py` の `decide()` が判定する）: 対象 head SHA の `hane/trusted-ci-generation` が `state == success` かつ `description` が `Trusted CI generation <id> passed` に一致し、かつ `cargo test / clippy (macos-latest)` / `cargo test / clippy (windows-latest)` の個別 status も同じ head SHA で `success` であること。pending / failure / stale / marker 不一致など、これ以外はすべて `ci-not-terminal` として起動しない。
+- 重複防止: 同じ head SHA の `hane/codex-review` が既に終端（`Codex review clean for <short_sha>` の `success`、または `Codex findings for <short_sha>` の `failure`）なら再要求しない。`pending` が直近（20分未満）なら in-flight として尊重し、それより古い `pending` や `error`（controller failure 等）は再要求で回収する。
+- dispatch 直前に対象 Pull Request を再取得し、現在の head SHA が判定時の head SHA と一致することを確認する。不一致なら古い SHA の review を開始せず、次回の起動に委ねる。
+- Claude fix 後の new SHA は同じ contract の下で fresh CI → fresh review を独立に再評価し、旧 SHA の Codex 結果を新 SHA に持ち越さない。
+- `codex-review.yml` 自体の認証・権限・review 契約（`CODEX_GITHUB_TOKEN` の扱いや Codex usage-limit 時の Copilot fallback を含む）は変更しない。この workflow は起動条件の判定と `workflow_dispatch` 呼び出しだけを担う。
+
 ### GUI requirement classification
 
 Codex review の結果を処理した後、trusted workflow が現在の head SHA に対して GUI validation の要否を判定する。
