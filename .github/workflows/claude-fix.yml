@@ -407,8 +407,11 @@ jobs:
 
           git push "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"
 
-          generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=success -f context='hane/claude-fix' \
+            -f description="Claude fix completed for ${short_sha}" \
+            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
           if [[ "${MANUAL_RETRY}" == true ]]; then
             new_short_sha="${new_sha:0:12}"
             gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
@@ -416,6 +419,7 @@ jobs:
               -f description="Claude fix cycle reset for ${new_short_sha} after manual retry" \
               -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
           fi
+          generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
             -f state=pending -f context='hane/trusted-ci-generation' \
             -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
@@ -431,10 +435,6 @@ jobs:
           gh workflow run gui-requirement.yml --repo "$REPOSITORY" --ref main \
             -f pr_number="$PR_NUMBER" -f target_sha="$new_sha"
 
-          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state=success -f context='hane/claude-fix' \
-            -f description="Claude fix completed for ${short_sha}" \
-            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
           comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI, review, and GUI requirement classification follow-up were dispatched for the new head."
           if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
             -f body="$comment_body" >/dev/null; then
