@@ -18,7 +18,8 @@ jobs:
       actions: write
       contents: write
       issues: write
-      pull-requests: read
+      # PR timeline comments require write access to pull requests for this worker.
+      pull-requests: write
       statuses: write
 
     steps:
