@@ -168,3 +168,46 @@ python3 -m unittest discover -s .github/tests -p 'test_implement_failure_summary
 workflow に埋め込んだコードそのものを抽出し、正常形式・欠損・破損・不正な値・
 機密に見立てた文字列の非出力・大きすぎるファイル・リンクやパイプの拒否を検査する。
 このテストは Claude の実行や GUI の実機検証を代替しない。
+
+## Issue #83: 停止・未完了理由を対象 PR / Issue へ自動コメントする
+
+Issue #80 / PR #81 では、`.github/workflows/**` への書き込み権限不足で
+必要な workflow ファイルだけ適用できず、停止理由が Issue 側の Claude コメントに
+埋もれて PR からは分からなかった。これを受け、`/implement`（`implement.yml`）と
+自動修正 worker（`claude-fix.yml`）の両方に、Claude の実行が正常に完了しなかった
+場合の安全な診断コメントを追加した。
+
+対象とする状態: Claude ステップ自体の failure / cancelled / skipped、および
+success でも `.github/workflows/**` への書き込みが権限不足で拒否された場合
+（`permission_denials` に該当パスが残る）。
+
+診断ロジックは「失敗時に残す診断」節と同じ理由で、`.github/scripts/*.py` のような
+チェックアウト後に読み書きされ得る別ファイルにはしない。Claude 実行後の working tree
+には agent が書いた内容が残り得るため、ディスク上のスクリプトを信頼しない。
+代わりに、既存の `Summarize Claude failure safely` と同じ形で、各 workflow の
+`run:` ブロックへ Python ヒアドキュメントとして直接埋め込む。埋め込みコードが
+公開するのは固定文言・既知の enum 分類・許可した文字種のパス名だけで、
+プロンプト・コマンド引数・会話本文・認証情報は出力しない。
+
+対象 PR がまだない `/implement` 初期段階（Claude ステップの failure / cancelled）は
+Issue にコメントする。workflow ファイルの書き込み拒否は PR 作成後にしか分からないため
+PR にコメントする。`claude-fix.yml` 側は常に PR 上で完結する。
+
+重複防止と自動回復の表示は、コメント本文末尾の HTML コメント
+`<!-- hane-stall: number=<Issue/PR番号> stage=<段階> sha=<SHA or none> --> `
+を鍵として、同じ鍵の既存コメントを検索し、なければ新規作成、あればその場で
+本文を上書き（PATCH）する方式にした。個別の通知サービスは作らず、既存の
+`gh api` 呼び出しパターンをそのまま踏襲する。`claude-fix.yml` の自動修正が
+その後成功した場合は、同じ鍵のコメントを "Resolved" 表示に上書きする。
+
+自動テスト:
+
+```sh
+python3 -m unittest discover -s .github/tests -p 'test_claude_stall_reports.py' -v
+```
+
+`implement.yml` に埋め込んだ2つのブロック（Issue 向けの stall report、
+PR 向けの workflow-denial report）を抽出して実行し、理由分類・redaction・
+パスの許可文字種チェック・重複排除・上限件数を検査する。`claude-fix.yml` 側の
+bash ロジック（dedup 検索・PATCH/POST 切替）はこのテストの対象外で、
+実機の Actions 実行でのみ確認できる。
