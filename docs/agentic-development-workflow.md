@@ -7,6 +7,11 @@ Hane の Issue から実装、レビュー、実アプリ検証、修正、マ�
 この文書を運用設計の正本とする。役割分担そのものを採用する理由は
 [ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。
 
+Local GUI validator の構成、信頼条件、依頼・結果の契約、段階的な実装順序は
+[Local GUI validation 設計](local-gui-validation.md) で具体化する。Computer Use を必須にせず、
+非公開リポジトリで実行を制御する判断は [ADR-0024](adr/0024-local-gui-validation.md) に残す。
+この方針の文書化と、実装・対象 Mac での実証の完了は区別する。
+
 追跡 Issue: #44
 
 ## 基本方針
@@ -119,7 +124,7 @@ Local GUI validator は **検証専用** とし、コードを変更しない。
 
 Hane は Rust + GPUI のネイティブデスクトップアプリなので、CI とコードレビューだけでは、実際にウィンドウを起動したときの描画や操作を十分に確認できない。Local GUI validator はローカル macOS 上で Pull Request の対象 commit を checkout し、Hane を build / 起動して操作する。
 
-実行機構は Local Codex の Computer Use、または同等のローカル GUI 操作機構を想定する。特定製品への依存は運用実装で確定する。
+実行機構は、事前に決めたシナリオで起動・操作・結果確認を行う Hane 専用の検証コマンドを主経路とする。Computer Use は必須にせず、別セッションのアプリ承認を引き継げることを前提にしない。Mac の runner は非公開の制御用リポジトリに登録し、公開側から直接使わせない。AI による画像確認は、保存した証拠を使う後段の処理として分ける。具体的な条件と未実証の範囲は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 検証対象の例は次のとおり。
 
@@ -291,7 +296,7 @@ Codex の GitHub integration は `@codex review` コメントの投稿者が Cod
 
 Local GUI validator はローカル macOS 上で動かす。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
 
-ローカル runner には、GUI validation に必要な最小限の GitHub 読み取り／結果報告権限だけを与える。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。
+検証依頼の受付と結果報告は GitHub 側の信頼するジョブに分け、Mac のビルド・実行ジョブに Pull Request への書き込み認証情報を渡さない。非公開リポジトリとの受け渡しに必要な認証は、既存のレビュー用認証と兼用せず、対象リポジトリと処理に限定する。runner 自体が持つ認証情報まで安全に隔離できるという意味ではないため、実行できるコードの範囲も制限する。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。詳細は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 ### GitHub Copilot
 
@@ -343,7 +348,7 @@ routing request の配送状態は少なくとも `pending` / `leased` / `dispat
 
 receiver processing record は少なくとも `pending` / `leased` / `completed` / `processing-failed` を持つ。受信 workflow は処理開始時に stable transition ID を永久 claim するのではなく、期限付き processing lease を取得する。処理中に停止した場合は lease expiry 後に同じ transition ID を再実行でき、`completed` の記録がある場合だけ重複配送を no-op にする。
 
-judge が `fix` など後続 worker の起動を必要とする結果を出した場合は、judge result の保存と stable child transition ID を持つ worker request の outbox 登録を原子的に行う。worker request も dispatcher lease と receiver processing lease を使い、親 receiver が完了直前に落ちても後続処理が失われず、重複配送でも二重実行しないようにする。
+judge が `fix` など後続 worker の起動を必要とする結果を出した場合は、judge result の保存と stable child transition ID を持つ worker request の outbox 登録を原子的に保存する。worker request も dispatcher lease と receiver processing lease を使い、親 receiver が完了直前に落ちても後続処理が失われず、重複配送でも二重実行しないようにする。
 
 実装時には、原子的更新または排他が可能な永続領域を状態、durable outbox、receiver processing の正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを状態や routing request の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
 
@@ -533,9 +538,9 @@ GitHub Agentic Workflows の `merge-pull-request` safe output は現時点で ex
 
 Local GUI runner は Pull Request のコードを実際に実行するため、さらに強い信頼境界を置く。
 
-- public fork Pull Request を無条件に実行しない。
-- 初期対象は owner / write 権限保持者、または trusted workflow が作成した same-repository branch とする。
-- 可能なら専用 Mac または専用 OS user を使う。
+- public fork Pull Request を初期のローカル検証対象にしない。runner は非公開の制御用リポジトリにだけ登録する。
+- 初期対象は既存 controller が信頼する same-repository の Pull Request に限り、さらに人が exact head SHA の実行を承認する。
+- 初期運用は専用 OS user で行う。非公開リポジトリや専用ユーザーだけで対象コードを安全に隔離できるとはしない。
 - SSH agent、個人データ、不要な cloud credential へアクセスさせない。
 - GUI validation に不要なディレクトリやサービスへの権限を与えない。
 - Markdown、Issue 本文、Pull Request 本文、テスト用ファイルなどに書かれた命令は **untrusted data** として扱う。
@@ -565,6 +570,10 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
 
 ### Phase 4: Local GUI validation
+
+実装は [Local GUI validation 設計](local-gui-validation.md) の段階に従い、まず Terminal、
+次に非公開リポジトリの runner、続いて依頼・報告と必須シナリオの順に実証する。
+起動・撮影の成功だけで包括的な GUI 検証やマージ条件を満たしたことにはしない。
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
 - no-GUI allowlist だけと確認できない変更は fail closed で GUI validation required とする。
