@@ -20,7 +20,11 @@ jobs:
         (
           github.event_name == 'issue_comment'
           && github.event.issue.pull_request
-          && (github.event.comment.body == '/codex-review' || github.event.comment.body == '/copilot-routing')
+          && (
+            github.event.comment.body == '/codex-review' ||
+            github.event.comment.body == '/copilot-routing' ||
+            github.event.comment.body == '/claude-fix'
+          )
         )
       }}
     runs-on: ubuntu-latest
@@ -47,10 +51,12 @@ jobs:
           REVIEW_SHA: ${{ github.event.review.commit_id }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
 
           echo 'skip=false' >> "$GITHUB_OUTPUT"
+          manual_claude_fix=false
 
           case "$EVENT_NAME" in
             issue_comment)
@@ -61,6 +67,9 @@ jobs:
               pr_number="$ISSUE_NUMBER"
               pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
               target_sha="$(jq -r '.head.sha' <<< "$pr")"
+              if [[ "$COMMENT_BODY" == "/claude-fix" ]]; then
+                manual_claude_fix=true
+              fi
               ;;
             pull_request_review)
               pr_number="$EVENT_PR_NUMBER"
@@ -110,9 +119,31 @@ jobs:
 
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+          echo "manual_claude_fix=$manual_claude_fix" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch manual Claude retry
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          payload="$(
+            jq -n \
+              --argjson pr_number "$PR_NUMBER" \
+              --arg target_sha "$TARGET_SHA" \
+              '{event_type: "hane-claude-fix", client_payload: {pr_number: $pr_number, target_sha: $target_sha, manual_retry: true}}'
+          )"
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/dispatches" \
+            --input - <<< "$payload"
 
       - name: Wait for terminal Codex outcome on the exact head
-        if: ${{ steps.target.outputs.skip != 'true' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' }}
         id: codex
         shell: bash
         env:
@@ -171,7 +202,7 @@ jobs:
           echo 'outcome=timeout' >> "$GITHUB_OUTPUT"
 
       - name: Reuse terminal routing result already stored for this SHA
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' }}
         id: terminal
         shell: bash
         env:
@@ -202,7 +233,7 @@ jobs:
           fi
 
       - name: Mark Copilot routing pending
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -221,7 +252,7 @@ jobs:
             >/dev/null
 
       - name: Collect exact-SHA Codex evidence
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' }}
         id: evidence
         shell: bash
         env:
@@ -290,7 +321,7 @@ jobs:
           echo 'missing_evidence=false' >> "$GITHUB_OUTPUT"
 
       - name: Build Copilot judge prompt
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -314,17 +345,17 @@ jobs:
           } > prompt.txt
 
       - name: Set up Node.js
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
         uses: actions/setup-node@v7
         with:
           node-version: '22'
 
       - name: Install Copilot CLI
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
         run: npm install -g @github/copilot
 
       - name: Invoke Copilot judge
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
         id: copilot
         shell: bash
         env:
@@ -370,7 +401,7 @@ jobs:
           echo "reason_b64=$(printf '%s' "$reason_single_line" | base64 -w0)" >> "$GITHUB_OUTPUT"
 
       - name: Re-verify current head before publishing
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' }}
         id: recheck
         shell: bash
         env:
@@ -384,7 +415,7 @@ jobs:
           [[ "$current_sha" == "$TARGET_SHA" ]] && echo 'stale=false' >> "$GITHUB_OUTPUT" || echo 'stale=true' >> "$GITHUB_OUTPUT"
 
       - name: Publish routing decision
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' && steps.recheck.outputs.stale == 'false' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' && steps.recheck.outputs.stale == 'false' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -419,7 +450,7 @@ jobs:
             --body "Copilot pre-GUI routing for \`${TARGET_SHA}\`: **${DECISION}** — ${reason}"
 
       - name: Publish stale routing result
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' && steps.recheck.outputs.stale == 'true' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'false' && steps.recheck.outputs.stale == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -439,7 +470,7 @@ jobs:
           echo "::warning::Pull Request head moved before the Copilot routing decision could be published."
 
       - name: Publish missing-evidence blocked result
-        if: ${{ steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'true' }}
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' && steps.terminal.outputs.outcome == '' && steps.evidence.outputs.missing_evidence == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -460,7 +491,7 @@ jobs:
       - name: Dispatch Claude fix worker
         if: >-
           ${{
-            steps.target.outputs.skip != 'true' && steps.codex.outputs.ready == 'true' &&
+            steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' &&
             (
               steps.terminal.outputs.outcome == 'fix' ||
               (steps.evidence.outputs.missing_evidence == 'false' && steps.copilot.outputs.decision == 'fix' && steps.recheck.outputs.stale == 'false')

@@ -31,10 +31,18 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          MANUAL_RETRY: ${{ github.event.client_payload.manual_retry || 'false' }}
         run: |
           set -euo pipefail
 
           echo 'proceed=false' >> "$GITHUB_OUTPUT"
+
+          manual_retry="${MANUAL_RETRY:-false}"
+          if [[ "$manual_retry" != true && "$manual_retry" != false ]]; then
+            echo '::error::manual_retry must be true or false.'
+            exit 1
+          fi
+          echo "manual_retry=$manual_retry" >> "$GITHUB_OUTPUT"
 
           if [[ -z "${PR_NUMBER:-}" || -z "${TARGET_SHA:-}" ]]; then
             echo '::error::Missing pr_number or target_sha.'
@@ -87,18 +95,33 @@ jobs:
             exit 0
           fi
 
+          cycle_reset_status_id="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for "))) ] | max_by(.id) // {} | (.id // 0)'
+          )"
+          cycle_reset_status_id="${cycle_reset_status_id:-0}"
+
           completed=0
           while IFS= read -r sha; do
             [[ -z "$sha" || "$sha" == "$TARGET_SHA" ]] && continue
-            short="${sha:0:12}"
-            desc="$(
-              gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100" \
-                --jq '[.[] | select(.context == "hane/claude-fix" and .state == "success")] | max_by(.id) // {} | .description // ""'
+            statuses_for_sha="$(gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100")"
+            reset_on_sha="$(
+              jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for "))) ] | max_by(.id) // {} | (.id // 0)' \
+                <<< "$statuses_for_sha"
             )"
-            [[ "$desc" == "Claude fix completed for ${short}" ]] && completed=$((completed + 1))
+            if [[ "$reset_on_sha" -gt "$cycle_reset_status_id" ]]; then
+              cycle_reset_status_id="$reset_on_sha"
+            fi
+            completion_id="$(
+              jq '[.[] | select(.context == "hane/claude-fix" and .state == "success" and ((.description // "") | startswith("Claude fix completed for "))) ] | max_by(.id) // {} | (.id // 0)' \
+                <<< "$statuses_for_sha"
+            )"
+            if [[ "$completion_id" -gt "$cycle_reset_status_id" ]]; then
+              completed=$((completed + 1))
+            fi
           done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
 
-          if [[ "$completed" -ge 3 ]]; then
+          if [[ "$manual_retry" != true && "$completed" -ge 3 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: max iterations for ${short_sha}" \
@@ -111,6 +134,10 @@ jobs:
             exit 0
           fi
 
+          if [[ "$manual_retry" == true ]]; then
+            echo "Manual Claude retry authorized for ${TARGET_SHA}; bypassing the current fix-cycle limit once."
+          fi
+
           latest="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
               --jq '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv'
@@ -118,11 +145,16 @@ jobs:
           description="${latest%%$'\t'*}"
           created_at="${latest#*$'\t'}"
 
+          if [[ "$manual_retry" != true ]]; then
+            case "$description" in
+              "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                echo "Automatic fix for ${TARGET_SHA} already has a terminal result."
+                exit 0
+                ;;
+            esac
+          fi
+
           case "$description" in
-            "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
-              echo "Automatic fix for ${TARGET_SHA} already has a terminal result."
-              exit 0
-              ;;
             "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
               created_epoch="$(date -d "$created_at" +%s 2>/dev/null || echo 0)"
               now_epoch="$(date -u +%s)"
@@ -309,6 +341,7 @@ jobs:
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
@@ -369,6 +402,13 @@ jobs:
 
           generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            new_short_sha="${new_sha:0:12}"
+            gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+              -f state=success -f context='hane/claude-fix-cycle' \
+              -f description="Claude fix cycle reset for ${new_short_sha} after manual retry" \
+              -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
+          fi
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
             -f state=pending -f context='hane/trusted-ci-generation' \
             -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
