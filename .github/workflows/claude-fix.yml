@@ -408,10 +408,12 @@ jobs:
           git push "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"
 
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+          if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=success -f context='hane/claude-fix' \
             -f description="Claude fix completed for ${short_sha}" \
-            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
+            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null; then
+            echo '::warning::Failed to publish Claude fix completion status; claude-fix-reconcile.yml will recover it from the bot commit.'
+          fi
           if [[ "${MANUAL_RETRY}" == true ]]; then
             new_short_sha="${new_sha:0:12}"
             gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
