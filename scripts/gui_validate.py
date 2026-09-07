@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
@@ -231,6 +232,8 @@ class RealEnvironment(Environment):
         log_file = open(config.log_path, "wb")
         try:
             process = subprocess.Popen(args, stderr=log_file, stdout=subprocess.DEVNULL, env=run_env)
+        except OSError as exc:
+            raise EnvError(str(exc)) from exc
         finally:
             log_file.close()
         return process
@@ -283,7 +286,11 @@ def do_preflight(env: Environment, config: Config) -> tuple[dict, dict]:
     except EnvError as exc:
         return make_step("preflight", "blocked", reason=f"HEAD の SHA を取得できない: {exc}"), {}
 
-    dirty_paths = env.git_dirty_paths(config.workspace_dir)
+    try:
+        dirty_paths = env.git_dirty_paths(config.workspace_dir)
+    except EnvError as exc:
+        return make_step("preflight", "blocked", reason=f"作業コピーの状態を取得できない: {exc}"), {}
+
     sha_matches = config.expected_sha is None or actual_sha == config.expected_sha
     target_info = {
         "expected_sha": config.expected_sha,
@@ -536,7 +543,15 @@ def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[
 
 def _env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
-    return float(value) if value else default
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} は数値として解釈できない: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{name} は有限の正の数である必要がある: {value!r}")
+    return parsed
 
 
 def _env_cmd(name: str) -> Optional[list[str]]:
@@ -592,7 +607,11 @@ def main(argv: list[str]) -> int:
         return EXIT_USAGE
 
     workspace_dir = Path(__file__).resolve().parent.parent
-    config = build_config(scenario, workspace_dir)
+    try:
+        config = build_config(scenario, workspace_dir)
+    except ValueError as exc:
+        print(f"invalid configuration: {exc}", file=sys.stderr)
+        return EXIT_USAGE
 
     def _handle_signal(signum, _frame):
         raise Aborted(f"signal {signum}")

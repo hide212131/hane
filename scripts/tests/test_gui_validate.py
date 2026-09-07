@@ -8,6 +8,7 @@ evidence retention on partial failure — can run in CI on any platform.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import unittest
@@ -115,6 +116,8 @@ class FakeEnvironment(gv.Environment):
         return Path(path), info
 
     def launch(self, binary_path, config):
+        if isinstance(self.process, Exception):
+            raise self.process
         return self.process
 
     def log_contains_ready(self, log_path):
@@ -208,6 +211,17 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["launch"]["result"], "fail")
         self.assertIn("exit=1", by_name["launch"]["reason"])
         self.assertEqual(by_name["cleanup"]["result"], "pass")
+
+    def test_launch_env_error_is_fail_not_uncaught(self):
+        config = make_config(Path("/workspace"))
+        env = FakeEnvironment(process=gv.EnvError("executable could not be started"))
+        result = gv.run_validation(env, config)
+
+        self.assertEqual(result["overall_result"], "fail")
+        by_name = {s["name"]: s for s in result["steps"]}
+        self.assertEqual(by_name["launch"]["result"], "fail")
+        self.assertIn("executable could not be started", by_name["launch"]["reason"])
+        self.assertEqual(by_name["cleanup"]["result"], "pass", "should not crash without a launched process")
         self.assertIn("既に終了", by_name["cleanup"]["reason"])
 
     def test_window_discovery_timeout_is_blocked(self):
@@ -268,6 +282,21 @@ class RunValidationTests(unittest.TestCase):
 
         self.assertEqual(result["overall_result"], "blocked")
         self.assertIn("作業コピー", result["steps"][0]["reason"])
+
+    def test_git_dirty_paths_error_blocks_preflight(self):
+        class RaisingEnvironment(FakeEnvironment):
+            def git_dirty_paths(self, workspace_dir):
+                raise gv.EnvError("unreadable index")
+
+        config = make_config(Path("/workspace"))
+        env = RaisingEnvironment()
+        result = gv.run_validation(env, config)
+
+        self.assertEqual(result["overall_result"], "blocked")
+        by_name = {s["name"]: s for s in result["steps"]}
+        self.assertEqual(by_name["preflight"]["result"], "blocked")
+        self.assertIn("unreadable index", by_name["preflight"]["reason"])
+        self.assertEqual(by_name["build"]["result"], "skipped")
 
     def test_missing_tools_blocks(self):
         config = make_config(Path("/workspace"))
@@ -387,6 +416,62 @@ class ScenarioSetupTests(unittest.TestCase):
             self.assertEqual(len(fixture.read_text().splitlines()), 40)
             self.assertEqual(features, ["instrument"])
             self.assertIn("HANE_DEV_CURSOR_DOWN", extra_env)
+
+
+class EnvFloatTests(unittest.TestCase):
+    def test_missing_env_returns_default(self):
+        self.assertEqual(gv._env_float("HANE_GUI_VALIDATE_TEST_UNSET", 15.0), 15.0)
+
+    def test_valid_value_is_parsed(self):
+        os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"] = "7.5"
+        try:
+            self.assertEqual(gv._env_float("HANE_GUI_VALIDATE_TEST_TIMEOUT", 15.0), 7.5)
+        finally:
+            del os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"]
+
+    def test_nan_is_rejected(self):
+        os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"] = "nan"
+        try:
+            with self.assertRaises(ValueError):
+                gv._env_float("HANE_GUI_VALIDATE_TEST_TIMEOUT", 15.0)
+        finally:
+            del os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"]
+
+    def test_infinite_is_rejected(self):
+        os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"] = "inf"
+        try:
+            with self.assertRaises(ValueError):
+                gv._env_float("HANE_GUI_VALIDATE_TEST_TIMEOUT", 15.0)
+        finally:
+            del os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"]
+
+    def test_non_positive_is_rejected(self):
+        os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"] = "0"
+        try:
+            with self.assertRaises(ValueError):
+                gv._env_float("HANE_GUI_VALIDATE_TEST_TIMEOUT", 15.0)
+        finally:
+            del os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"]
+
+    def test_nonnumeric_is_rejected(self):
+        os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"] = "soon"
+        try:
+            with self.assertRaises(ValueError):
+                gv._env_float("HANE_GUI_VALIDATE_TEST_TIMEOUT", 15.0)
+        finally:
+            del os.environ["HANE_GUI_VALIDATE_TEST_TIMEOUT"]
+
+
+class RealEnvironmentLaunchTests(unittest.TestCase):
+    def test_popen_oserror_is_wrapped_as_env_error(self):
+        import tempfile
+
+        env = gv.RealEnvironment()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            config = make_config(run_dir, run_dir=run_dir, state_dir=run_dir, log_path=run_dir / "hane.log")
+            with self.assertRaises(gv.EnvError):
+                env.launch(run_dir / "does-not-exist-and-is-not-executable", config)
 
 
 if __name__ == "__main__":
