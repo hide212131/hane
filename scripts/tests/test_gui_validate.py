@@ -125,7 +125,7 @@ class FakeEnvironment(gv.Environment):
             return False
         return self._ready_polls >= self.ready_after
 
-    def find_window_once(self, pid, config):
+    def find_window_once(self, pid, config, timeout_seconds=None):
         self._window_polls += 1
         if self.window_ids is not None:
             idx = min(self._window_polls - 1, len(self.window_ids) - 1)

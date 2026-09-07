@@ -119,7 +119,7 @@ class Environment:
     def log_contains_ready(self, log_path: Path) -> bool:
         raise NotImplementedError
 
-    def find_window_once(self, pid: int, config: Config) -> Optional[str]:
+    def find_window_once(self, pid: int, config: Config, timeout_seconds: float) -> Optional[str]:
         raise NotImplementedError
 
     def capture(self, window_id: str, image_path: Path, config: Config) -> bool:
@@ -166,7 +166,29 @@ class RealEnvironment(Environment):
             missing.append("screencapture")
         return missing
 
+    def _cargo_target_dir(self, workspace_dir: Path) -> Path:
+        try:
+            out = subprocess.run(
+                [
+                    "cargo",
+                    "metadata",
+                    "--format-version",
+                    "1",
+                    "--no-deps",
+                    "--manifest-path",
+                    str(workspace_dir / "Cargo.toml"),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            metadata = json.loads(out.stdout)
+            return Path(metadata["target_directory"])
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
+            raise BuildError(f"cargo metadata の取得に失敗した: {exc}") from exc
+
     def build(self, workspace_dir: Path, features: list[str]) -> tuple[Path, dict]:
+        target_dir = self._cargo_target_dir(workspace_dir)
         args = [
             "cargo",
             "build",
@@ -183,7 +205,7 @@ class RealEnvironment(Environment):
             raise BuildError(f"cargo build exited {proc.returncode}: {tail}")
 
         binary_name = "hane.exe" if os.name == "nt" else "hane"
-        binary_path = workspace_dir / "target" / "debug" / binary_name
+        binary_path = target_dir / "debug" / binary_name
 
         def tool_version(args: list[str]) -> str:
             try:
@@ -223,14 +245,16 @@ class RealEnvironment(Environment):
         except OSError:
             return False
 
-    def find_window_once(self, pid: int, config: Config) -> Optional[str]:
+    def find_window_once(self, pid: int, config: Config, timeout_seconds: float) -> Optional[str]:
         if config.window_id_cmd is not None:
             args = [*config.window_id_cmd, str(pid)]
         else:
             script = Path(__file__).resolve().parent / "window_id.swift"
             args = ["swift", str(script), str(pid)]
         try:
-            out = subprocess.run(args, capture_output=True, text=True)
+            out = subprocess.run(args, capture_output=True, text=True, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return None
         except OSError:
             return None
         if out.returncode != 0:
@@ -348,7 +372,8 @@ def do_window_discovery(env: Environment, config: Config, process) -> tuple[dict
                 ),
                 None,
             )
-        window_id = env.find_window_once(process.pid, config)
+        remaining = deadline - env.clock.monotonic()
+        window_id = env.find_window_once(process.pid, config, remaining) if remaining > 0 else None
         if window_id:
             elapsed = env.clock.monotonic() - started
             return make_step("window_discovery", "pass", window_id=window_id, elapsed_seconds=round(elapsed, 3)), window_id
@@ -524,7 +549,10 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
     )
     generation = os.environ.get("HANE_GUI_VALIDATE_GENERATION", "1")
-    run_dir = Path(os.environ.get("HANE_GUI_VALIDATE_RUN_DIR") or (workspace_dir / "target" / "gui-validate" / request_id))
+    run_dir = Path(
+        os.environ.get("HANE_GUI_VALIDATE_RUN_DIR")
+        or (workspace_dir / "target" / "gui-validate" / request_id / generation)
+    )
     state_dir = run_dir / "state"
     run_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
