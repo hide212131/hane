@@ -51,6 +51,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      actions: read
       issues: write
       pull-requests: write
       id-token: write
@@ -196,8 +197,22 @@ jobs:
       - name: Stop Claude's public progress observer
         if: ${{ always() && steps.existing.outputs.skip != 'true' }}
         shell: bash
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
         run: |
           set -euo pipefail
+
+          case "${CLAUDE_OUTCOME:-}" in
+            success|failure|cancelled|skipped)
+              conclusion="$CLAUDE_OUTCOME"
+              ;;
+            *)
+              conclusion='unknown'
+              ;;
+          esac
+          # The job is still in progress here, so report the Claude step outcome
+          # before stopping the observer rather than waiting for job completion.
+          printf '%s\n' "[監視] Claude 実装ステップが終了しました: ${conclusion}。CI・GUI 検証の結果は別に確認してください。"
 
           pid_file="$RUNNER_TEMP/claude-progress.pid"
           if [[ ! -r "$pid_file" ]]; then

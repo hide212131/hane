@@ -118,6 +118,7 @@ class FailureSummaryTests(unittest.TestCase):
         self.assertNotIn("continue-on-error:", action)
         self.assertIn("--max-turns 160", action)
         self.assertIn("timeout-minutes: 60", WORKFLOW)
+        self.assertIn("actions: read", WORKFLOW)
         self.assertNotIn("show_full_output: true", WORKFLOW)
         self.assertNotIn("--dangerously", WORKFLOW)
 
@@ -132,6 +133,10 @@ class FailureSummaryTests(unittest.TestCase):
         self.assertIn("python3 -I -u .github/scripts/watch_claude_progress.py &", start)
         self.assertIn("RUNNER_TEMP/claude-progress.pid", start)
         self.assertIn("always() && steps.existing.outputs.skip != 'true'", stop)
+        self.assertIn("CLAUDE_OUTCOME: ${{ steps.claude.outcome }}", stop)
+        self.assertIn("case \"${CLAUDE_OUTCOME:-}\" in", stop)
+        self.assertIn("Claude 実装ステップが終了しました", stop)
+        self.assertLess(stop.index("Claude 実装ステップが終了しました"), stop.index('kill "$pid"'))
         self.assertIn("kill -KILL", stop)
         self.assertIn("RUNNER_TEMP/claude-progress.pid", stop)
         self.assertNotIn("timeout-minutes: 65", WORKFLOW)
