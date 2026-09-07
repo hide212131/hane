@@ -42,21 +42,22 @@ macOS の `swift` / `screencapture` に依存するため、実際の起動・�
 | `HANE_GUI_VALIDATE_EXPECTED_SHA` | なし | 指定すると `git rev-parse HEAD` と一致しない場合に `blocked` にする |
 | `HANE_GUI_VALIDATE_REQUEST_ID` | `<UTC timestamp>-<pid>` | 依頼 ID。実行ごとの保存先ディレクトリ名にもなる |
 | `HANE_GUI_VALIDATE_GENERATION` | `1` | 実行世代。再配送・再実行の識別に使う |
-| `HANE_GUI_VALIDATE_RUN_DIR` | `target/gui-validate/<request-id>` | 証拠一式（状態・ログ・画像・結果）の保存先 |
+| `HANE_GUI_VALIDATE_RUN_DIR` | `target/gui-validate/<request-id>/<generation>` | 証拠一式（状態・ログ・画像・結果）の保存先 |
 | `HANE_GUI_VALIDATE_STARTUP_TIMEOUT_SECS` | `15` | `hane_ready` を待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS` | `5` | 対象ウィンドウを待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_ID_CMD` | なし（既定は `swift window_id.swift`） | ウィンドウ確認コマンドの差し替え。自動テストで実画面なしに注入する用途 |
 | `HANE_GUI_VALIDATE_CAPTURE_CMD` | なし（既定は `screencapture -x -l`） | 撮影コマンドの差し替え。同上 |
+| `HANE_GUI_VALIDATE_CAPTURE_TIMEOUT_SECS` | `15` | 撮影コマンドの完了を待つ上限秒数。超過すると `blocked` として扱う |
 | `HANE_CAPTURE_FIXTURE` / `HANE_CAPTURE_CURSOR_OFFSET` / `HANE_CAPTURE_CURSOR_DOWN` | `capture.sh` と同じ | シナリオ別の入力・オフセット調整 |
 
 `HANE_STATE_DIR` は毎回 `<run-dir>/state` に固定され、呼び出し側からは上書きできない。普段の設定・Recent Files を使わないためである。
 
 ## 結果の保存先と形式
 
-実行ごとに `target/gui-validate/<request-id>/` を新規作成し、削除しない（失敗時も証拠を残す）。
+実行ごとに `target/gui-validate/<request-id>/<generation>/` を新規作成し、削除しない（失敗時も証拠を残す）。
 
 ```text
-target/gui-validate/<request-id>/
+target/gui-validate/<request-id>/<generation>/
   state/           # HANE_STATE_DIR（実行専用の設定・Recent Files）
   hane.log         # 起動したプロセスの stderr
   <scenario>.png   # 撮影できた場合のみ

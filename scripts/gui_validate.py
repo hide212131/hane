@@ -79,6 +79,7 @@ class Config:
     poll_interval_seconds: float = 0.1
     window_id_cmd: Optional[list[str]] = None
     capture_cmd: Optional[list[str]] = None
+    capture_timeout_seconds: float = 15.0
 
 
 class Clock:
@@ -166,29 +167,7 @@ class RealEnvironment(Environment):
             missing.append("screencapture")
         return missing
 
-    def _cargo_target_dir(self, workspace_dir: Path) -> Path:
-        try:
-            out = subprocess.run(
-                [
-                    "cargo",
-                    "metadata",
-                    "--format-version",
-                    "1",
-                    "--no-deps",
-                    "--manifest-path",
-                    str(workspace_dir / "Cargo.toml"),
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            metadata = json.loads(out.stdout)
-            return Path(metadata["target_directory"])
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
-            raise BuildError(f"cargo metadata の取得に失敗した: {exc}") from exc
-
     def build(self, workspace_dir: Path, features: list[str]) -> tuple[Path, dict]:
-        target_dir = self._cargo_target_dir(workspace_dir)
         args = [
             "cargo",
             "build",
@@ -196,6 +175,9 @@ class RealEnvironment(Environment):
             str(workspace_dir / "Cargo.toml"),
             "-p",
             "hane",
+            "--bin",
+            "hane",
+            "--message-format=json-render-diagnostics",
         ]
         if features:
             args += ["--features", ",".join(features)]
@@ -204,8 +186,22 @@ class RealEnvironment(Environment):
             tail = "\n".join(proc.stderr.splitlines()[-40:])
             raise BuildError(f"cargo build exited {proc.returncode}: {tail}")
 
-        binary_name = "hane.exe" if os.name == "nt" else "hane"
-        binary_path = target_dir / "debug" / binary_name
+        binary_path = None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("reason") != "compiler-artifact":
+                continue
+            executable = message.get("executable")
+            if executable and message.get("target", {}).get("name") == "hane":
+                binary_path = Path(executable)
+        if binary_path is None:
+            raise BuildError("cargo build の出力から実行ファイルのパスを特定できなかった")
 
         def tool_version(args: list[str]) -> str:
             try:
@@ -269,7 +265,11 @@ class RealEnvironment(Environment):
         else:
             args = ["screencapture", "-x", "-l", window_id, str(image_path)]
         try:
-            out = subprocess.run(args, capture_output=True, text=True)
+            out = subprocess.run(
+                args, capture_output=True, text=True, timeout=config.capture_timeout_seconds
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EnvError(f"撮影コマンドがタイムアウトした: {exc}") from exc
         except OSError as exc:
             raise EnvError(str(exc)) from exc
         if out.returncode != 0:
@@ -576,6 +576,7 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
         window_timeout_seconds=_env_float("HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS", 5.0),
         window_id_cmd=_env_cmd("HANE_GUI_VALIDATE_WINDOW_ID_CMD"),
         capture_cmd=_env_cmd("HANE_GUI_VALIDATE_CAPTURE_CMD"),
+        capture_timeout_seconds=_env_float("HANE_GUI_VALIDATE_CAPTURE_TIMEOUT_SECS", 15.0),
     )
 
 
@@ -597,7 +598,7 @@ def main(argv: list[str]) -> int:
         raise Aborted(f"signal {signum}")
 
     previous_handlers = {}
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         previous_handlers[sig] = signal.signal(sig, _handle_signal)
 
     try:
