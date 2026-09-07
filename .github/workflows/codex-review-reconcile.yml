@@ -1,0 +1,39 @@
+name: Codex review reconciliation
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: codex-review-dispatch-serialized
+      cancel-in-progress: false
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Check out trusted reconciliation script
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Dispatch Codex review for exact-head trusted CI success
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 -I -u .github/scripts/codex_review_reconcile.py
