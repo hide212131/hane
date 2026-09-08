@@ -134,10 +134,28 @@ class Environment:
 class RealEnvironment(Environment):
     def __init__(self) -> None:
         self.clock = Clock()
+        self._reserved_run_dir: Optional[Path] = None
+
+    def reserve(self, config: Config) -> None:
+        if self._reserved_run_dir == config.run_dir:
+            return
+        try:
+            config.run_dir.mkdir(parents=True, exist_ok=True)
+            marker = config.run_dir / ".gui-validate-owner"
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as owner:
+                owner.write(json.dumps({"pid": os.getpid(), "request_id": config.request_id,
+                                        "generation": config.generation}))
+            if any(path != marker for path in config.run_dir.iterdir()):
+                marker.unlink()  # Remove only the marker this call just created.
+                raise EnvError("実行用ディレクトリに既存ファイルがあるため予約できない")
+            self._reserved_run_dir = config.run_dir
+        except OSError as exc:
+            raise EnvError(f"実行用ディレクトリを排他的に予約できない: {exc}") from exc
 
     def prepare(self, config: Config) -> None:
         try:
-            config.run_dir.mkdir(parents=True, exist_ok=True)
+            self.reserve(config)
             config.state_dir.mkdir(parents=True, exist_ok=True)
             _scenario_setup(config.scenario, config.run_dir)
         except (OSError, ValueError) as exc:
@@ -183,6 +201,7 @@ class RealEnvironment(Environment):
         args = [
             "cargo",
             "build",
+            "--locked",
             "--manifest-path",
             str(workspace_dir / "Cargo.toml"),
             "-p",
@@ -193,7 +212,10 @@ class RealEnvironment(Environment):
         ]
         if features:
             args += ["--features", ",".join(features)]
-        proc = subprocess.run(args, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(args, cwd=workspace_dir, capture_output=True, text=True)
+        except OSError as exc:
+            raise BuildError(str(exc)) from exc
         if proc.returncode != 0:
             tail = "\n".join(proc.stderr.splitlines()[-40:])
             raise BuildError(f"cargo build exited {proc.returncode}: {tail}")
@@ -217,7 +239,7 @@ class RealEnvironment(Environment):
 
         def tool_version(args: list[str]) -> str:
             try:
-                out = subprocess.run(args, capture_output=True, text=True, check=True)
+                out = subprocess.run(args, cwd=workspace_dir, capture_output=True, text=True, check=True)
                 return out.stdout.strip()
             except (OSError, subprocess.CalledProcessError) as exc:
                 return f"unknown ({exc})"
@@ -528,7 +550,7 @@ def run_validation(env: Environment, config: Config) -> dict:
                         steps.append(do_capture(env, config, window_id))
     except Aborted as exc:
         steps.append(make_step("run", "blocked", reason=f"中断された: {exc}"))
-    except EnvError as exc:
+    except (EnvError, OSError) as exc:
         steps.append(make_step("setup", "blocked", reason=str(exc)))
     finally:
         steps.append(do_cleanup(env, process_holder["process"]))
@@ -654,14 +676,21 @@ def main(argv: list[str]) -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         previous_handlers[sig] = signal.signal(sig, _handle_signal)
 
+    env = RealEnvironment()
     try:
-        result = run_validation(RealEnvironment(), config)
+        result = run_validation(env, config)
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 
     result_path = config.run_dir / "result.json"
-    config.run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        env.reserve(config)
+    except EnvError as exc:
+        # A competing run owns these paths. Do not overwrite its evidence,
+        # even with our own blocked result after the failed reservation.
+        print(f"[BLOCKED] {exc}", file=sys.stderr)
+        return EXIT_BLOCKED
     result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     summary_path = config.run_dir / "summary.md"
     summary_path.write_text(result["summary"] + "\n")

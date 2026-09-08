@@ -67,7 +67,8 @@ def resolve(api):
                 continue
             request = request_for(pr)
             if old and old[0] == 'pending':
-                old_run = api.api(api.repo(f'actions/runs/{old[1].split("-")[0]}'))
+                old_id, old_attempt = old[1].split('-')
+                old_run = api.api(api.repo(f'actions/runs/{old_id}/attempts/{old_attempt}'))
                 age = (now() - parse_time(old_status['created_at'])).total_seconds()
                 if old_run.get('status') != 'completed' and age < 3600:
                     continue

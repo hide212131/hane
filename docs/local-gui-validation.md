@@ -10,7 +10,7 @@
 
 続く [run 34256439460](https://github.com/hide212131/hane/actions/runs/34256439460) では同じ Hane SHA に対する System Events 経由の ASCII 入力・保存内容照合・redo が成功した。undo のテストは選択置換と後続入力を単一履歴と誤って想定しており、日本語 IME は親入力方式が無効な状態での選択が `-50` となった。全体結果は `fail`、IME シナリオは `blocked` であり、成功結果に書き換えない。修正した手順による再実行を別の世代として記録する。
 
-[run 34257026535](https://github.com/hide212131/hane/actions/runs/34257026535) は Hane SHA `d85af7f1d86f4dc05ec44e790d23ba63df05af72`、手順 SHA `c264aac84fab0374ec48f33eb099ab849ad4253f` で ASCII 入力・保存・独立した編集のundo/redo・再オープン、および日本語IMEの `nihongo` → `日本語` 変換・確定・保存がすべてpassとなった。再オープンと日本語保存後の画像も確認した。親入力方式の有効化は使い捨てhosted環境だけで行い、元の入力方式への復元もpass。OSスクロールは次の手順で追加検証する。
+[run 34257026535](https://github.com/hide212131/hane/actions/runs/34257026535) は Hane SHA `d85af7f1d86f4dc05ec44e790d23ba63df05af72`、手順 SHA `c264aac84fab0374ec48f33eb099ab849ad4253f` で ASCII 入力・保存・独立した編集のundo/redo・再オープン、および日本語IMEの `nihongo` → `日本語` 変換・確定・保存がすべてpassとなった。再オープンと日本語保存後の画像も確認した。親入力方式の有効化は使い捨てhosted環境だけで行い、元の入力方式への復元もpass。続く [run 34257563560](https://github.com/hide212131/hane/actions/runs/34257563560)（同じHane SHA、手順 `96178aaff00eefeb43e85f3e109634c5fe51969c`）ではOSホイール操作によって表示が LINE 1–11 から LINE 13–23 に移り、文書が変わらないことも確認した。再オープン後の保存文字列は画面OCRでも確認した。
 
 ローカルの通常ログインユーザーでも editor / cursor-boundary / cursor-scroll の起動・撮影は先行実証済みだが、cursor 系は instrument による内部状態の設定であり、OSのホイール操作やIME入力の証拠ではない。standalone Computer Use の過去の承認問題を、現在のHane専用コマンドの必須条件にはしない。
 
