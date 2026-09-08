@@ -403,7 +403,7 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set +e
-          prompt="$(cat <<EOF
+          cat > "$RUNNER_TEMP/hane-claude-fix-prompt.txt" <<EOF
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
@@ -416,11 +416,10 @@ jobs:
           Evidence:
           $(cat "$RUNNER_TEMP/hane-claude-fix-evidence.json")
           EOF
-          )"
 
-          claude -p "$prompt" \
+          claude -p \
             --max-turns 80 \
-            --permission-mode bypassPermissions
+            --permission-mode bypassPermissions < "$RUNNER_TEMP/hane-claude-fix-prompt.txt"
           status=$?
           set -e
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"

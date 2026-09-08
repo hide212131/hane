@@ -17,9 +17,11 @@ That has no comparable size bound.
 """
 import errno
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +141,26 @@ class MergeStatusesByShaTests(unittest.TestCase):
             "expected the legacy --argjson invocation to fail once the payload "
             "exceeds the platform's argv size limit, matching run 34253902865",
         )
+
+    def test_large_evidence_reaches_claude_on_stdin_without_an_agent_call(self):
+        workflow = (ROOT / "workflows" / "claude-fix.yml").read_text()
+        step = workflow.split("      - name: Run Claude Code fix\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0])
+        evidence = json.dumps({"review_body": "x" * (3 * 1024 * 1024)})
+        (self.root / "hane-claude-fix-evidence.json").write_text(evidence)
+        mock = self.root / "claude"
+        mock.write_text('#!/bin/sh\ncat > "$RUNNER_TEMP/received-prompt.txt"\n')
+        mock.chmod(0o700)
+        environment = {**os.environ, "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
+                       "RUNNER_TEMP": str(self.root), "GITHUB_OUTPUT": str(self.root / "output"),
+                       "PR_NUMBER": "79", "TARGET_SHA": "a" * 40}
+        result = subprocess.run(["bash", "-c", script], env=environment,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        received = (self.root / "received-prompt.txt").read_text()
+        self.assertIn(evidence, received)
+        self.assertIn("exact reviewed commit " + "a" * 40, received)
+        self.assertEqual((self.root / "output").read_text(), "exit_code=0\n")
 
 
 if __name__ == "__main__":
