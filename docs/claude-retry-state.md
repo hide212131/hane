@@ -98,7 +98,7 @@ replace `gh` and execute the actual claim, manual-dispatch and terminal steps.
 They exercise successful writes, ambiguous persisted-but-failed writes,
 dispatch failures and duplicate delivery.
 
-Local validation: 75 tests passed, including 36 retry regressions; YAML parsing
+Local validation: 79 tests passed, including 40 workflow-state regressions; YAML parsing
 and Bash syntax passed for all changed workflows. Actionlint 1.7.12 passed
 with only its unsupported existing `concurrency.queue` syntax excluded. That
 syntax is documented by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
@@ -109,6 +109,18 @@ move during setup or claim publication, a closed/Draft PR, or a failed final
 read prevents invocation. The claim is not renewed on these paths. This covers
 [PR #85 discussion 3959823708](https://github.com/hide212131/hane/pull/85#discussion_r3959823708)
 with four production-shell regressions (including both automatic and manual delivery).
+
+A clean pre-invocation abort publishes `Claude fix not started` to release the
+execution lease. A subsequent authoritative fix (automatic case) or new owner
+grant can proceed immediately instead of waiting 55 minutes for a process that
+never started. The authorization claim itself is not renewed. This covers
+[discussion 3959981424](https://github.com/hide212131/hane/pull/85#discussion_r3959981424).
+
+Trusted-generation finalization depends on the workflow-state test job as well
+as platform report jobs. A failing state test publishes a failed generation;
+cancelled/skipped state tests yield an incomplete generation. Successful state
+tests cannot mask a platform failure. The production finalizer shell is tested
+for these cases, covering [discussion 3959981430](https://github.com/hide212131/hane/pull/85#discussion_r3959981430).
 
 Before leaving draft:
 

@@ -94,7 +94,7 @@ def recovery(statuses, sha, now):
     # A new explicit command is required after the claim boundary.
     if any(MANUAL.fullmatch(c) for c in latest):
         return result
-    recoverable = ("", f"Claude fix pending for {short}", f"Claude fix running for {short}",
+    recoverable = ("", f"Claude fix not started for {short}", f"Claude fix pending for {short}", f"Claude fix running for {short}",
                    f"Claude fix controller failed for {short}")
     result["recover"] = description in recoverable
     return result

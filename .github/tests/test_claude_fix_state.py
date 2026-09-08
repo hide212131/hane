@@ -232,7 +232,7 @@ class WorkflowShellTests(unittest.TestCase):
                                   'head': {'sha': data.get('head', os.environ.get('CURRENT_HEAD', os.environ['TARGET_SHA']))}}))
                 sys.exit(0)
             if '--method' not in args:
-                print(json.dumps([data['statuses']]))
+                print(json.dumps([data['statuses']] if '--slurp' in args else data['statuses']))
                 sys.exit(0)
             fields = dict(args[i+1].split('=', 1) for i, a in enumerate(args) if a == '-f')
             if fields:
@@ -321,6 +321,48 @@ class WorkflowShellTests(unittest.TestCase):
         self.env['ROUTE_AFTER_CLAIM'] = 'true'
         self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
         self.assertNotIn('granted=true', self.output.read_text())
+
+    def test_guard_abort_releases_lease_for_a_later_fix_or_owner_command(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        for manual in ('true', 'false'):
+            with self.subTest(manual=manual):
+                self.env['MANUAL_RETRY'] = manual
+                rows = [route(1), route(2, 'continue-validation'), execution('running', age=0)]
+                if manual == 'true':
+                    rows.append(grant(40))
+                self.assertEqual(self.run_shell(script, rows).returncode, 0)
+                data = json.loads(self.state.read_text())['statuses']
+                latest = policy.latest_by_context(data)['hane/claude-fix']
+                self.assertEqual(latest['description'], f'Claude fix not started for {SHORT}')
+                data.append(route(100))
+                if manual == 'true':
+                    data.append(grant(101, B))
+                self.assertTrue(policy.recovery(data, SHA, NOW)['recover'])
+                self.assertNotIn('granted=true', self.output.read_text())
+
+    def trusted_ci_result(self, workflow_result, platform='success'):
+        self.env.update(GENERATION_ID='101-1', WORKFLOW_TEST_RESULT=workflow_result,
+                        MACOS_REPORT_RESULT='success', WINDOWS_REPORT_RESULT='success')
+        rows = [status(1, 'hane/trusted-ci-generation', 'pending', 'Trusted CI generation 101-1'),
+                status(2, 'cargo test / clippy (macos-latest)', platform, 'CI result'),
+                status(3, 'cargo test / clippy (windows-latest)', 'success', 'CI result')]
+        script = step_script('ci.yml', 'Finalize generation marker')
+        result = self.run_shell(script, rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return policy.latest_by_context(json.loads(self.state.read_text())['statuses'])['hane/trusted-ci-generation']
+
+    def test_controller_test_failures_cannot_publish_passing_trusted_ci(self):
+        for result, expected in [('failure', 'failure'), ('cancelled', 'error'), ('skipped', 'error')]:
+            with self.subTest(result=result):
+                self.assertEqual(self.trusted_ci_result(result)['state'], expected)
+
+    def test_controller_success_cannot_mask_platform_failure(self):
+        self.assertEqual(self.trusted_ci_result('success', platform='failure')['state'], 'failure')
+
+    def test_all_successful_tests_publish_passing_generation(self):
+        result = self.trusted_ci_result('success')
+        self.assertEqual(result['state'], 'success')
+        self.assertEqual(result['description'], 'Trusted CI generation 101-1 passed')
 
     def test_router_delivery_failure_persists_one_grant_for_reconciliation(self):
         script = step_script("copilot-routing.yml", "Dispatch manual Claude retry")

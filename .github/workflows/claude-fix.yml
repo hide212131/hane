@@ -346,11 +346,20 @@ jobs:
         run: |
           set -euo pipefail
           echo 'granted=false' >> "$GITHUB_OUTPUT"
+          release_execution_lease() {
+            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix' \
+              -f description="Claude fix not started for ${TARGET_SHA:0:12}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          }
           if [[ "$MANUAL_RETRY" == true ]]; then
             statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
             valid="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" authorization \
               --sha "$TARGET_SHA" --context "$MANUAL_RETRY_CONTEXT" <<< "$statuses" | jq -r '.valid')"
-            [[ "$valid" == true ]] || exit 0
+            if [[ "$valid" != true ]]; then
+              release_execution_lease
+              exit 0
+            fi
             # Do not continue on an ambiguous POST failure. A persisted claim
             # cannot be replayed automatically; a new owner command is needed.
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -363,6 +372,7 @@ jobs:
           routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing \
             --sha "$TARGET_SHA" --manual "$MANUAL_RETRY" <<< "$statuses" | jq -r '.allowed')"
           if [[ "$routing" != true ]]; then
+            release_execution_lease
             echo 'Routing no longer authorizes a fix; skipping paid invocation.'
             exit 0
           fi
@@ -371,6 +381,7 @@ jobs:
           current_pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
           if ! jq -e --arg sha "$TARGET_SHA" \
             '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+            release_execution_lease
             echo 'PR moved, closed, or became draft during preparation; skipping paid invocation.'
             exit 0
           fi
