@@ -143,6 +143,9 @@ class Environment:
     def release_execution(self) -> None:
         """Release the GUI display after cleanup."""
 
+    def cleanup_build(self) -> None:
+        """Remove owned build files while retaining execution ownership."""
+
     def prepare(self, config: Config) -> None:
         """Create owned run artifacts only after the clean-checkout preflight."""
 
@@ -201,14 +204,17 @@ class RealEnvironment(Environment):
         except (ImportError, OSError) as exc:
             raise EnvError(f"GUI validator は別の実行が使用中、または実行ロックを取得できない: {exc}") from exc
 
+    def cleanup_build(self) -> None:
+        if self._build_snapshot is not None:
+            try:
+                self._build_snapshot.cleanup()
+                self._build_snapshot = None
+            except OSError as exc:
+                self._snapshot_cleanup_error = str(exc)
+
     def release_execution(self) -> None:
         try:
-            if self._build_snapshot is not None:
-                try:
-                    self._build_snapshot.cleanup()
-                    self._build_snapshot = None
-                except OSError as exc:
-                    self._snapshot_cleanup_error = str(exc)
+            self.cleanup_build()
         finally:
             if self._execution_fd is not None:
                 os.close(self._execution_fd)  # Kernel also releases the lock on process exit.
@@ -684,6 +690,7 @@ def finalize(
 
 
 def run_validation(env: Environment, config: Config) -> dict:
+    """Validate and clean up; the caller releases the lock after publication."""
     env._finalizing = False
     env._execution_acquired = False
     started_at = env.clock.now_iso()
@@ -741,7 +748,7 @@ def run_validation(env: Environment, config: Config) -> dict:
         try:
             steps.append(do_cleanup(env, process_holder["process"]))
         finally:
-            env.release_execution()
+            env.cleanup_build()
 
     if getattr(env, "_snapshot_cleanup_error", None):
         steps.append(make_step("snapshot_cleanup", "blocked", reason=env._snapshot_cleanup_error))
@@ -896,8 +903,11 @@ def main(argv: list[str]) -> int:
         result = run_validation(env, config)
         return _publish_result(env, config, result)
     finally:
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
+        try:
+            env.release_execution()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
 
 def _incorporate_publication_aborts(env: RealEnvironment, config: Config, result: dict) -> bool:

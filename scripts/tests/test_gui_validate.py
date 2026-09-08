@@ -890,6 +890,44 @@ class ExecutionIntegrityTests(unittest.TestCase):
                 first.release_execution()
                 second.release_execution()
 
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix publication ownership')
+    def test_early_failure_keeps_lock_until_publication_finishes(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        for fail_write in (False, True):
+            with self.subTest(fail_write=fail_write), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = make_config(root, expected_sha='a' * 40)
+                config.state_dir.rmdir()
+                config.run_dir.rmdir()
+                first, second = gv.RealEnvironment(), gv.RealEnvironment()
+                original_publish = gv._publish_result
+                def publish(*args):
+                    with self.assertRaises(gv.EnvError):
+                        second.acquire_execution()
+                    write = patch.object(Path, 'write_text', side_effect=OSError('test publication failure')) if fail_write else contextlib.nullcontext()
+                    with write:
+                        outcome = original_publish(*args)
+                    with self.assertRaises(gv.EnvError):
+                        second.acquire_execution()
+                    return outcome
+                with patch.object(gv, 'execution_lock_path', return_value=root / 'shared.lock'), \
+                        patch.object(gv, 'build_config', return_value=config), \
+                        patch.object(gv, 'RealEnvironment', return_value=first), \
+                        patch.object(first, 'git_head', return_value='b' * 40), \
+                        patch.object(first, 'git_dirty_paths', return_value=[]), \
+                        patch.object(first, 'missing_tools', return_value=[]), \
+                        patch.object(gv, '_publish_result', side_effect=publish), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        self.assertEqual(gv.main(['gui_validate.py', 'editor']), gv.EXIT_BLOCKED)
+                        self.assertEqual((config.run_dir / 'result.json').exists(), not fail_write)
+                        second.acquire_execution()
+                    finally:
+                        first.release_execution()
+                        second.release_execution()
+
     @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix inherited display lock')
     def test_surviving_child_keeps_lock_after_failed_cleanup_and_parent_release(self):
         from unittest.mock import patch
