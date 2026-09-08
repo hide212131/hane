@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hosted GUI interaction spike (Issue 44, follow-up to the launch probe).
 
-Runs two independent interactive smoke scenarios against the pinned target
+Runs independent interactive smoke scenarios against the pinned target
 checkout's Hane binary on a GitHub-hosted macOS runner:
 
   1. ascii_edit_save_undo_redo_reopen — OS-level select-all, type a known
@@ -15,7 +15,8 @@ checkout's Hane binary on a GitHub-hosted macOS runner:
 This is still an interactive *smoke* check: it proves keyboard input, save,
 undo/redo and reopen paths exist and produce the expected file bytes, plus a
 best-effort screenshot per session. It does not prove rendering pixel-by-
-pixel, and it does not cover scrolling, focus changes, or dialogs.
+pixel, and it does not cover all focus changes or dialogs. OS wheel scrolling is
+checked independently using visible line numbers recognized by Vision OCR.
 
 This script does not copy scripts/gui_validate.py. It loads the pinned
 target's copy via importlib and calls its preflight/build/launch/
@@ -40,11 +41,11 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/1"
+PROCEDURE_VERSION = "hosted-gui-interaction/2"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力の"
-    "対話スモーク確認に限定される。スクロール・フォーカス移動・ダイアログ表示等の"
+    "およびOSスクロールの基本スモーク確認に限定される。全フォーカス移動・ダイアログ表示等の"
     "網羅的な GUI 検証はまだ証明されていない。"
 )
 
@@ -186,6 +187,17 @@ def current_pid(process_holder) -> Optional[int]:
     return process.pid if process is not None else None
 
 
+def verify_visible_text(helper, image_path, expected, timeout):
+    ok, text, error = run_helper(helper, ["ocr", str(image_path)], timeout)
+    if not ok:
+        return make_step("visible_saved_text", "blocked", reason=error)
+    normalized = re.sub(r"\s+", "", text).casefold()
+    matched = re.sub(r"\s+", "", expected).casefold() in normalized
+    return make_step("visible_saved_text", "pass" if matched else "fail",
+                     reason=None if matched else "保存した文書の表示をOCRで確認できない",
+                     expected=expected, recognized_text=text)
+
+
 def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, binary_path,
                         expected_sha, request_id, startup_timeout, window_timeout,
                         helper_timeout, poll_timeout, priority) -> dict:
@@ -288,6 +300,7 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
     try:
         session_steps, _window_id = open_session(module, env, reopen_config, binary_path, reopen_process_holder, "reopen")
         steps += session_steps
+        steps.append(verify_visible_text(swift_helper, reopen_dir / "reopen.png", ASCII_AFTER_APPEND, helper_timeout))
         matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_AFTER_APPEND.encode("utf-8"), 1.0)
         step = make_step(
             "reopen_content_check", "pass" if matched else "fail",
@@ -405,6 +418,48 @@ def run_ime_scenario(module, env, target_dir, swift_helper, base_run_dir, binary
     }
 
 
+def run_scroll_scenario(module, env, target_dir, swift_helper, base_run_dir, binary_path,
+                        expected_sha, request_id, startup_timeout, window_timeout,
+                        helper_timeout, poll_timeout, priority):
+    run_dir = base_run_dir / "os_scroll"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fixture = run_dir / "scroll-fixture.md"
+    contents = "\n\n".join(f"LINE {n}" for n in range(1, 101)) + "\n"
+    fixture.write_text(contents, encoding="utf-8")
+    config = make_config(module, workspace_dir=target_dir, scenario="os-scroll",
+                         expected_sha=expected_sha, request_id=request_id, generation="1",
+                         run_dir=run_dir, fixture_path=fixture, features=["timing-probe"],
+                         extra_env={}, startup_timeout=startup_timeout, window_timeout=window_timeout)
+    holder = {"process": None}
+    steps = []
+    try:
+        initial, window_id = open_session(module, env, config, binary_path, holder, "before")
+        steps.extend(initial)
+        if window_id is not None:
+            before_ok, before_text, before_error = run_helper(swift_helper, ["ocr", str(run_dir / "before.png")], helper_timeout)
+            ok, detail, error = run_helper(swift_helper, ["wheel", str(current_pid(holder)), "-600"], helper_timeout)
+            steps.append(make_step("os_wheel", "pass" if ok else "blocked", reason=error or None, event=detail))
+            steps.append(capture_named(module, env, config, window_id, run_dir, "after"))
+            after_ok, after_text, after_error = run_helper(swift_helper, ["ocr", str(run_dir / "after.png")], helper_timeout)
+            if not before_ok or not after_ok:
+                steps.append(make_step("visible_scroll", "blocked", reason=before_error or after_error))
+            else:
+                before = [int(n) for n in re.findall(r"LINE\s+(\d+)", before_text, re.I)]
+                after = [int(n) for n in re.findall(r"LINE\s+(\d+)", after_text, re.I)]
+                moved = bool(before and after and 1 in before and min(after) > 1 and max(after) > max(before))
+                steps.append(make_step("visible_scroll", "pass" if moved else "fail",
+                                       reason=None if moved else "OSスクロール後に表示行の移動を確認できない",
+                                       before_lines=before, after_lines=after,
+                                       before_text=before_text, after_text=after_text))
+            unchanged = fixture.read_text(encoding="utf-8") == contents
+            steps.append(make_step("scroll_preserves_document", "pass" if unchanged else "fail",
+                                   reason=None if unchanged else "スクロールで文書内容が変わった"))
+    finally:
+        steps.append(close_session(module, env, holder))
+    return {"name": "os_scroll", "steps": steps, "result": worst_result(steps, priority),
+            "reason": reason_for(steps), "evidence": {"fixture_path": str(fixture)}}
+
+
 def env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if not value:
@@ -493,6 +548,7 @@ def main() -> int:
                 for scenario_name, run_scenario in (
                     ("ascii_edit_save_undo_redo_reopen", run_ascii_scenario),
                     ("japanese_ime_input", run_ime_scenario),
+                    ("os_scroll", run_scroll_scenario),
                 ):
                     try:
                         scenarios.append(run_scenario(

@@ -10,6 +10,7 @@
 import AppKit
 import Carbon
 import Foundation
+import Vision
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -167,12 +168,53 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
     """)
 }
 
+func recognizeText(_ path: String) {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["en-US", "ja-JP"]
+    do {
+        try VNImageRequestHandler(url: URL(fileURLWithPath: path), options: [:]).perform([request])
+        for observation in request.results ?? [] {
+            if let candidate = observation.topCandidates(1).first { print(candidate.string) }
+        }
+    } catch { fail("OCR failed: \(error)") }
+}
+
+func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
+    guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
+          let row = windows.first(where: { ($0[kCGWindowOwnerPID as String] as? Int) == Int(pid) && ($0[kCGWindowLayer as String] as? Int) == 0 }),
+          let dictionary = row[kCGWindowBounds as String] as? [String: Any],
+          let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary)
+    else { fail("target window bounds unavailable") }
+    runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
+    Thread.sleep(forTimeInterval: 0.3)
+    let point = CGPoint(x: bounds.midX, y: bounds.midY)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left),
+          let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: pixels, wheel2: 0, wheel3: 0)
+    else { fail("could not create OS pointer events") }
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.2)
+    wheel.location = point
+    wheel.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.7)
+    print("OS wheel at \(point.x),\(point.y), pixels=\(pixels)")
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
     fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save> ...")
 }
 
 switch command {
+case "ocr":
+    guard arguments.count == 2 else { fail("ocr requires screenshot path") }
+    recognizeText(arguments[1])
+case "wheel":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]), let pixels = Int32(arguments[2]) else { fail("wheel requires PID and pixels") }
+    scrollEditor(pid, pixels)
 case "current-source":
     print(currentSourceID())
 case "list-sources":
