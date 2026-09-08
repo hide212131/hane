@@ -492,6 +492,26 @@ class ScenarioSetupTests(unittest.TestCase):
                     gv.build_config("editor", root)
             self.assertEqual(existing.read_text(), "preserve me")
 
+    def test_reserved_generation_main_returns_blocked_without_overwriting(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            marker = run / ".gui-validate-owner"
+            marker.write_text("existing owner")
+            proof = run / "result.json"
+            proof.write_text("existing evidence")
+            with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(run)}), \
+                    patch.object(gv, "run_validation") as execute, \
+                    contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(gv.main(["gui_validate.py", "editor"]), gv.EXIT_BLOCKED)
+            execute.assert_not_called()
+            self.assertIn("BLOCKED", error.getvalue())
+            self.assertEqual(marker.read_text(), "existing owner")
+            self.assertEqual(proof.read_text(), "existing evidence")
+
     def test_duplicate_generation_has_only_one_atomic_directory_owner(self):
         from concurrent.futures import ThreadPoolExecutor
         from threading import Barrier
