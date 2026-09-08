@@ -41,6 +41,7 @@ class PolicyTests(unittest.TestCase):
         read.assert_not_called()
         self.assertIsNone(data['gui_receipt'])
         self.assertNotIn(controller.GUI_CONTEXT, data['statuses'])
+        self.assertEqual(data['judge_procedure_version'], controller.JUDGE_PROCEDURE)
 
     def test_all_gui_terminal_outcomes_reach_final_judge(self):
         for outcome in ('pass', 'fail', 'blocked'):

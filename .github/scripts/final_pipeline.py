@@ -8,7 +8,7 @@ import subprocess
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gui_policy import CONTEXT as GUI_CONTEXT, gui_state
-from final_policy import AUTO_LABEL, CONTEXT, authenticated_receipt, final_state, fingerprint, gate, may_judge, parse_decision
+from final_policy import AUTO_LABEL, CONTEXT, JUDGE_PROCEDURE, authenticated_receipt, final_state, fingerprint, gate, may_judge, parse_decision
 from pipeline_api import GitHub
 from gui_artifacts import artifact_json
 
@@ -76,6 +76,7 @@ def snapshot(api, number):
     if not data['gui_required']:
         statuses.pop(GUI_CONTEXT, None)
     return {'pr_number': number, 'sha': data['sha'], 'repository': api.repository,
+            'judge_procedure_version': JUDGE_PROCEDURE,
             'title': pr['title'], 'body': pr.get('body'), 'trusted': True, 'mergeable': pr.get('mergeable'),
             'ci_ready': data['ci_ready'], 'review_ready': data['review_ready'],
             'classified': data['classified'], 'gui_required': data['gui_required'],
