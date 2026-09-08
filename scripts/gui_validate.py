@@ -382,7 +382,12 @@ class RealEnvironment(Environment):
         run_env.update(config.extra_env)
         log_file = open(config.log_path, "wb")
         try:
-            process = subprocess.Popen(args, stderr=log_file, stdout=subprocess.DEVNULL, env=run_env)
+            # The child shares this flock's open-file description. If cleanup
+            # fails (or the validator dies), its surviving child keeps the
+            # display reserved until that child actually exits.
+            inherited_lock = (self._execution_fd,) if self._execution_fd is not None else ()
+            process = subprocess.Popen(args, stderr=log_file, stdout=subprocess.DEVNULL,
+                                       env=run_env, pass_fds=inherited_lock)
         except OSError as exc:
             raise EnvError(str(exc)) from exc
         finally:
