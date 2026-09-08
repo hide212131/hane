@@ -89,9 +89,10 @@ class FakeAPI:
     def statuses(self, sha):
         return self.rows
 
-    def post_status(self, sha, context, state, description):
+    def post_status(self, sha, context, state, description, run_id=None):
         self.writes.append((sha, context, state, description))
-        self.rows[context] = {'state': state, 'description': description}
+        self.rows[context] = {'state': state, 'description': description,
+                              'target_url': f'https://github.com/{self.repository}/actions/runs/{run_id}'}
 
     def repo(self, path):
         return path
@@ -165,7 +166,7 @@ class FixEvidenceTests(unittest.TestCase):
         api = FakeAPI()
         api.rows['hane/final-judge'] = {'id': 10, 'state': 'failure',
             'description': f'Final fix v1 {SHA[:12]} e{key}',
-            'target_url': 'https://github.com/owner/repo/actions/runs/123'}
+            'target_url': 'https://github.com/owner/repo/actions/runs/123/attempts/1'}
         run = {'status': 'completed', 'head_branch': 'main', 'path': '.github/workflows/final-judge.yml',
                'event': 'workflow_run', 'run_attempt': 1}
         with patch.object(bridge, 'snapshot', return_value=data), patch.object(api, 'api', return_value=run), patch.object(bridge, 'artifact_json', return_value=proof):

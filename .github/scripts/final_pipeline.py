@@ -106,7 +106,8 @@ def snapshot(api, number):
 
 def publish(api, data, key, result):
     state = {'pending': 'pending', 'ready': 'success', 'merged': 'success', 'fix': 'failure', 'blocked': 'error'}[result]
-    api.post_status(data['sha'], CONTEXT, state, f'Final {result} v1 {data["sha"][:12]} e{key}')
+    api.post_status(data['sha'], CONTEXT, state, f'Final {result} v1 {data["sha"][:12]} e{key}',
+                    run_id=f'{os.environ["GITHUB_RUN_ID"]}/attempts/{os.environ["GITHUB_RUN_ATTEMPT"]}')
 
 
 def judge(data):
@@ -144,8 +145,8 @@ def process(api, number, directory):
         # Never replay a paid invocation after a terminal result or ambiguous
         # failure. An expired pending claim becomes blocked, requiring new evidence.
         if previous == 'pending':
-            match = re.fullmatch(r'https://github.com/' + re.escape(api.repository) + r'/actions/runs/(\d+)', old.get('target_url', ''))
-            if match and api.api(api.repo(f'actions/runs/{match[1]}')).get('status') == 'completed':
+            match = re.fullmatch(r'https://github.com/' + re.escape(api.repository) + r'/actions/runs/(\d+)/attempts/(\d+)', old.get('target_url', ''))
+            if match and api.api(api.repo(f'actions/runs/{match[1]}/attempts/{match[2]}')).get('status') == 'completed':
                 publish(api, data, key, 'blocked')
         return
     if fingerprint(snapshot(api, number)) != key:

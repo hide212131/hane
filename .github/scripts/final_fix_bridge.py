@@ -23,13 +23,12 @@ def evidence(api, number, sha):
     key = fingerprint(data)
     if final_state(status, sha, key) != 'fix':
         return None
-    match = re.fullmatch(r'https://github.com/' + re.escape(api.repository) + r'/actions/runs/(\d+)', status.get('target_url', ''))
+    match = re.fullmatch(r'https://github.com/' + re.escape(api.repository) + r'/actions/runs/(\d+)/attempts/(\d+)', status.get('target_url', ''))
     if not match:
         raise ValueError('invalid final fix run URL')
-    run_id = match[1]
-    run = api.api(api.repo(f'actions/runs/{run_id}'))
-    attempt = str(run['run_attempt'])
-    if (run.get('status') != 'completed' or run.get('head_branch') != 'main'
+    run_id, attempt = match[1], match[2]
+    run = api.api(api.repo(f'actions/runs/{run_id}/attempts/{attempt}'))
+    if (str(run.get('run_attempt')) != attempt or run.get('status') != 'completed' or run.get('head_branch') != 'main'
             or run.get('path') != '.github/workflows/final-judge.yml'
             or run.get('event') not in ('workflow_dispatch', 'workflow_run', 'schedule')):
         raise ValueError('untrusted or incomplete final judge run')
