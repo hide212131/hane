@@ -107,6 +107,8 @@ jobs:
           while IFS= read -r commit_record; do
             sha="$(jq -r '.sha' <<< "$commit_record")"
             commit_message="$(jq -r '.message // ""' <<< "$commit_record")"
+            commit_subject="$(jq -r '.subject // ""' <<< "$commit_record")"
+            commit_actor="$(jq -r '.actor // ""' <<< "$commit_record")"
             [[ -z "$sha" ]] && continue
             pr_commit_shas+=( "$sha" )
             statuses_for_sha="$(gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100")"
@@ -117,7 +119,8 @@ jobs:
             if [[ "$reset_present" == true ]]; then
               cycle_reset_sha="$sha"
             fi
-            if grep -q '^Manual retry: true$' <<< "$commit_message"; then
+            if [[ "$commit_actor" == 'github-actions[bot]' && "$commit_subject" == 'Automatic Claude fix for Copilot routing decision on '* ]] \
+              && grep -q '^Manual retry: true$' <<< "$commit_message"; then
               manual_retry_sha="$sha"
               manual_retry_reset_present="$reset_present"
             fi
@@ -131,7 +134,7 @@ jobs:
             fi
           done < <(
             gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" \
-              --jq '.[] | {sha, message:(.commit.message // "")}'
+              --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), message:(.commit.message // ""), actor:(.author.login // .committer.login // "")}'
           )
 
           # A manual-retry commit is durable evidence of a new cycle even when

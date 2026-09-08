@@ -117,6 +117,11 @@ jobs:
             claude_description="${claude_latest%%$'\t'*}"
             claude_created_at="${claude_latest#*$'\t'}"
             claude_age="$(status_age_seconds "$claude_created_at")"
+            manual_retry_authorized="$(
+              jq -r --arg manual "Claude manual retry authorized for ${short_sha}" \
+                '[.[] | select(.context == "hane/claude-fix-manual" and .state == "success" and .description == $manual)] | length > 0' \
+                <<< "$statuses"
+            )"
 
             recover_claude=false
             if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" ]]; then
@@ -128,7 +133,10 @@ jobs:
                 "Claude fix controller failed for ${short_sha}")
                   [[ "$claude_age" -ge 60 ]] && recover_claude=true
                   ;;
-                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                "Claude fix completed for ${short_sha}")
+                  ;;
+                "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                  [[ "$manual_retry_authorized" == true ]] && recover_claude=true
                   ;;
                 *)
                   echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."
