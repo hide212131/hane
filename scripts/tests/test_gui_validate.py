@@ -110,7 +110,7 @@ class FakeEnvironment(gv.Environment):
     def missing_tools(self, config):
         return self.missing
 
-    def build(self, workspace_dir, features):
+    def build(self, workspace_dir, features, source_sha=None):
         self.build_calls += 1
         if isinstance(self.build_result, Exception):
             raise self.build_result
@@ -550,10 +550,15 @@ class ScenarioSetupTests(unittest.TestCase):
                 output = json.dumps({"reason": "compiler-artifact", "target": {"name": "hane"},
                                      "executable": str(binary)}) if "build" in args else "test version"
                 return subprocess.CompletedProcess(args, 0, output, "")
-            with patch.object(gv.subprocess, "run", side_effect=command):
-                path, build = gv.RealEnvironment().build(root, ["timing-probe"])
+            env = gv.RealEnvironment()
+            with patch.object(env, 'snapshot_checkout', return_value=root), \
+                    patch.object(env, 'git_head', return_value='a' * 40), \
+                    patch.object(env, 'git_dirty_paths', return_value=[]), \
+                    patch.object(gv.subprocess, "run", side_effect=command):
+                path, build = env.build(root, ["timing-probe"], source_sha='a' * 40)
             self.assertEqual(path, binary)
             self.assertIn("--locked", calls[0][0])
+            self.assertIn("--target-dir", calls[0][0])
             self.assertTrue(all(options["cwd"] == root for _, options in calls))
             self.assertEqual(build["features"], ["timing-probe"])
 
@@ -644,8 +649,8 @@ class ExecutionIntegrityTests(unittest.TestCase):
             env = FakeEnvironment(process=FakeProcess(42))
             config = make_config(self.root)
             original = env.build
-            def changed_build(*args):
-                result = original(*args)
+            def changed_build(*args, **kwargs):
+                result = original(*args, **kwargs)
                 if kind == 'head':
                     env.head_sha = 'different-head'
                 else:
@@ -655,6 +660,51 @@ class ExecutionIntegrityTests(unittest.TestCase):
                 result = gv.run_validation(env, config)
             self.assertEqual(result['overall_result'], 'blocked')
             launch.assert_not_called()
+
+    def test_transient_working_copy_edits_cannot_enter_snapshot_build(self):
+        from unittest.mock import patch
+        repo = self.root / 'repo'
+        repo.mkdir()
+        source = repo / 'source.txt'
+        source.write_text('recorded commit input')
+        (repo / 'Cargo.toml').write_text('[workspace]\n')
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=GUI test',
+                        '-c', 'user.email=gui-test@example.invalid', '-c', 'commit.gpgsign=false',
+                        'commit', '-qm', 'snapshot input'], check=True)
+        sha = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+        config = make_config(self.root, workspace_dir=repo, expected_sha=sha)
+        env = gv.RealEnvironment()
+        original_run = subprocess.run
+        compiled_inputs = []
+        def command(args, **kwargs):
+            if args[0] == 'git':
+                return original_run(args, **kwargs)
+            if args[0] == 'cargo' and args[1] == 'build':
+                source.write_text('transient outside-commit input')
+                build_dir = Path(kwargs['cwd'])
+                compiled_inputs.append((build_dir / 'source.txt').read_text())
+                source.write_text('recorded commit input')
+                target = Path(args[args.index('--target-dir') + 1])
+                target.mkdir()
+                binary = target / 'hane'
+                binary.write_bytes(b'private snapshot executable')
+                output = json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'hane'}, 'executable': str(binary)})
+                return subprocess.CompletedProcess(args, 0, output, '')
+            return subprocess.CompletedProcess(args, 0, 'test tool version', '')
+        try:
+            with patch.object(gv.subprocess, 'run', side_effect=command):
+                step, binary, info = gv.do_build(env, config, baseline_sha=sha)
+            self.assertEqual(step['result'], 'pass')
+            self.assertEqual(compiled_inputs, ['recorded commit input'])
+            self.assertEqual(info['source_snapshot_sha'], sha)
+            self.assertNotEqual(Path(info['source_snapshot_dir']), repo)
+            self.assertTrue(binary.is_file())
+        finally:
+            env.release_execution()
+        self.assertFalse(Path(info['source_snapshot_dir']).exists())
+        self.assertEqual(source.read_text(), 'recorded commit input')
 
     def test_checkout_change_before_build_prevents_cargo_execution(self):
         for head, dirty in [('new-head', []), ('abc123', [' M Cargo.toml'])]:
@@ -668,7 +718,7 @@ class ExecutionIntegrityTests(unittest.TestCase):
         from unittest.mock import patch
         for kind in ('head', 'dirty'):
             env = FakeEnvironment(process=FakeProcess(42))
-            def failed_build(*args):
+            def failed_build(*args, **kwargs):
                 if kind == 'head':
                     env.head_sha = 'changed-head'
                 else:

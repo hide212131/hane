@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -154,7 +155,7 @@ class Environment:
     def missing_tools(self, config: Config) -> list[str]:
         raise NotImplementedError
 
-    def build(self, workspace_dir: Path, features: list[str]) -> tuple[Path, dict]:
+    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None) -> tuple[Path, dict]:
         raise NotImplementedError
 
     def launch(self, binary_path: Path, config: Config):
@@ -176,6 +177,7 @@ class RealEnvironment(Environment):
         self._reserved_run_dir: Optional[Path] = None
         self._execution_fd: Optional[int] = None
         self._deferred_aborts: list[int] = []
+        self._build_snapshot = None
 
     def record_aborts(self, signals) -> None:
         self._deferred_aborts.extend(signals)
@@ -200,9 +202,17 @@ class RealEnvironment(Environment):
             raise EnvError(f"GUI validator は別の実行が使用中、または実行ロックを取得できない: {exc}") from exc
 
     def release_execution(self) -> None:
-        if self._execution_fd is not None:
-            os.close(self._execution_fd)  # Kernel releases the advisory lock, also on process exit.
-            self._execution_fd = None
+        try:
+            if self._build_snapshot is not None:
+                try:
+                    self._build_snapshot.cleanup()
+                    self._build_snapshot = None
+                except OSError as exc:
+                    self._snapshot_cleanup_error = str(exc)
+        finally:
+            if self._execution_fd is not None:
+                os.close(self._execution_fd)  # Kernel also releases the lock on process exit.
+                self._execution_fd = None
 
     def reserve(self, config: Config) -> None:
         if self._reserved_run_dir == config.run_dir:
@@ -268,13 +278,37 @@ class RealEnvironment(Environment):
             missing.append("screencapture")
         return missing
 
-    def build(self, workspace_dir: Path, features: list[str]) -> tuple[Path, dict]:
+    def snapshot_checkout(self, workspace_dir: Path, source_sha: str) -> Path:
+        # Clone immutable Git objects into a private repository; editing or
+        # restoring files in the user's working copy cannot change build inputs.
+        # No linked worktree registration or hard-linked object files are used.
+        with defer_aborts():
+            self._build_snapshot = tempfile.TemporaryDirectory(prefix="hane-gui-build-")
+        snapshot = Path(self._build_snapshot.name) / "source"
+        try:
+            subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", "--no-checkout",
+                            "--", str(workspace_dir), str(snapshot)],
+                           capture_output=True, text=True, check=True)
+            subprocess.run(["git", "checkout", "--quiet", "--detach", source_sha], cwd=snapshot,
+                           capture_output=True, text=True, check=True)
+            if self.git_head(snapshot) != source_sha or self.git_dirty_paths(snapshot):
+                raise EnvError("独立したビルド用checkoutのSHAまたはclean状態が一致しない")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise EnvError(f"ビルド用checkoutを作成できない: {exc}") from exc
+        return snapshot
+
+    def build(self, workspace_dir: Path, features: list[str], source_sha: Optional[str] = None) -> tuple[Path, dict]:
+        source_sha = source_sha or self.git_head(workspace_dir)
+        snapshot = self.snapshot_checkout(workspace_dir, source_sha)
+        target_dir = snapshot.parent / "target"
         args = [
             "cargo",
             "build",
             "--locked",
             "--manifest-path",
-            str(workspace_dir / "Cargo.toml"),
+            str(snapshot / "Cargo.toml"),
+            "--target-dir",
+            str(target_dir),
             "-p",
             "hane",
             "--bin",
@@ -284,9 +318,11 @@ class RealEnvironment(Environment):
         if features:
             args += ["--features", ",".join(features)]
         try:
-            proc = subprocess.run(args, cwd=workspace_dir, capture_output=True, text=True)
+            proc = subprocess.run(args, cwd=snapshot, capture_output=True, text=True)
         except OSError as exc:
             raise BuildError(str(exc)) from exc
+        if self.git_head(snapshot) != source_sha or self.git_dirty_paths(snapshot):
+            raise EnvError("ビルド用checkoutの入力が変更された")
         if proc.returncode != 0:
             tail = "\n".join(proc.stderr.splitlines()[-40:])
             raise BuildError(f"cargo build exited {proc.returncode}: {tail}")
@@ -310,7 +346,7 @@ class RealEnvironment(Environment):
 
         def tool_version(args: list[str]) -> str:
             try:
-                out = subprocess.run(args, cwd=workspace_dir, capture_output=True, text=True, check=True)
+                out = subprocess.run(args, cwd=snapshot, capture_output=True, text=True, check=True)
                 return out.stdout.strip()
             except (OSError, subprocess.CalledProcessError) as exc:
                 return f"unknown ({exc})"
@@ -323,6 +359,9 @@ class RealEnvironment(Environment):
             "cargo_version": tool_version(["cargo", "--version"]),
             "binary_path": str(binary_path),
             "binary_sha256": digest,
+            "source_snapshot_sha": source_sha,
+            "source_snapshot_dir": str(snapshot),
+            "source_snapshot_clean": True,
         }
         return binary_path, build_info
 
@@ -433,7 +472,7 @@ def do_build(env: Environment, config: Config, baseline_sha: Optional[str] = Non
             return make_step("build", "blocked", reason="ビルド直前に checkout が変更されたため実行しない",
                              actual_sha=initial_sha, dirty_paths=initial_dirty), None, {}
         try:
-            binary_path, build_info = env.build(config.workspace_dir, config.features)
+            binary_path, build_info = env.build(config.workspace_dir, config.features, source_sha=initial_sha)
         except BuildError as exc:
             build_error = exc
         actual_sha = env.git_head(config.workspace_dir)
@@ -675,6 +714,9 @@ def run_validation(env: Environment, config: Config) -> dict:
             steps.append(do_cleanup(env, process_holder["process"]))
         finally:
             env.release_execution()
+
+    if getattr(env, "_snapshot_cleanup_error", None):
+        steps.append(make_step("snapshot_cleanup", "blocked", reason=env._snapshot_cleanup_error))
 
     return finalize(steps, config, target_info, build_info, started_at, env)
 
