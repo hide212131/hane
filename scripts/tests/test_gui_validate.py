@@ -1,9 +1,8 @@
 """Tests for gui_validate.py that never touch a real screen or a real build.
 
-Every OS-facing call (git, cargo, swift, screencapture, the launched process)
-is replaced by a FakeEnvironment/FakeProcess so the state machine — timeouts,
-pass/fail/blocked classification, cleanup scoped to the one launched process,
-evidence retention on partial failure — can run in CI on any platform.
+Builds and GUI operations use fakes. Temporary Git repositories and a bounded
+Python child process verify snapshot isolation and inherited process locks.
+The state-machine tests never launch Hane, Cargo, or screen/input tools.
 """
 
 from __future__ import annotations
@@ -853,6 +852,35 @@ class ExecutionIntegrityTests(unittest.TestCase):
                 first.release_execution()
                 second.acquire_execution()
             finally:
+                first.release_execution()
+                second.release_execution()
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix inherited display lock')
+    def test_surviving_child_keeps_lock_after_failed_cleanup_and_parent_release(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.object(gv, 'execution_lock_path', return_value=Path(tmp) / 'shared.lock'):
+            root = Path(tmp)
+            child_script = root / 'child.py'
+            child_script.write_text('import time\ntime.sleep(30)\n')
+            config = make_config(root, fixture_path=child_script)
+            first, second = gv.RealEnvironment(), gv.RealEnvironment()
+            process = None
+            try:
+                first.acquire_execution()
+                process = first.launch(Path(sys.executable), config)
+                with patch.object(process, 'terminate'), patch.object(process, 'kill'), \
+                        patch.object(process, 'wait', side_effect=subprocess.TimeoutExpired('child', 5)):
+                    self.assertEqual(gv.do_cleanup(first, process)['result'], 'blocked')
+                first.release_execution()
+                with self.assertRaises(gv.EnvError):
+                    second.acquire_execution()
+                process.kill()
+                process.wait(timeout=5)
+                second.acquire_execution()
+            finally:
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
                 first.release_execution()
                 second.release_execution()
 
