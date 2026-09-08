@@ -2,7 +2,7 @@
 
 2026-09-09 更新。GitHub-hosted macOS を優先し、不足が実証された操作だけをローカルで補う。[ADR-0024](adr/0024-local-gui-validation.md) が採用理由、[全体の開発ワークフロー](agentic-development-workflow.md) が役割・進行条件の正本である。文書名は既存リンクとの互換のため維持する。
 
-この設計の記録は、final judge や merge gate が実装・動作済みであるという意味ではない。実証と実装の進捗は [Issue #44](https://github.com/hide212131/hane/issues/44) と [#55](https://github.com/hide212131/hane/issues/55) で追跡する。
+GUI受領処理と [final judge / merge gate](final-judgement.md) の実装を追加した。実装の追加と、実際の自動マージまでの動作実証は区別する。実証と実装の進捗は [Issue #44](https://github.com/hide212131/hane/issues/44) と [#55](https://github.com/hide212131/hane/issues/55) で追跡する。
 
 ## 実証済みの範囲
 

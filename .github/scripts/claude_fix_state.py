@@ -58,8 +58,11 @@ def routing_allows_fix(statuses, sha, manual=False):
     ignored = {f"Copilot routing controller failed for {short}"}
     if manual:
         ignored.add(f"Copilot routing: workflow changes require owner for {short}")
-    for event in sorted((s for s in statuses if s.get("context") == "hane/copilot-routing"),
+    for event in sorted((s for s in statuses if s.get("context") in ("hane/copilot-routing", "hane/final-judge")),
                         key=lambda s: s["id"], reverse=True):
+        if event.get("context") == "hane/final-judge":
+            return (event.get("state") == "failure" and re.fullmatch(
+                rf"Final fix v1 {short} e[0-9a-f]{{16}}", event.get("description", "")) is not None)
         if event.get("state") == "error" and event.get("description") in ignored:
             continue
         return (event.get("state") == "failure"
