@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import math
+import platform
 import re
 import signal
 import subprocess
@@ -41,7 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/2"
+PROCEDURE_VERSION = "hosted-gui-interaction/3"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力の"
@@ -594,6 +595,12 @@ def main() -> int:
             "finished_at": env.clock.now_iso(),
             "target": target_info,
             "control": {"sha": control_sha},
+            "runner": {"os": os.environ.get("RUNNER_OS", ""),
+                       "arch": os.environ.get("RUNNER_ARCH", ""),
+                       "image_os": os.environ.get("ImageOS", ""),
+                       "image_version": os.environ.get("ImageVersion", ""),
+                       "macos_version": platform.mac_ver()[0],
+                       "machine": platform.machine()},
             "build": build_info,
             "top_level_steps": top_steps,
             "scenarios": scenarios,

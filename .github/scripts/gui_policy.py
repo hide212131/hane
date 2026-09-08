@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 POLICY = 'v1'
-PROCEDURE = 'hosted-gui-interaction/2'
+PROCEDURE = 'hosted-gui-interaction/3'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) v1 ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
 REQUIRED_STEPS = {
@@ -82,6 +82,8 @@ def parse_time(value):
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     """Fail closed on provenance/shape errors; never upgrade partial evidence."""
     now = now or datetime.now(timezone.utc)
+    if request.get('procedure_version') != PROCEDURE:
+        raise ValueError('requested procedure version mismatch')
     expected = (('request_id', request['request_id']), ('run_id', request['run_id']),
                 ('run_attempt', request['run_attempt']), ('procedure_version', PROCEDURE))
     for name, value in expected:
@@ -109,6 +111,15 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
         build = raw.get('build', {})
         if not re.fullmatch('[0-9a-f]{64}', build.get('binary_sha256', '')) or build.get('features') != ['timing-probe']:
             raise ValueError('missing binary identity or wrong build features')
+        if build.get('source_snapshot_sha') != request['sha'] or build.get('source_snapshot_clean') is not True:
+            raise ValueError('build input snapshot is not bound to requested SHA')
+        runner = raw.get('runner', {})
+        if (runner.get('os') != 'macOS' or runner.get('image_os') != 'macos15'
+                or {'ARM64': 'arm64', 'X64': 'x86_64'}.get(runner.get('arch')) != runner.get('machine')
+                or not isinstance(runner.get('machine'), str)
+                or not str(runner.get('macos_version', '')).startswith('15.')
+                or not isinstance(runner.get('image_version'), str) or not runner['image_version'].strip()):
+            raise ValueError('missing or inconsistent hosted runner image metadata')
         top = raw.get('top_level_steps', [])
         if {s.get('name') for s in top} != {'preflight', 'build'} or any(s.get('result') != 'pass' for s in top):
             raise ValueError('incomplete build/preflight')
