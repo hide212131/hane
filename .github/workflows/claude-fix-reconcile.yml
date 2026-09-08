@@ -106,8 +106,7 @@ jobs:
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
             routing_decision="$(
-              jq -r --arg fix "Copilot routing: fix for ${short_sha}" \
-                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | .description // ""' \
+              jq -r '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | .description // ""' \
                 <<< "$statuses"
             )"
             claude_latest="$(
@@ -119,7 +118,7 @@ jobs:
             claude_age="$(status_age_seconds "$claude_created_at")"
             manual_retry_authorized="$(
               jq -r --arg manual "Claude manual retry authorized for ${short_sha}" \
-                '[.[] | select(.context == "hane/claude-fix-manual" and .state == "success" and .description == $manual)] | length > 0' \
+                '[.[] | select(.context == "hane/claude-fix-manual")] | max_by(.id) // {} | (.state == "success" and .description == $manual)' \
                 <<< "$statuses"
             )"
 
@@ -135,8 +134,10 @@ jobs:
                   ;;
                 "Claude fix completed for ${short_sha}")
                   ;;
-                "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                "Claude fix blocked: max iterations for ${short_sha}")
                   [[ "$manual_retry_authorized" == true ]] && recover_claude=true
+                  ;;
+                "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
                   ;;
                 *)
                   echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."

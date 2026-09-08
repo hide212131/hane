@@ -414,6 +414,12 @@ jobs:
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix produced no changes for ${short_sha}" \
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+            if [[ "${MANUAL_RETRY}" == true ]]; then
+              gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+                -f state=error -f context='hane/claude-fix-manual' \
+                -f description="Claude manual retry consumed for ${short_sha}" \
+                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+            fi
             echo 'published=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -540,9 +546,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix-manual' \
+              -f description="Claude manual retry consumed for ${short_sha}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+              echo '::warning::Failed to consume the manual Claude retry authorization.'
+            fi
+          fi
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix failed for ${short_sha}" \

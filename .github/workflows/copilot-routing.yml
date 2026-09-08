@@ -121,6 +121,27 @@ jobs:
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
           echo "manual_claude_fix=$manual_claude_fix" >> "$GITHUB_OUTPUT"
 
+      - name: Detect workflow changes
+        if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' }}
+        id: workflow_guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          files_json="$(
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+              | jq '[.[][] | .filename]'
+          )"
+          if jq -e 'any(.[]; startswith(".github/workflows/"))' <<< "$files_json" >/dev/null; then
+            echo 'workflow_changes=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'workflow_changes=false' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Dispatch manual Claude retry
         if: ${{ steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix == 'true' }}
         shell: bash
@@ -498,7 +519,7 @@ jobs:
       - name: Dispatch Claude fix worker
         if: >-
           ${{
-            steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.codex.outputs.ready == 'true' &&
+            steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' && steps.workflow_guard.outputs.workflow_changes != 'true' && steps.codex.outputs.ready == 'true' &&
             (
               steps.terminal.outputs.outcome == 'fix' ||
               (steps.evidence.outputs.missing_evidence == 'false' && steps.copilot.outputs.decision == 'fix' && steps.recheck.outputs.stale == 'false')
@@ -522,6 +543,35 @@ jobs:
             --method POST \
             "repos/${REPOSITORY}/dispatches" \
             --input - <<< "$payload"
+
+      - name: Mark workflow changes as owner-only
+        if: >-
+          ${{
+            steps.target.outputs.skip != 'true' && steps.target.outputs.manual_claude_fix != 'true' &&
+            steps.workflow_guard.outputs.workflow_changes == 'true' && steps.codex.outputs.ready == 'true' &&
+            (
+              steps.terminal.outputs.outcome == 'fix' ||
+              (steps.evidence.outputs.missing_evidence == 'false' && steps.copilot.outputs.decision == 'fix' && steps.recheck.outputs.stale == 'false')
+            )
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=error \
+            -f context='hane/copilot-routing' \
+            -f description="Copilot routing: workflow changes require owner for ${short_sha}" \
+            -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" \
+            >/dev/null
+          gh issue comment "$PR_NUMBER" \
+            --repo "$REPOSITORY" \
+            --body "Copilot pre-GUI routing for \`${TARGET_SHA}\`: workflow changes require owner review; Claude automatic fix was not dispatched."
 
       - name: Mark controller failure as blocked
         if: ${{ failure() && steps.target.outputs.target_sha != '' }}
