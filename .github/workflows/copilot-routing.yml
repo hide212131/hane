@@ -131,6 +131,13 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=success \
+            -f context='hane/claude-fix-manual' \
+            -f description="Claude manual retry authorized for ${short_sha}" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
           payload="$(
             jq -n \
               --argjson pr_number "$PR_NUMBER" \
