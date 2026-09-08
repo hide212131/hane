@@ -58,7 +58,7 @@ class BuildError(EnvError):
 
 
 @contextmanager
-def defer_aborts(*, raise_after: bool = True):
+def defer_aborts(*, raise_after: bool = True, on_abort=None):
     """Finish a small ownership transaction before delivering an abort.
 
     Defer Python handlers rather than masking OS signals: a newly spawned Hane
@@ -74,6 +74,8 @@ def defer_aborts(*, raise_after: bool = True):
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        if received and on_abort is not None:
+            on_abort(received)
         if received and raise_after:
             raise Aborted(f"signal {received[0]} (ownership transaction completed)")
 
@@ -173,6 +175,10 @@ class RealEnvironment(Environment):
         self.clock = Clock()
         self._reserved_run_dir: Optional[Path] = None
         self._execution_fd: Optional[int] = None
+        self._deferred_aborts: list[int] = []
+
+    def record_aborts(self, signals) -> None:
+        self._deferred_aborts.extend(signals)
 
     def acquire_execution(self) -> None:
         if self._execution_fd is not None:
@@ -202,7 +208,9 @@ class RealEnvironment(Environment):
         if self._reserved_run_dir == config.run_dir:
             return
         try:
-            with defer_aborts(raise_after=not getattr(self, "_finalizing", False)):
+            finalizing = getattr(self, "_finalizing", False)
+            with defer_aborts(raise_after=not finalizing,
+                              on_abort=self.record_aborts if finalizing else None):
                 config.run_dir.mkdir(parents=True, exist_ok=True)
                 marker = config.run_dir / ".gui-validate-owner"
                 fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -416,19 +424,28 @@ def do_preflight(env: Environment, config: Config) -> tuple[dict, dict]:
 
 
 def do_build(env: Environment, config: Config, baseline_sha: Optional[str] = None) -> tuple[dict, Optional[Path], dict]:
+    binary_path, build_info, build_error = None, {}, None
     try:
         initial_sha = env.git_head(config.workspace_dir)
-        binary_path, build_info = env.build(config.workspace_dir, config.features)
+        initial_dirty = env.git_dirty_paths(config.workspace_dir)
+        if (initial_dirty or (baseline_sha and initial_sha != baseline_sha)
+                or (config.expected_sha and initial_sha != config.expected_sha)):
+            return make_step("build", "blocked", reason="ビルド直前に checkout が変更されたため実行しない",
+                             actual_sha=initial_sha, dirty_paths=initial_dirty), None, {}
+        try:
+            binary_path, build_info = env.build(config.workspace_dir, config.features)
+        except BuildError as exc:
+            build_error = exc
         actual_sha = env.git_head(config.workspace_dir)
         dirty_paths = env.git_dirty_paths(config.workspace_dir)
-    except BuildError as exc:
-        return make_step("build", "fail", reason=f"ビルドに失敗した: {exc}"), None, {}
     except EnvError as exc:
-        return make_step("build", "blocked", reason=f"ビルド後の checkout を検証できない: {exc}"), None, {}
+        return make_step("build", "blocked", reason=f"ビルド前後の checkout を検証できない: {exc}"), None, {}
     if (actual_sha != initial_sha or (baseline_sha and actual_sha != baseline_sha)
             or (config.expected_sha and actual_sha != config.expected_sha) or dirty_paths):
         return make_step("build", "blocked", reason="ビルド中に checkout が変更されたため起動しない",
                          actual_sha=actual_sha, dirty_paths=dirty_paths), None, build_info
+    if build_error is not None:
+        return make_step("build", "fail", reason=f"ビルドに失敗した: {build_error}"), None, {}
     build_info.update(validated_sha=actual_sha, working_copy_clean_after_build=True)
     return make_step("build", "pass", **build_info), binary_path, build_info
 
@@ -785,6 +802,7 @@ def main(argv: list[str]) -> int:
         # interrupt final evidence publication with another asynchronous raise.
         if not getattr(env, "_finalizing", False):
             raise Aborted(f"signal {signum}")
+        env.record_aborts([signum])
 
     previous_handlers = {}
     for sig in ABORT_SIGNALS:
@@ -796,6 +814,20 @@ def main(argv: list[str]) -> int:
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
+
+
+def _incorporate_publication_aborts(env: RealEnvironment, config: Config, result: dict) -> bool:
+    pending = getattr(env, "_deferred_aborts", [])
+    steps = result.setdefault("steps", [])
+    if not pending or any(step.get("name") == "publication_abort" for step in steps):
+        return False
+    reason = "終了処理後または結果保存中に中断要求を受信した"
+    steps.append(make_step("publication_abort", "blocked", reason=reason, signals=list(pending)))
+    if result["overall_result"] == "pass":
+        result["overall_result"] = "blocked"
+    result["overall_reason"] = "; ".join(filter(None, (result.get("overall_reason"), reason)))
+    result["summary"] = _summary(result["overall_result"], result["overall_reason"], config)
+    return True
 
 
 def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
@@ -815,17 +847,24 @@ def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
     summary_path = config.run_dir / "summary.md"
     result_temp = config.run_dir / ".result.json.tmp"
     summary_temp = config.run_dir / ".summary.md.tmp"
-    try:
-        result_temp.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
-        summary_temp.write_text(result["summary"] + "\n")
-        summary_temp.replace(summary_path)
-        result_temp.replace(result_path)  # Publish the canonical receipt last, atomically.
-    except OSError as exc:
-        print(f"[BLOCKED] 結果を書き込めなかった: {exc}", file=sys.stderr)
-        return EXIT_BLOCKED
+    while True:
+        _incorporate_publication_aborts(env, config, result)
+        try:
+            result_temp.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+            summary_temp.write_text(result["summary"] + "\n")
+            summary_temp.replace(summary_path)
+            result_temp.replace(result_path)  # Publish the canonical receipt last, atomically.
+        except OSError as exc:
+            print(f"[BLOCKED] 結果を書き込めなかった: {exc}", file=sys.stderr)
+            return EXIT_BLOCKED
+        if not _incorporate_publication_aborts(env, config, result):
+            break
 
     print(result["summary"])
     print(f"result: {result_path}")
+
+    if _incorporate_publication_aborts(env, config, result):
+        return _publish_result(env, config, result)
 
     return {"pass": EXIT_PASS, "fail": EXIT_FAIL, "blocked": EXIT_BLOCKED}[result["overall_result"]]
 
