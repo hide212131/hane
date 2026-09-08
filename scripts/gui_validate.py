@@ -19,9 +19,9 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -55,6 +55,33 @@ class EnvError(Exception):
 
 class BuildError(EnvError):
     pass
+
+
+@contextmanager
+def defer_aborts(*, raise_after: bool = True):
+    """Finish a small ownership transaction before delivering an abort.
+
+    Defer Python handlers rather than masking OS signals: a newly spawned Hane
+    must not inherit a blocked SIGTERM mask from its parent.
+    """
+    previous = {}
+    received = []
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for sig in ABORT_SIGNALS:
+                previous[sig] = signal.signal(sig, lambda signum, _frame: received.append(signum))
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if received and raise_after:
+            raise Aborted(f"signal {received[0]} (ownership transaction completed)")
+
+
+def execution_lock_path() -> Path:
+    import pwd
+    # Account database, not HOME/TMPDIR or a process-specific temp directory.
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache" / "hane" / "gui-validation.lock"
 
 
 def make_step(name: str, result: str, reason: Optional[str] = None, **detail) -> dict:
@@ -152,14 +179,17 @@ class RealEnvironment(Environment):
             return
         try:
             import fcntl
-            lock = Path(tempfile.gettempdir()) / f"hane-gui-validation-{os.getuid()}.lock"
-            fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BaseException:
-                os.close(fd)
-                raise
-            self._execution_fd = fd
+            with defer_aborts():
+                lock = execution_lock_path()
+                lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                self._execution_fd = fd
+                self._execution_acquired = True
         except (ImportError, OSError) as exc:
             raise EnvError(f"GUI validator は別の実行が使用中、または実行ロックを取得できない: {exc}") from exc
 
@@ -172,16 +202,17 @@ class RealEnvironment(Environment):
         if self._reserved_run_dir == config.run_dir:
             return
         try:
-            config.run_dir.mkdir(parents=True, exist_ok=True)
-            marker = config.run_dir / ".gui-validate-owner"
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as owner:
-                owner.write(json.dumps({"pid": os.getpid(), "request_id": config.request_id,
-                                        "generation": config.generation}))
-            if any(path != marker for path in config.run_dir.iterdir()):
-                marker.unlink()  # Remove only the marker this call just created.
-                raise EnvError("実行用ディレクトリに既存ファイルがあるため予約できない")
-            self._reserved_run_dir = config.run_dir
+            with defer_aborts(raise_after=not getattr(self, "_finalizing", False)):
+                config.run_dir.mkdir(parents=True, exist_ok=True)
+                marker = config.run_dir / ".gui-validate-owner"
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as owner:
+                    if any(path != marker for path in config.run_dir.iterdir()):
+                        marker.unlink()  # Remove only the marker this call just created.
+                        raise EnvError("実行用ディレクトリに既存ファイルがあるため予約できない")
+                    self._reserved_run_dir = config.run_dir
+                    owner.write(json.dumps({"pid": os.getpid(), "request_id": config.request_id,
+                                            "generation": config.generation}))
         except OSError as exc:
             raise EnvError(f"実行用ディレクトリを排他的に予約できない: {exc}") from exc
 
@@ -404,14 +435,15 @@ def do_build(env: Environment, config: Config, baseline_sha: Optional[str] = Non
 
 def do_launch(env: Environment, config: Config, binary_path: Path, process_holder: dict) -> dict:
     try:
-        process = env.launch(binary_path, config)
+        with defer_aborts():
+            process = env.launch(binary_path, config)
+            process_holder["process"] = process
     except EnvError as exc:
         return make_step("launch", "fail", reason=f"起動に失敗した: {exc}")
 
     # Recorded before the wait loop so an Aborted raised mid-poll (e.g. a
     # SIGTERM delivered between iterations) still leaves the caller's finally
     # block able to find and stop this exact process.
-    process_holder["process"] = process
 
     deadline = env.clock.monotonic() + config.startup_timeout_seconds
     started = env.clock.monotonic()
@@ -780,9 +812,17 @@ def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
         # even with our own blocked result after the failed reservation.
         print(f"[BLOCKED] {exc}", file=sys.stderr)
         return EXIT_BLOCKED
-    result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     summary_path = config.run_dir / "summary.md"
-    summary_path.write_text(result["summary"] + "\n")
+    result_temp = config.run_dir / ".result.json.tmp"
+    summary_temp = config.run_dir / ".summary.md.tmp"
+    try:
+        result_temp.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+        summary_temp.write_text(result["summary"] + "\n")
+        summary_temp.replace(summary_path)
+        result_temp.replace(result_path)  # Publish the canonical receipt last, atomically.
+    except OSError as exc:
+        print(f"[BLOCKED] 結果を書き込めなかった: {exc}", file=sys.stderr)
+        return EXIT_BLOCKED
 
     print(result["summary"])
     print(f"result: {result_path}")
