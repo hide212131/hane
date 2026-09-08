@@ -449,15 +449,6 @@ durable な表現（commit status, context `hane/gui-requirement`）:
 - `claude-fix.yml` の自動修正 push は、新しい head SHA に対して `ci.yml` / `codex-review.yml` と同じタイミングで `gh workflow run gui-requirement.yml -f pr_number=... -f target_sha=<new_sha>` を dispatch する。
 - `claude-fix-reconcile.yml` は既存の Codex review 配送回復ロジックと同じ形で、自動修正 head の `hane/gui-requirement` 終端状態（成功の `false` または失敗の `true`）が存在しない場合に同じ `workflow_dispatch` を再試行する。この reconcile は `Copilot pre-GUI routing` / `Claude automatic fix worker` の `workflow_run` 完了イベントと `*/10 * * * *` の cron でも起動するため、配送失敗時も取りこぼさない。
 
-### Claude automatic fix の手動再試行
-
-自動修正が同じ Pull Request で3回完了すると、無限ループ防止のため worker は自動停止する。この状態で repository owner が Pull Request に本文完全一致で `/claude-fix` とコメントすると、現在の上限を明示的に一度だけ bypass して Claude fix worker を再実行する。
-
-- 手動再試行が新しい commit を push できた場合、その新しい head SHA を次の自動修正サイクルの境界として保存する。
-- 手動再試行自身は新しい3回枠を消費せず、その後の自動修正に最大3回を許可する。
-- 以後の自動修正が3回完了すると、再び上限で停止する。必要なら owner がもう一度 `/claude-fix` を明示して新しい枠を開始できる。
-- `/codex-review` の再実行や失敗した workflow の再実行だけでは、この上限は解除しない。
-
 ### Local GUI validation
 
 GUI requirement classification が `required = true` で、対象 head SHA の CI が成功し、Codex outcome が `clean` または Copilot pre-GUI routing が `continue-validation` の場合、状態を `waiting-gui` にして Local GUI runner に検証を要求する。

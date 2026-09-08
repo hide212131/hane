@@ -57,16 +57,12 @@ jobs:
           dispatch_claude_fix() {
             local pr_number="$1"
             local target_sha="$2"
-            local manual_retry="${3:-false}"
-            local manual_retry_context="${4:-}"
             local payload
             payload="$(
               jq -n \
                 --argjson pr_number "$pr_number" \
                 --arg target_sha "$target_sha" \
-                --arg manual_retry "$manual_retry" \
-                --arg manual_retry_context "$manual_retry_context" \
-                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha,manual_retry:($manual_retry == "true"),manual_retry_context:$manual_retry_context}}'
+                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}'
             )"
             gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$payload"
           }
@@ -107,21 +103,9 @@ jobs:
             is_trusted_pr_author "$pr_author" || continue
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
-            routing_fix="Copilot routing: fix for ${short_sha}"
-            routing_owner_only="Copilot routing: workflow changes require owner for ${short_sha}"
-            routing_controller_failed="Copilot routing controller failed for ${short_sha}"
-            routing_fix_id="$(
-              jq -r --arg fix "$routing_fix" \
-                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | (.id // 0)' \
-                <<< "$statuses"
-            )"
-            routing_owner_only_id="$(
-              jq -r --arg owner "$routing_owner_only" \
-                '[.[] | select(.context == "hane/copilot-routing" and .description == $owner)] | max_by(.id) // {} | (.id // 0)' \
-                <<< "$statuses"
-            )"
             routing_decision="$(
-              jq -r '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | .description // ""' \
+              jq -r --arg fix "Copilot routing: fix for ${short_sha}" \
+                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | .description // ""' \
                 <<< "$statuses"
             )"
             claude_latest="$(
@@ -131,31 +115,6 @@ jobs:
             claude_description="${claude_latest%%$'\t'*}"
             claude_created_at="${claude_latest#*$'\t'}"
             claude_age="$(status_age_seconds "$claude_created_at")"
-            manual_retry_latest="$(
-              jq -r --arg prefix 'hane/claude-fix-manual/' \
-                '[.[] | select((.context // "") | startswith($prefix))] | max_by(.id) // {} | [.state // "", .context // "", .description // ""] | @tsv' \
-                <<< "$statuses"
-            )"
-            manual_retry_state="$(cut -f1 <<< "$manual_retry_latest")"
-            manual_retry_context="$(cut -f2 <<< "$manual_retry_latest")"
-            manual_retry_description="$(cut -f3 <<< "$manual_retry_latest")"
-            manual_retry_authorized=false
-            if [[ "$manual_retry_state" == success \
-              && "$manual_retry_description" == "Claude manual retry authorized for ${short_sha}" \
-              && "$manual_retry_context" =~ ^hane/claude-fix-manual/[0-9]+-[0-9]+$ ]]; then
-              manual_retry_authorized=true
-            else
-              manual_retry_context=""
-            fi
-
-            # An owner-authorized retry explicitly restores the earlier fix route,
-            # even when the workflow guard subsequently recorded an owner-only
-            # status on the same head.
-            if [[ "$manual_retry_authorized" == true && "$routing_fix_id" -gt 0 ]]; then
-              routing_decision="$routing_fix"
-            elif [[ "$routing_decision" == "$routing_controller_failed" && "$routing_fix_id" -gt "$routing_owner_only_id" ]]; then
-              routing_decision="$routing_fix"
-            fi
 
             recover_claude=false
             if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" ]]; then
@@ -167,12 +126,7 @@ jobs:
                 "Claude fix controller failed for ${short_sha}")
                   [[ "$claude_age" -ge 60 ]] && recover_claude=true
                   ;;
-                "Claude fix completed for ${short_sha}")
-                  ;;
-                "Claude fix blocked: max iterations for ${short_sha}")
-                  [[ "$manual_retry_authorized" == true ]] && recover_claude=true
-                  ;;
-                "Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
                   ;;
                 *)
                   echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."
@@ -181,18 +135,14 @@ jobs:
             fi
 
             if [[ "$recover_claude" == true ]]; then
-              manual_retry="$manual_retry_authorized"
               echo "Recovering Claude fix for PR #${pr_number} head ${head_sha}."
-              if [[ "$manual_retry" == true ]]; then
-                echo "Preserving manual Claude retry authorization for ${head_sha}."
-              fi
-              dispatch_claude_fix "$pr_number" "$head_sha" "$manual_retry" "$manual_retry_context"
+              dispatch_claude_fix "$pr_number" "$head_sha"
               continue
             fi
 
             pr_commits="$(
               gh api --paginate "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), message:(.commit.message // ""), actor:(.author.login // .committer.login // "")}' \
+                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")}' \
                 | jq -s '.'
             )"
 
@@ -221,31 +171,10 @@ jobs:
               completion_state="$(cut -f1 <<< "$completion_latest")"
               completion_description="$(cut -f2 <<< "$completion_latest")"
               if [[ "$completion_state" != success || "$completion_description" != "Claude fix completed for ${old_short}" ]]; then
-                if ! gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
+                gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
                   -f state=success -f context='hane/claude-fix' \
                   -f description="Claude fix completed for ${old_short}" \
-                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
-                  echo "::warning::Failed to recover Claude fix completion for ${predecessor_sha}."
-                fi
-              fi
-
-              # Manual retry commits are the durable evidence that a fresh cycle
-              # must start. Recover the marker after completion recovery so a
-              # transient worker failure cannot lose the cycle boundary.
-              commit_message="$(jq -r '.message // ""' <<< "$commit_record")"
-              if grep -q '^Manual retry: true$' <<< "$commit_message"; then
-                reset_state="$(
-                  gh api "repos/${REPOSITORY}/commits/${fix_sha}/statuses?per_page=100" \
-                    --jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for ")))] | length'
-                )"
-                if [[ "$reset_state" -eq 0 ]]; then
-                  if ! gh api --method POST "repos/${REPOSITORY}/statuses/${fix_sha}" \
-                    -f state=success -f context='hane/claude-fix-cycle' \
-                    -f description="Claude fix cycle reset for ${fix_sha:0:12} after manual retry" \
-                    -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
-                    echo "::warning::Failed to recover Claude fix cycle reset for ${fix_sha}."
-                  fi
-                fi
+                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null
               fi
             done
 
