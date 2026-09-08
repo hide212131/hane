@@ -284,6 +284,8 @@ class RealEnvironment(Environment):
             missing.append("swift")
         if config.capture_cmd is None and shutil.which("screencapture") is None:
             missing.append("screencapture")
+        if shutil.which("sips") is None:
+            missing.append("sips")
         return missing
 
     def snapshot_checkout(self, workspace_dir: Path, source_sha: str) -> Path:
@@ -442,7 +444,19 @@ class RealEnvironment(Environment):
             raise EnvError(str(exc)) from exc
         if out.returncode != 0:
             return False
-        return image_path.is_file()
+        if not image_path.is_file() or image_path.stat().st_size == 0:
+            return False
+        # Decode the complete image, rather than accepting a file/header left
+        # by a custom command that exited successfully without a screenshot.
+        try:
+            with tempfile.TemporaryDirectory(prefix='hane-image-check-') as directory:
+                decoded = Path(directory) / 'decoded.png'
+                checked = subprocess.run(['/usr/bin/sips', '-s', 'format', 'png', str(image_path),
+                                          '--out', str(decoded)], capture_output=True, text=True,
+                                         timeout=config.capture_timeout_seconds)
+                return checked.returncode == 0 and decoded.is_file() and decoded.stat().st_size > 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise EnvError(f"撮影画像を検証できない: {exc}") from exc
 
 
 def do_preflight(env: Environment, config: Config) -> tuple[dict, dict]:
@@ -961,10 +975,11 @@ def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
             # reserve() succeeded for this generation while the execution lock
             # is held. A previous iteration may already have published pass;
             # never leave it canonical after a failed downgrade publication.
-            try:
-                result_path.unlink(missing_ok=True)
-            except OSError as invalidate_error:
-                print(f"[BLOCKED] 古い結果の無効化にも失敗した: {invalidate_error}", file=sys.stderr)
+            for canonical in (result_path, summary_path):
+                try:
+                    canonical.unlink(missing_ok=True)
+                except OSError as invalidate_error:
+                    print(f"[BLOCKED] {canonical.name}の無効化にも失敗した: {invalidate_error}", file=sys.stderr)
             print(f"[BLOCKED] 結果を書き込めなかった: {exc}", file=sys.stderr)
             return EXIT_BLOCKED
         if not _incorporate_publication_aborts(env, config, result):
