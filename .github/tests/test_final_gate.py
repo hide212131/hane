@@ -177,6 +177,45 @@ class EffectTests(unittest.TestCase):
         self.assertEqual(api.merges, [])
         self.assertEqual(api.writes[-1][2], 'error')
 
+    def test_lost_fix_receipt_gets_one_fresh_judgement_then_explicit_block(self):
+        data = ready()
+        key = fingerprint(data)
+        run = {'status': 'completed', 'run_attempt': 1, 'head_branch': 'main',
+               'path': '.github/workflows/final-judge.yml', 'event': 'workflow_run'}
+        for count in (1, 2):
+            api = FakeAPI()
+            api.rows[controller.CONTEXT] = {'state': 'failure',
+                'description': f'Final fix v1 {SHA[:12]} e{key}',
+                'target_url': 'https://github.com/owner/repo/actions/runs/100/attempts/1'}
+            history = [{'context': controller.CONTEXT, 'state': 'pending',
+                'description': f'Final pending v1 {SHA[:12]} e{key}', 'target_url': f'run/{i}'} for i in range(count)]
+            with self.subTest(count=count), patch.object(controller, 'snapshot', return_value=data), \
+                    patch.object(api, 'api', return_value=run), \
+                    patch.object(api, 'pages', create=True, return_value=history), \
+                    patch.object(controller, 'artifact_json', side_effect=ValueError('expired')), \
+                    patch.object(controller, 'judge', return_value={'decision': 'fix', 'reason': 'save fails'}) as judge:
+                controller.process(api, 1, self.directory)
+            self.assertEqual(judge.call_count, int(count == 1))
+            proof = json.loads((self.directory / '1.json').read_text())
+            self.assertEqual(proof['effect'], 'fix requested' if count == 1 else 'blocked')
+            self.assertEqual(api.writes[-1][2], 'failure' if count == 1 else 'error')
+
+    def test_retained_fix_receipt_skips_paid_replay(self):
+        data, api = ready(), FakeAPI()
+        key = fingerprint(data)
+        api.rows[controller.CONTEXT] = {'state': 'failure',
+            'description': f'Final fix v1 {SHA[:12]} e{key}',
+            'target_url': 'https://github.com/owner/repo/actions/runs/100/attempts/1'}
+        proof = {'schema_version': 1, 'run_id': '100', 'run_attempt': '1', 'snapshot': data,
+                 'evidence_key': key, 'effect': 'fix requested', 'copilot': {'decision': 'fix'}}
+        run = {'status': 'completed', 'run_attempt': 1, 'head_branch': 'main',
+               'path': '.github/workflows/final-judge.yml', 'event': 'workflow_run'}
+        with patch.object(controller, 'snapshot', return_value=data), patch.object(api, 'api', return_value=run), \
+                patch.object(controller, 'artifact_json', return_value=proof), patch.object(controller, 'judge') as judge:
+            controller.process(api, 1, self.directory)
+        judge.assert_not_called()
+        self.assertEqual(api.writes, [])
+
 class FixEvidenceTests(unittest.TestCase):
     def test_final_fix_receipt_must_match_current_fingerprint(self):
         import final_fix_bridge as bridge

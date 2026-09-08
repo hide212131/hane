@@ -72,7 +72,9 @@ def snapshot(api, number):
     required = sorted({c['context'] for r in rules if r.get('type') == 'required_status_checks'
                        for c in r['parameters']['required_status_checks']})
     files = data['files']
-    proof = gui_receipt(api, pr, data['statuses'])
+    proof = gui_receipt(api, pr, data['statuses']) if data['gui_required'] else None
+    if not data['gui_required']:
+        statuses.pop(GUI_CONTEXT, None)
     return {'pr_number': number, 'sha': data['sha'], 'repository': api.repository,
             'title': pr['title'], 'body': pr.get('body'), 'trusted': True, 'mergeable': pr.get('mergeable'),
             'ci_ready': data['ci_ready'], 'review_ready': data['review_ready'],
@@ -124,7 +126,44 @@ def process(api, number, directory):
     key = fingerprint(data)
     old = api.statuses(data['sha']).get(CONTEXT, {})
     previous = final_state(old, data['sha'], key)
-    if previous:
+    recovery = False
+    if previous == 'fix':
+        # The publishing run must finish uploading before reconciliation can
+        # decide its receipt was lost. Never reconstruct fix from status alone.
+        match = re.fullmatch(r'https://github.com/' + re.escape(api.repository) + r'/actions/runs/(\d+)/attempts/(\d+)', old.get('target_url', ''))
+        if not match:
+            raise ValueError('invalid final receipt run URL')
+        run_id, attempt = match[1], match[2]
+        run = api.api(api.repo(f'actions/runs/{run_id}/attempts/{attempt}'))
+        if run.get('status') != 'completed':
+            return
+        if (str(run.get('run_attempt')) != attempt or run.get('head_branch') != 'main'
+                or run.get('path') != '.github/workflows/final-judge.yml'
+                or run.get('event') not in ('workflow_dispatch', 'workflow_run', 'schedule')):
+            raise ValueError('untrusted final receipt run')
+        try:
+            retained = artifact_json(api, run_id, f'final-receipts-{run_id}-{attempt}', f'{number}.json')
+            if (retained.get('schema_version') != 1 or retained.get('run_id') != run_id
+                    or retained.get('run_attempt') != attempt or retained.get('snapshot') != data
+                    or retained.get('evidence_key') != key or retained.get('effect') != 'fix requested'
+                    or retained.get('copilot', {}).get('decision') != 'fix'):
+                raise ValueError('invalid final fix receipt')
+            return
+        except (ValueError, KeyError):
+            recovery = True
+        history = api.pages(api.repo(f'commits/{data["sha"]}/statuses'))
+        claims = {row.get('target_url') for row in history
+                  if row.get('context') == CONTEXT and final_state(row, data['sha'], key) == 'pending'}
+        if len(claims) >= 2:
+            proof = {'schema_version': 1, 'evidence_key': key, 'snapshot': data,
+                     'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                     'copilot': None, 'effect': 'blocked',
+                     'recovery_error': 'Final fix receipt lost after bounded recovery; new evidence or owner intervention required'}
+            (directory / f'{number}.json').write_text(json.dumps(proof, indent=2))
+            if fingerprint(snapshot(api, number)) == key:
+                publish(api, data, key, 'blocked')
+            return
+    if previous and not recovery:
         # Never replay a paid invocation after a terminal result or ambiguous
         # failure. An expired pending claim becomes blocked, requiring new evidence.
         if previous == 'pending':
@@ -142,6 +181,8 @@ def process(api, number, directory):
     proof = {'schema_version': 1, 'evidence_key': key, 'snapshot': data,
              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
              'copilot': decision, 'gate_denials': gate(data), 'effect': 'none'}
+    if recovery:
+        proof['recovery'] = 'Fresh Copilot judgement after lost final fix receipt; at most two claims per evidence key'
     receipt_path = directory / f'{number}.json'
     receipt_path.write_text(json.dumps(proof, ensure_ascii=False, indent=2))
     fresh = snapshot(api, number)
