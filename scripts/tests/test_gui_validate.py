@@ -471,7 +471,7 @@ class ScenarioSetupTests(unittest.TestCase):
                 config = gv.build_config("editor", root)
                 self.assertFalse(run.exists())
                 env = gv.RealEnvironment()
-                with patch.object(env, "missing_tools", return_value=[]), patch.object(
+                with patch.object(env, "acquire_execution"), patch.object(env, "missing_tools", return_value=[]), patch.object(
                     env, "build", side_effect=gv.BuildError("test stops before compilation")
                 ) as build:
                     result = gv.run_validation(env, config)

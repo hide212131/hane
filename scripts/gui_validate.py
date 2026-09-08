@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+ABORT_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
+
 SCHEMA_VERSION = 1
 PROCEDURE_VERSION = "gui-validate/1"
 VERIFICATION_KIND = "launch_and_capture_path"
@@ -510,7 +512,7 @@ def do_cleanup(env: Environment, process) -> dict:
     received: list[int] = []
     previous = {}
     if threading.current_thread() is threading.main_thread():
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        for sig in ABORT_SIGNALS:
             previous[sig] = signal.signal(sig, lambda signum, _frame: received.append(signum))
     try:
         try:
@@ -751,7 +753,7 @@ def main(argv: list[str]) -> int:
             raise Aborted(f"signal {signum}")
 
     previous_handlers = {}
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in ABORT_SIGNALS:
         previous_handlers[sig] = signal.signal(sig, _handle_signal)
 
     try:
