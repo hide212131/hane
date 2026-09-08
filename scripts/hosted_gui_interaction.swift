@@ -25,7 +25,6 @@ func runAppleScript(_ source: String) {
 func inputSources() -> [TISInputSource] {
     let properties = [
         kTISPropertyInputSourceCategory!: kTISCategoryKeyboardInputSource as Any,
-        kTISPropertyInputSourceIsSelectCapable!: true as CFBoolean,
     ] as CFDictionary
     return TISCreateInputSourceList(properties, true).takeRetainedValue() as! [TISInputSource]
 }
@@ -43,6 +42,21 @@ func currentSourceID() -> String {
 }
 
 func selectSource(_ id: String) {
+    // Apple's TextInputSources.h requires an input mode's parent method
+    // to be enabled before the mode can be selected. Hosted images list
+    // Japanese modes even though their parent is disabled initially.
+    if ProcessInfo.processInfo.environment["GITHUB_ACTIONS"] == "true" {
+        for parent in inputSources() {
+            guard let parentID = sourceID(parent), id.hasPrefix(parentID + "."),
+                  let typePointer = TISGetInputSourceProperty(parent, kTISPropertyInputSourceType)
+            else { continue }
+            let type = Unmanaged<CFString>.fromOpaque(typePointer).takeUnretainedValue()
+            if type as String == kTISTypeKeyboardInputMethodModeEnabled as String {
+                let code = TISEnableInputSource(parent)
+                guard code == noErr else { fail("could not enable parent \(parentID): \(code)") }
+            }
+        }
+    }
     guard let source = inputSources().first(where: { sourceID($0) == id }) else {
         fail("input source not found: \(id)")
     }
@@ -66,6 +80,24 @@ func selectAllTypeSave(_ pid: pid_t, _ text: String) {
             delay 0.2
             keystroke "a" using command down
             delay 0.1
+            keystroke "\(escaped)"
+            delay 0.2
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
+
+func appendSave(_ pid: pid_t, _ text: String) {
+    let escaped = escapeForAppleScript(text)
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            key code 124 using command down
+            delay 1.0
             keystroke "\(escaped)"
             delay 0.2
             keystroke "s" using command down
@@ -153,6 +185,9 @@ case "select-all-type-save":
         fail("select-all-type-save requires PID and text")
     }
     selectAllTypeSave(pid, arguments[2])
+case "append-save":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("append-save requires PID and text") }
+    appendSave(pid, arguments[2])
 case "undo-save":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("undo-save requires PID") }
     undoSave(pid)

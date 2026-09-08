@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  HANE_PINNED_SHA: 0f5e2b1f0ffb41a248b9a806009de273e8e8d793
+  HANE_PINNED_SHA: d85af7f1d86f4dc05ec44e790d23ba63df05af72
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:

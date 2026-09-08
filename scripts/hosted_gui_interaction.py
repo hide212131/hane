@@ -53,6 +53,7 @@ EXIT_NONPASS = 1
 
 ASCII_FIXTURE_ORIGINAL = "# hosted gui interaction spike\n\noriginal content\n"
 ASCII_KNOWN_TEXT = "hane hosted gui ascii check"
+ASCII_AFTER_APPEND = ASCII_KNOWN_TEXT + "x"
 IME_FIXTURE_ORIGINAL = "# hosted gui interaction spike (ime)\n\n"
 IME_ROMAJI = "nihongo"
 # Expected result of typing "nihongo" then space (convert) then return
@@ -221,17 +222,29 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
                         actual=actual.decode("utf-8", errors="replace"),
                     ))
 
+            # Selection replacement and subsequent typing are different edit
+            # groups in Hane. Test undo with one deliberately separate insertion
+            # instead of assuming the entire select-all/typing sequence is one.
+            ok, _out, err = run_helper(swift_helper, ["append-save", str(pid), "x"], helper_timeout)
+            if not ok:
+                steps.append(make_step("append_save", "blocked", reason=err))
+            else:
+                matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_AFTER_APPEND.encode(), poll_timeout)
+                steps.append(make_step("append_save", "pass" if matched else "fail",
+                                       reason=None if matched else "追加入力が保存されていない",
+                                       actual=actual.decode("utf-8", errors="replace")))
+
             ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
             if not ok:
                 steps.append(make_step("undo_save", "blocked", reason=err))
             else:
-                matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_FIXTURE_ORIGINAL.encode("utf-8"), poll_timeout)
+                matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_KNOWN_TEXT.encode("utf-8"), poll_timeout)
                 if matched:
                     steps.append(make_step("undo_save", "pass"))
                 else:
                     steps.append(make_step(
                         "undo_save", "fail",
-                        reason="undo 後に保存された内容が元のフィクスチャと一致しない",
+                        reason="undo 後に保存された内容が追加入力前の文書と一致しない",
                         actual=actual.decode("utf-8", errors="replace"),
                     ))
 
@@ -239,7 +252,7 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
             if not ok:
                 steps.append(make_step("redo_save", "blocked", reason=err))
             else:
-                matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_KNOWN_TEXT.encode("utf-8"), poll_timeout)
+                matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_AFTER_APPEND.encode("utf-8"), poll_timeout)
                 if matched:
                     steps.append(make_step("redo_save", "pass"))
                 else:
@@ -275,7 +288,7 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
     try:
         session_steps, _window_id = open_session(module, env, reopen_config, binary_path, reopen_process_holder, "reopen")
         steps += session_steps
-        matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_KNOWN_TEXT.encode("utf-8"), 1.0)
+        matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_AFTER_APPEND.encode("utf-8"), 1.0)
         step = make_step(
             "reopen_content_check", "pass" if matched else "fail",
             reason=None if matched else "再オープン後もフィクスチャ内容が期待通りであることを確認できない",
@@ -435,6 +448,7 @@ def main() -> int:
     helper_timeout = env_float("HANE_GUI_INTERACTION_HELPER_TIMEOUT_SECS", 20.0)
     poll_timeout = env_float("HANE_GUI_INTERACTION_POLL_TIMEOUT_SECS", 10.0)
 
+    os.chdir(target_dir)  # honor the target checkout's rust-toolchain.toml
     module = load_pinned_gui_validate(target_dir)
     env = module.RealEnvironment()
     priority = module.RESULT_PRIORITY
