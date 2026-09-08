@@ -839,6 +839,15 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
     if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
         raise ValueError("実行用ディレクトリは未作成または空である必要がある（過去の証拠を上書きしない）")
 
+    workspace_root, output_root = workspace_dir.resolve(), run_dir.resolve()
+    if output_root == workspace_root or workspace_root in output_root.parents:
+        # Retained artifacts must not make the next generation's checkout
+        # dirty. Reject before acquiring/reserving anything, including receipts.
+        ignored = subprocess.run(['git', 'check-ignore', '--quiet', '--', str(output_root) + '/'],
+                                 cwd=workspace_root, capture_output=True)
+        if ignored.returncode != 0:
+            raise ValueError("checkout内の実行用ディレクトリはGitで無視される場所に限る（target/またはcheckout外を指定）")
+
     fixture_path, features, extra_env = _scenario_setup(scenario, run_dir, prepare=False)
 
     return Config(

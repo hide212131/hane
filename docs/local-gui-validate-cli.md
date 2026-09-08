@@ -42,7 +42,7 @@ macOS の `swift` / `screencapture` に依存するため、実際の起動・�
 | `HANE_GUI_VALIDATE_EXPECTED_SHA` | なし | 指定すると `git rev-parse HEAD` と一致しない場合に `blocked` にする |
 | `HANE_GUI_VALIDATE_REQUEST_ID` | `<UTC timestamp>-<pid>` | 依頼 ID。実行ごとの保存先ディレクトリ名にもなる |
 | `HANE_GUI_VALIDATE_GENERATION` | `1` | 実行世代。再配送・再実行の識別に使う |
-| `HANE_GUI_VALIDATE_RUN_DIR` | `target/gui-validate/<request-id>/<generation>` | 証拠一式（状態・ログ・画像・結果）の保存先 |
+| `HANE_GUI_VALIDATE_RUN_DIR` | `target/gui-validate/<request-id>/<generation>` | 証拠一式の保存先。checkout内はGitの無視対象に限る。非無視パスは証拠作成前にusage errorとして拒否 |
 | `HANE_GUI_VALIDATE_STARTUP_TIMEOUT_SECS` | `15` | `hane_ready` を待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS` | `5` | 対象ウィンドウを待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_ID_CMD` | なし（既定は `swift window_id.swift`） | ウィンドウ確認コマンドの差し替え。自動テストで実画面なしに注入する用途 |
