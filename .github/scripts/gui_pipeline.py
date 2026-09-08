@@ -68,7 +68,10 @@ def terminal_receipt_retained(api, pr, state):
 
 
 def eligible(api, request):
-    data = api.evidence(api.pr(request['pr_number']))
+    pr = api.pr(request['pr_number'])
+    if not api.trusted(pr) or pr['head']['sha'] != request['sha']:
+        return False
+    data = api.evidence(pr)
     return all(data[k] for k in ('gui_required', 'classified', 'review_ready', 'ci_ready'))
 
 
