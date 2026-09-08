@@ -106,3 +106,5 @@ x64 / ARM64 を自動判定し、必要なら `-Architecture x64` または `-Ar
 `scripts/capture.sh editor`（`cursor-boundary` / `cursor-scroll` も指定可）で実行します。
 性能基準線は [docs/baseline/](docs/baseline/)、設計判断は [ADR index](docs/adr/README.md)、
 リファクタリングの進捗は [実施計画](docs/refactor-execution-plan.md) を正とします。
+
+GUI検証の要否、対象commitの照合、結果の扱いは [GUI検証設計](docs/local-gui-validation.md) を参照してください。
