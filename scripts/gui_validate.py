@@ -103,6 +103,9 @@ class Environment:
 
     clock: Clock
 
+    def prepare(self, config: Config) -> None:
+        """Create owned run artifacts only after the clean-checkout preflight."""
+
     def git_head(self, workspace_dir: Path) -> str:
         raise NotImplementedError
 
@@ -131,6 +134,14 @@ class Environment:
 class RealEnvironment(Environment):
     def __init__(self) -> None:
         self.clock = Clock()
+
+    def prepare(self, config: Config) -> None:
+        try:
+            config.run_dir.mkdir(parents=True, exist_ok=True)
+            config.state_dir.mkdir(parents=True, exist_ok=True)
+            _scenario_setup(config.scenario, config.run_dir)
+        except (OSError, ValueError) as exc:
+            raise EnvError(f"検証用ファイルを準備できない: {exc}") from exc
 
     def git_head(self, workspace_dir: Path) -> str:
         try:
@@ -496,6 +507,7 @@ def run_validation(env: Environment, config: Config) -> dict:
             for name in ("build", "launch", "window_discovery", "capture"):
                 steps.append(skipped_step(name, "preflight が pass しなかった"))
         else:
+            env.prepare(config)
             build_step, binary_path, build_info = do_build(env, config)
             steps.append(build_step)
             if build_step["result"] != "pass":
@@ -516,13 +528,15 @@ def run_validation(env: Environment, config: Config) -> dict:
                         steps.append(do_capture(env, config, window_id))
     except Aborted as exc:
         steps.append(make_step("run", "blocked", reason=f"中断された: {exc}"))
+    except EnvError as exc:
+        steps.append(make_step("setup", "blocked", reason=str(exc)))
     finally:
         steps.append(do_cleanup(env, process_holder["process"]))
 
     return finalize(steps, config, target_info, build_info, started_at, env)
 
 
-def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[str], dict[str, str]]:
+def _scenario_setup(scenario: str, run_dir: Path, *, prepare: bool = True) -> tuple[Optional[Path], list[str], dict[str, str]]:
     if scenario == "editor":
         fixture = os.environ.get("HANE_CAPTURE_FIXTURE", "")
         fixture_path = run_dir / "editor.md"
@@ -532,24 +546,30 @@ def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[
             # resource references resolve exactly as when opened normally.
             fixture_path = Path(fixture).absolute()
             try:
-                with fixture_path.open("rb") as source:
-                    source.read(1)
-            except OSError as exc:
+                if not fixture_path.is_file():
+                    raise ValueError("通常ファイルではない")
+                # RopeBuffer::from_reader accepts a complete UTF-8 document,
+                # not merely a readable first byte. Reject invalid documents
+                # before Hane can replace an open error with an error buffer.
+                fixture_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as exc:
                 raise ValueError(f"HANE_CAPTURE_FIXTURE を読み込めない: {exc}") from exc
-        else:
+        elif prepare:
             fixture_path.write_text("# Hane GUI validation\n\n起動・撮影の確認用文書です。\n", encoding="utf-8")
         # The normal build does not arm or emit hane_ready. timing-probe
         # enables readiness observation without instrument's synthetic input.
         return fixture_path, ["timing-probe"], {}
     if scenario == "cursor-boundary":
         fixture_path = run_dir / "cursor-boundary.md"
-        fixture_path.write_text("first line\nsecond line\n")
+        if prepare:
+            fixture_path.write_text("first line\nsecond line\n")
         offset = os.environ.get("HANE_CAPTURE_CURSOR_OFFSET", "11")
         return fixture_path, ["instrument"], {"HANE_MEASUREMENT_CURSOR_OFFSET": offset}
     if scenario == "cursor-scroll":
         fixture_path = run_dir / "forty-lines.md"
         lines = [f"line {n:02d} — scroll verification\n" for n in range(1, 41)]
-        fixture_path.write_text("".join(lines))
+        if prepare:
+            fixture_path.write_text("".join(lines))
         down = os.environ.get("HANE_CAPTURE_CURSOR_DOWN", "32")
         return fixture_path, ["instrument"], {"HANE_DEV_CURSOR_DOWN": down}
     raise ValueError(f"unknown scenario: {scenario}")
@@ -583,10 +603,10 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
         or (workspace_dir / "target" / "gui-validate" / request_id / generation)
     )
     state_dir = run_dir / "state"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
+        raise ValueError("実行用ディレクトリは未作成または空である必要がある（過去の証拠を上書きしない）")
 
-    fixture_path, features, extra_env = _scenario_setup(scenario, run_dir)
+    fixture_path, features, extra_env = _scenario_setup(scenario, run_dir, prepare=False)
 
     return Config(
         workspace_dir=workspace_dir,
@@ -623,7 +643,7 @@ def main(argv: list[str]) -> int:
     workspace_dir = Path(__file__).resolve().parent.parent
     try:
         config = build_config(scenario, workspace_dir)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"invalid configuration: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
@@ -641,6 +661,7 @@ def main(argv: list[str]) -> int:
             signal.signal(sig, handler)
 
     result_path = config.run_dir / "result.json"
+    config.run_dir.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     summary_path = config.run_dir / "summary.md"
     summary_path.write_text(result["summary"] + "\n")

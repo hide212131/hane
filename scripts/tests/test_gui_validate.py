@@ -444,6 +444,53 @@ class ScenarioSetupTests(unittest.TestCase):
                     self.assertIn("invalid configuration", error.getvalue())
                     self.assertNotIn("Traceback", error.getvalue())
 
+    def test_invalid_utf8_fixture_is_rejected_before_launch(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "invalid.md"
+            source.write_bytes(b"valid prefix\n\xff")
+            with patch.dict(os.environ, {"HANE_CAPTURE_FIXTURE": str(source)}):
+                with self.assertRaisesRegex(ValueError, "HANE_CAPTURE_FIXTURE"):
+                    gv._scenario_setup("editor", Path(tmp) / "run", prepare=False)
+
+    def test_clean_preflight_precedes_artifacts_in_unignored_run_directory(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "README.md").write_text("fixture repository\n")
+            subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(root), "-c", "user.name=GUI test",
+                            "-c", "user.email=gui-test@example.invalid", "-c", "commit.gpgsign=false",
+                            "commit", "-qm", "fixture"], check=True)
+            run = root / "unignored-run"
+            with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(run), "HANE_CAPTURE_FIXTURE": ""}):
+                config = gv.build_config("editor", root)
+                self.assertFalse(run.exists())
+                env = gv.RealEnvironment()
+                with patch.object(env, "missing_tools", return_value=[]), patch.object(
+                    env, "build", side_effect=gv.BuildError("test stops before compilation")
+                ) as build:
+                    result = gv.run_validation(env, config)
+                self.assertEqual(result["steps"][0]["result"], "pass")
+                self.assertTrue(result["target"]["working_copy_clean"])
+                self.assertTrue((run / "editor.md").is_file())
+                build.assert_called_once()
+
+    def test_existing_run_evidence_is_never_overwritten(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "editor.md"
+            existing.write_text("preserve me")
+            with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(root)}):
+                with self.assertRaisesRegex(ValueError, "上書きしない"):
+                    gv.build_config("editor", root)
+            self.assertEqual(existing.read_text(), "preserve me")
+
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
         import tempfile
 
