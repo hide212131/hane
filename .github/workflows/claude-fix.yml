@@ -86,26 +86,6 @@ jobs:
             exit 0
           fi
 
-          target_commit_message="$(
-            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}" --jq '.commit.message // ""'
-          )"
-          target_is_manual_retry=false
-          if grep -q '^Manual retry: true$' <<< "$target_commit_message"; then
-            target_is_manual_retry=true
-            target_reset_present="$(
-              gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-                --jq 'any(.[]; .context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for ")))'
-            )"
-            if [[ "$target_reset_present" != true ]]; then
-              if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-                -f state=success -f context='hane/claude-fix-cycle' \
-                -f description="Claude fix cycle reset for ${short_sha} after manual retry" \
-                -f target_url="https://github.com/${REPOSITORY}/commit/${TARGET_SHA}" >/dev/null; then
-                echo '::warning::Failed to restore the manual Claude fix cycle boundary before counting automatic fixes.'
-              fi
-            fi
-          fi
-
           routing="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
               --jq "[.[] | select(.context == \"hane/copilot-routing\" and .state == \"failure\" and .description == \"Copilot routing: fix for ${short_sha}\")] | max_by(.id) // {} | .description // \"\""
@@ -122,7 +102,11 @@ jobs:
           pr_commit_shas=()
           completion_shas=()
           cycle_reset_sha=""
-          while IFS= read -r sha; do
+          manual_retry_sha=""
+          manual_retry_reset_present=false
+          while IFS= read -r commit_record; do
+            sha="$(jq -r '.sha' <<< "$commit_record")"
+            commit_message="$(jq -r '.message // ""' <<< "$commit_record")"
             [[ -z "$sha" ]] && continue
             pr_commit_shas+=( "$sha" )
             statuses_for_sha="$(gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100")"
@@ -133,6 +117,10 @@ jobs:
             if [[ "$reset_present" == true ]]; then
               cycle_reset_sha="$sha"
             fi
+            if grep -q '^Manual retry: true$' <<< "$commit_message"; then
+              manual_retry_sha="$sha"
+              manual_retry_reset_present="$reset_present"
+            fi
             [[ "$sha" == "$TARGET_SHA" ]] && continue
             completion_present="$(
               jq -r 'any(.[]; .context == "hane/claude-fix" and .state == "success" and ((.description // "") | startswith("Claude fix completed for ")))' \
@@ -141,13 +129,22 @@ jobs:
             if [[ "$completion_present" == true ]]; then
               completion_shas+=( "$sha" )
             fi
-          done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
+          done < <(
+            gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" \
+              --jq '.[] | {sha, message:(.commit.message // "")}'
+          )
 
-          # If the marker POST itself failed, use the durable manual-retry
-          # commit as the effective boundary for this run. Reconciliation will
-          # publish the missing status later.
-          if [[ "$target_is_manual_retry" == true ]]; then
-            cycle_reset_sha="$TARGET_SHA"
+          # A manual-retry commit is durable evidence of a new cycle even when
+          # both the worker and reconciler failed to publish its status marker.
+          # Restore the marker before enforcing the limit, but keep the commit
+          # as the effective boundary if this POST also fails.
+          if [[ -n "$manual_retry_sha" && "$manual_retry_reset_present" != true ]]; then
+            if ! gh api --method POST "repos/${REPOSITORY}/statuses/${manual_retry_sha}" \
+              -f state=success -f context='hane/claude-fix-cycle' \
+              -f description="Claude fix cycle reset for ${manual_retry_sha:0:12} after manual retry" \
+              -f target_url="https://github.com/${REPOSITORY}/commit/${manual_retry_sha}" >/dev/null; then
+              echo '::warning::Failed to restore the manual Claude fix cycle boundary before counting automatic fixes.'
+            fi
           fi
 
           cycle_reset_index=-1
@@ -156,6 +153,18 @@ jobs:
               cycle_reset_index="$index"
             fi
           done
+
+          manual_retry_index=-1
+          for index in "${!pr_commit_shas[@]}"; do
+            if [[ "${pr_commit_shas[$index]}" == "$manual_retry_sha" ]]; then
+              manual_retry_index="$index"
+              break
+            fi
+          done
+          if [[ "$manual_retry_index" -gt "$cycle_reset_index" ]]; then
+            cycle_reset_sha="$manual_retry_sha"
+            cycle_reset_index="$manual_retry_index"
+          fi
 
           completed=0
           for completion_sha in "${completion_shas[@]}"; do
