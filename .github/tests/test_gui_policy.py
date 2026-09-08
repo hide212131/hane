@@ -160,7 +160,7 @@ class RequirementAndReviewTests(unittest.TestCase):
         self.assertFalse(policy.review_ready(statuses, SHA))
 
     def test_gui_status_requires_exact_sha_and_matching_terminal_state(self):
-        row = {'state': 'success', 'description': f'GUI pass v1 {SHA[:12]} g123-1'}
+        row = {'state': 'success', 'description': f'GUI pass {policy.STATUS_VERSION} {SHA[:12]} g123-1'}
         self.assertEqual(policy.gui_state(row, SHA), ('pass', '123-1'))
         self.assertIsNone(policy.gui_state(row, 'd' * 40))
         row['state'] = 'error'

@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_api import GitHub
-from gui_policy import CONTEXT, POLICY, PROCEDURE, gui_state, parse_time, receipt, validate_receipt
+from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, gui_state, parse_time, receipt, validate_receipt
 
 
 def now():
@@ -32,7 +32,7 @@ def publish(api, request, outcome):
     # The serialized resolver owns claims; report owns only its exact generation.
     state = {'pending': 'pending', 'pass': 'success', 'fail': 'failure', 'blocked': 'error'}[outcome]
     api.post_status(request['sha'], CONTEXT, state,
-                    f'GUI {outcome} {POLICY} {request["sha"][:12]} g{request["generation"]}')
+                    f'GUI {outcome} {STATUS_VERSION} {request["sha"][:12]} g{request["generation"]}')
 
 
 def current(api, request, require_claim=True):

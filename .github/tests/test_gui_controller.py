@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import gui_pipeline as controller
 from pipeline_api import GitHub, CI_NAMES
 from test_gui_policy import SHA, REQUEST, NOW
+from gui_policy import STATUS_VERSION
 
 
 class FakeGitHub(GitHub):
@@ -53,7 +54,7 @@ class ControllerTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.api = FakeGitHub()
         self.api.rows['hane/gui-validation'] = {'state': 'pending',
-            'description': f'GUI pending v1 {SHA[:12]} g123-1',
+            'description': f'GUI pending {STATUS_VERSION} {SHA[:12]} g123-1',
             'created_at': '2026-09-09T00:10:00Z'}
 
     def test_report_never_writes_after_head_or_generation_changes(self):
@@ -64,7 +65,7 @@ class ControllerTests(unittest.TestCase):
                 if kind == 'head':
                     api.pull['head']['sha'] = 'd' * 40
                 else:
-                    api.rows['hane/gui-validation']['description'] = f'GUI pending v1 {SHA[:12]} g999-1'
+                    api.rows['hane/gui-validation']['description'] = f'GUI pending {STATUS_VERSION} {SHA[:12]} g999-1'
                 controller.report(api, REQUEST)
                 self.assertEqual(api.writes, [])
 
@@ -90,6 +91,17 @@ class ControllerTests(unittest.TestCase):
             controller.resolve(self.api)
         self.assertEqual(self.api.writes, [])
         self.assertIn('has_work=false', (self.root / 'outputs').read_text())
+
+    def test_obsolete_procedure_terminal_status_starts_fresh_generation(self):
+        self.api.rows['hane/gui-validation'] = {'state': 'success',
+            'description': f'GUI pass v1 {SHA[:12]} g123-1'}
+        with patch.object(controller, 'now', return_value=NOW):
+            controller.resolve(self.api)
+        self.assertEqual(len(self.api.writes), 1)
+        self.assertEqual(self.api.writes[0][2], 'pending')
+        self.assertIn(STATUS_VERSION, self.api.writes[0][3])
+        self.assertIn('g456-1', self.api.writes[0][3])
+        self.assertIn('has_work=true', (self.root / 'outputs').read_text())
 
     def test_expired_request_cannot_begin(self):
         with patch.object(controller, 'now', return_value=NOW.replace(hour=2)):
