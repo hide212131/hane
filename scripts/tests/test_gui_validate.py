@@ -477,7 +477,7 @@ class ScenarioSetupTests(unittest.TestCase):
                     result = gv.run_validation(env, config)
                 self.assertEqual(result["steps"][0]["result"], "pass")
                 self.assertTrue(result["target"]["working_copy_clean"])
-                self.assertTrue((run / "editor.md").is_file())
+                self.assertFalse(run.exists())  # Build failure precedes fixture creation.
                 build.assert_called_once()
 
     def test_existing_run_evidence_is_never_overwritten(self):
@@ -630,6 +630,64 @@ class RealEnvironmentLaunchTests(unittest.TestCase):
             config = make_config(run_dir, run_dir=run_dir, state_dir=run_dir, log_path=run_dir / "hane.log")
             with self.assertRaises(gv.EnvError):
                 env.launch(run_dir / "does-not-exist-and-is-not-executable", config)
+
+
+class ExecutionIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_build_time_head_or_source_change_prevents_launch(self):
+        from unittest.mock import patch
+        for kind in ('head', 'dirty'):
+            env = FakeEnvironment(process=FakeProcess(42))
+            config = make_config(self.root)
+            original = env.build
+            def changed_build(*args):
+                result = original(*args)
+                if kind == 'head':
+                    env.head_sha = 'different-head'
+                else:
+                    env.dirty_paths = [' M crates/hane/src/main.rs']
+                return result
+            with patch.object(env, 'build', side_effect=changed_build), patch.object(env, 'launch') as launch:
+                result = gv.run_validation(env, config)
+            self.assertEqual(result['overall_result'], 'blocked')
+            launch.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix display lock')
+    def test_different_run_directories_still_share_execution_lock(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.object(gv.tempfile, 'gettempdir', return_value=tmp):
+            first, second = gv.RealEnvironment(), gv.RealEnvironment()
+            try:
+                first.acquire_execution()
+                with self.assertRaises(gv.EnvError):
+                    second.acquire_execution()
+                first.release_execution()
+                second.acquire_execution()
+            finally:
+                first.release_execution()
+                second.release_execution()
+
+    def test_signal_during_cleanup_keeps_result_and_finishes_own_child(self):
+        import signal
+        process = FakeProcess(42)
+        original_wait = process.wait
+        def interrupted_wait(*args, **kwargs):
+            signal.raise_signal(signal.SIGTERM)
+            return original_wait(*args, **kwargs)
+        process.wait = interrupted_wait
+        env = FakeEnvironment(process=process)
+        previous = signal.getsignal(signal.SIGTERM)
+        result = gv.run_validation(env, make_config(self.root))
+        self.assertEqual(result['overall_result'], 'blocked')
+        self.assertIsNotNone(process.poll())
+        cleanup = next(s for s in result['steps'] if s['name'] == 'cleanup')
+        self.assertEqual(cleanup['signals'], [signal.SIGTERM])
+        self.assertEqual(cleanup['process_cleanup']['result'], 'pass')
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
 
 if __name__ == "__main__":
