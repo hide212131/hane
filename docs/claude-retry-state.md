@@ -77,6 +77,7 @@ regression coverage; it is not a claim of a new reviewer approval.
 | [3959341995](https://github.com/hide212131/hane/pull/82#discussion_r3959341995) old authorization/queued dispatch replay | Per-context latest state, revalidation, pre-execution claim; shell duplicate-delivery test |
 | [3959418598](https://github.com/hide212131/hane/pull/82#discussion_r3959418598) owner-only route blocks recovery | `RecoveryTests.test_workflow_owner_route_requires_active_manual_authorization` |
 | [3959418607](https://github.com/hide212131/hane/pull/82#discussion_r3959418607) A consumes B | Separate contexts; exact production terminal shell tests for failure, no changes and patch handoff |
+| [3959487382](https://github.com/hide212131/hane/pull/82#discussion_r3959487382) latest global status hides B after A completes | `AuthorizationTests.test_old_consumption_never_masks_new_grant_regardless_of_api_order`; all status order permutations retain B |
 
 ## Validation and review completion
 
