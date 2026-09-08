@@ -90,3 +90,5 @@ artifact は結果JSON、summary、対象ログ、対象window画像、専用fix
 専用OSユーザー、private制御repo、常駐runnerは必須にしない。ユーザーが確認したコードと操作は通常のログインアカウントでも検証できる。未確認の外部PRを無人実行する許可とは扱わない。
 
 まず対話的な専用コマンドで不足する操作だけを確認し、普段の入力と競合させない。対象PIDのみを操作・終了し、変更した入力方式等を復元する。個人パスが映った画像はそのまま公開しない。常駐化が必要な場合だけ、専用アカウント・private repo・runnerの配置を運用上の選択肢として再検討する。
+
+起動・撮影用CLI `scripts/gui_validate.py` の実行方法・結果JSON・終了コードは [CLI操作説明](local-gui-validate-cli.md) に記す。状態遷移の回帰テストは `scripts/tests/test_gui_validate.py` にある。
