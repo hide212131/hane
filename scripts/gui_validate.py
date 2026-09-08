@@ -429,7 +429,10 @@ class RealEnvironment(Environment):
         return window_id or None
 
     def capture(self, window_id: str, image_path: Path, config: Config) -> bool:
-        image_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise EnvError(f"撮影先を準備できない: {exc}") from exc
         if config.capture_cmd is not None:
             args = [*config.capture_cmd, window_id, str(image_path)]
         else:
@@ -444,11 +447,11 @@ class RealEnvironment(Environment):
             raise EnvError(str(exc)) from exc
         if out.returncode != 0:
             return False
-        if not image_path.is_file() or image_path.stat().st_size == 0:
-            return False
         # Decode the complete image, rather than accepting a file/header left
         # by a custom command that exited successfully without a screenshot.
         try:
+            if not image_path.is_file() or image_path.stat().st_size == 0:
+                return False
             with tempfile.TemporaryDirectory(prefix='hane-image-check-') as directory:
                 decoded = Path(directory) / 'decoded.png'
                 checked = subprocess.run(['/usr/bin/sips', '-s', 'format', 'png', str(image_path),
@@ -857,10 +860,15 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
     if output_root == workspace_root or workspace_root in output_root.parents:
         # Retained artifacts must not make the next generation's checkout
         # dirty. Reject before acquiring/reserving anything, including receipts.
-        ignored = subprocess.run(['git', 'check-ignore', '--quiet', '--', str(output_root) + '/'],
-                                 cwd=workspace_root, capture_output=True)
-        if ignored.returncode != 0:
+        try:
+            ignored = subprocess.run(['git', 'check-ignore', '--quiet', '--', str(output_root) + '/'],
+                                     cwd=workspace_root, capture_output=True)
+        except OSError as exc:
+            raise EnvError(f"保存先のGit無視設定を確認できない: {exc}") from exc
+        if ignored.returncode == 1:
             raise ValueError("checkout内の実行用ディレクトリはGitで無視される場所に限る（target/またはcheckout外を指定）")
+        if ignored.returncode != 0:
+            raise EnvError(f"保存先のGit無視設定を確認できない: git exit {ignored.returncode}")
 
     fixture_path, features, extra_env = _scenario_setup(scenario, run_dir, prepare=False)
 
