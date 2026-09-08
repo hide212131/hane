@@ -455,6 +455,35 @@ class ScenarioSetupTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "HANE_CAPTURE_FIXTURE"):
                     gv._scenario_setup("editor", Path(tmp) / "run", prepare=False)
 
+    def test_external_fixture_damaged_during_build_blocks_before_launch(self):
+        from unittest.mock import patch
+        for damage in ('delete', 'directory', 'invalid_utf8'):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'source.md'
+                source.write_text('initially valid document')
+                def build(*args, **kwargs):
+                    source.unlink()
+                    if damage == 'directory':
+                        source.mkdir()
+                    elif damage == 'invalid_utf8':
+                        source.write_bytes(b'invalid document\xff')
+                    return root / 'hane', {}
+                env = gv.RealEnvironment()
+                with patch.dict(os.environ, {'HANE_CAPTURE_FIXTURE': str(source),
+                        'HANE_GUI_VALIDATE_RUN_DIR': str(root / 'run')}):
+                    config = gv.build_config('editor', root)
+                    with patch.object(env, 'acquire_execution'), \
+                            patch.object(env, 'git_head', return_value='abc123'), \
+                            patch.object(env, 'git_dirty_paths', return_value=[]), \
+                            patch.object(env, 'missing_tools', return_value=[]), \
+                            patch.object(env, 'build', side_effect=build), \
+                            patch.object(env, 'launch') as launch:
+                        result = gv.run_validation(env, config)
+                self.assertEqual(result['overall_result'], 'blocked')
+                self.assertIn('HANE_CAPTURE_FIXTURE', result['overall_reason'])
+                launch.assert_not_called()
+
     def test_clean_preflight_precedes_artifacts_in_unignored_run_directory(self):
         from unittest.mock import patch
 

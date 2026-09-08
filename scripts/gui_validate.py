@@ -238,6 +238,8 @@ class RealEnvironment(Environment):
         try:
             self.reserve(config)
             config.state_dir.mkdir(parents=True, exist_ok=True)
+            # Called after do_build and immediately before do_launch: re-read
+            # external fixtures too, since they may have changed during Cargo.
             _scenario_setup(config.scenario, config.run_dir)
         except (OSError, ValueError) as exc:
             raise EnvError(f"検証用ファイルを準備できない: {exc}") from exc
