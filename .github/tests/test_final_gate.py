@@ -181,5 +181,24 @@ class FixEvidenceTests(unittest.TestCase):
             self.assertIsNone(bridge.evidence(api, 1, SHA))
 
 
+class LiveProbeTests(unittest.TestCase):
+    def test_probe_calls_judge_for_every_terminal_outcome_without_writes(self):
+        import final_judge_probe as probe
+        api, data = FakeAPI(), ready()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'GITHUB_WORKFLOW_REF': 'owner/repo/.github/workflows/final-judge-probe.yml@refs/heads/main',
+            'GITHUB_ACTOR': 'owner', 'INPUT_PR': '1', 'PROBE_RECEIPT': str(Path(tmp) / 'proof.json')}), \
+                patch.object(probe, 'GitHub', return_value=api), \
+                patch.object(probe, 'snapshot', return_value=data), \
+                patch.object(probe, 'judge', return_value={'decision': 'blocked', 'reason': 'probe'}) as judge:
+            probe.main()
+            recorded = json.loads((Path(tmp) / 'proof.json').read_text())
+        self.assertEqual(judge.call_count, 3)
+        self.assertEqual([c['gui_outcome'] for c in recorded['cases']], ['pass', 'fail', 'blocked'])
+        self.assertEqual([c['fault_injected'] for c in recorded['cases']], [False, True, True])
+        self.assertEqual(api.writes, [])
+        self.assertEqual(api.merges, [])
+
+
 if __name__ == '__main__':
     unittest.main()

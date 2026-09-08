@@ -1,0 +1,43 @@
+name: Final judge terminal-outcome probe
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Current PR with real complete GUI-pass evidence; no merge or status effects
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: npm install -g @github/copilot
+      - name: Exercise live judge with pass and explicitly fault-injected fail and blocked
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          PROBE_RECEIPT: ${{ runner.temp }}/terminal-outcome-probe.json
+        run: python3 -I .github/scripts/final_judge_probe.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-outcome-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/terminal-outcome-probe.json
+          if-no-files-found: error
+          retention-days: 30

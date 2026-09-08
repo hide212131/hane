@@ -33,3 +33,5 @@ After a fix is pushed, existing trusted CI, Codex review, and GUI classification
 ## Evidence retention and limitations
 
 Final receipts are retained for 30 days; production GUI receipts for 14 days. An expired or missing artifact cannot authorize a merge. The GUI suite covers focused OS keyboard, IME, reopen and wheel smoke scenarios, not every editor interaction. Live success, failure/recovery and automatic-merge evidence must be recorded before declaring Issue #44 complete.
+
+The owner-only `Final judge terminal-outcome probe` dispatch exercises the live Copilot call using a real complete GUI-pass snapshot and explicitly fault-injected fail/blocked copies. It has read-only GitHub permissions and publishes no PR statuses, dispatches, or merges. Its artifacts label the injected cases; they are boundary-test evidence, not claims of real application failures and never production GUI receipts.
