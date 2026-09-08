@@ -17,7 +17,7 @@ SHA = 'a' * 40
 
 
 def ready(gui=True):
-    return {'pr_number': 1, 'sha': SHA, 'repository': 'owner/repo', 'trusted': True,
+    return {'pr_number': 1, 'sha': SHA, 'repository': 'owner/repo', 'trusted': True, 'mergeable': True,
             'ci_ready': True, 'review_ready': True, 'classified': True, 'gui_required': gui,
             'unresolved_threads': [], 'blocking_reviews': [], 'required_checks': sorted(CI_NAMES),
             'workflow_changes': False, 'auto_merge': True,
@@ -36,7 +36,7 @@ class PolicyTests(unittest.TestCase):
             self.assertTrue(gate(data))
 
     def test_required_missing_conditions_always_prevent_ready(self):
-        cases = [('trusted', False), ('ci_ready', False), ('review_ready', False),
+        cases = [('trusted', False), ('mergeable', False), ('mergeable', None), ('ci_ready', False), ('review_ready', False),
                  ('classified', False), ('unresolved_threads', ['thread']),
                  ('blocking_reviews', [12]), ('required_checks', []),
                  ('required_checks', sorted(CI_NAMES) + ['new required check']),

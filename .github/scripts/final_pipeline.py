@@ -63,7 +63,7 @@ def review_threads(api, number):
         connection = data['data']['repository']['pullRequest']['reviewThreads']
         records += connection['nodes']
         if not connection['pageInfo']['hasNextPage']:
-            return sorted(row['id'] for row in records if row['isResolved'] is not True)
+            return sorted(row['id'] for row in records if row['isResolved'] is not True and row['isOutdated'] is not True)
         cursor = connection['pageInfo']['endCursor']
     raise ValueError('review thread pagination exceeded')
 
@@ -91,7 +91,7 @@ def snapshot(api, number):
     files = data['files']
     proof = gui_receipt(api, pr, data['statuses'])
     return {'pr_number': number, 'sha': data['sha'], 'repository': api.repository,
-            'title': pr['title'], 'body': pr.get('body'), 'trusted': True,
+            'title': pr['title'], 'body': pr.get('body'), 'trusted': True, 'mergeable': pr.get('mergeable'),
             'ci_ready': data['ci_ready'], 'review_ready': data['review_ready'],
             'classified': data['classified'], 'gui_required': data['gui_required'],
             'statuses': {k: {f: v.get(f) for f in ('id', 'state', 'description', 'target_url')} for k, v in statuses.items()},

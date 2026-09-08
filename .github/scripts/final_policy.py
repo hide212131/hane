@@ -34,7 +34,7 @@ def final_state(status, sha, key):
 def gate(snapshot):
     """Every condition must be known and current. Returns actionable denials."""
     errors = []
-    for name in ('trusted', 'ci_ready', 'review_ready', 'classified'):
+    for name in ('trusted', 'ci_ready', 'review_ready', 'classified', 'mergeable'):
         if snapshot.get(name) is not True:
             errors.append(name)
     if snapshot.get('unresolved_threads'):

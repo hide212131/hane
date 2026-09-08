@@ -8,6 +8,8 @@ Claude implements, Codex reviews, and Copilot judges. The final judge receives e
 
 Every authenticated terminal GUI outcome (`pass`, `fail`, `blocked`, including recovered interrupted runs) reaches final judgement. No-GUI PRs proceed only after current CI, review, and policy classification are ready. GUI artifacts must come from the production GUI workflow on main, for the exact PR/SHA/run attempt/control SHA. Experiment artifacts cannot satisfy this gate.
 
+GUI claim/report jobs and final judgement share a serialized state-writer queue, so a new GUI generation cannot replace its evidence during final judgement/merge.
+
 A decision is bound to a fingerprint of the current evidence. Changed head, GUI generation, labels, review state, or required rules invalidate it. Repeated deliveries cannot repeat a paid judgement for unchanged evidence. A lost pending judge becomes blocked after its run completes. New evidence permits a fresh decision; controller/inference failures never mean pass.
 
 ## Automatic merge
@@ -17,7 +19,7 @@ The repository owner opts a PR into automatic merging with the `agentic-auto-mer
 - Open, non-draft, same-repository PR from the owner or repository implementation bots, targeting main.
 - Both required platform CI checks and the complete CI run pass. Missing, skipped, failed, stale, or unexpected required checks block merging.
 - Current review clean, or exact-head findings with a later Copilot continue-validation route.
-- No unresolved review threads or active changes-requested reviews.
+- No unresolved current (non-outdated) review threads or active changes-requested reviews. GitHub must positively report that the PR is mergeable; unknown/conflicted results block.
 - Current GUI policy classification; an authenticated current-generation GUI pass when required.
 - No workflow file changes, including renamed workflow files. These remain owner-merge-only.
 - Copilot final decision `ready` and unchanged evidence immediately before the GitHub merge request.
