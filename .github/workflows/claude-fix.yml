@@ -86,6 +86,20 @@ jobs:
             exit 0
           fi
 
+          if [[ "$manual_retry" == true ]]; then
+            manual_description="Claude manual retry authorized for ${short_sha}"
+            manual_authorization="$(
+              gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+                --jq '[.[] | select(.context == "hane/claude-fix-manual")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv'
+            )"
+            manual_state="${manual_authorization%%$'\t'*}"
+            manual_status_description="${manual_authorization#*$'\t'}"
+            if [[ "$manual_state" != success || "$manual_status_description" != "$manual_description" ]]; then
+              echo '::warning::Manual Claude retry authorization was consumed or is no longer valid; ignoring stale recovery dispatch.'
+              exit 0
+            fi
+          fi
+
           workflow_files="$(
             gh api --paginate --slurp \
               "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
@@ -538,11 +552,20 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           artifact_name="hane-workflow-fix-${TARGET_SHA}"
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix-manual' \
+              -f description="Claude manual retry consumed for ${short_sha}" \
+              -f target_url="$run_url" >/dev/null; then
+              echo '::warning::Failed to consume the manual Claude retry authorization.'
+            fi
+          fi
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix blocked: workflow patch requires owner for ${short_sha}" \

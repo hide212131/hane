@@ -105,10 +105,26 @@ jobs:
             is_trusted_pr_author "$pr_author" || continue
 
             statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
+            routing_fix="Copilot routing: fix for ${short_sha}"
+            routing_owner_only="Copilot routing: workflow changes require owner for ${short_sha}"
+            routing_controller_failed="Copilot routing controller failed for ${short_sha}"
+            routing_fix_id="$(
+              jq -r --arg fix "$routing_fix" \
+                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | (.id // 0)' \
+                <<< "$statuses"
+            )"
+            routing_owner_only_id="$(
+              jq -r --arg owner "$routing_owner_only" \
+                '[.[] | select(.context == "hane/copilot-routing" and .description == $owner)] | max_by(.id) // {} | (.id // 0)' \
+                <<< "$statuses"
+            )"
             routing_decision="$(
               jq -r '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | .description // ""' \
                 <<< "$statuses"
             )"
+            if [[ "$routing_decision" == "$routing_controller_failed" && "$routing_fix_id" -gt "$routing_owner_only_id" ]]; then
+              routing_decision="$routing_fix"
+            fi
             claude_latest="$(
               jq -r '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' \
                 <<< "$statuses"
@@ -146,11 +162,7 @@ jobs:
             fi
 
             if [[ "$recover_claude" == true ]]; then
-              manual_retry="$(
-                jq -r --arg manual "Claude manual retry authorized for ${short_sha}" \
-                  '[.[] | select(.context == "hane/claude-fix-manual" and .state == "success" and .description == $manual)] | length > 0' \
-                  <<< "$statuses"
-              )"
+              manual_retry="$manual_retry_authorized"
               echo "Recovering Claude fix for PR #${pr_number} head ${head_sha}."
               if [[ "$manual_retry" == true ]]; then
                 echo "Preserving manual Claude retry authorization for ${head_sha}."
