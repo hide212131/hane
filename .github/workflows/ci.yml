@@ -32,7 +32,7 @@ jobs:
       - name: Run workflow regression tests without network or agent calls
         run: |
           python3 -m unittest discover -s .github/tests -p 'test_*.py'
-          python3 -m unittest discover -s scripts/tests -p 'test_gui_validate.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
   claim_trusted_ci_generation:
     name: Reclaim trusted CI generation
