@@ -714,6 +714,29 @@ class ExecutionIntegrityTests(unittest.TestCase):
             self.assertIsNone(binary)
             self.assertEqual(env.build_calls, 0)
 
+    def test_temporary_root_inside_checkout_does_not_dirty_source(self):
+        from unittest.mock import patch
+        repo = self.root / 'repo'
+        repo.mkdir()
+        (repo / 'source.txt').write_text('committed input')
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=GUI test',
+                        '-c', 'user.email=gui-test@example.invalid', '-c', 'commit.gpgsign=false',
+                        'commit', '-qm', 'snapshot input'], check=True)
+        temp_root = repo / 'custom-temp'
+        temp_root.mkdir()
+        env = gv.RealEnvironment()
+        self.assertEqual(env.git_dirty_paths(repo), [])
+        try:
+            with patch.object(gv.tempfile, 'gettempdir', return_value=str(temp_root)):
+                snapshot = env.snapshot_checkout(repo, env.git_head(repo))
+            self.assertNotIn(repo.resolve(), snapshot.resolve().parents)
+            self.assertEqual(env.git_dirty_paths(repo), [])
+            self.assertEqual((snapshot / 'source.txt').read_text(), 'committed input')
+        finally:
+            env.release_execution()
+
     def test_failed_build_with_checkout_interference_is_environment_blocked(self):
         from unittest.mock import patch
         for kind in ('head', 'dirty'):
