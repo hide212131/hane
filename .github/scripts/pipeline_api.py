@@ -78,9 +78,9 @@ class GitHub:
         ci = max((r for r in runs if r.get('path') == '.github/workflows/ci.yml'), key=lambda r: r['id'], default={})
         return ci.get('status') == 'completed' and ci.get('conclusion') == 'success'
 
-    def evidence(self, pr):
+    def evidence(self, pr, statuses=None):
         sha = pr['head']['sha']
-        statuses = self.statuses(sha)
+        statuses = self.statuses(sha) if statuses is None else statuses
         files = self.pages(self.repo(f'pulls/{pr["number"]}/files'))
         force = any(label['name'] == 'gui-validation-required' for label in pr.get('labels', []))
         required = required_from_files(files, pr['changed_files'], force)

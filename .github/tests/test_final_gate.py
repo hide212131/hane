@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,32 @@ def ready(gui=True):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_waiting_review_does_not_fetch_detailed_judge_evidence(self):
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'head': {'sha': SHA}}
+        api.trusted.return_value = True
+        api.statuses.return_value = {}
+        self.assertIsNone(controller.snapshot(api, 1, require_judge_ready=True))
+        api.evidence.assert_not_called()
+        api.pages.assert_not_called()
+        api.api.assert_not_called()
+
+    def test_terminal_gui_still_fetches_evidence_when_review_is_blocked(self):
+        from gui_policy import STATUS_VERSION
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'head': {'sha': SHA}, 'title': 'GUI failure', 'labels': []}
+        api.trusted.return_value = True
+        rows = {controller.GUI_CONTEXT: {'state': 'error', 'description': f'GUI blocked {STATUS_VERSION} {SHA[:12]} g123-1'}}
+        api.statuses.return_value = rows
+        api.evidence.return_value = dict(ready(), review_ready=False, files=[], statuses=rows)
+        api.pages.return_value = []
+        api.api.return_value = []
+        with patch.object(controller, 'gui_receipt', return_value={'outcome': 'blocked'}), \
+                patch.object(controller, 'review_threads', return_value=[]):
+            data = controller.snapshot(api, 1, require_judge_ready=True)
+        self.assertTrue(may_judge(data))
+        api.evidence.assert_called_once_with(api.pr.return_value, statuses=rows)
+
     def test_no_gui_snapshot_ignores_expired_old_gui_receipt(self):
         api = MagicMock(repository='owner/repo')
         api.pr.return_value = {'title': 'Docs', 'mergeable': True, 'labels': []}
@@ -40,6 +67,7 @@ class PolicyTests(unittest.TestCase):
         read.assert_not_called()
         self.assertIsNone(data['gui_receipt'])
         self.assertNotIn(controller.GUI_CONTEXT, data['statuses'])
+        self.assertEqual(data['judge_procedure_version'], controller.JUDGE_PROCEDURE)
 
     def test_all_gui_terminal_outcomes_reach_final_judge(self):
         for outcome in ('pass', 'fail', 'blocked'):
@@ -98,6 +126,31 @@ class PolicyTests(unittest.TestCase):
         for context, description, state in [('hane/copilot-routing', f'Copilot routing: continue-validation for {SHA[:12]}', 'success'),
                                            ('hane/final-judge', f'Final blocked v1 {SHA[:12]} e' + 'b' * 16, 'error')]:
             self.assertFalse(routing_allows_fix([final, {'id': 11, 'context': context, 'description': description, 'state': state}], SHA))
+
+
+class InvocationTests(unittest.TestCase):
+    def test_cli_has_a_nonempty_no_tool_allowlist_and_no_workflow_token(self):
+        response = subprocess.CompletedProcess([], 0, '{"decision":"blocked","reason":"unresolved review"}', '')
+        with patch.dict(os.environ, {'COPILOT_GITHUB_TOKEN': 'model-secret', 'GH_TOKEN': 'workflow-secret', 'GITHUB_TOKEN': 'other-secret'}), \
+                patch.object(controller.subprocess, 'run', return_value=response) as run:
+            self.assertEqual(controller.judge(ready())['decision'], 'blocked')
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index('--available-tools') + 1], '__hane_final_judge_no_tools__')
+        self.assertNotIn('*', argv)
+        child = run.call_args.kwargs['env']
+        self.assertNotIn('GH_TOKEN', child)
+        self.assertNotIn('GITHUB_TOKEN', child)
+        self.assertEqual(child['COPILOT_GITHUB_TOKEN'], 'model-secret')
+
+    def test_invocation_error_is_bounded_and_credentials_are_redacted(self):
+        response = subprocess.CompletedProcess([], 1, '', 'error model-secret workflow-secret ' + 'x' * 2000)
+        with patch.dict(os.environ, {'COPILOT_GITHUB_TOKEN': 'model-secret', 'GH_TOKEN': 'workflow-secret'}), \
+                patch.object(controller.subprocess, 'run', return_value=response), self.assertRaises(ValueError) as error:
+            controller.judge(ready())
+        self.assertNotIn('model-secret', str(error.exception))
+        self.assertNotIn('workflow-secret', str(error.exception))
+        self.assertIn('[REDACTED]', str(error.exception))
+        self.assertLess(len(str(error.exception)), 1300)
 
 
 class FakeAPI:
