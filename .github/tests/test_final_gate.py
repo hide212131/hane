@@ -175,6 +175,17 @@ class FixEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bridge.evidence(api, 1, SHA)
 
+    def test_worker_cannot_adopt_a_new_final_generation_mid_implementation(self):
+        from final_fix_bridge import same_authorization
+        original = {'run_id': '123', 'run_attempt': '1', 'evidence_key': 'key', 'snapshot': ready()}
+        self.assertTrue(same_authorization(original, deepcopy(original)))
+        for field, value in [('run_id', '456'), ('run_attempt', '2'), ('evidence_key', 'other'),
+                             ('snapshot', dict(ready(), gui_receipt={'outcome': 'fail', 'generation': 'new'}))]:
+            self.assertFalse(same_authorization(original, dict(original, **{field: value})))
+        self.assertFalse(same_authorization(original, None))
+        self.assertFalse(same_authorization(None, original))
+        self.assertTrue(same_authorization(None, None))
+
     def test_pre_gui_route_does_not_depend_on_final_artifacts(self):
         import final_fix_bridge as bridge
         api = FakeAPI()

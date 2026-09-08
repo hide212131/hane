@@ -46,7 +46,13 @@ def main():
     if sys.argv[1] == 'evidence':
         number, sha = int(os.environ['PR_NUMBER']), os.environ['TARGET_SHA']
         proof = evidence(api, number, sha)
-        Path(os.environ['FINAL_EVIDENCE_PATH']).write_text(json.dumps(proof, ensure_ascii=False))
+        path = Path(os.environ['FINAL_EVIDENCE_PATH'])
+        if '--verify' in sys.argv[2:]:
+            original = json.loads(path.read_text())
+            if not same_authorization(original, proof):
+                raise ValueError('final fix authorization changed since implementation evidence was captured')
+        else:
+            path.write_text(json.dumps(proof, ensure_ascii=False))
         # If a final fix is the latest authorization, a stale/missing matching
         # receipt must stop the paid invocation, not fall back to old findings.
         latest = api.statuses(sha)
@@ -71,6 +77,15 @@ def main():
                 'pr_number': number, 'target_sha': pr['head']['sha'], 'manual_retry': False}})
         except Exception as exc:
             print(f'PR {number}: no final fix dispatch: {exc}', file=sys.stderr)
+
+
+def same_authorization(original, current):
+    if original is None and current is None:
+        return True
+    return (isinstance(original, dict) and isinstance(current, dict)
+            and all(original.get(key) == current.get(key) and original.get(key) is not None
+                    for key in ('run_id', 'run_attempt', 'evidence_key'))
+            and original.get('snapshot') == current.get('snapshot'))
 
 
 if __name__ == '__main__':
