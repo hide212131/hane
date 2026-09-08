@@ -86,6 +86,20 @@ jobs:
             exit 0
           fi
 
+          workflow_files="$(
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+              | jq '[.[][] | .filename] | any(.[]; startswith(".github/workflows/"))'
+          )"
+          if [[ "$workflow_files" == true ]]; then
+            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix' \
+              -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
+              -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" >/dev/null
+            echo '::warning::Claude automatic fix is disabled for Pull Requests that change workflow files.'
+            exit 0
+          fi
+
           routing="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
               --jq "[.[] | select(.context == \"hane/copilot-routing\" and .state == \"failure\" and .description == \"Copilot routing: fix for ${short_sha}\")] | max_by(.id) // {} | .description // \"\""
