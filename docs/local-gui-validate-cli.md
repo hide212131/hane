@@ -48,9 +48,13 @@ macOS の `swift` / `screencapture` に依存するため、実際の起動・�
 | `HANE_GUI_VALIDATE_WINDOW_ID_CMD` | なし（既定は `swift window_id.swift`） | ウィンドウ確認コマンドの差し替え。自動テストで実画面なしに注入する用途 |
 | `HANE_GUI_VALIDATE_CAPTURE_CMD` | なし（既定は `screencapture -x -l`） | 撮影コマンドの差し替え。同上 |
 | `HANE_GUI_VALIDATE_CAPTURE_TIMEOUT_SECS` | `15` | 撮影コマンドの完了を待つ上限秒数。超過すると `blocked` として扱う |
-| `HANE_CAPTURE_FIXTURE` / `HANE_CAPTURE_CURSOR_OFFSET` / `HANE_CAPTURE_CURSOR_DOWN` | `capture.sh` と同じ | シナリオ別の入力・オフセット調整 |
+| `HANE_CAPTURE_FIXTURE` | なし | editorで開く既存文書 |
+| `HANE_CAPTURE_CURSOR_OFFSET` | `11` | cursor-boundaryの文字位置。固定文書内の整数 `0`〜`23` |
+| `HANE_CAPTURE_CURSOR_DOWN` | `32` | cursor-scrollの移動回数。固定文書に応じた整数 `0`〜`40` |
 
 `HANE_STATE_DIR` は毎回 `<run-dir>/state` に固定され、呼び出し側からは上書きできない。普段の設定・Recent Files を使わないためである。
+
+起動するアプリには、このシナリオで検証した設定と専用の `HANE_STATE_DIR` だけを渡す。親環境の `HANE_MEASUREMENT_EMPTY`、`HANE_NO_FOCUS`、`HANE_METRICS_CSV` などの計測設定は引き継がない。
 
 ## 結果の保存先と形式
 

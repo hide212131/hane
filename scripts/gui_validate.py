@@ -377,7 +377,10 @@ class RealEnvironment(Environment):
         args = [str(binary_path)]
         if config.fixture_path is not None:
             args.append(str(config.fixture_path))
-        run_env = os.environ.copy()
+        # Only this scenario's validated Hane settings may affect the child.
+        # Ambient measurement flags can change the document/focus or write a
+        # metrics file outside this run, even when the scenario overrides pass.
+        run_env = {key: value for key, value in os.environ.items() if not key.startswith("HANE_")}
         run_env["HANE_STATE_DIR"] = str(config.state_dir)
         run_env.update(config.extra_env)
         log_file = open(config.log_path, "wb")
@@ -771,18 +774,29 @@ def _scenario_setup(scenario: str, run_dir: Path, *, prepare: bool = True) -> tu
         return fixture_path, ["timing-probe"], {}
     if scenario == "cursor-boundary":
         fixture_path = run_dir / "cursor-boundary.md"
+        contents = "first line\nsecond line\n"
+        offset = _env_bounded_int("HANE_CAPTURE_CURSOR_OFFSET", 11, len(contents))
         if prepare:
-            fixture_path.write_text("first line\nsecond line\n")
-        offset = os.environ.get("HANE_CAPTURE_CURSOR_OFFSET", "11")
+            fixture_path.write_text(contents)
         return fixture_path, ["instrument"], {"HANE_MEASUREMENT_CURSOR_OFFSET": offset}
     if scenario == "cursor-scroll":
         fixture_path = run_dir / "forty-lines.md"
         lines = [f"line {n:02d} — scroll verification\n" for n in range(1, 41)]
+        down = _env_bounded_int("HANE_CAPTURE_CURSOR_DOWN", 32, len(lines))
         if prepare:
             fixture_path.write_text("".join(lines))
-        down = os.environ.get("HANE_CAPTURE_CURSOR_DOWN", "32")
         return fixture_path, ["instrument"], {"HANE_DEV_CURSOR_DOWN": down}
     raise ValueError(f"unknown scenario: {scenario}")
+
+
+def _env_bounded_int(name: str, default: int, maximum: int) -> str:
+    value = os.environ.get(name, str(default))
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError(f"{name} は0〜{maximum}の整数である必要がある")
+    parsed = int(value)
+    if parsed > maximum:
+        raise ValueError(f"{name} は0〜{maximum}の整数である必要がある")
+    return str(parsed)
 
 
 def _env_float(name: str, default: float) -> float:
