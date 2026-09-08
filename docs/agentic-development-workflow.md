@@ -396,7 +396,7 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 
 #### 手動再レビュー要求 `/codex-review`
 
-owner / write 権限保持者は、対象 Pull Request が open な same-repository Pull Request である間、Pull Request のコメントに `/codex-review` と投稿して同じ controller を明示的に再起動できる。
+owner / write 権限保持者は、対象 Pull Request が open な same-repository Pull Request である間、Pull Request のコメントに `/codex-review` と投稿して同じ controller を明示的に再起動できる。ただし、対象 head SHA に対して終端結果（`clean` / `findings`）がすでに存在する場合、controller は新しい `@codex review` コメントを投稿せずその結果を再利用する（詳細は以下の再利用条件を参照）。
 
 - `/codex-review` コメント投稿者の実効権限は `/implement` と同じ方法（collaborator permission API、または `OWNER`）で確認し、`write` / `maintain` / `admin` を持たない投稿者のコメントは無視する。
 - controller はレビューを要求する前に対象 Pull Request の現在の head SHA を解決し、以降の判定・記録の対象 SHA として確定する。対象が open な same-repository Pull Request でない場合は起動しない。
