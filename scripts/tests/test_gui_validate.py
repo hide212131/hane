@@ -838,7 +838,7 @@ class ExecutionIntegrityTests(unittest.TestCase):
         import io
         import signal
         from unittest.mock import patch
-        for phase in ('after_cleanup', 'during_write', 'after_replace'):
+        for phase in ('after_cleanup', 'during_write', 'after_replace', 'retry_write_failure'):
             with tempfile.TemporaryDirectory() as tmp:
                 config = make_config(Path(tmp))
                 env = gv.RealEnvironment()
@@ -856,13 +856,15 @@ class ExecutionIntegrityTests(unittest.TestCase):
                     return {'overall_result': 'pass', 'summary': 'passed', 'steps': []}
                 original_write, original_replace = Path.write_text, Path.replace
                 def write(path, *args, **kwargs):
+                    if phase == 'retry_write_failure' and injected:
+                        raise OSError('disk full on interrupted receipt retry')
                     value = original_write(path, *args, **kwargs)
                     if phase == 'during_write' and path.name == '.result.json.tmp':
                         interrupt_once()
                     return value
                 def replace(path, *args, **kwargs):
                     value = original_replace(path, *args, **kwargs)
-                    if phase == 'after_replace' and path.name == '.result.json.tmp':
+                    if phase in ('after_replace', 'retry_write_failure') and path.name == '.result.json.tmp':
                         interrupt_once()
                     return value
                 with patch.object(gv, 'build_config', return_value=config), \
@@ -871,6 +873,9 @@ class ExecutionIntegrityTests(unittest.TestCase):
                         patch.object(env, 'reserve'), patch.object(Path, 'write_text', write), \
                         patch.object(Path, 'replace', replace), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(gv.main(['gui_validate.py', 'editor']), gv.EXIT_BLOCKED)
+                if phase == 'retry_write_failure':
+                    self.assertFalse((config.run_dir / 'result.json').exists())
+                    continue
                 proof = json.loads((config.run_dir / 'result.json').read_text())
                 self.assertEqual(proof['overall_result'], 'blocked')
                 self.assertEqual(proof['steps'][-1]['signals'], [signal.SIGTERM])
