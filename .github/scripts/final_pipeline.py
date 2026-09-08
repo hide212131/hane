@@ -1,33 +1,16 @@
 """Trusted final judgement and compare-and-swap merge controller."""
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gui_policy import CONTEXT as GUI_CONTEXT, gui_state
 from final_policy import AUTO_LABEL, CONTEXT, authenticated_receipt, final_state, fingerprint, gate, may_judge, parse_decision
 from pipeline_api import GitHub
-
-
-def artifact_json(api, run_id, name, filename):
-    rows = api.pages(api.repo(f'actions/runs/{run_id}/artifacts'), 'artifacts')
-    candidates = [a for a in rows if a['name'] == name and not a.get('expired')]
-    if len(candidates) != 1 or candidates[0]['size_in_bytes'] > 2 * 1024 * 1024:
-        raise ValueError('missing, duplicate, expired or oversized receipt artifact')
-    archive = subprocess.run(['gh', 'api', api.repo(f'actions/artifacts/{candidates[0]["id"]}/zip')],
-                             capture_output=True, timeout=60, check=True).stdout
-    if len(archive) > 2 * 1024 * 1024:
-        raise ValueError('oversized artifact download')
-    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
-        info = zipped.getinfo(filename)
-        if info.file_size > 1024 * 1024:
-            raise ValueError('oversized receipt')
-        return json.loads(zipped.read(info))
+from gui_artifacts import artifact_json
 
 
 def gui_receipt(api, pr, statuses):
