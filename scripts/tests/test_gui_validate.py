@@ -656,6 +656,71 @@ class ExecutionIntegrityTests(unittest.TestCase):
             self.assertEqual(result['overall_result'], 'blocked')
             launch.assert_not_called()
 
+    def test_checkout_change_before_build_prevents_cargo_execution(self):
+        for head, dirty in [('new-head', []), ('abc123', [' M Cargo.toml'])]:
+            env = FakeEnvironment(head_sha=head, dirty_paths=dirty)
+            step, binary, _ = gv.do_build(env, make_config(self.root), baseline_sha='abc123')
+            self.assertEqual(step['result'], 'blocked')
+            self.assertIsNone(binary)
+            self.assertEqual(env.build_calls, 0)
+
+    def test_failed_build_with_checkout_interference_is_environment_blocked(self):
+        from unittest.mock import patch
+        for kind in ('head', 'dirty'):
+            env = FakeEnvironment(process=FakeProcess(42))
+            def failed_build(*args):
+                if kind == 'head':
+                    env.head_sha = 'changed-head'
+                else:
+                    env.dirty_paths = [' M Cargo.toml']
+                raise gv.BuildError('compilation failed after external change')
+            with patch.object(env, 'build', side_effect=failed_build), patch.object(env, 'launch') as launch:
+                result = gv.run_validation(env, make_config(self.root))
+            self.assertEqual(result['overall_result'], 'blocked')
+            launch.assert_not_called()
+
+    def test_aborts_after_cleanup_and_during_publication_cannot_publish_pass(self):
+        import contextlib
+        import io
+        import signal
+        from unittest.mock import patch
+        for phase in ('after_cleanup', 'during_write', 'after_replace'):
+            with tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp))
+                env = gv.RealEnvironment()
+                injected = False
+                def interrupt_once():
+                    nonlocal injected
+                    if not injected:
+                        injected = True
+                        signal.raise_signal(signal.SIGTERM)
+                def validated(*args):
+                    env._execution_acquired = True
+                    env._finalizing = True
+                    if phase == 'after_cleanup':
+                        interrupt_once()
+                    return {'overall_result': 'pass', 'summary': 'passed', 'steps': []}
+                original_write, original_replace = Path.write_text, Path.replace
+                def write(path, *args, **kwargs):
+                    value = original_write(path, *args, **kwargs)
+                    if phase == 'during_write' and path.name == '.result.json.tmp':
+                        interrupt_once()
+                    return value
+                def replace(path, *args, **kwargs):
+                    value = original_replace(path, *args, **kwargs)
+                    if phase == 'after_replace' and path.name == '.result.json.tmp':
+                        interrupt_once()
+                    return value
+                with patch.object(gv, 'build_config', return_value=config), \
+                        patch.object(gv, 'RealEnvironment', return_value=env), \
+                        patch.object(gv, 'run_validation', side_effect=validated), \
+                        patch.object(env, 'reserve'), patch.object(Path, 'write_text', write), \
+                        patch.object(Path, 'replace', replace), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gv.main(['gui_validate.py', 'editor']), gv.EXIT_BLOCKED)
+                proof = json.loads((config.run_dir / 'result.json').read_text())
+                self.assertEqual(proof['overall_result'], 'blocked')
+                self.assertEqual(proof['steps'][-1]['signals'], [signal.SIGTERM])
+
     @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix display lock')
     def test_different_run_directories_still_share_execution_lock(self):
         from unittest.mock import patch
