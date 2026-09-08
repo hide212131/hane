@@ -31,7 +31,7 @@ python3 scripts/gui_validate.py [editor|cursor-boundary|cursor-scroll]
 - `editor`: 起動完了ログ `hane_ready` を出す `timing-probe` feature でビルドし、実行専用の `editor.md` を開く（`HANE_CAPTURE_FIXTURE` の指定時はその文書を直接開き、相対画像などの参照元ディレクトリを維持する）。通常ビルドはこのログを出さない。合成入力を行う `instrument` は使わない。文書のパスを渡すことで、初回の既定フォルダ選択ダイアログを撮影することを防ぐ。このシナリオは起動・撮影のみで、文書の編集操作を行わない。将来の入力・保存シナリオには、指定された元文書を流用せず、専用の一時文書を使う。指定文書が存在しない、ディレクトリである、読み取り権限がない、UTF-8文書として読めない場合は、設定エラー（終了コード3）を表示し、アプリを起動しない。
 - `cursor-boundary` / `cursor-scroll`: `instrument` feature でビルドし、専用の固定文書を実行ごとに生成する
 
-macOS の `swift` / `screencapture` に依存するため、実際の起動・撮影・撮影経路の実証は macOS でのみ行える。macOS 以外では `missing_tools` により `preflight` 工程で `blocked` になる（後述）。
+macOS の `swift` / `screencapture` / `sips` に依存するため、実際の起動・撮影・撮影経路の実証は macOS でのみ行える。macOS 以外では `missing_tools` により `preflight` 工程で `blocked` になる（後述）。
 
 ### 環境変数
 
@@ -85,10 +85,10 @@ target/gui-validate/<request-id>/<generation>/
 
 工程ごとの分類方針:
 
-- 要求 SHA 不一致・作業コピーの汚染・必要なツール（`cargo` / `swift` / `screencapture`）の欠如は `blocked`（環境・権限の問題）
+- 要求 SHA 不一致・作業コピーの汚染・必要なツール（`cargo` / `swift` / `screencapture` / `sips`）の欠如は `blocked`（環境・権限の問題）
 - ビルド失敗は `fail`（対象コードの問題として扱う）
 - `hane_ready` 前にプロセスが終了した場合は `fail`（クラッシュ）、生きたままタイムアウトした場合は `blocked`（原因を断定しない）
-- ウィンドウ確認のタイムアウトと撮影コマンドの失敗は `blocked`
+- ウィンドウ確認のタイムアウトと撮影コマンドの失敗は `blocked`。撮影コマンドの終了コードだけでは成功にせず、空でない画像を `sips` で最後までデコードできることを確認する
 - 前段が失敗・停止した工程は `skipped`（未実施を `blocked`/`fail` と区別する）
 
 ## 終了コード
@@ -137,6 +137,6 @@ python3 -m unittest discover -s scripts/tests
 
 実行ロックのパスはOSのアカウント情報から求めたホーム配下の `.cache/hane/gui-validation.lock` に固定し、TMPDIRやHOMEの環境変数に依存しない。子プロセスと所有マーカーの作成時は、管理情報を確定するまで中断要求の配送を遅らせる。子プロセスにSIGTERMのブロック状態を継承させない。結果JSONは一時ファイルへの書き込み完了後に置き換え、保存失敗時は部分的なJSONを正式な結果として公開せずblockedとなる。
 
-ビルドが失敗した場合もcheckoutの再確認を省略しない。外部変更が混入していれば製品のfailではなくblockedとする。終了処理後・結果保存中の中断要求は記録し、成功結果をblockedに更新して保存する。再保存が失敗した場合は自分の世代のcanonical result.jsonを削除する。削除自体にも失敗した場合はその理由を標準エラーへ記録し、終了コード2を返す。この場合はファイルだけで成功と判断しない。
+ビルドが失敗した場合もcheckoutの再確認を省略しない。外部変更が混入していれば製品のfailではなくblockedとする。終了処理後・結果保存中の中断要求は記録し、成功結果をblockedに更新して保存する。再保存が失敗した場合は自分の世代のcanonical result.jsonとsummary.mdを削除する。削除自体にも失敗した場合はその理由を標準エラーへ記録し、終了コード2を返す。この場合はファイルだけで成功と判断しない。
 
 コンパイル入力は、記録したコミットを独立した一時Gitリポジトリへcheckoutして固定する。元の作業コピーやGitオブジェクトへのハードリンクは共有せず、Cargoの出力先もこの実行専用に分離する。元の作業コピーを一時的に編集して元に戻しても、ビルド入力には入らない。ビルド用コピーのSHA・clean状態を結果に記録し、アプリ終了後にこの実行が作成したコピーだけを削除する。

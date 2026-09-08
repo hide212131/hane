@@ -875,6 +875,7 @@ class ExecutionIntegrityTests(unittest.TestCase):
                     self.assertEqual(gv.main(['gui_validate.py', 'editor']), gv.EXIT_BLOCKED)
                 if phase == 'retry_write_failure':
                     self.assertFalse((config.run_dir / 'result.json').exists())
+                    self.assertFalse((config.run_dir / 'summary.md').exists())
                     continue
                 proof = json.loads((config.run_dir / 'result.json').read_text())
                 self.assertEqual(proof['overall_result'], 'blocked')
@@ -1028,6 +1029,26 @@ class ExecutionIntegrityTests(unittest.TestCase):
             self.assertEqual(gv._publish_result(env, config, result), gv.EXIT_BLOCKED)
         self.assertFalse((config.run_dir / 'result.json').exists())
         self.assertIn('BLOCKED', error.getvalue())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS native image decoder')
+    def test_capture_rejects_empty_and_corrupt_images_despite_successful_command(self):
+        import struct
+        import zlib
+        from unittest.mock import patch
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        valid = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(b'\x00\xff\xff\xff')) + chunk(b'IEND', b''))
+        original_run = subprocess.run
+        for payload, expected in ((b'', False), (b'not an image', False), (valid[:24], False), (valid, True)):
+            config = make_config(self.root, capture_cmd=['fake-capture'])
+            def command(argv, **kwargs):
+                if argv[0] == 'fake-capture':
+                    config.image_path.write_bytes(payload)
+                    return subprocess.CompletedProcess(argv, 0, '', '')
+                return original_run(argv, **kwargs)
+            with self.subTest(payload=payload), patch.object(gv.subprocess, 'run', side_effect=command):
+                self.assertEqual(gv.RealEnvironment().capture('123', config.image_path, config), expected)
 
     def test_execution_lock_loser_cannot_reserve_winners_empty_directory(self):
         import contextlib
