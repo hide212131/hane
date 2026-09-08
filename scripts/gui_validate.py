@@ -625,6 +625,8 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
         or (workspace_dir / "target" / "gui-validate" / request_id / generation)
     )
     state_dir = run_dir / "state"
+    if (run_dir / ".gui-validate-owner").exists():
+        raise EnvError("この実行ディレクトリは別の実行が予約済み（既存の証拠を保護）")
     if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
         raise ValueError("実行用ディレクトリは未作成または空である必要がある（過去の証拠を上書きしない）")
 
@@ -665,6 +667,9 @@ def main(argv: list[str]) -> int:
     workspace_dir = Path(__file__).resolve().parent.parent
     try:
         config = build_config(scenario, workspace_dir)
+    except EnvError as exc:
+        print(f"[BLOCKED] {exc}", file=sys.stderr)
+        return EXIT_BLOCKED
     except (ValueError, OSError) as exc:
         print(f"invalid configuration: {exc}", file=sys.stderr)
         return EXIT_USAGE
