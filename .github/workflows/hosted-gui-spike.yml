@@ -1,0 +1,121 @@
+name: Hosted GUI spike (Issue 44)
+
+# One-off empirical experiment: does the launch -> ready -> window ->
+# screenshot -> teardown path (scripts/gui_validate.py, editor scenario)
+# work on a GitHub-hosted macOS runner? This is not a comprehensive GUI
+# validation pass and it is not a merge gate; it only records evidence
+# from a single hosted run for Issue 44.
+
+on:
+  push:
+    branches:
+      - codex/issue44-hosted-gui
+
+permissions:
+  contents: read
+
+env:
+  HANE_PINNED_SHA: 0f5e2b1f0ffb41a248b9a806009de273e8e8d793
+
+jobs:
+  spike:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out pinned Hane commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.HANE_PINNED_SHA }}
+          persist-credentials: false
+
+      - name: Record environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "== date (UTC) =="
+            date -u
+            echo
+            echo "== macOS version =="
+            sw_vers
+            echo
+            echo "== runner image =="
+            echo "ImageOS=${ImageOS:-unknown}"
+            echo "ImageVersion=${ImageVersion:-unknown}"
+            echo "runner.os=${RUNNER_OS:-unknown}"
+            echo "runner.arch=${RUNNER_ARCH:-unknown}"
+            echo
+            echo "== hardware =="
+            sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+            echo
+            echo "== display info =="
+            system_profiler SPDisplaysDataType 2>/dev/null || echo "system_profiler SPDisplaysDataType failed"
+            echo
+            echo "== Metal info =="
+            system_profiler SPDisplaysDataType 2>/dev/null | grep -i metal || echo "no explicit Metal line found"
+            echo
+            echo "== git HEAD =="
+            git -C "${GITHUB_WORKSPACE}" rev-parse HEAD
+            echo
+            echo "== toolchain =="
+            swift --version || true
+            cargo --version || true
+            rustc --version || true
+          } | tee "${RUNNER_TEMP}/environment.txt"
+
+      - name: Prepare run directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_dir="${RUNNER_TEMP}/hane-gui-spike"
+          mkdir -p "${run_dir}"
+          echo "HANE_GUI_VALIDATE_RUN_DIR=${run_dir}" >> "${GITHUB_ENV}"
+          echo "HANE_GUI_VALIDATE_REQUEST_ID=hosted-gui-spike-${{ github.run_id }}-${{ github.run_attempt }}" >> "${GITHUB_ENV}"
+
+      - name: Run gui_validate.py (editor scenario)
+        id: gui_validate
+        shell: bash
+        env:
+          HANE_GUI_VALIDATE_EXPECTED_SHA: ${{ env.HANE_PINNED_SHA }}
+          HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS: "30"
+        run: |
+          set +e
+          python3 scripts/gui_validate.py editor
+          echo "exit_code=$?" >> "${GITHUB_OUTPUT}"
+
+      - name: Copy evidence to upload staging area
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_dir="${RUNNER_TEMP}/hane-gui-spike"
+          stage_dir="${RUNNER_TEMP}/hane-gui-spike-artifact"
+          mkdir -p "${stage_dir}"
+          for f in result.json summary.md hane.log editor.png; do
+            src="${run_dir}/${f}"
+            if [[ -f "${src}" ]]; then
+              cp "${src}" "${stage_dir}/${f}"
+            fi
+          done
+          cp "${RUNNER_TEMP}/environment.txt" "${stage_dir}/environment.txt"
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-gui-spike-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hane-gui-spike-artifact
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Fail the job if the spike did not pass
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="${{ steps.gui_validate.outputs.exit_code }}"
+          echo "gui_validate.py exit code: ${code}"
+          if [[ "${code}" != "0" ]]; then
+            echo "::error::gui_validate.py did not pass (exit=${code}); see uploaded artifact for evidence."
+            exit "${code}"
+          fi
