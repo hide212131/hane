@@ -30,7 +30,9 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
           persist-credentials: false
       - name: Run workflow regression tests without network or agent calls
-        run: python3 -m unittest discover -s .github/tests -p 'test_*.py'
+        run: |
+          python3 -m unittest discover -s .github/tests -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_gui_validate.py'
 
   claim_trusted_ci_generation:
     name: Reclaim trusted CI generation
