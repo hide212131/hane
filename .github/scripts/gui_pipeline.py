@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_api import GitHub
-from gui_policy import CONTEXT, POLICY, gui_state, parse_time, receipt, validate_receipt
+from gui_policy import CONTEXT, POLICY, PROCEDURE, gui_state, parse_time, receipt, validate_receipt
 
 
 def now():
@@ -23,7 +23,7 @@ def request_for(pr):
     generation = f'{run_id}-{attempt}'
     stamp = now()
     return {'pr_number': pr['number'], 'sha': pr['head']['sha'], 'repository': os.environ['GITHUB_REPOSITORY'],
-            'control_sha': os.environ['CONTROL_SHA'], 'generation': generation,
+            'control_sha': os.environ['CONTROL_SHA'], 'procedure_version': PROCEDURE, 'generation': generation,
             'request_id': f'gui-{generation}-pr{pr["number"]}', 'run_id': run_id, 'run_attempt': attempt,
             'created_at': stamp.isoformat(), 'expires_at': (stamp + timedelta(hours=1)).isoformat()}
 

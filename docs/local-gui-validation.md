@@ -63,6 +63,8 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 
 結果には上記の対応情報に加え、実際のcheckout SHA・clean状態、binary digestとtoolchain/features、runner image/version、開始・終了時刻、工程・シナリオごとの `pass` / `fail` / `blocked`、理由、証拠の一覧・digestを含める。GitHub Actionsの run ID / attempt は artifact と結果に一致させる。
 
+手順 `hosted-gui-interaction/3` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
+
 受領処理は本文中の自己申告だけを信頼せず、Actions APIでworkflow、repository、実行元、run/attempt、artifactを照合する。現在のPR headと世代を再取得し、不一致の結果はstaleとして現在判定から除く。同じ世代の終端結果は再処理しない。再実行は新しい世代を発行し、旧結果を消さずに分ける。
 
 ビルド不能・ジョブ失敗・取消・期限切れで通常の結果が作れない場合も、受領側が実行状態を確認して `blocked` として終端処理する。`pass` / `fail` / `blocked` のいずれでも final judge を起動する。GUIが必要な場合、同じ対象SHA・現世代の `pass` がなければjudgeの `ready` を採用しない。

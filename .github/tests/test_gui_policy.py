@@ -17,6 +17,7 @@ from pipeline_api import GitHub
 
 SHA, CONTROL = 'a' * 40, 'b' * 40
 REQUEST = {'pr_number': 79, 'sha': SHA, 'control_sha': CONTROL, 'repository': 'owner/hane',
+           'procedure_version': policy.PROCEDURE,
            'run_id': '123', 'run_attempt': '1', 'generation': '123-1', 'request_id': 'gui-123-1-pr79',
            'created_at': '2026-09-09T00:00:00+00:00', 'expires_at': '2026-09-09T01:00:00+00:00'}
 NOW = datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc)
@@ -33,7 +34,10 @@ def passing_result():
             'procedure_version': policy.PROCEDURE, 'control': {'sha': CONTROL},
             'target': {'actual_sha': SHA, 'expected_sha': SHA, 'sha_matches': True, 'working_copy_clean': True},
             'started_at': '2026-09-09T00:01:00Z', 'finished_at': '2026-09-09T00:10:00Z',
-            'build': {'binary_sha256': 'c' * 64, 'features': ['timing-probe']},
+            'build': {'binary_sha256': 'c' * 64, 'features': ['timing-probe'],
+                      'source_snapshot_sha': SHA, 'source_snapshot_clean': True},
+            'runner': {'os': 'macOS', 'arch': 'ARM64', 'machine': 'arm64', 'image_os': 'macos15',
+                       'image_version': '20260829.0321.1', 'macos_version': '15.7.9'},
             'top_level_steps': [{'name': s, 'result': 'pass'} for s in ('preflight', 'build')],
             'scenarios': scenarios, 'overall_result': 'pass'}
 
@@ -69,6 +73,20 @@ class ReceiptTests(unittest.TestCase):
             change(raw)
             with self.assertRaises(ValueError):
                 self.validate(raw)
+
+    def test_missing_runner_image_or_wrong_snapshot_cannot_pass(self):
+        changes = [lambda r: r.pop('runner'), lambda r: r['runner'].pop('image_version'),
+                   lambda r: r['runner'].update(arch='X64'),
+                   lambda r: r['build'].update(source_snapshot_sha='d' * 40),
+                   lambda r: r['build'].update(source_snapshot_clean=False)]
+        for change in changes:
+            raw = passing_result()
+            change(raw)
+            with self.assertRaises(ValueError):
+                self.validate(raw)
+        request = dict(REQUEST, procedure_version='hosted-gui-interaction/2')
+        with self.assertRaises(ValueError):
+            policy.validate_receipt(passing_result(), request, self.evidence, 'success', NOW)
 
     def test_missing_or_failed_scenario_step_and_reopen_cleanup_cannot_pass(self):
         for mutation in ('scenario', 'step', 'failure', 'cleanup', 'duplicate'):
