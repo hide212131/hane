@@ -392,19 +392,6 @@ jobs:
             -f body="$comment_body" >/dev/null; then
             echo '::warning::Failed to publish successful-fix notification.'
           fi
-
-          # A completed fix resolves any earlier stall report bound to this same target SHA.
-          all_comments="$(gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100")"
-          for stage in claude-fix claude-fix-controller claude-fix-workflow-patch; do
-            marker="hane-stall: number=${PR_NUMBER} stage=${stage} sha=${TARGET_SHA}"
-            existing_id="$(jq -r --arg marker "$marker" '[.[][] | select(((.body // "") | contains($marker)))] | last // {} | .id // empty' <<< "$all_comments")"
-            [[ -z "$existing_id" ]] && continue
-            resolved_body="$(printf '### ✅ Resolved\n\nTarget: PR #%s / %s\nRun: %s\n\nA later automatic Claude fix push (`%s`) resolved this stall.\n\n<!-- %s -->\n' \
-              "$PR_NUMBER" "$TARGET_SHA" "https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" "$new_sha" "$marker")"
-            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$resolved_body" >/dev/null || \
-              echo '::warning::Failed to mark stall report resolved.'
-          done
-
           echo 'published=true' >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow fix patch
@@ -432,33 +419,9 @@ jobs:
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix blocked: workflow patch requires owner for ${short_sha}" \
             -f target_url="$run_url" >/dev/null
-          marker="hane-stall: number=${PR_NUMBER} stage=claude-fix-workflow-patch sha=${TARGET_SHA}"
-          comment_body="$(cat <<EOF2
-          ### ⚠️ Claude stopped — maintainer action required
-
-          Target: PR #${PR_NUMBER} / ${TARGET_SHA}
-          Run: ${run_url}
-          Stage: automatic Claude fix worker
-
-          Automatic Claude fix includes \`.github/workflows/**\` changes that \`GITHUB_TOKEN\` cannot push. The complete binary-capable patch is saved as artifact \`${artifact_name}\` on the run above.
-
-          Required action: apply the patch as the repository owner with \`git apply --binary\`. The PR will not automatically continue until this is resolved.
-          EOF2
-          )"
-          full_body="$(printf '%s\n\n<!-- %s -->\n' "$comment_body" "$marker")"
-          existing_id="$(
-            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq '.[] | {id, body}' \
-              | jq -rs --arg marker "$marker" '[.[] | select(((.body // "") | contains($marker)))] | last.id // empty'
-          )"
-          if [[ -n "$existing_id" ]]; then
-            publish_status=0
-            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$full_body" >/dev/null || publish_status=$?
-          else
-            publish_status=0
-            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$full_body" >/dev/null || publish_status=$?
-          fi
-          if [[ "$publish_status" != 0 ]]; then
+          comment_body="Automatic Claude fix for \`${TARGET_SHA}\` includes \`.github/workflows/**\` changes. The complete binary-capable patch is saved as artifact \`${artifact_name}\` on ${run_url}. Apply it as the repository owner with \`git apply --binary\`."
+          if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$comment_body" >/dev/null; then
             echo '::warning::Failed to publish workflow-fix handoff notification.'
           fi
 
@@ -469,7 +432,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
-          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
@@ -478,32 +440,6 @@ jobs:
             -f description="Claude fix failed for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
 
-          marker="hane-stall: number=${PR_NUMBER} stage=claude-fix sha=${TARGET_SHA}"
-          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          comment_body="$(cat <<EOF2
-          ### ⚠️ Claude stopped — maintainer action required
-
-          Target: PR #${PR_NUMBER} / ${TARGET_SHA}
-          Run: ${run_url}
-          Stage: automatic Claude fix worker
-
-          The automatic Claude fix worker exited with a non-zero status while addressing review findings and/or trusted CI failures for this commit.
-
-          Required action: review the job run linked above; a human fix or a new push is required to continue.
-          EOF2
-          )"
-          full_body="$(printf '%s\n\n<!-- %s -->\n' "$comment_body" "$marker")"
-          existing_id="$(
-            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq '.[] | {id, body}' \
-              | jq -rs --arg marker "$marker" '[.[] | select(((.body // "") | contains($marker)))] | last.id // empty'
-          )"
-          if [[ -n "$existing_id" ]]; then
-            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$full_body" >/dev/null
-          else
-            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$full_body" >/dev/null
-          fi
-
       - name: Mark controller failure
         if: ${{ failure() && steps.target.outputs.target_sha != '' }}
         shell: bash
@@ -511,7 +447,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
-          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
@@ -526,33 +461,6 @@ jobs:
               exit 0
               ;;
           esac
-
-          marker="hane-stall: number=${PR_NUMBER} stage=claude-fix-controller sha=${TARGET_SHA}"
-          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          comment_body="$(cat <<EOF2
-          ### 🛑 Claude blocked — automatic retry pending
-
-          Target: PR #${PR_NUMBER} / ${TARGET_SHA}
-          Run: ${run_url}
-          Stage: automatic Claude fix worker (controller)
-
-          The automatic Claude fix worker's controller step failed before Claude could run (for example: checkout, dependency install, or evidence collection failed).
-
-          Required action: none — this is retried automatically after a short backoff. If this state persists across multiple runs, please investigate the job log above.
-          EOF2
-          )"
-          full_body="$(printf '%s\n\n<!-- %s -->\n' "$comment_body" "$marker")"
-          existing_id="$(
-            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq '.[] | {id, body}' \
-              | jq -rs --arg marker "$marker" '[.[] | select(((.body // "") | contains($marker)))] | last.id // empty'
-          )"
-          if [[ -n "$existing_id" ]]; then
-            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$full_body" >/dev/null
-          else
-            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$full_body" >/dev/null
-          fi
-
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix controller failed for ${short_sha}" \
