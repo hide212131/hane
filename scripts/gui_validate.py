@@ -282,8 +282,14 @@ class RealEnvironment(Environment):
         # Clone immutable Git objects into a private repository; editing or
         # restoring files in the user's working copy cannot change build inputs.
         # No linked worktree registration or hard-linked object files are used.
+        workspace_root = workspace_dir.resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if temp_root == workspace_root or workspace_root in temp_root.parents:
+            temp_root = workspace_root.parent
+        if temp_root == workspace_root:
+            raise EnvError("checkout外にビルド用の一時領域を確保できない")
         with defer_aborts():
-            self._build_snapshot = tempfile.TemporaryDirectory(prefix="hane-gui-build-")
+            self._build_snapshot = tempfile.TemporaryDirectory(prefix="hane-gui-build-", dir=temp_root)
         snapshot = Path(self._build_snapshot.name) / "source"
         try:
             subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", "--no-checkout",
