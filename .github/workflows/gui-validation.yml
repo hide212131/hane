@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: gui-request-resolver
+      group: hane-validation-state-writer
       cancel-in-progress: false
       queue: max
     permissions:
@@ -123,6 +123,10 @@ jobs:
 
   report:
     name: "GUI receipt #${{ matrix.pr_number }}"
+    concurrency:
+      group: hane-validation-state-writer
+      cancel-in-progress: false
+      queue: max
     needs: [resolve, run]
     if: ${{ always() && needs.resolve.outputs.has_work == 'true' }}
     strategy:
