@@ -402,6 +402,18 @@ class FinalizePriorityTests(TemporaryWorkspaceTest):
 
 
 class ScenarioSetupTests(unittest.TestCase):
+    def test_extra_arguments_are_rejected_before_configuration_or_execution(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        for arguments in (['editor', 'a' * 40], ['editor', '--unexpected'], ['--help', 'extra']):
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()) as error, \
+                    patch.object(gv, 'build_config') as configure, patch.object(gv, 'RealEnvironment') as environment:
+                self.assertEqual(gv.main(['gui_validate.py', *arguments]), gv.EXIT_USAGE)
+                self.assertIn('HANE_GUI_VALIDATE_EXPECTED_SHA', error.getvalue())
+                configure.assert_not_called()
+                environment.assert_not_called()
+
     def test_editor_uses_isolated_fixture_and_readiness_probe(self):
         import tempfile
 

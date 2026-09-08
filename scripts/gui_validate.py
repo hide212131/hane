@@ -837,6 +837,9 @@ def build_config(scenario: str, workspace_dir: Path) -> Config:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) > 2:
+        print("expected at most one scenario argument; set the expected SHA with HANE_GUI_VALIDATE_EXPECTED_SHA", file=sys.stderr)
+        return EXIT_USAGE
     scenario = argv[1] if len(argv) > 1 else "editor"
     if scenario in ("-h", "--help"):
         print(__doc__)
