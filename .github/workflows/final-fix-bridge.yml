@@ -1,0 +1,33 @@
+name: Final judgement fix feedback
+on:
+  workflow_run:
+    workflows: [Copilot final judgement]
+    types: [completed]
+  schedule:
+    - cron: '8,28,48 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional PR to reconcile
+        type: string
+permissions:
+  contents: read
+jobs:
+  dispatch:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: python3 -I .github/scripts/final_fix_bridge.py dispatch

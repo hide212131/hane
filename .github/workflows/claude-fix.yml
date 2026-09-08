@@ -35,6 +35,8 @@ jobs:
         run: |
           cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
           cp .hane-control/.github/scripts/merge_statuses_by_sha.sh "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh"
+          mkdir -p "$RUNNER_TEMP/hane-final-control"
+          cp .hane-control/.github/scripts/*.py "$RUNNER_TEMP/hane-final-control/"
 
       - name: Resolve automatic fix
         id: target
@@ -277,9 +279,12 @@ jobs:
           fi
           finding_count="$(jq 'length' "$findings_file")"
 
-          # A fix may be justified by reviewer findings, by trusted CI failure, or both.
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence
+          final_evidence_count="$(jq 'if . == null then 0 else 1 end' "$FINAL_EVIDENCE_PATH")"
+          # An authenticated final-judge receipt also supplies GUI failure evidence.
           # CI-only fix routes are valid even when the reviewer is clean.
-          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 ]]; then
+          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 && "$final_evidence_count" -eq 0 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: missing evidence for ${short_sha}" \
@@ -307,9 +312,10 @@ jobs:
             --slurpfile ci_statuses "$ci_statuses_file" \
             --rawfile copilot_reason_raw "$copilot_reason_file" \
             --slurpfile changed_files "$files_json_file" \
+            --slurpfile final_evidence "$FINAL_EVIDENCE_PATH" \
             '($review_body_raw | rtrimstr("\n")) as $review_body |
              ($copilot_reason_raw | rtrimstr("\n")) as $copilot_reason |
-             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0]}' \
+             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0],final_judge_evidence:$final_evidence[0]}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -391,6 +397,10 @@ jobs:
             echo 'PR moved, closed, or became draft during preparation; skipping paid invocation.'
             exit 0
           fi
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]] && jq -e '. != null' "$FINAL_EVIDENCE_PATH" >/dev/null; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence
+          fi
           echo 'granted=true' >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code fix
@@ -407,7 +417,7 @@ jobs:
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
-          Fix the reviewer findings, trusted CI failures, and Copilot fix reason present in the evidence below.
+          Fix the reviewer findings, trusted CI failures, GUI failures, and Copilot final or pre-GUI fix reason present in the evidence below.
           Use the repository normally: inspect code, run shell commands, Cargo, tests, linters, package managers,
           searches and network tools when useful. Make the smallest correct fix.
           Leave the final changes in the working tree uncommitted. The workflow owns commit and push.
@@ -440,6 +450,10 @@ jobs:
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
           echo 'workflow_patch=false' >> "$GITHUB_OUTPUT"
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]] && jq -e '. != null' "$FINAL_EVIDENCE_PATH" >/dev/null; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence
+          fi
 
           if [[ -z "$(git status --porcelain)" ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
