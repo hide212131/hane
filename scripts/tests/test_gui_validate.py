@@ -608,6 +608,20 @@ class ScenarioSetupTests(unittest.TestCase):
             self.assertTrue(all(options["cwd"] == root for _, options in calls))
             self.assertEqual(build["features"], ["timing-probe"])
 
+    def test_launch_uses_only_owned_and_validated_hane_environment(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), extra_env={'HANE_DEV_CURSOR_DOWN': '32'})
+            env = gv.RealEnvironment()
+            with patch.dict(os.environ, {'HANE_STATE_DIR': '/other/state', 'HANE_MEASUREMENT_EMPTY': '1',
+                    'HANE_METRICS_CSV': '/other/metrics.csv', 'HANE_DEV_CURSOR_DOWN': 'invalid',
+                    'GUI_TEST_ORDINARY_ENV': 'preserved'}), patch.object(gv.subprocess, 'Popen') as launch:
+                env.launch(Path('/test/hane'), config)
+            child_env = launch.call_args.kwargs['env']
+            self.assertEqual({key: value for key, value in child_env.items() if key.startswith('HANE_')},
+                             {'HANE_STATE_DIR': str(config.state_dir), 'HANE_DEV_CURSOR_DOWN': '32'})
+            self.assertEqual(child_env['GUI_TEST_ORDINARY_ENV'], 'preserved')
+
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
         import tempfile
 
@@ -625,6 +639,27 @@ class ScenarioSetupTests(unittest.TestCase):
             self.assertEqual(len(fixture.read_text().splitlines()), 40)
             self.assertEqual(features, ["instrument"])
             self.assertIn("HANE_DEV_CURSOR_DOWN", extra_env)
+
+    def test_cursor_overrides_reject_invalid_configuration_before_execution(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        cases = [('cursor-boundary', 'HANE_CAPTURE_CURSOR_OFFSET', 23),
+                 ('cursor-scroll', 'HANE_CAPTURE_CURSOR_DOWN', 40)]
+        with tempfile.TemporaryDirectory() as tmp:
+            for scenario, variable, maximum in cases:
+                for value in ('', 'invalid', '1.5', '-1', str(maximum + 1), '999999999999999999999999'):
+                    with self.subTest(variable=variable, value=value), patch.dict(os.environ,
+                            {variable: value, 'HANE_GUI_VALIDATE_RUN_DIR': str(Path(tmp) / 'run')}), \
+                            patch.object(gv, 'RealEnvironment') as environment, \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(gv.main(['gui_validate.py', scenario]), gv.EXIT_USAGE)
+                        environment.assert_not_called()
+                        self.assertFalse((Path(tmp) / 'run').exists())
+                for value in ('0', str(maximum)):
+                    with patch.dict(os.environ, {variable: value}):
+                        _, _, extra = gv._scenario_setup(scenario, Path(tmp), prepare=False)
+                    self.assertEqual(list(extra.values()), [value])
 
 
 class EnvFloatTests(unittest.TestCase):
