@@ -659,7 +659,7 @@ class ExecutionIntegrityTests(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix display lock')
     def test_different_run_directories_still_share_execution_lock(self):
         from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmp, patch.object(gv.tempfile, 'gettempdir', return_value=tmp):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(gv, 'execution_lock_path', return_value=Path(tmp) / 'shared.lock'):
             first, second = gv.RealEnvironment(), gv.RealEnvironment()
             try:
                 first.acquire_execution()
@@ -670,6 +670,73 @@ class ExecutionIntegrityTests(unittest.TestCase):
             finally:
                 first.release_execution()
                 second.release_execution()
+
+    @unittest.skipUnless(hasattr(os, 'getuid'), 'Mac/Unix account database')
+    def test_execution_lock_identity_ignores_temporary_directory_overrides(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.root))):
+            with patch.dict(os.environ, {'TMPDIR': str(self.root / 'terminal')}):
+                first = gv.execution_lock_path()
+            with patch.dict(os.environ, {'TMPDIR': str(self.root / 'runner')}):
+                second = gv.execution_lock_path()
+        self.assertEqual(first, second)
+        self.assertEqual(first, self.root / '.cache/hane/gui-validation.lock')
+
+    def test_abort_immediately_after_process_creation_still_cleans_child(self):
+        import signal
+        from unittest.mock import patch
+        process = FakeProcess(42)
+        env = FakeEnvironment(process=process)
+        def launch(*args):
+            signal.raise_signal(signal.SIGTERM)
+            return process
+        with patch.object(env, 'launch', side_effect=launch):
+            result = gv.run_validation(env, make_config(self.root))
+        self.assertEqual(result['overall_result'], 'blocked')
+        self.assertIsNotNone(process.poll())
+        cleanup = next(s for s in result['steps'] if s['name'] == 'cleanup')
+        self.assertEqual(cleanup['terminated_pid'], 42)
+
+    def test_abort_after_marker_creation_preserves_ownership_and_result(self):
+        import contextlib
+        import io
+        import signal
+        from unittest.mock import patch
+        config = make_config(self.root)
+        config.state_dir.rmdir()
+        env = gv.RealEnvironment()
+        env._execution_acquired = True
+        original_open = os.open
+        def interrupted_open(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return fd
+        with patch.object(gv.os, 'open', side_effect=interrupted_open), self.assertRaises(gv.Aborted):
+            env.reserve(config)
+        self.assertEqual(env._reserved_run_dir, config.run_dir)
+        env._finalizing = True
+        result = {'summary': 'blocked by test signal', 'overall_result': 'blocked'}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gv._publish_result(env, config, result), gv.EXIT_BLOCKED)
+        self.assertEqual(json.loads((config.run_dir / 'result.json').read_text())['overall_result'], 'blocked')
+
+    def test_publication_failure_never_exposes_partial_canonical_json(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        config = make_config(self.root)
+        config.state_dir.rmdir()
+        env = gv.RealEnvironment()
+        env._execution_acquired = True
+        env._finalizing = True
+        env.reserve(config)
+        result = {'summary': 'pass', 'overall_result': 'pass'}
+        with patch.object(Path, 'write_text', side_effect=OSError('test write failure')), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(gv._publish_result(env, config, result), gv.EXIT_BLOCKED)
+        self.assertFalse((config.run_dir / 'result.json').exists())
+        self.assertIn('BLOCKED', error.getvalue())
 
     def test_execution_lock_loser_cannot_reserve_winners_empty_directory(self):
         import contextlib
