@@ -538,6 +538,17 @@ class ScenarioSetupTests(unittest.TestCase):
                     gv.build_config("editor", root)
             self.assertEqual(existing.read_text(), "preserve me")
 
+    def test_unavailable_git_during_output_validation_is_environment_blocked(self):
+        from unittest.mock import patch
+        for failure in (FileNotFoundError('git missing'), subprocess.CompletedProcess([], 128, b'', b'git failed')):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                outcome = {'side_effect': failure} if isinstance(failure, Exception) else {'return_value': failure}
+                with patch.dict(os.environ, {'HANE_GUI_VALIDATE_RUN_DIR': str(root / 'target/run')}), \
+                        patch.object(gv.subprocess, 'run', **outcome), self.assertRaises(gv.EnvError):
+                    gv.build_config('editor', root)
+                self.assertFalse((root / 'target').exists())
+
     def test_reserved_generation_main_returns_blocked_without_overwriting(self):
         import contextlib
         import io
