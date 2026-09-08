@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -490,6 +491,51 @@ class ScenarioSetupTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "上書きしない"):
                     gv.build_config("editor", root)
             self.assertEqual(existing.read_text(), "preserve me")
+
+    def test_duplicate_generation_has_only_one_atomic_directory_owner(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(root / "run"), "HANE_CAPTURE_FIXTURE": ""}):
+                config = gv.build_config("editor", root)
+            start = Barrier(2)
+            def reserve(_):
+                env = gv.RealEnvironment()
+                start.wait(timeout=5)
+                try:
+                    env.reserve(config)
+                    env.reserve(config)  # The same owner may publish its result.
+                    return "owner"
+                except gv.EnvError:
+                    return "blocked"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(reserve, range(2)))
+            self.assertCountEqual(results, ["owner", "blocked"])
+            marker = json.loads((config.run_dir / ".gui-validate-owner").read_text())
+            self.assertEqual(marker["request_id"], config.request_id)
+
+    def test_build_uses_locked_dependencies_and_target_toolchain_directory(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "hane"
+            binary.write_bytes(b"test executable")
+            calls = []
+            def command(args, **kwargs):
+                calls.append((args, kwargs))
+                output = json.dumps({"reason": "compiler-artifact", "target": {"name": "hane"},
+                                     "executable": str(binary)}) if "build" in args else "test version"
+                return subprocess.CompletedProcess(args, 0, output, "")
+            with patch.object(gv.subprocess, "run", side_effect=command):
+                path, build = gv.RealEnvironment().build(root, ["timing-probe"])
+            self.assertEqual(path, binary)
+            self.assertIn("--locked", calls[0][0])
+            self.assertTrue(all(options["cwd"] == root for _, options in calls))
+            self.assertEqual(build["features"], ["timing-probe"])
 
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
         import tempfile
