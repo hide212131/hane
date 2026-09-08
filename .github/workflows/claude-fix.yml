@@ -32,7 +32,9 @@ jobs:
 
       - name: Preserve trusted control policy before checking out the PR
         shell: bash
-        run: cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
+        run: |
+          cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
+          cp .hane-control/.github/scripts/merge_statuses_by_sha.sh "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh"
 
       - name: Resolve automatic fix
         id: target
@@ -142,14 +144,21 @@ jobs:
           # Count logical pushed fixes, including ones whose status POST was lost.
           # Fetch the entire event log so old authorizations/boundaries cannot age
           # out of a single API page.
-          commits="$(gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" | jq 'add')"
-          statuses_by_sha='{}'
+          # A long-lived PR's combined commit/status evidence can exceed the
+          # ~128KiB jq --arg/--argjson argv limit ("Argument list too long");
+          # keep every accumulated payload file-backed instead of on argv.
+          commits_file="$RUNNER_TEMP/hane-claude-fix-commits.json"
+          gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" | jq 'add' > "$commits_file"
+          statuses_dir="$RUNNER_TEMP/hane-claude-fix-statuses"
+          mkdir -p "$statuses_dir"
           while IFS= read -r sha; do
-            statuses_for_sha="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100" | jq 'add')"
-            statuses_by_sha="$(jq --arg sha "$sha" --argjson statuses "$statuses_for_sha" '. + {($sha): $statuses}' <<< "$statuses_by_sha")"
-          done < <(jq -r '.[].sha' <<< "$commits")
+            gh api --paginate --slurp "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100" | jq 'add' > "${statuses_dir}/${sha}.json"
+          done < <(jq -r '.[].sha' "$commits_file")
+          statuses_by_sha_file="$RUNNER_TEMP/hane-claude-fix-statuses-by-sha.json"
+          bash "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh" "$commits_file" "$statuses_dir" "$statuses_by_sha_file"
           budget="$(
-            jq -n --argjson commits "$commits" --argjson statuses "$statuses_by_sha" '{commits:$commits,statuses:$statuses}' \
+            jq -n --slurpfile commits "$commits_file" --slurpfile statuses "$statuses_by_sha_file" \
+              '{commits:$commits[0],statuses:$statuses[0]}' \
               | python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" budget --sha "$TARGET_SHA"
           )"
           completed="$(jq -r '.completed' <<< "$budget")"
@@ -230,16 +239,17 @@ jobs:
           )"
 
           review_url=''
-          review_body=''
-          findings_json='[]'
+          review_body_file="$RUNNER_TEMP/hane-claude-fix-review-body.txt"
+          findings_file="$RUNNER_TEMP/hane-claude-fix-findings.json"
+          : > "$review_body_file"
+          echo '[]' > "$findings_file"
           if [[ -n "$review" ]]; then
             review_id="${review%%$'\t'*}"
             review_url="${review#*$'\t'}"
-            review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
-            findings_json="$(
-              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-                | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
-            )"
+            gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""' > "$review_body_file"
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
+              | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]" \
+              > "$findings_file"
           fi
 
           statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
@@ -251,22 +261,21 @@ jobs:
           ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
           ordinary_ci_url="$(cut -f3 <<< "$ordinary_ci")"
 
-          ci_statuses="$(
-            jq \
-              --arg ordinary_status "$ordinary_ci_status" \
-              --arg ordinary_conclusion "$ordinary_ci_conclusion" \
-              --arg ordinary_url "$ordinary_ci_url" \
-              '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
-               (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
-              <<< "$statuses"
-          )"
+          ci_statuses_file="$RUNNER_TEMP/hane-claude-fix-ci-statuses.json"
+          jq \
+            --arg ordinary_status "$ordinary_ci_status" \
+            --arg ordinary_conclusion "$ordinary_ci_conclusion" \
+            --arg ordinary_url "$ordinary_ci_url" \
+            '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
+             (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
+            <<< "$statuses" > "$ci_statuses_file"
           ci_failure_count="$(
             jq '[.[] | select((.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) and .state == "failure")] | length' <<< "$statuses"
           )"
           if [[ "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ]]; then
             ci_failure_count=$((ci_failure_count + 1))
           fi
-          finding_count="$(jq 'length' <<< "$findings_json")"
+          finding_count="$(jq 'length' "$findings_file")"
 
           # A fix may be justified by reviewer findings, by trusted CI failure, or both.
           # CI-only fix routes are valid even when the reviewer is clean.
@@ -278,15 +287,13 @@ jobs:
             exit 0
           fi
 
-          copilot_reason="$(
-            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq ".[] | select(((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) or ((.body // \"\") | contains(\"Copilot pre-GUI routing recovery for \`${TARGET_SHA}\`: **fix**\"))) | .body" \
-              | tail -n 1
-          )"
-          files_json="$(
-            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-              | jq '[.[][] | {filename, status, additions, deletions}]'
-          )"
+          copilot_reason_file="$RUNNER_TEMP/hane-claude-fix-copilot-reason.txt"
+          gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) or ((.body // \"\") | contains(\"Copilot pre-GUI routing recovery for \`${TARGET_SHA}\`: **fix**\"))) | .body" \
+            | tail -n 1 > "$copilot_reason_file"
+          files_json_file="$RUNNER_TEMP/hane-claude-fix-files.json"
+          gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            | jq '[.[][] | {filename, status, additions, deletions}]' > "$files_json_file"
           pr_title="$(jq -r '.title' <<< "$pr")"
 
           jq -n \
@@ -295,15 +302,14 @@ jobs:
             --arg pr_title "$pr_title" \
             --arg review_source "$review_source" \
             --arg review_url "$review_url" \
-            --arg review_body "$review_body" \
-            --argjson review_findings "$findings_json" \
-            --arg codex_review_url "$review_url" \
-            --arg codex_review_body "$review_body" \
-            --argjson codex_findings "$findings_json" \
-            --argjson ci_statuses "$ci_statuses" \
-            --arg copilot_reason "$copilot_reason" \
-            --argjson changed_files "$files_json" \
-            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_reason,changed_files:$changed_files}' \
+            --rawfile review_body_raw "$review_body_file" \
+            --slurpfile review_findings "$findings_file" \
+            --slurpfile ci_statuses "$ci_statuses_file" \
+            --rawfile copilot_reason_raw "$copilot_reason_file" \
+            --slurpfile changed_files "$files_json_file" \
+            '($review_body_raw | rtrimstr("\n")) as $review_body |
+             ($copilot_reason_raw | rtrimstr("\n")) as $copilot_reason |
+             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0]}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
