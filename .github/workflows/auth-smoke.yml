@@ -1,94 +1,81 @@
-name: AI authentication smoke test
+name: PR 82 notification permission comparison
 
 on:
   workflow_dispatch:
-    inputs:
-      engine:
-        description: Authentication path to test
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - claude
-          - copilot
 
 permissions:
   contents: read
 
 jobs:
-  claude:
-    if: ${{ inputs.engine == 'claude' || inputs.engine == 'all' }}
+  control:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     permissions:
-      contents: read
-      issues: read
+      actions: write
+      contents: write
+      issues: write
       pull-requests: read
-      id-token: write
+      statuses: write
     steps:
-      - name: Check Claude OAuth secret
-        shell: bash
+      - name: Post a bounded diagnostic notification to PR 82
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VARIANT: control
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-            echo "::error::Repository secret CLAUDE_CODE_OAUTH_TOKEN is not configured."
-            exit 1
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="PR #82 notification verification (${VARIANT}). This is a diagnostic comment from the workflow token; no Claude execution occurred. Run: ${run_url}"
+          set +e
+          gh api --include --method POST "repos/${REPOSITORY}/issues/82/comments" \
+            -f body="$body" > "$RUNNER_TEMP/notification-response.txt" 2> "$RUNNER_TEMP/notification-error.txt"
+          result=$?
+          set -e
+          # Response headers/body contain the public test comment, never request credentials.
+          cat "$RUNNER_TEMP/notification-response.txt"
+          cat "$RUNNER_TEMP/notification-error.txt"
+          {
+            echo "Variant: ${VARIANT}"
+            echo "API exit code: ${result}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VARIANT" == candidate && "$result" -ne 0 ]]; then
+            exit "$result"
           fi
 
-      - name: Check out repository
-        uses: actions/checkout@v5
-
-      - name: Verify Claude authentication
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            This is an authentication smoke test only.
-            Do not modify files, create commits, or perform GitHub write operations.
-            Respond with exactly: CLAUDE_AUTH_OK
-          claude_args: |
-            --max-turns 1
-
-  copilot:
-    if: ${{ inputs.engine == 'copilot' || inputs.engine == 'all' }}
+  candidate:
+    needs: control
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     permissions:
-      contents: read
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
     steps:
-      - name: Check Copilot PAT secret
-        shell: bash
+      - name: Post a bounded diagnostic notification to PR 82
         env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VARIANT: candidate
+        shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
-            echo "::error::Repository secret COPILOT_GITHUB_TOKEN is not configured."
-            exit 1
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="PR #82 notification verification (${VARIANT}). This is a diagnostic comment from the workflow token; no Claude execution occurred. Run: ${run_url}"
+          set +e
+          gh api --include --method POST "repos/${REPOSITORY}/issues/82/comments" \
+            -f body="$body" > "$RUNNER_TEMP/notification-response.txt" 2> "$RUNNER_TEMP/notification-error.txt"
+          result=$?
+          set -e
+          # Response headers/body contain the public test comment, never request credentials.
+          cat "$RUNNER_TEMP/notification-response.txt"
+          cat "$RUNNER_TEMP/notification-error.txt"
+          {
+            echo "Variant: ${VARIANT}"
+            echo "API exit code: ${result}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VARIANT" == candidate && "$result" -ne 0 ]]; then
+            exit "$result"
           fi
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-
-      - name: Install Copilot CLI
-        run: npm install -g @github/copilot
-
-      - name: Verify Copilot authentication
-        shell: bash
-        env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          output="$(copilot -p 'Respond with exactly: COPILOT_AUTH_OK. Do not use tools.' --no-ask-user)"
-          printf '%s\n' "$output"
-          if ! grep -q 'COPILOT_AUTH_OK' <<<"$output"; then
-            echo "::error::Copilot inference completed without the expected smoke-test marker."
-            exit 1
-          fi
-
-# This workflow intentionally tests the production authentication choices documented
-# in docs/agentic-development-workflow.md. It does not test Codex because PR #49
-# already exercised the ChatGPT Codex GitHub integration repeatedly.
