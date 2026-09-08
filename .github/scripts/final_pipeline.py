@@ -115,6 +115,15 @@ def judge(data):
               'ready requires complete passed evidence and no blocking findings. fix means a concrete code/docs correction is needed. '
               'blocked means environment, missing evidence, ambiguity, or policy prevents completion. '
               'GUI fail and blocked must be evaluated, never silently treated as pass. '
+              'Evidence schema: ci_ready is the controller-verified result for the exact head, checking both required '
+              'platform jobs and the complete CI workflow (or the authenticated trusted-CI generation). '
+              'statuses is a selected subset of commit statuses, not a list of check runs; missing platform jobs '
+              'from this subset does not contradict ci_ready. required_checks lists repository merge rules. '
+              'classified means the GUI requirement classification matches current changed files and labels. '
+              'hane/gui-requirement deliberately uses state failure to mean GUI IS REQUIRED, and success to mean '
+              'GUI IS NOT REQUIRED; it is not the GUI test result. Read gui_receipt.outcome for the authenticated '
+              'GUI result. review_ready is the controller-verified exact-head review/routing result; unresolved_threads '
+              'and blocking_reviews remain independent blockers. These verified facts do not waive any gate denial. '
               'Deterministic merge restrictions listed in gate_denials cannot be waived.\n' +
               json.dumps({'gate_denials': gate(data), 'evidence': data}, ensure_ascii=False))
     # Stay below Linux's per-argument bound. Oversized evidence is blocked rather

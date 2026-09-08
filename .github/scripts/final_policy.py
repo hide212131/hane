@@ -7,7 +7,7 @@ from pipeline_api import CI_NAMES
 
 CONTEXT = 'hane/final-judge'
 AUTO_LABEL = 'agentic-auto-merge'
-JUDGE_PROCEDURE = 'copilot-final/2'
+JUDGE_PROCEDURE = 'copilot-final/3'
 STATUS = re.compile(r'Final (pending|ready|fix|blocked|merged) v1 ([0-9a-f]{12}) e([0-9a-f]{16})')
 
 
