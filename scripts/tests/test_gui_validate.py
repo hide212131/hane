@@ -671,6 +671,20 @@ class ExecutionIntegrityTests(unittest.TestCase):
                 first.release_execution()
                 second.release_execution()
 
+    def test_execution_lock_loser_cannot_reserve_winners_empty_directory(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        config = make_config(self.root)
+        env = gv.RealEnvironment()
+        with patch.object(env, 'acquire_execution', side_effect=gv.EnvError('busy')), \
+                patch.object(env, 'reserve') as reserve, contextlib.redirect_stderr(io.StringIO()):
+            result = gv.run_validation(env, config)
+            self.assertEqual(gv._publish_result(env, config, result), gv.EXIT_BLOCKED)
+        reserve.assert_not_called()
+        self.assertFalse((config.run_dir / '.gui-validate-owner').exists())
+        self.assertFalse((config.run_dir / 'result.json').exists())
+
     def test_signal_during_cleanup_keeps_result_and_finishes_own_child(self):
         import signal
         process = FakeProcess(42)
