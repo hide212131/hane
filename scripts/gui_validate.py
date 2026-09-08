@@ -527,7 +527,15 @@ def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[
         fixture = os.environ.get("HANE_CAPTURE_FIXTURE", "")
         fixture_path = run_dir / "editor.md"
         if fixture:
-            shutil.copyfile(fixture, fixture_path)
+            # This scenario only launches and captures: it never sends editing
+            # input. Keep the supplied document's directory so sibling and ../
+            # resource references resolve exactly as when opened normally.
+            fixture_path = Path(fixture).absolute()
+            try:
+                with fixture_path.open("rb") as source:
+                    source.read(1)
+            except OSError as exc:
+                raise ValueError(f"HANE_CAPTURE_FIXTURE を読み込めない: {exc}") from exc
         else:
             fixture_path.write_text("# Hane GUI validation\n\n起動・撮影の確認用文書です。\n", encoding="utf-8")
         # The normal build does not arm or emit hane_ready. timing-probe

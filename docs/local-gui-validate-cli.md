@@ -28,7 +28,7 @@ python3 scripts/gui_validate.py [editor|cursor-boundary|cursor-scroll]
 
 引数省略時は `editor` を使う。シナリオの意味は `capture.sh` と同じ:
 
-- `editor`: 起動完了ログ `hane_ready` を出す `timing-probe` feature でビルドし、実行専用の `editor.md` を開く（`HANE_CAPTURE_FIXTURE` の指定時は元文書をコピーする）。通常ビルドはこのログを出さない。合成入力を行う `instrument` は使わない。文書のパスを渡すことで、初回の既定フォルダ選択ダイアログを撮影することを防ぐ。
+- `editor`: 起動完了ログ `hane_ready` を出す `timing-probe` feature でビルドし、実行専用の `editor.md` を開く（`HANE_CAPTURE_FIXTURE` の指定時はその文書を直接開き、相対画像などの参照元ディレクトリを維持する）。通常ビルドはこのログを出さない。合成入力を行う `instrument` は使わない。文書のパスを渡すことで、初回の既定フォルダ選択ダイアログを撮影することを防ぐ。このシナリオは起動・撮影のみで、文書の編集操作を行わない。将来の入力・保存シナリオには、指定された元文書を流用せず、専用の一時文書を使う。指定文書が存在しない、ディレクトリである、読み取り権限がない場合は、設定エラー（終了コード3）を表示し、アプリを起動しない。
 - `cursor-boundary` / `cursor-scroll`: `instrument` feature でビルドし、専用の固定文書を実行ごとに生成する
 
 macOS の `swift` / `screencapture` に依存するため、実際の起動・撮影・撮影経路の実証は macOS でのみ行える。macOS 以外では `missing_tools` により `preflight` 工程で `blocked` になる（後述）。

@@ -408,20 +408,41 @@ class ScenarioSetupTests(unittest.TestCase):
             self.assertEqual(features, ["timing-probe"])
             self.assertEqual(extra_env, {})
 
-    def test_editor_copies_supplied_fixture(self):
+    def test_editor_preserves_supplied_fixture_resource_context(self):
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / "source.md"
-            source.write_text("# Test\n", encoding="utf-8")
+            documents = root / "documents"
+            documents.mkdir()
+            source = documents / "source.md"
+            contents = "![local](image.png)\n![parent](../shared.png)\n"
+            source.write_text(contents, encoding="utf-8")
+            (documents / "image.png").write_bytes(b"local resource")
+            (root / "shared.png").write_bytes(b"parent resource")
             run = root / "run"
             run.mkdir()
             with patch.dict(os.environ, {"HANE_CAPTURE_FIXTURE": str(source)}):
                 fixture, _, _ = gv._scenario_setup("editor", run)
-            self.assertEqual(fixture, run / "editor.md")
-            fixture.write_text("changed", encoding="utf-8")
-            self.assertEqual(source.read_text(encoding="utf-8"), "# Test\n")
+            self.assertEqual(fixture, source)
+            self.assertEqual((fixture.parent / "image.png").read_bytes(), b"local resource")
+            self.assertEqual((fixture.parent / "../shared.png").read_bytes(), b"parent resource")
+            self.assertEqual(source.read_text(encoding="utf-8"), contents)
+
+    def test_missing_or_directory_fixture_returns_controlled_usage_error(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for source in (Path(tmp) / "missing.md", Path(tmp)):
+                with self.subTest(source=source), patch.dict(os.environ, {
+                    "HANE_CAPTURE_FIXTURE": str(source),
+                    "HANE_GUI_VALIDATE_RUN_DIR": str(Path(tmp) / "run"),
+                }), contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(gv.main(["gui_validate.py", "editor"]), gv.EXIT_USAGE)
+                    self.assertIn("invalid configuration", error.getvalue())
+                    self.assertNotIn("Traceback", error.getvalue())
 
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
         import tempfile
