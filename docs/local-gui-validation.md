@@ -63,9 +63,9 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 
 結果には上記の対応情報に加え、実際のcheckout SHA・clean状態、binary digestとtoolchain/features、runner image/version、開始・終了時刻、工程・シナリオごとの `pass` / `fail` / `blocked`、理由、証拠の一覧・digestを含める。GitHub Actionsの run ID / attempt は artifact と結果に一致させる。
 
-手順 `hosted-gui-interaction/3` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
+手順 `hosted-gui-interaction/4` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
 
-GUIステータスの版にも手順番号を含める（例: `v1-p3`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
+GUIステータスの版にも手順番号を含める（例: `v1-p4`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
 
 同じ手順版でも、終端結果に対応するreceipt artifactが欠落・期限切れの場合は新世代で再検証する。ステータス公開後のアップロード中は、その実行attemptの完了を待つ。証拠が保存されている終端結果は繰り返さない。
 

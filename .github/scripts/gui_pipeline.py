@@ -67,6 +67,19 @@ def terminal_receipt_retained(api, pr, state):
         return False
 
 
+def eligible(api, request):
+    data = api.evidence(api.pr(request['pr_number']))
+    return all(data[k] for k in ('gui_required', 'classified', 'review_ready', 'ci_ready'))
+
+
+def retire(api, request):
+    # Outside the terminal receipt grammar: this is invalidated work, not a
+    # failed GUI observation. A later eligible resolver can claim a fresh run.
+    if current(api, request):
+        api.post_status(request['sha'], CONTEXT, 'error',
+                        f'GUI superseded {STATUS_VERSION} {request["sha"][:12]} g{request["generation"]}')
+
+
 def resolve(api):
     requested = os.environ.get('INPUT_PR', '').strip()
     force = os.environ.get('INPUT_FORCE', 'false') == 'true'
@@ -86,6 +99,11 @@ def resolve(api):
                 continue
             old_status = api.statuses(pr['head']['sha']).get(CONTEXT, {})
             old = gui_state(old_status, pr['head']['sha'])
+            request = request_for(pr)
+            if not eligible(api, request):
+                if old and old[0] == 'pending':
+                    retire(api, dict(request, generation=old[1]))
+                continue
             lost_generation = None
             if old and old[0] != 'pending' and not force:
                 if terminal_receipt_retained(api, pr, old):
@@ -123,12 +141,19 @@ def resolve(api):
 def begin(api, request):
     allowed = (now() < parse_time(request['expires_at']) and current(api, request)
                and request['repository'] == api.repository)
+    if allowed and not eligible(api, request):
+        # Worker has read-only credentials. Serialized report/resolve retires
+        # the claim; begin must never acquire status-write permissions.
+        allowed = False
     output('proceed', 'true' if allowed else 'false')
 
 
 def report(api, request):
     if not current(api, request):
         print('Stale GUI generation: no status written')
+        return
+    if not eligible(api, request):
+        retire(api, request)
         return
     evidence_dir = Path(os.environ['EVIDENCE_DIR'])
     raw = None
@@ -147,6 +172,9 @@ def report(api, request):
     Path(os.environ['RECEIPT_PATH']).write_text(json.dumps(proof, ensure_ascii=False, indent=2))
     # Recheck after reading artifacts and worker metadata, immediately before POST.
     if current(api, request):
+        if not eligible(api, request):
+            retire(api, request)
+            return
         publish(api, request, outcome)
         print(f'GUI {outcome} for PR {request["pr_number"]} at {request["sha"]}')
 
