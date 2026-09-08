@@ -91,7 +91,7 @@ jobs:
               "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
               | jq '[.[][] | .filename] | any(.[]; startswith(".github/workflows/"))'
           )"
-          if [[ "$workflow_files" == true ]]; then
+          if [[ "$workflow_files" == true && "${MANUAL_RETRY:-false}" != true ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
