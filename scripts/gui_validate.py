@@ -581,6 +581,7 @@ def finalize(
 
 def run_validation(env: Environment, config: Config) -> dict:
     env._finalizing = False
+    env._execution_acquired = False
     started_at = env.clock.now_iso()
     steps: list[dict] = []
     target_info: dict = {}
@@ -589,6 +590,7 @@ def run_validation(env: Environment, config: Config) -> dict:
 
     try:
         env.acquire_execution()
+        env._execution_acquired = True
         preflight_step, target_info = do_preflight(env, config)
         steps.append(preflight_step)
         if preflight_step["result"] != "pass":
@@ -765,6 +767,11 @@ def main(argv: list[str]) -> int:
 
 
 def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
+    if not getattr(env, "_execution_acquired", False):
+        # The display-lock winner may not have reached fixture preparation yet.
+        # A loser must not claim its still-empty evidence directory first.
+        print(result["summary"], file=sys.stderr)
+        return EXIT_BLOCKED
     result_path = config.run_dir / "result.json"
     try:
         env.reserve(config)
