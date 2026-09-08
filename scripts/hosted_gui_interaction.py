@@ -508,105 +508,117 @@ def main() -> int:
     env = module.RealEnvironment()
     priority = module.RESULT_PRIORITY
 
-    started_at = env.clock.now_iso()
-
-    preflight_config = make_config(
-        module, workspace_dir=target_dir, scenario="hosted-gui-interaction-preflight",
-        expected_sha=expected_sha, request_id=request_id, generation="0", run_dir=base_run_dir / "_preflight",
-        fixture_path=None, features=["timing-probe"], extra_env={},
-        startup_timeout=startup_timeout, window_timeout=window_timeout,
-    )
-
-    top_steps: list[dict] = []
-    scenarios: list[dict] = []
-    build_info: dict = {}
-    target_info: dict = {}
-
-    preflight_step, target_info = module.do_preflight(env, preflight_config)
-    top_steps.append(preflight_step)
-
-    control_sha = "unknown"
+    lock_error = None
     try:
-        control_sha = env.git_head(control_dir)
+        env.acquire_execution()
     except module.EnvError as exc:
-        top_steps.append(make_step("control_git_head", "blocked", reason=str(exc)))
+        lock_error = str(exc)
+    try:
+        started_at = env.clock.now_iso()
 
-    if preflight_step["result"] != "pass":
-        top_steps.append(skipped_step("build", "preflight が pass しなかった"))
-    else:
-        build_step, binary_path, build_info = module.do_build(env, preflight_config)
-        top_steps.append(build_step)
-        if build_step["result"] != "pass":
-            binary_path = None
-        if binary_path is not None:
-            def handle_signal(signum, _frame):
-                raise module.Aborted(f"signal {signum}")
+        preflight_config = make_config(
+            module, workspace_dir=target_dir, scenario="hosted-gui-interaction-preflight",
+            expected_sha=expected_sha, request_id=request_id, generation="0", run_dir=base_run_dir / "_preflight",
+            fixture_path=None, features=["timing-probe"], extra_env={},
+            startup_timeout=startup_timeout, window_timeout=window_timeout,
+        )
 
-            previous = {sig: signal.signal(sig, handle_signal)
-                        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-            try:
-                for scenario_name, run_scenario in (
-                    ("ascii_edit_save_undo_redo_reopen", run_ascii_scenario),
-                    ("japanese_ime_input", run_ime_scenario),
-                    ("os_scroll", run_scroll_scenario),
-                ):
-                    try:
-                        scenarios.append(run_scenario(
-                            module, env, target_dir, swift_helper, base_run_dir, binary_path,
-                            expected_sha, request_id, startup_timeout, window_timeout,
-                            helper_timeout, poll_timeout, priority,
-                        ))
-                    except (module.Aborted, Exception) as exc:
-                        scenarios.append({"name": scenario_name, "result": "blocked",
-                                          "reason": str(exc), "steps": []})
-                        if isinstance(exc, module.Aborted):
-                            break
-            finally:
-                for sig, handler in previous.items():
-                    signal.signal(sig, handler)
+        top_steps: list[dict] = []
+        scenarios: list[dict] = []
+        build_info: dict = {}
+        target_info: dict = {}
 
-    scenario_results = [s["result"] for s in scenarios] or ["blocked"]
-    all_results = [s["result"] for s in top_steps if s["result"] in priority] + [
-        r for r in scenario_results if r in priority
-    ]
-    overall_result = min(all_results, key=lambda r: priority[r]) if all_results else "blocked"
-    reasons = [s.get("reason") for s in top_steps if s.get("reason") and s["result"] != "pass"]
-    reasons += [s.get("reason") for s in scenarios if s.get("reason") and s["result"] != "pass"]
-    overall_reason = "; ".join(r for r in reasons if r) or "すべての工程が成功した"
+        if lock_error:
+            preflight_step = make_step("preflight", "blocked", reason=lock_error)
+        else:
+            preflight_step, target_info = module.do_preflight(env, preflight_config)
+        top_steps.append(preflight_step)
 
-    result_doc = {
-        "schema_version": SCHEMA_VERSION,
-        "procedure_version": PROCEDURE_VERSION,
-        "verification_kind": VERIFICATION_KIND,
-        "request_id": request_id,
-        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-        "started_at": started_at,
-        "finished_at": env.clock.now_iso(),
-        "target": target_info,
-        "control": {"sha": control_sha},
-        "build": build_info,
-        "top_level_steps": top_steps,
-        "scenarios": scenarios,
-        "overall_result": overall_result,
-        "overall_reason": overall_reason,
-        "scope_note": SCOPE_NOTE,
-    }
-    label = {"pass": "PASS", "fail": "FAIL", "blocked": "BLOCKED"}[overall_result]
-    result_doc["summary"] = (
-        f"[{label}] hosted-gui-interaction request={request_id} — {overall_reason} "
-        "(対話スモーク確認。網羅的な GUI 検証ではない)"
-    )
+        control_sha = "unknown"
+        try:
+            control_sha = env.git_head(control_dir)
+        except module.EnvError as exc:
+            top_steps.append(make_step("control_git_head", "blocked", reason=str(exc)))
 
-    result_path = base_run_dir / "result.json"
-    result_path.write_text(json.dumps(result_doc, indent=2, ensure_ascii=False) + "\n")
-    summary_path = base_run_dir / "summary.md"
-    summary_path.write_text(result_doc["summary"] + "\n")
+        if preflight_step["result"] != "pass":
+            top_steps.append(skipped_step("build", "preflight が pass しなかった"))
+        else:
+            build_step, binary_path, build_info = module.do_build(env, preflight_config)
+            top_steps.append(build_step)
+            if build_step["result"] != "pass":
+                binary_path = None
+            if binary_path is not None:
+                def handle_signal(signum, _frame):
+                    raise module.Aborted(f"signal {signum}")
 
-    print(result_doc["summary"])
-    print(f"result: {result_path}")
+                previous = {sig: signal.signal(sig, handle_signal)
+                            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+                try:
+                    for scenario_name, run_scenario in (
+                        ("ascii_edit_save_undo_redo_reopen", run_ascii_scenario),
+                        ("japanese_ime_input", run_ime_scenario),
+                        ("os_scroll", run_scroll_scenario),
+                    ):
+                        try:
+                            scenarios.append(run_scenario(
+                                module, env, target_dir, swift_helper, base_run_dir, binary_path,
+                                expected_sha, request_id, startup_timeout, window_timeout,
+                                helper_timeout, poll_timeout, priority,
+                            ))
+                        except (module.Aborted, Exception) as exc:
+                            scenarios.append({"name": scenario_name, "result": "blocked",
+                                              "reason": str(exc), "steps": []})
+                            if isinstance(exc, module.Aborted):
+                                break
+                finally:
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)
 
-    return EXIT_PASS if overall_result == "pass" else EXIT_NONPASS
+        scenario_results = [s["result"] for s in scenarios] or ["blocked"]
+        all_results = [s["result"] for s in top_steps if s["result"] in priority] + [
+            r for r in scenario_results if r in priority
+        ]
+        overall_result = min(all_results, key=lambda r: priority[r]) if all_results else "blocked"
+        reasons = [s.get("reason") for s in top_steps if s.get("reason") and s["result"] != "pass"]
+        reasons += [s.get("reason") for s in scenarios if s.get("reason") and s["result"] != "pass"]
+        overall_reason = "; ".join(r for r in reasons if r) or "すべての工程が成功した"
+
+        result_doc = {
+            "schema_version": SCHEMA_VERSION,
+            "procedure_version": PROCEDURE_VERSION,
+            "verification_kind": VERIFICATION_KIND,
+            "request_id": request_id,
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            "started_at": started_at,
+            "finished_at": env.clock.now_iso(),
+            "target": target_info,
+            "control": {"sha": control_sha},
+            "build": build_info,
+            "top_level_steps": top_steps,
+            "scenarios": scenarios,
+            "overall_result": overall_result,
+            "overall_reason": overall_reason,
+            "scope_note": SCOPE_NOTE,
+        }
+        label = {"pass": "PASS", "fail": "FAIL", "blocked": "BLOCKED"}[overall_result]
+        result_doc["summary"] = (
+            f"[{label}] hosted-gui-interaction request={request_id} — {overall_reason} "
+            "(対話スモーク確認。網羅的な GUI 検証ではない)"
+        )
+
+        result_path = base_run_dir / "result.json"
+        result_path.write_text(json.dumps(result_doc, indent=2, ensure_ascii=False) + "\n")
+        summary_path = base_run_dir / "summary.md"
+        summary_path.write_text(result_doc["summary"] + "\n")
+
+        print(result_doc["summary"])
+        print(f"result: {result_path}")
+
+        return EXIT_PASS if overall_result == "pass" else EXIT_NONPASS
+    finally:
+        env.release_execution()
+
 
 
 if __name__ == "__main__":

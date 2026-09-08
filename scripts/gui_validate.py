@@ -19,10 +19,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+ABORT_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
 
 SCHEMA_VERSION = 1
 PROCEDURE_VERSION = "gui-validate/1"
@@ -103,6 +107,12 @@ class Environment:
 
     clock: Clock
 
+    def acquire_execution(self) -> None:
+        """Reserve this user's GUI display for the entire validation."""
+
+    def release_execution(self) -> None:
+        """Release the GUI display after cleanup."""
+
     def prepare(self, config: Config) -> None:
         """Create owned run artifacts only after the clean-checkout preflight."""
 
@@ -135,6 +145,28 @@ class RealEnvironment(Environment):
     def __init__(self) -> None:
         self.clock = Clock()
         self._reserved_run_dir: Optional[Path] = None
+        self._execution_fd: Optional[int] = None
+
+    def acquire_execution(self) -> None:
+        if self._execution_fd is not None:
+            return
+        try:
+            import fcntl
+            lock = Path(tempfile.gettempdir()) / f"hane-gui-validation-{os.getuid()}.lock"
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            self._execution_fd = fd
+        except (ImportError, OSError) as exc:
+            raise EnvError(f"GUI validator は別の実行が使用中、または実行ロックを取得できない: {exc}") from exc
+
+    def release_execution(self) -> None:
+        if self._execution_fd is not None:
+            os.close(self._execution_fd)  # Kernel releases the advisory lock, also on process exit.
+            self._execution_fd = None
 
     def reserve(self, config: Config) -> None:
         if self._reserved_run_dir == config.run_dir:
@@ -352,11 +384,21 @@ def do_preflight(env: Environment, config: Config) -> tuple[dict, dict]:
     return make_step("preflight", "pass", **target_info), target_info
 
 
-def do_build(env: Environment, config: Config) -> tuple[dict, Optional[Path], dict]:
+def do_build(env: Environment, config: Config, baseline_sha: Optional[str] = None) -> tuple[dict, Optional[Path], dict]:
     try:
+        initial_sha = env.git_head(config.workspace_dir)
         binary_path, build_info = env.build(config.workspace_dir, config.features)
+        actual_sha = env.git_head(config.workspace_dir)
+        dirty_paths = env.git_dirty_paths(config.workspace_dir)
     except BuildError as exc:
         return make_step("build", "fail", reason=f"ビルドに失敗した: {exc}"), None, {}
+    except EnvError as exc:
+        return make_step("build", "blocked", reason=f"ビルド後の checkout を検証できない: {exc}"), None, {}
+    if (actual_sha != initial_sha or (baseline_sha and actual_sha != baseline_sha)
+            or (config.expected_sha and actual_sha != config.expected_sha) or dirty_paths):
+        return make_step("build", "blocked", reason="ビルド中に checkout が変更されたため起動しない",
+                         actual_sha=actual_sha, dirty_paths=dirty_paths), None, build_info
+    build_info.update(validated_sha=actual_sha, working_copy_clean_after_build=True)
     return make_step("build", "pass", **build_info), binary_path, build_info
 
 
@@ -440,7 +482,7 @@ def do_capture(env: Environment, config: Config, window_id: str) -> dict:
     return make_step("capture", "pass", image_path=str(config.image_path))
 
 
-def do_cleanup(env: Environment, process) -> dict:
+def _cleanup_process(env: Environment, process) -> dict:
     if process is None:
         return make_step("cleanup", "pass", reason="起動したプロセスはなかった")
     pid = process.pid
@@ -462,6 +504,28 @@ def do_cleanup(env: Environment, process) -> dict:
     if exited:
         return make_step("cleanup", "pass", terminated_pid=pid)
     return make_step("cleanup", "blocked", reason="起動したプロセスを終了できなかった", terminated_pid=pid)
+
+
+def do_cleanup(env: Environment, process) -> dict:
+    # Defer further abort signals while terminating the exact child. Otherwise
+    # an exception raised inside the caller's finally would skip its evidence.
+    received: list[int] = []
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in ABORT_SIGNALS:
+            previous[sig] = signal.signal(sig, lambda signum, _frame: received.append(signum))
+    try:
+        try:
+            result = _cleanup_process(env, process)
+        except (Aborted, OSError) as exc:
+            result = make_step("cleanup", "blocked", reason=f"終了処理を完了できなかった: {exc}")
+        if received:
+            result = make_step("cleanup", "blocked", reason="終了処理中に中断要求を受信した",
+                               signals=received, process_cleanup=result)
+        return result
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def _summary(overall_result: str, overall_reason: str, config: Config) -> str:
@@ -516,6 +580,7 @@ def finalize(
 
 
 def run_validation(env: Environment, config: Config) -> dict:
+    env._finalizing = False
     started_at = env.clock.now_iso()
     steps: list[dict] = []
     target_info: dict = {}
@@ -523,19 +588,20 @@ def run_validation(env: Environment, config: Config) -> dict:
     process_holder: dict = {"process": None}
 
     try:
+        env.acquire_execution()
         preflight_step, target_info = do_preflight(env, config)
         steps.append(preflight_step)
         if preflight_step["result"] != "pass":
             for name in ("build", "launch", "window_discovery", "capture"):
                 steps.append(skipped_step(name, "preflight が pass しなかった"))
         else:
-            env.prepare(config)
-            build_step, binary_path, build_info = do_build(env, config)
+            build_step, binary_path, build_info = do_build(env, config, target_info["actual_sha"])
             steps.append(build_step)
             if build_step["result"] != "pass":
                 for name in ("launch", "window_discovery", "capture"):
                     steps.append(skipped_step(name, "build が pass しなかった"))
             else:
+                env.prepare(config)
                 launch_step = do_launch(env, config, binary_path, process_holder)
                 steps.append(launch_step)
                 if launch_step["result"] != "pass":
@@ -553,7 +619,11 @@ def run_validation(env: Environment, config: Config) -> dict:
     except (EnvError, OSError) as exc:
         steps.append(make_step("setup", "blocked", reason=str(exc)))
     finally:
-        steps.append(do_cleanup(env, process_holder["process"]))
+        env._finalizing = True
+        try:
+            steps.append(do_cleanup(env, process_holder["process"]))
+        finally:
+            env.release_execution()
 
     return finalize(steps, config, target_info, build_info, started_at, env)
 
@@ -674,20 +744,27 @@ def main(argv: list[str]) -> int:
         print(f"invalid configuration: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
+    env = RealEnvironment()
+
     def _handle_signal(signum, _frame):
-        raise Aborted(f"signal {signum}")
+        # Cleanup records its own deferred signals. Once cleanup begins, never
+        # interrupt final evidence publication with another asynchronous raise.
+        if not getattr(env, "_finalizing", False):
+            raise Aborted(f"signal {signum}")
 
     previous_handlers = {}
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in ABORT_SIGNALS:
         previous_handlers[sig] = signal.signal(sig, _handle_signal)
 
-    env = RealEnvironment()
     try:
         result = run_validation(env, config)
+        return _publish_result(env, config, result)
     finally:
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 
+
+def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
     result_path = config.run_dir / "result.json"
     try:
         env.reserve(config)
