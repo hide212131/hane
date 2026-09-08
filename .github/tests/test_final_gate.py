@@ -3,6 +3,7 @@ from copy import deepcopy
 from pathlib import Path
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -98,6 +99,31 @@ class PolicyTests(unittest.TestCase):
         for context, description, state in [('hane/copilot-routing', f'Copilot routing: continue-validation for {SHA[:12]}', 'success'),
                                            ('hane/final-judge', f'Final blocked v1 {SHA[:12]} e' + 'b' * 16, 'error')]:
             self.assertFalse(routing_allows_fix([final, {'id': 11, 'context': context, 'description': description, 'state': state}], SHA))
+
+
+class InvocationTests(unittest.TestCase):
+    def test_cli_has_a_nonempty_no_tool_allowlist_and_no_workflow_token(self):
+        response = subprocess.CompletedProcess([], 0, '{"decision":"blocked","reason":"unresolved review"}', '')
+        with patch.dict(os.environ, {'COPILOT_GITHUB_TOKEN': 'model-secret', 'GH_TOKEN': 'workflow-secret', 'GITHUB_TOKEN': 'other-secret'}), \
+                patch.object(controller.subprocess, 'run', return_value=response) as run:
+            self.assertEqual(controller.judge(ready())['decision'], 'blocked')
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index('--available-tools') + 1], '__hane_final_judge_no_tools__')
+        self.assertNotIn('*', argv)
+        child = run.call_args.kwargs['env']
+        self.assertNotIn('GH_TOKEN', child)
+        self.assertNotIn('GITHUB_TOKEN', child)
+        self.assertEqual(child['COPILOT_GITHUB_TOKEN'], 'model-secret')
+
+    def test_invocation_error_is_bounded_and_credentials_are_redacted(self):
+        response = subprocess.CompletedProcess([], 1, '', 'error model-secret workflow-secret ' + 'x' * 2000)
+        with patch.dict(os.environ, {'COPILOT_GITHUB_TOKEN': 'model-secret', 'GH_TOKEN': 'workflow-secret'}), \
+                patch.object(controller.subprocess, 'run', return_value=response), self.assertRaises(ValueError) as error:
+            controller.judge(ready())
+        self.assertNotIn('model-secret', str(error.exception))
+        self.assertNotIn('workflow-secret', str(error.exception))
+        self.assertIn('[REDACTED]', str(error.exception))
+        self.assertLess(len(str(error.exception)), 1300)
 
 
 class FakeAPI:
