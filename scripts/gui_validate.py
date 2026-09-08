@@ -683,34 +683,41 @@ def run_validation(env: Environment, config: Config) -> dict:
     target_info: dict = {}
     build_info: dict = {}
     process_holder: dict = {"process": None}
+    active_stage = None
 
     try:
         env.acquire_execution()
         env._execution_acquired = True
+        active_stage = "preflight"
         preflight_step, target_info = do_preflight(env, config)
         steps.append(preflight_step)
         if preflight_step["result"] != "pass":
             for name in ("build", "launch", "window_discovery", "capture"):
                 steps.append(skipped_step(name, "preflight が pass しなかった"))
         else:
+            active_stage = "build"
             build_step, binary_path, build_info = do_build(env, config, target_info["actual_sha"])
             steps.append(build_step)
             if build_step["result"] != "pass":
                 for name in ("launch", "window_discovery", "capture"):
                     steps.append(skipped_step(name, "build が pass しなかった"))
             else:
+                active_stage = "setup"
                 env.prepare(config)
+                active_stage = "launch"
                 launch_step = do_launch(env, config, binary_path, process_holder)
                 steps.append(launch_step)
                 if launch_step["result"] != "pass":
                     steps.append(skipped_step("window_discovery", "launch が pass しなかった"))
                     steps.append(skipped_step("capture", "launch が pass しなかった"))
                 else:
+                    active_stage = "window_discovery"
                     window_step, window_id = do_window_discovery(env, config, process_holder["process"])
                     steps.append(window_step)
                     if window_step["result"] != "pass":
                         steps.append(skipped_step("capture", "window_discovery が pass しなかった"))
                     else:
+                        active_stage = "capture"
                         steps.append(do_capture(env, config, window_id))
     except Aborted as exc:
         steps.append(make_step("run", "blocked", reason=f"中断された: {exc}"))
@@ -718,6 +725,11 @@ def run_validation(env: Environment, config: Config) -> dict:
         steps.append(make_step("setup", "blocked", reason=str(exc)))
     finally:
         env._finalizing = True
+        recorded = {step["name"] for step in steps}
+        for name in ("preflight", "build", "launch", "window_discovery", "capture"):
+            if name not in recorded:
+                steps.append(make_step(name, "blocked", reason="工程の途中で検証が中断された")
+                             if name == active_stage else skipped_step(name, "前工程が完了しなかった"))
         try:
             steps.append(do_cleanup(env, process_holder["process"]))
         finally:

@@ -335,6 +335,9 @@ class RunValidationTests(TemporaryWorkspaceTest):
         by_name = {s["name"]: s for s in result["steps"]}
         self.assertIn("run", by_name)
         self.assertIn("中断", by_name["run"]["reason"])
+        self.assertEqual(by_name["launch"]["result"], "blocked")
+        self.assertEqual(by_name["window_discovery"]["result"], "skipped")
+        self.assertEqual(by_name["capture"]["result"], "skipped")
         self.assertEqual(by_name["cleanup"]["result"], "pass")
         self.assertTrue(process._terminated)
 
@@ -482,6 +485,9 @@ class ScenarioSetupTests(unittest.TestCase):
                         result = gv.run_validation(env, config)
                 self.assertEqual(result['overall_result'], 'blocked')
                 self.assertIn('HANE_CAPTURE_FIXTURE', result['overall_reason'])
+                stages = {step['name']: step['result'] for step in result['steps']}
+                self.assertEqual([stages[name] for name in ('launch', 'window_discovery', 'capture')],
+                                 ['skipped', 'skipped', 'skipped'])
                 launch.assert_not_called()
 
     def test_clean_preflight_precedes_artifacts_in_unignored_run_directory(self):
