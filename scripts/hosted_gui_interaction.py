@@ -18,8 +18,8 @@ best-effort screenshot per session. It does not prove rendering pixel-by-
 pixel, and it does not cover all focus changes or dialogs. OS wheel scrolling is
 checked independently using visible line numbers recognized by Vision OCR.
 
-This script does not copy scripts/gui_validate.py. It loads the pinned
-target's copy via importlib and calls its preflight/build/launch/
+This script loads scripts/gui_validate.py from the trusted control
+checkout via importlib and calls its preflight/build/launch/
 window_discovery/capture/cleanup functions directly, so the exact same PID
 lifecycle logic is reused rather than reimplemented.
 """
@@ -64,9 +64,9 @@ IME_ROMAJI = "nihongo"
 IME_EXPECTED_TEXT = "日本語"
 
 
-def load_pinned_gui_validate(target_dir: Path):
+def load_pinned_gui_validate(control_dir: Path):
     sys.dont_write_bytecode = True
-    module_path = target_dir / "scripts" / "gui_validate.py"
+    module_path = control_dir / "scripts" / "gui_validate.py"
     if not module_path.is_file():
         raise SystemExit(f"pinned gui_validate.py not found at {module_path}")
     spec = importlib.util.spec_from_file_location("pinned_gui_validate", module_path)
@@ -504,7 +504,7 @@ def main() -> int:
     poll_timeout = env_float("HANE_GUI_INTERACTION_POLL_TIMEOUT_SECS", 10.0)
 
     os.chdir(target_dir)  # honor the target checkout's rust-toolchain.toml
-    module = load_pinned_gui_validate(target_dir)
+    module = load_pinned_gui_validate(control_dir)
     env = module.RealEnvironment()
     priority = module.RESULT_PRIORITY
 
