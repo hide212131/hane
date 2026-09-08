@@ -26,6 +26,7 @@ jobs:
       pull-requests: write
       statuses: write
       actions: read
+      checks: read
     steps:
       - uses: actions/checkout@v6
         with:

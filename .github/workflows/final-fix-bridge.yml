@@ -20,6 +20,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      checks: read
       pull-requests: read
       statuses: read
     steps:
