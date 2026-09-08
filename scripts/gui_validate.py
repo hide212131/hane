@@ -526,7 +526,9 @@ def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[
     if scenario == "editor":
         fixture = os.environ.get("HANE_CAPTURE_FIXTURE", "")
         fixture_path = Path(fixture) if fixture else None
-        return fixture_path, [], {}
+        # The normal build does not arm or emit hane_ready. timing-probe
+        # enables readiness observation without instrument's synthetic input.
+        return fixture_path, ["timing-probe"], {}
     if scenario == "cursor-boundary":
         fixture_path = run_dir / "cursor-boundary.md"
         fixture_path.write_text("first line\nsecond line\n")

@@ -404,7 +404,7 @@ class ScenarioSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fixture, features, extra_env = gv._scenario_setup("editor", Path(tmp))
             self.assertIsNone(fixture)
-            self.assertEqual(features, [])
+            self.assertEqual(features, ["timing-probe"])
             self.assertEqual(extra_env, {})
 
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
