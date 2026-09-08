@@ -142,7 +142,7 @@ jobs:
 
             pr_commits="$(
               gh api --paginate "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")}' \
+                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), message:(.commit.message // ""), actor:(.author.login // .committer.login // "")}' \
                 | jq -s '.'
             )"
 
@@ -171,10 +171,31 @@ jobs:
               completion_state="$(cut -f1 <<< "$completion_latest")"
               completion_description="$(cut -f2 <<< "$completion_latest")"
               if [[ "$completion_state" != success || "$completion_description" != "Claude fix completed for ${old_short}" ]]; then
-                gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
+                if ! gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
                   -f state=success -f context='hane/claude-fix' \
                   -f description="Claude fix completed for ${old_short}" \
-                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null
+                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
+                  echo "::warning::Failed to recover Claude fix completion for ${predecessor_sha}."
+                fi
+              fi
+
+              # Manual retry commits are the durable evidence that a fresh cycle
+              # must start. Recover the marker after completion recovery so a
+              # transient worker failure cannot lose the cycle boundary.
+              commit_message="$(jq -r '.message // ""' <<< "$commit_record")"
+              if grep -q '^Manual retry: true$' <<< "$commit_message"; then
+                reset_state="$(
+                  gh api "repos/${REPOSITORY}/commits/${fix_sha}/statuses?per_page=100" \
+                    --jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for ")))] | length'
+                )"
+                if [[ "$reset_state" -eq 0 ]]; then
+                  if ! gh api --method POST "repos/${REPOSITORY}/statuses/${fix_sha}" \
+                    -f state=success -f context='hane/claude-fix-cycle' \
+                    -f description="Claude fix cycle reset for ${fix_sha:0:12} after manual retry" \
+                    -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
+                    echo "::warning::Failed to recover Claude fix cycle reset for ${fix_sha}."
+                  fi
+                fi
               fi
             done
 

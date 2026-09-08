@@ -95,35 +95,51 @@ jobs:
             exit 0
           fi
 
-          cycle_reset_status_id="$(
-            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for "))) ] | max_by(.id) // {} | (.id // 0)'
-          )"
-          cycle_reset_status_id="${cycle_reset_status_id:-0}"
-
-          completion_ids=()
+          # Status IDs are global and can be assigned out of logical order when
+          # reconciliation repairs a status after the worker has already pushed.
+          # Use PR commit order so a recovered completion on the old target cannot
+          # consume a slot from the cycle started by a manual retry.
+          pr_commit_shas=()
+          completion_shas=()
+          cycle_reset_sha=""
           while IFS= read -r sha; do
-            [[ -z "$sha" || "$sha" == "$TARGET_SHA" ]] && continue
+            [[ -z "$sha" ]] && continue
+            pr_commit_shas+=( "$sha" )
             statuses_for_sha="$(gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100")"
-            reset_on_sha="$(
-              jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for "))) ] | max_by(.id) // {} | (.id // 0)' \
+            reset_present="$(
+              jq -r 'any(.[]; .context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for ")))' \
                 <<< "$statuses_for_sha"
             )"
-            if [[ "$reset_on_sha" -gt "$cycle_reset_status_id" ]]; then
-              cycle_reset_status_id="$reset_on_sha"
+            if [[ "$reset_present" == true ]]; then
+              cycle_reset_sha="$sha"
             fi
-            completion_id="$(
-              jq '[.[] | select(.context == "hane/claude-fix" and .state == "success" and ((.description // "") | startswith("Claude fix completed for "))) ] | max_by(.id) // {} | (.id // 0)' \
+            [[ "$sha" == "$TARGET_SHA" ]] && continue
+            completion_present="$(
+              jq -r 'any(.[]; .context == "hane/claude-fix" and .state == "success" and ((.description // "") | startswith("Claude fix completed for ")))' \
                 <<< "$statuses_for_sha"
             )"
-            if [[ "$completion_id" -gt 0 ]]; then
-              completion_ids+=( "$completion_id" )
+            if [[ "$completion_present" == true ]]; then
+              completion_shas+=( "$sha" )
             fi
           done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
 
+          cycle_reset_index=-1
+          for index in "${!pr_commit_shas[@]}"; do
+            if [[ "${pr_commit_shas[$index]}" == "$cycle_reset_sha" ]]; then
+              cycle_reset_index="$index"
+            fi
+          done
+
           completed=0
-          for completion_id in "${completion_ids[@]}"; do
-            if [[ "$completion_id" -gt "$cycle_reset_status_id" ]]; then
+          for completion_sha in "${completion_shas[@]}"; do
+            completion_index=-1
+            for index in "${!pr_commit_shas[@]}"; do
+              if [[ "${pr_commit_shas[$index]}" == "$completion_sha" ]]; then
+                completion_index="$index"
+                break
+              fi
+            done
+            if [[ "$completion_index" -gt "$cycle_reset_index" ]]; then
               completed=$((completed + 1))
             fi
           done
@@ -390,6 +406,7 @@ jobs:
           Automatic Claude fix for Copilot routing decision on ${short_sha}
 
           Addresses the Copilot pre-GUI routing \"fix\" decision recorded on ${TARGET_SHA}.
+          Manual retry: ${MANUAL_RETRY}
           EOF
           )"
           new_sha="$(git rev-parse HEAD)"
@@ -416,10 +433,12 @@ jobs:
           fi
           if [[ "${MANUAL_RETRY}" == true ]]; then
             new_short_sha="${new_sha:0:12}"
-            gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+            if ! gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
               -f state=success -f context='hane/claude-fix-cycle' \
               -f description="Claude fix cycle reset for ${new_short_sha} after manual retry" \
-              -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
+              -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null; then
+              echo '::warning::Failed to publish Claude fix cycle reset; claude-fix-reconcile.yml will recover it from the manual-retry commit.'
+            fi
           fi
           generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
