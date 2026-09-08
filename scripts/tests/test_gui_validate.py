@@ -398,14 +398,30 @@ class FinalizePriorityTests(TemporaryWorkspaceTest):
 
 
 class ScenarioSetupTests(unittest.TestCase):
-    def test_editor_defaults_to_no_fixture(self):
+    def test_editor_uses_isolated_fixture_and_readiness_probe(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             fixture, features, extra_env = gv._scenario_setup("editor", Path(tmp))
-            self.assertIsNone(fixture)
+            self.assertEqual(fixture, Path(tmp) / "editor.md")
+            self.assertIn("# Hane GUI validation", fixture.read_text(encoding="utf-8"))
             self.assertEqual(features, ["timing-probe"])
             self.assertEqual(extra_env, {})
+
+    def test_editor_copies_supplied_fixture(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.md"
+            source.write_text("# Test\n", encoding="utf-8")
+            run = root / "run"
+            run.mkdir()
+            with patch.dict(os.environ, {"HANE_CAPTURE_FIXTURE": str(source)}):
+                fixture, _, _ = gv._scenario_setup("editor", run)
+            self.assertEqual(fixture, run / "editor.md")
+            fixture.write_text("changed", encoding="utf-8")
+            self.assertEqual(source.read_text(encoding="utf-8"), "# Test\n")
 
     def test_cursor_boundary_writes_two_lines_and_instrument_feature(self):
         import tempfile

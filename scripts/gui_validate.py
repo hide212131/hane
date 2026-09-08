@@ -525,7 +525,11 @@ def run_validation(env: Environment, config: Config) -> dict:
 def _scenario_setup(scenario: str, run_dir: Path) -> tuple[Optional[Path], list[str], dict[str, str]]:
     if scenario == "editor":
         fixture = os.environ.get("HANE_CAPTURE_FIXTURE", "")
-        fixture_path = Path(fixture) if fixture else None
+        fixture_path = run_dir / "editor.md"
+        if fixture:
+            shutil.copyfile(fixture, fixture_path)
+        else:
+            fixture_path.write_text("# Hane GUI validation\n\n起動・撮影の確認用文書です。\n", encoding="utf-8")
         # The normal build does not arm or emit hane_ready. timing-probe
         # enables readiness observation without instrument's synthetic input.
         return fixture_path, ["timing-probe"], {}
