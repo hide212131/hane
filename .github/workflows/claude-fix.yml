@@ -18,7 +18,8 @@ jobs:
       actions: write
       contents: write
       issues: write
-      pull-requests: read
+      # Grant explicit PR comment access; verify the notification path in Actions.
+      pull-requests: write
       statuses: write
 
     steps:
