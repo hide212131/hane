@@ -6,7 +6,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_api import GitHub
-from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, gui_state, parse_time, receipt, validate_receipt
+from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, authenticated_receipt, gui_state, parse_time, receipt, validate_receipt
+from gui_artifacts import artifact_json
 
 
 def now():
@@ -44,18 +45,26 @@ def current(api, request, require_claim=True):
     return True
 
 
-def terminal_receipt_retained(api, number, generation):
+def terminal_receipt_retained(api, pr, state):
+    outcome, generation = state
+    number = pr['number']
     run_id, attempt = generation.split('-')
     run = api.api(api.repo(f'actions/runs/{run_id}/attempts/{attempt}'))
     if run.get('status') != 'completed':
         # The report publishes its status before uploading the receipt. Give
         # that exact attempt time to finish before deciding evidence is lost.
         return True
-    names = {f'gui-receipt-{number}-{generation}', f'gui-recovered-{generation}'}
-    artifacts = api.pages(api.repo(f'actions/runs/{run_id}/artifacts'), 'artifacts')
-    retained = [row for row in artifacts if row.get('name') in names
-                and row.get('expired') is False and 0 < row.get('size_in_bytes', 0) <= 2 * 1024 * 1024]
-    return len(retained) == 1
+    try:
+        try:
+            proof = artifact_json(api, run_id, f'gui-receipt-{number}-{generation}', 'gui-receipt.json')
+        except (ValueError, KeyError):
+            if outcome != 'blocked':
+                return False
+            proof = artifact_json(api, run_id, f'gui-recovered-{generation}', f'{number}.json')
+        authenticated_receipt(proof, pr['head']['sha'], number, api.repository, state, run)
+        return True
+    except (ValueError, KeyError):
+        return False
 
 
 def resolve(api):
@@ -79,7 +88,7 @@ def resolve(api):
             old = gui_state(old_status, pr['head']['sha'])
             lost_generation = None
             if old and old[0] != 'pending' and not force:
-                if terminal_receipt_retained(api, number, old[1]):
+                if terminal_receipt_retained(api, pr, old):
                     continue
                 lost_generation, old = old[1], None
             request = request_for(pr)

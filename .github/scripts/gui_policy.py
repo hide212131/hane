@@ -151,3 +151,26 @@ def receipt(request, outcome, reason, raw=None, evidence_dir=None):
                 hashes[path.relative_to(evidence_dir).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     return {'schema_version': 1, 'policy_version': POLICY, 'request': request,
             'outcome': outcome, 'reason': str(reason)[:2000], 'result': raw, 'sha256': hashes}
+
+
+def authenticated_receipt(proof, snapshot_sha, pr_number, repository, state, run):
+    outcome, generation = state
+    run_id, attempt = generation.split('-')
+    if not isinstance(proof, dict) or not isinstance(proof.get('request'), dict):
+        raise ValueError('invalid GUI receipt shape')
+    request = proof['request']
+    if (run.get('status') != 'completed' or str(run.get('id')) != run_id
+            or str(run.get('run_attempt')) != attempt
+            or run.get('path') != '.github/workflows/gui-validation.yml'
+            or run.get('head_branch') != 'main'
+            or run.get('event') not in ('workflow_dispatch', 'workflow_run', 'schedule')
+            or request.get('control_sha') != run.get('head_sha')
+            or request.get('procedure_version') != PROCEDURE
+            or proof.get('schema_version') != 1 or proof.get('policy_version') != 'v1'
+            or request.get('sha') != snapshot_sha or request.get('pr_number') != pr_number
+            or request.get('repository') != repository or request.get('generation') != generation
+            or request.get('run_id') != run_id or request.get('run_attempt') != attempt
+            or request.get('request_id') != f'gui-{generation}-pr{pr_number}'
+            or proof.get('outcome') != outcome or outcome == 'pending'):
+        raise ValueError('GUI receipt provenance mismatch')
+    return proof
