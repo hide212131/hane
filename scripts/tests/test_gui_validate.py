@@ -486,7 +486,7 @@ class ScenarioSetupTests(unittest.TestCase):
                 env = gv.RealEnvironment()
                 with patch.dict(os.environ, {'HANE_CAPTURE_FIXTURE': str(source),
                         'HANE_GUI_VALIDATE_RUN_DIR': str(root / 'run')}):
-                    config = gv.build_config('editor', root)
+                    config = gv.build_config('editor', root / 'checkout')
                     with patch.object(env, 'acquire_execution'), \
                             patch.object(env, 'git_head', return_value='abc123'), \
                             patch.object(env, 'git_dirty_paths', return_value=[]), \
@@ -501,7 +501,7 @@ class ScenarioSetupTests(unittest.TestCase):
                                  ['skipped', 'skipped', 'skipped'])
                 launch.assert_not_called()
 
-    def test_clean_preflight_precedes_artifacts_in_unignored_run_directory(self):
+    def test_retained_output_must_be_ignored_or_outside_checkout(self):
         from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -514,17 +514,17 @@ class ScenarioSetupTests(unittest.TestCase):
                             "commit", "-qm", "fixture"], check=True)
             run = root / "unignored-run"
             with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(run), "HANE_CAPTURE_FIXTURE": ""}):
-                config = gv.build_config("editor", root)
+                with self.assertRaisesRegex(ValueError, "Gitで無視"):
+                    gv.build_config("editor", root)
                 self.assertFalse(run.exists())
-                env = gv.RealEnvironment()
-                with patch.object(env, "acquire_execution"), patch.object(env, "missing_tools", return_value=[]), patch.object(
-                    env, "build", side_effect=gv.BuildError("test stops before compilation")
-                ) as build:
-                    result = gv.run_validation(env, config)
-                self.assertEqual(result["steps"][0]["result"], "pass")
-                self.assertTrue(result["target"]["working_copy_clean"])
-                self.assertFalse(run.exists())  # Build failure precedes fixture creation.
-                build.assert_called_once()
+                (root / '.gitignore').write_text('/unignored-run/\n')
+                first = gv.build_config('editor', root)
+                gv.RealEnvironment().reserve(first)
+                (run / 'result.json').write_text('retained evidence')
+            with patch.dict(os.environ, {'HANE_GUI_VALIDATE_RUN_DIR': str(run / 'next')}):
+                self.assertEqual(gv.build_config('editor', root).run_dir, run / 'next')
+            with patch.dict(os.environ, {'HANE_GUI_VALIDATE_RUN_DIR': str(root.parent / 'external-evidence')}):
+                self.assertEqual(gv.build_config('editor', root).run_dir, root.parent / 'external-evidence')
 
     def test_existing_run_evidence_is_never_overwritten(self):
         from unittest.mock import patch
@@ -566,7 +566,7 @@ class ScenarioSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with patch.dict(os.environ, {"HANE_GUI_VALIDATE_RUN_DIR": str(root / "run"), "HANE_CAPTURE_FIXTURE": ""}):
-                config = gv.build_config("editor", root)
+                config = gv.build_config("editor", root / 'checkout')
             start = Barrier(2)
             def reserve(_):
                 env = gv.RealEnvironment()
