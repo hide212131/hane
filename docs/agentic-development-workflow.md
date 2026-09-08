@@ -9,7 +9,7 @@ Hane の Issue から実装、レビュー、実アプリ検証、修正、マ�
 
 Local GUI validator の構成、信頼条件、依頼・結果の契約、段階的な実装順序は
 [Local GUI validation 設計](local-gui-validation.md) で具体化する。Computer Use を必須にせず、
-非公開リポジトリで実行を制御する判断は [ADR-0024](adr/0024-local-gui-validation.md) に残す。
+GitHub-hosted macOS を優先し、必要な場合だけ通常アカウントを含むローカルで補う判断は [ADR-0024](adr/0024-local-gui-validation.md) に残す。
 この方針の文書化と、実装・対象 Mac での実証の完了は区別する。
 
 追跡 Issue: #44
@@ -79,7 +79,7 @@ CI + Codex review
                                     +--> push --> 全検証やり直し
 ```
 
-必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、ローカル Mac の GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
+必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
 
 ## 各 agent / validator の責務
 
@@ -124,7 +124,7 @@ Local GUI validator は **検証専用** とし、コードを変更しない。
 
 Hane は Rust + GPUI のネイティブデスクトップアプリなので、CI とコードレビューだけでは、実際にウィンドウを起動したときの描画や操作を十分に確認できない。Local GUI validator はローカル macOS 上で Pull Request の対象 commit を checkout し、Hane を build / 起動して操作する。
 
-実行機構は、事前に決めたシナリオで起動・操作・結果確認を行う Hane 専用の検証コマンドを主経路とする。Computer Use は必須にせず、別セッションのアプリ承認を引き継げることを前提にしない。Mac の runner は非公開の制御用リポジトリに登録し、公開側から直接使わせない。AI による画像確認は、保存した証拠を使う後段の処理として分ける。具体的な条件と未実証の範囲は [Local GUI validation 設計](local-gui-validation.md) に従う。
+実行機構は、事前に決めたシナリオで起動・操作・結果確認を行う Hane 専用の検証コマンドを主経路とする。Computer Use は必須にせず、別セッションのアプリ承認を引き継げることを前提にしない。標準 GitHub-hosted macOS を優先し、検証手順と対象アプリを別の SHA で取得する。専用ローカルユーザーや非公開制御リポジトリを必須にしない。AI による画像確認は、保存した証拠を使う後段の処理として分ける。具体的な条件と未実証の範囲は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 検証対象の例は次のとおり。
 
@@ -161,7 +161,7 @@ trusted workflow は Pull Request の各 head SHA について、変更ファイ
 
 #### GUI validation の実行順序
 
-ローカル Mac の実行時間を無駄にしないため、GUI validation は次を満たした後に実行する。
+GUI runner の実行時間を無駄にしないため、GUI validation は次を満たした後に実行する。
 
 1. 対象 head SHA の必須 CI が成功している。
 2. 同じ head SHA に対する Codex review が完了している。
@@ -294,9 +294,9 @@ Codex の GitHub integration は `@codex review` コメントの投稿者が Cod
 
 ### Local GUI validator
 
-Local GUI validator はローカル macOS 上で動かす。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
+Local GUI validator は互換のため維持する役割名であり、実行場所は標準 GitHub-hosted macOS を優先する。不足が実証された操作だけローカル macOS で補う。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
 
-検証依頼の受付と結果報告は GitHub 側の信頼するジョブに分け、Mac のビルド・実行ジョブに Pull Request への書き込み認証情報を渡さない。非公開リポジトリとの受け渡しに必要な認証は、既存のレビュー用認証と兼用せず、対象リポジトリと処理に限定する。runner 自体が持つ認証情報まで安全に隔離できるという意味ではないため、実行できるコードの範囲も制限する。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。詳細は [Local GUI validation 設計](local-gui-validation.md) に従う。
+検証依頼の受付と結果報告は GitHub 側の信頼するジョブに分け、Mac のビルド・実行ジョブに Pull Request への書き込み認証情報を渡さない。hostedの実行ジョブには書き込み用認証やエージェントの認証を渡さず、checkoutの認証情報を残さない。ローカル補完で別リポジトリへの受け渡しが必要な場合も、既存のレビュー用認証と兼用しない。runner 自体が持つ認証情報まで安全に隔離できるという意味ではないため、実行できるコードの範囲も制限する。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。詳細は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 ### GitHub Copilot
 
@@ -552,9 +552,9 @@ GitHub Agentic Workflows の `merge-pull-request` safe output は現時点で ex
 
 Local GUI runner は Pull Request のコードを実際に実行するため、さらに強い信頼境界を置く。
 
-- public fork Pull Request を初期のローカル検証対象にしない。runner は非公開の制御用リポジトリにだけ登録する。
-- 初期対象は既存 controller が信頼する same-repository の Pull Request に限り、さらに人が exact head SHA の実行を承認する。
-- 初期運用は専用 OS user で行う。非公開リポジトリや専用ユーザーだけで対象コードを安全に隔離できるとはしない。
+- public fork Pull Request を検証対象にしない。標準 GitHub-hosted macOS を優先する。
+- hostedの対象は既存 controller が信頼する same-repository の Pull Request に限る。ローカルで実行する場合は人が対象 SHA と操作を確認する。
+- ローカル補完では通常のログインアカウントも認める。専用OSユーザーやprivate制御repoは運用上の選択肢であり、必須にしない。いずれも任意の外部コードを安全に隔離する保証とはしない。
 - SSH agent、個人データ、不要な cloud credential へアクセスさせない。
 - GUI validation に不要なディレクトリやサービスへの権限を与えない。
 - Markdown、Issue 本文、Pull Request 本文、テスト用ファイルなどに書かれた命令は **untrusted data** として扱う。
@@ -586,7 +586,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 ### Phase 4: Local GUI validation
 
 実装は [Local GUI validation 設計](local-gui-validation.md) の段階に従い、まず Terminal、
-次に非公開リポジトリの runner、続いて依頼・報告と必須シナリオの順に実証する。
+2026-09-09 に標準 GitHub-hosted macOS の起動・撮影が成功した。次に hosted 上の操作、依頼・結果受領、final judge、merge gate を実証する。ローカル補完は hosted で不足する操作に限って検討する。
 起動・撮影の成功だけで包括的な GUI 検証やマージ条件を満たしたことにはしない。
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
