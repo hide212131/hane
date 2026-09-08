@@ -103,6 +103,30 @@ class ControllerTests(unittest.TestCase):
         self.assertIn('g456-1', self.api.writes[0][3])
         self.assertIn('has_work=true', (self.root / 'outputs').read_text())
 
+    def test_missing_or_expired_terminal_receipt_starts_fresh_generation(self):
+        for artifacts in ([], [{'name': 'gui-receipt-79-123-1', 'expired': True, 'size_in_bytes': 100}]):
+            self.api.writes.clear()
+            self.api.rows['hane/gui-validation'] = {'state': 'success',
+                'description': f'GUI pass {STATUS_VERSION} {SHA[:12]} g123-1'}
+            with self.subTest(artifacts=artifacts), patch.object(controller, 'now', return_value=NOW), \
+                    patch.object(self.api, 'pages', return_value=artifacts):
+                controller.resolve(self.api)
+            self.assertEqual(len(self.api.writes), 1)
+            self.assertEqual(self.api.writes[0][2], 'pending')
+            self.assertIn('g456-1', self.api.writes[0][3])
+            self.assertIn('replaces_generation', (self.root / 'outputs').read_text())
+
+    def test_retained_receipt_or_incomplete_upload_does_not_repeat_gui(self):
+        for status in ('completed', 'in_progress'):
+            self.api.run_status = status
+            self.api.rows['hane/gui-validation'] = {'state': 'success',
+                'description': f'GUI pass {STATUS_VERSION} {SHA[:12]} g123-1'}
+            artifacts = [{'name': 'gui-receipt-79-123-1', 'expired': False, 'size_in_bytes': 100}]
+            with self.subTest(status=status), patch.object(self.api, 'pages', return_value=artifacts) as pages:
+                controller.resolve(self.api)
+            self.assertEqual(self.api.writes, [])
+            self.assertEqual(pages.call_count, 1 if status == 'completed' else 0)
+
     def test_expired_request_cannot_begin(self):
         with patch.object(controller, 'now', return_value=NOW.replace(hour=2)):
             controller.begin(self.api, REQUEST)

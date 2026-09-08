@@ -44,6 +44,20 @@ def current(api, request, require_claim=True):
     return True
 
 
+def terminal_receipt_retained(api, number, generation):
+    run_id, attempt = generation.split('-')
+    run = api.api(api.repo(f'actions/runs/{run_id}/attempts/{attempt}'))
+    if run.get('status') != 'completed':
+        # The report publishes its status before uploading the receipt. Give
+        # that exact attempt time to finish before deciding evidence is lost.
+        return True
+    names = {f'gui-receipt-{number}-{generation}', f'gui-recovered-{generation}'}
+    artifacts = api.pages(api.repo(f'actions/runs/{run_id}/artifacts'), 'artifacts')
+    retained = [row for row in artifacts if row.get('name') in names
+                and row.get('expired') is False and 0 < row.get('size_in_bytes', 0) <= 2 * 1024 * 1024]
+    return len(retained) == 1
+
+
 def resolve(api):
     requested = os.environ.get('INPUT_PR', '').strip()
     force = os.environ.get('INPUT_FORCE', 'false') == 'true'
@@ -63,9 +77,14 @@ def resolve(api):
                 continue
             old_status = api.statuses(pr['head']['sha']).get(CONTEXT, {})
             old = gui_state(old_status, pr['head']['sha'])
+            lost_generation = None
             if old and old[0] != 'pending' and not force:
-                continue
+                if terminal_receipt_retained(api, number, old[1]):
+                    continue
+                lost_generation, old = old[1], None
             request = request_for(pr)
+            if lost_generation:
+                request.update(replaces_generation=lost_generation, replacement_reason='receipt missing or expired')
             if old and old[0] == 'pending':
                 old_id, old_attempt = old[1].split('-')
                 old_run = api.api(api.repo(f'actions/runs/{old_id}/attempts/{old_attempt}'))
