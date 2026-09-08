@@ -449,6 +449,20 @@ durable な表現（commit status, context `hane/gui-requirement`）:
 - `claude-fix.yml` の自動修正 push は、新しい head SHA に対して `ci.yml` / `codex-review.yml` と同じタイミングで `gh workflow run gui-requirement.yml -f pr_number=... -f target_sha=<new_sha>` を dispatch する。
 - `claude-fix-reconcile.yml` は既存の Codex review 配送回復ロジックと同じ形で、自動修正 head の `hane/gui-requirement` 終端状態（成功の `false` または失敗の `true`）が存在しない場合に同じ `workflow_dispatch` を再試行する。この reconcile は `Copilot pre-GUI routing` / `Claude automatic fix worker` の `workflow_run` 完了イベントと `*/10 * * * *` の cron でも起動するため、配送失敗時も取りこぼさない。
 
+### Claude automatic fix の手動再試行
+
+自動修正が同じ Pull Request で3回完了すると worker は停止する。repository owner が、現在の head に `fix` 判定がある非Draft PRへ本文完全一致で `/claude-fix` とコメントすると、現在の回数上限を一度だけ bypass する。承認はそのコメントIDと対象headに結び付く。
+
+- 同じ承認からの有料実行は最大1回。実行直前に `authorized` から `claimed` へ記録してから Claude を呼ぶ。
+- 配送失敗や準備中の障害は、未claimの承認を使って復旧できる。claim後のタイムアウトや結果不明は自動再実行しない。owner がログを確認して新しい `/claude-fix` を投稿する。
+- 失敗・変更なし・workflowパッチ引き渡しは、その実行の承認だけを消費する。別の新しい承認を上書きしない。
+- 手動再試行が新しいcommitをpushできた場合、そのcommitが新しい自動修正サイクルの境界になる。手動実行自身は枠を消費せず、その後の自動修正に最大3回を許可する。
+- 完了statusやリセットstatusのPOSTが失敗しても、bot commitの実際の親子関係から完了と境界を算出する。APIへの記録順には依存しない。
+- `/codex-review` や同じworkflow runの再実行では承認を追加しない。新しい明示的コメントが必要。
+- `.github/workflows/**` を変更するPRの自動修正はworkerでも禁止する。owner承認での実行は可能だが、生成物がworkflow変更を含む場合はpatch artifactとして引き渡す。
+
+状態遷移、障害時の判断、回帰テストとPR #82指摘の対応は [Claude retry state](claude-retry-state.md) を参照。
+
 ### Local GUI validation
 
 GUI requirement classification が `required = true` で、対象 head SHA の CI が成功し、Codex outcome が `clean` または Copilot pre-GUI routing が `continue-validation` の場合、状態を `waiting-gui` にして Local GUI runner に検証を要求する。

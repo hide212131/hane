@@ -27,6 +27,17 @@ jobs:
       statuses: write
 
     steps:
+      - name: Check out trusted control policy
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .hane-control
+          persist-credentials: false
+
+      - name: Preserve trusted control policy before checking out the PR
+        shell: bash
+        run: cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
+
       - name: Reconcile trusted automatic-fix transitions
         shell: bash
         env:
@@ -57,12 +68,16 @@ jobs:
           dispatch_claude_fix() {
             local pr_number="$1"
             local target_sha="$2"
+            local manual_retry="${3:-false}"
+            local manual_retry_context="${4:-}"
             local payload
             payload="$(
               jq -n \
                 --argjson pr_number "$pr_number" \
                 --arg target_sha "$target_sha" \
-                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}'
+                --arg manual_retry "$manual_retry" \
+                --arg manual_retry_context "$manual_retry_context" \
+                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha,manual_retry:($manual_retry == "true"),manual_retry_context:$manual_retry_context}}'
             )"
             gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$payload"
           }
@@ -102,47 +117,25 @@ jobs:
 
             is_trusted_pr_author "$pr_author" || continue
 
-            statuses="$(gh api "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100")"
-            routing_decision="$(
-              jq -r --arg fix "Copilot routing: fix for ${short_sha}" \
-                '[.[] | select(.context == "hane/copilot-routing" and .description == $fix)] | max_by(.id) // {} | .description // ""' \
-                <<< "$statuses"
-            )"
-            claude_latest="$(
-              jq -r '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' \
-                <<< "$statuses"
-            )"
-            claude_description="${claude_latest%%$'\t'*}"
-            claude_created_at="${claude_latest#*$'\t'}"
-            claude_age="$(status_age_seconds "$claude_created_at")"
-
-            recover_claude=false
-            if [[ "$routing_decision" == "Copilot routing: fix for ${short_sha}" ]]; then
-              case "$claude_description" in
-                '') recover_claude=true ;;
-                "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
-                  [[ "$claude_age" -ge 3300 ]] && recover_claude=true
-                  ;;
-                "Claude fix controller failed for ${short_sha}")
-                  [[ "$claude_age" -ge 60 ]] && recover_claude=true
-                  ;;
-                "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
-                  ;;
-                *)
-                  echo "::warning::Unknown Claude fix state '${claude_description}' on ${head_sha}; not redispatching."
-                  ;;
-              esac
-            fi
+            statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${head_sha}/statuses?per_page=100" | jq 'add')"
+            decision="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" recovery --sha "$head_sha" <<< "$statuses")"
+            recover_claude="$(jq -r '.recover' <<< "$decision")"
+            manual_retry_authorized="$(jq -r '.manual_retry' <<< "$decision")"
+            manual_retry_context="$(jq -r '.manual_retry_context' <<< "$decision")"
 
             if [[ "$recover_claude" == true ]]; then
+              manual_retry="$manual_retry_authorized"
               echo "Recovering Claude fix for PR #${pr_number} head ${head_sha}."
-              dispatch_claude_fix "$pr_number" "$head_sha"
+              if [[ "$manual_retry" == true ]]; then
+                echo "Preserving manual Claude retry authorization for ${head_sha}."
+              fi
+              dispatch_claude_fix "$pr_number" "$head_sha" "$manual_retry" "$manual_retry_context"
               continue
             fi
 
             pr_commits="$(
               gh api --paginate "repos/${REPOSITORY}/pulls/${pr_number}/commits?per_page=100" \
-                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), actor:(.author.login // .committer.login // "")}' \
+                --jq '.[] | {sha, subject:(.commit.message|split("\n")[0]), message:(.commit.message // ""), parents, actor:(.author.login // .committer.login // "")}' \
                 | jq -s '.'
             )"
 
@@ -163,6 +156,9 @@ jobs:
               predecessor_count="$(grep -c . <<< "$predecessor_matches" || true)"
               [[ "$predecessor_count" -eq 1 ]] || continue
               predecessor_sha="$(head -n 1 <<< "$predecessor_matches")"
+              # Match the actual pushed edge, not just a subject/trailer string.
+              [[ "$(jq -r '.parents | length' <<< "$commit_record")" -eq 1 ]] || continue
+              [[ "$(jq -r '.parents[0].sha' <<< "$commit_record")" == "$predecessor_sha" ]] || continue
 
               completion_latest="$(
                 gh api "repos/${REPOSITORY}/commits/${predecessor_sha}/statuses?per_page=100" \
@@ -171,10 +167,31 @@ jobs:
               completion_state="$(cut -f1 <<< "$completion_latest")"
               completion_description="$(cut -f2 <<< "$completion_latest")"
               if [[ "$completion_state" != success || "$completion_description" != "Claude fix completed for ${old_short}" ]]; then
-                gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
+                if ! gh api --method POST "repos/${REPOSITORY}/statuses/${predecessor_sha}" \
                   -f state=success -f context='hane/claude-fix' \
                   -f description="Claude fix completed for ${old_short}" \
-                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null
+                  -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
+                  echo "::warning::Failed to recover Claude fix completion for ${predecessor_sha}."
+                fi
+              fi
+
+              # Manual retry commits are the durable evidence that a fresh cycle
+              # must start. Recover the marker after completion recovery so a
+              # transient worker failure cannot lose the cycle boundary.
+              commit_message="$(jq -r '.message // ""' <<< "$commit_record")"
+              if grep -q '^Manual retry: true$' <<< "$commit_message"; then
+                reset_state="$(
+                  gh api "repos/${REPOSITORY}/commits/${fix_sha}/statuses?per_page=100" \
+                    --jq '[.[] | select(.context == "hane/claude-fix-cycle" and .state == "success" and ((.description // "") | startswith("Claude fix cycle reset for ")))] | length'
+                )"
+                if [[ "$reset_state" -eq 0 ]]; then
+                  if ! gh api --method POST "repos/${REPOSITORY}/statuses/${fix_sha}" \
+                    -f state=success -f context='hane/claude-fix-cycle' \
+                    -f description="Claude fix cycle reset for ${fix_sha:0:12} after manual retry" \
+                    -f target_url="https://github.com/${REPOSITORY}/commit/${fix_sha}" >/dev/null; then
+                    echo "::warning::Failed to recover Claude fix cycle reset for ${fix_sha}."
+                  fi
+                fi
               fi
             done
 
