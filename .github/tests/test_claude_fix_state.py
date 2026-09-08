@@ -194,6 +194,13 @@ class WorkflowShellTests(unittest.TestCase):
             path = pathlib.Path(os.environ['API_STATE'])
             data = json.loads(path.read_text())
             args = sys.argv[1:]
+            if '--method' not in args and any('/pulls/' in a for a in args):
+                if os.environ.get('FAIL_PR_READ') == 'true':
+                    sys.exit(1)
+                print(json.dumps({'state': os.environ.get('PR_STATE', 'open'),
+                                  'draft': os.environ.get('PR_DRAFT') == 'true',
+                                  'head': {'sha': data.get('head', os.environ.get('CURRENT_HEAD', os.environ['TARGET_SHA']))}}))
+                sys.exit(0)
             if '--method' not in args:
                 print(json.dumps([data['statuses']]))
                 sys.exit(0)
@@ -202,6 +209,8 @@ class WorkflowShellTests(unittest.TestCase):
                 data['statuses'].append(dict(fields, id=max([s['id'] for s in data['statuses']], default=0)+1))
             else:
                 data['dispatches'] += 1
+            if fields.get('description', '').startswith('Claude manual retry claimed') and os.environ.get('MOVE_HEAD_ON_CLAIM'):
+                data['head'] = os.environ['MOVE_HEAD_ON_CLAIM']
             path.write_text(json.dumps(data))
             if os.environ.get('FAIL_POST') == 'true':
                 sys.exit(1)
@@ -241,6 +250,37 @@ class WorkflowShellTests(unittest.TestCase):
         script = step_script("claude-fix.yml", "Claim one paid invocation for this authorization")
         self.assertEqual(self.run_shell(script, [grant(1), grant(2, B), consume(3)]).returncode, 0)
         self.assertIn("granted=true", self.output.read_text())
+
+    def test_prepared_checkout_is_stale_at_invocation_for_manual_and_automatic(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        self.env['CURRENT_HEAD'] = 'b' * 40
+        for manual in ('true', 'false'):
+            with self.subTest(manual=manual):
+                self.env['MANUAL_RETRY'] = manual
+                self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+                self.assertNotIn('granted=true', self.output.read_text())
+
+    def test_head_moved_during_claim_post_never_grants_paid_execution(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        self.env['MOVE_HEAD_ON_CLAIM'] = 'b' * 40
+        self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+        self.assertNotIn('granted=true', self.output.read_text())
+        rows = json.loads(self.state.read_text())['statuses']
+        self.assertFalse(policy.authorization_valid(rows, SHA, A))
+
+    def test_failed_final_pr_read_is_fail_closed(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        self.env['FAIL_PR_READ'] = 'true'
+        self.assertNotEqual(self.run_shell(script, [grant()]).returncode, 0)
+        self.assertNotIn('granted=true', self.output.read_text())
+
+    def test_closed_or_draft_pr_cannot_invoke_claude(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        for state, draft in [('closed', 'false'), ('open', 'true')]:
+            with self.subTest(state=state, draft=draft):
+                self.env.update(PR_STATE=state, PR_DRAFT=draft)
+                self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+                self.assertNotIn('granted=true', self.output.read_text())
 
     def test_router_delivery_failure_persists_one_grant_for_reconciliation(self):
         script = step_script("copilot-routing.yml", "Dispatch manual Claude retry")

@@ -341,6 +341,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
           MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
           MANUAL_RETRY_CONTEXT: ${{ steps.target.outputs.manual_retry_context }}
@@ -358,6 +359,14 @@ jobs:
               -f state=pending -f context="$MANUAL_RETRY_CONTEXT" \
               -f description="Claude manual retry claimed for ${TARGET_SHA:0:12}" \
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          fi
+          # Checkout, setup and claim publication can outlive the reviewed head.
+          # Check eligibility after the claim, immediately before permitting Claude.
+          current_pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          if ! jq -e --arg sha "$TARGET_SHA" \
+            '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+            echo 'PR moved, closed, or became draft during preparation; skipping paid invocation.'
+            exit 0
           fi
           echo 'granted=true' >> "$GITHUB_OUTPUT"
 

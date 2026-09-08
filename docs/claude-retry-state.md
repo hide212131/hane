@@ -88,11 +88,17 @@ replace `gh` and execute the actual claim, manual-dispatch and terminal steps.
 They exercise successful writes, ambiguous persisted-but-failed writes,
 dispatch failures and duplicate delivery.
 
-Local validation: 66 tests passed, including 27 retry regressions; YAML parsing
+Local validation: 70 tests passed, including 31 retry regressions; YAML parsing
 and Bash syntax passed for all changed workflows. Actionlint 1.7.12 passed
 with only its unsupported existing `concurrency.queue` syntax excluded. That
 syntax is documented by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).
 No live paid retry, notification POST, or main-branch rollout was performed.
+
+The pre-invocation guard re-reads PR eligibility after the claim write. A head
+move during setup or claim publication, a closed/Draft PR, or a failed final
+read prevents invocation. The claim is not renewed on these paths. This covers
+[PR #85 discussion 3959823708](https://github.com/hide212131/hane/pull/85#discussion_r3959823708)
+with four production-shell regressions (including both automatic and manual delivery).
 
 Before leaving draft:
 
