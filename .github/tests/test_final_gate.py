@@ -176,6 +176,24 @@ class EffectTests(unittest.TestCase):
             self.assertEqual(len(api.writes), 1)  # claim only, never a terminal status
             self.assertEqual(api.merges, [])
 
+    def test_unavailable_merge_response_is_reconciled_against_exact_head(self):
+        for actual_head in (SHA, 'd' * 40):
+            api, data = FakeAPI(), ready()
+            confirmed = {'merged': True, 'head': {'sha': actual_head}, 'merge_commit_sha': 'c' * 40}
+            with self.subTest(head=actual_head), patch.object(controller, 'snapshot', return_value=data), \
+                    patch.object(controller, 'judge', return_value={'decision': 'ready', 'reason': 'passed'}), \
+                    patch.object(api, 'api', side_effect=TimeoutError('response lost')), \
+                    patch.object(api, 'pr', create=True, return_value=confirmed) as reread:
+                controller.process(api, 1, self.directory)
+            reread.assert_called_once_with(1)
+            proof = json.loads((self.directory / '1.json').read_text())
+            self.assertEqual(proof['effect'], 'merged' if actual_head == SHA else 'blocked')
+            if actual_head == SHA:
+                self.assertEqual(proof['merge_sha'], 'c' * 40)
+                self.assertTrue(proof['merge_reconciled_after_lost_response'])
+            else:
+                self.assertNotIn('merge_sha', proof)
+
     def test_last_moment_regression_prevents_merge(self):
         api, data = FakeAPI(), ready()
         regressed = dict(data, ci_ready=False)

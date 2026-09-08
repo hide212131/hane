@@ -203,6 +203,18 @@ def process(api, number, directory):
                     result = api.api(api.repo(f'pulls/{number}/merge'), {'sha': newest['sha'], 'merge_method': 'squash'}, 'PUT')
                 except Exception as exc:
                     result = {'merged': False, 'message': f'merge response unavailable: {exc}'}
+                    # A lost HTTP response does not mean the server rejected
+                    # the CAS. Read the actual PR before recording blocked.
+                    try:
+                        confirmed = api.pr(number)
+                        merge_sha = confirmed.get('merge_commit_sha', '')
+                        if (confirmed.get('merged') is True
+                                and confirmed.get('head', {}).get('sha') == newest['sha']
+                                and isinstance(merge_sha, str) and re.fullmatch('[0-9a-f]{40}', merge_sha)):
+                            result = {'merged': True, 'sha': merge_sha}
+                            proof['merge_reconciled_after_lost_response'] = True
+                    except Exception as confirm_error:
+                        result['message'] += f'; PR state unavailable: {confirm_error}'
                 if result.get('merged') is True:
                     proof['effect'] = 'merged'
                     proof['merge_sha'] = result['sha']
