@@ -949,6 +949,13 @@ def _publish_result(env: RealEnvironment, config: Config, result: dict) -> int:
             summary_temp.replace(summary_path)
             result_temp.replace(result_path)  # Publish the canonical receipt last, atomically.
         except OSError as exc:
+            # reserve() succeeded for this generation while the execution lock
+            # is held. A previous iteration may already have published pass;
+            # never leave it canonical after a failed downgrade publication.
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError as invalidate_error:
+                print(f"[BLOCKED] 古い結果の無効化にも失敗した: {invalidate_error}", file=sys.stderr)
             print(f"[BLOCKED] 結果を書き込めなかった: {exc}", file=sys.stderr)
             return EXIT_BLOCKED
         if not _incorporate_publication_aborts(env, config, result):

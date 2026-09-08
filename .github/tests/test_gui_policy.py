@@ -38,7 +38,7 @@ def passing_result():
                       'source_snapshot_sha': SHA, 'source_snapshot_clean': True},
             'runner': {'os': 'macOS', 'arch': 'ARM64', 'machine': 'arm64', 'image_os': 'macos15',
                        'image_version': '20260829.0321.1', 'macos_version': '15.7.9'},
-            'top_level_steps': [{'name': s, 'result': 'pass'} for s in ('preflight', 'build')],
+            'top_level_steps': [{'name': s, 'result': 'pass'} for s in ('preflight', 'prepare_helper', 'build')],
             'scenarios': scenarios, 'overall_result': 'pass'}
 
 

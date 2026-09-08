@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 POLICY = 'v1'
-PROCEDURE = 'hosted-gui-interaction/3'
+PROCEDURE = 'hosted-gui-interaction/4'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
@@ -122,7 +122,7 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                 or not isinstance(runner.get('image_version'), str) or not runner['image_version'].strip()):
             raise ValueError('missing or inconsistent hosted runner image metadata')
         top = raw.get('top_level_steps', [])
-        if {s.get('name') for s in top} != {'preflight', 'build'} or any(s.get('result') != 'pass' for s in top):
+        if {s.get('name') for s in top} != {'preflight', 'prepare_helper', 'build'} or any(s.get('result') != 'pass' for s in top):
             raise ValueError('incomplete build/preflight')
         scenarios = raw.get('scenarios', [])
         if len(scenarios) != len(REQUIRED_STEPS) or {s.get('name') for s in scenarios} != set(REQUIRED_STEPS):

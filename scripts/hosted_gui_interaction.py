@@ -27,6 +27,7 @@ lifecycle logic is reused rather than reimplemented.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import math
@@ -37,12 +38,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/3"
+PROCEDURE_VERSION = "hosted-gui-interaction/4"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力の"
@@ -97,14 +98,32 @@ def reason_for(steps: list[dict]) -> str:
     return "; ".join(reasons) if reasons else "すべての工程が成功した"
 
 
-def run_helper(swift_helper: Path, args: list[str], timeout: float) -> tuple[bool, str, str]:
+@dataclass(frozen=True)
+class PreparedHelper:
+    binary: Path
+    digest: str
+
+
+def prepare_helper(source: Path, directory: Path) -> PreparedHelper:
+    binary = directory / 'interaction-helper'
+    subprocess.run(['/usr/bin/swiftc', str(source), '-o', str(binary)],
+                   capture_output=True, text=True, check=True, timeout=120)
+    binary.chmod(0o500)
+    return PreparedHelper(binary, hashlib.sha256(binary.read_bytes()).hexdigest())
+
+
+def run_helper(swift_helper: PreparedHelper, args: list[str], timeout: float) -> tuple[bool, str, str]:
     try:
+        if hashlib.sha256(swift_helper.binary.read_bytes()).hexdigest() != swift_helper.digest:
+            return False, '', 'compiled interaction helper integrity mismatch'
         proc = subprocess.run(
-            ["swift", str(swift_helper), *args],
+            [str(swift_helper.binary), *args],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        if hashlib.sha256(swift_helper.binary.read_bytes()).hexdigest() != swift_helper.digest:
+            return False, '', 'compiled interaction helper integrity mismatch'
     except subprocess.TimeoutExpired:
         return False, "", f"swift helper timed out after {timeout}s: {' '.join(args)}"
     except OSError as exc:
@@ -510,6 +529,7 @@ def main() -> int:
     priority = module.RESULT_PRIORITY
 
     lock_error = None
+    helper_directory = tempfile.TemporaryDirectory(prefix='hane-trusted-helper-')
     try:
         env.acquire_execution()
     except module.EnvError as exc:
@@ -544,7 +564,19 @@ def main() -> int:
         if preflight_step["result"] != "pass":
             top_steps.append(skipped_step("build", "preflight が pass しなかった"))
         else:
-            build_step, binary_path, build_info = module.do_build(env, preflight_config)
+            # Compile trusted source before Cargo can execute target build.rs.
+            # Digest is retained in this process, checked around every use.
+            # This detects replacement, but is not OS isolation against a
+            # hostile same-user background process racing these checks.
+            try:
+                swift_helper = prepare_helper(swift_helper, Path(helper_directory.name))
+                top_steps.append(make_step('prepare_helper', 'pass', sha256=swift_helper.digest))
+            except (OSError, subprocess.SubprocessError) as exc:
+                top_steps.append(make_step('prepare_helper', 'blocked', reason=str(exc)))
+            if isinstance(swift_helper, PreparedHelper):
+                build_step, binary_path, build_info = module.do_build(env, preflight_config)
+            else:
+                build_step, binary_path = skipped_step('build', 'trusted helper unavailable'), None
             top_steps.append(build_step)
             if build_step["result"] != "pass":
                 binary_path = None
@@ -625,6 +657,7 @@ def main() -> int:
         return EXIT_PASS if overall_result == "pass" else EXIT_NONPASS
     finally:
         env.release_execution()
+        helper_directory.cleanup()
 
 
 

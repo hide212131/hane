@@ -163,6 +163,31 @@ class ControllerTests(unittest.TestCase):
             controller.begin(self.api, REQUEST)
         self.assertIn('proceed=false', (self.root / 'outputs').read_text())
 
+    def test_lost_eligibility_retires_pending_without_gui_failure(self):
+        for field in ('gui_required', 'classified', 'review_ready', 'ci_ready'):
+            for mode in ('begin', 'report', 'resolve'):
+                self.api.writes.clear()
+                data = self.api.evidence(self.api.pull)
+                data[field] = False
+                with self.subTest(field=field, mode=mode), \
+                        patch.object(self.api, 'evidence', return_value=data), \
+                        patch.object(controller, 'now', return_value=NOW):
+                    if mode == 'resolve':
+                        controller.resolve(self.api)
+                    else:
+                        getattr(controller, mode)(self.api, REQUEST)
+                    if mode == 'begin':
+                        self.assertEqual(self.api.writes, [])
+                        controller.resolve(self.api)
+                self.assertEqual(len(self.api.writes), 1)
+                self.assertIn('GUI superseded', self.api.writes[0][3])
+                self.api.rows['hane/gui-validation']['description'] = self.api.writes[0][3]
+                self.api.writes.clear()
+                with patch.object(controller, 'now', return_value=NOW):
+                    controller.resolve(self.api)
+                self.assertEqual(self.api.writes[0][2], 'pending')
+                self.api.rows['hane/gui-validation']['description'] = f'GUI pending {STATUS_VERSION} {SHA[:12]} g123-1'
+
 
 class CITests(unittest.TestCase):
     def test_latest_platform_and_whole_workflow_must_pass(self):
