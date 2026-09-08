@@ -12,6 +12,7 @@ import final_pipeline as controller
 from final_policy import authenticated_receipt, fingerprint, final_state, gate, may_judge, parse_decision
 from claude_fix_state import routing_allows_fix
 from pipeline_api import CI_NAMES
+from gui_policy import PROCEDURE
 
 SHA = 'a' * 40
 
@@ -60,7 +61,8 @@ class PolicyTests(unittest.TestCase):
 
     def test_receipt_must_come_from_main_exact_attempt_and_procedure_run(self):
         request = {'pr_number': 1, 'sha': SHA, 'repository': 'owner/repo', 'control_sha': 'b' * 40,
-                   'generation': '123-2', 'run_id': '123', 'run_attempt': '2', 'request_id': 'gui-123-2-pr1'}
+                   'generation': '123-2', 'run_id': '123', 'run_attempt': '2', 'request_id': 'gui-123-2-pr1',
+                   'procedure_version': PROCEDURE}
         proof = {'schema_version': 1, 'policy_version': 'v1', 'request': request, 'outcome': 'pass'}
         run = {'id': 123, 'run_attempt': 2, 'status': 'completed', 'path': '.github/workflows/gui-validation.yml',
                'head_branch': 'main', 'head_sha': 'b' * 40, 'event': 'workflow_dispatch'}
@@ -70,6 +72,9 @@ class PolicyTests(unittest.TestCase):
             bad = dict(run, **{field: value})
             with self.subTest(field=field), self.assertRaises(ValueError):
                 authenticated_receipt(proof, SHA, 1, 'owner/repo', ('pass', '123-2'), bad)
+        request['procedure_version'] = 'hosted-gui-interaction/2'
+        with self.assertRaises(ValueError):
+            authenticated_receipt(proof, SHA, 1, 'owner/repo', ('pass', '123-2'), run)
 
     def test_final_fix_authorization_can_be_superseded(self):
         final = {'id': 10, 'context': 'hane/final-judge', 'state': 'failure',
@@ -129,6 +134,23 @@ class EffectTests(unittest.TestCase):
             with self.subTest(field=field, value=value), patch.object(controller, 'snapshot', return_value=data), patch.object(controller, 'judge', return_value={'decision': 'ready', 'reason': 'model recommendation'}):
                 controller.process(api, 1, self.directory)
                 self.assertEqual(api.merges, [])
+
+    def test_refused_or_uncertain_merge_is_blocked_without_repeating_judge(self):
+        for response in ({'merged': False, 'message': 'branch protection refused'}, ValueError('network failure')):
+            api, data = FakeAPI(), ready()
+            options = {'side_effect': response} if isinstance(response, Exception) else {'return_value': response}
+            with self.subTest(response=response), patch.object(controller, 'snapshot', return_value=data), \
+                    patch.object(controller, 'judge', return_value={'decision': 'ready', 'reason': 'passed'}) as judge, \
+                    patch.object(api, 'api', **options) as merge:
+                controller.process(api, 1, self.directory)
+                controller.process(api, 1, self.directory)
+            self.assertEqual(judge.call_count, 1)
+            self.assertEqual(merge.call_count, 1)
+            self.assertEqual(api.writes[-1][2], 'error')
+            proof = json.loads((self.directory / '1.json').read_text())
+            self.assertEqual(proof['effect'], 'blocked')
+            self.assertTrue(proof['merge_error'])
+            self.assertNotIn('merge_sha', proof)
 
     def test_head_or_generation_change_after_judgement_has_no_terminal_effect(self):
         for field, value in [('sha', 'd' * 40), ('gui_receipt', {'outcome': 'pass', 'generation': 'new'})]:

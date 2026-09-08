@@ -174,14 +174,20 @@ def process(api, number, directory):
             # Re-read all conditions immediately before GitHub's atomic head check.
             newest = snapshot(api, number)
             if fingerprint(newest) == key and not gate(newest):
-                result = api.api(api.repo(f'pulls/{number}/merge'), {'sha': newest['sha'], 'merge_method': 'squash'}, 'PUT')
+                try:
+                    result = api.api(api.repo(f'pulls/{number}/merge'), {'sha': newest['sha'], 'merge_method': 'squash'}, 'PUT')
+                except Exception as exc:
+                    result = {'merged': False, 'message': f'merge response unavailable: {exc}'}
                 if result.get('merged') is True:
                     proof['effect'] = 'merged'
                     proof['merge_sha'] = result['sha']
                     receipt_path.write_text(json.dumps(proof, ensure_ascii=False, indent=2))
                     publish(api, newest, key, 'merged')
                 else:
-                    proof['effect'] = 'merge refused'
+                    proof['effect'] = 'blocked'
+                    proof['merge_error'] = str(result.get('message', 'GitHub refused the merge'))[:2000]
+                    receipt_path.write_text(json.dumps(proof, ensure_ascii=False, indent=2))
+                    publish(api, newest, key, 'blocked')
         elif outcome == 'fix' and not fresh['workflow_changes']:
             # The shared fix worker validates this exact final receipt before
             # accepting GUI failures as implementation evidence.

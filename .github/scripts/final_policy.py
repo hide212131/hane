@@ -2,7 +2,7 @@
 import hashlib
 import json
 import re
-from gui_policy import CONTEXT as GUI_CONTEXT, gui_state
+from gui_policy import CONTEXT as GUI_CONTEXT, PROCEDURE, gui_state
 from pipeline_api import CI_NAMES
 
 CONTEXT = 'hane/final-judge'
@@ -72,6 +72,7 @@ def authenticated_receipt(proof, snapshot_sha, pr_number, repository, state, run
             or run.get('head_branch') != 'main'
             or run.get('event') not in ('workflow_dispatch', 'workflow_run', 'schedule')
             or request.get('control_sha') != run.get('head_sha')
+            or request.get('procedure_version') != PROCEDURE
             or proof.get('schema_version') != 1 or proof.get('policy_version') != 'v1'
             or request.get('sha') != snapshot_sha or request.get('pr_number') != pr_number
             or request.get('repository') != repository or request.get('generation') != generation

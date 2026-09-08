@@ -12,6 +12,8 @@ GUI claim/report jobs and final judgement share a serialized state-writer queue,
 
 A decision is bound to a fingerprint of the current evidence. Changed head, GUI generation, labels, review state, or required rules invalidate it. Repeated deliveries cannot repeat a paid judgement for unchanged evidence. A lost pending judge becomes blocked after its run completes. New evidence permits a fresh decision; controller/inference failures never mean pass.
 
+A refused or unavailable merge response records its reason and ends as `blocked`, even when Copilot recommended `ready`. It does not claim a merge or repeat the paid judgement. Fresh evidence allows another attempt; an uncertain response must first be checked against the actual PR state.
+
 ## Automatic merge
 
 The repository owner opts a PR into automatic merging with the `agentic-auto-merge` label. The label grants no exception to the checks below:
