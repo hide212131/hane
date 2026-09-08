@@ -132,13 +132,10 @@ jobs:
             exit 0
           fi
 
-          routing="$(
-            jq -r --arg fix "Copilot routing: fix for ${short_sha}" \
-              '[.[] | select(.context == "hane/copilot-routing" and .state == "failure" and .description == $fix)] | max_by(.id) // {} | .description // ""' \
-              <<< "$authorization_statuses"
-          )"
-          if [[ "$routing" != "Copilot routing: fix for ${short_sha}" ]]; then
-            echo "::warning::No exact-head Copilot fix decision exists for ${TARGET_SHA}."
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing \
+            --sha "$TARGET_SHA" --manual "$manual_retry" <<< "$authorization_statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            echo 'The current routing decision does not authorize a fix.'
             exit 0
           fi
 
@@ -360,6 +357,14 @@ jobs:
               -f state=pending -f context="$MANUAL_RETRY_CONTEXT" \
               -f description="Claude manual retry claimed for ${TARGET_SHA:0:12}" \
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          fi
+          # A newer substantive route may have arrived during setup/claim.
+          statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing \
+            --sha "$TARGET_SHA" --manual "$MANUAL_RETRY" <<< "$statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            echo 'Routing no longer authorizes a fix; skipping paid invocation.'
+            exit 0
           fi
           # Checkout, setup and claim publication can outlive the reviewed head.
           # Check eligibility after the claim, immediately before permitting Claude.

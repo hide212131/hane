@@ -119,6 +119,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(policy.recovery([grant()], SHA, NOW)["recover"])
 
 
+class RoutingTests(unittest.TestCase):
+    def test_new_no_fix_survives_controller_failure_for_manual_and_automatic(self):
+        for kind in ['continue-validation', 'blocked']:
+            rows = [route(1), route(2, kind), status(3, 'hane/copilot-routing', 'error',
+                                                   f'Copilot routing controller failed for {SHORT}')]
+            for manual in [False, True]:
+                with self.subTest(kind=kind, manual=manual):
+                    self.assertFalse(policy.routing_allows_fix(rows, SHA, manual))
+                    self.assertFalse(policy.recovery(rows + ([grant(4)] if manual else []), SHA, NOW)['recover'])
+
+    def test_owner_override_cannot_cross_a_newer_no_fix(self):
+        for kind in ['continue-validation', 'blocked']:
+            rows = [route(1), route(2, kind), route(3, 'workflow changes require owner'), grant(4)]
+            self.assertFalse(policy.routing_allows_fix(rows, SHA, True))
+            self.assertFalse(policy.recovery(rows, SHA, NOW)['recover'])
+
+    def test_pending_unknown_or_wrong_state_never_reuses_old_fix(self):
+        for description, state in [(f'Copilot routing pending for {SHORT}', 'pending'),
+                                   ('Unknown routing outcome', 'error'),
+                                   (f'Copilot routing: fix for {SHORT}', 'success')]:
+            rows = [route(1), status(2, 'hane/copilot-routing', state, description),
+                    status(3, 'hane/copilot-routing', 'error', f'Copilot routing controller failed for {SHORT}')]
+            self.assertFalse(policy.routing_allows_fix(rows, SHA, True))
+
+    def test_newer_fix_restores_permission_after_blocked(self):
+        rows = [route(1, 'blocked'), route(2)]
+        self.assertTrue(policy.routing_allows_fix(rows, SHA))
+        self.assertTrue(policy.recovery(rows, SHA, NOW)['recover'])
+
+
 def commit(number, parent=None, manual=False, bot=True):
     # Use distinctive prefixes because the workflow records 12-character prefixes.
     sha = f"{number:012x}" + "0" * 28
@@ -211,6 +241,10 @@ class WorkflowShellTests(unittest.TestCase):
                 data['dispatches'] += 1
             if fields.get('description', '').startswith('Claude manual retry claimed') and os.environ.get('MOVE_HEAD_ON_CLAIM'):
                 data['head'] = os.environ['MOVE_HEAD_ON_CLAIM']
+            if fields.get('description', '').startswith('Claude manual retry claimed') and os.environ.get('ROUTE_AFTER_CLAIM'):
+                data['statuses'].append(dict(context='hane/copilot-routing', state='success',
+                    description='Copilot routing: continue-validation for ' + os.environ['TARGET_SHA'][:12],
+                    id=max(s['id'] for s in data['statuses'])+1))
             path.write_text(json.dumps(data))
             if os.environ.get('FAIL_POST') == 'true':
                 sys.exit(1)
@@ -233,14 +267,14 @@ class WorkflowShellTests(unittest.TestCase):
 
     def test_duplicate_delivery_claims_only_once(self):
         script = step_script("claude-fix.yml", "Claim one paid invocation for this authorization")
-        self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+        self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
         self.assertIn("granted=true", self.output.read_text())
         self.assertEqual(self.run_shell(script).returncode, 0)
         self.assertNotIn("granted=true", self.output.read_text())
 
     def test_ambiguous_claim_post_does_not_grant_execution_or_retry(self):
         script = step_script("claude-fix.yml", "Claim one paid invocation for this authorization")
-        self.assertNotEqual(self.run_shell(script, [grant()], fail=True).returncode, 0)
+        self.assertNotEqual(self.run_shell(script, [route(), grant()], fail=True).returncode, 0)
         self.assertNotIn("granted=true", self.output.read_text())
         self.assertEqual(self.run_shell(script).returncode, 0)
         self.assertNotIn("granted=true", self.output.read_text())
@@ -248,7 +282,7 @@ class WorkflowShellTests(unittest.TestCase):
     def test_new_authorization_can_claim_after_old_consumption(self):
         self.env['MANUAL_RETRY_CONTEXT'] = B
         script = step_script("claude-fix.yml", "Claim one paid invocation for this authorization")
-        self.assertEqual(self.run_shell(script, [grant(1), grant(2, B), consume(3)]).returncode, 0)
+        self.assertEqual(self.run_shell(script, [route(), grant(1), grant(2, B), consume(3)]).returncode, 0)
         self.assertIn("granted=true", self.output.read_text())
 
     def test_prepared_checkout_is_stale_at_invocation_for_manual_and_automatic(self):
@@ -257,13 +291,13 @@ class WorkflowShellTests(unittest.TestCase):
         for manual in ('true', 'false'):
             with self.subTest(manual=manual):
                 self.env['MANUAL_RETRY'] = manual
-                self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+                self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
                 self.assertNotIn('granted=true', self.output.read_text())
 
     def test_head_moved_during_claim_post_never_grants_paid_execution(self):
         script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
         self.env['MOVE_HEAD_ON_CLAIM'] = 'b' * 40
-        self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+        self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
         self.assertNotIn('granted=true', self.output.read_text())
         rows = json.loads(self.state.read_text())['statuses']
         self.assertFalse(policy.authorization_valid(rows, SHA, A))
@@ -271,7 +305,7 @@ class WorkflowShellTests(unittest.TestCase):
     def test_failed_final_pr_read_is_fail_closed(self):
         script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
         self.env['FAIL_PR_READ'] = 'true'
-        self.assertNotEqual(self.run_shell(script, [grant()]).returncode, 0)
+        self.assertNotEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
         self.assertNotIn('granted=true', self.output.read_text())
 
     def test_closed_or_draft_pr_cannot_invoke_claude(self):
@@ -279,8 +313,14 @@ class WorkflowShellTests(unittest.TestCase):
         for state, draft in [('closed', 'false'), ('open', 'true')]:
             with self.subTest(state=state, draft=draft):
                 self.env.update(PR_STATE=state, PR_DRAFT=draft)
-                self.assertEqual(self.run_shell(script, [grant()]).returncode, 0)
+                self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
                 self.assertNotIn('granted=true', self.output.read_text())
+
+    def test_new_no_fix_during_claim_stops_invocation(self):
+        script = step_script('claude-fix.yml', 'Claim one paid invocation for this authorization')
+        self.env['ROUTE_AFTER_CLAIM'] = 'true'
+        self.assertEqual(self.run_shell(script, [route(), grant()]).returncode, 0)
+        self.assertNotIn('granted=true', self.output.read_text())
 
     def test_router_delivery_failure_persists_one_grant_for_reconciliation(self):
         script = step_script("copilot-routing.yml", "Dispatch manual Claude retry")

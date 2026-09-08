@@ -37,6 +37,16 @@ decisions. They copy it from `github.workflow_sha` before checking out the PR,
 so the controller and policy come from the same workflow revision. Pull request
 code is not imported to make the pre-execution authorization decision.
 
+The latest routing event is also authoritative in both worker and recovery.
+Controller-failure notifications may be skipped while reading history, but a
+newer `continue-validation`, `blocked`, pending, unknown or malformed decision
+must never revive an older fix. An owner grant bypasses only an owner-only
+workflow guard; it does not override a newer no-fix decision. The worker checks
+this shared policy both during resolution and after claiming, before its final
+PR eligibility lookup. This covers [discussion 3959897165](https://github.com/hide212131/hane/pull/85#discussion_r3959897165)
+with routing regressions and a real claim-shell simulation of a newer no-fix
+arriving during the claim POST.
+
 ## Cycle budget
 
 The budget limits successful automatic fixes, not total workflow runs. Each
@@ -88,7 +98,7 @@ replace `gh` and execute the actual claim, manual-dispatch and terminal steps.
 They exercise successful writes, ambiguous persisted-but-failed writes,
 dispatch failures and duplicate delivery.
 
-Local validation: 70 tests passed, including 31 retry regressions; YAML parsing
+Local validation: 75 tests passed, including 36 retry regressions; YAML parsing
 and Bash syntax passed for all changed workflows. Actionlint 1.7.12 passed
 with only its unsupported existing `concurrency.queue` syntax excluded. That
 syntax is documented by [GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax).

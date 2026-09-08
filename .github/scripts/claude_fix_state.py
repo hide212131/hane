@@ -47,22 +47,32 @@ def age_seconds(status, now):
         return 0
 
 
+def routing_allows_fix(statuses, sha, manual=False):
+    """Ignore transport failures, never superseding routing decisions.
+
+    An explicit owner grant may bypass an owner-only workflow guard, but not
+    a newer continue/blocked/pending/unknown decision. Inspect the actual
+    preceding event instead of resurrecting an arbitrary historical fix.
+    """
+    short = sha[:12]
+    ignored = {f"Copilot routing controller failed for {short}"}
+    if manual:
+        ignored.add(f"Copilot routing: workflow changes require owner for {short}")
+    for event in sorted((s for s in statuses if s.get("context") == "hane/copilot-routing"),
+                        key=lambda s: s["id"], reverse=True):
+        if event.get("state") == "error" and event.get("description") in ignored:
+            continue
+        return (event.get("state") == "failure"
+                and event.get("description") == f"Copilot routing: fix for {short}")
+    return False
+
+
 def recovery(statuses, sha, now):
     short = sha[:12]
     latest = latest_by_context(statuses)
     manual = authorizations(statuses, sha)
-    route = latest.get("hane/copilot-routing", {}).get("description", "")
-    fix = f"Copilot routing: fix for {short}"
-    owner = f"Copilot routing: workflow changes require owner for {short}"
-    failed = f"Copilot routing controller failed for {short}"
-    fix_id = max((s["id"] for s in statuses if s.get("context") == "hane/copilot-routing"
-                  and s.get("description") == fix and s.get("state") == "failure"), default=0)
-    owner_id = max((s["id"] for s in statuses if s.get("context") == "hane/copilot-routing"
-                    and s.get("description") == owner), default=0)
-    route_ok = (route == fix or (route == failed and fix_id > owner_id)
-                or (bool(manual) and fix_id > 0))
     result = {"recover": False, "manual_retry": False, "manual_retry_context": ""}
-    if not route_ok:
+    if not routing_allows_fix(statuses, sha, bool(manual)):
         return result
     execution = latest.get("hane/claude-fix", {})
     description = execution.get("description", "")
@@ -126,14 +136,17 @@ def cycle_budget(commits, statuses_by_sha, target_sha):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("authorization", "recovery", "budget"))
+    parser.add_argument("mode", choices=("authorization", "recovery", "budget", "routing"))
     parser.add_argument("--sha", required=True)
     parser.add_argument("--context", default="")
+    parser.add_argument("--manual", choices=("true", "false"), default="false")
     args = parser.parse_args()
     data = json.load(sys.stdin)
     if args.mode == "authorization":
         result = {"valid": authorization_valid(data, args.sha, args.context),
                   "active": bool(authorizations(data, args.sha))}
+    elif args.mode == "routing":
+        result = {"allowed": routing_allows_fix(data, args.sha, args.manual == "true")}
     elif args.mode == "recovery":
         result = recovery(data, args.sha, datetime.now(timezone.utc))
     else:
