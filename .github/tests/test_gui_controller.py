@@ -35,7 +35,9 @@ class FakeGitHub(GitHub):
 
     def api(self, path, **kwargs):
         self.paths.append(path)
-        return {'id': 123, 'status': self.run_status}
+        return {'id': 123, 'run_attempt': 1, 'status': self.run_status,
+                'path': '.github/workflows/gui-validation.yml', 'head_branch': 'main',
+                'head_sha': 'b' * 40, 'event': 'workflow_dispatch'}
 
     def evidence(self, pr):
         return dict.fromkeys(('gui_required', 'classified', 'review_ready', 'ci_ready'), True)
@@ -121,11 +123,40 @@ class ControllerTests(unittest.TestCase):
             self.api.run_status = status
             self.api.rows['hane/gui-validation'] = {'state': 'success',
                 'description': f'GUI pass {STATUS_VERSION} {SHA[:12]} g123-1'}
-            artifacts = [{'name': 'gui-receipt-79-123-1', 'expired': False, 'size_in_bytes': 100}]
-            with self.subTest(status=status), patch.object(self.api, 'pages', return_value=artifacts) as pages:
+            proof = {'schema_version': 1, 'policy_version': 'v1', 'request': REQUEST, 'outcome': 'pass'}
+            with self.subTest(status=status), patch.object(controller, 'artifact_json', return_value=proof) as read:
                 controller.resolve(self.api)
             self.assertEqual(self.api.writes, [])
-            self.assertEqual(pages.call_count, 1 if status == 'completed' else 0)
+            self.assertEqual(read.call_count, 1 if status == 'completed' else 0)
+
+    def test_recovery_receipt_is_authenticated_for_the_requested_pr(self):
+        proof = {'schema_version': 1, 'policy_version': 'v1', 'request': REQUEST, 'outcome': 'blocked'}
+        other = deepcopy(proof)
+        other['request'].update(pr_number=80, request_id='gui-123-1-pr80')
+        for result, expected in ((proof, True), (other, False), (ValueError('missing 79.json member'), False)):
+            with self.subTest(result=result), patch.object(controller, 'artifact_json', side_effect=[ValueError('normal missing'), result]) as read:
+                self.assertEqual(controller.terminal_receipt_retained(self.api, self.api.pull, ('blocked', '123-1')), expected)
+                self.assertEqual(read.call_args.args[-1], '79.json')
+        with patch.object(controller, 'artifact_json', return_value=proof) as read:
+            self.assertTrue(controller.terminal_receipt_retained(self.api, self.api.pull, ('blocked', '123-1')))
+            self.assertEqual(read.call_count, 1)  # A different PR's recovery artifact is irrelevant.
+
+    def test_shared_recovery_archive_requires_the_exact_pr_member(self):
+        import io
+        import json
+        import subprocess
+        import zipfile
+        import gui_artifacts
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zipped:
+            zipped.writestr('80.json', json.dumps({'request': {'pr_number': 80}}))
+        rows = [{'id': 1, 'name': 'gui-recovered-123-1', 'expired': False, 'size_in_bytes': len(archive.getvalue())}]
+        response = subprocess.CompletedProcess([], 0, archive.getvalue(), b'')
+        with patch.object(self.api, 'pages', return_value=rows), \
+                patch.object(gui_artifacts.subprocess, 'run', return_value=response):
+            with self.assertRaises(ValueError):
+                gui_artifacts.artifact_json(self.api, '123', 'gui-recovered-123-1', '79.json')
+            self.assertEqual(gui_artifacts.artifact_json(self.api, '123', 'gui-recovered-123-1', '80.json')['request']['pr_number'], 80)
 
     def test_expired_request_cannot_begin(self):
         with patch.object(controller, 'now', return_value=NOW.replace(hour=2)):
