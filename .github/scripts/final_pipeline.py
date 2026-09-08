@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gui_policy import CONTEXT as GUI_CONTEXT, gui_state
+from gui_policy import CONTEXT as GUI_CONTEXT, gui_state, review_ready
 from final_policy import AUTO_LABEL, CONTEXT, JUDGE_PROCEDURE, authenticated_receipt, final_state, fingerprint, gate, may_judge, parse_decision
 from pipeline_api import GitHub
 from gui_artifacts import artifact_json
@@ -51,11 +51,23 @@ def review_threads(api, number):
     raise ValueError('review thread pagination exceeded')
 
 
-def snapshot(api, number):
+def snapshot(api, number, *, require_judge_ready=False):
     pr = api.pr(number)
     if not api.trusted(pr):
         raise ValueError('PR is no longer trusted/open/reviewable')
-    data = api.evidence(pr)
+    if require_judge_ready:
+        rows = api.statuses(pr['head']['sha'])
+        terminal = gui_state(rows.get(GUI_CONTEXT, {}), pr['head']['sha'])
+        if not (terminal and terminal[0] != 'pending') and not review_ready(rows, pr['head']['sha']):
+            return None
+        data = api.evidence(pr, statuses=rows)
+        if data['gui_required']:
+            if not terminal or terminal[0] == 'pending':
+                return None
+        elif not all(data[k] for k in ('classified', 'review_ready', 'ci_ready')):
+            return None
+    else:
+        data = api.evidence(pr)
     statuses = {k: v for k, v in data['statuses'].items()
                 if k in ('hane/codex-review', 'hane/review-source', 'hane/copilot-routing',
                          'hane/gui-requirement', GUI_CONTEXT, 'hane/trusted-ci-generation')
@@ -130,8 +142,8 @@ def judge(data):
 
 
 def process(api, number, directory):
-    data = snapshot(api, number)
-    if not may_judge(data):
+    data = snapshot(api, number, require_judge_ready=True)
+    if data is None or not may_judge(data):
         return
     key = fingerprint(data)
     old = api.statuses(data['sha']).get(CONTEXT, {})
