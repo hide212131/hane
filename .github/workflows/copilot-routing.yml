@@ -153,9 +153,11 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
+          authorization_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          authorization_context="hane/claude-fix-manual/${authorization_id}"
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=success \
-            -f context='hane/claude-fix-manual' \
+            -f context="$authorization_context" \
             -f description="Claude manual retry authorized for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             >/dev/null
@@ -163,7 +165,8 @@ jobs:
             jq -n \
               --argjson pr_number "$PR_NUMBER" \
               --arg target_sha "$TARGET_SHA" \
-              '{event_type: "hane-claude-fix", client_payload: {pr_number: $pr_number, target_sha: $target_sha, manual_retry: true}}'
+              --arg manual_retry_context "$authorization_context" \
+              '{event_type: "hane-claude-fix", client_payload: {pr_number: $pr_number, target_sha: $target_sha, manual_retry: true, manual_retry_context: $manual_retry_context}}'
           )"
           gh api \
             --method POST \
