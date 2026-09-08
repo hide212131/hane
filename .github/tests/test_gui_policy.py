@@ -115,6 +115,16 @@ class RequirementAndReviewTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 policy.required_from_files(rows, count)
 
+    def test_workflow_adapter_uses_the_same_rename_policy_as_resolver(self):
+        cases = [([{'filename': 'docs/a.md', 'previous_filename': 'crates/ui/a.rs'}], 1, 'true'),
+                 ([{'filename': 'docs/a.md', 'previous_filename': 'docs/old.md'}], 1, 'false'),
+                 ([{'filename': 'docs/a.md', 'previous_filename': None}], 1, 'blocked'),
+                 ([{'filename': 'docs/a.md'}], 2, 'blocked'), ([], 0, 'true')]
+        for files, count, expected in cases:
+            result = subprocess.run([sys.executable, '-I', str(SCRIPTS / 'gui_classify.py'), str(count)],
+                                    input=json.dumps([files]), text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout.strip(), expected)
+
     def test_head_label_or_policy_mismatch_cannot_reuse_classification(self):
         status = {'state': 'success', 'description': f'GUI validation not required (v1) for {SHA[:12]}'}
         self.assertTrue(policy.classification_matches(status, SHA, False))

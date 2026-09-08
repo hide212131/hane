@@ -106,6 +106,12 @@ jobs:
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "target_sha=$head_sha" >> "$GITHUB_OUTPUT"
 
+      - name: Check out trusted classification policy
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
       - name: Mark GUI requirement classification pending
         shell: bash
         env:
@@ -157,45 +163,8 @@ jobs:
             exit 0
           fi
 
-          if ! jq -e 'type == "array" and all(.[]; type == "array")' <<< "$files_json" >/dev/null; then
-            echo "::warning::Changed-file pagination returned malformed evidence for #${PR_NUMBER}."
-            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          actual_count="$(jq '[.[][]] | length' <<< "$files_json")"
-          valid_filename_count="$(
-            jq '[.[][] | select((.filename | type) == "string" and (.filename | length) > 0)] | length' \
-              <<< "$files_json"
-          )"
-
-          if [[ "$actual_count" -ne "$expected_count" || "$valid_filename_count" -ne "$actual_count" ]]; then
-            echo "::warning::Changed-file evidence is incomplete for #${PR_NUMBER}: expected=${expected_count}, fetched=${actual_count}, valid_filenames=${valid_filename_count}."
-            echo 'decision=blocked' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "$actual_count" -eq 0 ]]; then
-            echo "No changed files were reported for #${PR_NUMBER}; failing closed to required = true."
-            echo 'decision=true' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          all_allowlisted="$(
-            jq -r '
-              all(.[][];
-                ((.filename | startswith("docs/")) or
-                 (.filename | startswith(".github/")) or
-                 (((.filename | contains("/")) | not) and (.filename | endswith(".md"))))
-              )
-            ' <<< "$files_json"
-          )"
-
-          if [[ "$all_allowlisted" == true ]]; then
-            echo 'decision=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'decision=true' >> "$GITHUB_OUTPUT"
-          fi
+          decision="$(python3 -I .github/scripts/gui_classify.py "$expected_count" <<< "$files_json")"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
 
       - name: Re-fetch trusted target immediately before publishing
         id: recheck

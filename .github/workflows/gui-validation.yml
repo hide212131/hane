@@ -65,7 +65,6 @@ jobs:
     if: ${{ needs.resolve.outputs.has_work == 'true' }}
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
     runs-on: macos-15
     timeout-minutes: 30
