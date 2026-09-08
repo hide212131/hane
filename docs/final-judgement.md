@@ -10,7 +10,7 @@ Every authenticated terminal GUI outcome (`pass`, `fail`, `blocked`, including r
 
 GUI claim/report jobs and final judgement share a serialized state-writer queue, so a new GUI generation cannot replace its evidence during final judgement/merge.
 
-A decision is bound to a fingerprint of the current evidence. Changed head, GUI generation, labels, review state, or required rules invalidate it. Repeated deliveries cannot repeat a paid judgement for unchanged evidence. A lost pending judge becomes blocked after its run completes. New evidence permits a fresh decision; controller/inference failures never mean pass.
+A decision is bound to a fingerprint of the current evidence. Changed head, required GUI generation, labels, review state, or required rules invalidate it. A no-GUI snapshot ignores old GUI receipts and statuses. Repeated deliveries reuse retained final decisions. If a completed final fix run loses its receipt, the controller permits one fresh paid judgement (two claims total per evidence key), using status history to enforce the bound. Further receipt loss becomes explicitly blocked and requires new evidence or owner intervention. It never reconstructs Copilot approval from a status. A lost pending judge becomes blocked after its run completes. New evidence permits a fresh decision; controller/inference failures never mean pass.
 
 A refused or unavailable merge response records its reason and ends as `blocked`, even when Copilot recommended `ready`. It does not claim a merge or repeat the paid judgement. Fresh evidence allows another attempt; an uncertain response must first be checked against the actual PR state.
 

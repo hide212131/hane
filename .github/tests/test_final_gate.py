@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import final_pipeline as controller
 from final_policy import authenticated_receipt, fingerprint, final_state, gate, may_judge, parse_decision
@@ -26,6 +26,21 @@ def ready(gui=True):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_no_gui_snapshot_ignores_expired_old_gui_receipt(self):
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'title': 'Docs', 'mergeable': True, 'labels': []}
+        api.trusted.return_value = True
+        api.evidence.return_value = dict(ready(gui=False), files=[], statuses={
+            controller.GUI_CONTEXT: {'id': 5, 'state': 'success', 'description': 'old receipt'}})
+        api.pages.return_value = []
+        api.api.return_value = []
+        with patch.object(controller, 'gui_receipt', side_effect=ValueError('expired')) as read, \
+                patch.object(controller, 'review_threads', return_value=[]):
+            data = controller.snapshot(api, 1)
+        read.assert_not_called()
+        self.assertIsNone(data['gui_receipt'])
+        self.assertNotIn(controller.GUI_CONTEXT, data['statuses'])
+
     def test_all_gui_terminal_outcomes_reach_final_judge(self):
         for outcome in ('pass', 'fail', 'blocked'):
             data = ready()

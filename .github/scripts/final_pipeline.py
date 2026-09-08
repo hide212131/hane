@@ -145,7 +145,8 @@ def process(api, number, directory):
             retained = artifact_json(api, run_id, f'final-receipts-{run_id}-{attempt}', f'{number}.json')
             if (retained.get('schema_version') != 1 or retained.get('run_id') != run_id
                     or retained.get('run_attempt') != attempt or retained.get('snapshot') != data
-                    or retained.get('evidence_key') != key or retained.get('effect') != 'fix requested'
+                    or retained.get('evidence_key') != key
+                    or retained.get('effect') != ('fix' if data['workflow_changes'] else 'fix requested')
                     or retained.get('copilot', {}).get('decision') != 'fix'):
                 raise ValueError('invalid final fix receipt')
             return
