@@ -124,9 +124,10 @@ def judge(data):
         raise ValueError('judge evidence exceeds bounded prompt transport')
     if not os.environ.get('COPILOT_GITHUB_TOKEN'):
         raise ValueError('Copilot credential unavailable')
+    judge_env = {key: value for key, value in os.environ.items() if key not in ('GH_TOKEN', 'GITHUB_TOKEN')}
     result = subprocess.run(['copilot', '-p', prompt, '--no-ask-user', '--silent', '--deny-tool', '*',
                              '--disable-builtin-mcps', '--no-custom-instructions'],
-                            capture_output=True, text=True, timeout=600)
+                            capture_output=True, text=True, timeout=600, env=judge_env)
     if result.returncode:
         raise ValueError(f'Copilot invocation failed with exit {result.returncode}')
     return parse_decision(result.stdout.strip())
@@ -176,6 +177,7 @@ def process(api, number, directory):
                 if result.get('merged') is True:
                     proof['effect'] = 'merged'
                     proof['merge_sha'] = result['sha']
+                    receipt_path.write_text(json.dumps(proof, ensure_ascii=False, indent=2))
                     publish(api, newest, key, 'merged')
                 else:
                     proof['effect'] = 'merge refused'
