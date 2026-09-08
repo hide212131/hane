@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -170,9 +171,16 @@ def make_config(tmp_path: Path, **overrides) -> gv.Config:
     return gv.Config(**defaults)
 
 
-class RunValidationTests(unittest.TestCase):
+class TemporaryWorkspaceTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name)
+
+
+class RunValidationTests(TemporaryWorkspaceTest):
     def test_pass_path(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=111)
         env = FakeEnvironment(process=process)
         result = gv.run_validation(env, config)
@@ -186,7 +194,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertIn("経路確認", result["scope_note"])
 
     def test_launch_timeout_is_blocked_and_skips_downstream(self):
-        config = make_config(Path("/workspace"), startup_timeout_seconds=1.0, poll_interval_seconds=0.2)
+        config = make_config(self.workspace, startup_timeout_seconds=1.0, poll_interval_seconds=0.2)
         process = FakeProcess(pid=222)
         env = FakeEnvironment(process=process, ready_after=None)
         result = gv.run_validation(env, config)
@@ -201,7 +209,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertTrue(process._terminated)
 
     def test_launch_crash_before_ready_is_fail(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=333, exits_after_polls=1, exit_code=1)
         env = FakeEnvironment(process=process, ready_after=None)
         result = gv.run_validation(env, config)
@@ -213,7 +221,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["cleanup"]["result"], "pass")
 
     def test_launch_env_error_is_fail_not_uncaught(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = FakeEnvironment(process=gv.EnvError("executable could not be started"))
         result = gv.run_validation(env, config)
 
@@ -222,10 +230,10 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["launch"]["result"], "fail")
         self.assertIn("executable could not be started", by_name["launch"]["reason"])
         self.assertEqual(by_name["cleanup"]["result"], "pass", "should not crash without a launched process")
-        self.assertIn("既に終了", by_name["cleanup"]["reason"])
+        self.assertEqual(by_name["cleanup"]["reason"], "起動したプロセスはなかった")
 
     def test_window_discovery_timeout_is_blocked(self):
-        config = make_config(Path("/workspace"), window_timeout_seconds=1.0, poll_interval_seconds=0.2)
+        config = make_config(self.workspace, window_timeout_seconds=1.0, poll_interval_seconds=0.2)
         process = FakeProcess(pid=444)
         env = FakeEnvironment(process=process, window_after=None)
         result = gv.run_validation(env, config)
@@ -236,7 +244,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["capture"]["result"], "skipped")
 
     def test_capture_failure_is_blocked_not_fail(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=555)
         env = FakeEnvironment(process=process, capture_result=False)
         result = gv.run_validation(env, config)
@@ -247,14 +255,14 @@ class RunValidationTests(unittest.TestCase):
         self.assertIsNone(result["evidence"]["image_path"])
 
     def test_capture_exception_is_blocked(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=556)
         env = FakeEnvironment(process=process, capture_result=gv.EnvError("permission denied"))
         result = gv.run_validation(env, config)
         self.assertEqual(result["overall_result"], "blocked")
 
     def test_cleanup_failure_forces_overall_blocked(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=666, unkillable=True)
         env = FakeEnvironment(process=process)
         result = gv.run_validation(env, config)
@@ -265,7 +273,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["cleanup"]["result"], "blocked")
 
     def test_sha_mismatch_blocks_before_build(self):
-        config = make_config(Path("/workspace"), expected_sha="deadbeef")
+        config = make_config(self.workspace, expected_sha="deadbeef")
         env = FakeEnvironment(head_sha="abc123")
         result = gv.run_validation(env, config)
 
@@ -276,7 +284,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(env.build_calls, 0)
 
     def test_dirty_working_copy_blocks(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = FakeEnvironment(dirty_paths=[" M crates/app/src/main.rs"])
         result = gv.run_validation(env, config)
 
@@ -288,7 +296,7 @@ class RunValidationTests(unittest.TestCase):
             def git_dirty_paths(self, workspace_dir):
                 raise gv.EnvError("unreadable index")
 
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = RaisingEnvironment()
         result = gv.run_validation(env, config)
 
@@ -299,7 +307,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["build"]["result"], "skipped")
 
     def test_missing_tools_blocks(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = FakeEnvironment(missing=["swift", "screencapture"])
         result = gv.run_validation(env, config)
 
@@ -307,7 +315,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertIn("swift", result["steps"][0]["reason"])
 
     def test_build_failure_is_fail(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = FakeEnvironment(build_result=gv.BuildError("compile error"))
         result = gv.run_validation(env, config)
 
@@ -317,7 +325,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(by_name["launch"]["result"], "skipped")
 
     def test_abort_mid_launch_still_cleans_up_and_is_blocked(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=777)
         env = FakeEnvironment(process=process, ready_after=5, abort_after_launch_polls=2)
         result = gv.run_validation(env, config)
@@ -342,7 +350,7 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(step["result"], "pass")
 
     def test_result_schema_has_required_fields(self):
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         process = FakeProcess(pid=888)
         env = FakeEnvironment(process=process)
         result = gv.run_validation(env, config)
@@ -369,10 +377,10 @@ class RunValidationTests(unittest.TestCase):
         self.assertEqual(result["verification_kind"], "launch_and_capture_path")
 
 
-class FinalizePriorityTests(unittest.TestCase):
+class FinalizePriorityTests(TemporaryWorkspaceTest):
     def _finalize(self, results):
         steps = [gv.make_step(f"s{i}", r) for i, r in enumerate(results)]
-        config = make_config(Path("/workspace"))
+        config = make_config(self.workspace)
         env = FakeEnvironment()
         return gv.finalize(steps, config, {}, {}, "2026-09-07T00:00:00Z", env)
 
