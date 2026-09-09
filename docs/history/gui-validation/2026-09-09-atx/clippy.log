@@ -1,0 +1,14 @@
+   Compiling gpui v0.2.2
+    Checking image v0.25.10
+    Checking backtrace v0.3.76
+    Checking gpui_media v0.2.2
+    Checking hane-session v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/session)
+    Checking hane-markdown v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/markdown)
+   Compiling hane v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/app)
+    Checking hane-benchmark v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/benchmark)
+    Checking hane-presentation v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/presentation)
+    Checking hane-editor v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/editor)
+    Checking hane-document v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/document)
+    Checking hane-metrics v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/metrics)
+    Checking hane-ui v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.40s

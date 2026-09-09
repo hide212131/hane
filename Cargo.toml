@@ -36,3 +36,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# CommonMark 0.31.2 ATX closing whitespace fix; see vendor/pulldown-cmark/HANE-PATCH.md.
+[patch.crates-io]
+pulldown-cmark = { path = "vendor/pulldown-cmark" }

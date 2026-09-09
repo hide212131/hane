@@ -2441,6 +2441,7 @@ version = "0.1.0"
 dependencies = [
  "hane-document",
  "pulldown-cmark",
+ "serde_json",
 ]
 
 [[package]]
@@ -2464,6 +2465,8 @@ version = "0.1.0"
 dependencies = [
  "hane-document",
  "hane-editor",
+ "hane-markdown",
+ "hane-presentation",
 ]
 
 [[package]]
@@ -4049,13 +4052,18 @@ dependencies = [
 [[package]]
 name = "pulldown-cmark"
 version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
 dependencies = [
  "bitflags 2.13.1",
  "memchr",
+ "pulldown-cmark-escape",
  "unicase",
 ]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "pulp"

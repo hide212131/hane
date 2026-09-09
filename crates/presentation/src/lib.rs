@@ -955,7 +955,13 @@ fn marker_is_disclosed(
             .blocks()
             .filter(|(_, node)| syntax_display(node.kind).node_block.is_some())
             .any(|(_, block)| {
-                marker.start == block.source_range.start
+                (marker.start == block.source_range.start
+                    || (matches!(block.kind, NodeKind::Heading(_))
+                        && block
+                            .children
+                            .last()
+                            .and_then(|id| parsed.tree.node(*id))
+                            .is_none_or(|child| child.source_range.end <= marker.start)))
                     && marker.end <= block.source_range.end
                     && range_touches(block.source_range, disclosure)
             })
@@ -1018,10 +1024,21 @@ pub fn present_markdown_with_disclosure(
         return block;
     }
     let parsed = parse_document(revision, range, source);
+    // An ATX heading nested in an existing quote/list still carries its
+    // heading level. Container layout remains owned by the indexed block.
     let kind = parsed
         .tree
         .blocks()
-        .find_map(|(_, block)| syntax_display(block.kind).node_block)
+        .find_map(|(_, block)| match block.kind {
+            NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
+            _ => None,
+        })
+        .or_else(|| {
+            parsed
+                .tree
+                .blocks()
+                .find_map(|(_, block)| syntax_display(block.kind).node_block)
+        })
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
