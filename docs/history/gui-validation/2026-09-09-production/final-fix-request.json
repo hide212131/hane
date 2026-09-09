@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "evidence_key": "5468bd7993b0c31e",
+  "snapshot": {
+    "pr_number": 60,
+    "sha": "c878cec39731af036f537506138f34a8828bb053",
+    "repository": "hide212131/hane",
+    "judge_procedure_version": "copilot-final/2",
+    "title": "docs: document controlled Codex review operation",
+    "body": "Agentic implementation of #59.\n\nCreated by the Phase 2 /implement workflow tracked in #44.\n\nThe implementation was produced by Claude Code after the trigger actor was verified as having repository write, maintain, or admin access. Pull Request CI and the later review/GUI/judge phases remain responsible for validation and merge decisions.",
+    "trusted": true,
+    "mergeable": true,
+    "ci_ready": true,
+    "review_ready": true,
+    "classified": true,
+    "gui_required": false,
+    "statuses": {
+      "hane/gui-requirement": {
+        "id": 53597888902,
+        "state": "success",
+        "description": "GUI validation not required (v1) for c878cec39731",
+        "target_url": "https://github.com/hide212131/hane/actions/runs/33965628636"
+      },
+      "hane/codex-review": {
+        "id": 53595904189,
+        "state": "success",
+        "description": "Codex review clean for c878cec39731",
+        "target_url": "https://github.com/hide212131/hane/pull/60#pullrequestreview-5120770381"
+      },
+      "hane/review-source": {
+        "id": 53595903992,
+        "state": "success",
+        "description": "Review source: Copilot fallback for c878cec39731",
+        "target_url": "https://github.com/hide212131/hane/pull/60#pullrequestreview-5120770381"
+      },
+      "hane/trusted-ci-generation": {
+        "id": 53595388653,
+        "state": "success",
+        "description": "Trusted CI generation 33959136159-1 passed",
+        "target_url": "https://github.com/hide212131/hane/actions/runs/33959166002"
+      },
+      "cargo test / clippy (macos-latest)": {
+        "id": 53595387042,
+        "state": "success",
+        "description": "Trusted CI passed",
+        "target_url": "https://github.com/hide212131/hane/actions/runs/33959166002"
+      },
+      "cargo test / clippy (windows-latest)": {
+        "id": 53595385280,
+        "state": "success",
+        "description": "Trusted CI passed",
+        "target_url": "https://github.com/hide212131/hane/actions/runs/33959166002"
+      }
+    },
+    "files": [
+      {
+        "filename": "docs/agentic-development-workflow.md",
+        "status": "modified",
+        "additions": 13,
+        "deletions": 0
+      }
+    ],
+    "gui_receipt": null,
+    "exact_reviews": [
+      {
+        "id": 5120770381,
+        "state": "COMMENTED",
+        "body": "### 🟡 Changes recommended\n\nThe new `/codex-review` documentation currently implies the controller always posts a new `@codex review` request comment, but the implementation can reuse an existing same-SHA request marker without posting again, so the documented contract is slightly inaccurate.\n\n*Once you've addressed the issues Copilot identified, you can request another Copilot review.*\n\n<details>\n<summary>Pull request overview</summary>\n\nThis PR updates the agentic development workflow documentation to explicitly describe the operator-controlled `/codex-review` path for re-triggering Codex review on an open same-repository PR, including head-SHA pinning, terminal-result reuse, and fail-closed behavior.\n\n**Changes:**\n- Documented the manual `/codex-review` trigger flow, including permission checks and author trust requirements.\n- Documented head SHA resolution/fixation and reuse of existing terminal `hane/codex-review` commit status to avoid duplicate Codex requests.\n- Added a Phase 3 checklist reference pointing readers to the new manual re-review section.\n</details>\n\n<details>\n<summary>File summaries</summary>\n\n| File | Description |\r\n| ---- | ----------- |\r\n| docs/agentic-development-workflow.md | Adds the manual `/codex-review` operational contract (authorization, SHA pinning, reuse, pending publication, fail-closed outcomes) and references it from Phase 3. |\n</details>\n\n<details>\n<summary>Review details</summary>\n\n- **Files reviewed:** 1/1 changed files\n- **Comments generated:** 1\n- **Review effort level:** Lite\n</details>\n\n---\n\n💡 <a href=\"/hide212131/hane/new/main?filename=.github/skills/code-review/SKILL.md\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Add a `code-review` agent skill</a> or configure MCP servers for context-aware, tailored reviews. <a href=\"https://docs.github.com/copilot/how-tos/use-copilot-agents/request-a-code-review/use-code-review?tool=webui#mcp-servers-and-agent-skills\" class=\"Link--inTextBlock\" target=\"_blank\" rel=\"noopener noreferrer\">Learn more in the docs.</a>",
+        "html_url": "https://github.com/hide212131/hane/pull/60#pullrequestreview-5120770381"
+      }
+    ],
+    "unresolved_threads": [
+      "PRRT_kwDOUETGuM6ffXBR",
+      "PRRT_kwDOUETGuM6ffXBT",
+      "PRRT_kwDOUETGuM6ffXBU",
+      "PRRT_kwDOUETGuM6fgKgW",
+      "PRRT_kwDOUETGuM6fiKK6"
+    ],
+    "blocking_reviews": [],
+    "required_checks": [
+      "cargo test / clippy (macos-latest)",
+      "cargo test / clippy (windows-latest)"
+    ],
+    "workflow_changes": false,
+    "auto_merge": false
+  },
+  "run_id": "34291844354",
+  "run_attempt": "1",
+  "copilot": {
+    "decision": "fix",
+    "reason": "Gate denial: unresolved review threads (5 open) including Copilot's changes-recommended comment about inaccurate documentation of /codex-review reuse behavior; must resolve threads and address doc accuracy before merge."
+  },
+  "gate_denials": [
+    "unresolved review threads"
+  ],
+  "effect": "fix requested"
+}
