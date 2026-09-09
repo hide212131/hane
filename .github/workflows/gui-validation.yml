@@ -1,0 +1,171 @@
+name: GUI validation
+on:
+  workflow_run:
+    workflows: [CI, Codex review gate, Copilot pre-GUI routing]
+    types: [completed]
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional PR to reconcile
+        type: string
+      target_sha:
+        description: Optional exact head SHA for that PR
+        type: string
+      force:
+        description: Owner requests a fresh GUI generation after a terminal result
+        type: boolean
+        default: false
+permissions:
+  contents: read
+
+env:
+  CONTROL_SHA: ${{ github.workflow_sha }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: hane-validation-state-writer
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      has_work: ${{ steps.resolve.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.target_sha }}
+          INPUT_FORCE: ${{ inputs.force || 'false' }}
+        run: python3 -I .github/scripts/gui_pipeline.py resolve
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-recovered-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gui-recovered/*.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  run:
+    name: "GUI worker #${{ matrix.pr_number }}"
+    needs: resolve
+    if: ${{ needs.resolve.outputs.has_work == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    concurrency:
+      group: gui-worker-${{ matrix.pr_number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+      actions: read
+      checks: read
+    steps:
+      - name: Check out trusted procedure
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.control_sha }}
+          path: control
+          persist-credentials: false
+      - name: Recheck exact head and generation before target execution
+        id: begin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ toJson(matrix) }}
+        run: python3 -I control/.github/scripts/gui_pipeline.py begin
+      - name: Check out exact target
+        if: steps.begin.outputs.proceed == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.sha }}
+          path: hane
+          persist-credentials: false
+      - name: Recheck immediately before build and launch
+        if: steps.begin.outputs.proceed == 'true'
+        id: execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ toJson(matrix) }}
+        run: python3 -I control/.github/scripts/gui_pipeline.py begin
+      - name: Validate Hane using the trusted procedure
+        if: steps.execution.outputs.proceed == 'true'
+        env:
+          HANE_GUI_INTERACTION_TARGET_DIR: ${{ github.workspace }}/hane
+          HANE_GUI_INTERACTION_CONTROL_DIR: ${{ github.workspace }}/control
+          HANE_GUI_INTERACTION_EXPECTED_SHA: ${{ matrix.sha }}
+          HANE_GUI_INTERACTION_RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+          HANE_GUI_INTERACTION_REQUEST_ID: ${{ matrix.request_id }}
+        run: python3 control/scripts/hosted_gui_interaction.py
+      - name: Stage public evidence only
+        if: always()
+        run: python3 -I control/.github/scripts/stage_gui_evidence.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-evidence-${{ matrix.pr_number }}-${{ matrix.generation }}
+          path: ${{ runner.temp }}/hane-gui-artifact
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: "GUI receipt #${{ matrix.pr_number }}"
+    concurrency:
+      group: hane-validation-state-writer
+      cancel-in-progress: false
+      queue: max
+    needs: [resolve, run]
+    if: ${{ always() && needs.resolve.outputs.has_work == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.control_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: gui-evidence-${{ matrix.pr_number }}-${{ matrix.generation }}
+          path: ${{ runner.temp }}/gui-evidence
+      - name: Validate and publish exact-generation receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ toJson(matrix) }}
+          EVIDENCE_DIR: ${{ runner.temp }}/gui-evidence
+          RECEIPT_PATH: ${{ runner.temp }}/gui-receipt.json
+        run: python3 -I .github/scripts/gui_pipeline.py report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-receipt-${{ matrix.pr_number }}-${{ matrix.generation }}
+          path: ${{ runner.temp }}/gui-receipt.json
+          if-no-files-found: warn
+          retention-days: 14

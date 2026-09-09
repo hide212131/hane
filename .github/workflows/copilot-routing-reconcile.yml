@@ -1,0 +1,318 @@
+name: Copilot routing reconciliation
+
+on:
+  workflow_run:
+    workflows:
+      - Codex review gate
+      - CI
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: copilot-routing-serialized
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+      issues: write
+      statuses: write
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Reconcile missing exact-SHA routing decisions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${COPILOT_GITHUB_TOKEN:-}" ]]; then
+            echo '::error::COPILOT_GITHUB_TOKEN is not configured.'
+            exit 1
+          fi
+
+          status_age_seconds() {
+            local created_at="$1"
+            local created_epoch now_epoch
+            created_epoch="$(date -d "$created_at" +%s 2>/dev/null || echo 0)"
+            now_epoch="$(date -u +%s)"
+            if [[ "$created_epoch" -le 0 ]]; then
+              echo 999999
+            else
+              echo $((now_epoch - created_epoch))
+            fi
+          }
+
+          dispatch_claude_fix() {
+            local pr_number="$1"
+            local target_sha="$2"
+            local payload
+            payload="$(
+              jq -n \
+                --argjson pr_number "$pr_number" \
+                --arg target_sha "$target_sha" \
+                '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}'
+            )"
+            gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$payload"
+          }
+
+          reconcile_pr() {
+            local pr_number="$1"
+            local pr state draft target_sha head_repo pr_author short_sha
+            local statuses ci_latest ci_state ci_description ci_failure
+            local ordinary_ci ordinary_ci_status ordinary_ci_conclusion ordinary_ci_url
+            local semantic_description routing_latest routing_state routing_description routing_created_at routing_age
+            local codex_latest codex_state codex_description codex_findings codex_clean trigger_kind
+            local review review_id review_url review_body findings_json
+            local ci_evidence files_json pr_title evidence prompt output copilot_status json decision reason
+            local current_sha refreshed existing route_state route_description
+
+            pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+            state="$(jq -r '.state' <<< "$pr")"
+            draft="$(jq -r '.draft' <<< "$pr")"
+            target_sha="$(jq -r '.head.sha' <<< "$pr")"
+            head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+            pr_author="$(jq -r '.user.login' <<< "$pr")"
+            short_sha="${target_sha:0:12}"
+
+            if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" ]]; then
+              return 0
+            fi
+
+            # Hane has one human developer. These bots are repository-owned implementation automation.
+            case "$pr_author" in
+              hide212131|'github-actions[bot]'|'claude[bot]') ;;
+              *) return 0 ;;
+            esac
+
+            statuses="$(gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100")"
+
+            ci_latest="$(
+              jq -r '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv' <<< "$statuses"
+            )"
+            ci_state="$(cut -f1 <<< "$ci_latest")"
+            ci_description="$(cut -f2 <<< "$ci_latest")"
+
+            ordinary_ci="$(
+              gh api "repos/${REPOSITORY}/actions/runs?head_sha=${target_sha}&per_page=100" \
+                --jq '[.workflow_runs[] | select(.name == "CI" and .event == "pull_request")] | max_by(.id) // {} | [.status // "", .conclusion // "", .html_url // ""] | @tsv'
+            )"
+            ordinary_ci_status="$(cut -f1 <<< "$ordinary_ci")"
+            ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
+            ordinary_ci_url="$(cut -f3 <<< "$ordinary_ci")"
+
+            ci_failure=false
+            if [[ "$ci_state" == failure || ( "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ) ]]; then
+              ci_failure=true
+            fi
+
+            semantic_description="$(
+              jq -r \
+                --arg fix "Copilot routing: fix for ${short_sha}" \
+                --arg cont "Copilot routing: continue-validation for ${short_sha}" \
+                --arg blocked "Copilot routing: blocked for ${short_sha}" \
+                '[.[] | select(.context == "hane/copilot-routing" and (.description == $fix or .description == $cont or .description == $blocked))] | max_by(.id) // {} | .description // ""' \
+                <<< "$statuses"
+            )"
+
+            case "$semantic_description" in
+              "Copilot routing: fix for ${short_sha}"|"Copilot routing: blocked for ${short_sha}")
+                return 0
+                ;;
+              "Copilot routing: continue-validation for ${short_sha}")
+                [[ "$ci_failure" != true ]] && return 0
+                ;;
+            esac
+
+            routing_latest="$(
+              jq -r '[.[] | select(.context == "hane/copilot-routing")] | max_by(.id) // {} | [.state // "", .description // "", .created_at // ""] | @tsv' <<< "$statuses"
+            )"
+            routing_state="$(cut -f1 <<< "$routing_latest")"
+            routing_description="$(cut -f2 <<< "$routing_latest")"
+            routing_created_at="$(cut -f3 <<< "$routing_latest")"
+            routing_age="$(status_age_seconds "$routing_created_at")"
+            if [[ "$routing_state" == pending && "$routing_description" == "Copilot routing pending for ${short_sha}" && "$routing_age" -lt 1200 ]]; then
+              return 0
+            fi
+
+            codex_latest="$(
+              jq -r '[.[] | select(.context == "hane/codex-review")] | max_by(.id) // {} | [.state // "", .description // ""] | @tsv' <<< "$statuses"
+            )"
+            codex_state="$(cut -f1 <<< "$codex_latest")"
+            codex_description="$(cut -f2 <<< "$codex_latest")"
+            codex_findings=false
+            codex_clean=false
+            [[ "$codex_state" == failure && "$codex_description" == "Codex findings for ${short_sha}" ]] && codex_findings=true
+            [[ "$codex_state" == success && "$codex_description" == "Codex review clean for ${short_sha}" ]] && codex_clean=true
+
+            trigger_kind=''
+            if [[ "$codex_findings" == true && "$ci_failure" == true ]]; then
+              trigger_kind='codex-findings+ci-failure'
+            elif [[ "$codex_findings" == true ]]; then
+              trigger_kind='codex-findings-recovered'
+            elif [[ "$codex_clean" == true && "$ci_failure" == true ]]; then
+              trigger_kind='ci-failure'
+            else
+              return 0
+            fi
+
+            review_body=''
+            review_url=''
+            findings_json='[]'
+            if [[ "$codex_findings" == true ]]; then
+              review="$(
+                gh api --paginate "repos/${REPOSITORY}/pulls/${pr_number}/reviews?per_page=100" \
+                  --jq ".[] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .commit_id == \"${target_sha}\") | [.id, .html_url] | @tsv" \
+                  | tail -n 1
+              )"
+              if [[ -z "$review" ]]; then
+                gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+                  -f state=error -f context='hane/copilot-routing' \
+                  -f description="Copilot routing: blocked for ${short_sha}" \
+                  -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+                return 0
+              fi
+
+              review_id="${review%%$'\t'*}"
+              review_url="${review#*$'\t'}"
+              review_body="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}/reviews/${review_id}" --jq '.body // ""')"
+              findings_json="$(
+                gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${pr_number}/comments?per_page=100" \
+                  | jq "[.[][] | select(.user.login == \"chatgpt-codex-connector[bot]\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
+              )"
+            fi
+
+            ci_evidence="$(
+              jq \
+                --arg ordinary_status "$ordinary_ci_status" \
+                --arg ordinary_conclusion "$ordinary_ci_conclusion" \
+                --arg ordinary_url "$ordinary_ci_url" \
+                '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
+                 (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
+                <<< "$statuses"
+            )"
+            files_json="$(
+              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
+                | jq '[.[][] | {filename, status, additions, deletions}]'
+            )"
+            pr_title="$(jq -r '.title' <<< "$pr")"
+
+            evidence="$(
+              jq -n \
+                --argjson pr_number "$pr_number" \
+                --arg target_sha "$target_sha" \
+                --arg trigger_kind "$trigger_kind" \
+                --arg pr_title "$pr_title" \
+                --arg codex_review_url "$review_url" \
+                --arg codex_review_body "$review_body" \
+                --argjson codex_findings "$findings_json" \
+                --arg ci_generation_state "$ci_state" \
+                --arg ci_generation_description "$ci_description" \
+                --argjson ci_statuses "$ci_evidence" \
+                --argjson changed_files "$files_json" \
+                '{pr_number:$pr_number,target_sha:$target_sha,trigger_kind:$trigger_kind,pr_title:$pr_title,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_generation_state:$ci_generation_state,ci_generation_description:$ci_generation_description,ci_statuses:$ci_statuses,changed_files:$changed_files}'
+            )"
+
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=pending -f context='hane/copilot-routing' \
+              -f description="Copilot routing pending for ${short_sha}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+            prompt="$(printf '%s\n' \
+              'You are GitHub Copilot acting strictly as the pre-GUI routing judge for Hane.' \
+              'Do not implement code or use tools.' \
+              'Return exactly one JSON object: {"decision":"fix|continue-validation|blocked","reason":"<short explanation>"}.' \
+              'If trusted CI is failing, continue-validation is not valid.' \
+              'Evidence:' \
+              "$evidence")"
+
+            set +e
+            output="$(copilot -p "$prompt" --no-ask-user 2>&1)"
+            copilot_status=$?
+            set -e
+
+            decision=''
+            reason=''
+            if [[ $copilot_status -eq 0 ]]; then
+              json="$(printf '%s\n' "$output" | grep -o '{[^{}]*}' | tail -n 1 || true)"
+              if [[ -n "$json" ]] && jq -e 'has("decision") and has("reason") and (.decision|type=="string") and (.reason|type=="string")' <<< "$json" >/dev/null 2>&1; then
+                decision="$(jq -r '.decision' <<< "$json")"
+                reason="$(jq -r '.reason' <<< "$json")"
+              fi
+            fi
+
+            case "$decision" in
+              fix|continue-validation|blocked) ;;
+              *) decision=blocked; reason='Copilot returned malformed recovery output.' ;;
+            esac
+            if [[ "$ci_failure" == true && "$decision" == continue-validation ]]; then
+              decision=blocked
+              reason='Trusted CI is failing; continue-validation is not valid.'
+            fi
+            reason="$(printf '%s' "$reason" | tr '\n' ' ' | cut -c1-300)"
+
+            current_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+            [[ "$current_sha" != "$target_sha" ]] && return 0
+
+            refreshed="$(gh api "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100")"
+            existing="$(
+              jq -r \
+                --arg fix "Copilot routing: fix for ${short_sha}" \
+                --arg cont "Copilot routing: continue-validation for ${short_sha}" \
+                --arg blocked "Copilot routing: blocked for ${short_sha}" \
+                '[.[] | select(.context == "hane/copilot-routing" and (.description == $fix or .description == $cont or .description == $blocked))] | max_by(.id) // {} | .description // ""' \
+                <<< "$refreshed"
+            )"
+            case "$existing" in
+              "Copilot routing: fix for ${short_sha}"|"Copilot routing: blocked for ${short_sha}")
+                return 0
+                ;;
+              "Copilot routing: continue-validation for ${short_sha}")
+                [[ "$ci_failure" != true ]] && return 0
+                ;;
+            esac
+
+            case "$decision" in
+              fix) route_state=failure; route_description="Copilot routing: fix for ${short_sha}" ;;
+              continue-validation) route_state=success; route_description="Copilot routing: continue-validation for ${short_sha}" ;;
+              *) route_state=error; route_description="Copilot routing: blocked for ${short_sha}" ;;
+            esac
+
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state="$route_state" -f context='hane/copilot-routing' \
+              -f description="$route_description" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+            gh issue comment "$pr_number" --repo "$REPOSITORY" \
+              --body "Copilot pre-GUI routing recovery for \`${target_sha}\`: **${decision}** — ${reason}"
+
+            if [[ "$decision" == fix ]]; then
+              dispatch_claude_fix "$pr_number" "$target_sha"
+            fi
+          }
+
+          while IFS= read -r pr_number; do
+            [[ -z "$pr_number" ]] && continue
+            reconcile_pr "$pr_number"
+          done < <(
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+              | jq -r '.[][] | select(.draft == false and .head.repo.full_name == .base.repo.full_name) | .number'
+          )

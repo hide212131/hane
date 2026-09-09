@@ -1,21 +1,153 @@
 name: CI
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci:{0}:{1}', inputs.target_sha, inputs.generation_id) || format('pr-ci:{0}', github.event.pull_request.number) }}
 
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Commit SHA to validate with the trusted CI definition
+        required: true
+        type: string
+      generation_id:
+        description: Trusted status generation claimed before dispatch
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: cargo test / clippy (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  workflow_state_tests:
+    name: Workflow state regression tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out target
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+          persist-credentials: false
+      - name: Run workflow regression tests without network or agent calls
+        run: |
+          python3 -m unittest discover -s .github/tests -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+  claim_trusted_ci_generation:
+    name: Reclaim trusted CI generation
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Reset generation and platform statuses to pending
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "::error::A different trusted CI generation owns ${TARGET_SHA}: ${latest_generation:-<unknown>}"
+              exit 1
+              ;;
+          esac
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$expected_generation" \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (macos-latest)' \
+            -f description='Trusted CI rerun pending' \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (windows-latest)' \
+            -f description='Trusted CI rerun pending' \
+            -f target_url="$run_url" >/dev/null
+
+  test_macos:
+    name: cargo test / clippy (macos-latest)
+    needs: claim_trusted_ci_generation
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
+    runs-on: macos-latest
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pr-run-{0}-macos', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Reclaim macOS trusted status for this attempt
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "::error::A different trusted CI generation owns ${TARGET_SHA}: ${latest_generation:-<unknown>}"
+              exit 1
+              ;;
+          esac
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$expected_generation" \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (macos-latest)' \
+            -f description='Trusted CI macOS attempt pending' \
+            -f target_url="$run_url" >/dev/null
+
+      - name: Check out Pull Request
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out dispatched target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -25,3 +157,280 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  report_macos:
+    name: Report macOS trusted CI status
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: test_macos
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Report result to target commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+          TEST_RESULT: ${{ needs.test_macos.result }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
+
+          case "$TEST_RESULT" in
+            success)
+              state=success
+              description='Trusted CI passed'
+              ;;
+            cancelled)
+              state=error
+              description='Trusted CI was cancelled'
+              ;;
+            *)
+              state=failure
+              description='Trusted CI failed'
+              ;;
+          esac
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='cargo test / clippy (macos-latest)' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+  test_windows:
+    name: cargo test / clippy (windows-latest)
+    needs: claim_trusted_ci_generation
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.claim_trusted_ci_generation.result == 'success') }}
+    runs-on: windows-latest
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && format('trusted-ci-status-{0}', inputs.target_sha) || format('pr-run-{0}-windows', github.run_id) }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Reclaim Windows trusted status for this attempt
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "::error::A different trusted CI generation owns ${TARGET_SHA}: ${latest_generation:-<unknown>}"
+              exit 1
+              ;;
+          esac
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$expected_generation" \
+            -f target_url="$run_url" >/dev/null
+          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=pending \
+            -f context='cargo test / clippy (windows-latest)' \
+            -f description='Trusted CI Windows attempt pending' \
+            -f target_url="$run_url" >/dev/null
+
+      - name: Check out Pull Request
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out dispatched target
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  report_windows:
+    name: Report Windows trusted CI status
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs: test_windows
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Report result to target commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+          TEST_RESULT: ${{ needs.test_windows.result }}
+        run: |
+          set -euo pipefail
+
+          latest_generation="$(
+            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+              --jq '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""'
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns status publication: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
+
+          case "$TEST_RESULT" in
+            success)
+              state=success
+              description='Trusted CI passed'
+              ;;
+            cancelled)
+              state=error
+              description='Trusted CI was cancelled'
+              ;;
+            *)
+              state=failure
+              description='Trusted CI failed'
+              ;;
+          esac
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='cargo test / clippy (windows-latest)' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null
+
+  finalize_trusted_ci_generation:
+    name: Finalize trusted CI generation
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs:
+      - workflow_state_tests
+      - report_macos
+      - report_windows
+    runs-on: ubuntu-latest
+    concurrency:
+      group: trusted-ci-status-${{ inputs.target_sha }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Finalize generation marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          GENERATION_ID: ${{ inputs.generation_id }}
+          WORKFLOW_TEST_RESULT: ${{ needs.workflow_state_tests.result }}
+          MACOS_REPORT_RESULT: ${{ needs.report_macos.result }}
+          WINDOWS_REPORT_RESULT: ${{ needs.report_windows.result }}
+        run: |
+          set -euo pipefail
+
+          statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
+          latest_generation="$(
+            jq -r \
+              '[.[] | select(.context == "hane/trusted-ci-generation")] | max_by(.id) | .description // ""' \
+              <<< "$statuses"
+          )"
+          expected_generation="Trusted CI generation ${GENERATION_ID}"
+
+          case "$latest_generation" in
+            "$expected_generation"|"$expected_generation passed"|"$expected_generation failed"|"$expected_generation incomplete") ;;
+            *)
+              echo "A newer trusted CI generation owns finalization: ${latest_generation:-<unknown>}"
+              exit 0
+              ;;
+          esac
+
+          macos_state="$(
+            jq -r \
+              '[.[] | select(.context == "cargo test / clippy (macos-latest)")] | max_by(.id) | .state // "missing"' \
+              <<< "$statuses"
+          )"
+          windows_state="$(
+            jq -r \
+              '[.[] | select(.context == "cargo test / clippy (windows-latest)")] | max_by(.id) | .state // "missing"' \
+              <<< "$statuses"
+          )"
+
+          if [[ "$WORKFLOW_TEST_RESULT" == failure ]]; then
+            state=failure
+            description="Trusted CI generation ${GENERATION_ID} failed"
+          elif [[ "$WORKFLOW_TEST_RESULT" != success || "$MACOS_REPORT_RESULT" != success || "$WINDOWS_REPORT_RESULT" != success ]]; then
+            state=error
+            description="Trusted CI generation ${GENERATION_ID} incomplete"
+          elif [[ "$macos_state" == success && "$windows_state" == success ]]; then
+            state=success
+            description="Trusted CI generation ${GENERATION_ID} passed"
+          elif [[ "$macos_state" == failure || "$windows_state" == failure ]]; then
+            state=failure
+            description="Trusted CI generation ${GENERATION_ID} failed"
+          else
+            state=error
+            description="Trusted CI generation ${GENERATION_ID} incomplete"
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context='hane/trusted-ci-generation' \
+            -f description="$description" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            >/dev/null

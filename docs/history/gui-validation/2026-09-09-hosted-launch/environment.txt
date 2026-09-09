@@ -1,0 +1,30 @@
+== date (UTC) ==
+Tue Sep  8 17:01:14 UTC 2026
+
+== macOS version ==
+ProductName:		macOS
+ProductVersion:		15.7.9
+BuildVersion:		24G830
+
+== runner image ==
+ImageOS=macos15
+ImageVersion=20260829.0321.1
+runner.os=macOS
+runner.arch=ARM64
+
+== hardware ==
+Apple M1 (Virtual)
+
+== display info ==
+
+== Metal info ==
+no explicit Metal line found
+
+== git HEAD ==
+0f5e2b1f0ffb41a248b9a806009de273e8e8d793
+
+== toolchain ==
+Apple Swift version 6.1.2 (swiftlang-6.1.2.1.2 clang-1700.0.13.5)
+Target: arm64-apple-macosx15.0
+cargo 1.93.1 (083ac5135 2025-12-15)
+rustc 1.93.1 (01f6ddf75 2026-02-11)

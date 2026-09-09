@@ -330,6 +330,11 @@ pub struct EditorView {
     /// invalidates every layout, which is why it is recorded rather than
     /// recomputed.
     content_width: f32,
+    /// Horizontal offset of the main column from the window's left edge,
+    /// i.e. the sidebar and its resizer when a work folder is open, zero
+    /// otherwise. Row mouse events report window-space coordinates, so this
+    /// has to be subtracted before it is used to hit-test text.
+    main_column_left: f32,
     /// Hash of the window font properties used by `WindowShaper`. Width and
     /// document revision live in each cache entry; this is the remaining global
     /// invalidation generation.
@@ -599,6 +604,7 @@ impl EditorView {
             line_owners: HashMap::new(),
             layout_cache: HashMap::new(),
             content_width: 0.0,
+            main_column_left: 0.0,
             layout_font_revision: 0,
             caret_geometry: None,
             block_index: BlockIndexState::new(),
@@ -1953,7 +1959,7 @@ impl EditorView {
         window: &Window,
     ) -> Option<SourceOffset> {
         let visual = self.rendered_line(line)?;
-        let x = window_x - self.theme.line_horizontal_padding;
+        let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment, x);
         Some(source_offset_for_visual_position(
             self.editor(),
@@ -3113,6 +3119,7 @@ impl Render for EditorView {
         } else {
             0.0
         };
+        self.main_column_left = sidebar_width;
         self.content_width = text_column_width(
             f32::from(window.viewport_size().width),
             sidebar_width,
@@ -3324,6 +3331,11 @@ impl Render for EditorView {
                                     row_element(
                                         editor, &visual, &layout, row_index, self.theme, &resolver,
                                     )
+                                    // Lets GPUI-event regression tests read a row's real
+                                    // painted window bounds via `VisualTestContext::debug_bounds`
+                                    // instead of duplicating the render-time offset math. A
+                                    // no-op outside test builds.
+                                    .debug_selector(move || format!("row-{line}-{row_index}"))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |view, event, window, cx| {
@@ -5287,5 +5299,294 @@ mod tests {
         assert!(existing.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #95: `offset_at_row_x` translated a mouse event's window-space x
+    // by only the line's horizontal padding, ignoring that an open
+    // work-folder sidebar (and its resizer) shifts the whole main column to
+    // the right. Every row hit test was off by that many pixels whenever a
+    // sidebar was open, so a mouse-down or drag anywhere in the body text
+    // landed on the wrong character. These tests drive the real
+    // `EditorView` render tree through `gpui::TestAppContext::simulate_event`
+    // and check the resulting selection, instead of calling the handlers
+    // directly or testing the coordinate math in isolation.
+
+    /// Predicts the `SourceOffset` a click at `visual_offset` on a row should
+    /// land on, and the real window-space point that should produce it — from
+    /// the row's actual painted bounds (`debug_selector`) and the same glyph
+    /// shaping the renderer used, not from the coordinate translation under
+    /// test.
+    fn row_click(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+        line: usize,
+        row_index: usize,
+        visual_offset: usize,
+    ) -> (gpui::Point<gpui::Pixels>, SourceOffset) {
+        let bounds = cx.debug_bounds(selector).expect("row painted for selector");
+        let fragment = row_fragment(view, cx, line, row_index);
+        cx.update(|window, app| {
+            view.read_with(app, |editor_view, _| {
+                let visual = editor_view.rendered_line(line).expect("line rendered");
+                let shaper = WindowShaper::new(window);
+                let x = f32::from(bounds.origin.x)
+                    + editor_view.theme.line_horizontal_padding
+                    + shaper.x_for_offset(&visual, fragment, visual_offset);
+                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
+                let expected = source_offset_for_visual_position(
+                    editor_view.editor(),
+                    line,
+                    &visual,
+                    visual_offset,
+                );
+                (point(px(x), px(y)), expected)
+            })
+        })
+    }
+
+    /// The row's own stretch of its line's visual text, as painted this
+    /// frame — the same range `on_row_mouse_down`/`on_row_mouse_move` use.
+    fn row_fragment(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+        row_index: usize,
+    ) -> Range<usize> {
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                let (block_id, _) = *editor_view
+                    .line_owners
+                    .get(&line)
+                    .expect("line owner recorded");
+                editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout
+                    .lines[row_index]
+                    .line_visual_range
+                    .clone()
+            })
+        })
+    }
+
+    /// Opens an `EditorView` in a real window for GPUI mouse-event
+    /// regression tests: a fixed size so layout is deterministic, and
+    /// optionally a work-folder sidebar so the main column sits to the right
+    /// of it — the geometry `on_row_mouse_down`/`on_row_mouse_move` have to
+    /// hit-test against. Returns the work folder's temporary root, if any,
+    /// for the caller to clean up.
+    fn open_view_for_mouse_tests<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+        with_sidebar: bool,
+    ) -> (
+        gpui::Entity<EditorView>,
+        &'a mut gpui::VisualTestContext,
+        Option<PathBuf>,
+    ) {
+        let text = text.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let root = if with_sidebar {
+            let root = draft_test_root("mouse-drag-sidebar");
+            std::fs::create_dir_all(&root).unwrap();
+            let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+            view.update(cx, |view, cx| {
+                view.work_folder = Some(work_folder);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            Some(root)
+        } else {
+            None
+        };
+        (view, cx, root)
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_start_lands_on_the_clicked_character_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+
+        // A sidebar resize shifts the main column further right; the same
+        // visual offsets must still resolve correctly against the new bounds.
+        view.update(cx, |view, cx| {
+            view.sidebar_width = 320.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_middle_extends_in_either_direction_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let (left_point, left_active) = row_click(&view, cx, "row-0-0", 0, 0, 2);
+        cx.simulate_mouse_move(left_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor,
+                    active: left_active
+                }
+            );
+        });
+        assert!(left_active < anchor);
+
+        let (right_point, right_active) = row_click(&view, cx, "row-0-0", 0, 0, 10);
+        cx.simulate_mouse_move(right_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(right_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor,
+                    active: right_active
+                }
+            );
+        });
+        assert!(right_active > anchor);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_across_lines_keeps_the_original_anchor_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let (move_point, active) = row_click(&view, cx, "row-2-0", 2, 0, 4);
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_ne!(anchor, active);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_start_lands_on_the_clicked_character_without_a_sidebar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+    }
+
+    #[gpui::test]
+    fn drag_selection_lands_on_the_second_row_of_a_soft_wrapped_line_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "wrap word wrap word wrap word wrap word wrap word wrap word";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+        cx.simulate_resize(gpui::size(px(420.0), px(760.0)));
+        cx.run_until_parked();
+
+        let second_row = row_fragment(&view, cx, 0, 1);
+        assert!(
+            second_row.len() >= 3,
+            "line must wrap into a second row with a few characters for this test to be meaningful"
+        );
+        let start_offset = second_row.start;
+        let mid_offset = second_row.start + 3;
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-1", 0, 1, start_offset);
+        let (move_point, active) = row_click(&view, cx, "row-0-1", 0, 1, mid_offset);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_ne!(anchor, active);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "あいうえおかきくけこ\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        // Each character is 3 UTF-8 bytes; 3 and 9 are the boundaries after
+        // the first and third characters.
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 9);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(3));
+        assert_eq!(active, SourceOffset(9));
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
