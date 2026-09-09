@@ -15,7 +15,7 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::IndexedBlock;
+use hane_markdown::{IndexedBlock, NodeKind};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
     InlineDisplay, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset, block_line_span,
@@ -28,13 +28,24 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
+/// How far a joined paragraph's inline parse may reach past the drawn window to
+/// find a marker's other half — see [`present_block`]'s `render`/`lines` split.
+/// Bounded so a document with no blank line in it, which tiles into one
+/// arbitrarily large paragraph block, cannot force reading the whole document
+/// just to draw a handful of on-screen lines.
+const JOIN_CONTEXT_LINES: usize = 200;
+
 /// Presents the lines of one indexed Markdown block that reach `visible`.
 ///
 /// A block is not bounded — a document without a blank line in it is a single
-/// paragraph — so only the lines inside the visible window are built; the rest
-/// are counted and stand in as space. Which lines are literal code or table
-/// syntax is decided in presentation, from the block kind; this crate never
-/// inspects the source for fences or pipes.
+/// paragraph — so only the lines inside the visible window are drawn; the rest
+/// are counted and stand in as space. For a paragraph, the source fetched for
+/// parsing reaches up to [`JOIN_CONTEXT_LINES`] beyond `visible` on either side
+/// (still clipped to the block), because CommonMark resolves `**`/`_`/`` ` ``
+/// across the whole paragraph and a marker whose other half falls outside what
+/// was read cannot be recognized. Which lines are literal code or table syntax
+/// is decided in presentation, from the block kind; this crate never inspects
+/// the source for fences or pipes.
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
@@ -42,8 +53,14 @@ pub(crate) fn presented_block(
 ) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
-    let window = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let ranges = window
+    let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
+    let context = if block.kind == NodeKind::Paragraph {
+        span.start.max(render.start.saturating_sub(JOIN_CONTEXT_LINES))
+            ..span.end.min(render.end.saturating_add(JOIN_CONTEXT_LINES))
+    } else {
+        render.clone()
+    };
+    let ranges = context
         .clone()
         .map(|line| document.line_range(LineId(line)).ok())
         .collect::<Option<Vec<_>>>()?;
@@ -51,7 +68,7 @@ pub(crate) fn presented_block(
         .iter()
         .map(|range| document.text(*range).unwrap_or_default())
         .collect::<Vec<_>>();
-    let lines = window
+    let lines = context
         .zip(&ranges)
         .zip(&texts)
         .map(|((line, range), text)| BlockLine {
@@ -68,6 +85,7 @@ pub(crate) fn presented_block(
             trailing_blank_lines: trailing_blank_lines(document, &span),
             span,
             lines: &lines,
+            render,
         },
         DEFAULT_LINE_HEIGHT,
     ))

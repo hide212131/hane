@@ -712,8 +712,18 @@ pub struct BlockWindow<'a> {
     /// blocks into the block above, and those lines are not part of the
     /// construct — a blank line after a closing fence is not code.
     pub trailing_blank_lines: usize,
-    /// The contiguous run inside `span` to present. Everything else is clipped.
+    /// Lines available to build the [`VisualBlock`] from. For a joinable
+    /// paragraph (see [`present_block`]) this may reach beyond `render` on
+    /// either side, because CommonMark resolves `**`/`_`/`` ` `` across the
+    /// whole paragraph, not just the lines that happen to be drawn; a marker
+    /// whose other half sits outside `lines` still cannot be recognized, so
+    /// the caller should give enough of the paragraph to close every marker
+    /// that opens inside `render`.
     pub lines: &'a [BlockLine<'a>],
+    /// The subset of `lines` (by document line number) to actually turn into
+    /// presented [`VisualLine`]s. Lines in `lines` outside this range are
+    /// parsing context only and are not drawn.
+    pub render: Range<usize>,
 }
 
 /// Display kind for a whole block. The syntax-display table distinguishes a
@@ -723,7 +733,7 @@ fn block_display_kind(kind: NodeKind) -> BlockKind {
     syntax_display(kind).indexed_block
 }
 
-/// Presents the visible lines of one indexed Markdown block.
+/// Presents `window.render`'s lines of one indexed Markdown block.
 ///
 /// Every line is presented in the context its block kind implies, except the
 /// blank run closing the block. The trailing newline each line's visual text
@@ -745,7 +755,7 @@ pub fn present_block(
     // which is out of this construct's scope, so only a top-level paragraph
     // qualifies.
     let joinable = block.kind == NodeKind::Paragraph;
-    let mut lines = Vec::with_capacity(window.lines.len());
+    let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     let mut index = 0;
     while index < window.lines.len() {
         let line = window.lines[index];
@@ -774,9 +784,10 @@ pub fn present_block(
                 &window.lines[index..run_end],
                 revision,
                 line_height,
+                &window.render,
                 &mut lines,
             );
-        } else {
+        } else if window.render.contains(&line.line) {
             let mut presented = present_polished_line(
                 line.line as u64,
                 revision,
@@ -793,10 +804,9 @@ pub fn present_block(
         }
         index = run_end;
     }
-    let lines_before = window
-        .lines
-        .first()
-        .map_or(0, |line| line.line.saturating_sub(window.span.start));
+    let lines_before = lines.first().map_or(0, |line| {
+        (line.line_id as usize).saturating_sub(window.span.start)
+    });
     let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
     VisualBlock {
         id: block.id,
@@ -1285,6 +1295,7 @@ fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
     line_height: f32,
+    render: &Range<usize>,
     out: &mut Vec<VisualLine>,
 ) {
     let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
@@ -1295,6 +1306,9 @@ fn present_joined_run(
         parsed: &parsed,
     };
     for line in lines {
+        if !render.contains(&line.line) {
+            continue;
+        }
         let mut presented = present_markdown_from_parse(
             line.line as u64,
             revision,
