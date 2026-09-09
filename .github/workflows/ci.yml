@@ -18,6 +18,22 @@ permissions:
   contents: read
 
 jobs:
+  workflow_state_tests:
+    name: Workflow state regression tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out target
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+          persist-credentials: false
+      - name: Run workflow regression tests without network or agent calls
+        run: |
+          python3 -m unittest discover -s .github/tests -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
   claim_trusted_ci_generation:
     name: Reclaim trusted CI generation
     if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -341,6 +357,7 @@ jobs:
     name: Finalize trusted CI generation
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     needs:
+      - workflow_state_tests
       - report_macos
       - report_windows
     runs-on: ubuntu-latest
@@ -359,6 +376,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
           GENERATION_ID: ${{ inputs.generation_id }}
+          WORKFLOW_TEST_RESULT: ${{ needs.workflow_state_tests.result }}
           MACOS_REPORT_RESULT: ${{ needs.report_macos.result }}
           WINDOWS_REPORT_RESULT: ${{ needs.report_windows.result }}
         run: |
@@ -391,7 +409,10 @@ jobs:
               <<< "$statuses"
           )"
 
-          if [[ "$MACOS_REPORT_RESULT" != success || "$WINDOWS_REPORT_RESULT" != success ]]; then
+          if [[ "$WORKFLOW_TEST_RESULT" == failure ]]; then
+            state=failure
+            description="Trusted CI generation ${GENERATION_ID} failed"
+          elif [[ "$WORKFLOW_TEST_RESULT" != success || "$MACOS_REPORT_RESULT" != success || "$WINDOWS_REPORT_RESULT" != success ]]; then
             state=error
             description="Trusted CI generation ${GENERATION_ID} incomplete"
           elif [[ "$macos_state" == success && "$windows_state" == success ]]; then
