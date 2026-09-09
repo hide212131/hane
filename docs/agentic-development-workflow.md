@@ -413,15 +413,11 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 
 #### 手動再レビュー要求 `/codex-review`
 
-owner / write 権限保持者は、対象 Pull Request が open な same-repository Pull Request である間、Pull Request のコメントに `/codex-review` と投稿して同じ controller を明示的に再起動できる。ただし、対象 head SHA に対して終端結果（`clean` / `findings`）がすでに存在する場合、controller は新しい `@codex review` コメントを投稿せずその結果を再利用する（詳細は以下の再利用条件を参照）。
+repository owner は、open・non-draft・同一リポジトリの Pull Request に `/codex-review` とコメントして controller を再起動できる。PR author も repository owner、`github-actions[bot]`、`claude[bot]` のいずれかである必要がある。owner 以外からの要求や対象条件を満たさない要求は、認可ステップが失敗し Actions run が失敗する。
 
-- `/codex-review` コメント投稿者の実効権限は `/implement` と同じ方法（collaborator permission API、または `OWNER`）で確認し、`write` / `maintain` / `admin` を持たない投稿者のコメントは無視する。
-- controller はレビューを要求する前に対象 Pull Request の現在の head SHA を解決し、以降の判定・記録の対象 SHA として確定する。対象が open な same-repository Pull Request でない場合は起動しない。
-- 加えて、対象 Pull Request の author 自身も信頼できる必要がある。author が `github-actions[bot]` または `claude[bot]` である場合を除き、author が現在 write / maintain / admin 権限を持たない場合は起動しない（`.github/workflows/codex-review.yml` の `Resolve and authorize review target`）。コメント投稿者が owner / write 権限保持者であっても、この author 側の条件を満たさない限り `/codex-review` は失敗する。
-- 確定した head SHA に対して、終端結果を示す `hane/codex-review` commit status（`clean` を示す成功、または `findings` を示す失敗のいずれか）がすでに存在する場合は、その結果を再利用し、新しい Codex request は発行しない。同じ終端 SHA に対して `/codex-review` を繰り返しても重複したレビュー要求は発行されない。
-- 再利用できる終端結果がない場合、controller はまず `hane/codex-review` に `pending` 状態を publish し、その後に確定した head SHA を明記した `@codex review` コメントを投稿する。このコメント投稿には [認証](#認証) の Codex の項で説明した、Codex に接続した repository owner 専用の `CODEX_GITHUB_TOKEN` を使う。
-- Codex はレビュー専用であり、コードを変更しない。
-- 認識できた `clean` / `findings` の結果は、レビュー対象にした head SHA に対応付けて保存する。stale（レビュー中に head SHA が変わった）、unknown（終端結果を観測できない）、controller 自体の失敗は、いずれも成功として扱わず fail closed とする。
+controller は現在の head SHA を固定し、その SHA の終端 `clean` / `findings` を再利用する。終端 status がなくても、同一 SHA の既存 Codex review に指摘があればそれを再利用する。既存の SHA marker 付き要求コメントも再利用できるため、コマンドは新規レビュー要求を必ず発行するものではない。既存要求後に error がある場合は遅れて届いた完了結果を確認し、再利用できなければ新規要求を発行する。
+
+新規 `@codex review` コメントには repository owner 専用の `CODEX_GITHUB_TOKEN` を使う。Codex はレビュー専用でコードを変更しない。head が変化した場合、結果不明、controller の失敗はいずれも成功として扱わない。
 
 ### GUI requirement classification
 
@@ -606,7 +602,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - Pull Request の最新 head SHA に Codex review を実行する。
 - review 完了と `clean` / `findings` を head SHA と対応付けて次の処理へ渡せるようにする。
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
-- owner / write 権限保持者は Pull Request コメント `/codex-review` で同じ controller を明示的に再起動できる。権限確認、head SHA の記録、終端結果の再利用、fail closed の扱いは「[Codex review](#codex-review)」の「手動再レビュー要求」節に従う。
+- repository owner は Pull Request コメント `/codex-review` で同じ controller を明示的に再起動できる。権限確認、head SHA の記録、終端結果の再利用、fail closed の扱いは「[Codex review](#codex-review)」の「手動再レビュー要求」節に従う。
 
 ### Phase 4: Local GUI validation
 
