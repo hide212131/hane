@@ -18,10 +18,26 @@ jobs:
       actions: write
       contents: write
       issues: write
-      pull-requests: read
+      # Grant explicit PR comment access; verify the notification path in Actions.
+      pull-requests: write
       statuses: write
 
     steps:
+      - name: Check out trusted control policy
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .hane-control
+          persist-credentials: false
+
+      - name: Preserve trusted control policy before checking out the PR
+        shell: bash
+        run: |
+          cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
+          cp .hane-control/.github/scripts/merge_statuses_by_sha.sh "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh"
+          mkdir -p "$RUNNER_TEMP/hane-final-control"
+          cp .hane-control/.github/scripts/*.py "$RUNNER_TEMP/hane-final-control/"
+
       - name: Resolve automatic fix
         id: target
         shell: bash
@@ -30,10 +46,25 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          MANUAL_RETRY: ${{ github.event.client_payload.manual_retry || 'false' }}
+          MANUAL_RETRY_CONTEXT: ${{ github.event.client_payload.manual_retry_context || '' }}
         run: |
           set -euo pipefail
 
           echo 'proceed=false' >> "$GITHUB_OUTPUT"
+
+          manual_retry="${MANUAL_RETRY:-false}"
+          if [[ "$manual_retry" != true && "$manual_retry" != false ]]; then
+            echo '::error::manual_retry must be true or false.'
+            exit 1
+          fi
+          manual_retry_context="${MANUAL_RETRY_CONTEXT:-}"
+          if [[ "$manual_retry" == true && ! "$manual_retry_context" =~ ^hane/claude-fix-manual/[0-9]+-[0-9]+$ ]]; then
+            echo '::error::manual_retry_context must identify the owner authorization being consumed.'
+            exit 1
+          fi
+          echo "manual_retry=$manual_retry" >> "$GITHUB_OUTPUT"
+          echo "manual_retry_context=$manual_retry_context" >> "$GITHUB_OUTPUT"
 
           if [[ -z "${PR_NUMBER:-}" || -z "${TARGET_SHA:-}" ]]; then
             echo '::error::Missing pr_number or target_sha.'
@@ -77,27 +108,64 @@ jobs:
             exit 0
           fi
 
-          routing="$(
-            gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
-              --jq "[.[] | select(.context == \"hane/copilot-routing\" and .state == \"failure\" and .description == \"Copilot routing: fix for ${short_sha}\")] | max_by(.id) // {} | .description // \"\""
+          authorization_statuses="$(
+            gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add'
           )"
-          if [[ "$routing" != "Copilot routing: fix for ${short_sha}" ]]; then
-            echo "::warning::No exact-head Copilot fix decision exists for ${TARGET_SHA}."
+          authorization="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" authorization \
+            --sha "$TARGET_SHA" --context "$manual_retry_context" <<< "$authorization_statuses")"
+          if [[ "$manual_retry" == true && "$(jq -r '.valid' <<< "$authorization")" != true ]]; then
+            echo '::warning::Manual authorization was claimed or consumed; ignoring stale dispatch.'
+            exit 0
+          fi
+          if [[ "$manual_retry" != true ]] && jq -e 'any(.[]; (.context // "") | startswith("hane/claude-fix-manual/"))' <<< "$authorization_statuses" >/dev/null; then
+            echo 'Explicit retry state exists on this head; only an unclaimed owner command may start another execution.'
             exit 0
           fi
 
-          completed=0
-          while IFS= read -r sha; do
-            [[ -z "$sha" || "$sha" == "$TARGET_SHA" ]] && continue
-            short="${sha:0:12}"
-            desc="$(
-              gh api "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100" \
-                --jq '[.[] | select(.context == "hane/claude-fix" and .state == "success")] | max_by(.id) // {} | .description // ""'
-            )"
-            [[ "$desc" == "Claude fix completed for ${short}" ]] && completed=$((completed + 1))
-          done < <(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" --jq '.[].sha')
+          workflow_files="$(
+            gh api --paginate --slurp \
+              "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+              | jq '[.[][] | .filename] | any(.[]; startswith(".github/workflows/"))'
+          )"
+          if [[ "$workflow_files" == true && "${MANUAL_RETRY:-false}" != true ]]; then
+            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix' \
+              -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
+              -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" >/dev/null
+            echo '::warning::Claude automatic fix is disabled for Pull Requests that change workflow files.'
+            exit 0
+          fi
 
-          if [[ "$completed" -ge 3 ]]; then
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing \
+            --sha "$TARGET_SHA" --manual "$manual_retry" <<< "$authorization_statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            echo 'The current routing decision does not authorize a fix.'
+            exit 0
+          fi
+
+          # Count logical pushed fixes, including ones whose status POST was lost.
+          # Fetch the entire event log so old authorizations/boundaries cannot age
+          # out of a single API page.
+          # A long-lived PR's combined commit/status evidence can exceed the
+          # ~128KiB jq --arg/--argjson argv limit ("Argument list too long");
+          # keep every accumulated payload file-backed instead of on argv.
+          commits_file="$RUNNER_TEMP/hane-claude-fix-commits.json"
+          gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" | jq 'add' > "$commits_file"
+          statuses_dir="$RUNNER_TEMP/hane-claude-fix-statuses"
+          mkdir -p "$statuses_dir"
+          while IFS= read -r sha; do
+            gh api --paginate --slurp "repos/${REPOSITORY}/commits/${sha}/statuses?per_page=100" | jq 'add' > "${statuses_dir}/${sha}.json"
+          done < <(jq -r '.[].sha' "$commits_file")
+          statuses_by_sha_file="$RUNNER_TEMP/hane-claude-fix-statuses-by-sha.json"
+          bash "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh" "$commits_file" "$statuses_dir" "$statuses_by_sha_file"
+          budget="$(
+            jq -n --slurpfile commits "$commits_file" --slurpfile statuses "$statuses_by_sha_file" \
+              '{commits:$commits[0],statuses:$statuses[0]}' \
+              | python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" budget --sha "$TARGET_SHA"
+          )"
+          completed="$(jq -r '.completed' <<< "$budget")"
+
+          if [[ "$manual_retry" != true && "$completed" -ge 3 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: max iterations for ${short_sha}" \
@@ -110,6 +178,10 @@ jobs:
             exit 0
           fi
 
+          if [[ "$manual_retry" == true ]]; then
+            echo "Manual Claude retry authorized for ${TARGET_SHA}; bypassing the current fix-cycle limit once."
+          fi
+
           latest="$(
             gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
               --jq '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv'
@@ -117,11 +189,16 @@ jobs:
           description="${latest%%$'\t'*}"
           created_at="${latest#*$'\t'}"
 
+          if [[ "$manual_retry" != true ]]; then
+            case "$description" in
+              "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
+                echo "Automatic fix for ${TARGET_SHA} already has a terminal result."
+                exit 0
+                ;;
+            esac
+          fi
+
           case "$description" in
-            "Claude fix completed for ${short_sha}"|"Claude fix blocked"*|"Claude fix stale for ${short_sha}"|"Claude fix failed for ${short_sha}"|"Claude fix produced no changes for ${short_sha}")
-              echo "Automatic fix for ${TARGET_SHA} already has a terminal result."
-              exit 0
-              ;;
             "Claude fix pending for ${short_sha}"|"Claude fix running for ${short_sha}")
               created_epoch="$(date -d "$created_at" +%s 2>/dev/null || echo 0)"
               now_epoch="$(date -u +%s)"
@@ -164,16 +241,17 @@ jobs:
           )"
 
           review_url=''
-          review_body=''
-          findings_json='[]'
+          review_body_file="$RUNNER_TEMP/hane-claude-fix-review-body.txt"
+          findings_file="$RUNNER_TEMP/hane-claude-fix-findings.json"
+          : > "$review_body_file"
+          echo '[]' > "$findings_file"
           if [[ -n "$review" ]]; then
             review_id="${review%%$'\t'*}"
             review_url="${review#*$'\t'}"
-            review_body="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""')"
-            findings_json="$(
-              gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-                | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]"
-            )"
+            gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""' > "$review_body_file"
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
+              | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]" \
+              > "$findings_file"
           fi
 
           statuses="$(gh api "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100")"
@@ -185,26 +263,28 @@ jobs:
           ordinary_ci_conclusion="$(cut -f2 <<< "$ordinary_ci")"
           ordinary_ci_url="$(cut -f3 <<< "$ordinary_ci")"
 
-          ci_statuses="$(
-            jq \
-              --arg ordinary_status "$ordinary_ci_status" \
-              --arg ordinary_conclusion "$ordinary_ci_conclusion" \
-              --arg ordinary_url "$ordinary_ci_url" \
-              '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
-               (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
-              <<< "$statuses"
-          )"
+          ci_statuses_file="$RUNNER_TEMP/hane-claude-fix-ci-statuses.json"
+          jq \
+            --arg ordinary_status "$ordinary_ci_status" \
+            --arg ordinary_conclusion "$ordinary_ci_conclusion" \
+            --arg ordinary_url "$ordinary_ci_url" \
+            '[.[] | select(.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) | {context, state, description, target_url}] +
+             (if $ordinary_status != "" then [{context:"github-actions/CI",state:$ordinary_conclusion,description:("workflow status: " + $ordinary_status),target_url:$ordinary_url}] else [] end)' \
+            <<< "$statuses" > "$ci_statuses_file"
           ci_failure_count="$(
             jq '[.[] | select((.context == "hane/trusted-ci-generation" or (.context | startswith("cargo test / clippy"))) and .state == "failure")] | length' <<< "$statuses"
           )"
           if [[ "$ordinary_ci_status" == completed && "$ordinary_ci_conclusion" == failure ]]; then
             ci_failure_count=$((ci_failure_count + 1))
           fi
-          finding_count="$(jq 'length' <<< "$findings_json")"
+          finding_count="$(jq 'length' "$findings_file")"
 
-          # A fix may be justified by reviewer findings, by trusted CI failure, or both.
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence
+          final_evidence_count="$(jq 'if . == null then 0 else 1 end' "$FINAL_EVIDENCE_PATH")"
+          # An authenticated final-judge receipt also supplies GUI failure evidence.
           # CI-only fix routes are valid even when the reviewer is clean.
-          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 ]]; then
+          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 && "$final_evidence_count" -eq 0 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: missing evidence for ${short_sha}" \
@@ -212,15 +292,13 @@ jobs:
             exit 0
           fi
 
-          copilot_reason="$(
-            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-              --jq ".[] | select(((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) or ((.body // \"\") | contains(\"Copilot pre-GUI routing recovery for \`${TARGET_SHA}\`: **fix**\"))) | .body" \
-              | tail -n 1
-          )"
-          files_json="$(
-            gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-              | jq '[.[][] | {filename, status, additions, deletions}]'
-          )"
+          copilot_reason_file="$RUNNER_TEMP/hane-claude-fix-copilot-reason.txt"
+          gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(((.body // \"\") | contains(\"Copilot pre-GUI routing for \`${TARGET_SHA}\`: **fix**\")) or ((.body // \"\") | contains(\"Copilot pre-GUI routing recovery for \`${TARGET_SHA}\`: **fix**\"))) | .body" \
+            | tail -n 1 > "$copilot_reason_file"
+          files_json_file="$RUNNER_TEMP/hane-claude-fix-files.json"
+          gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            | jq '[.[][] | {filename, status, additions, deletions}]' > "$files_json_file"
           pr_title="$(jq -r '.title' <<< "$pr")"
 
           jq -n \
@@ -229,15 +307,15 @@ jobs:
             --arg pr_title "$pr_title" \
             --arg review_source "$review_source" \
             --arg review_url "$review_url" \
-            --arg review_body "$review_body" \
-            --argjson review_findings "$findings_json" \
-            --arg codex_review_url "$review_url" \
-            --arg codex_review_body "$review_body" \
-            --argjson codex_findings "$findings_json" \
-            --argjson ci_statuses "$ci_statuses" \
-            --arg copilot_reason "$copilot_reason" \
-            --argjson changed_files "$files_json" \
-            '{pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings,codex_review_url:$codex_review_url,codex_review_body:$codex_review_body,codex_findings:$codex_findings,ci_statuses:$ci_statuses,copilot_fix_reason:$copilot_reason,changed_files:$changed_files}' \
+            --rawfile review_body_raw "$review_body_file" \
+            --slurpfile review_findings "$findings_file" \
+            --slurpfile ci_statuses "$ci_statuses_file" \
+            --rawfile copilot_reason_raw "$copilot_reason_file" \
+            --slurpfile changed_files "$files_json_file" \
+            --slurpfile final_evidence "$FINAL_EVIDENCE_PATH" \
+            '($review_body_raw | rtrimstr("\n")) as $review_body |
+             ($copilot_reason_raw | rtrimstr("\n")) as $copilot_reason |
+             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0],final_judge_evidence:$final_evidence[0]}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -266,8 +344,67 @@ jobs:
         if: ${{ steps.target.outputs.proceed == 'true' }}
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Run Claude Code fix
+      - name: Claim one paid invocation for this authorization
         if: ${{ steps.target.outputs.proceed == 'true' }}
+        id: claim
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
+          MANUAL_RETRY_CONTEXT: ${{ steps.target.outputs.manual_retry_context }}
+        run: |
+          set -euo pipefail
+          echo 'granted=false' >> "$GITHUB_OUTPUT"
+          release_execution_lease() {
+            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=error -f context='hane/claude-fix' \
+              -f description="Claude fix not started for ${TARGET_SHA:0:12}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          }
+          if [[ "$MANUAL_RETRY" == true ]]; then
+            statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
+            valid="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" authorization \
+              --sha "$TARGET_SHA" --context "$MANUAL_RETRY_CONTEXT" <<< "$statuses" | jq -r '.valid')"
+            if [[ "$valid" != true ]]; then
+              release_execution_lease
+              exit 0
+            fi
+            # Do not continue on an ambiguous POST failure. A persisted claim
+            # cannot be replayed automatically; a new owner command is needed.
+            gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+              -f state=pending -f context="$MANUAL_RETRY_CONTEXT" \
+              -f description="Claude manual retry claimed for ${TARGET_SHA:0:12}" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          fi
+          # A newer substantive route may have arrived during setup/claim.
+          statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing \
+            --sha "$TARGET_SHA" --manual "$MANUAL_RETRY" <<< "$statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            release_execution_lease
+            echo 'Routing no longer authorizes a fix; skipping paid invocation.'
+            exit 0
+          fi
+          # Checkout, setup and claim publication can outlive the reviewed head.
+          # Check eligibility after the claim, immediately before permitting Claude.
+          current_pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          if ! jq -e --arg sha "$TARGET_SHA" \
+            '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+            release_execution_lease
+            echo 'PR moved, closed, or became draft during preparation; skipping paid invocation.'
+            exit 0
+          fi
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
+          fi
+          echo 'granted=true' >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude Code fix
+        if: ${{ steps.claim.outputs.granted == 'true' }}
         id: claude
         shell: bash
         env:
@@ -276,11 +413,11 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set +e
-          prompt="$(cat <<EOF
+          cat > "$RUNNER_TEMP/hane-claude-fix-prompt.txt" <<EOF
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
-          Fix the reviewer findings, trusted CI failures, and Copilot fix reason present in the evidence below.
+          Fix the reviewer findings, trusted CI failures, GUI failures, and Copilot final or pre-GUI fix reason present in the evidence below.
           Use the repository normally: inspect code, run shell commands, Cargo, tests, linters, package managers,
           searches and network tools when useful. Make the smallest correct fix.
           Leave the final changes in the working tree uncommitted. The workflow owns commit and push.
@@ -289,17 +426,16 @@ jobs:
           Evidence:
           $(cat "$RUNNER_TEMP/hane-claude-fix-evidence.json")
           EOF
-          )"
 
-          claude -p "$prompt" \
+          claude -p \
             --max-turns 80 \
-            --permission-mode bypassPermissions
+            --permission-mode bypassPermissions < "$RUNNER_TEMP/hane-claude-fix-prompt.txt"
           status=$?
           set -e
           echo "exit_code=$status" >> "$GITHUB_OUTPUT"
 
       - name: Finalize automatic fix
-        if: ${{ steps.target.outputs.proceed == 'true' && steps.claude.outputs.exit_code == '0' }}
+        if: ${{ steps.claim.outputs.granted == 'true' && steps.claude.outputs.exit_code == '0' }}
         id: finalize
         shell: bash
         env:
@@ -308,16 +444,36 @@ jobs:
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
           HEAD_REF: ${{ steps.target.outputs.head_ref }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
+          MANUAL_RETRY_CONTEXT: ${{ steps.target.outputs.manual_retry_context }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
           echo 'workflow_patch=false' >> "$GITHUB_OUTPUT"
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
+          fi
 
           if [[ -z "$(git status --porcelain)" ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix produced no changes for ${short_sha}" \
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+            if [[ "${MANUAL_RETRY}" == true ]]; then
+              manual_status="$(
+                gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq -r \
+                   "[.[][] | select(.context == \"${MANUAL_RETRY_CONTEXT}\")] | max_by(.id) // {} | [.state // \"\", .description // \"\"] | @tsv"
+              )"
+              if [[ "${manual_status}" == $'pending\tClaude manual retry claimed for '"${short_sha}" ]]; then
+                gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+                  -f state=error -f context="${MANUAL_RETRY_CONTEXT}" \
+                  -f description="Claude manual retry consumed for ${short_sha}" \
+                  -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+              else
+                echo '::warning::Manual Claude retry authorization was already consumed or replaced; leaving the newer authorization untouched.'
+              fi
+            fi
             echo 'published=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -349,6 +505,7 @@ jobs:
           Automatic Claude fix for Copilot routing decision on ${short_sha}
 
           Addresses the Copilot pre-GUI routing \"fix\" decision recorded on ${TARGET_SHA}.
+          Manual retry: ${MANUAL_RETRY}
           EOF
           )"
           new_sha="$(git rev-parse HEAD)"
@@ -364,10 +521,41 @@ jobs:
             exit 0
           fi
 
+          # Recheck the authorization actually used to implement this patch.
+          current_pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          if ! jq -e --arg sha "$TARGET_SHA" '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+            echo 'PR eligibility changed before push; retaining the local patch only.'
+            exit 0
+          fi
+          statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing --sha "$TARGET_SHA" --manual "$MANUAL_RETRY" <<< "$statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            echo 'A newer decision no longer permits this fix; refusing push.'
+            exit 0
+          fi
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
+          fi
+
           git push "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"
 
-          generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state=success -f context='hane/claude-fix' \
+            -f description="Claude fix completed for ${short_sha}" \
+            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null; then
+            echo '::warning::Failed to publish Claude fix completion status; claude-fix-reconcile.yml will recover it from the bot commit.'
+          fi
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            new_short_sha="${new_sha:0:12}"
+            if ! gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+              -f state=success -f context='hane/claude-fix-cycle' \
+              -f description="Claude fix cycle reset for ${new_short_sha} after manual retry" \
+              -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null; then
+              echo '::warning::Failed to publish Claude fix cycle reset; claude-fix-reconcile.yml will recover it from the manual-retry commit.'
+            fi
+          fi
+          generation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
             -f state=pending -f context='hane/trusted-ci-generation' \
             -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
@@ -383,10 +571,6 @@ jobs:
           gh workflow run gui-requirement.yml --repo "$REPOSITORY" --ref main \
             -f pr_number="$PR_NUMBER" -f target_sha="$new_sha"
 
-          gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
-            -f state=success -f context='hane/claude-fix' \
-            -f description="Claude fix completed for ${short_sha}" \
-            -f target_url="https://github.com/${REPOSITORY}/commit/${new_sha}" >/dev/null
           comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI, review, and GUI requirement classification follow-up were dispatched for the new head."
           if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
             -f body="$comment_body" >/dev/null; then
@@ -410,11 +594,29 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
+          MANUAL_RETRY_CONTEXT: ${{ steps.target.outputs.manual_retry_context }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           artifact_name="hane-workflow-fix-${TARGET_SHA}"
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            manual_status="$(
+              gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq -r \
+                 "[.[][] | select(.context == \"${MANUAL_RETRY_CONTEXT}\")] | max_by(.id) // {} | [.state // \"\", .description // \"\"] | @tsv"
+            )"
+            if [[ "${manual_status}" == $'pending\tClaude manual retry claimed for '"${short_sha}" ]]; then
+              if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+                -f state=error -f context="${MANUAL_RETRY_CONTEXT}" \
+                -f description="Claude manual retry consumed for ${short_sha}" \
+                -f target_url="$run_url" >/dev/null; then
+                echo '::warning::Failed to consume the manual Claude retry authorization.'
+              fi
+            else
+              echo '::warning::Manual Claude retry authorization was already consumed or replaced; leaving the newer authorization untouched.'
+            fi
+          fi
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix blocked: workflow patch requires owner for ${short_sha}" \
@@ -426,15 +628,33 @@ jobs:
           fi
 
       - name: Publish Claude execution failure
-        if: ${{ steps.target.outputs.proceed == 'true' && steps.claude.outputs.exit_code != '0' }}
+        if: ${{ steps.claim.outputs.granted == 'true' && steps.claude.outputs.exit_code != '0' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          MANUAL_RETRY: ${{ steps.target.outputs.manual_retry }}
+          MANUAL_RETRY_CONTEXT: ${{ steps.target.outputs.manual_retry_context }}
         run: |
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
+          if [[ "${MANUAL_RETRY}" == true ]]; then
+            manual_status="$(
+              gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq -r \
+                 "[.[][] | select(.context == \"${MANUAL_RETRY_CONTEXT}\")] | max_by(.id) // {} | [.state // \"\", .description // \"\"] | @tsv"
+            )"
+            if [[ "${manual_status}" == $'pending\tClaude manual retry claimed for '"${short_sha}" ]]; then
+              if ! gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
+                -f state=error -f context="${MANUAL_RETRY_CONTEXT}" \
+                -f description="Claude manual retry consumed for ${short_sha}" \
+                -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null; then
+                echo '::warning::Failed to consume the manual Claude retry authorization.'
+              fi
+            else
+              echo '::warning::Manual Claude retry authorization was already consumed or replaced; leaving the newer authorization untouched.'
+            fi
+          fi
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix failed for ${short_sha}" \

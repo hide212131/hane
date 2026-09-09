@@ -9,7 +9,7 @@ Hane の Issue から実装、レビュー、実アプリ検証、修正、マ�
 
 Local GUI validator の構成、信頼条件、依頼・結果の契約、段階的な実装順序は
 [Local GUI validation 設計](local-gui-validation.md) で具体化する。Computer Use を必須にせず、
-非公開リポジトリで実行を制御する判断は [ADR-0024](adr/0024-local-gui-validation.md) に残す。
+GitHub-hosted macOS を優先し、必要な場合だけ通常アカウントを含むローカルで補う判断は [ADR-0024](adr/0024-local-gui-validation.md) に残す。
 この方針の文書化と、実装・対象 Mac での実証の完了は区別する。
 
 追跡 Issue: #44
@@ -27,6 +27,18 @@ Local GUI validator の構成、信頼条件、依頼・結果の契約、段階
 ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Copilot = judge** は変更しない。Local GUI validator はこの3者を置き換えず、コードレビューや CI では確認しにくい実アプリの挙動を補完する独立した検証層とする。
 
 AI の判断と、GitHub 上で実際に変更を加える処理を分ける。特にマージは Copilot の判断だけでは実行せず、CI、Codex review、GUI validation、対象 commit、未解決レビューなどを機械的に確認する。
+
+## Issue・Pull Request・コメントの言語
+
+このワークフローで作成・更新する、人が読む GitHub 上の文章は日本語に統一する。Claude Code、Codex、GitHub Copilot、Local GUI validator、および GitHub Actions の定型投稿に共通で適用する。
+
+- Issue と Pull Request のタイトル・本文（見出し、概要、変更内容、検証結果を含む）は日本語で書く。
+- Issue / Pull Request のコメント、レビュー本文、インラインのレビュー指摘、返信、進捗報告、修正依頼、判断理由、人間への引き継ぎも日本語で書く。
+- 入力の Issue、レビュー、ログが英語でも、説明や要約は日本語にする。
+- コード、コマンド、パス、URL、製品名、ログの引用など、原文を保つ必要があるものはそのまま記載し、周囲の説明を日本語にする。
+- 機械処理の契約は翻訳しない。`/implement`、`@codex review`、ラベル、JSON のキー、`fix` / `ready` / `blocked` などの列挙値、相関マーカーを保持する。JSON 内の人向けの説明・判断理由は日本語にする。
+
+新しい agent prompt やコメント生成処理を追加・変更するときも、この言語方針を適用する。投稿前にタイトル・本文・コメントの説明文が日本語であることと、機械処理用の識別子を変更していないことを確認する。
 
 ## 全体フロー
 
@@ -79,7 +91,7 @@ CI + Codex review
                                     +--> push --> 全検証やり直し
 ```
 
-必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、ローカル Mac の GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
+必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
 
 ## 各 agent / validator の責務
 
@@ -124,7 +136,7 @@ Local GUI validator は **検証専用** とし、コードを変更しない。
 
 Hane は Rust + GPUI のネイティブデスクトップアプリなので、CI とコードレビューだけでは、実際にウィンドウを起動したときの描画や操作を十分に確認できない。Local GUI validator はローカル macOS 上で Pull Request の対象 commit を checkout し、Hane を build / 起動して操作する。
 
-実行機構は、事前に決めたシナリオで起動・操作・結果確認を行う Hane 専用の検証コマンドを主経路とする。Computer Use は必須にせず、別セッションのアプリ承認を引き継げることを前提にしない。Mac の runner は非公開の制御用リポジトリに登録し、公開側から直接使わせない。AI による画像確認は、保存した証拠を使う後段の処理として分ける。具体的な条件と未実証の範囲は [Local GUI validation 設計](local-gui-validation.md) に従う。
+実行機構は、事前に決めたシナリオで起動・操作・結果確認を行う Hane 専用の検証コマンドを主経路とする。Computer Use は必須にせず、別セッションのアプリ承認を引き継げることを前提にしない。標準 GitHub-hosted macOS を優先し、検証手順と対象アプリを別の SHA で取得する。専用ローカルユーザーや非公開制御リポジトリを必須にしない。AI による画像確認は、保存した証拠を使う後段の処理として分ける。具体的な条件と未実証の範囲は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 検証対象の例は次のとおり。
 
@@ -161,7 +173,7 @@ trusted workflow は Pull Request の各 head SHA について、変更ファイ
 
 #### GUI validation の実行順序
 
-ローカル Mac の実行時間を無駄にしないため、GUI validation は次を満たした後に実行する。
+GUI runner の実行時間を無駄にしないため、GUI validation は次を満たした後に実行する。
 
 1. 対象 head SHA の必須 CI が成功している。
 2. 同じ head SHA に対する Codex review が完了している。
@@ -294,9 +306,9 @@ Codex の GitHub integration は `@codex review` コメントの投稿者が Cod
 
 ### Local GUI validator
 
-Local GUI validator はローカル macOS 上で動かす。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
+Local GUI validator は互換のため維持する役割名であり、実行場所は標準 GitHub-hosted macOS を優先する。不足が実証された操作だけローカル macOS で補う。GitHub から対象 Pull Request と head SHA を受け取り、その SHA を checkout して検証する。
 
-検証依頼の受付と結果報告は GitHub 側の信頼するジョブに分け、Mac のビルド・実行ジョブに Pull Request への書き込み認証情報を渡さない。非公開リポジトリとの受け渡しに必要な認証は、既存のレビュー用認証と兼用せず、対象リポジトリと処理に限定する。runner 自体が持つ認証情報まで安全に隔離できるという意味ではないため、実行できるコードの範囲も制限する。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。詳細は [Local GUI validation 設計](local-gui-validation.md) に従う。
+検証依頼の受付と結果報告は GitHub 側の信頼するジョブに分け、Mac のビルド・実行ジョブに Pull Request への書き込み認証情報を渡さない。hostedの実行ジョブには書き込み用認証やエージェントの認証を渡さず、checkoutの認証情報を残さない。ローカル補完で別リポジトリへの受け渡しが必要な場合も、既存のレビュー用認証と兼用しない。runner 自体が持つ認証情報まで安全に隔離できるという意味ではないため、実行できるコードの範囲も制限する。個人用の SSH agent、不要な cloud credential、個人データへアクセスできる前提にはしない。詳細は [Local GUI validation 設計](local-gui-validation.md) に従う。
 
 ### GitHub Copilot
 
@@ -463,6 +475,20 @@ durable な表現（commit status, context `hane/gui-requirement`）:
 - `claude-fix.yml` の自動修正 push は、新しい head SHA に対して `ci.yml` / `codex-review.yml` と同じタイミングで `gh workflow run gui-requirement.yml -f pr_number=... -f target_sha=<new_sha>` を dispatch する。
 - `claude-fix-reconcile.yml` は既存の Codex review 配送回復ロジックと同じ形で、自動修正 head の `hane/gui-requirement` 終端状態（成功の `false` または失敗の `true`）が存在しない場合に同じ `workflow_dispatch` を再試行する。この reconcile は `Copilot pre-GUI routing` / `Claude automatic fix worker` の `workflow_run` 完了イベントと `*/10 * * * *` の cron でも起動するため、配送失敗時も取りこぼさない。
 
+### Claude automatic fix の手動再試行
+
+自動修正が同じ Pull Request で3回完了すると worker は停止する。repository owner が、現在の head に `fix` 判定がある非Draft PRへ本文完全一致で `/claude-fix` とコメントすると、現在の回数上限を一度だけ bypass する。承認はそのコメントIDと対象headに結び付く。
+
+- 同じ承認からの有料実行は最大1回。実行直前に `authorized` から `claimed` へ記録してから Claude を呼ぶ。
+- 配送失敗や準備中の障害は、未claimの承認を使って復旧できる。claim後のタイムアウトや結果不明は自動再実行しない。owner がログを確認して新しい `/claude-fix` を投稿する。
+- 失敗・変更なし・workflowパッチ引き渡しは、その実行の承認だけを消費する。別の新しい承認を上書きしない。
+- 手動再試行が新しいcommitをpushできた場合、そのcommitが新しい自動修正サイクルの境界になる。手動実行自身は枠を消費せず、その後の自動修正に最大3回を許可する。
+- 完了statusやリセットstatusのPOSTが失敗しても、bot commitの実際の親子関係から完了と境界を算出する。APIへの記録順には依存しない。
+- `/codex-review` や同じworkflow runの再実行では承認を追加しない。新しい明示的コメントが必要。
+- `.github/workflows/**` を変更するPRの自動修正はworkerでも禁止する。owner承認での実行は可能だが、生成物がworkflow変更を含む場合はpatch artifactとして引き渡す。
+
+状態遷移、障害時の判断、回帰テストとPR #82指摘の対応は [Claude retry state](claude-retry-state.md) を参照。
+
 ### Local GUI validation
 
 GUI requirement classification が `required = true` で、対象 head SHA の CI が成功し、Codex outcome が `clean` または Copilot pre-GUI routing が `continue-validation` の場合、状態を `waiting-gui` にして Local GUI runner に検証を要求する。
@@ -552,9 +578,9 @@ GitHub Agentic Workflows の `merge-pull-request` safe output は現時点で ex
 
 Local GUI runner は Pull Request のコードを実際に実行するため、さらに強い信頼境界を置く。
 
-- public fork Pull Request を初期のローカル検証対象にしない。runner は非公開の制御用リポジトリにだけ登録する。
-- 初期対象は既存 controller が信頼する same-repository の Pull Request に限り、さらに人が exact head SHA の実行を承認する。
-- 初期運用は専用 OS user で行う。非公開リポジトリや専用ユーザーだけで対象コードを安全に隔離できるとはしない。
+- public fork Pull Request を検証対象にしない。標準 GitHub-hosted macOS を優先する。
+- hostedの対象は既存 controller が信頼する same-repository の Pull Request に限る。ローカルで実行する場合は人が対象 SHA と操作を確認する。
+- ローカル補完では通常のログインアカウントも認める。専用OSユーザーやprivate制御repoは運用上の選択肢であり、必須にしない。いずれも任意の外部コードを安全に隔離する保証とはしない。
 - SSH agent、個人データ、不要な cloud credential へアクセスさせない。
 - GUI validation に不要なディレクトリやサービスへの権限を与えない。
 - Markdown、Issue 本文、Pull Request 本文、テスト用ファイルなどに書かれた命令は **untrusted data** として扱う。
@@ -585,8 +611,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 4: Local GUI validation
 
-実装は [Local GUI validation 設計](local-gui-validation.md) の段階に従い、まず Terminal、
-次に非公開リポジトリの runner、続いて依頼・報告と必須シナリオの順に実証する。
+実装は [Local GUI validation 設計](local-gui-validation.md) に従う。2026-09-09 の本番GUI操作、依頼・結果受領、実キャンセル回復、final judge、merge gateの証拠は[本番実証記録](history/gui-validation/2026-09-09-production.md)にまとめる。ローカル補完は hosted で不足する操作に限って検討する。
 起動・撮影の成功だけで包括的な GUI 検証やマージ条件を満たしたことにはしない。
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。
