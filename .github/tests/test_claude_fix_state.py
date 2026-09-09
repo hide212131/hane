@@ -100,6 +100,15 @@ class RecoveryTests(unittest.TestCase):
             decision = policy.recovery([route(), grant(), execution(kind)], SHA, NOW)
             self.assertEqual(decision["manual_retry_context"], A)
 
+    def test_newer_authorization_recovers_when_an_older_one_is_blocked(self):
+        # A is granted, then a newer no-fix decision blocks it, then B is
+        # granted afterwards. Recovery must search past the blocked A instead
+        # of stopping at the oldest outstanding authorization.
+        rows = [grant(1, A), route(2, "continue-validation"), grant(3, B)]
+        decision = policy.recovery(rows, SHA, NOW)
+        self.assertTrue(decision["recover"])
+        self.assertEqual(decision["manual_retry_context"], B)
+
     def test_workflow_owner_route_requires_active_manual_authorization(self):
         rows = [route(1), route(2, "workflow changes require owner")]
         self.assertFalse(policy.recovery(rows, SHA, NOW)["recover"])

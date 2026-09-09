@@ -138,8 +138,17 @@ def recovery(statuses, sha, now):
     # An active grant is context-aware: it must only be checked against
     # decisions recorded after it, the same rule the worker applies when a
     # lost repository_dispatch POST otherwise strands a persisted approval.
+    # Several grants can be outstanding at once (e.g. an older one whose
+    # dispatch failed, superseded by a newer no-fix decision, followed by a
+    # fresh grant); search from the newest so a still-permitted approval is
+    # never shadowed by an older one a later routing decision blocked.
+    chosen = None
     if manual:
-        if not manual_command_allows_fix(statuses, sha, manual[0]["context"], now):
+        for candidate in reversed(manual):
+            if manual_command_allows_fix(statuses, sha, candidate["context"], now):
+                chosen = candidate
+                break
+        if chosen is None:
             return result
     elif not routing_allows_fix(statuses, sha, False):
         return result
@@ -157,7 +166,7 @@ def recovery(statuses, sha, now):
     # terminal status POST was lost or a stale dispatch was already queued.
     if manual:
         return {"recover": True, "manual_retry": True,
-                "manual_retry_context": manual[0]["context"]}
+                "manual_retry_context": chosen["context"]}
 
     # Never turn an uncertain manual execution into an automatic paid retry.
     # A new explicit command is required after the claim boundary.
