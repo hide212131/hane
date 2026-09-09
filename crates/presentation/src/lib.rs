@@ -737,15 +737,46 @@ pub fn present_block(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
-    let lines = window
-        .lines
-        .iter()
-        .map(|line| {
-            let context = if line.line < content_end {
-                context
-            } else {
-                LineContext::Normal
-            };
+    // A standalone paragraph's continuation lines are one run of inline content,
+    // so its emphasis, strong emphasis and code spans are parsed together
+    // (`present_joined_run`) rather than one physical line at a time. A list
+    // item or a blockquote also presents `LineContext::Normal`, but joining
+    // there would also have to re-derive their per-line bullet/`> ` markers,
+    // which is out of this construct's scope, so only a top-level paragraph
+    // qualifies.
+    let joinable = block.kind == NodeKind::Paragraph;
+    let mut lines = Vec::with_capacity(window.lines.len());
+    let mut index = 0;
+    while index < window.lines.len() {
+        let line = window.lines[index];
+        let line_context = if line.line < content_end {
+            context
+        } else {
+            LineContext::Normal
+        };
+        let mut run_end = index + 1;
+        if joinable && line_context == LineContext::Normal && is_plain_text_line(line) {
+            while run_end < window.lines.len() {
+                let next = window.lines[run_end];
+                let next_context = if next.line < content_end {
+                    context
+                } else {
+                    LineContext::Normal
+                };
+                if next_context != LineContext::Normal || !is_plain_text_line(next) {
+                    break;
+                }
+                run_end += 1;
+            }
+        }
+        if run_end - index > 1 {
+            present_joined_run(
+                &window.lines[index..run_end],
+                revision,
+                line_height,
+                &mut lines,
+            );
+        } else {
             let mut presented = present_polished_line(
                 line.line as u64,
                 revision,
@@ -753,14 +784,15 @@ pub fn present_block(
                 line.text,
                 line_height,
                 line.disclosure,
-                context,
+                line_context,
             );
             while presented.visual_text.ends_with(['\r', '\n']) {
                 presented.visual_text.pop();
             }
-            presented
-        })
-        .collect::<Vec<_>>();
+            lines.push(presented);
+        }
+        index = run_end;
+    }
     let lines_before = window
         .lines
         .first()
@@ -1018,6 +1050,54 @@ pub fn present_markdown_with_disclosure(
         return block;
     }
     let parsed = parse_document(revision, range, source);
+    present_markdown_from_parse(
+        line_id,
+        revision,
+        range,
+        source,
+        source,
+        line_height,
+        disclosure,
+        &parsed,
+    )
+}
+
+/// Presents one physical line from an already-parsed tree instead of parsing
+/// `source` alone.
+///
+/// CommonMark treats a soft line break inside a paragraph as whitespace within
+/// one continuous run of inline content, not as a boundary: `**bold` opened on
+/// one physical line can close with `**` on the next, and the same is true of
+/// `_..._`  and a backtick-delimited code span. Presenting each physical line as
+/// its own self-contained parse — which [`present_markdown_with_disclosure`]
+/// does, because caret, selection and IME still address physical lines — cannot
+/// see that, since the delimiter that closes the construct sits outside the
+/// slice being parsed. [`present_block`] instead parses every line of a
+/// multi-line paragraph together and calls this once per line with the shared
+/// result, so `parsed.markers` and `parsed.tree` may describe delimiters and
+/// spans that live partly or wholly on a different physical line; this clips
+/// them to `range` exactly as a self-contained parse already clips a node that
+/// escapes it.
+///
+/// `whole_source` is the text `parsed` was built from — `source` itself for a
+/// self-contained parse, or the joined text of every line in the run for a
+/// shared one — so a code span's padding (see [`code_span_padding`]) can be
+/// read even when it sits on a physical line other than this one.
+fn present_markdown_from_parse(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    whole_source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    parsed: &MarkdownParse,
+) -> VisualLine {
+    if source.is_empty() {
+        let mut block = present_plain(line_id, revision, range, source);
+        block.estimated_height = line_height;
+        return block;
+    }
     let kind = parsed
         .tree
         .blocks()
@@ -1026,7 +1106,21 @@ pub fn present_markdown_with_disclosure(
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    for &marker in &parsed.markers {
+    // A code span whose content both opens and closes on whitespace hides one
+    // leading and one trailing byte of it, the same display-only normalization
+    // CommonMark §6.1 applies to a code span's rendered content. Folded into the
+    // marker list so it hides, discloses and clips exactly like a real marker.
+    let mut markers = parsed.markers.clone();
+    markers.extend(code_span_padding(parsed, whole_source));
+    markers.sort_by_key(|marker| (marker.start, marker.end));
+    // Only markers wholly inside this physical line's range are this line's to
+    // show or hide; a shared multi-line parse also carries every other line's
+    // markers, which belong to the [`VisualLine`] built for that line instead.
+    let markers_on_line = markers
+        .iter()
+        .copied()
+        .filter(|marker| marker.start >= range.start && marker.end <= range.end);
+    for marker in markers_on_line {
         if source_cursor < marker.start.0 {
             append_segment(
                 &mut visual,
@@ -1037,7 +1131,7 @@ pub fn present_markdown_with_disclosure(
                 Visibility::Visible,
             );
         }
-        let expanded = marker_is_disclosed(marker, &parsed, disclosure);
+        let expanded = marker_is_disclosed(marker, parsed, disclosure);
         append_segment(
             &mut visual,
             &mut segments,
@@ -1076,6 +1170,9 @@ pub fn present_markdown_with_disclosure(
         return present_raw_source(line_id, revision, range, source, line_height);
     }
     let source_map = SourceMap { segments };
+    // A style run's node may also span lines that are not this one; clipping to
+    // `range` (as already done here) and letting `source_to_visual` fail outside
+    // it is what discards the part that belongs elsewhere.
     let mut style_runs = parsed
         .tree
         .iter()
@@ -1113,6 +1210,94 @@ pub fn present_markdown_with_disclosure(
         context: LineContext::Normal,
         disclosure,
         image: None,
+    }
+}
+
+/// Byte ranges of a code span's leading and trailing padding, for every code
+/// span in `parsed` whose content both opens and closes on whitespace (a line
+/// ending counts, since CommonMark §6.1 first converts one to a space) without
+/// being made of whitespace alone. Each returned range is exactly the one byte
+/// that display trims; [`present_markdown_from_parse`] folds them into its
+/// marker list so they hide, disclose and clip exactly like a real delimiter,
+/// leaving the source itself untouched.
+fn code_span_padding(parsed: &MarkdownParse, whole_source: &str) -> Vec<SourceRange> {
+    let base = parsed.source_range.start.0;
+    let is_pad = |byte: u8| matches!(byte, b' ' | b'\n' | b'\r');
+    parsed
+        .tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::InlineCode)
+        .filter_map(|(_, node)| {
+            let start = node.source_range.start.0;
+            let end = node.source_range.end.0;
+            let text = whole_source.get(start - base..end - base)?;
+            let marker_len = text.bytes().take_while(|byte| *byte == b'`').count();
+            if marker_len == 0 || marker_len * 2 > text.len() {
+                return None;
+            }
+            let content_start = start + marker_len;
+            let content_end = end - marker_len;
+            let content = whole_source.get(content_start - base..content_end - base)?;
+            let bytes = content.as_bytes();
+            let padded = bytes.first().copied().is_some_and(is_pad)
+                && bytes.last().copied().is_some_and(is_pad)
+                && !bytes.iter().copied().all(is_pad);
+            padded.then(|| {
+                [
+                    SourceRange::new(content_start, content_start + 1),
+                    SourceRange::new(content_end - 1, content_end),
+                ]
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+/// True for a line [`present_block`] may fold into a joined multi-line parse:
+/// ordinary paragraph text, as opposed to a standalone image line that
+/// [`present_polished_line`] presents on its own. Matches the condition that
+/// function uses to choose `present_image` over `present_markdown_with_disclosure`,
+/// so a line grouped by this check is exactly one that would have gone through
+/// the shared parse anyway.
+fn is_plain_text_line(line: BlockLine<'_>) -> bool {
+    parse_standalone_image(line.text)
+        .filter(|_| {
+            line.disclosure
+                .is_none_or(|active| !range_touches(line.range, active))
+        })
+        .is_none()
+}
+
+/// Presents a run of a standalone paragraph's contiguous physical lines from
+/// one shared parse of their joined source, so emphasis, strong emphasis and
+/// code spans that cross a physical line boundary resolve the way a single
+/// whole-paragraph parse would. See [`present_markdown_from_parse`] for why a
+/// per-line parse cannot see these on its own.
+fn present_joined_run(
+    lines: &[BlockLine<'_>],
+    revision: Revision,
+    line_height: f32,
+    out: &mut Vec<VisualLine>,
+) {
+    let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
+    let joined_source = lines.iter().map(|line| line.text).collect::<String>();
+    let parsed = parse_document(revision, joined_range, &joined_source);
+    for line in lines {
+        let mut presented = present_markdown_from_parse(
+            line.line as u64,
+            revision,
+            line.range,
+            line.text,
+            &joined_source,
+            line_height,
+            line.disclosure,
+            &parsed,
+        );
+        presented.context = LineContext::Normal;
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
+        }
+        out.push(presented);
     }
 }
 

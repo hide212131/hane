@@ -51,6 +51,44 @@ fn every_editable_source_boundary_round_trips_when_its_construct_is_disclosed() 
 }
 
 #[test]
+fn code_span_padding_hides_on_display_and_discloses_with_the_span() {
+    // CommonMark §6.1: content that both opens and closes on a space, and is
+    // not all spaces, is displayed with one space trimmed from each end. The
+    // source itself must be untouched, so the padding reappears once the
+    // cursor discloses the code span, exactly like a hidden marker.
+    let source = "pad ` code ` pad";
+    let range = SourceRange::new(0, source.len());
+
+    let collapsed = present_markdown_with_disclosure(1, Revision(1), range, source, 26.0, None);
+    assert_eq!(collapsed.visual_text, "pad code pad");
+
+    let disclosed = present_markdown_with_disclosure(
+        1,
+        Revision(1),
+        range,
+        source,
+        26.0,
+        Some(SourceRange::empty(7)),
+    );
+    assert_eq!(disclosed.visual_text, source);
+}
+
+#[test]
+fn code_span_padding_is_left_alone_when_only_one_side_has_a_space() {
+    // Trimming only applies when the content both opens and closes on a
+    // space; one-sided padding, and content made only of spaces, is content.
+    for source in ["`code `", "` code`", "` `"] {
+        let range = SourceRange::new(0, source.len());
+        let block = present_markdown_with_disclosure(1, Revision(1), range, source, 26.0, None);
+        assert_eq!(
+            block.visual_text,
+            source[1..source.len() - 1],
+            "{source:?} should show its content unchanged"
+        );
+    }
+}
+
+#[test]
 fn unsupported_and_edge_constructs_never_lose_source() {
     // Constructs Hane does not specialize yet (raw HTML, autolinks, footnote and
     // reference-link references, task-list checkboxes, backslash escapes, HTML
