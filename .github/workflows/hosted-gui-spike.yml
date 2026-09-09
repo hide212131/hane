@@ -1,0 +1,88 @@
+name: Hosted GUI spike (Issue 44)
+
+# Fixed-target experiment only; these results are not a merge gate.
+on:
+  push:
+    branches: [codex/issue44-hosted-gui]
+
+permissions:
+  contents: read
+
+env:
+  HANE_PINNED_SHA: 721fda20c897efffb70bec730bf6d29656d70fcb
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  spike:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out experiment procedure
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Check out pinned Hane target
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.HANE_PINNED_SHA }}
+          path: hane
+          persist-credentials: false
+      - name: Record environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            date -u
+            sw_vers
+            echo "ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+            echo "Runner=${RUNNER_OS:-unknown}/${RUNNER_ARCH:-unknown}"
+            sysctl -n machdep.cpu.brand_string
+            system_profiler SPDisplaysDataType
+            git -C hane rev-parse HEAD
+            git -C control rev-parse HEAD
+            swift --version
+          } > "$RUNNER_TEMP/environment.txt"
+      - name: Run independent interaction scenarios
+        id: interaction
+        shell: bash
+        env:
+          HANE_GUI_INTERACTION_TARGET_DIR: ${{ github.workspace }}/hane
+          HANE_GUI_INTERACTION_CONTROL_DIR: ${{ github.workspace }}/control
+          HANE_GUI_INTERACTION_EXPECTED_SHA: ${{ env.HANE_PINNED_SHA }}
+          HANE_GUI_INTERACTION_RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+          HANE_GUI_INTERACTION_REQUEST_ID: hosted-interaction-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 control/scripts/hosted_gui_interaction.py
+      - name: Stage only public experiment evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          source = temp / 'hane-gui-interaction'
+          dest = temp / 'hane-gui-artifact'
+          dest.mkdir(exist_ok=True)
+          names = {'result.json', 'summary.md', 'hane.log', 'ascii-fixture.md', 'ime-fixture.md', 'scroll-fixture.md'}
+          for file in source.rglob('*'):
+              relative = file.relative_to(source)
+              if 'state' in relative.parts or not file.is_file() or file.is_symlink():
+                  continue
+              if file.name in names or file.suffix == '.png':
+                  target = dest / relative
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(file, target)
+          environment = temp / 'environment.txt'
+          if environment.is_file():
+              shutil.copyfile(environment, dest / environment.name)
+          PY
+      - name: Upload evidence for all outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-gui-interaction-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hane-gui-artifact
+          retention-days: 7
+          if-no-files-found: error

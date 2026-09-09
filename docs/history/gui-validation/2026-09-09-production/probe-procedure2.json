@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_sha": "ebee7f158b930bdd2b4225d9a29dcd25f8e16872",
+  "source_pr": 90,
+  "cases": [
+    {
+      "gui_outcome": "pass",
+      "fault_injected": false,
+      "copilot": {
+        "decision": "blocked",
+        "reason": "hane/gui-requirement status is 'failure' despite gui-validation passing; required_checks (cargo test/clippy) not present in statuses, leaving CI completeness unverified — conflicting/incomplete evidence at exact head blocks a ready decision."
+      },
+      "gate_denials": [],
+      "external_effects": []
+    },
+    {
+      "gui_outcome": "fail",
+      "fault_injected": true,
+      "copilot": {
+        "decision": "blocked",
+        "reason": "GUI receipt overall_result is fail (probe fault-injected on save-content scenario) and gate_denials explicitly states GUI is not pass; this deterministic merge restriction cannot be waived regardless of other passing checks."
+      },
+      "gate_denials": [
+        "GUI is not pass"
+      ],
+      "external_effects": []
+    },
+    {
+      "gui_outcome": "blocked",
+      "fault_injected": true,
+      "copilot": {
+        "decision": "blocked",
+        "reason": "GUI receipt overall_result is 'blocked' (scenario ascii_edit_save_undo_redo_reopen faulted before input) and the hane/gui-requirement status is 'failure'; gate_denials explicitly bars merge since GUI is not pass. This is a deterministic denial that cannot be waived regardless of other passing checks."
+      },
+      "gate_denials": [
+        "GUI is not pass"
+      ],
+      "external_effects": []
+    }
+  ]
+}
