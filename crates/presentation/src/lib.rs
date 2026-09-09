@@ -1055,11 +1055,24 @@ pub fn present_markdown_with_disclosure(
         revision,
         range,
         source,
-        source,
         line_height,
         disclosure,
-        &parsed,
+        &SharedParse {
+            whole_source: source,
+            parsed: &parsed,
+        },
     )
+}
+
+/// A parse [`present_markdown_from_parse`] presents one physical line of, plus
+/// the text it was parsed from. For a self-contained parse `whole_source` is
+/// that line's own `source`; for a joined multi-line run (see
+/// [`present_joined_run`]) it is every line's text concatenated, since
+/// `parsed` may then describe delimiters and spans on a different physical
+/// line than the one being presented.
+struct SharedParse<'a> {
+    whole_source: &'a str,
+    parsed: &'a MarkdownParse,
 }
 
 /// Presents one physical line from an already-parsed tree instead of parsing
@@ -1074,30 +1087,25 @@ pub fn present_markdown_with_disclosure(
 /// see that, since the delimiter that closes the construct sits outside the
 /// slice being parsed. [`present_block`] instead parses every line of a
 /// multi-line paragraph together and calls this once per line with the shared
-/// result, so `parsed.markers` and `parsed.tree` may describe delimiters and
+/// result, so `shared.parsed`'s markers and tree may describe delimiters and
 /// spans that live partly or wholly on a different physical line; this clips
 /// them to `range` exactly as a self-contained parse already clips a node that
 /// escapes it.
-///
-/// `whole_source` is the text `parsed` was built from — `source` itself for a
-/// self-contained parse, or the joined text of every line in the run for a
-/// shared one — so a code span's padding (see [`code_span_padding`]) can be
-/// read even when it sits on a physical line other than this one.
 fn present_markdown_from_parse(
     line_id: u64,
     revision: Revision,
     range: SourceRange,
     source: &str,
-    whole_source: &str,
     line_height: f32,
     disclosure: Option<SourceRange>,
-    parsed: &MarkdownParse,
+    shared: &SharedParse<'_>,
 ) -> VisualLine {
     if source.is_empty() {
         let mut block = present_plain(line_id, revision, range, source);
         block.estimated_height = line_height;
         return block;
     }
+    let parsed = shared.parsed;
     let kind = parsed
         .tree
         .blocks()
@@ -1111,7 +1119,7 @@ fn present_markdown_from_parse(
     // CommonMark §6.1 applies to a code span's rendered content. Folded into the
     // marker list so it hides, discloses and clips exactly like a real marker.
     let mut markers = parsed.markers.clone();
-    markers.extend(code_span_padding(parsed, whole_source));
+    markers.extend(code_span_padding(parsed, shared.whole_source));
     markers.sort_by_key(|marker| (marker.start, marker.end));
     // Only markers wholly inside this physical line's range are this line's to
     // show or hide; a shared multi-line parse also carries every other line's
@@ -1282,16 +1290,19 @@ fn present_joined_run(
     let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
     let joined_source = lines.iter().map(|line| line.text).collect::<String>();
     let parsed = parse_document(revision, joined_range, &joined_source);
+    let shared = SharedParse {
+        whole_source: &joined_source,
+        parsed: &parsed,
+    };
     for line in lines {
         let mut presented = present_markdown_from_parse(
             line.line as u64,
             revision,
             line.range,
             line.text,
-            &joined_source,
             line_height,
             line.disclosure,
-            &parsed,
+            &shared,
         );
         presented.context = LineContext::Normal;
         while presented.visual_text.ends_with(['\r', '\n']) {
