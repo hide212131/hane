@@ -8,6 +8,7 @@ paid invocation; a pending claim is deliberately not automatically retried.
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 import re
 import sys
 
@@ -70,12 +71,86 @@ def routing_allows_fix(statuses, sha, manual=False):
     return False
 
 
+def manual_command_allows_fix(statuses, sha, context, now):
+    """Let one explicit owner command supersede only decisions older than it.
+
+    The worker calls this after validating the exact manual authorization
+    context. A routing/final decision created after that authorization still
+    wins, so a late no-fix decision can stop the paid invocation. A previously
+    active execution lease is also not stolen by a newer owner command, unless
+    that lease has already expired under the same 3300-second budget the
+    worker itself uses to reclaim a stale pending/running lease.
+    """
+    if not MANUAL.fullmatch(context):
+        return False
+
+    short = sha[:12]
+    authorized = f"Claude manual retry authorized for {short}"
+    claimed = f"Claude manual retry claimed for {short}"
+    grants = [s for s in statuses
+              if s.get("context") == context
+              and s.get("state") == "success"
+              and s.get("description") == authorized]
+    if not grants:
+        return False
+    grant = max(grants, key=lambda s: s["id"])
+
+    current = latest_by_context(statuses).get(context, {})
+    if not ((current.get("state") == "success" and current.get("description") == authorized)
+            or (current.get("state") == "pending" and current.get("description") == claimed)):
+        return False
+
+    execution = latest_by_context(statuses).get("hane/claude-fix", {})
+    if (execution.get("id", -1) < grant["id"]
+            and execution.get("description") in (
+                f"Claude fix pending for {short}", f"Claude fix running for {short}")
+            and age_seconds(execution, now) < 3300):
+        return False
+
+    ignored = {
+        f"Copilot routing controller failed for {short}",
+        f"Copilot routing: workflow changes require owner for {short}",
+    }
+    events = sorted(
+        (s for s in statuses
+         if s.get("id", -1) > grant["id"]
+         and s.get("context") in ("hane/copilot-routing", "hane/final-judge")),
+        key=lambda s: s["id"], reverse=True,
+    )
+    for event in events:
+        if event.get("context") == "hane/final-judge":
+            return (event.get("state") == "failure" and re.fullmatch(
+                rf"Final fix v1 {short} e[0-9a-f]{{16}}", event.get("description", "")) is not None)
+        if event.get("state") == "error" and event.get("description") in ignored:
+            continue
+        return (event.get("state") == "failure"
+                and event.get("description") == f"Copilot routing: fix for {short}")
+    # Nothing happened since the grant: trust it, but only once some routing
+    # or final-judge evidence has ever been recorded for this sha.
+    return any(s.get("context") in ("hane/copilot-routing", "hane/final-judge") for s in statuses)
+
+
 def recovery(statuses, sha, now):
     short = sha[:12]
     latest = latest_by_context(statuses)
     manual = authorizations(statuses, sha)
     result = {"recover": False, "manual_retry": False, "manual_retry_context": ""}
-    if not routing_allows_fix(statuses, sha, bool(manual)):
+    # An active grant is context-aware: it must only be checked against
+    # decisions recorded after it, the same rule the worker applies when a
+    # lost repository_dispatch POST otherwise strands a persisted approval.
+    # Several grants can be outstanding at once (e.g. an older one whose
+    # dispatch failed, superseded by a newer no-fix decision, followed by a
+    # fresh grant); search from the newest so a still-permitted approval is
+    # never shadowed by an older one a later routing decision blocked.
+    chosen = None
+    if manual:
+        for candidate in reversed(manual):
+            if manual_command_allows_fix(statuses, sha, candidate["context"], now):
+                chosen = candidate
+                break
+        if chosen is None:
+            return result
+    elif not routing_allows_fix(statuses, sha, False):
         return result
     execution = latest.get("hane/claude-fix", {})
     description = execution.get("description", "")
@@ -91,7 +166,7 @@ def recovery(statuses, sha, now):
     # terminal status POST was lost or a stale dispatch was already queued.
     if manual:
         return {"recover": True, "manual_retry": True,
-                "manual_retry_context": manual[0]["context"]}
+                "manual_retry_context": chosen["context"]}
 
     # Never turn an uncertain manual execution into an automatic paid retry.
     # A new explicit command is required after the claim boundary.
@@ -149,7 +224,13 @@ def main():
         result = {"valid": authorization_valid(data, args.sha, args.context),
                   "active": bool(authorizations(data, args.sha))}
     elif args.mode == "routing":
-        result = {"allowed": routing_allows_fix(data, args.sha, args.manual == "true")}
+        manual = args.manual == "true"
+        manual_context = args.context or os.environ.get("MANUAL_RETRY_CONTEXT", "")
+        if manual and manual_context:
+            result = {"allowed": manual_command_allows_fix(
+                data, args.sha, manual_context, datetime.now(timezone.utc))}
+        else:
+            result = {"allowed": routing_allows_fix(data, args.sha, manual)}
     elif args.mode == "recovery":
         result = recovery(data, args.sha, datetime.now(timezone.utc))
     else:
