@@ -179,6 +179,12 @@ class ClaudeWorkflowDenialReportTests(unittest.TestCase):
 class WorkflowWiringTests(unittest.TestCase):
     """Confirms the new steps are wired with safe conditions and the right permissions."""
 
+    def test_claude_step_leaves_time_for_notifications(self):
+        step = WORKFLOW.split("      - name: Implement issue with Claude Code\n")[1].split("      - name:", 1)[0]
+        self.assertIn("timeout-minutes: 45", step)
+        job = WORKFLOW.split("  implement:\n")[1].split("    steps:", 1)[0]
+        self.assertIn("timeout-minutes: 60", job)
+
     def test_stall_report_step_is_not_gated_on_existing_pr_skip_path(self):
         step = WORKFLOW.split("      - name: Report Claude stall to the Issue\n")[1].split("      - name:", 1)[0]
         self.assertIn("always() && steps.existing.outputs.skip != 'true' && steps.claude.outcome != 'success'", step)

@@ -42,6 +42,12 @@ class FixNotificationsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return [json.loads(x) for x in writes.read_text().splitlines()] if writes.exists() else []
 
+    def test_claude_timeout_reaches_status_and_notification_steps(self):
+        step = WORKFLOW.split("      - name: Run Claude Code fix\n")[1].split("      - name:", 1)[0]
+        self.assertIn("timeout-minutes: 45", step)
+        self.assertIn("continue-on-error: true", step)
+        self.assertIn("always()", STEP.split("        run: |", 1)[0])
+
     def test_failure_posts_japanese_diagnostic(self):
         writes = self.run_report('Claude fix failed for ' + SHA[:12])
         self.assertEqual(len(writes), 1)

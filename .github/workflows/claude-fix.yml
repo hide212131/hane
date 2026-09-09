@@ -406,6 +406,9 @@ jobs:
       - name: Run Claude Code fix
         if: ${{ steps.claim.outputs.granted == 'true' }}
         id: claude
+        # A step timeout must still reach the status and notification steps.
+        timeout-minutes: 45
+        continue-on-error: true
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
