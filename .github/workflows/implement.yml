@@ -444,15 +444,29 @@ jobs:
             gh api --method POST "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments" -f body="$full_body" >/dev/null
           fi
 
-      - name: Ensure Claude produced a branch
+      - name: Ensure Claude produced implementation changes
         if: ${{ steps.existing.outputs.skip != 'true' }}
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
         run: |
           set -euo pipefail
           if [[ -z "${BRANCH_NAME:-}" || "$BRANCH_NAME" == 'main' ]]; then
             echo "::error::Claude Code did not report a dedicated implementation branch: ${BRANCH_NAME:-<empty>}"
+            exit 1
+          fi
+
+          encoded_branch="$(jq -rn --arg value "$BRANCH_NAME" '$value | @uri')"
+          if ! gh api "repos/${REPOSITORY}/branches/${encoded_branch}" >/dev/null 2>&1; then
+            echo "::error::Claude Code returned success but did not push the implementation branch: ${BRANCH_NAME}"
+            exit 1
+          fi
+
+          ahead_by="$(gh api "repos/${REPOSITORY}/compare/main...${encoded_branch}" --jq '.ahead_by')"
+          if [[ ! "$ahead_by" =~ ^[0-9]+$ ]] || (( ahead_by < 1 )); then
+            echo "::error::Claude Code returned success but the implementation branch has no commits ahead of main: ${BRANCH_NAME}"
             exit 1
           fi
 
