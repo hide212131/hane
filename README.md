@@ -112,3 +112,5 @@ x64 / ARM64 を自動判定し、必要なら `-Architecture x64` または `-Ar
 実行方法・結果 JSON の形式・終了コードは [docs/local-gui-validate-cli.md](docs/local-gui-validate-cli.md)、
 設計は [docs/local-gui-validation.md](docs/local-gui-validation.md) と [ADR-0024](docs/adr/0024-local-gui-validation.md) を参照してください。
 実画面を使わない自動テストは `python3 -m unittest discover -s scripts/tests` で実行できます。
+
+GUI検証の要否、対象commitの照合、結果の扱いは [GUI検証設計](docs/local-gui-validation.md) を参照してください。
