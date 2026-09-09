@@ -138,7 +138,7 @@ Codex review を Copilot judge の推論で恒常的に代替する案は当面�
   - `You have reached your Codex usage limits for code reviews.`
   - `Codex usage limits have been reached for code reviews.`
 - これは Codex の **一般的な失敗** に対する fallback ではない。timeout、結果不明、controller error、証跡不備、判定できない状態はこれまでどおり fail closed のままとし、Copilot への置き換えは行わない。
-- fallback が有効なのは、対象 Pull Request が open かつ non-draft、同一リポジトリ、かつ信頼できる author（`/implement` を起動できる owner / write 権限保持者、または `github-actions[bot]` / `claude[bot]` などの信頼した自動化経路）が作成した場合に限る。条件を満たさない場合は何もせず終了する。
+- fallback が有効なのは、対象 Pull Request が open かつ non-draft、同一リポジトリ、かつ信頼できる author（repository owner、`github-actions[bot]`、`claude[bot]`）が作成した場合に限る。open・non-draft・同一リポジトリの条件を満たさない場合はスキップし、author の条件を満たさない場合は失敗する。
 - fallback は常に現在の exact head SHA に紐づく。処理中に PR の head SHA が変わった場合、その fallback は stale として扱い進めない。
 - 対象 SHA にすでに `copilot-pull-request-reviewer[bot]` の exact-head review があれば、新たに review を要求せずそれを再利用する。対象 SHA の `hane/codex-review` がすでに `clean` / `findings` の終端状態であれば、fallback 自体が不要と判断してそのまま終了する。
 
@@ -156,7 +156,7 @@ Codex review を Copilot judge の推論で恒常的に代替する案は当面�
 
 ##### 実運用実績
 
-この fallback は #69 で実装した。PR #60 の head `c878cec39731af036f537506138f34a8828bb053` で、Codex の使用量上限到達を観測し、exact head に対する Copilot Code Review が clean で完了し、`hane/review-source` に Copilot fallback が記録され、互換 context `hane/codex-review` も終端 `clean` になったことをライブで確認済みである。
+この fallback は #69 で実装した。PR #60 の head `c878cec39731af036f537506138f34a8828bb053` では fallback の起動と provenance 記録を確認したが、review 投稿者と inline comment 投稿者の表記差により、指摘ありの review を誤って clean と判定していた。これは clean の検証成功例ではない。#71 で review ID と Copilot の既知の投稿者名を照合して修正する。
 
 ### Local GUI validator
 
@@ -624,7 +624,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - Pull Request の最新 head SHA に Codex review を実行する。
 - review 完了と `clean` / `findings` を head SHA と対応付けて次の処理へ渡せるようにする。
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
-- Codex の code review 使用量上限を `chatgpt-codex-connector[bot]` が明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換える（#69 で実装、PR #60 head `c878cec39731af036f537506138f34a8828bb053` でライブ確認済み）。詳細は「Codex」節の「Codex 使用量上限時の Copilot review fallback」を参照。
+- Codex の code review 使用量上限を `chatgpt-codex-connector[bot]` が明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換える（#69 で実装、指摘の取り込み修正は #71）。詳細は「Codex」節の「Codex 使用量上限時の Copilot review fallback」を参照。
 
 ### Phase 4: Local GUI validation
 
