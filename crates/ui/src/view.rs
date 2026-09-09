@@ -779,8 +779,29 @@ impl EditorView {
 
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
+    fn active_session_has_sidebar_row(&self) -> bool {
+        self.work_folder_drafts
+            .contains_key(&self.sessions.active_id())
+            || self.active_session().path().is_some_and(|path| {
+                self.work_folder.as_ref().is_some_and(|folder| {
+                    let mut rows = Vec::new();
+                    flatten_work_folder_tree(
+                        folder.children(),
+                        1,
+                        &self.expanded_folders,
+                        &mut rows,
+                    );
+                    rows.iter().any(|row| {
+                        matches!(&row.node, WorkFolderNode::File(entry) if entry.path() == path)
+                    })
+                })
+            })
+    }
+
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         if id == self.sessions.active_id() {
+            self.sidebar_focus = SidebarFocus::ActiveSession;
+            cx.notify();
             return true;
         }
         let scroll_y = self.scroll_y;
@@ -3484,10 +3505,13 @@ impl EditorView {
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
-        let root_is_selected =
-            self.sidebar_focus == SidebarFocus::Folder && self.selected_folder.is_none();
+        let root_is_selected = (self.sidebar_focus == SidebarFocus::Folder
+            && self.selected_folder.is_none())
+            || (self.sidebar_focus == SidebarFocus::ActiveSession
+                && !self.active_session_has_sidebar_row());
         let root_row = div()
             .id("work-folder-root")
+            .debug_selector(|| "sidebar-root".to_owned())
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
             .rounded_sm()
@@ -3606,6 +3630,7 @@ impl EditorView {
                     self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
+                    .debug_selector(|| "sidebar-draft".to_owned())
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                     .rounded_sm()
@@ -4964,6 +4989,33 @@ mod tests {
             );
         });
 
+        view.update(cx, |view, cx| view.open_work_folder_entry(&note, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert!(
+                !view.active_session_has_sidebar_row(),
+                "collapsed folder hides the active file; root is the fallback"
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn empty_work_folder_has_no_active_sidebar_row(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("sidebar-empty-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _| {
+            view.work_folder = Some(OsWorkFolderScanner.scan(&root).unwrap());
+            assert!(!view.active_session_has_sidebar_row());
+        });
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -5404,6 +5456,31 @@ mod tests {
             None
         };
         (view, cx, root)
+    }
+
+    #[gpui::test]
+    fn clicking_active_draft_after_root_selection_restores_draft_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, root) = open_view_for_mouse_tests(cx, "", true);
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+        let root_point = cx.debug_bounds("sidebar-root").unwrap().center();
+        cx.simulate_mouse_down(root_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(root_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder)
+        });
+        cx.run_until_parked();
+        let draft_point = cx.debug_bounds("sidebar-draft").unwrap().center();
+        cx.simulate_mouse_down(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), id);
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+        });
+        std::fs::remove_dir_all(root.unwrap()).unwrap();
     }
 
     #[gpui::test]
