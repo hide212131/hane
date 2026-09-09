@@ -19,7 +19,8 @@ class FakeGitHub(GitHub):
         self.pull = {'number': 79, 'state': 'open', 'draft': False,
                      'head': {'sha': SHA, 'repo': {'full_name': self.repository}},
                      'base': {'ref': 'main'}, 'user': {'login': 'owner'}}
-        self.rows = {}
+        self.rows = {'hane/codex-review': {'state': 'success',
+                     'description': f'Codex review clean for {SHA[:12]}'}}
         self.writes = []
         self.paths = []
         self.run_status = 'completed'
@@ -58,6 +59,20 @@ class ControllerTests(unittest.TestCase):
         self.api.rows['hane/gui-validation'] = {'state': 'pending',
             'description': f'GUI pending {STATUS_VERSION} {SHA[:12]} g123-1',
             'created_at': '2026-09-09T00:10:00Z'}
+
+    def test_waiting_review_skips_expensive_evidence_and_retires_pending(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                api = FakeGitHub()
+                api.rows.clear()
+                if pending:
+                    api.rows[controller.CONTEXT] = self.api.rows[controller.CONTEXT]
+                with patch.object(api, 'evidence', side_effect=AssertionError('unready review must not fetch CI/files')), \
+                        patch.object(controller, 'now', return_value=NOW):
+                    controller.resolve(api)
+                self.assertEqual(len(api.writes), int(pending))
+                if pending:
+                    self.assertIn('GUI superseded', api.writes[0][3])
 
     def test_report_never_writes_after_head_or_generation_changes(self):
         for kind in ('head', 'generation'):
@@ -190,6 +205,37 @@ class ControllerTests(unittest.TestCase):
 
 
 class CITests(unittest.TestCase):
+    def test_reported_check_details_are_the_exact_records_used_by_gate(self):
+        api = GitHub('owner/hane')
+        checks = [{'id': i + 1, 'name': name, 'head_sha': SHA, 'app': {'slug': 'github-actions'},
+                   'status': 'completed', 'conclusion': 'success', 'html_url': f'check/{i + 1}'}
+                  for i, name in enumerate(CI_NAMES)]
+        checks += [dict(checks[0], id=99, head_sha='b' * 40, conclusion='failure'),
+                   dict(checks[1], id=100, app={'slug': 'other-app'}, conclusion='failure')]
+        run = {'id': 10, 'head_sha': SHA, 'path': '.github/workflows/ci.yml',
+               'status': 'completed', 'conclusion': 'success', 'html_url': 'run/10'}
+        with patch.object(api, 'pages', return_value=checks), patch.object(api, 'api', return_value={'workflow_runs': [run]}):
+            proof = api.ci_evidence(SHA, {})
+            self.assertTrue(proof['ready'])
+            self.assertEqual([c['id'] for c in proof['checks']], [1, 2])
+            self.assertEqual(proof['workflow']['html_url'], 'run/10')
+            run['conclusion'] = 'failure'
+            proof = api.ci_evidence(SHA, {})
+            self.assertFalse(proof['ready'])
+            self.assertTrue(all(c['conclusion'] == 'success' for c in proof['checks']))
+            self.assertEqual(proof['workflow']['conclusion'], 'failure')
+
+    def test_generation_mismatch_is_visible_in_ci_details(self):
+        api = GitHub('owner/hane')
+        statuses = {name: {'state': 'success', 'target_url': f'run/{i + 1}'}
+                    for i, name in enumerate(CI_NAMES)}
+        statuses['hane/trusted-ci-generation'] = {'state': 'success',
+            'description': 'Trusted CI generation 1-1 passed', 'target_url': 'run/1'}
+        proof = api.ci_evidence(SHA, statuses)
+        self.assertFalse(proof['ready'])
+        self.assertEqual(proof['generation']['target_url'], 'run/1')
+        self.assertEqual([c['target_url'] for c in proof['checks']], ['run/1', 'run/2'])
+
     def test_latest_platform_and_whole_workflow_must_pass(self):
         api = GitHub('owner/hane')
         checks = [{'id': i, 'name': name, 'head_sha': SHA, 'app': {'slug': 'github-actions'},
