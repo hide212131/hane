@@ -23,7 +23,7 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 macOS 版は現在 Developer ID による署名と Apple の notarization には未対応です。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
-Windows版は GitHub Actions の `hane-windows-x64` artifact から ZIP を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
+Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
