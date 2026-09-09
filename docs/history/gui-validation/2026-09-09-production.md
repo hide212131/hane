@@ -28,7 +28,13 @@ PR #90、対象 `ebee7f158b930bdd2b4225d9a29dcd25f8e16872`。GUI手順は `hoste
 
 [read-only probe 34293618770](https://github.com/hide212131/hane/actions/runs/34293618770) は同じcontrol、judge手順3で実行した。実passはCopilot `ready`かつgate違反なし、明示した模擬fail/blockedはいずれもCopilot `blocked`かつgate `GUI is not pass` となった。外部書き込みやマージは行っていない。[本番final run 34293573119](https://github.com/hide212131/hane/actions/runs/34293573119) でも実passに対して `ready` を記録した。
 
-opt-in後の [final run 34293722884](https://github.com/hide212131/hane/actions/runs/34293722884) は、CIの個別根拠が省略されていることと、PR本文の古い「準備中はopt-inを無効にする」という記述を理由にblockedとなった。controlは `40048d38323112fbbae2309a1eeeeeb1b6ff5637`、judge手順3。readyを得た後の停止も成功に書き換えず、別の判定として保持する。#93では選択したCIチェックとworkflow結果を判定入力に追加し、手順4へ更新する。PR本文も、検証済みの証拠と現在のopt-in状態を示す内容へ更新する。
+opt-in後の [final run 34293722884](https://github.com/hide212131/hane/actions/runs/34293722884) は、CIの個別根拠が省略されていることと、PR本文の古い「準備中はopt-inを無効にする」という記述を理由にblockedとなった。controlは `40048d38323112fbbae2309a1eeeeeb1b6ff5637`、judge手順3。readyを得た後の停止も成功に書き換えず、別の判定として保持する。#93で選択したCIチェックとworkflow結果を判定入力に追加し、手順4へ更新した（control `671ec799db72fb9c29215ef321b8de2da310de92`）。PR本文も、検証済みの証拠と現在のopt-in状態を示す内容へ更新した。gate条件は維持した。
+
+## GUI必須PRの実際の自動マージ
+
+[final run 34295616870](https://github.com/hide212131/hane/actions/runs/34295616870) が、更新後の本文と回復世代 `34293007271-1` の正式passを確認し、Copilot `ready`、gate違反なしで #90 を自動squash mergeした。merge SHAは `fbfe6425453e2bbea87138d79b71a59a355552bf`。人手によるマージではない。
+
+この実行は#93導入前から待機していたcontrol `40048d38323112fbbae2309a1eeeeeb1b6ff5637`、judge手順3によるものだった。CI詳細追加後の手順4がこのマージを実行したとは扱わない。手順4の実装は135件の制御テストと両OSのCI、最新SHAのCodex reviewを通過してmainへ導入した。
 
 ## 保存した証拠
 
