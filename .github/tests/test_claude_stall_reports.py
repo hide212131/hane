@@ -61,17 +61,17 @@ class ClaudeStallReportTests(unittest.TestCase):
         report = self.run_code(outcome="failure")
         self.assertTrue(report["should_post"])
         self.assertIn("hane-stall: number=83 stage=implement sha=none", report["marker"])
-        self.assertIn("Claude did not report a specific reason.", report["body"])
-        self.assertIn("Target: Issue #83", report["body"])
+        self.assertIn("Claudeから具体的な停止理由が返されませんでした。", report["body"])
+        self.assertIn("対象: Issue #83", report["body"])
         self.assertIn("https://github.com/hide212131/hane/actions/runs/123", report["body"])
 
     def test_known_subtype_maps_to_specific_reason(self):
         report = self.run_code(data=RESULT, outcome="failure")
-        self.assertIn("Claude reached its turn limit before finishing the implementation.", report["body"])
+        self.assertIn("Claudeは実装完了前にターン数の上限へ達しました。", report["body"])
 
     def test_cancelled_outcome_has_its_own_reason(self):
         report = self.run_code(outcome="cancelled")
-        self.assertIn("cancelled before Claude finished", report["body"])
+        self.assertIn("完了前に実行が中止", report["body"])
 
     def test_success_is_never_reached_but_missing_env_suppresses_posting(self):
         report = self.run_code(outcome="failure", issue_number="")
@@ -86,7 +86,7 @@ class ClaudeStallReportTests(unittest.TestCase):
     def test_invalid_json_falls_back_to_generic_reason(self):
         report = self.run_code(raw="not-json SECRET-EXAMPLE", outcome="failure")
         self.assertNotIn("SECRET-EXAMPLE", report["body"])
-        self.assertIn("Claude did not report a specific reason.", report["body"])
+        self.assertIn("Claudeから具体的な停止理由が返されませんでした。", report["body"])
 
 
 class ClaudeWorkflowDenialReportTests(unittest.TestCase):
@@ -119,7 +119,7 @@ class ClaudeWorkflowDenialReportTests(unittest.TestCase):
         self.assertTrue(report["should_post"])
         self.assertIn("`.github/workflows/codex-review-reconcile.yml`", report["body"])
         self.assertEqual(report["marker"], "hane-stall: number=81 stage=implement-workflow-denied sha=e3144213abcd")
-        self.assertIn("Target: PR #81 / e3144213abcd", report["body"])
+        self.assertIn("対象: PR #81 / e3144213abcd", report["body"])
 
     def test_non_workflow_denials_are_not_reported(self):
         result = dict(RESULT, permission_denials=[
@@ -146,7 +146,7 @@ class ClaudeWorkflowDenialReportTests(unittest.TestCase):
         self.assertLessEqual(report["body"].count(".yml`"), 20)
 
     def test_missing_execution_record_suppresses_posting(self):
-        self.record.unlink()
+        self.record.unlink(missing_ok=True)
         env = dict(os.environ, RUNNER_TEMP=str(self.root), EXECUTION_FILE=str(self.record),
                    PR_NUMBER="81", TARGET_SHA="deadbeef", REPOSITORY="hide212131/hane",
                    RUN_ID="123", REPORT_FILE=str(self.report))
@@ -171,7 +171,7 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", step)
 
     def test_dedup_marker_is_used_for_both_new_steps(self):
-        self.assertIn('--jq --arg marker "$marker"', WORKFLOW)
+        self.assertIn('jq -s --arg marker "$marker"', WORKFLOW)
         self.assertEqual(WORKFLOW.count("gh api --method PATCH \"repos/${REPOSITORY}/issues/comments/${existing_id}\""), 2)
 
 

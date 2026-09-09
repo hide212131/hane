@@ -198,7 +198,7 @@ PR にコメントする。`claude-fix.yml` 側は常に PR 上で完結する�
 を鍵として、同じ鍵の既存コメントを検索し、なければ新規作成、あればその場で
 本文を上書き（PATCH）する方式にした。個別の通知サービスは作らず、既存の
 `gh api` 呼び出しパターンをそのまま踏襲する。`claude-fix.yml` の自動修正が
-その後成功した場合は、同じ鍵のコメントを "Resolved" 表示に上書きする。
+その後成功した場合は、同じ対象SHAの鍵のコメントを「解決済み」表示に上書きする。
 
 自動テスト:
 
@@ -208,6 +208,4 @@ python3 -m unittest discover -s .github/tests -p 'test_claude_stall_reports.py' 
 
 `implement.yml` に埋め込んだ2つのブロック（Issue 向けの stall report、
 PR 向けの workflow-denial report）を抽出して実行し、理由分類・redaction・
-パスの許可文字種チェック・重複排除・上限件数を検査する。`claude-fix.yml` 側の
-bash ロジック（dedup 検索・PATCH/POST 切替）はこのテストの対象外で、
-実機の Actions 実行でのみ確認できる。
+パスの許可文字種チェック・重複排除・上限件数を検査する。`claude-fix.yml` 側は `test_claude_fix_notifications.py` が実際の通知ステップを抽出し、GitHub APIの代替を使って投稿・重複更新・解決済み表示・中止・偽造markerの拒否を検査する。本番GitHubへのコメント配送はこのローカルテストの対象外。
