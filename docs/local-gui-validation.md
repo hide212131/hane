@@ -6,6 +6,8 @@ GUI受領処理と [final judge / merge gate](final-judgement.md) の実装を�
 
 ## 実証済みの範囲
 
+本番経路のSHA・手順・世代と、実キャンセル回復・Copilot最終判定・自動マージの記録は[2026-09-09 本番実証](history/gui-validation/2026-09-09-production.md)を参照する。以下は導入前の実験履歴であり、本番receiptとは区別する。
+
 [run 34254547035](https://github.com/hide212131/hane/actions/runs/34254547035) は標準 `macos-15`（macOS 15.7.9 / ARM64）で、Hane SHA `0f5e2b1f0ffb41a248b9a806009de273e8e8d793` の clean checkout、build、launch、対象 PID の window 取得、撮影、終了に成功した。見出しと日本語本文の描画も画像で確認した。[保存した結果・環境・画像](history/gui-validation/2026-09-09-hosted-launch/README.md)を参照する。
 
 続く [run 34256439460](https://github.com/hide212131/hane/actions/runs/34256439460) では同じ Hane SHA に対する System Events 経由の ASCII 入力・保存内容照合・redo が成功した。undo のテストは選択置換と後続入力を単一履歴と誤って想定しており、日本語 IME は親入力方式が無効な状態での選択が `-50` となった。全体結果は `fail`、IME シナリオは `blocked` であり、成功結果に書き換えない。修正した手順による再実行を別の世代として記録する。
