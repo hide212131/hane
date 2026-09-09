@@ -144,9 +144,9 @@ Codex review を Copilot judge の推論で恒常的に代替する案は当面�
 
 ##### 記録される context（provenance と互換性）
 
-- `hane/review-source` は、その SHA の review を実際にどちらが行ったかを記録する。Copilot fallback を使った場合は `Review source: Copilot fallback for <short-sha>` を記録する。
+- `hane/review-source` は Copilot fallback の marker であり、`codex-limit-copilot-fallback.yml` だけがこれを書き込む。fallback を使った場合は `Review source: Copilot fallback for <short-sha>` を記録する。通常経路の `codex-review.yml` はこの context を書き込まない。
 - `hane/codex-review` は既存の後続 phase が消費する **互換 context** として維持し、review の実施者が Copilot であっても `clean` / `findings` の終端 semantics をそのまま設定する（context 名は変えない）。
-- そのため、review の provenance（実際の実施者）を知りたい後続処理や運用者は、`hane/codex-review` の文言だけから実施者を推測せず、`hane/review-source` を確認する必要がある。
+- そのため、review の provenance（実際の実施者）を知りたい後続処理や運用者は、対象 SHA に `hane/review-source` の成功状態が **存在するかどうか** で判定する。存在すれば Copilot fallback、存在しなければ通常の Codex review である。`hane/codex-review` の文言だけから実施者を推測してはならない。
 
 ##### 後続処理への接続
 
@@ -355,7 +355,7 @@ Hane は個人所有リポジトリなので、GitHub Agentic Workflows の Copi
 - current head SHA
 - Codex-reviewed SHA
 - Codex outcome: `clean` / `findings`（`hane/codex-review` に記録する互換 context。実施者が Codex か Copilot fallback かは含まない）
-- review source: `codex` / `copilot-fallback`（`hane/review-source` に記録する provenance）
+- review source: `codex` / `copilot-fallback`（`hane/review-source` の成功状態が存在すれば `copilot-fallback`、存在しなければ `codex`。この context は fallback 使用時のみ書き込まれる）
 - GUI-classified SHA
 - GUI validation required?
 - GUI requirement classification source / policy version
