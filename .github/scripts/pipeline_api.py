@@ -60,23 +60,34 @@ class GitHub:
                          'description': description, 'target_url': f'https://github.com/{self.repository}/actions/runs/{run_id}'})
 
     def ci_ready(self, sha, statuses):
+        return self.ci_evidence(sha, statuses)['ready']
+
+    def ci_evidence(self, sha, statuses):
         generation = statuses.get('hane/trusted-ci-generation')
         if generation:
-            if generation.get('state') != 'success' or not re.fullmatch(r'Trusted CI generation .+ passed', generation.get('description', '')):
-                return False
-            return all(statuses.get(name, {}).get('state') == 'success'
-                       and statuses[name].get('target_url') == generation.get('target_url') for name in CI_NAMES)
+            ready = (generation.get('state') == 'success'
+                     and re.fullmatch(r'Trusted CI generation .+ passed', generation.get('description', '')) is not None
+                     and all(statuses.get(name, {}).get('state') == 'success'
+                             and statuses[name].get('target_url') == generation.get('target_url') for name in CI_NAMES))
+            return {'head_sha': sha, 'source': 'trusted-ci-generation', 'ready': ready,
+                    'generation': {k: generation.get(k) for k in ('id', 'state', 'description', 'target_url')},
+                    'checks': [{'name': name, **{k: statuses.get(name, {}).get(k)
+                                for k in ('id', 'state', 'target_url')}} for name in CI_NAMES]}
         checks = self.pages(self.repo(f'commits/{sha}/check-runs'), 'check_runs')
+        selected = []
         for name in CI_NAMES:
             candidates = [c for c in checks if c.get('name') == name and c.get('head_sha') == sha
                           and c.get('app', {}).get('slug') == 'github-actions']
             check = max(candidates, key=lambda c: c['id'], default={})
-            if check.get('status') != 'completed' or check.get('conclusion') != 'success':
-                return False
+            selected.append({'name': name, **{k: check.get(k)
+                             for k in ('id', 'head_sha', 'status', 'conclusion', 'html_url')}})
         # Include the regression-test job and any other failed CI step.
         runs = self.api(self.repo(f'actions/runs?head_sha={sha}&event=pull_request&per_page=100'))['workflow_runs']
         ci = max((r for r in runs if r.get('path') == '.github/workflows/ci.yml'), key=lambda r: r['id'], default={})
-        return ci.get('status') == 'completed' and ci.get('conclusion') == 'success'
+        ready = (all(c['status'] == 'completed' and c['conclusion'] == 'success' for c in selected)
+                 and ci.get('status') == 'completed' and ci.get('conclusion') == 'success')
+        return {'head_sha': sha, 'source': 'github-actions-check-runs', 'ready': ready, 'checks': selected,
+                'workflow': {k: ci.get(k) for k in ('id', 'head_sha', 'path', 'status', 'conclusion', 'html_url')}}
 
     def evidence(self, pr, statuses=None):
         sha = pr['head']['sha']
@@ -85,6 +96,7 @@ class GitHub:
         force = any(label['name'] == 'gui-validation-required' for label in pr.get('labels', []))
         required = required_from_files(files, pr['changed_files'], force)
         classified = classification_matches(statuses.get('hane/gui-requirement', {}), sha, required)
+        ci = self.ci_evidence(sha, statuses)
         return {'pr': pr, 'sha': sha, 'statuses': statuses, 'files': files, 'gui_required': required,
                 'classified': classified, 'review_ready': review_ready(statuses, sha),
-                'ci_ready': self.ci_ready(sha, statuses)}
+                'ci_ready': ci['ready'], 'ci_evidence': ci}
