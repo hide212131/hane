@@ -8,6 +8,7 @@ paid invocation; a pending claim is deliberately not automatically retried.
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 import re
 import sys
 
@@ -68,6 +69,60 @@ def routing_allows_fix(statuses, sha, manual=False):
         return (event.get("state") == "failure"
                 and event.get("description") == f"Copilot routing: fix for {short}")
     return False
+
+
+def manual_command_allows_fix(statuses, sha, context):
+    """Let one explicit owner command supersede only decisions older than it.
+
+    The worker calls this after validating the exact manual authorization
+    context. A routing/final decision created after that authorization still
+    wins, so a late no-fix decision can stop the paid invocation. A previously
+    active execution lease is also not stolen by a newer owner command.
+    """
+    if not MANUAL.fullmatch(context):
+        return False
+
+    short = sha[:12]
+    authorized = f"Claude manual retry authorized for {short}"
+    claimed = f"Claude manual retry claimed for {short}"
+    grants = [s for s in statuses
+              if s.get("context") == context
+              and s.get("state") == "success"
+              and s.get("description") == authorized]
+    if not grants:
+        return False
+    grant = max(grants, key=lambda s: s["id"])
+
+    current = latest_by_context(statuses).get(context, {})
+    if not ((current.get("state") == "success" and current.get("description") == authorized)
+            or (current.get("state") == "pending" and current.get("description") == claimed)):
+        return False
+
+    execution = latest_by_context(statuses).get("hane/claude-fix", {})
+    if (execution.get("id", -1) < grant["id"]
+            and execution.get("description") in (
+                f"Claude fix pending for {short}", f"Claude fix running for {short}")):
+        return False
+
+    ignored = {
+        f"Copilot routing controller failed for {short}",
+        f"Copilot routing: workflow changes require owner for {short}",
+    }
+    events = sorted(
+        (s for s in statuses
+         if s.get("id", -1) > grant["id"]
+         and s.get("context") in ("hane/copilot-routing", "hane/final-judge")),
+        key=lambda s: s["id"], reverse=True,
+    )
+    for event in events:
+        if event.get("context") == "hane/final-judge":
+            return (event.get("state") == "failure" and re.fullmatch(
+                rf"Final fix v1 {short} e[0-9a-f]{{16}}", event.get("description", "")) is not None)
+        if event.get("state") == "error" and event.get("description") in ignored:
+            continue
+        return (event.get("state") == "failure"
+                and event.get("description") == f"Copilot routing: fix for {short}")
+    return True
 
 
 def recovery(statuses, sha, now):
@@ -149,7 +204,12 @@ def main():
         result = {"valid": authorization_valid(data, args.sha, args.context),
                   "active": bool(authorizations(data, args.sha))}
     elif args.mode == "routing":
-        result = {"allowed": routing_allows_fix(data, args.sha, args.manual == "true")}
+        manual = args.manual == "true"
+        manual_context = args.context or os.environ.get("MANUAL_RETRY_CONTEXT", "")
+        if manual and manual_context:
+            result = {"allowed": manual_command_allows_fix(data, args.sha, manual_context)}
+        else:
+            result = {"allowed": routing_allows_fix(data, args.sha, manual)}
     elif args.mode == "recovery":
         result = recovery(data, args.sha, datetime.now(timezone.utc))
     else:
