@@ -6,7 +6,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_api import GitHub
-from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, authenticated_receipt, gui_state, parse_time, receipt, validate_receipt
+from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, authenticated_receipt, gui_state, parse_time, receipt, review_ready, validate_receipt
 from gui_artifacts import artifact_json
 
 
@@ -100,9 +100,16 @@ def resolve(api):
             wanted_sha = os.environ.get('INPUT_SHA', '').strip()
             if requested and wanted_sha and wanted_sha != pr['head']['sha']:
                 continue
-            old_status = api.statuses(pr['head']['sha']).get(CONTEXT, {})
+            statuses = api.statuses(pr['head']['sha'])
+            old_status = statuses.get(CONTEXT, {})
             old = gui_state(old_status, pr['head']['sha'])
             request = request_for(pr)
+            # Waiting reviews cannot start GUI work. Avoid fetching files,
+            # check runs and full CI for them on every reconciliation event.
+            if not review_ready(statuses, pr['head']['sha']):
+                if old and old[0] == 'pending':
+                    retire(api, dict(request, generation=old[1]))
+                continue
             if not eligible(api, request):
                 if old and old[0] == 'pending':
                     retire(api, dict(request, generation=old[1]))

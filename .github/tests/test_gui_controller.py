@@ -19,7 +19,8 @@ class FakeGitHub(GitHub):
         self.pull = {'number': 79, 'state': 'open', 'draft': False,
                      'head': {'sha': SHA, 'repo': {'full_name': self.repository}},
                      'base': {'ref': 'main'}, 'user': {'login': 'owner'}}
-        self.rows = {}
+        self.rows = {'hane/codex-review': {'state': 'success',
+                     'description': f'Codex review clean for {SHA[:12]}'}}
         self.writes = []
         self.paths = []
         self.run_status = 'completed'
@@ -58,6 +59,20 @@ class ControllerTests(unittest.TestCase):
         self.api.rows['hane/gui-validation'] = {'state': 'pending',
             'description': f'GUI pending {STATUS_VERSION} {SHA[:12]} g123-1',
             'created_at': '2026-09-09T00:10:00Z'}
+
+    def test_waiting_review_skips_expensive_evidence_and_retires_pending(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                api = FakeGitHub()
+                api.rows.clear()
+                if pending:
+                    api.rows[controller.CONTEXT] = self.api.rows[controller.CONTEXT]
+                with patch.object(api, 'evidence', side_effect=AssertionError('unready review must not fetch CI/files')), \
+                        patch.object(controller, 'now', return_value=NOW):
+                    controller.resolve(api)
+                self.assertEqual(len(api.writes), int(pending))
+                if pending:
+                    self.assertIn('GUI superseded', api.writes[0][3])
 
     def test_report_never_writes_after_head_or_generation_changes(self):
         for kind in ('head', 'generation'):
