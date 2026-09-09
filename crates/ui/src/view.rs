@@ -209,6 +209,21 @@ struct TitleRenameAttempt {
     title: String,
 }
 
+/// Which of the sidebar's two selection sources is currently shown
+/// highlighted. The two are tracked separately because they change on
+/// different events — the active session swaps whenever a file or draft is
+/// opened, while `selected_folder` only changes on an explicit folder/root
+/// click — so without this flag both could end up highlighted at once (see
+/// issue #47).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SidebarFocus {
+    /// A file or draft row is highlighted, driven by the active session.
+    #[default]
+    ActiveSession,
+    /// A folder or root row is highlighted, driven by `selected_folder`.
+    Folder,
+}
+
 pub struct EditorView {
     /// Every open document. Holding a set rather than one editor is what lets a
     /// filer add and switch documents without the renderer changing.
@@ -230,8 +245,15 @@ pub struct EditorView {
     work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
     /// The folder the sidebar currently has selected, used as the target
     /// directory for the next "new note" or "new folder". `None` means the
-    /// work folder root.
+    /// work folder root. This is independent of what the sidebar shows
+    /// highlighted (see `sidebar_focus`): opening a file leaves this
+    /// unchanged, so "select a folder, then create a note" keeps working
+    /// even though the folder row itself stops being highlighted.
     selected_folder: Option<PathBuf>,
+    /// Which selection source (`selected_folder` or the active session) the
+    /// sidebar currently highlights. Exclusive by construction, so a file and
+    /// a folder row can never both show as selected at once.
+    sidebar_focus: SidebarFocus,
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
@@ -553,6 +575,7 @@ impl EditorView {
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
+            sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
@@ -756,8 +779,29 @@ impl EditorView {
 
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
+    fn active_session_has_sidebar_row(&self) -> bool {
+        self.work_folder_drafts
+            .contains_key(&self.sessions.active_id())
+            || self.active_session().path().is_some_and(|path| {
+                self.work_folder.as_ref().is_some_and(|folder| {
+                    let mut rows = Vec::new();
+                    flatten_work_folder_tree(
+                        folder.children(),
+                        1,
+                        &self.expanded_folders,
+                        &mut rows,
+                    );
+                    rows.iter().any(|row| {
+                        matches!(&row.node, WorkFolderNode::File(entry) if entry.path() == path)
+                    })
+                })
+            })
+    }
+
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         if id == self.sessions.active_id() {
+            self.sidebar_focus = SidebarFocus::ActiveSession;
+            cx.notify();
             return true;
         }
         let scroll_y = self.scroll_y;
@@ -782,6 +826,10 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // Whatever the sidebar had highlighted before, the document on
+        // screen just changed to a specific file or draft, so that is what
+        // should be highlighted now instead.
+        self.sidebar_focus = SidebarFocus::ActiveSession;
         let lines = self.sessions.active().editor().document().line_count();
         self.granularity = Granularity::Lines;
         self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
@@ -1216,6 +1264,7 @@ impl EditorView {
             self.expanded_folders.insert(path.clone());
         }
         self.selected_folder = Some(path);
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -1225,6 +1274,7 @@ impl EditorView {
     /// selects, never toggles.
     fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
         self.selected_folder = None;
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -3455,9 +3505,13 @@ impl EditorView {
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
-        let root_is_selected = self.selected_folder.is_none();
+        let root_is_selected = (self.sidebar_focus == SidebarFocus::Folder
+            && self.selected_folder.is_none())
+            || (self.sidebar_focus == SidebarFocus::ActiveSession
+                && !self.active_session_has_sidebar_row());
         let root_row = div()
             .id("work-folder-root")
+            .debug_selector(|| "sidebar-root".to_owned())
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
             .rounded_sm()
@@ -3490,7 +3544,8 @@ impl EditorView {
                 let left_padding = px(SIDEBAR_ROW_HORIZONTAL_PADDING + 12.0 * row.depth as f32);
                 match row.node {
                     WorkFolderNode::File(entry) => {
-                        let is_active = active_path == Some(entry.path());
+                        let is_active = self.sidebar_focus == SidebarFocus::ActiveSession
+                            && active_path == Some(entry.path());
                         let path = entry.path().to_path_buf();
                         div()
                             .id(("work-folder-entry", index))
@@ -3521,7 +3576,8 @@ impl EditorView {
                             }))
                     }
                     WorkFolderNode::Folder(folder) => {
-                        let is_selected = self.selected_folder.as_deref() == Some(folder.path());
+                        let is_selected = self.sidebar_focus == SidebarFocus::Folder
+                            && self.selected_folder.as_deref() == Some(folder.path());
                         let is_expanded = self.expanded_folders.contains(folder.path());
                         let path = folder.path().to_path_buf();
                         let disclosure = if is_expanded {
@@ -3570,9 +3626,11 @@ impl EditorView {
             .into_iter()
             .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
             .map(|(id, session)| {
-                let is_active = active_id == id;
+                let is_active =
+                    self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
+                    .debug_selector(|| "sidebar-draft".to_owned())
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                     .rounded_sm()
@@ -4869,6 +4927,98 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Issue #47: the sidebar must never show two rows selected at once.
+    // Opening a file after selecting a folder must move the highlight onto
+    // the file (even though `selected_folder` — the new-entry target — stays
+    // put), and explicitly selecting a folder while a file is open must move
+    // the highlight back onto the folder despite that file remaining the
+    // active session underneath.
+    #[gpui::test]
+    fn opening_a_file_and_selecting_a_folder_never_both_show_selected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-exclusive-selection");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let note = root.join("dev").join("note.md");
+        std::fs::write(&note, "# Note").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+        });
+
+        // Opening a file must move the highlight onto it, even though the
+        // folder just selected remains the target directory for new entries.
+        view.update(cx, |view, cx| {
+            view.open_work_folder_entry(&note, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert_eq!(
+                view.selected_folder.as_deref(),
+                Some(root.join("dev").as_path()),
+                "the folder selected earlier must still be the new-entry target"
+            );
+        });
+
+        // Explicitly reselecting the folder must move the highlight back,
+        // even though the file above is still the active session.
+        view.update(cx, |view, cx| {
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+            assert_eq!(
+                view.active_session().path(),
+                Some(note.as_path()),
+                "selecting the folder must not close the still-open file"
+            );
+        });
+
+        view.update(cx, |view, cx| view.open_work_folder_entry(&note, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert!(
+                !view.active_session_has_sidebar_row(),
+                "collapsed folder hides the active file; root is the fallback"
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn empty_work_folder_has_no_active_sidebar_row(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("sidebar-empty-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _| {
+            view.work_folder = Some(OsWorkFolderScanner.scan(&root).unwrap());
+            assert!(!view.active_session_has_sidebar_row());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Issue #39: "new folder" creates an empty subfolder through the
     // filesystem boundary (`FileService::create_dir`), adds it to the work
     // folder tree without a rescan, and shows it expanded.
@@ -5306,6 +5456,31 @@ mod tests {
             None
         };
         (view, cx, root)
+    }
+
+    #[gpui::test]
+    fn clicking_active_draft_after_root_selection_restores_draft_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, root) = open_view_for_mouse_tests(cx, "", true);
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+        let root_point = cx.debug_bounds("sidebar-root").unwrap().center();
+        cx.simulate_mouse_down(root_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(root_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder)
+        });
+        cx.run_until_parked();
+        let draft_point = cx.debug_bounds("sidebar-draft").unwrap().center();
+        cx.simulate_mouse_down(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), id);
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+        });
+        std::fs::remove_dir_all(root.unwrap()).unwrap();
     }
 
     #[gpui::test]
