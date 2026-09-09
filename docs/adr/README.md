@@ -24,6 +24,7 @@
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 | [ADR-0023](0023-ai-agent-development-workflow.md) | AI agent 開発の実装・レビュー・進行判断の分離 |
+| [ADR-0024](0024-local-gui-validation.md) | ローカル GUI 検証を Computer Use の承認から切り離し、非公開リポジトリで実行を制御する（実装前） |
 
 ## Superseded / amended
 
