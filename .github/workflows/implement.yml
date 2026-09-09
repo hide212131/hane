@@ -339,6 +339,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -392,6 +393,7 @@ jobs:
           issue_number = os.environ.get("ISSUE_NUMBER", "")
           repository = os.environ.get("REPOSITORY", "")
           run_id = os.environ.get("RUN_ID", "")
+          run_attempt = os.environ.get("RUN_ATTEMPT", "1")
 
           reason = OUTCOME_TEXT.get(outcome, "Claudeから具体的な停止理由が返されませんでした。")
           result = read_result()
@@ -400,7 +402,7 @@ jobs:
               if isinstance(subtype, str) and subtype in REASON_TEXT:
                   reason = REASON_TEXT[subtype]
 
-          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id if repository and run_id else ""
+          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id + "/attempts/" + run_attempt if repository and run_id else ""
 
           body = "\n".join([
               "### Claudeの停止：管理者の対応が必要です",
@@ -549,6 +551,7 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.target_sha }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -623,7 +626,8 @@ jobs:
           target_sha = os.environ.get("TARGET_SHA", "")
           repository = os.environ.get("REPOSITORY", "")
           run_id = os.environ.get("RUN_ID", "")
-          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id if repository and run_id else ""
+          run_attempt = os.environ.get("RUN_ATTEMPT", "1")
+          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id + "/attempts/" + run_attempt if repository and run_id else ""
 
           should_post = bool(paths) and bool(pr_number) and bool(repository)
           body = ""
@@ -757,3 +761,30 @@ jobs:
           gh issue comment "$ISSUE_NUMBER" \
             --repo "$REPOSITORY" \
             --body "$body"
+
+  report_job_failure:
+    needs: [authorize, implement]
+    if: ${{ always() && (github.event_name == 'issue_comment' && needs.authorize.outputs.authorized == 'true' && (needs.implement.result == 'failure' || needs.implement.result == 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/report_claude_job_failure.py
+          sparse-checkout-cone-mode: false
+      - name: Report worker job failure independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_NUMBER: ${{ github.event.issue.number }}
+          TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          STAGE: implement
+          WORKER_RESULT: ${{ needs.implement.result }}
+        run: python3 -I .github/scripts/report_claude_job_failure.py

@@ -9,7 +9,7 @@ import textwrap
 import unittest
 
 WORKFLOW = (Path(__file__).resolve().parents[1] / 'workflows/claude-fix.yml').read_text()
-STEP = WORKFLOW.split('      - name: Report Claude fix outcome to the Pull Request\n')[1]
+STEP = WORKFLOW.split('      - name: Report Claude fix outcome to the Pull Request\n')[1].split('\n  report_job_failure:', 1)[0]
 SCRIPT = textwrap.dedent(STEP.split('        run: |\n')[1])
 SHA = 'a' * 40
 
@@ -35,7 +35,7 @@ class FixNotificationsTests(unittest.TestCase):
             writes = root / 'writes'
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                        REPOSITORY='hide212131/hane', PR_NUMBER='84', TARGET_SHA=SHA,
-                       GITHUB_RUN_ID='123', CLAIMED='true', CLAUDE_EXIT='1', JOB_STATUS='success',
+                       GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1', CLAIMED='true', CLAUDE_EXIT='1', JOB_STATUS='success',
                        DESCRIPTION=description, COMMENTS=json.dumps(comments), WRITES=str(writes))
             env.update(extra)
             result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True)

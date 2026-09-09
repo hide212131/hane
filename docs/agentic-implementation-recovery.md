@@ -211,3 +211,5 @@ PR 向けの workflow-denial report）を抽出して実行し、理由分類・
 パスの許可文字種チェック・重複排除・上限件数を検査する。`claude-fix.yml` 側は `test_claude_fix_notifications.py` が実際の通知ステップを抽出し、GitHub APIの代替を使って投稿・重複更新・解決済み表示・中止・偽造markerの拒否を検査する。本番GitHubへのコメント配送はこのローカルテストの対象外。
 
 Claude本体のステップには45分の実行上限を設け、60分のジョブ期限より前に診断・通知へ進める時間を残す。修正workerではステップのタイムアウト後も失敗statusを記録し、末尾の通知を実行する。runnerの強制終了やジョブ全体の期限到達では同一ジョブ内の通知を保証できないため、通知がなくてもActionsの終了結果を確認する。
+
+ジョブ全体の期限到達・失敗は、独立した `report_job_failure` ジョブ（`needs` と `always()`）が受け取る。実装通知は認可済みのIssueに限り、修正通知は同一リポジトリの信頼したauthorのPRに限る。このジョブは実装後の作業コピーを使わず、`github.workflow_sha` に固定した通知コードを新しいrunnerで読み込む。同じ実行の詳細通知が既にある場合は重複投稿しない。workflow自体の強制キャンセルや通知runner/APIの障害は別途Actionsで確認する。

@@ -735,9 +735,36 @@ jobs:
           if [[ "$resolved" == true && -z "$existing_id" ]]; then exit 0; fi
           title='Claude自動修正の停止理由'
           if [[ "$resolved" == true ]]; then title='Claude自動修正：解決済み'; fi
-          body="$(printf '### %s\n\n対象: PR #%s / %s\n\n%s\n\n実行: https://github.com/%s/actions/runs/%s\n\n%s\n' "$title" "$PR_NUMBER" "$TARGET_SHA" "$reason" "$REPOSITORY" "$GITHUB_RUN_ID" "$marker")"
+          body="$(printf '### %s\n\n対象: PR #%s / %s\n\n%s\n\n実行: https://github.com/%s/actions/runs/%s/attempts/%s\n\n%s\n' "$title" "$PR_NUMBER" "$TARGET_SHA" "$reason" "$REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$marker")"
           if [[ -n "$existing_id" ]]; then
             gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$body" >/dev/null
           else
             gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" >/dev/null
           fi
+
+  report_job_failure:
+    needs: fix
+    if: ${{ always() && (needs.fix.result == 'failure' || needs.fix.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/report_claude_job_failure.py
+          sparse-checkout-cone-mode: false
+      - name: Report worker job failure independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          STAGE: claude-fix
+          WORKER_RESULT: ${{ needs.fix.result }}
+        run: python3 -I .github/scripts/report_claude_job_failure.py
