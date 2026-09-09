@@ -23,11 +23,13 @@ jobs:
       actions: write
       contents: read
       pull-requests: read
+      statuses: read
 
     steps:
       - name: Check out trusted reconciliation script
         uses: actions/checkout@v6
         with:
+          ref: main
           persist-credentials: false
           sparse-checkout: .github/scripts
 

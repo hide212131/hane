@@ -120,6 +120,8 @@ def decide(now, pr, statuses, repository, trusted_authors=TRUSTED_AUTHORS):
             if created is None or (now - created).total_seconds() < IN_FLIGHT_SECONDS:
                 return {"action": "skip", "reason": "in-flight"}
 
+        return {"action": "skip", "reason": "manual-recovery-required"}
+
     return {"action": "dispatch", "pr_number": number, "target_sha": head_sha}
 
 
@@ -212,6 +214,14 @@ def run(api, repository, now, emit) -> int:
         fresh_head = (fresh.get("head") or {}).get("sha") if isinstance(fresh, dict) else None
         if fresh_head != decision["target_sha"]:
             emit(f"PR #{number} の head が dispatch 直前に変わったため、古い SHA の review は開始しません。")
+            continue
+
+        try:
+            fresh_statuses = api.pages(f"/commits/{fresh_head}/statuses")
+        except Unavailable:
+            exit_code = 2
+            continue
+        if decide(now, fresh, fresh_statuses, repository)["action"] != "dispatch":
             continue
 
         try:

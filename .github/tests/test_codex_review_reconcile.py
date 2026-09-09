@@ -97,18 +97,18 @@ class DecideTests(unittest.TestCase):
         statuses = passing_ci_statuses() + [status("hane/codex-review", "pending", f"Codex review pending for {SHORT}", created_at="not-a-date", status_id=4)]
         self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["reason"], "in-flight")
 
-    def test_stale_pending_review_is_reclaimed(self):
+    def test_stale_pending_review_needs_manual_recovery(self):
         created = (NOW - dt.timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")
         statuses = passing_ci_statuses() + [status("hane/codex-review", "pending", f"Codex review pending for {SHORT}", created_at=created, status_id=4)]
-        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["action"], "dispatch")
+        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["reason"], "manual-recovery-required")
 
-    def test_controller_failure_is_retried(self):
+    def test_controller_failure_needs_manual_recovery(self):
         statuses = passing_ci_statuses() + [status("hane/codex-review", "error", f"Codex review controller failed for {SHORT}", status_id=4)]
-        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["action"], "dispatch")
+        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["reason"], "manual-recovery-required")
 
     def test_review_for_a_different_old_sha_is_not_reused(self):
         statuses = passing_ci_statuses() + [status("hane/codex-review", "success", "Codex review clean for aaaaaaaaaaaa", status_id=4)]
-        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["action"], "dispatch")
+        self.assertEqual(reconcile.decide(NOW, pr(), statuses, REPO)["reason"], "manual-recovery-required")
 
     def test_draft_pr_is_skipped(self):
         self.assertEqual(reconcile.decide(NOW, pr(draft=True), passing_ci_statuses(), REPO)["reason"], "not-eligible")
@@ -195,6 +195,22 @@ class RunTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(api.posts, [])
         self.assertTrue(any("head が dispatch 直前に変わった" in line for line in self.lines))
+
+    def test_closed_or_untrusted_pr_before_dispatch_is_skipped(self):
+        for fresh in (pr(state="closed"), pr(draft=True), pr(author="untrusted")):
+            api = FakeAPI([pr()], {SHA: passing_ci_statuses()}, fresh_by_number={79: fresh})
+            self.assertEqual(reconcile.run(api, REPO, NOW, self.emit), 0)
+            self.assertEqual(api.posts, [])
+
+    def test_review_started_during_recheck_is_not_redispatched(self):
+        api = FakeAPI([pr()], {SHA: passing_ci_statuses()}, fresh_by_number={79: pr()})
+        original = api.get
+        def get(suffix):
+            api.statuses_by_sha[SHA] += [status("hane/codex-review", "pending", status_id=9)]
+            return original(suffix)
+        api.get = get
+        self.assertEqual(reconcile.run(api, REPO, NOW, self.emit), 0)
+        self.assertEqual(api.posts, [])
 
     def test_already_reviewed_pr_is_not_redispatched(self):
         statuses = passing_ci_statuses() + [status("hane/codex-review", "success", f"Codex review clean for {SHORT}", status_id=4)]
