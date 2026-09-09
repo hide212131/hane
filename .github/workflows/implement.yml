@@ -222,6 +222,8 @@ jobs:
       - name: Implement issue with Claude Code
         if: ${{ steps.existing.outputs.skip != 'true' }}
         id: claude
+        # Leave time in the 60-minute job for failure diagnostics and notification.
+        timeout-minutes: 45
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -326,6 +328,122 @@ jobs:
           # END CLAUDE FAILURE SUMMARY
           PY
 
+      - name: Report Claude stall to the Issue
+        if: ${{ always() && steps.existing.outputs.skip != 'true' && steps.claude.outcome != 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export REPORT_FILE="$RUNNER_TEMP/hane-stall-report-implement.json"
+          python3 -I - <<'PY'
+          # BEGIN CLAUDE STALL REPORT (implement)
+          import json
+          import os
+          import stat
+          from pathlib import Path
+
+          MAX_BYTES = 32 * 1024 * 1024
+          REASON_TEXT = {
+              "error_max_turns": "Claudeは実装完了前にターン数の上限へ達しました。",
+              "error_during_execution": "Claude Codeは実行中の内部エラーで停止しました。",
+              "error_max_budget_usd": "Claudeは完了前に予算上限へ達しました。",
+              "error_max_structured_output_retries": "Claudeは構造化結果の生成に繰り返し失敗しました。",
+          }
+          OUTCOME_TEXT = {
+              "cancelled": "Claudeの完了前に実行が中止されました。手動中止やタイムアウトなどを実行ログで確認してください。",
+              "skipped": "実装ステップは実行されませんでした。",
+              "failure": "Claudeから具体的な停止理由が返されませんでした。",
+          }
+
+
+          def read_result():
+              root = Path(os.environ["RUNNER_TEMP"]).resolve()
+              path = Path(os.environ.get("EXECUTION_FILE") or root / "claude-execution-output.json")
+              try:
+                  if path.parent.resolve() != root:
+                      return None
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as stream:
+                      info = os.fstat(stream.fileno())
+                      if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
+                          return None
+                      raw = stream.read(MAX_BYTES + 1)
+                  if len(raw) > MAX_BYTES:
+                      return None
+                  data = json.loads(raw)
+              except (OSError, ValueError, RecursionError):
+                  return None
+              messages = data if isinstance(data, list) else [data]
+              for message in reversed(messages):
+                  if isinstance(message, dict) and message.get("type") == "result":
+                      return message
+              return None
+
+
+          outcome = os.environ.get("CLAUDE_OUTCOME", "")
+          issue_number = os.environ.get("ISSUE_NUMBER", "")
+          repository = os.environ.get("REPOSITORY", "")
+          run_id = os.environ.get("RUN_ID", "")
+          run_attempt = os.environ.get("RUN_ATTEMPT", "1")
+
+          reason = OUTCOME_TEXT.get(outcome, "Claudeから具体的な停止理由が返されませんでした。")
+          result = read_result()
+          if result is not None:
+              subtype = result.get("subtype")
+              if isinstance(subtype, str) and subtype in REASON_TEXT:
+                  reason = REASON_TEXT[subtype]
+
+          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id + "/attempts/" + run_attempt if repository and run_id else ""
+
+          body = "\n".join([
+              "### Claudeの停止：管理者の対応が必要です",
+              "",
+              "対象: Issue #" + issue_number + "（この段階では実装PRを確認できていません）",
+              "実行: " + (run_url or "（取得できません）"),
+              "段階: `/implement` によるClaude Code実装",
+              "",
+              reason,
+              "",
+              "対応: 実行ログを確認し、原因を解消後に `/implement` を再度コメントしてください。",
+          ])
+
+          marker = "hane-stall: number=" + issue_number + " stage=implement sha=none"
+
+          should_post = bool(issue_number) and bool(repository)
+          Path(os.environ["REPORT_FILE"]).write_text(json.dumps({
+              "should_post": should_post, "marker": marker, "body": body,
+          }))
+          # END CLAUDE STALL REPORT (implement)
+          PY
+
+          if [[ "$(jq -r '.should_post' "$REPORT_FILE")" != "true" ]]; then
+            exit 0
+          fi
+          marker="$(jq -r '.marker' "$REPORT_FILE")"
+          comment_body="$(jq -r '.body' "$REPORT_FILE")"
+          full_body="$(printf '%s\n\n<!-- %s -->\n' "$comment_body" "$marker")"
+
+          existing_id="$(
+            gh api --paginate "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | {id, body}' \
+              | jq -s --arg marker "$marker" '[.[] | select(((.body // "") | contains($marker)))] | last.id // empty'
+          )"
+
+          if [[ -n "$existing_id" ]]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$full_body" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments" -f body="$full_body" >/dev/null
+          fi
+
       - name: Ensure Claude produced a branch
         if: ${{ steps.existing.outputs.skip != 'true' }}
         shell: bash
@@ -422,6 +540,142 @@ jobs:
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
           echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
 
+      - name: Report blocked workflow file changes to the Pull Request
+        if: ${{ steps.target.outputs.target_sha != '' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          PR_URL: ${{ steps.target.outputs.pr_url }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export PR_NUMBER="${PR_URL##*/}"
+          export REPORT_FILE="$RUNNER_TEMP/hane-stall-report-workflow-denied.json"
+          python3 -I - <<'PY'
+          # BEGIN CLAUDE WORKFLOW DENIAL REPORT
+          import json
+          import os
+          import re
+          import stat
+          from pathlib import Path
+
+          MAX_BYTES = 32 * 1024 * 1024
+          PATH_PATTERN = re.compile(r"^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$")
+
+
+          def read_result():
+              root = Path(os.environ["RUNNER_TEMP"]).resolve()
+              path = Path(os.environ.get("EXECUTION_FILE") or root / "claude-execution-output.json")
+              try:
+                  if path.parent.resolve() != root:
+                      return None
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as stream:
+                      info = os.fstat(stream.fileno())
+                      if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
+                          return None
+                      raw = stream.read(MAX_BYTES + 1)
+                  if len(raw) > MAX_BYTES:
+                      return None
+                  data = json.loads(raw)
+              except (OSError, ValueError, RecursionError):
+                  return None
+              messages = data if isinstance(data, list) else [data]
+              for message in reversed(messages):
+                  if isinstance(message, dict) and message.get("type") == "result":
+                      return message
+              return None
+
+
+          result = read_result()
+          paths = []
+          if result is not None:
+              denials = result.get("permission_denials")
+              if isinstance(denials, list):
+                  for denial in denials:
+                      if not isinstance(denial, dict) or denial.get("tool_name") not in ("Write", "Edit"):
+                          continue
+                      tool_input = denial.get("tool_input")
+                      candidate = None
+                      if isinstance(tool_input, dict):
+                          candidate = tool_input.get("file_path") or tool_input.get("path")
+                      if not isinstance(candidate, str):
+                          continue
+                      candidate_path = Path(candidate)
+                      if ".." in candidate_path.parts:
+                          continue
+                      if candidate_path.is_absolute():
+                          workspace = os.environ.get("GITHUB_WORKSPACE", "")
+                          if not workspace or not Path(workspace).is_absolute():
+                              continue
+                          try:
+                              candidate = candidate_path.relative_to(Path(workspace)).as_posix()
+                          except ValueError:
+                              continue
+                      if PATH_PATTERN.fullmatch(candidate) and candidate not in paths:
+                          paths.append(candidate)
+                  paths = paths[:20]
+
+          pr_number = os.environ.get("PR_NUMBER", "")
+          target_sha = os.environ.get("TARGET_SHA", "")
+          repository = os.environ.get("REPOSITORY", "")
+          run_id = os.environ.get("RUN_ID", "")
+          run_attempt = os.environ.get("RUN_ATTEMPT", "1")
+          run_url = "https://github.com/" + repository + "/actions/runs/" + run_id + "/attempts/" + run_attempt if repository and run_id else ""
+
+          should_post = bool(paths) and bool(pr_number) and bool(repository)
+          body = ""
+          marker = ""
+          if should_post:
+              lines = [
+                  "### Claudeの停止：管理者の対応が必要です",
+                  "",
+                  "対象: PR #" + pr_number + " / " + target_sha,
+                  "実行: " + (run_url or "（取得できません）"),
+                  "段階: `/implement` によるClaude Code実装",
+                  "",
+                  "Claudeの実行結果に、次のworkflowファイルへの書き込み拒否が記録されました。",
+                  "",
+              ] + ["- `" + p + "`" for p in paths] + [
+                  "",
+                  "対応: 元のIssueと実行ログで適用できなかった変更を確認し、必要なworkflow変更を管理者が反映してください。",
+                  "",
+                  "未反映の変更を確認するまで、このPRを実装完了として扱わないでください。",
+              ]
+              body = "\n".join(lines)
+              marker = "hane-stall: number=" + pr_number + " stage=implement-workflow-denied sha=" + target_sha
+
+          Path(os.environ["REPORT_FILE"]).write_text(json.dumps({
+              "should_post": should_post, "marker": marker, "body": body,
+          }))
+          # END CLAUDE WORKFLOW DENIAL REPORT
+          PY
+
+          if [[ "$(jq -r '.should_post' "$REPORT_FILE")" != "true" ]]; then
+            exit 0
+          fi
+          marker="$(jq -r '.marker' "$REPORT_FILE")"
+          comment_body="$(jq -r '.body' "$REPORT_FILE")"
+          full_body="$(printf '%s\n\n<!-- %s -->\n' "$comment_body" "$marker")"
+
+          existing_id="$(
+            gh api --paginate "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | {id, body}' \
+              | jq -s --arg marker "$marker" '[.[] | select(((.body // "") | contains($marker)))] | last.id // empty'
+          )"
+
+          if [[ -n "$existing_id" ]]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$full_body" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$full_body" >/dev/null
+          fi
+
   dispatch_ci:
     needs: implement
     if: ${{ needs.implement.result == 'success' && needs.implement.outputs.target_sha != '' }}
@@ -507,3 +761,30 @@ jobs:
           gh issue comment "$ISSUE_NUMBER" \
             --repo "$REPOSITORY" \
             --body "$body"
+
+  report_job_failure:
+    needs: [authorize, implement]
+    if: ${{ always() && (github.event_name == 'issue_comment' && needs.authorize.outputs.authorized == 'true' && (needs.implement.result == 'failure' || needs.implement.result == 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/report_claude_job_failure.py
+          sparse-checkout-cone-mode: false
+      - name: Report worker job failure independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_NUMBER: ${{ github.event.issue.number }}
+          TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          STAGE: implement
+          WORKER_RESULT: ${{ needs.implement.result }}
+        run: python3 -I .github/scripts/report_claude_job_failure.py

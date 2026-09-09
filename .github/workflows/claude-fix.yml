@@ -406,6 +406,9 @@ jobs:
       - name: Run Claude Code fix
         if: ${{ steps.claim.outputs.granted == 'true' }}
         id: claude
+        # A step timeout must still reach the status and notification steps.
+        timeout-minutes: 45
+        continue-on-error: true
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -685,3 +688,83 @@ jobs:
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix controller failed for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+      - name: Report Claude fix outcome to the Pull Request
+        if: ${{ always() && steps.target.outputs.target_sha != '' && steps.target.outputs.pr_number != '' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          CLAIMED: ${{ steps.claim.outputs.granted }}
+          CLAUDE_EXIT: ${{ steps.claude.outputs.exit_code }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          latest="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+            | jq -r '[.[][] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | .description // ""')"
+          resolved=false
+          case "$latest" in
+            "Claude fix completed for ${short_sha}")
+              reason='この対象commitの自動修正は完了しました。新しいheadのCI・レビュー結果を確認してください。'
+              resolved=true ;;
+            "Claude fix blocked: workflow patch requires owner for ${short_sha}")
+              reason='workflow変更は自動pushできません。実行結果の hane-workflow-fix artifactを確認し、ownerがパッチを適用してください。' ;;
+            "Claude fix blocked"*)
+              reason='実行条件または回数制限により停止しました。実行ログを確認し、必要ならownerが新しい /claude-fix コメントで再試行してください。' ;;
+            "Claude fix produced no changes for ${short_sha}")
+              reason='Claudeは修正差分を作成しませんでした。残っているレビュー指摘を確認してください。' ;;
+            "Claude fix failed for ${short_sha}")
+              reason='Claudeの修正処理が失敗しました。実行ログを確認し、必要ならownerが新しい /claude-fix コメントで再試行してください。' ;;
+            "Claude fix controller failed for ${short_sha}")
+              reason='自動修正controllerが失敗しました。実行ログを確認してください。承認を消費済みの場合は新しい /claude-fix が必要です。' ;;
+            *)
+              if [[ "$JOB_STATUS" == cancelled && "$CLAIMED" == true ]]; then
+                reason='承認取得後に実行が中止されました。結果を確認し、再実行が必要ならownerが新しい /claude-fix コメントを投稿してください。'
+              else
+                exit 0
+              fi ;;
+          esac
+          marker="<!-- hane-stall: number=${PR_NUMBER} stage=claude-fix sha=${TARGET_SHA} -->"
+          existing_id="$(gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            | jq -r --arg marker "$marker" '[.[][] | select(.user.login == "github-actions[bot]" and ((.body // "") | contains($marker)))] | max_by(.id) | .id // empty')"
+          if [[ "$resolved" == true && -z "$existing_id" ]]; then exit 0; fi
+          title='Claude自動修正の停止理由'
+          if [[ "$resolved" == true ]]; then title='Claude自動修正：解決済み'; fi
+          body="$(printf '### %s\n\n対象: PR #%s / %s\n\n%s\n\n実行: https://github.com/%s/actions/runs/%s/attempts/%s\n\n%s\n' "$title" "$PR_NUMBER" "$TARGET_SHA" "$reason" "$REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$marker")"
+          if [[ -n "$existing_id" ]]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" >/dev/null
+          fi
+
+  report_job_failure:
+    needs: fix
+    if: ${{ always() && (needs.fix.result == 'failure' || needs.fix.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/report_claude_job_failure.py
+          sparse-checkout-cone-mode: false
+      - name: Report worker job failure independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          STAGE: claude-fix
+          WORKER_RESULT: ${{ needs.fix.result }}
+        run: python3 -I .github/scripts/report_claude_job_failure.py
