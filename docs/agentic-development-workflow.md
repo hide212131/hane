@@ -28,6 +28,18 @@ ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Co
 
 AI の判断と、GitHub 上で実際に変更を加える処理を分ける。特にマージは Copilot の判断だけでは実行せず、CI、Codex review、GUI validation、対象 commit、未解決レビューなどを機械的に確認する。
 
+## Issue・Pull Request・コメントの言語
+
+このワークフローで作成・更新する、人が読む GitHub 上の文章は日本語に統一する。Claude Code、Codex、GitHub Copilot、Local GUI validator、および GitHub Actions の定型投稿に共通で適用する。
+
+- Issue と Pull Request のタイトル・本文（見出し、概要、変更内容、検証結果を含む）は日本語で書く。
+- Issue / Pull Request のコメント、レビュー本文、インラインのレビュー指摘、返信、進捗報告、修正依頼、判断理由、人間への引き継ぎも日本語で書く。
+- 入力の Issue、レビュー、ログが英語でも、説明や要約は日本語にする。
+- コード、コマンド、パス、URL、製品名、ログの引用など、原文を保つ必要があるものはそのまま記載し、周囲の説明を日本語にする。
+- 機械処理の契約は翻訳しない。`/implement`、`@codex review`、ラベル、JSON のキー、`fix` / `ready` / `blocked` などの列挙値、相関マーカーを保持する。JSON 内の人向けの説明・判断理由は日本語にする。
+
+新しい agent prompt やコメント生成処理を追加・変更するときも、この言語方針を適用する。投稿前にタイトル・本文・コメントの説明文が日本語であることと、機械処理用の識別子を変更していないことを確認する。
+
 ## 全体フロー
 
 ```text
