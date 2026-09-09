@@ -51,6 +51,14 @@ def execution(kind, age=4000):
     return status(30, "hane/claude-fix", "error", f"Claude fix {kind} for {SHORT}", age)
 
 
+def live_execution(kind):
+    # The subprocess-driven WorkflowShellTests evaluate lease age against the
+    # real wall clock, not the fixed NOW used elsewhere in this module.
+    return dict(id=30, context="hane/claude-fix", state="error",
+                description=f"Claude fix {kind} for {SHORT}",
+                created_at=datetime.now(timezone.utc).isoformat())
+
+
 class AuthorizationTests(unittest.TestCase):
     def test_old_consumption_never_masks_new_grant_regardless_of_api_order(self):
         for rows in itertools.permutations([grant(1), grant(2, B), consume(3)]):
@@ -120,20 +128,34 @@ class RecoveryTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
-    def test_new_no_fix_survives_controller_failure_for_manual_and_automatic(self):
+    def test_new_no_fix_survives_controller_failure_for_automatic(self):
         for kind in ['continue-validation', 'blocked']:
             rows = [route(1), route(2, kind), status(3, 'hane/copilot-routing', 'error',
                                                    f'Copilot routing controller failed for {SHORT}')]
-            for manual in [False, True]:
-                with self.subTest(kind=kind, manual=manual):
-                    self.assertFalse(policy.routing_allows_fix(rows, SHA, manual))
-                    self.assertFalse(policy.recovery(rows + ([grant(4)] if manual else []), SHA, NOW)['recover'])
+            with self.subTest(kind=kind):
+                self.assertFalse(policy.routing_allows_fix(rows, SHA, False))
+                self.assertFalse(policy.recovery(rows, SHA, NOW)['recover'])
 
-    def test_owner_override_cannot_cross_a_newer_no_fix(self):
+    def test_owner_grant_after_no_fix_and_controller_failure_recovers_via_context_aware_override(self):
+        # A grant newer than the stale no-fix decision and the (ignorable)
+        # controller failure supersedes both, the same as a live dispatch
+        # would decide via manual_command_allows_fix; recovery must agree so
+        # a lost repository_dispatch POST cannot strand the authorization.
+        for kind in ['continue-validation', 'blocked']:
+            rows = [route(1), route(2, kind), status(3, 'hane/copilot-routing', 'error',
+                                                   f'Copilot routing controller failed for {SHORT}'), grant(4)]
+            with self.subTest(kind=kind):
+                self.assertFalse(policy.routing_allows_fix(rows, SHA, True))
+                self.assertTrue(policy.recovery(rows, SHA, NOW)['recover'])
+
+    def test_owner_grant_after_owner_only_guard_and_no_fix_recovers_via_context_aware_override(self):
+        # Same context-aware override: the grant is newer than every event
+        # here (including the owner-only workflow guard), so it supersedes
+        # the earlier no-fix decision just like the plain no-fix case above.
         for kind in ['continue-validation', 'blocked']:
             rows = [route(1), route(2, kind), route(3, 'workflow changes require owner'), grant(4)]
             self.assertFalse(policy.routing_allows_fix(rows, SHA, True))
-            self.assertFalse(policy.recovery(rows, SHA, NOW)['recover'])
+            self.assertTrue(policy.recovery(rows, SHA, NOW)['recover'])
 
     def test_pending_unknown_or_wrong_state_never_reuses_old_fix(self):
         for description, state in [(f'Copilot routing pending for {SHORT}', 'pending'),
@@ -327,7 +349,7 @@ class WorkflowShellTests(unittest.TestCase):
         for manual in ('true', 'false'):
             with self.subTest(manual=manual):
                 self.env['MANUAL_RETRY'] = manual
-                rows = [route(1), route(2, 'continue-validation'), execution('running', age=0)]
+                rows = [route(1), route(2, 'continue-validation'), live_execution('running')]
                 if manual == 'true':
                     rows.append(grant(40))
                 self.assertEqual(self.run_shell(script, rows).returncode, 0)
