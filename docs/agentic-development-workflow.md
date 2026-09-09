@@ -585,8 +585,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 
 ### Phase 4: Local GUI validation
 
-実装は [Local GUI validation 設計](local-gui-validation.md) の段階に従い、まず Terminal、
-2026-09-09 に標準 GitHub-hosted macOS の起動・撮影が成功した。次に hosted 上の操作、依頼・結果受領、final judge、merge gate を実証する。ローカル補完は hosted で不足する操作に限って検討する。
+実装は [Local GUI validation 設計](local-gui-validation.md) に従う。2026-09-09 の本番GUI操作、依頼・結果受領、実キャンセル回復、final judge、merge gateの証拠は[本番実証記録](history/gui-validation/2026-09-09-production.md)にまとめる。ローカル補完は hosted で不足する操作に限って検討する。
 起動・撮影の成功だけで包括的な GUI 検証やマージ条件を満たしたことにはしない。
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。

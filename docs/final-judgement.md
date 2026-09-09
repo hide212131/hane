@@ -2,6 +2,8 @@
 
 The controller implementation is in `.github/workflows/final-judge.yml`. Live end-to-end verification is tracked in Issue #44; implementing this workflow alone does not close that issue.
 
+The [2026-09-09 production evidence](history/gui-validation/2026-09-09-production.md) records exact-head GUI receipts, cancellation recovery, real Copilot decisions, fault-injected boundary probes and automatic merge results. It distinguishes production outcomes from experiments and preserves the validation limits.
+
 ## Evidence and roles
 
 Claude implements, Codex reviews, and Copilot judges. The final judge receives exact-head CI/review/GUI evidence as data. It has no tools and receives no workflow write token. The trusted controller independently checks its JSON recommendation against deterministic rules.

@@ -4,6 +4,7 @@
 
 | 実証 | 記録 |
 | --- | --- |
+| 本番GUI受領、実キャンセル回復、Copilot最終判定、自動マージ | [2026-09-09 本番記録](2026-09-09-production.md) |
 | GitHub-hosted macOS上での起動、対象ウィンドウ撮影、終了 | [run 34254547035](https://github.com/hide212131/hane/actions/runs/34254547035) |
 | ASCII入力・保存・undo/redo・再オープン、日本語IME確定・保存、OSホイール | [run 34259421224](https://github.com/hide212131/hane/actions/runs/34259421224) |
 
