@@ -441,6 +441,14 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 - 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。timeout、結果不明、controller error、証跡不備はすべてこの fail closed 経路であり、Copilot への置き換え対象ではない。
 - 例外は「Codex 使用量上限時の Copilot review fallback」節で定義した narrow なケースのみである。`chatgpt-codex-connector[bot]` が code review 使用量上限到達を明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換え、`hane/codex-review` に終端 `clean` / `findings` を、`hane/review-source` に provenance を記録する。
 
+#### 手動再レビュー要求 `/codex-review`
+
+repository owner は、open・non-draft・同一リポジトリの Pull Request に `/codex-review` とコメントして controller を再起動できる。PR author も repository owner、`github-actions[bot]`、`claude[bot]` のいずれかである必要がある。owner 以外からの要求や対象条件を満たさない要求は、認可ステップが失敗し Actions run が失敗する。
+
+controller は現在の head SHA を固定し、その SHA の終端 `clean` / `findings` を再利用する。終端 status がなくても、同一 SHA の既存 Codex review に指摘があればそれを再利用する。既存の SHA marker 付き要求コメントも再利用できるため、コマンドは新規レビュー要求を必ず発行するものではない。既存要求後に error がある場合は遅れて届いた完了結果を確認し、再利用できなければ新規要求を発行する。
+
+新規 `@codex review` コメントには repository owner 専用の `CODEX_GITHUB_TOKEN` を使う。Codex はレビュー専用でコードを変更しない。head が変化した場合、結果不明、controller の失敗はいずれも成功として扱わない。
+
 ### GUI requirement classification
 
 Codex review の結果を処理した後、trusted workflow が現在の head SHA に対して GUI validation の要否を判定する。
@@ -625,6 +633,7 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - review 完了と `clean` / `findings` を head SHA と対応付けて次の処理へ渡せるようにする。
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
 - Codex の code review 使用量上限を `chatgpt-codex-connector[bot]` が明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換える（#69 で実装、指摘の取り込み修正は #71）。詳細は「Codex」節の「Codex 使用量上限時の Copilot review fallback」を参照。
+- repository owner は Pull Request コメント `/codex-review` で同じ controller を明示的に再起動できる。権限確認、head SHA の記録、終端結果の再利用、fail closed の扱いは「[Codex review](#codex-review)」の「手動再レビュー要求」節に従う。
 
 ### Phase 4: Local GUI validation
 
