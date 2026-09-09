@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "procedure_version": "gui-validate/1",
+  "verification_kind": "launch_and_capture_path",
+  "request_id": "hosted-gui-spike-34254547035-1",
+  "generation": "1",
+  "scenario": "editor",
+  "overall_result": "pass",
+  "overall_reason": "すべての工程が成功した",
+  "started_at": "2026-09-08T17:01:29Z",
+  "finished_at": "2026-09-08T17:04:34Z",
+  "target": {
+    "expected_sha": "0f5e2b1f0ffb41a248b9a806009de273e8e8d793",
+    "actual_sha": "0f5e2b1f0ffb41a248b9a806009de273e8e8d793",
+    "sha_matches": true,
+    "working_copy_clean": true,
+    "dirty_paths": []
+  },
+  "build": {
+    "profile": "debug",
+    "features": [
+      "timing-probe"
+    ],
+    "rustc_version": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+    "cargo_version": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "binary_path": "/Users/runner/work/hane/hane/target/debug/hane",
+    "binary_sha256": "4ddd0358f1438783562f953df095940d47ebbde9f9f6f1fac2c04ca937001486"
+  },
+  "steps": [
+    {
+      "name": "preflight",
+      "result": "pass",
+      "reason": null,
+      "expected_sha": "0f5e2b1f0ffb41a248b9a806009de273e8e8d793",
+      "actual_sha": "0f5e2b1f0ffb41a248b9a806009de273e8e8d793",
+      "sha_matches": true,
+      "working_copy_clean": true,
+      "dirty_paths": []
+    },
+    {
+      "name": "build",
+      "result": "pass",
+      "reason": null,
+      "profile": "debug",
+      "features": [
+        "timing-probe"
+      ],
+      "rustc_version": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
+      "cargo_version": "cargo 1.93.1 (083ac5135 2025-12-15)",
+      "binary_path": "/Users/runner/work/hane/hane/target/debug/hane",
+      "binary_sha256": "4ddd0358f1438783562f953df095940d47ebbde9f9f6f1fac2c04ca937001486"
+    },
+    {
+      "name": "launch",
+      "result": "pass",
+      "reason": null,
+      "pid": 7976,
+      "elapsed_seconds": 1.717
+    },
+    {
+      "name": "window_discovery",
+      "result": "pass",
+      "reason": null,
+      "window_id": "23",
+      "elapsed_seconds": 5.735
+    },
+    {
+      "name": "capture",
+      "result": "pass",
+      "reason": null,
+      "image_path": "/Users/runner/work/_temp/hane-gui-spike/editor.png"
+    },
+    {
+      "name": "cleanup",
+      "result": "pass",
+      "reason": null,
+      "terminated_pid": 7976
+    }
+  ],
+  "evidence": {
+    "log_path": "/Users/runner/work/_temp/hane-gui-spike/hane.log",
+    "image_path": "/Users/runner/work/_temp/hane-gui-spike/editor.png",
+    "state_dir": "/Users/runner/work/_temp/hane-gui-spike/state",
+    "fixture_path": "/Users/runner/work/_temp/hane-gui-spike/editor.md"
+  },
+  "scope_note": "この結果は起動から撮影までの経路確認であり、描画内容・入力・保存を含む包括的な GUI 検証の合格を意味しない。",
+  "summary": "[PASS] gui-validate scenario=editor request=hosted-gui-spike-34254547035-1 gen=1 — すべての工程が成功した (起動・撮影の経路確認。描画・入力・保存の包括的検証ではない)"
+}
