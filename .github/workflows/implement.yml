@@ -600,7 +600,20 @@ jobs:
                       candidate = None
                       if isinstance(tool_input, dict):
                           candidate = tool_input.get("file_path") or tool_input.get("path")
-                      if isinstance(candidate, str) and PATH_PATTERN.match(candidate) and candidate not in paths:
+                      if not isinstance(candidate, str):
+                          continue
+                      candidate_path = Path(candidate)
+                      if ".." in candidate_path.parts:
+                          continue
+                      if candidate_path.is_absolute():
+                          workspace = os.environ.get("GITHUB_WORKSPACE", "")
+                          if not workspace or not Path(workspace).is_absolute():
+                              continue
+                          try:
+                              candidate = candidate_path.relative_to(Path(workspace)).as_posix()
+                          except ValueError:
+                              continue
+                      if PATH_PATTERN.fullmatch(candidate) and candidate not in paths:
                           paths.append(candidate)
                   paths = paths[:20]
 

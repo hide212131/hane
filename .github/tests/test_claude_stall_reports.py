@@ -103,6 +103,7 @@ class ClaudeWorkflowDenialReportTests(unittest.TestCase):
         self.record.write_text(json.dumps(data))
         env = dict(os.environ, RUNNER_TEMP=str(self.root), EXECUTION_FILE=str(self.record),
                    PR_NUMBER=pr_number, TARGET_SHA=target_sha, REPOSITORY=repository,
+                   GITHUB_WORKSPACE=str(self.root / "workspace"),
                    RUN_ID=run_id, REPORT_FILE=str(self.report))
         process = subprocess.run([sys.executable, "-I", "-c", DENIAL_CODE], env=env,
                                   capture_output=True, text=True, timeout=5)
@@ -120,6 +121,24 @@ class ClaudeWorkflowDenialReportTests(unittest.TestCase):
         self.assertIn("`.github/workflows/codex-review-reconcile.yml`", report["body"])
         self.assertEqual(report["marker"], "hane-stall: number=81 stage=implement-workflow-denied sha=e3144213abcd")
         self.assertIn("対象: PR #81 / e3144213abcd", report["body"])
+
+    def test_absolute_workspace_workflow_path_is_reported_relatively(self):
+        path = self.root / "workspace" / ".github/workflows/ci.yml"
+        report = self.run_code(data=dict(RESULT, permission_denials=[
+            {"tool_name": "Edit", "tool_input": {"file_path": str(path)}},
+        ]))
+        self.assertTrue(report["should_post"])
+        self.assertIn("`.github/workflows/ci.yml`", report["body"])
+        self.assertNotIn(str(self.root), report["body"])
+
+    def test_absolute_path_outside_workspace_or_traversal_is_rejected(self):
+        for path in (self.root / "outside/.github/workflows/ci.yml",
+                     self.root / "workspace-other/.github/workflows/ci.yml",
+                     self.root / "workspace/../workspace/.github/workflows/ci.yml"):
+            report = self.run_code(data=dict(RESULT, permission_denials=[
+                {"tool_name": "Write", "tool_input": {"file_path": str(path)}},
+            ]))
+            self.assertFalse(report["should_post"])
 
     def test_non_workflow_denials_are_not_reported(self):
         result = dict(RESULT, permission_denials=[
