@@ -367,7 +367,16 @@ pub struct EditorView {
     joined_parse_cache: HashMap<BlockId, JoinedBlockCache>,
     /// Blocks with a `schedule_joined_parse` background job in flight, so a
     /// block already being parsed is not queued again on the next frame.
-    joined_parse_jobs: HashSet<BlockId>,
+    joined_parse_jobs: HashMap<BlockId, JoinedParseJob>,
+}
+
+/// Identity of a background request. A late completion must not clear the
+/// in-flight entry of another document or a newer snapshot of the same block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinedParseJob {
+    document: DocumentKey,
+    revision: Revision,
+    source_range: SourceRange,
 }
 
 /// One joinable block's cached whole-span parse (see
@@ -636,7 +645,7 @@ impl EditorView {
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
             joined_parse_cache: HashMap::new(),
-            joined_parse_jobs: HashSet::new(),
+            joined_parse_jobs: HashMap::new(),
         }
     }
 
@@ -1988,7 +1997,7 @@ impl EditorView {
             if block_fits_sync_join_budget(block, &span) {
                 continue;
             }
-            if self.joined_parse_jobs.contains(&block.id)
+            if self.joined_parse_jobs.contains_key(&block.id)
                 || self
                     .joined_parse_cache
                     .get(&block.id)
@@ -2003,18 +2012,41 @@ impl EditorView {
                     .end
                     .saturating_sub(trailing_blank_lines(document, &span));
             let snapshot = document.clone();
-            self.joined_parse_jobs.insert(block.id);
             let id = block.id;
             let source_range = block.source_range;
-            let key = self.document_key();
+            let job = JoinedParseJob {
+                document: self.document_key(),
+                revision,
+                source_range,
+            };
+            self.joined_parse_jobs.insert(id, job);
             cx.spawn(async move |view, cx| {
                 let parse = cx
                     .background_executor()
                     .spawn(async move { parse_joined_span(&snapshot, content, revision) })
                     .await;
                 let _ = view.update(cx, |view, cx| {
+                    if view.document_key() != job.document
+                        || view.joined_parse_jobs.get(&id) != Some(&job)
+                    {
+                        return;
+                    }
                     view.joined_parse_jobs.remove(&id);
-                    if view.document_key() != key {
+                    // Even a rejected result releases this block for a new
+                    // request on the next frame, without evicting valid rows.
+                    cx.notify();
+                    // Resolve against the already-published current index;
+                    // never parse source synchronously to validate a result.
+                    // A provisional request can retry once the formal index
+                    // arrives and provides an exact block identity and range.
+                    let current = view
+                        .current_index()
+                        .and_then(|index| index.block_at(source_range.start));
+                    if view.editor().document().revision() != revision
+                        || current.is_none_or(|block| {
+                            block.id != id || block.source_range != source_range
+                        })
+                    {
                         return;
                     }
                     if let Some(parse) = parse {
@@ -4281,14 +4313,14 @@ mod tests {
                     .all(|run| run.kind != hane_presentation::StyleKind::Bold)
             );
             view.schedule_joined_parse(std::slice::from_ref(&indexed), cx);
-            assert!(view.joined_parse_jobs.contains(&indexed.id));
+            assert!(view.joined_parse_jobs.contains_key(&indexed.id));
             indexed
         });
 
         cx.run_until_parked();
 
         view.update(cx, |view, _cx| {
-            assert!(!view.joined_parse_jobs.contains(&indexed.id));
+            assert!(!view.joined_parse_jobs.contains_key(&indexed.id));
             let cached = view.joined_parse_cache.get(&indexed.id).unwrap();
             assert_eq!(cached.revision, view.editor().document().revision());
             assert_eq!(cached.source_range, indexed.source_range);
@@ -4305,6 +4337,136 @@ mod tests {
                     .any(|run| run.kind == hane_presentation::StyleKind::Bold)
             );
         });
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_rejects_an_old_revision_without_evicting_current_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = format!(
+            "before **{}\nmiddle\nend**\n",
+            "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+        );
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let id = view.update(cx, |view, cx| {
+            let document = view.sessions.active().editor().document();
+            let index = BlockIndex::from_buffer(document);
+            let indexed = index.block(0).unwrap();
+            view.schedule_joined_parse(&[indexed], cx);
+            view.editor_mut().insert_text("new ").unwrap();
+            let document = view.sessions.active().editor().document();
+            view.block_index.publish(
+                BlockIndex::from_buffer(document),
+                IndexSource::Formal,
+                document,
+            );
+            let indexed = view.current_index().unwrap().block(0).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let parse = parse_joined_span(
+                view.editor().document(),
+                span,
+                view.editor().document().revision(),
+            )
+            .unwrap();
+            // A newer request may already have completed after switching away
+            // and back. The late old request must preserve this exact snapshot.
+            view.joined_parse_cache.insert(
+                indexed.id,
+                JoinedBlockCache {
+                    revision: view.editor().document().revision(),
+                    source_range: indexed.source_range,
+                    parse,
+                },
+            );
+            view.cached_block(&indexed, &(1..2)).unwrap();
+            indexed.id
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(!view.joined_parse_jobs.contains_key(&id));
+            assert_eq!(
+                view.joined_parse_cache[&id].revision,
+                view.editor().document().revision()
+            );
+            assert!(
+                view.block_cache.contains_key(&id),
+                "a rejected result must not evict current rows"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_requires_the_current_block_identity_and_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for change_identity in [true, false] {
+            let text = format!(
+                "{}\nsecond\n",
+                "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+            );
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            let id = view.update(cx, |view, cx| {
+                let document = view.sessions.active().editor().document();
+                view.block_index.publish(
+                    BlockIndex::from_buffer(document),
+                    IndexSource::Formal,
+                    document,
+                );
+                let mut request = view.current_index().unwrap().block(0).unwrap();
+                // Model a request whose old block boundaries/identity disagree
+                // with the index that is current when the worker finishes.
+                if change_identity {
+                    request.id = BlockId(999);
+                } else {
+                    request.source_range.end.0 -= 1;
+                }
+                view.schedule_joined_parse(&[request], cx);
+                assert!(view.joined_parse_jobs.contains_key(&request.id));
+                request.id
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, _| {
+                assert!(!view.joined_parse_jobs.contains_key(&id));
+                assert!(view.joined_parse_cache.is_empty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_does_not_clear_another_snapshots_pending_job(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for switch_document in [true, false] {
+            let text = format!(
+                "{}\nsecond\n",
+                "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+            );
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            let (id, current_job) = view.update(cx, |view, cx| {
+                let indexed = BlockIndex::from_buffer(view.editor().document())
+                    .block(0)
+                    .unwrap();
+                view.schedule_joined_parse(&[indexed], cx);
+                if switch_document {
+                    view.sessions.open_untitled(&text, "Other");
+                    view.on_document_replaced();
+                } else {
+                    view.editor_mut().insert_text("new ").unwrap();
+                }
+                let current_job = JoinedParseJob {
+                    document: view.document_key(),
+                    revision: view.editor().document().revision(),
+                    source_range: indexed.source_range,
+                };
+                view.joined_parse_jobs.insert(indexed.id, current_job);
+                (indexed.id, current_job)
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, _| {
+                assert_eq!(view.joined_parse_jobs.get(&id), Some(&current_job));
+                assert!(view.joined_parse_cache.is_empty());
+            });
+        }
     }
 
     #[gpui::test]
