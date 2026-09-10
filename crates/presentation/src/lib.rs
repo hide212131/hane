@@ -789,7 +789,7 @@ pub fn present_block(
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
-        if run.len() > 1 {
+        if run_uses_shared_parse(run.len(), window.joined) {
             present_joined_run(
                 &window.lines[run.clone()],
                 revision,
@@ -1309,6 +1309,26 @@ fn inactive_standalone_image<'a>(
         .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
 }
 
+/// Whether a [`disclosure_runs`] run should be presented and disclosed with
+/// shared-parse semantics — one whole-paragraph parse and one run-wide merged
+/// disclosure (see [`merged_disclosure`]) — rather than as a single
+/// self-contained line.
+///
+/// True whenever [`disclosure_runs`] itself joined two or more physical
+/// lines, but also whenever a caller already holds a valid whole-block
+/// [`JoinedParse`]: `window.lines` can be trimmed down to just `window.render`
+/// once one exists (see `presented_block`'s `JOIN_SYNC_LINE_BUDGET` seam in
+/// `hane-ui`), which collapses the run to one physical line even though the
+/// block's own construct still spans more than the one line being drawn. A
+/// one-line run must then still resolve markers against the cached
+/// whole-block parse instead of a lone-line reparse that never saw the rest
+/// of the construct — the same Markdown must not change marker visibility or
+/// style depending on how many physical lines happen to be in the render
+/// window.
+fn run_uses_shared_parse(run_len: usize, joined: Option<&JoinedParse>) -> bool {
+    run_len > 1 || joined.is_some()
+}
+
 /// Groups `window.lines` into the runs [`present_block`] presents from: a run
 /// of two or more contiguous lines in a joinable block's normal flow, sharing
 /// one whole-paragraph parse and one run-wide merged disclosure (see
@@ -1324,6 +1344,11 @@ fn inactive_standalone_image<'a>(
 /// between the two halves, even though that image line itself renders through
 /// [`present_image`] rather than the shared parse (see
 /// [`inactive_standalone_image`]).
+///
+/// Whether a returned run is actually presented with shared-parse semantics
+/// is [`run_uses_shared_parse`]'s call, not this function's: a run can come
+/// back one line long here and still need the shared parse, when
+/// `window.joined` is already available.
 fn disclosure_runs(block_kind: NodeKind, window: &BlockWindow<'_>) -> Vec<Range<usize>> {
     let context = block_line_context(block_kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
@@ -1361,9 +1386,12 @@ fn disclosure_runs(block_kind: NodeKind, window: &BlockWindow<'_>) -> Vec<Range<
 /// Disclosure [`present_block`] would currently assign to each of
 /// `window.render`'s lines, paired with that line's document line number: the
 /// run-wide merged disclosure (see [`merged_disclosure`]) for a non-empty line
-/// inside a joined multi-line run — even one whose own [`BlockLine::disclosure`]
-/// is `None`, because the caret, selection or IME sits on a different physical
-/// line of the same shared construct — or the line's own disclosure otherwise.
+/// inside a run [`run_uses_shared_parse`] says presents with shared-parse
+/// semantics — even one whose own [`BlockLine::disclosure`] is `None`, because
+/// the caret, selection or IME sits on a different physical line of the same
+/// shared construct, or because that other line is off-screen entirely and
+/// only reachable through `window.joined` — or the line's own disclosure
+/// otherwise.
 /// An empty line (the blank run trailing the document's last block; see
 /// [`block_line_span`]) never gets the merged value even when grouped into the
 /// run, matching `present_markdown_from_parse`'s own early return for empty
@@ -1388,18 +1416,18 @@ pub fn expected_disclosures(
     let mut out = Vec::new();
     for run in disclosure_runs(block_kind, window) {
         let lines = &window.lines[run];
-        let joined = lines.len() > 1;
-        let merged = joined
+        let shared_parse = run_uses_shared_parse(lines.len(), window.joined);
+        let merged = shared_parse
             .then(|| joined_run_disclosure(lines, window.block_disclosure))
             .flatten();
         for line in lines {
             if window.render.contains(&line.line) {
-                let disclosure = if joined
+                let disclosure = if shared_parse
                     && !line.text.is_empty()
                     && inactive_standalone_image(line.text, line.range, line.disclosure).is_none()
                 {
                     merged
-                } else if joined {
+                } else if shared_parse {
                     None
                 } else {
                     line.disclosure
@@ -2419,6 +2447,100 @@ mod tests {
         assert_eq!(
             expected,
             visual
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn one_physical_line_render_window_with_cached_joined_parse_matches_a_wider_window() {
+        // `presented_block` (in `hane-ui`) trims `window.lines` down to just
+        // `window.render` once a cached `JoinedParse` is available (see
+        // `JOIN_SYNC_LINE_BUDGET`), which can leave `disclosure_runs` a run
+        // only one physical line long even though the block's own construct —
+        // a `**` pair here — spans a second, off-screen line. `present_block`
+        // must still resolve it against the cached whole-block parse instead
+        // of falling back to a lone-line, self-contained reparse that never
+        // sees the closing marker: the rendered line's marker visibility,
+        // style runs and source map must come out identical whether the
+        // render window is one line or both.
+        let line0 = "This is **bold\n";
+        let line1 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + line1.len());
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: None,
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: line1,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range1.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+
+        let wide_window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..2,
+            joined: Some(&joined),
+            block_disclosure: None,
+        };
+        let wide = present_block(&block, Revision(1), &wide_window, 26.0);
+
+        let narrow_lines = &lines[0..1];
+        let narrow_window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: narrow_lines,
+            render: 0..1,
+            joined: Some(&joined),
+            block_disclosure: None,
+        };
+        let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+
+        assert_eq!(narrow.lines.len(), 1);
+        assert_eq!(narrow.lines[0].visual_text, wide.lines[0].visual_text);
+        assert_eq!(narrow.lines[0].style_runs, wide.lines[0].style_runs);
+        assert_eq!(
+            narrow.lines[0].source_map.segments,
+            wide.lines[0].source_map.segments
+        );
+        // Without the shared parse, line 0's lone `**` would be unmatched and
+        // stay literal instead of hiding as an opening Strong marker.
+        assert!(
+            narrow.lines[0]
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::HiddenMarkup),
+            "the opening marker must resolve against the cached whole-block parse, not a lone-line reparse"
+        );
+
+        // `expected_disclosures` must agree with what `present_block` itself
+        // just assigned, for the same trimmed window.
+        let expected = expected_disclosures(NodeKind::Paragraph, &narrow_window);
+        assert_eq!(
+            expected,
+            narrow
                 .lines
                 .iter()
                 .map(|line| (line.line_id as usize, line.disclosure))

@@ -2257,6 +2257,14 @@ impl EditorView {
 
     /// The caret target on the last row of the block above, or the first row of
     /// the block below.
+    ///
+    /// Resolves the neighbor block first, then looks up `joined_parse_cache`
+    /// with exactly the same revision + source_range validity rule
+    /// `layout_around` uses, so a joinable neighbor beyond
+    /// `JOIN_SYNC_LINE_BUDGET` with a cached whole-span parse presents with the
+    /// same shared-parse semantics vertical navigation would get from any other
+    /// call into `presented_block` — not a navigation-only fallback that never
+    /// sees a marker pair straddling the one line being targeted.
     fn neighbor_row_target(
         &self,
         block: &VisualBlock,
@@ -2264,14 +2272,21 @@ impl EditorView {
         x: f32,
         shaper: &dyn LineShaper,
     ) -> Option<SourceOffset> {
-        neighbor_row_target(
+        let (indexed, window) =
+            neighbor_block_window(self.editor(), self.current_index(), block, down)?;
+        let revision = self.editor().document().revision();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        target_in_neighbor(
             self.editor(),
-            self.current_index(),
-            block,
+            &indexed,
+            window,
             down,
             x,
             self.content_width,
             shaper,
+            joined.map(|cached| &cached.parse),
         )
     }
 
@@ -2748,19 +2763,20 @@ impl EditorView {
     }
 }
 
-/// The caret target one row into the next or previous block, aiming at `x`.
-///
-/// Only the one line of the neighbor that the caret can land on is presented, so
-/// stepping off the edge of a block costs the same whatever the neighbor's size.
-fn neighbor_row_target(
+/// The adjacent `IndexedBlock` a vertical step off the edge of `block` would
+/// land in, and the one-line window on it the caret can land on — the "which
+/// block, which line" half of [`neighbor_row_target`], kept separate from
+/// presenting and laying it out so a caller (see
+/// `EditorView::neighbor_row_target`) can look up a cached [`JoinedParse`] for
+/// the resolved block's own id before presenting it, instead of the resolve
+/// and the presentation being fused into one call that never gets a chance to
+/// supply one.
+fn neighbor_block_window(
     editor: &Editor,
     index: Option<&BlockIndex>,
     block: &VisualBlock,
     down: bool,
-    x: f32,
-    width: f32,
-    shaper: &dyn LineShaper,
-) -> Option<SourceOffset> {
+) -> Option<(IndexedBlock, Range<usize>)> {
     let document = editor.document();
     let probe = if down {
         let next = block.source_range.end;
@@ -2775,7 +2791,28 @@ fn neighbor_row_target(
     } else {
         span.end.saturating_sub(1)..span.end
     };
-    let visual = presented_block(editor, &indexed, &window, None)?;
+    Some((indexed, window))
+}
+
+/// Presents and lays out an already-resolved neighbor block (see
+/// [`neighbor_block_window`]) and answers the caret target on the row the
+/// caller is stepping onto. `joined`, when the caller has a valid cached
+/// whole-span parse for `indexed`, is threaded straight through to
+/// `presented_block` so a joinable neighbor beyond `JOIN_SYNC_LINE_BUDGET`
+/// resolves the same marker pairs vertical navigation's one-line window would
+/// otherwise never see the other half of.
+#[allow(clippy::too_many_arguments)]
+fn target_in_neighbor(
+    editor: &Editor,
+    indexed: &IndexedBlock,
+    window: Range<usize>,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+    joined: Option<&JoinedParse>,
+) -> Option<SourceOffset> {
+    let visual = presented_block(editor, indexed, &window, joined)?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -2783,6 +2820,33 @@ fn neighbor_row_target(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// The caret target one row into the next or previous block, aiming at `x`.
+///
+/// Only the one line of the neighbor that the caret can land on is presented, so
+/// stepping off the edge of a block costs the same whatever the neighbor's size,
+/// unless `joined` supplies a cached whole-span parse for it. Test-only: the
+/// real render path is `EditorView::neighbor_row_target`, which resolves the
+/// neighbor itself (see [`neighbor_block_window`]) so it can look up a cached
+/// [`JoinedParse`] by the resolved block's own id before presenting it (see
+/// [`target_in_neighbor`]) — this is the resolve-then-present pair fused back
+/// together for tests that supply `joined` directly instead of through a
+/// cache.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn neighbor_row_target(
+    editor: &Editor,
+    index: Option<&BlockIndex>,
+    block: &VisualBlock,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+    joined: Option<&JoinedParse>,
+) -> Option<SourceOffset> {
+    let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
+    target_in_neighbor(editor, &indexed, window, down, x, width, shaper, joined)
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -4353,9 +4417,17 @@ mod tests {
             "the blank line is the last row of the block"
         );
 
-        let target =
-            neighbor_row_target(&editor, Some(&index), &first, true, x, TEST_WIDTH, &shaper)
-                .expect("there is a block below");
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is a block below");
         let (second, below) = laid_out(&editor, &index, 1, &shaper);
         let point = below
             .point_for_source(&second, target, &shaper)
@@ -4390,6 +4462,7 @@ mod tests {
             0.0,
             TEST_WIDTH,
             &shaper,
+            None,
         )
         .expect("there is a block above");
         assert_eq!(
@@ -4419,11 +4492,95 @@ mod tests {
                     down,
                     0.0,
                     TEST_WIDTH,
-                    &shaper
+                    &shaper,
+                    None,
                 ),
                 None
             );
         }
+    }
+
+    #[test]
+    fn moving_into_a_joinable_neighbor_beyond_the_sync_budget_uses_the_cached_parse() {
+        // The neighbor below `first` is a paragraph whose two `**` markers sit
+        // more than `JOIN_SYNC_LINE_BUDGET` lines apart, so a one-line render
+        // window on it cannot resolve them without a cached whole-span parse
+        // (see `a_huge_joinable_paragraph_presents_only_its_visible_window_
+        // without_a_cached_parse` in `hane_ui::line`). `neighbor_row_target`
+        // must thread a caller-supplied `JoinedParse` through to
+        // `presented_block` — exactly what `EditorView::neighbor_row_target`
+        // does once it resolves the neighbor and consults `joined_parse_cache`
+        // — instead of always running the one-line, no-parse path a
+        // navigation-only policy of its own would.
+        let mut source = String::from("alpha\n\n**bold\n");
+        for line in 0..(JOIN_SYNC_LINE_BUDGET + 200) {
+            source.push_str(&format!("filler line {line}\n"));
+        }
+        source.push_str("end**\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (first, _) = laid_out(&editor, &index, 0, &shaper);
+
+        let second = index.block(1).expect("second block");
+        let document = editor.document();
+        let span = block_line_span(document, &second).expect("block spans lines");
+        let content_end = span.end - trailing_blank_lines(document, &span);
+        let joined = parse_joined_span(document, span.start..content_end, document.revision())
+            .expect("the whole span parses");
+
+        // Aimed at the 3rd column: inside "bold" once the opening `**` hides
+        // as a marker, but still inside the literal `**` when it does not —
+        // the same x lands on a different source offset in each case.
+        let x = 2.0 * 8.0;
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            Some(&joined),
+        )
+        .expect("there is a block below");
+
+        let without_cache = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is still a block below without the cache");
+        assert_ne!(
+            target, without_cache,
+            "without the cached parse the opening `**` stays literal instead \
+             of hiding as a marker, so the same aim point must land on a \
+             different source offset"
+        );
+
+        // The one-line neighbor window must resolve to the same source offset
+        // a wider window over the same block would, once both share the
+        // cached whole-span parse — the same guarantee
+        // `one_physical_line_render_window_with_cached_joined_parse_matches_a_
+        // wider_window` establishes for `present_block` itself, carried
+        // through navigation's own call path.
+        let wide_window = span.start..(span.start + 5).min(content_end.max(span.start + 1));
+        let wide_visual = presented_block(&editor, &second, &wide_window, Some(&joined))
+            .expect("the wide window presents");
+        let wide_layout = layout_block(&wide_visual, TEST_WIDTH, &shaper);
+        let wide_target = wide_layout
+            .source_at_x(&wide_visual, 0, x, &shaper)
+            .expect("row 0 exists in the wide window too");
+        assert_eq!(
+            target, wide_target,
+            "the neighbor's one-line window must resolve the same source offset \
+             a wider window would, once both share the cached whole-span parse"
+        );
     }
 
     #[test]
