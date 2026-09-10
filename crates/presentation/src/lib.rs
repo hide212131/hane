@@ -2427,6 +2427,91 @@ mod tests {
     }
 
     #[test]
+    fn standalone_image_line_does_not_split_a_run_with_distant_delimiters() {
+        // Same guarantee as `standalone_image_line_inside_a_run_does_not_split_the_shared_parse`,
+        // but with several plain lines separating the image line from each
+        // delimiter instead of the image sitting immediately next to both —
+        // the run's shared parse must not narrow to a self-contained window
+        // around the image line.
+        let lines_text = [
+            "This text has **bold that continues\n",
+            "through several\n",
+            "![alt](dest)\n",
+            "more plain lines\n",
+            "until it finally ends** here",
+        ];
+        let mut ranges = Vec::new();
+        let mut cursor = 50;
+        for text in &lines_text {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let caret = ranges[0].start.0 + lines_text[0].find("bold").unwrap();
+        let lines: Vec<BlockLine<'_>> = lines_text
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(index, (text, range))| BlockLine {
+                line: index,
+                range: *range,
+                text,
+                disclosure: (index == 0).then(|| SourceRange::empty(caret)),
+            })
+            .collect();
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(ranges[0].start.0, ranges[4].end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: lines.len(),
+        };
+        let window = BlockWindow {
+            span: 0..lines.len(),
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..lines.len(),
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines.len(), lines.len());
+
+        // The opening `**` (line 0) and the closing `**` (line 4) are five
+        // physical lines apart with an image line between them; both must
+        // still resolve as the same Strong construct's markers.
+        let opening_marker = ranges[0].start.0 + lines_text[0].find("**").unwrap();
+        assert!(
+            visual.lines[0].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == opening_marker
+            }),
+            "the opening marker before the image line must still expand"
+        );
+        let closing_marker = ranges[4].start.0 + lines_text[4].find("**").unwrap();
+        assert!(
+            visual.lines[4].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker after the image line must still expand"
+        );
+
+        // The image line itself still renders through the dedicated image
+        // path rather than the shared markdown parse.
+        assert_eq!(visual.lines[2].kind, BlockKind::Image);
+        assert_eq!(
+            visual.lines[2].image,
+            Some(ImagePresentation {
+                alt: "alt".to_owned(),
+                destination: "dest".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn hidden_unicode_boundaries_normalize_with_affinity() {
         let source = "**日本🙂**";
         let block = present_markdown(

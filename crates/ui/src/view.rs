@@ -4233,6 +4233,44 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn cached_block_reuses_a_joined_runs_presentation_across_frames(cx: &mut gpui::TestAppContext) {
+        // `disclosures_are_current` is only a guard; the actual per-frame path
+        // is `cached_block`, which the render loop calls every frame. This
+        // exercises that call site directly so a wiring regression there —
+        // not just a regression in the helper itself — would be caught.
+        let text = "This is **bold\nacross lines** ok\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            let caret = SourceOffset(text.find("bold").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(caret))
+                .unwrap();
+            let indexed = view.block_at_offset(caret).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+
+            let (_, first_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(!first_reused, "nothing was cached yet");
+
+            let (_, second_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(
+                second_reused,
+                "an unmoved caret inside a joined run must reuse the cached \
+                 presentation instead of rebuilding it every frame"
+            );
+
+            let elsewhere = SourceOffset(text.find(" ok").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(elsewhere))
+                .unwrap();
+            let (_, third_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(
+                !third_reused,
+                "moving off the disclosed construct must still rebuild the presentation"
+            );
+        });
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
