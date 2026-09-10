@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: claude-fix-focused-pr-102
+      group: claude-fix-pr-102
       cancel-in-progress: false
     permissions:
       actions: write
