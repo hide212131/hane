@@ -318,7 +318,6 @@ jobs:
           git commit -m "Automatic Claude fix for Copilot routing decision on ${old_short}" \
             -m "Focused finding: ${FINDING}"
           new_sha="$(git rev-parse HEAD)"
-          new_short="${new_sha:0:12}"
 
           current_pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
           if ! jq -e --arg sha "$ORIGINAL_SHA" --arg repo "$REPOSITORY" \
@@ -334,9 +333,9 @@ jobs:
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           generation_id="single-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+          gh api --method POST "repos/${REPOSITORY}/statuses/${ORIGINAL_SHA}" \
             -f state=success -f context='hane/claude-fix' \
-            -f description="Claude fix completed for ${new_short}" \
+            -f description="Claude fix completed for ${old_short}" \
             -f target_url="$run_url" >/dev/null
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
