@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: claude-single-finding-pr-102
+      group: claude-fix-pr-102
       cancel-in-progress: false
       queue: max
     permissions:
@@ -47,10 +47,17 @@ jobs:
           head_ref="$(jq -r '.head.ref' <<< "$pr")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
           author="$(jq -r '.user.login' <<< "$pr")"
-          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" || "$author" != hide212131 || -z "$head_ref" || "$head_ref" == main ]]; then
-            echo '::error::PR #102 is not an eligible owner-authored same-repository feature PR.'
+          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" || -z "$head_ref" || "$head_ref" == main ]]; then
+            echo '::error::PR #102 is not an eligible same-repository feature PR.'
             exit 1
           fi
+          case "$author" in
+            hide212131|'github-actions[bot]'|'claude[bot]') ;;
+            *)
+              echo "::error::PR #102 author ${author} is not an allowed implementation identity."
+              exit 1
+              ;;
+          esac
           echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "ref=$head_ref" >> "$GITHUB_OUTPUT"
 
@@ -177,7 +184,7 @@ jobs:
           echo 'proceed=false' >> "$GITHUB_OUTPUT"
           pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
           if ! jq -e --arg sha "$ORIGINAL_SHA" --arg repo "$REPOSITORY" \
-            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and .user.login == "hide212131"' \
+            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and (.user.login == "hide212131" or .user.login == "github-actions[bot]" or .user.login == "claude[bot]")' \
             <<< "$pr" >/dev/null; then
             echo 'PR #102 moved, closed, became draft, or lost eligibility during setup; skipping Claude.'
             exit 0
@@ -298,7 +305,7 @@ jobs:
 
           current_pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
           if ! jq -e --arg sha "$ORIGINAL_SHA" --arg repo "$REPOSITORY" \
-            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and .user.login == "hide212131"' \
+            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and (.user.login == "hide212131" or .user.login == "github-actions[bot]" or .user.login == "claude[bot]")' \
             <<< "$current_pr" >/dev/null; then
             echo '::error::PR #102 moved, closed, became draft, or lost eligibility; refusing source push.'
             exit 1
@@ -315,7 +322,7 @@ jobs:
 
           current_pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
           if ! jq -e --arg sha "$ORIGINAL_SHA" --arg repo "$REPOSITORY" \
-            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and .user.login == "hide212131"' \
+            '.state == "open" and .draft == false and .head.sha == $sha and .head.repo.full_name == $repo and (.user.login == "hide212131" or .user.login == "github-actions[bot]" or .user.login == "claude[bot]")' \
             <<< "$current_pr" >/dev/null; then
             echo '::error::PR #102 changed immediately before push; refusing source push.'
             exit 1
