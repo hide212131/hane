@@ -390,6 +390,165 @@ pub const fn has_delimiter_markers(kind: NodeKind) -> bool {
     )
 }
 
+/// A cursor in a physical line's container prefix. Tabs can be partially
+/// consumed by CommonMark containers, so byte offsets and columns differ.
+#[derive(Clone, Copy, Default)]
+struct PrefixCursor {
+    byte: usize,
+    column: usize,
+    pending_spaces: usize,
+}
+
+impl PrefixCursor {
+    fn space(&mut self, line: &[u8]) -> bool {
+        if self.pending_spaces > 0 {
+            self.pending_spaces -= 1;
+        } else {
+            match line.get(self.byte) {
+                Some(b' ') => {}
+                Some(b'\t') => self.pending_spaces = 3 - self.column % 4,
+                _ => return false,
+            }
+            self.byte += 1;
+        }
+        self.column += 1;
+        true
+    }
+
+    fn indent(&mut self, line: &[u8], limit: usize) -> usize {
+        let start = self.column;
+        while self.column - start < limit && self.space(line) {}
+        self.column - start
+    }
+
+    fn quote(&mut self, line: &[u8]) -> Option<std::ops::Range<usize>> {
+        self.indent(line, 3);
+        if self.pending_spaces != 0 || line.get(self.byte) != Some(&b'>') {
+            return None;
+        }
+        let start = self.byte;
+        self.byte += 1;
+        self.column += 1;
+        self.space(line);
+        Some(start..self.byte)
+    }
+
+    fn list_item(&mut self, line: &[u8]) -> Option<usize> {
+        let start_column = self.column;
+        self.indent(line, 3);
+        if self.pending_spaces != 0 {
+            return None;
+        }
+        let marker = self.byte;
+        match line.get(self.byte) {
+            Some(b'-' | b'+' | b'*') => self.byte += 1,
+            Some(b'0'..=b'9') => {
+                while self.byte - marker < 9 && line.get(self.byte).is_some_and(u8::is_ascii_digit)
+                {
+                    self.byte += 1;
+                }
+                if !matches!(line.get(self.byte), Some(b'.' | b')')) {
+                    return None;
+                }
+                self.byte += 1;
+            }
+            _ => return None,
+        }
+        self.column += self.byte - marker;
+        let after_marker = *self;
+        let padding = self.indent(line, 5);
+        if padding == 0 {
+            return None;
+        }
+        // Five or more spaces mean one padding column followed by content
+        // indentation, rather than a wider list-item container.
+        if padding > 4 {
+            *self = after_marker;
+            self.space(line);
+        }
+        Some(self.column - start_column)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrefixContainer {
+    Quote,
+    ListItem { start: usize, indent: usize },
+}
+
+fn consume_containers(
+    containers: &[PrefixContainer],
+    line_start: usize,
+    line: &[u8],
+) -> Option<PrefixCursor> {
+    let mut cursor = PrefixCursor::default();
+    for container in containers {
+        match *container {
+            PrefixContainer::Quote => {
+                cursor.quote(line)?;
+            }
+            PrefixContainer::ListItem { start, indent } => {
+                if (line_start..line_start + line.len()).contains(&start) {
+                    cursor.list_item(line)?;
+                } else if cursor.indent(line, indent) != indent {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(cursor)
+}
+
+/// Recover a quote's markers from its actual ancestor containers, not a fixed
+/// byte width per depth. Lazy continuation lines fail the prefix scan and have
+/// no marker. List-item padding is measured on that item's opening line.
+fn quote_markers(
+    tree: &MarkdownTree,
+    id: NodeId,
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let ancestors: Vec<_> = tree.ancestors(id).skip(1).collect();
+    let mut containers = Vec::new();
+    for ancestor in ancestors.into_iter().rev() {
+        let node = tree.node(ancestor).expect("ancestor exists");
+        match node.kind {
+            NodeKind::Quote => containers.push(PrefixContainer::Quote),
+            NodeKind::ListItem { .. } => {
+                let start = node.source_range.start.0 - range.start.0;
+                let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+                let line = source[line_start..]
+                    .split_inclusive('\n')
+                    .next()
+                    .unwrap_or("");
+                let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
+                else {
+                    return Vec::new();
+                };
+                let Some(indent) = cursor.list_item(line.as_bytes()) else {
+                    return Vec::new();
+                };
+                containers.push(PrefixContainer::ListItem { start, indent });
+            }
+            _ => {}
+        }
+    }
+    let node = tree.node(id).expect("quote exists");
+    let start = node.source_range.start.0 - range.start.0;
+    let end = node.source_range.end.0 - range.start.0;
+    let mut line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+    let mut markers = Vec::new();
+    for line in source[line_start..end].split_inclusive('\n') {
+        if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
+            && let Some(marker) = cursor.quote(line.as_bytes())
+        {
+            markers.push(absolute_range(range.start.0 + line_start, marker));
+        }
+        line_start += line.len();
+    }
+    markers
+}
+
 /// Derives marker source ranges by lexing only inside the source ranges that
 /// pulldown-cmark already attributed to each node. The event ranges stay
 /// authoritative; this only recovers open/close delimiter positions that the
@@ -415,35 +574,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
                 }
             }
             NodeKind::Quote => {
-                // CommonMark repeats the `> ` prefix on every quoted physical
-                // line, not only the block's first, so a multi-line quote
-                // parsed as one shared slice (`present_joined_run`) needs a
-                // marker per line to hide each one. The node's source range
-                // already starts at this quote's own marker on the first
-                // physical line (pulldown positions nested quotes past their
-                // ancestors' prefixes there), but continuation lines carry
-                // every enclosing quote's `> ` verbatim, so this quote's own
-                // marker sits `depth - 1` prefixes in from the line start.
-                let depth = tree
-                    .ancestors(id)
-                    .filter(|ancestor| {
-                        tree.node(*ancestor)
-                            .is_some_and(|node| matches!(node.kind, NodeKind::Quote))
-                    })
-                    .count();
-                let end_relative = block.source_range.end.0.saturating_sub(range.start.0);
-                let body = tail.get(..end_relative - relative).unwrap_or(tail);
-                let mut offset = relative;
-                for (index, line) in body.split_inclusive('\n').enumerate() {
-                    let skip = if index == 0 { 0 } else { (depth - 1) * 2 };
-                    if line.get(skip..).is_some_and(|rest| rest.starts_with("> ")) {
-                        markers.push(SourceRange::new(
-                            range.start.0 + offset + skip,
-                            range.start.0 + offset + skip + 2,
-                        ));
-                    }
-                    offset += line.len();
-                }
+                markers.extend(quote_markers(tree, id, range, source));
             }
             NodeKind::ListItem { .. } => {
                 let prefix = tail
@@ -883,6 +1014,86 @@ mod tests {
             ordered.markers.first().copied(),
             Some(SourceRange::new(0, 3))
         );
+    }
+
+    #[test]
+    fn quote_markers_follow_each_lines_actual_container_prefixes() {
+        for (source, expected) in [
+            (
+                "> > first\n> > second\n",
+                vec![(0, 2), (2, 4), (10, 12), (12, 14)],
+            ),
+            (">>first\n>>second\n", vec![(0, 1), (1, 2), (8, 9), (9, 10)]),
+            (
+                "  > > first\n >  >second\n",
+                vec![(2, 4), (4, 6), (13, 15), (16, 17)],
+            ),
+            (
+                ">\t>first\n>\t>second\n",
+                vec![(0, 2), (2, 3), (9, 11), (11, 12)],
+            ),
+            (
+                "> > first\n> lazy\nlazy too\n> > last\n",
+                vec![(0, 2), (2, 4), (10, 12), (26, 28), (28, 30)],
+            ),
+            (
+                "> > first\r\n> > second\r\n",
+                vec![(0, 2), (2, 4), (11, 13), (13, 15)],
+            ),
+            (
+                "> > 日本\n> > 語\n",
+                vec![(0, 2), (2, 4), (11, 13), (13, 15)],
+            ),
+        ] {
+            // A nonzero slice origin catches accidental mixing of local and
+            // absolute positions, including on the first physical line.
+            let base = 37;
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(base, base + source.len()),
+                source,
+            );
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(base + start, base + end))
+                .collect();
+            assert_eq!(parsed.markers, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn quote_markers_follow_list_ancestors_without_hiding_literal_greater_than() {
+        for (source, expected) in [
+            ("- > first\n  > second\n", vec![(2, 4), (12, 14)]),
+            (
+                "> - > first\n>   > second\n",
+                vec![(0, 2), (4, 6), (12, 14), (16, 18)],
+            ),
+            ("1) > first\n   > second\n", vec![(3, 5), (14, 16)]),
+            (
+                "- > first\n  lazy > literal\n  > last\n",
+                vec![(2, 4), (29, 31)],
+            ),
+            (
+                "> ```\n> > literal\n> ```\n",
+                vec![(0, 2), (6, 8), (18, 20)],
+            ),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let actual: Vec<_> = parsed
+                .tree
+                .blocks()
+                .filter(|(_, node)| node.kind == NodeKind::Quote)
+                .flat_map(|(id, _)| quote_markers(&parsed.tree, id, parsed.source_range, source))
+                .collect();
+            let mut actual = actual;
+            actual.sort_by_key(|marker| marker.start);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(start, end))
+                .collect();
+            assert_eq!(actual, expected, "source: {source:?}");
+        }
     }
 
     #[test]
