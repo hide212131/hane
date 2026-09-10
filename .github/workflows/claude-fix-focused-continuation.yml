@@ -68,6 +68,7 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          set -uo pipefail
           cat > "$RUNNER_TEMP/focused-1.txt" <<'EOF'
           You are repairing Hane PR #102. Solve exactly ONE reviewer finding in this invocation.
 
@@ -82,13 +83,26 @@ jobs:
           - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
           - Stop once FINDING 1 and its focused tests are complete. Do not keep exploring unrelated improvements.
           EOF
-          claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-1.txt"
+          set +e
+          claude -p --max-turns 80 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-1.txt" 2>&1 | tee "$RUNNER_TEMP/focused-1.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            if ! grep -Eq 'Reached (max|maximum number of) turns' "$RUNNER_TEMP/focused-1.log"; then
+              exit "$status"
+            fi
+            cat > "$RUNNER_TEMP/focused-1-cont.txt" <<'EOF'
+            Continue FINDING 1 ONLY in the existing Hane PR #102 working tree. Inspect `git diff` first; do not restart the investigation or redesign completed work. Finish the viewport-bounded huge-paragraph/CommonMark-context fix, repair only compile/test issues caused by that diff, run only its focused tests, and stop. Do not touch the other findings or .github/workflows. Leave changes uncommitted.
+            EOF
+            claude -p --max-turns 20 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-1-cont.txt"
+          fi
 
       - name: Repair 2 - stabilize multi-line disclosure cache
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          set -uo pipefail
           cat > "$RUNNER_TEMP/focused-2.txt" <<'EOF'
           Continue Hane PR #102 in the EXISTING working tree. Solve exactly ONE reviewer finding in this invocation.
 
@@ -105,13 +119,26 @@ jobs:
           - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
           - Stop once FINDING 2 and its focused tests are complete.
           EOF
-          claude -p --max-turns 60 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-2.txt"
+          set +e
+          claude -p --max-turns 40 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-2.txt" 2>&1 | tee "$RUNNER_TEMP/focused-2.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            if ! grep -Eq 'Reached (max|maximum number of) turns' "$RUNNER_TEMP/focused-2.log"; then
+              exit "$status"
+            fi
+            cat > "$RUNNER_TEMP/focused-2-cont.txt" <<'EOF'
+            Continue FINDING 2 ONLY in the existing Hane PR #102 working tree. Inspect `git diff`; do not revisit FINDING 1. Finish only disclosure/cache currentness, fix only compile/test issues caused by this finding, run focused tests, and stop. Do not touch FINDING 3 or .github/workflows. Leave changes uncommitted.
+            EOF
+            claude -p --max-turns 20 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-2-cont.txt"
+          fi
 
       - name: Repair 3 - keep inline context across image lines
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
+          set -uo pipefail
           cat > "$RUNNER_TEMP/focused-3.txt" <<'EOF'
           Continue Hane PR #102 in the EXISTING working tree. Solve exactly ONE reviewer finding in this invocation.
 
@@ -127,7 +154,19 @@ jobs:
           - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
           - Stop once FINDING 3 and its focused tests are complete.
           EOF
-          claude -p --max-turns 60 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-3.txt"
+          set +e
+          claude -p --max-turns 40 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-3.txt" 2>&1 | tee "$RUNNER_TEMP/focused-3.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            if ! grep -Eq 'Reached (max|maximum number of) turns' "$RUNNER_TEMP/focused-3.log"; then
+              exit "$status"
+            fi
+            cat > "$RUNNER_TEMP/focused-3-cont.txt" <<'EOF'
+            Continue FINDING 3 ONLY in the existing Hane PR #102 working tree. Inspect `git diff`; do not revisit FINDING 1 or 2. Finish only the standalone-image/shared-inline-context fix, repair only compile/test issues caused by this finding, run focused tests, and stop. Do not modify .github/workflows. Leave changes uncommitted.
+            EOF
+            claude -p --max-turns 20 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-3-cont.txt"
+          fi
 
       - name: Validate, push, and dispatch validation
         shell: bash
@@ -143,7 +182,13 @@ jobs:
             echo '::error::Focused repair completed without producing a change.'
             exit 1
           fi
-          if grep -q '^\.github/workflows/' <<< "$changed"; then
+
+          # Reject every workflow-tree mutation, including modifications,
+          # staged changes, new files, deletions, and renames whose source OR
+          # destination is under .github/workflows.
+          if ! git diff --quiet -- .github/workflows \
+            || ! git diff --cached --quiet -- .github/workflows \
+            || [[ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]]; then
             echo '::error::Focused repair attempted to change workflow files.'
             exit 1
           fi
