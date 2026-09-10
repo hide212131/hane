@@ -164,7 +164,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.repair1.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
-          name: pr-102-focused-checkpoint-1-${{ github.run_id }}
+          name: pr-102-focused-checkpoint-1-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/checkpoint-1
           if-no-files-found: warn
           retention-days: 14
@@ -240,7 +240,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.repair2.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
-          name: pr-102-focused-checkpoint-2-${{ github.run_id }}
+          name: pr-102-focused-checkpoint-2-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/checkpoint-2
           if-no-files-found: warn
           retention-days: 14
@@ -315,7 +315,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.repair3.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
-          name: pr-102-focused-checkpoint-3-${{ github.run_id }}
+          name: pr-102-focused-checkpoint-3-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/checkpoint-3
           if-no-files-found: warn
           retention-days: 14
