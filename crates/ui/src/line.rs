@@ -278,7 +278,7 @@ fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
         .when(display.tint == BlockTint::Muted, |element| {
             element.text_color(rgb(theme.quote_foreground))
         })
-        .when_some(surface_color(display.surface), |element, color| {
+        .when_some(surface_color(display.surface, theme), |element, color| {
             element.bg(rgb(color))
         })
 }
