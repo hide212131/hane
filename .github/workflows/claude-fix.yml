@@ -431,7 +431,7 @@ jobs:
           EOF
 
           claude -p \
-            --max-turns 80 \
+            --max-turns 160 \
             --permission-mode bypassPermissions < "$RUNNER_TEMP/hane-claude-fix-prompt.txt"
           status=$?
           set -e
