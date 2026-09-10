@@ -84,7 +84,7 @@ navigation、disclosure、single-line presentation のために独自に Markdow
 
 行数上限または byte 上限のどちらかを超える joinable block は、UI/render path で全文を copy・連結・parse しない。
 
-上限超過時は background parse / cache を利用する。background result は source revision と block identity/range が現在値と一致する場合だけ publish / reuse する。
+上限超過時は background parse / cache を利用する。background result は、この ADR で定義する `JoinedParse` については source revision と block identity/range が現在値と厳密一致する場合だけ publish / reuse する。stale result の扱いは「8. `JoinedParse` は strict-match-only とする」に従う。
 
 具体的な閾値は実測と benchmark で調整可能とし、この ADR は特定の数値を固定しない。ただし「行数だけの上限」は不可とする。
 
@@ -106,7 +106,23 @@ shared parse / presentation cache は、少なくとも source revision、対象
 
 同一 revision で有効な `JoinedParse` が存在する場合、projection 経路ごとに別の parse を作らない。
 
-revision が変わった snapshot を新 revision へ流用しない。
+revision が変わった snapshot を新 revision へ暗黙に流用しない。
+
+### 8. `JoinedParse` は strict-match-only とし、ADR-0005 の rebase 対象にしない
+
+ADR-0005 は一般の background result について、入力 snapshot 以降の edit と semantic range が非交差で、かつ result が持つすべての source position を `RevisionDelta` で正しく変換できる場合に限り stale result の rebase / partial publish を認めている。この契約自体は変更しない。
+
+一方、現在の `JoinedParse` は joined source と Markdown parse tree、marker / style に使う source range を **一つの block の exact source snapshot** に結び付けた semantic cache であり、ADR-0005 が要求する全 source position の delta 変換を実装していない。block 前方の edit だけでも absolute source coordinate がずれるため、「編集範囲と非交差」という理由だけで current revision へ持ち上げてはならない。
+
+したがって `JoinedParse` の background result / cache entry は次のすべてが一致する場合だけ publish / reuse する。
+
+- document revision
+- stable block identity
+- block source range
+
+いずれかが一致しなければ stale として破棄し、再baseしない。これは `JoinedParse` に限定した strict policy であり、`BlockIndexState::publish` 等が持つ既存の rebase 契約を一般に狭めるものではない。
+
+将来 `JoinedParse` を rebase 可能にする場合は、parse tree、markers、style/source ranges、joined sourceとの対応を含む全 source coordinate を `RevisionDelta` で変換し、semantic equivalence を証明する必要がある。その実装を導入するときに本 ADR を更新する。
 
 ## 禁止する実装パターン
 
@@ -118,6 +134,7 @@ revision が変わった snapshot を新 revision へ流用しない。
 - disclosure を visible lines だけから再構成する。
 - 「4096行以下」など行数だけを根拠に巨大 source を同期全文 parse する。
 - nested quote marker を block 先頭の relative offset の単純流用で求める。
+- `JoinedParse` を revision/range不一致のまま「非交差だから」と current revision へ流用する。
 
 例外が必要な場合は、同一 source/revision の semantic equivalence をテストで証明し、この ADR を更新する。
 
@@ -131,7 +148,7 @@ PR #102 および後続実装では、少なくとも次を固定する。
 4. caret / selection / IME が multi-line construct にある場合、対応 marker disclosure が off-screen line を含む構文全体で整合する。
 5. nested quote の各 physical line で各 depth の marker range が正しい。
 6. 行数は少ないが byte 数が巨大な block を synchronous full parse path に入れない。
-7. background parse result は revision mismatch 時に publish されない。
+7. background `JoinedParse` result は revision / block identity / source range のいずれかが mismatch なら publish / reuse されない。
 8. viewport、scroll位置、rendered line count を変えても同一 source/revision の semantic result が同じである。
 
 ## 移行方針
