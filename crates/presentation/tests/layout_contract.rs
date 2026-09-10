@@ -68,6 +68,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     span,
                     lines: &lines,
                     joined: None,
+                    block_disclosure: None,
                 },
                 LINE_HEIGHT,
             )

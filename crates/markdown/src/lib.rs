@@ -396,7 +396,7 @@ pub const fn has_delimiter_markers(kind: NodeKind) -> bool {
 /// event stream does not expose. Returned ranges are sorted and merged.
 fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
     let mut markers = Vec::new();
-    for (_, block) in tree.blocks() {
+    for (id, block) in tree.blocks() {
         let relative = block.source_range.start.0.saturating_sub(range.start.0);
         let tail = source.get(relative..).unwrap_or_default();
         match block.kind {
@@ -418,15 +418,28 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
                 // CommonMark repeats the `> ` prefix on every quoted physical
                 // line, not only the block's first, so a multi-line quote
                 // parsed as one shared slice (`present_joined_run`) needs a
-                // marker per line to hide each one.
+                // marker per line to hide each one. The node's source range
+                // already starts at this quote's own marker on the first
+                // physical line (pulldown positions nested quotes past their
+                // ancestors' prefixes there), but continuation lines carry
+                // every enclosing quote's `> ` verbatim, so this quote's own
+                // marker sits `depth - 1` prefixes in from the line start.
+                let depth = tree
+                    .ancestors(id)
+                    .filter(|ancestor| {
+                        tree.node(*ancestor)
+                            .is_some_and(|node| matches!(node.kind, NodeKind::Quote))
+                    })
+                    .count();
                 let end_relative = block.source_range.end.0.saturating_sub(range.start.0);
                 let body = tail.get(..end_relative - relative).unwrap_or(tail);
                 let mut offset = relative;
-                for line in body.split_inclusive('\n') {
-                    if line.starts_with("> ") {
+                for (index, line) in body.split_inclusive('\n').enumerate() {
+                    let skip = if index == 0 { 0 } else { (depth - 1) * 2 };
+                    if line.get(skip..).is_some_and(|rest| rest.starts_with("> ")) {
                         markers.push(SourceRange::new(
-                            range.start.0 + offset,
-                            range.start.0 + offset + 2,
+                            range.start.0 + offset + skip,
+                            range.start.0 + offset + skip + 2,
                         ));
                     }
                     offset += line.len();

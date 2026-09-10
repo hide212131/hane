@@ -28,6 +28,33 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
+/// Disclosure (caret, selection or IME range) that touches `range`, which may
+/// be a single physical line's range or a whole block's span. `is_final`
+/// mirrors [`line_owns_cursor`]'s own end-of-range tweak: true when `range`
+/// reaches the document's end, so a caret resting right after the last
+/// character is still owned by it rather than by nothing.
+fn range_disclosure(editor: &Editor, range: SourceRange, is_final: bool) -> Option<SourceRange> {
+    let selection = editor.selection().range();
+    let disclosure = if selection.is_empty() {
+        line_owns_cursor(range, selection.start, is_final).then_some(selection)
+    } else if selection.intersects(range) {
+        Some(SourceRange {
+            start: selection.start.max(range.start),
+            end: selection.end.min(range.end),
+        })
+    } else {
+        None
+    };
+    editor
+        .ime()
+        .and_then(|ime| {
+            ime.current_range
+                .intersects(range)
+                .then_some(ime.current_range)
+        })
+        .or(disclosure)
+}
+
 /// Lines a joinable block's own span may reach before `presented_block` stops
 /// reading and reparsing all of it synchronously on every viewport miss.
 ///
@@ -82,6 +109,7 @@ pub(crate) fn presented_block(
             lines: &lines,
             render,
             joined,
+            block_disclosure: ctx.block_disclosure,
         },
         DEFAULT_LINE_HEIGHT,
     ))
@@ -115,6 +143,7 @@ pub(crate) fn expected_block_disclosures(
             lines: &lines,
             render: render.clone(),
             joined,
+            block_disclosure: ctx.block_disclosure,
         },
     ))
 }
@@ -129,6 +158,7 @@ struct BlockContext {
     context: Range<usize>,
     ranges: Vec<SourceRange>,
     texts: Vec<String>,
+    block_disclosure: Option<SourceRange>,
 }
 
 fn block_context(
@@ -153,11 +183,23 @@ fn block_context(
         .iter()
         .map(|range| document.text(*range).unwrap_or_default())
         .collect::<Vec<_>>();
+    // Computed from editor state against the block's whole source range, not
+    // from `ranges`/`texts` above, so a joinable block whose `context` is
+    // `render` alone (a cached `JoinedParse` above `JOIN_SYNC_LINE_BUDGET`;
+    // see the branch above) still reports a caret/selection/IME range that
+    // sits on one of its own off-screen physical lines instead of losing it
+    // to a reconstruction that only ever saw the visible ones.
+    let block_disclosure = range_disclosure(
+        editor,
+        block.source_range,
+        span.end == document.line_count(),
+    );
     Some(BlockContext {
         trailing_blank_lines: trailing_blank_lines(document, span),
         context,
         ranges,
         texts,
+        block_disclosure,
     })
 }
 
@@ -183,30 +225,7 @@ pub(crate) fn disclosure_for_line(
     line: usize,
     range: SourceRange,
 ) -> Option<SourceRange> {
-    let selection = editor.selection().range();
-    let disclosure = if selection.is_empty() {
-        line_owns_cursor(
-            range,
-            selection.start,
-            line + 1 == editor.document().line_count(),
-        )
-        .then_some(selection)
-    } else if selection.intersects(range) {
-        Some(SourceRange {
-            start: selection.start.max(range.start),
-            end: selection.end.min(range.end),
-        })
-    } else {
-        None
-    };
-    editor
-        .ime()
-        .and_then(|ime| {
-            ime.current_range
-                .intersects(range)
-                .then_some(ime.current_range)
-        })
-        .or(disclosure)
+    range_disclosure(editor, range, line + 1 == editor.document().line_count())
 }
 
 const DEFAULT_LINE_HEIGHT: f32 = 26.0;

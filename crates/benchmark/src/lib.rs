@@ -278,6 +278,7 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
                     span,
                     lines: &lines,
                     joined: None,
+                    block_disclosure: None,
                 },
                 26.0,
             );

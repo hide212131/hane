@@ -755,6 +755,15 @@ pub struct BlockWindow<'a> {
     /// single whole-paragraph parse would, regardless of where the viewport
     /// happens to sit.
     pub joined: Option<&'a JoinedParse>,
+    /// Caret, selection or IME range touching this block's whole span,
+    /// computed by the caller directly from editor state rather than
+    /// reconstructed from `lines`. A joined run's own [`merged_disclosure`]
+    /// only sees the physical lines `lines` actually carries, which for a
+    /// block presented from `render` alone (see [`JoinedParse`]) excludes any
+    /// off-screen line of the same shared construct; this field is what lets
+    /// a caret sitting on one of those off-screen lines still disclose the
+    /// construct's markers on the lines that are drawn.
+    pub block_disclosure: Option<SourceRange>,
 }
 
 /// Display kind for a whole block. The syntax-display table distinguishes a
@@ -787,6 +796,7 @@ pub fn present_block(
                 line_height,
                 &window.render,
                 window.joined,
+                window.block_disclosure,
                 &mut lines,
             );
             continue;
@@ -1379,7 +1389,9 @@ pub fn expected_disclosures(
     for run in disclosure_runs(block_kind, window) {
         let lines = &window.lines[run];
         let joined = lines.len() > 1;
-        let merged = joined.then(|| merged_disclosure(lines)).flatten();
+        let merged = joined
+            .then(|| joined_run_disclosure(lines, window.block_disclosure))
+            .flatten();
         for line in lines {
             if window.render.contains(&line.line) {
                 let disclosure = if joined
@@ -1409,10 +1421,30 @@ fn merged_disclosure(lines: &[BlockLine<'_>]) -> Option<SourceRange> {
     lines
         .iter()
         .filter_map(|line| line.disclosure)
-        .reduce(|a, b| SourceRange {
-            start: a.start.min(b.start),
-            end: a.end.max(b.end),
-        })
+        .reduce(union_disclosure)
+}
+
+fn union_disclosure(a: SourceRange, b: SourceRange) -> SourceRange {
+    SourceRange {
+        start: a.start.min(b.start),
+        end: a.end.max(b.end),
+    }
+}
+
+/// The disclosure a joined run of `lines` presents against: [`merged_disclosure`]'s
+/// reconstruction from `lines`' own per-line disclosures, unioned with
+/// `block_disclosure`. `lines` may be only the block's visible slice (see
+/// [`BlockWindow::block_disclosure`]), so a caret/selection/IME range that
+/// falls on an off-screen physical line of the same shared construct would
+/// otherwise never surface here.
+fn joined_run_disclosure(
+    lines: &[BlockLine<'_>],
+    block_disclosure: Option<SourceRange>,
+) -> Option<SourceRange> {
+    [merged_disclosure(lines), block_disclosure]
+        .into_iter()
+        .flatten()
+        .reduce(union_disclosure)
 }
 
 /// One joinable block's whole-span parse, kept independent of which lines a
@@ -1501,6 +1533,7 @@ fn present_joined_run(
     line_height: f32,
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
+    block_disclosure: Option<SourceRange>,
     out: &mut Vec<VisualLine>,
 ) {
     let computed;
@@ -1520,7 +1553,7 @@ fn present_joined_run(
     // only expands a marker whose enclosing span reaches the disclosure it is
     // given, so every line of the run is offered the same, run-wide disclosure
     // rather than only the one line that literally owns the caret.
-    let disclosure = merged_disclosure(lines);
+    let disclosure = joined_run_disclosure(lines, block_disclosure);
     for line in lines {
         if !render.contains(&line.line) {
             continue;
@@ -2268,6 +2301,7 @@ mod tests {
             lines: &lines,
             render: 0..2,
             joined: None,
+            block_disclosure: None,
         };
         let visual = present_block(&block, Revision(1), &window, 26.0);
         let closing_marker = range1.start.0 + line1.find("**").unwrap();
@@ -2348,6 +2382,7 @@ mod tests {
             lines: &lines,
             render: 0..3,
             joined: None,
+            block_disclosure: None,
         };
         let visual = present_block(&block, Revision(1), &window, 26.0);
         assert_eq!(visual.lines.len(), 3);
