@@ -20,9 +20,11 @@ jobs:
       group: claude-fix-focused-pr-102
       cancel-in-progress: false
     permissions:
+      actions: write
       contents: write
       issues: write
       pull-requests: write
+      statuses: write
 
     steps:
       - name: Resolve exact PR head
@@ -106,7 +108,7 @@ jobs:
             exit "$status"
           fi
 
-      - name: Validate and push repair
+      - name: Validate, push, and dispatch validation
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -140,8 +142,26 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m 'fix: resolve remaining CommonMark presentation findings'
+          new_sha="$(git rev-parse HEAD)"
           gh auth setup-git
           git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          generation_id="focused-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+            -f state=pending -f context='hane/trusted-ci-generation' \
+            -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
+          for context in 'cargo test / clippy (macos-latest)' 'cargo test / clippy (windows-latest)'; do
+            gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+              -f state=pending -f context="$context" -f description='Trusted CI is queued' -f target_url="$run_url" >/dev/null
+          done
+
+          gh workflow run ci.yml --repo "$REPOSITORY" --ref main \
+            -f target_sha="$new_sha" -f generation_id="$generation_id"
+          gh workflow run codex-review.yml --repo "$REPOSITORY" --ref main \
+            -f pr_number=102 -f target_sha="$new_sha"
+          gh workflow run gui-requirement.yml --repo "$REPOSITORY" --ref main \
+            -f pr_number=102 -f target_sha="$new_sha"
 
       - name: Report completion
         if: success()
@@ -150,4 +170,4 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           gh api --method POST "repos/${REPOSITORY}/issues/102/comments" \
-            -f body='Focused Claude continuation completed and pushed a new PR #102 head. Normal CI, Codex review, GUI validation, and final judgement should evaluate the new commit.' >/dev/null
+            -f body='Focused Claude continuation completed and pushed a new PR #102 head. Trusted CI, Codex review, and GUI requirement classification were explicitly dispatched for the new commit.' >/dev/null
