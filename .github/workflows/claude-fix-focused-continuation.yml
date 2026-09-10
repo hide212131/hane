@@ -1,0 +1,153 @@
+name: Focused Claude repair continuation
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.issue.number == 102 &&
+      github.event.comment.user.login == 'hide212131' &&
+      github.event.comment.body == '/claude-fix-focused'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: claude-fix-focused-pr-102
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Resolve exact PR head
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
+          state="$(jq -r '.state' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_ref="$(jq -r '.head.ref' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" || -z "$head_ref" || "$head_ref" == main ]]; then
+            echo '::error::PR #102 is not an eligible same-repository feature PR.'
+            exit 1
+          fi
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "ref=$head_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run focused repair with one continuation
+        id: claude
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -uo pipefail
+          cat > "$RUNNER_TEMP/focused-pass1.txt" <<'EOF'
+          You are repairing Hane PR #102. Work only on the current checked-out PR head and do not merge it.
+
+          Address these current reviewer findings with the smallest correct implementation:
+          1. Preserve viewport-bounded rendering. A huge joinable paragraph (including a 100,000-line single paragraph) must not cause the UI render path to synchronously read/copy/concatenate/parse the entire paragraph whenever a viewport cache miss occurs. Preserve CommonMark correctness for emphasis/inline-code delimiters that can be far outside the viewport by using cached/background full-block parsing or another architecture that keeps render-time source reads bounded.
+          2. Shared multi-line disclosure and EditorView::disclosures_are_current must use the same semantics so an active multi-line paragraph does not invalidate presentation/layout caches every frame.
+          3. A standalone image physical line inside a paragraph must not split the shared inline parse context for surrounding Markdown, while that physical line still renders through the dedicated image presentation path when inactive.
+          4. Ensure the earlier paragraph-wide parse-context review concern is actually resolved without regressing Hane's virtualization contract.
+
+          Read AGENTS.md and the relevant existing architecture before editing. Reuse Hane's existing background document parse / block cache design instead of adding an unbounded render-path scan. Add focused regression tests, including a large single-paragraph viewport-bounded case and image-between-delimiters case. Make code changes before spending time on broad tests. Run targeted tests and formatting after the implementation. Do not change files under .github/workflows. Leave changes uncommitted; this workflow owns commit/push.
+          EOF
+
+          set +e
+          claude -p --max-turns 160 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-pass1.txt" 2>&1 | tee "$RUNNER_TEMP/focused-pass1.log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$status" -ne 0 ]]; then
+            if ! grep -q 'Reached max turns' "$RUNNER_TEMP/focused-pass1.log"; then
+              echo "::error::Claude failed for a reason other than max-turn exhaustion."
+              exit "$status"
+            fi
+            cat > "$RUNNER_TEMP/focused-pass2.txt" <<'EOF'
+            Continue the same Hane PR #102 repair in the existing working tree. Do not restart the investigation.
+
+            First inspect `git diff` and the tests already added. Finish only the remaining work needed for the three reviewer findings: bounded render-time work for huge joinable paragraphs with full CommonMark context supplied by cache/background work, disclosure cache consistency, and standalone-image lines not splitting paragraph inline context. Fix compile/test failures caused by the current diff. Run targeted tests and cargo fmt. Do not modify .github/workflows, do not merge, and leave final changes uncommitted.
+            EOF
+            set +e
+            claude -p --max-turns 160 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-pass2.txt" 2>&1 | tee "$RUNNER_TEMP/focused-pass2.log"
+            status=${PIPESTATUS[0]}
+            set -e
+          fi
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Focused Claude repair did not complete successfully."
+            exit "$status"
+          fi
+
+      - name: Validate and push repair
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
+          HEAD_REF: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          changed="$(git status --porcelain=v1 | cut -c4-)"
+          if [[ -z "$changed" ]]; then
+            echo '::error::Claude completed without producing a change.'
+            exit 1
+          fi
+          if grep -q '^\.github/workflows/' <<< "$changed"; then
+            echo '::error::Focused repair attempted to change workflow files.'
+            exit 1
+          fi
+
+          cargo fmt --all
+          cargo test -p hane-presentation
+          cargo test -p hane-ui
+          cargo clippy -p hane-presentation -p hane-ui --all-targets --all-features -- -D warnings
+
+          current_sha="$(gh api "repos/${REPOSITORY}/pulls/102" --jq '.head.sha')"
+          if [[ "$current_sha" != "$ORIGINAL_SHA" ]]; then
+            echo "::error::PR #102 moved from ${ORIGINAL_SHA} to ${current_sha}; refusing to push over newer work."
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: resolve remaining CommonMark presentation findings'
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+      - name: Report completion
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method POST "repos/${REPOSITORY}/issues/102/comments" \
+            -f body='Focused Claude continuation completed and pushed a new PR #102 head. Normal CI, Codex review, GUI validation, and final judgement should evaluate the new commit.' >/dev/null
