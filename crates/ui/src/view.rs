@@ -21,7 +21,8 @@ use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{
-    JOIN_SYNC_LINE_BUDGET, block_element, expected_block_disclosures, presented_block, row_element,
+    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
+    row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -359,7 +360,7 @@ pub struct EditorView {
     document_parse_job_running: bool,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
-    /// `JOIN_SYNC_LINE_BUDGET`), keyed like `block_cache`. Populated by
+    /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
     /// `schedule_joined_parse`, off the render path, and is what lets such a
     /// block still resolve a marker pair arbitrarily far apart without this
     /// view reading the whole block on every scroll.
@@ -1964,7 +1965,7 @@ impl EditorView {
     }
 
     /// Coalesced per-block background job producing the whole-span parse of a
-    /// joinable block whose span outgrows [`JOIN_SYNC_LINE_BUDGET`] — the
+    /// joinable block that exceeds either synchronous line or byte budget — the
     /// case `presented_block` itself cannot read and reparse synchronously on
     /// every viewport miss without making a single huge paragraph's render
     /// cost scale with its length. One job per block at a time; mirrors
@@ -1984,7 +1985,7 @@ impl EditorView {
             let Some(span) = block_line_span(document, block) else {
                 continue;
             };
-            if span.len() <= JOIN_SYNC_LINE_BUDGET {
+            if block_fits_sync_join_budget(block, &span) {
                 continue;
             }
             if self.joined_parse_jobs.contains(&block.id)
@@ -4025,6 +4026,7 @@ fn source_offset_for_visual_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line::JOIN_SYNC_LINE_BUDGET;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
@@ -4245,6 +4247,64 @@ mod tests {
             code.matches(&index.block(0).unwrap()),
             "a freshly presented block matches the index it came from"
         );
+    }
+
+    #[gpui::test]
+    fn byte_large_low_line_count_block_receives_background_shared_semantics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Both delimiters are outside the small visible middle line. The byte
+        // budget excludes synchronous full parsing, so only the real background
+        // scheduler can provide the Strong semantics and invalidate the initial
+        // bounded presentation.
+        let padding = "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET);
+        let text = format!("before **{padding}\nmiddle\nend**\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let indexed = view.update(cx, |view, cx| {
+            let document = view.sessions.active().editor().document();
+            view.block_index.publish(
+                BlockIndex::from_buffer(document),
+                IndexSource::Formal,
+                document,
+            );
+            let indexed = view.block_at_offset(SourceOffset(0)).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            assert!(span.len() <= JOIN_SYNC_LINE_BUDGET);
+            assert!(!block_fits_sync_join_budget(&indexed, &span));
+
+            let (initial, _) = view.cached_block(&indexed, &(1..2)).unwrap();
+            assert_eq!(initial.lines.len(), 1);
+            assert!(
+                initial.lines[0]
+                    .style_runs
+                    .iter()
+                    .all(|run| run.kind != hane_presentation::StyleKind::Bold)
+            );
+            view.schedule_joined_parse(std::slice::from_ref(&indexed), cx);
+            assert!(view.joined_parse_jobs.contains(&indexed.id));
+            indexed
+        });
+
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            assert!(!view.joined_parse_jobs.contains(&indexed.id));
+            let cached = view.joined_parse_cache.get(&indexed.id).unwrap();
+            assert_eq!(cached.revision, view.editor().document().revision());
+            assert_eq!(cached.source_range, indexed.source_range);
+            let (presented, reused) = view.cached_block(&indexed, &(1..2)).unwrap();
+            assert!(
+                !reused,
+                "publishing shared semantics invalidates the fallback"
+            );
+            assert_eq!(presented.lines.len(), 1);
+            assert!(
+                presented.lines[0]
+                    .style_runs
+                    .iter()
+                    .any(|run| run.kind == hane_presentation::StyleKind::Bold)
+            );
+        });
     }
 
     #[gpui::test]
