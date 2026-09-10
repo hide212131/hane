@@ -570,17 +570,36 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
         let tail = source.get(relative..).unwrap_or_default();
         match block.kind {
             NodeKind::Heading(_) => {
-                let hashes = tail
-                    .as_bytes()
-                    .iter()
-                    .take_while(|byte| **byte == b'#')
-                    .count();
-                if hashes > 0 {
-                    let suffix = usize::from(tail.as_bytes().get(hashes) == Some(&b' '));
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0,
-                        block.source_range.start.0 + hashes + suffix,
-                    ));
+                // Only the parser decides whether this is ATX (Setext starts
+                // with content). Recover delimiters inside its authoritative
+                // heading range, leaving escapes and inline delimiters intact.
+                let body = &tail[..block.source_range.end.0 - block.source_range.start.0];
+                let hashes = body.bytes().take_while(|byte| *byte == b'#').count();
+                if (1..=6).contains(&hashes)
+                    && body
+                        .as_bytes()
+                        .get(hashes)
+                        .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    let opening_end = hashes
+                        + body[hashes..]
+                            .bytes()
+                            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                            .count();
+                    let start = block.source_range.start.0;
+                    let end = start + body.trim_end_matches(['\r', '\n']).len();
+                    markers.push(SourceRange::new(start, start + opening_end));
+                    // The parser has already excluded the optional closer and
+                    // trailing whitespace from its last direct child. Do not
+                    // re-scan hashes: escaped/literal hashes belong to content.
+                    let content_end = block
+                        .children
+                        .last()
+                        .and_then(|id| tree.node(*id))
+                        .map_or(start + opening_end, |node| node.source_range.end.0);
+                    if content_end < end {
+                        markers.push(SourceRange::new(content_end, end));
+                    }
                 }
             }
             NodeKind::Quote => {

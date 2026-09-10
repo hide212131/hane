@@ -1,0 +1,279 @@
+name: Focused Claude shared-parse stabilization continuation
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.issue.number == 102 &&
+      github.event.comment.user.login == 'hide212131' &&
+      github.event.comment.body == '/claude-fix-focused-shared-parse'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: claude-fix-focused-pr-102
+      cancel-in-progress: false
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Resolve exact PR head
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/${REPOSITORY}/pulls/102")"
+          state="$(jq -r '.state' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_ref="$(jq -r '.head.ref' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+          if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" || -z "$head_ref" || "$head_ref" == main ]]; then
+            echo '::error::PR #102 is not an eligible same-repository feature PR.'
+            exit 1
+          fi
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "ref=$head_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out exact PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore compatible checkpoint
+        id: restore
+        shell: bash
+        env:
+          ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo 'restored=false' >> "$GITHUB_OUTPUT"
+          if ! git fetch origin refs/heads/checkpoint/pr-102-focused:refs/remotes/origin/checkpoint/pr-102-focused 2>/dev/null; then
+            exit 0
+          fi
+          checkpoint_sha="$(git rev-parse refs/remotes/origin/checkpoint/pr-102-focused)"
+          checkpoint_base="$(git show -s --format=%B "$checkpoint_sha" | sed -n 's/^Hane-Checkpoint-Base: //p' | tail -n 1)"
+          checkpoint_finding="$(git show -s --format=%B "$checkpoint_sha" | sed -n 's/^Hane-Checkpoint-Finding: //p' | tail -n 1)"
+          if [[ "$checkpoint_base" != "$ORIGINAL_SHA" || "$checkpoint_finding" != 'shared-parse-consistency' ]]; then
+            echo "Ignoring incompatible checkpoint for base ${checkpoint_base:-unknown}, finding ${checkpoint_finding:-unknown}; current PR head is ${ORIGINAL_SHA}."
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$ORIGINAL_SHA" "$checkpoint_sha"; then
+            echo 'Ignoring checkpoint that does not descend from its recorded PR head.'
+            exit 0
+          fi
+          if ! git diff --quiet "$ORIGINAL_SHA".."$checkpoint_sha" -- .github/workflows; then
+            echo '::warning::Ignoring checkpoint because it changes workflow files.'
+            exit 0
+          fi
+          git checkout --detach "$checkpoint_sha"
+          echo "sha=$checkpoint_sha" >> "$GITHUB_OUTPUT"
+          echo 'restored=true' >> "$GITHUB_OUTPUT"
+          echo "Restored source checkpoint ${checkpoint_sha} for exact base ${ORIGINAL_SHA}."
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Repair shared parse consistency cluster
+        id: repair
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          cat > "$RUNNER_TEMP/focused-shared-parse.txt" <<'EOF'
+          You are repairing Hane PR #102. This invocation solves ONE root-cause cluster: every presentation/navigation projection of a joinable block must use the same valid JoinedParse snapshot when one is available.
+
+          Do not rediscover the architecture from scratch. The current head has already been analyzed. Follow the implementation seams below unless the code makes one literally impossible; if so, choose the smallest equivalent design and explain it in code comments/tests.
+
+          CURRENT ROOT-CAUSE CLUSTER ONLY:
+          1. `crates/presentation/src/lib.rs::present_block` uses `present_joined_run` only when `run.len() > 1`, and `expected_disclosures` independently uses `lines.len() > 1`. A valid `window.joined` is therefore ignored when the render window contains only one physical line of a large joinable block. The same Markdown can change marker visibility/style depending on rendered line count.
+          2. `crates/ui/src/view.rs::layout_around` correctly looks up `joined_parse_cache` with revision + source_range validation, but adjacent-block vertical navigation eventually calls the free `neighbor_row_target`, which resolves the neighbor and then calls `presented_block(..., None)`. Navigation therefore uses a different semantic parse from normal rendering and can shift the caret x-position.
+
+          REQUIRED IMPLEMENTATION DIRECTION:
+          A. In presentation, create one small helper/seam (for example `run_uses_shared_parse`) that decides whether a disclosure run is presented from shared parse semantics. Both `present_block` and `expected_disclosures` MUST call the same helper. A joinable block with `window.joined.is_some()` must use shared parse semantics even when the run has one physical line. Preserve the existing trailing-blank and standalone-image contracts.
+          B. In UI navigation, separate "resolve the adjacent IndexedBlock + one-line window" from "present/layout that resolved block". `EditorView::neighbor_row_target` must be able to obtain the neighbor block first, then look up `joined_parse_cache` using exactly the same current revision + source_range validity rule as `layout_around`, and pass that `JoinedParse` to `presented_block`. Do not create a navigation-only Markdown parse policy.
+          C. Add regression tests BEFORE or together with the implementation:
+             - presentation: a cached JoinedParse with distant delimiters and a one-physical-line render window has the same marker visibility/style/SourceMap semantics as a wider render window;
+             - UI/navigation: a joinable neighbor beyond the sync line budget with distant delimiters and a cached JoinedParse yields the same target x/source mapping as its normal shared presentation. Extend the existing neighbor-row test seam rather than inventing a fake parser.
+
+          IMPORTANT SCOPE BOUNDARY:
+          - Do NOT fix the byte-size sync/background threshold in this invocation.
+          - Do NOT fix nested quote marker derivation in this invocation.
+          - Do NOT modify `.github/workflows`.
+          - Do NOT merge.
+          - Do not add another local fallback parse.
+
+          CHECKPOINT:
+          A checkpoint from an interrupted attempt may already be present. Inspect `git diff` and `git log -3` first. Preserve useful existing work and continue from it.
+
+          EXECUTION:
+          - Read AGENTS.md first.
+          - Inspect only the directly relevant functions/tests before editing; the design above is the chosen direction.
+          - Make a code/test change early rather than spending the turn budget on broad repository exploration.
+          - Run narrowly relevant tests while implementing.
+          - Stop once this cluster and its focused tests are complete; final workspace validation runs later in this workflow.
+          EOF
+
+          set +e
+          claude -p \
+            --max-turns 160 \
+            --permission-mode bypassPermissions \
+            --output-format stream-json \
+            --verbose \
+            < "$RUNNER_TEMP/focused-shared-parse.txt" \
+            | tee "$RUNNER_TEMP/claude-shared-parse.jsonl"
+          claude_exit="${PIPESTATUS[0]}"
+          printf '%s\n' "$claude_exit" > "$RUNNER_TEMP/claude-exit-code.txt"
+          if [[ -s "$RUNNER_TEMP/claude-shared-parse.jsonl" ]]; then
+            jq -s '[.[] | select(.type == "result")] | last // {}' \
+              "$RUNNER_TEMP/claude-shared-parse.jsonl" > "$RUNNER_TEMP/claude-result.json" 2>/dev/null || true
+          fi
+          exit "$claude_exit"
+
+      - name: Save checkpoint after repair
+        if: ${{ always() && !cancelled() && steps.repair.outcome != 'skipped' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set +e
+          checkpoint_dir="$RUNNER_TEMP/checkpoint-shared-parse"
+          mkdir -p "$checkpoint_dir"
+          git status --porcelain=v1 > "$checkpoint_dir/status.txt"
+          git rev-parse HEAD > "$checkpoint_dir/head.txt"
+          printf '%s\n' "$ORIGINAL_SHA" > "$checkpoint_dir/base.txt"
+          git diff --binary "$ORIGINAL_SHA" > "$checkpoint_dir/source.patch"
+          git ls-files --others --exclude-standard -z > "$checkpoint_dir/untracked.zlist"
+          if [[ -s "$checkpoint_dir/untracked.zlist" ]]; then
+            tar --null -T "$checkpoint_dir/untracked.zlist" -czf "$checkpoint_dir/untracked.tar.gz"
+          fi
+          cp "$RUNNER_TEMP/claude-shared-parse.jsonl" "$checkpoint_dir/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/claude-result.json" "$checkpoint_dir/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/claude-exit-code.txt" "$checkpoint_dir/" 2>/dev/null || true
+
+          dirty="$(git status --porcelain=v1)"
+          head_sha="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD \
+            && git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
+            && git diff --quiet -- .github/workflows \
+            && git diff --cached --quiet -- .github/workflows \
+            && [[ -z "$(git ls-files --others --exclude-standard -- .github/workflows)" ]] \
+            && { [[ "$head_sha" != "$ORIGINAL_SHA" ]] || [[ -n "$dirty" ]]; }; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            if [[ -n "$dirty" ]]; then
+              git add -A
+              git commit -m 'checkpoint: PR 102 shared parse consistency' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: shared-parse-consistency' >/dev/null || true
+            else
+              git commit --allow-empty -m 'checkpoint: PR 102 shared parse consistency' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: shared-parse-consistency' >/dev/null
+            fi
+            gh auth setup-git
+            git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
+          fi
+          exit 0
+
+      - name: Upload checkpoint after repair
+        if: ${{ always() && !cancelled() && steps.repair.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-102-shared-parse-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checkpoint-shared-parse
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Validate, push, and dispatch validation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
+          HEAD_REF: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD; then
+            echo '::error::Focused repair changed history away from the reviewed PR head.'
+            exit 1
+          fi
+          if ! git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
+            || ! git diff --quiet -- .github/workflows \
+            || ! git diff --cached --quiet -- .github/workflows \
+            || [[ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]]; then
+            echo '::error::Focused repair attempted to change workflow files.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$ORIGINAL_SHA" ]]; then
+            git reset --soft "$ORIGINAL_SHA"
+          fi
+          if [[ -z "$(git status --porcelain=v1)" ]]; then
+            echo '::error::Focused repair completed without producing a change.'
+            exit 1
+          fi
+
+          cargo fmt --all
+          cargo test -p hane-ui
+          cargo test -p hane-presentation
+          cargo clippy -p hane-ui -p hane-presentation --all-targets --all-features -- -D warnings
+
+          current_sha="$(gh api "repos/${REPOSITORY}/pulls/102" --jq '.head.sha')"
+          if [[ "$current_sha" != "$ORIGINAL_SHA" ]]; then
+            echo "::error::PR #102 moved from ${ORIGINAL_SHA} to ${current_sha}; refusing to push over newer work."
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: unify shared parse across presentation and navigation'
+          new_sha="$(git rev-parse HEAD)"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          generation_id="focused-shared-parse-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+            -f state=pending -f context='hane/trusted-ci-generation' \
+            -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
+          for context in 'cargo test / clippy (macos-latest)' 'cargo test / clippy (windows-latest)'; do
+            gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
+              -f state=pending -f context="$context" -f description='Trusted CI is queued' -f target_url="$run_url" >/dev/null
+          done
+          gh workflow run ci.yml --repo "$REPOSITORY" --ref main \
+            -f target_sha="$new_sha" -f generation_id="$generation_id"
+          gh workflow run codex-review.yml --repo "$REPOSITORY" --ref main \
+            -f pr_number=102 -f target_sha="$new_sha"
+          gh workflow run gui-requirement.yml --repo "$REPOSITORY" --ref main \
+            -f pr_number=102 -f target_sha="$new_sha"
+
+      - name: Report completion
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --method POST "repos/${REPOSITORY}/issues/102/comments" \
+            -f body='shared parse consistency cluster の focused Claude 修復が完了しました。途中成果とClaudeのstream JSON診断はcheckpoint Artifactへ保存済みで、最終コミットに対する trusted CI、Codex review、GUI requirement 判定も起動しました。' >/dev/null

@@ -1,0 +1,437 @@
+   Compiling hane-session v0.1.0 (/Users/hide/.codex/.chatgpt-projects/g-p-6a92de3904248191b5ff6d8014f64ed1/hane-issue99/crates/session)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.83s
+     Running unittests src/main.rs (target/debug/deps/hane-9bfb3dde3f0f1214)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_benchmark-6f4c8128e9af1dc4)
+
+running 1 test
+test tests::percentiles_use_nearest_rank ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/hane_bench-00ecf1473548facd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_document-cd8e7043e640c30c)
+
+running 8 tests
+test tests::utf16_offsets_convert_without_flattening_the_rope ... ok
+test tests::only_lf_and_crlf_are_line_breaks ... ok
+test tests::rejects_non_character_boundaries ... ok
+test tests::lines_preserve_crlf_but_exclude_it_from_columns ... ok
+test tests::non_overlapping_range_can_rebase ... ok
+test tests::reader_builds_rope_without_intermediate_document_string ... ok
+test tests::anchors_follow_insert_bias_and_deletion ... ok
+test tests::unicode_edit_and_inverse_are_byte_based ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_editor-074c3df34fba9d93)
+
+running 11 tests
+test tests::new_edit_after_undo_discards_redo ... ok
+test tests::ime_updates_replace_previous_marked_text_and_commit ... ok
+test tests::newline_replaces_selection_and_is_its_own_undo_transaction ... ok
+test tests::selection_replacement_restores_text_and_selection ... ok
+test tests::utf16_conversion_handles_surrogate_pairs ... ok
+test tests::ime_updates_form_one_undo_transaction ... ok
+test tests::ime_cancel_restores_original_selection_and_text ... ok
+test tests::grapheme_movement_keeps_combining_sequence_together ... ok
+test tests::home_and_end_are_line_boundaries ... ok
+test tests::consecutive_typing_is_one_undo_transaction ... ok
+test tests::consecutive_backspace_and_delete_are_grouped ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cursor_boundaries.rs (target/debug/deps/cursor_boundaries-89947f29d9f76f5c)
+
+running 6 tests
+test every_arrow_is_a_no_op_in_an_empty_document ... ok
+test vertical_arrows_at_line_starts ... ok
+test horizontal_arrows_at_line_and_document_boundaries ... ok
+test vertical_arrows_at_line_ends ... ok
+test horizontal_arrows_visit_every_grapheme_boundary ... ok
+test vertical_arrows_map_every_line_column ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/editor_scenarios.rs (target/debug/deps/editor_scenarios-fc8b24d6bb653ed5)
+
+running 2 tests
+test moving_down_then_inserting_text_edits_the_expected_column ... ok
+test vertical_movement_keeps_the_preferred_column_across_a_short_line ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ime_contract.rs (target/debug/deps/ime_contract-9705fb4ff297d71f)
+
+running 3 tests
+test ime_marked_range_selection_commit_and_undo_share_one_source_contract ... ok
+test extended_vertical_selection_remains_on_source_boundaries ... ok
+test every_utf8_character_boundary_round_trips_through_utf16 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_markdown-726d482896b68234)
+
+running 25 tests
+test block_store::tests::an_emptied_store_reports_nothing ... ok
+test block_index::tests::blocks_tile_the_document_and_resolve_by_offset ... ok
+test block_index::tests::blocks_in_range_returns_only_overlapping_blocks ... ok
+test block_index::tests::a_background_parse_that_finished_late_is_rebased_onto_the_edits ... ok
+test block_index::tests::batched_edits_are_absorbed_in_one_update ... ok
+test block_index::tests::a_blank_document_holds_no_block_and_recovers_when_typed_into ... ok
+test block_index::tests::splitting_and_merging_blocks_keeps_the_index_equal_to_a_full_parse ... ok
+test block_index::tests::closing_a_fence_resynchronizes_the_following_blocks ... ok
+test block_index::tests::publish_prefers_newer_revisions_and_formal_parses ... ok
+test tests::commonmark_ranges_remain_absolute_for_unicode_and_nested_styles ... ok
+test tests::markers_cover_block_prefixes_for_heading_quote_and_list ... ok
+test tests::markers_cover_inline_open_and_close_delimiters ... ok
+test tests::local_index_agrees_with_the_formal_index_on_the_visible_window ... ok
+test tests::parses_fenced_code_as_a_code_block ... ok
+test tests::tables_nest_rows_and_cells_under_the_table ... ok
+test tests::local_index_resolves_gfm_pipe_tables ... ok
+test tests::task_list_items_carry_their_checkbox_state ... ok
+test tests::tree_nests_children_inside_their_parent_source_ranges ... ok
+test block_index::tests::incremental_updates_match_a_full_parse_across_mixed_edits ... ok
+test tests::local_index_sees_a_fence_that_opens_inside_the_lookback_window ... ok
+test tests::local_index_covers_only_the_scanned_window ... ok
+test block_store::tests::splices_and_length_changes_keep_the_store_consistent ... ok
+test block_store::tests::lookups_agree_with_a_flat_model_across_chunk_boundaries ... ok
+test block_index::tests::an_unterminated_fence_invalidates_the_tail_conservatively ... ok
+test block_index::tests::typing_inside_a_block_reparses_only_its_neighborhood ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/atx_conformance.rs (target/debug/deps/atx_conformance-de4efbb3f12c2d06)
+
+running 3 tests
+test setext_content_beginning_with_hashes_is_not_an_atx_marker ... ok
+test atx_tab_closers_use_parser_semantics ... ok
+test commonmark_0312_atx_examples_match_html_and_hane_tree ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/block_index_contract.rs (target/debug/deps/block_index_contract-71d4485269b1cbe0)
+
+running 5 tests
+test a_stale_parse_never_replaces_what_is_already_published ... ok
+test block_identity_survives_editing_so_caches_stay_warm ... ok
+test block_line_counts_tile_the_document_through_edits ... ok
+test an_edit_whose_effect_reaches_far_marks_the_tail_provisional_instead_of_guessing ... ok
+test local_editing_costs_the_same_in_a_small_and_a_large_document ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/document_contract.rs (target/debug/deps/document_contract-8f298ec3805ad772)
+
+running 5 tests
+test reference_links_and_escaped_markers_have_unambiguous_parse_contracts ... ok
+test stale_background_result_cannot_match_the_current_revision ... ok
+test multiline_commonmark_fixtures_keep_structural_ranges ... ok
+test block_kinds_follow_document_revisions ... ok
+test opening_fence_edit_changes_far_context_and_removal_restores_it ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_metrics-df2e192599c9a0da)
+
+running 3 tests
+test tests::rolling_window_evicts_oldest_sample ... ok
+test tests::percentile_uses_nearest_rank ... ok
+test tests::duration_distribution_reports_all_required_statistics ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_presentation-570f050db57fd945)
+
+running 15 tests
+test tests::fenwick_updates_and_finds_visible_blocks ... ok
+test tests::plain_presentation_preserves_markdown_source_bytes ... ok
+test tests::raw_source_fallback_preserves_every_byte_as_plain_text ... ok
+test tests::height_splice_preserves_measurements_outside_the_changed_blocks ... ok
+test tests::stale_non_overlapping_block_rebases ... ok
+test tests::the_last_block_stays_visible_across_a_chunk_boundary ... ok
+test tests::the_last_block_stays_visible_when_the_viewport_reaches_the_end ... ok
+test tests::fenced_code_context_styles_the_line_as_code_without_hiding_markup ... ok
+test tests::phase4_table_uses_synthesized_separators_with_canonical_mapping ... ok
+test tests::phase4_image_keeps_source_and_exposes_lazy_destination ... ok
+test tests::nested_delimiter_runs_do_not_duplicate_visual_or_source_segments ... ok
+test tests::hidden_unicode_boundaries_normalize_with_affinity ... ok
+test tests::disclosure_expands_only_the_active_inline_construct ... ok
+test tests::phase3_presentation_hides_markers_without_changing_source ... ok
+test tests::chunked_height_index_matches_a_flat_model_across_boundaries ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/atx_headings.rs (target/debug/deps/atx_headings-33e45de825a0c827)
+
+running 1 test
+test atx_headings_preserve_display_disclosure_positions_and_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/layout_contract.rs (target/debug/deps/layout_contract-6aa3e828a83e164f)
+
+running 12 tests
+test mixed_script_and_emoji_wrap_without_panicking_or_splitting_a_char_boundary ... ok
+test vertical_movement_follows_rows_and_keeps_the_preferred_x ... ok
+test the_first_and_last_row_report_the_block_edge ... ok
+test a_long_unbroken_ascii_token_wraps_instead_of_widening_the_column ... ok
+test narrowing_the_column_rewraps_without_changing_the_source_it_covers ... ok
+test long_japanese_text_without_spaces_wraps_at_the_column ... ok
+test selection_is_painted_per_row ... ok
+test a_caret_at_a_wrap_point_renders_at_the_start_of_the_next_row ... ok
+test a_short_row_clamps_the_caret_without_losing_the_preferred_x ... ok
+test soft_wrapped_rows_tile_their_line_and_keep_the_break_kind ... ok
+test multi_line_constructs_lay_out_one_row_per_source_line_when_they_fit ... ok
+test every_editable_source_offset_round_trips_through_the_layout ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/markdown_features.rs (target/debug/deps/markdown_features-c4e84274091b4e44)
+
+running 1 test
+test markdown_features_satisfy_the_shared_display_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/source_map_contract.rs (target/debug/deps/source_map_contract-286923841d4d4e99)
+
+running 5 tests
+test current_revision_local_presentation_wins_while_formal_context_is_stale ... ok
+test visual_click_and_drag_endpoints_produce_a_source_selection ... ok
+test hidden_and_synthesized_positions_normalize_idempotently ... ok
+test every_editable_source_boundary_round_trips_when_its_construct_is_disclosed ... ok
+test unsupported_and_edge_constructs_never_lose_source ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_session-931a59db6cbcc50f)
+
+running 60 tests
+test draft::tests::generated_ids_are_distinct_even_back_to_back ... ok
+test identity::tests::spellings_of_one_path_share_an_identity ... ok
+test identity::tests::a_move_keeps_the_document_and_changes_only_the_path ... ok
+test identity::tests::stamps_classify_external_changes ... ok
+test identity::tests::different_files_never_match ... ok
+test naming::tests::a_brand_new_note_with_no_title_yet_does_nothing ... ok
+test naming::tests::a_hash_glued_to_a_word_is_kept_not_treated_as_closing ... ok
+test naming::tests::a_closing_atx_sequence_is_stripped ... ok
+test naming::tests::a_non_auto_managed_existing_file_is_never_renamed ... ok
+test naming::tests::a_drifted_filename_stops_auto_management_instead_of_renaming ... ok
+test naming::tests::a_brand_new_note_with_a_title_creates_a_named_file ... ok
+test draft::tests::a_folder_with_no_recovery_directory_recovers_to_nothing ... ok
+test naming::tests::a_very_long_title_is_truncated ... ok
+test naming::tests::an_auto_managed_note_follows_its_h1 ... ok
+test naming::tests::an_empty_or_whitespace_only_document_has_no_title ... ok
+test naming::tests::an_unchanged_title_needs_no_rename ... ok
+test naming::tests::collision_resolution_is_a_no_op_when_the_plain_name_is_free ... ok
+test naming::tests::collision_resolution_picks_the_first_free_numbered_name ... ok
+test naming::tests::deleting_the_h1_keeps_the_current_name ... ok
+test draft::tests::removing_a_draft_that_was_never_written_is_not_an_error ... ok
+test naming::tests::dot_and_dotdot_titles_are_rejected ... ok
+test naming::tests::level_two_and_deeper_headings_are_not_titles ... ok
+test naming::tests::headings_inside_fenced_code_are_ignored ... ok
+test naming::tests::the_first_h1_is_extracted_regardless_of_leading_blank_lines ... ok
+test resource::tests::an_untitled_document_does_not_borrow_the_working_directory ... ok
+test naming::tests::only_the_first_of_several_h1s_counts ... ok
+test resource::tests::relative_destinations_resolve_against_the_document_directory ... ok
+test naming::tests::unicode_and_emoji_titles_are_kept_as_is ... ok
+test naming::tests::path_separators_and_reserved_characters_are_replaced ... ok
+test service::tests::a_guarded_save_recreates_a_file_that_was_deleted ... ok
+test service::tests::a_guarded_save_refuses_to_overwrite_a_file_that_moved_on ... ok
+test store::tests::recent_files_are_deduplicated_and_bounded ... ok
+test store::tests::recent_files_follow_renames_and_drop_deletions ... ok
+test store::tests::recent_path_escaping_round_trips ... ok
+test draft::tests::a_written_draft_round_trips_through_recover ... ok
+test service::tests::atomic_document_save_preserves_markdown_bytes ... ok
+test draft::tests::removing_a_draft_drops_it_from_recovery ... ok
+test store::tests::stores_outlive_the_component_that_wrote_them ... ok
+test workfolder::tests::a_missing_root_is_reported_as_an_error ... ok
+test draft::tests::a_draft_that_fails_to_read_is_counted_as_failed_without_losing_the_others ... ok
+test store::tests::default_folder_is_absent_until_set ... ok
+test service::tests::a_rename_moves_the_file_on_the_real_filesystem ... ok
+test draft::tests::rewriting_a_draft_keeps_one_file_with_the_latest_text ... ok
+test workfolder::tests::an_empty_directory_scans_to_an_empty_work_folder ... ok
+test service::tests::round_trip_through_the_real_filesystem_keeps_identity_and_stamp ... ok
+test workfolder::tests::inserting_a_folder_creates_missing_intermediate_folders ... ok
+test workfolder::tests::inserting_an_already_present_path_does_not_duplicate_it ... ok
+test draft::tests::stray_non_draft_files_are_ignored_on_recovery ... ok
+test store::tests::settings_survive_a_store_reload ... ok
+test workfolder::tests::renaming_a_path_the_folder_was_not_scanned_with_is_a_no_op ... ok
+test workfolder::tests::a_file_root_is_reported_as_an_error ... ok
+test workfolder::tests::renaming_an_entry_follows_the_note_to_its_new_path_and_resorts ... ok
+test workfolder::tests::inserting_a_new_note_adds_it_in_sorted_position_without_a_rescan ... ok
+test service::tests::japanese_filenames_and_paths_round_trip_on_the_real_filesystem ... ok
+test workfolder::tests::empty_folders_are_discovered_and_kept_in_the_tree ... ok
+test workfolder::tests::nested_files_appear_under_their_folder_node ... ok
+test service::tests::a_rename_refuses_to_overwrite_an_existing_destination ... ok
+test workfolder::tests::the_root_recovery_journal_directory_is_not_scanned ... ok
+test workfolder::tests::markdown_files_are_discovered_and_non_markdown_files_are_ignored ... ok
+test workfolder::tests::dotfile_directories_other_than_the_root_recovery_journal_are_still_scanned ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/atx_editing.rs (target/debug/deps/atx_editing-5117ecb60c323615)
+
+running 3 tests
+test heading_drag_selection_ime_and_save_reopen_preserve_spelling ... ok
+test typing_and_removing_atx_markers_reparses_through_undo_and_redo ... ok
+test changing_heading_levels_keeps_large_document_updates_local ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/conflict_rules.rs (target/debug/deps/conflict_rules-be259e3eb033f258)
+
+running 21 tests
+test a_failed_load_leaves_the_session_untouched ... ok
+test create_new_refuses_to_overwrite_a_name_that_already_exists ... ok
+test an_external_edit_is_reloadable_only_while_the_session_has_nothing_to_lose ... ok
+test an_untitled_session_never_autosaves_and_asks_for_a_path ... ok
+test a_rename_moves_the_session_without_touching_the_document ... ok
+test closing_refuses_to_drop_unsaved_work_and_never_empties_the_window ... ok
+test a_delete_keeps_the_unsaved_document_and_a_save_recreates_the_file ... ok
+test a_write_that_outlives_its_document_is_dropped ... ok
+test a_save_refuses_to_clobber_an_external_edit_until_the_user_says_so ... ok
+test create_new_gives_an_untitled_note_its_first_h1_derived_name ... ok
+test an_h1_driven_rename_carries_the_auto_title_and_leaves_the_document_untouched ... ok
+test autosave_only_fires_for_the_edit_that_armed_it ... ok
+test events_for_other_files_leave_every_session_alone ... ok
+test h1_create_defers_while_a_manual_save_as_is_still_in_flight ... ok
+test one_write_runs_at_a_time_and_a_burst_collapses_to_the_last_target ... ok
+test opening_a_clean_session_reuses_it_and_invalidates_derived_state ... ok
+test opening_a_file_into_a_dirty_session_is_refused ... ok
+test opening_a_file_that_is_already_open_switches_instead_of_reloading ... ok
+test save_as_to_a_new_target_does_not_need_the_stamp_of_the_old_file ... ok
+test stopping_auto_naming_clears_the_tracked_title ... ok
+test switching_sessions_keeps_each_documents_own_state ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/work_folder_sidebar.rs (target/debug/deps/work_folder_sidebar-aaaec3026ea934f5)
+
+running 3 tests
+test a_sidebar_entry_not_yet_open_loads_into_a_session_of_its_own ... ok
+test switching_to_a_sidebar_entry_never_discards_a_dirty_session_elsewhere ... ok
+test reselecting_an_already_open_sidebar_entry_switches_without_reloading ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_ui-a973826678fdf2df)
+
+running 56 tests
+test line::tests::only_a_break_the_source_makes_owns_the_caret_past_the_last_character ... ok
+test view::panel_layout_tests::scrollbar_is_hidden_when_content_fits ... ok
+test view::panel_layout_tests::scrollbar_thumb_tracks_scroll_fraction ... ok
+test line::tests::shared_line_boundary_belongs_only_to_the_following_line ... ok
+test view::panel_layout_tests::sidebar_width_drag_respects_panel_limits ... ok
+test line::tests::document_end_belongs_to_the_final_line ... ok
+test line::tests::trailing_empty_line_exclusively_owns_document_end ... ok
+test line::tests::a_row_paints_only_its_own_stretch_of_the_line ... ok
+test line::tests::selection_and_ime_boundaries_split_only_the_affected_text ... ok
+test ranges::tests::partitions_soft_wrapped_style_ranges_on_utf8_byte_boundaries ... ok
+test ranges::tests::clamps_deduplicates_and_discards_empty_ranges ... ok
+test line::tests::a_fenced_block_presents_every_line_as_literal_code ... ok
+test view::tests::a_presented_block_carries_all_of_its_lines ... ok
+test line::tests::phase3_line_discloses_only_the_active_construct ... ok
+test view::tests::block_context_rejects_stale_revision ... ok
+test view::tests::cache_invalidation_only_marks_intersecting_lines ... ok
+test view::tests::a_save_failure_after_a_draft_recovery_warning_is_still_visible ... ok
+test view::tests::a_second_new_folder_with_the_same_name_does_not_collide ... ok
+test view::tests::a_stale_new_session_read_from_a_replaced_work_folder_is_discarded ... ok
+test view::tests::a_draft_recovery_warning_survives_opening_the_first_named_note ... ok
+test view::tests::a_dirty_background_session_blocks_opening_a_different_folder ... ok
+test view::tests::a_partial_draft_recovery_failure_is_surfaced_while_readable_drafts_still_recover ... ok
+test view::tests::a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped ... ok
+test view::tests::drag_selection_from_row_start_lands_on_the_clicked_character_without_a_sidebar ... ok
+test view::tests::drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open ... ok
+test view::tests::every_line_resolves_to_its_markdown_block ... ok
+test view::tests::drag_selection_lands_on_the_second_row_of_a_soft_wrapped_line_with_sidebar_open ... ok
+test view::tests::header_status_line_combines_warning_and_status_without_dropping_either ... ok
+test view::tests::height_anchor_rebases_without_scanning_untouched_blocks ... ok
+test view::tests::drag_selection_across_lines_keeps_the_original_anchor_with_sidebar_open ... ok
+test view::tests::height_remeasurement_cannot_leave_scroll_position_below_new_bottom ... ok
+test view::tests::layout_cache_key_rejects_each_geometry_input_independently ... ok
+test view::tests::height_block_metadata_splices_across_chunk_boundaries ... ok
+test view::tests::local_fallback_resolves_the_fenced_block_before_a_formal_index_exists ... ok
+test view::tests::moving_down_past_a_block_lands_on_the_first_row_of_the_next ... ok
+test view::tests::drag_selection_from_row_start_lands_on_the_clicked_character_with_sidebar_open ... ok
+test view::tests::drag_selection_from_row_middle_extends_in_either_direction_with_sidebar_open ... ok
+test view::tests::one_block_covers_every_physical_line_of_its_construct ... ok
+test view::tests::flush_pending_drafts_writes_immediately_without_waiting_for_the_debounce ... ok
+test view::tests::moving_up_past_a_block_lands_on_its_last_row ... ok
+test view::tests::new_work_folder_folder_creates_a_folder_and_adds_it_to_the_tree_expanded ... ok
+test view::tests::save_as_on_an_unnamed_note_starts_in_the_active_work_folder ... ok
+test view::tests::text_column_width_subtracts_sidebar_and_both_paddings ... ok
+test view::tests::selecting_the_work_folder_root_after_a_subfolder_restores_it_as_the_target ... ok
+test view::tests::the_document_edges_have_no_neighbor_row ... ok
+test view::tests::visual_click_positions_map_back_to_source_offsets ... ok
+test view::tests::moving_down_through_forty_lines_scrolls_cursor_to_viewport_bottom ... ok
+test view::tests::two_new_folder_clicks_before_the_first_completes_still_pick_different_names ... ok
+test view::tests::switch_to_work_folder_discards_previous_sessions_and_opens_the_new_root ... ok
+test view::tests::a_block_taller_than_the_viewport_presents_only_the_visible_lines ... ok
+test view::tests::draft_save_survives_switching_sessions_within_the_debounce_window ... ok
+test view::tests::an_existing_files_h1_is_never_auto_renamed ... ok
+test view::tests::a_new_notes_first_h1_names_its_file_inside_the_selected_folder ... ok
+test view::tests::a_new_notes_first_h1_names_its_file ... ok
+test view::tests::editing_an_auto_managed_h1_keeps_the_note_in_its_own_folder ... ok
+test view::tests::editing_an_auto_managed_h1_renames_the_file ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s
+
+   Doc-tests hane_benchmark
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_document
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_editor
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_markdown
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_metrics
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_presentation
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_session
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_ui
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1036,7 +1036,13 @@ fn marker_is_disclosed(
                 )
             })
             .any(|(_, block)| {
-                marker.start == block.source_range.start
+                (marker.start == block.source_range.start
+                    || (matches!(block.kind, NodeKind::Heading(_))
+                        && block
+                            .children
+                            .last()
+                            .and_then(|id| parsed.tree.node(*id))
+                            .is_none_or(|child| child.source_range.end <= marker.start)))
                     && marker.end <= block.source_range.end
                     && range_touches(block.source_range, disclosure)
             })
@@ -1155,10 +1161,25 @@ fn present_markdown_from_parse(
         return block;
     }
     let parsed = shared.parsed;
+    // An ATX heading nested in an existing quote/list still carries its
+    // heading level. Only nodes intersecting this physical line contribute:
+    // the shared tree also contains other headings and trailing blank lines.
+    // Container layout remains owned by the indexed block.
     let kind = parsed
         .tree
         .blocks()
-        .find_map(|(_, block)| syntax_display(block.kind).node_block)
+        .filter(|(_, block)| block.source_range.intersects(range))
+        .find_map(|(_, block)| match block.kind {
+            NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
+            _ => None,
+        })
+        .or_else(|| {
+            parsed
+                .tree
+                .blocks()
+                .filter(|(_, block)| block.source_range.intersects(range))
+                .find_map(|(_, block)| syntax_display(block.kind).node_block)
+        })
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
@@ -2305,6 +2326,79 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn shared_heading_kinds_follow_each_physical_lines_source_range() {
+        for (source, expected) in [
+            (
+                "> ## first\n> plain\n> ### second\n\n",
+                &[
+                    BlockKind::Heading(2),
+                    BlockKind::Quote,
+                    BlockKind::Heading(3),
+                    BlockKind::Paragraph,
+                ][..],
+            ),
+            (
+                "- ## first\n  plain\n  ### second\n",
+                &[
+                    BlockKind::Heading(2),
+                    BlockKind::ListItem,
+                    BlockKind::Heading(3),
+                ][..],
+            ),
+        ] {
+            let mut offset = 50;
+            let lines = source
+                .split_inclusive('\n')
+                .enumerate()
+                .map(|(line, text)| {
+                    let range = SourceRange::new(offset, offset + text.len());
+                    offset = range.end.0;
+                    BlockLine {
+                        line,
+                        range,
+                        text,
+                        disclosure: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let joined = parse_joined_block(&lines, Revision(1));
+            let mut wide = Vec::new();
+            present_joined_run(
+                &lines,
+                Revision(1),
+                26.0,
+                &(0..lines.len()),
+                None,
+                None,
+                &mut wide,
+            );
+            for (index, &expected_kind) in expected.iter().enumerate() {
+                assert_eq!(
+                    wide[index].kind, expected_kind,
+                    "line {index} in {source:?}"
+                );
+                let mut narrow = Vec::new();
+                present_joined_run(
+                    &lines[index..index + 1],
+                    Revision(1),
+                    26.0,
+                    &(index..index + 1),
+                    Some(&joined),
+                    None,
+                    &mut narrow,
+                );
+                assert_eq!(narrow[0].kind, expected_kind);
+                assert_eq!(narrow[0].estimated_height, wide[index].estimated_height);
+                assert_eq!(narrow[0].visual_text, wide[index].visual_text);
+                assert_eq!(
+                    narrow[0].source_map.segments,
+                    wide[index].source_map.segments
+                );
+            }
+        }
     }
 
     #[test]
