@@ -7,6 +7,14 @@
 現行のリファクタリング作業は [`docs/refactor-plan.md`](../refactor-plan.md) と
 [`docs/refactor-execution-plan.md`](../refactor-execution-plan.md) を正とする。
 
+## Proposed
+
+実装・検証を進めている設計判断。承認・実装完了前であり、現行実装の保証を意味しない。
+
+| ADR | 内容 |
+|---|---|
+| [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
+
 ## Active
 
 | ADR | 内容 |
