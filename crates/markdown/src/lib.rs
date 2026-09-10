@@ -459,6 +459,15 @@ impl PrefixCursor {
             _ => return None,
         }
         self.column += self.byte - marker;
+        // An empty opening line has one implicit padding column, including
+        // when the marker touches EOL or has several trailing spaces/tabs.
+        // This matches the parser's empty-list-item continuation indentation.
+        if line[self.byte..]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return Some(self.column - start_column + 1);
+        }
         let after_marker = *self;
         let padding = self.indent(line, 5);
         if padding == 0 {
@@ -1129,6 +1138,51 @@ mod tests {
                 .map(|(start, end)| SourceRange::new(start, end))
                 .collect();
             assert_eq!(actual, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn quote_markers_follow_list_items_with_an_empty_opening_line() {
+        for marker in ["-", "1.", "1)"] {
+            for padding in ["", " ", "   ", "\t"] {
+                for newline in ["\n", "\r\n"] {
+                    let indent = " ".repeat(marker.len() + 1);
+                    let source = format!(
+                        "{marker}{padding}{newline}{indent}> first{newline}{indent}> second"
+                    );
+                    let base = 37;
+                    let parsed = parse_document(
+                        Revision(1),
+                        SourceRange::new(base, base + source.len()),
+                        &source,
+                    );
+                    let (quote_id, quote) = parsed
+                        .tree
+                        .blocks()
+                        .find(|(_, node)| node.kind == NodeKind::Quote)
+                        .expect("the parser recognizes the nested quote");
+                    assert!(matches!(
+                        parsed.tree.node(quote.parent.unwrap()).unwrap().kind,
+                        NodeKind::ListItem { .. }
+                    ));
+                    let expected: Vec<_> = source
+                        .match_indices('>')
+                        .map(|(at, _)| SourceRange::new(base + at, base + at + 2))
+                        .collect();
+                    assert_eq!(
+                        quote_markers(&parsed.tree, quote_id, parsed.source_range, &source),
+                        expected,
+                        "source: {source:?}"
+                    );
+                    for range in expected {
+                        assert!(
+                            parsed.markers.contains(&range),
+                            "missing {range:?} in {source:?}"
+                        );
+                        assert!(parsed.quote_markers.contains(&(range, quote_id)));
+                    }
+                }
+            }
         }
     }
 
