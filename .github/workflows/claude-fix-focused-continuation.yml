@@ -390,4 +390,4 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           gh api --method POST "repos/${REPOSITORY}/issues/102/comments" \
-            -f body='Focused Claude repair completed. Each paid invocation was checkpointed, and trusted CI, Codex review, and GUI requirement classification were dispatched for the final commit.' >/dev/null
+            -f body='Focused Claude 修復が完了しました。各 Claude invocation の途中成果は checkpoint 保存済みで、最終コミットに対する trusted CI、Codex review、GUI requirement 判定も起動しました。' >/dev/null
