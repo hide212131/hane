@@ -1,4 +1,4 @@
-name: Focused Claude neighbor repair continuation
+name: Focused Claude shared-parse stabilization continuation
 
 on:
   issue_comment:
@@ -13,7 +13,7 @@ jobs:
       github.event.issue.pull_request &&
       github.event.issue.number == 102 &&
       github.event.comment.user.login == 'hide212131' &&
-      github.event.comment.body == '/claude-fix-focused-neighbor'
+      github.event.comment.body == '/claude-fix-focused-shared-parse'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
@@ -69,7 +69,7 @@ jobs:
           checkpoint_sha="$(git rev-parse refs/remotes/origin/checkpoint/pr-102-focused)"
           checkpoint_base="$(git show -s --format=%B "$checkpoint_sha" | sed -n 's/^Hane-Checkpoint-Base: //p' | tail -n 1)"
           checkpoint_finding="$(git show -s --format=%B "$checkpoint_sha" | sed -n 's/^Hane-Checkpoint-Finding: //p' | tail -n 1)"
-          if [[ "$checkpoint_base" != "$ORIGINAL_SHA" || "$checkpoint_finding" != 'neighbor-row-target' ]]; then
+          if [[ "$checkpoint_base" != "$ORIGINAL_SHA" || "$checkpoint_finding" != 'shared-parse-consistency' ]]; then
             echo "Ignoring incompatible checkpoint for base ${checkpoint_base:-unknown}, finding ${checkpoint_finding:-unknown}; current PR head is ${ORIGINAL_SHA}."
             exit 0
           fi
@@ -94,30 +94,61 @@ jobs:
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Repair neighbor row shared parse finding
+      - name: Repair shared parse consistency cluster
         id: repair
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          cat > "$RUNNER_TEMP/focused-neighbor.txt" <<'EOF'
-          You are repairing Hane PR #102. Solve exactly ONE reviewer finding in this invocation.
+          cat > "$RUNNER_TEMP/focused-shared-parse.txt" <<'EOF'
+          You are repairing Hane PR #102. This invocation solves ONE root-cause cluster: every presentation/navigation projection of a joinable block must use the same valid JoinedParse snapshot when one is available.
 
-          FINDING ONLY: On the current PR head, Codex found that the adjacent-block vertical navigation path in `crates/ui/src/view.rs` does not use the cached full joined parse. In particular, `neighbor_row_target` currently reaches `presented_block(..., None)`. For a joinable paragraph over the synchronous parse budget, normal rendering can use `EditorView`'s valid `joined_parse_cache` while this navigation-only layout parses only the first or last visible line. If an emphasis or inline-code delimiter closes far away, marker visibility can therefore differ and the caret can land at a shifted x-position.
+          Do not rediscover the architecture from scratch. The current head has already been analyzed. Follow the implementation seams below unless the code makes one literally impossible; if so, choose the smallest equivalent design and explain it in code comments/tests.
 
-          Make the smallest correct change so adjacent-block vertical navigation uses the matching valid cached `JoinedParse` under the same revision/source-range semantics as normal rendering. Add focused regression coverage that exercises the actual navigation path for a paragraph beyond the synchronous line budget with distant delimiters and demonstrates stable caret positioning/marker visibility.
+          CURRENT ROOT-CAUSE CLUSTER ONLY:
+          1. `crates/presentation/src/lib.rs::present_block` uses `present_joined_run` only when `run.len() > 1`, and `expected_disclosures` independently uses `lines.len() > 1`. A valid `window.joined` is therefore ignored when the render window contains only one physical line of a large joinable block. The same Markdown can change marker visibility/style depending on rendered line count.
+          2. `crates/ui/src/view.rs::layout_around` correctly looks up `joined_parse_cache` with revision + source_range validation, but adjacent-block vertical navigation eventually calls the free `neighbor_row_target`, which resolves the neighbor and then calls `presented_block(..., None)`. Navigation therefore uses a different semantic parse from normal rendering and can shift the caret x-position.
 
-          IMPORTANT: A checkpoint from an interrupted attempt may already be present. Inspect `git diff` and `git log -3` first. Preserve useful existing work and continue from it.
+          REQUIRED IMPLEMENTATION DIRECTION:
+          A. In presentation, create one small helper/seam (for example `run_uses_shared_parse`) that decides whether a disclosure run is presented from shared parse semantics. Both `present_block` and `expected_disclosures` MUST call the same helper. A joinable block with `window.joined.is_some()` must use shared parse semantics even when the run has one physical line. Preserve the existing trailing-blank and standalone-image contracts.
+          B. In UI navigation, separate "resolve the adjacent IndexedBlock + one-line window" from "present/layout that resolved block". `EditorView::neighbor_row_target` must be able to obtain the neighbor block first, then look up `joined_parse_cache` using exactly the same current revision + source_range validity rule as `layout_around`, and pass that `JoinedParse` to `presented_block`. Do not create a navigation-only Markdown parse policy.
+          C. Add regression tests BEFORE or together with the implementation:
+             - presentation: a cached JoinedParse with distant delimiters and a one-physical-line render window has the same marker visibility/style/SourceMap semantics as a wider render window;
+             - UI/navigation: a joinable neighbor beyond the sync line budget with distant delimiters and a cached JoinedParse yields the same target x/source mapping as its normal shared presentation. Extend the existing neighbor-row test seam rather than inventing a fake parser.
 
-          Work rules:
+          IMPORTANT SCOPE BOUNDARY:
+          - Do NOT fix the byte-size sync/background threshold in this invocation.
+          - Do NOT fix nested quote marker derivation in this invocation.
+          - Do NOT modify `.github/workflows`.
+          - Do NOT merge.
+          - Do not add another local fallback parse.
+
+          CHECKPOINT:
+          A checkpoint from an interrupted attempt may already be present. Inspect `git diff` and `git log -3` first. Preserve useful existing work and continue from it.
+
+          EXECUTION:
           - Read AGENTS.md first.
-          - Work only on this finding and directly related tests.
-          - Do not revisit the already-fixed huge-paragraph architecture, disclosure consistency, or standalone-image continuity except for a tiny compile-enabling adjustment if unavoidable.
-          - Run only narrowly relevant tests while implementing; final validation happens later in this workflow.
-          - Do not modify `.github/workflows` and do not merge.
-          - Stop once this finding and its focused tests are complete.
+          - Inspect only the directly relevant functions/tests before editing; the design above is the chosen direction.
+          - Make a code/test change early rather than spending the turn budget on broad repository exploration.
+          - Run narrowly relevant tests while implementing.
+          - Stop once this cluster and its focused tests are complete; final workspace validation runs later in this workflow.
           EOF
-          claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-neighbor.txt"
+
+          set +e
+          claude -p \
+            --max-turns 160 \
+            --permission-mode bypassPermissions \
+            --output-format stream-json \
+            --verbose \
+            < "$RUNNER_TEMP/focused-shared-parse.txt" \
+            | tee "$RUNNER_TEMP/claude-shared-parse.jsonl"
+          claude_exit="${PIPESTATUS[0]}"
+          printf '%s\n' "$claude_exit" > "$RUNNER_TEMP/claude-exit-code.txt"
+          if [[ -s "$RUNNER_TEMP/claude-shared-parse.jsonl" ]]; then
+            jq -s '[.[] | select(.type == "result")] | last // {}' \
+              "$RUNNER_TEMP/claude-shared-parse.jsonl" > "$RUNNER_TEMP/claude-result.json" 2>/dev/null || true
+          fi
+          exit "$claude_exit"
 
       - name: Save checkpoint after repair
         if: ${{ always() && !cancelled() && steps.repair.outcome != 'skipped' }}
@@ -127,7 +158,7 @@ jobs:
           ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
-          checkpoint_dir="$RUNNER_TEMP/checkpoint-neighbor"
+          checkpoint_dir="$RUNNER_TEMP/checkpoint-shared-parse"
           mkdir -p "$checkpoint_dir"
           git status --porcelain=v1 > "$checkpoint_dir/status.txt"
           git rev-parse HEAD > "$checkpoint_dir/head.txt"
@@ -137,6 +168,10 @@ jobs:
           if [[ -s "$checkpoint_dir/untracked.zlist" ]]; then
             tar --null -T "$checkpoint_dir/untracked.zlist" -czf "$checkpoint_dir/untracked.tar.gz"
           fi
+          cp "$RUNNER_TEMP/claude-shared-parse.jsonl" "$checkpoint_dir/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/claude-result.json" "$checkpoint_dir/" 2>/dev/null || true
+          cp "$RUNNER_TEMP/claude-exit-code.txt" "$checkpoint_dir/" 2>/dev/null || true
+
           dirty="$(git status --porcelain=v1)"
           head_sha="$(git rev-parse HEAD)"
           if git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD \
@@ -149,13 +184,13 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             if [[ -n "$dirty" ]]; then
               git add -A
-              git commit -m 'checkpoint: PR 102 neighbor row repair' \
+              git commit -m 'checkpoint: PR 102 shared parse consistency' \
                 -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
-                -m 'Hane-Checkpoint-Finding: neighbor-row-target' >/dev/null || true
+                -m 'Hane-Checkpoint-Finding: shared-parse-consistency' >/dev/null || true
             else
-              git commit --allow-empty -m 'checkpoint: PR 102 neighbor row repair' \
+              git commit --allow-empty -m 'checkpoint: PR 102 shared parse consistency' \
                 -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
-                -m 'Hane-Checkpoint-Finding: neighbor-row-target' >/dev/null
+                -m 'Hane-Checkpoint-Finding: shared-parse-consistency' >/dev/null
             fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
@@ -166,8 +201,8 @@ jobs:
         if: ${{ always() && !cancelled() && steps.repair.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
-          name: pr-102-neighbor-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/checkpoint-neighbor
+          name: pr-102-shared-parse-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checkpoint-shared-parse
           if-no-files-found: warn
           retention-days: 14
 
@@ -213,13 +248,13 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'fix: keep neighbor row navigation on shared parse'
+          git commit -m 'fix: unify shared parse across presentation and navigation'
           new_sha="$(git rev-parse HEAD)"
           gh auth setup-git
           git push origin "HEAD:refs/heads/${HEAD_REF}"
 
           run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          generation_id="focused-neighbor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          generation_id="focused-shared-parse-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh api --method POST "repos/${REPOSITORY}/statuses/${new_sha}" \
             -f state=pending -f context='hane/trusted-ci-generation' \
             -f description="Trusted CI generation ${generation_id}" -f target_url="$run_url" >/dev/null
@@ -241,4 +276,4 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           gh api --method POST "repos/${REPOSITORY}/issues/102/comments" \
-            -f body='隣接ブロック移動時の共有解析に関する focused Claude 修復が完了しました。途中成果は checkpoint 保存済みで、最終コミットに対する trusted CI、Codex review、GUI requirement 判定も起動しました。' >/dev/null
+            -f body='shared parse consistency cluster の focused Claude 修復が完了しました。途中成果とClaudeのstream JSON診断はcheckpoint Artifactへ保存済みで、最終コミットに対する trusted CI、Codex review、GUI requirement 判定も起動しました。' >/dev/null
