@@ -60,16 +60,32 @@ fn range_disclosure(editor: &Editor, range: SourceRange, is_final: bool) -> Opti
 ///
 /// A block is not bounded — a document without a blank line in it is a single
 /// paragraph (see [`VisualBlock`] in `hane_presentation`) — so nothing here
-/// can assume a joinable block's whole span is cheap to read. Below this
-/// budget the whole span is still read and parsed inline, exactly as before,
-/// which keeps a normal-sized paragraph resolving a far-apart marker pair
-/// synchronously with no caller-supplied [`JoinedParse`] required. Above it,
-/// `presented_block` reads only `visible`'s own lines unless the caller
-/// already has a cached whole-span parse (see
-/// `EditorView::schedule_joined_parse`, which computes one off the render
-/// path and is what resolves the rest correctly without a fixed context
-/// window whose result would depend on where the viewport happens to sit).
+/// can assume a joinable block's whole span is cheap to read. This line budget
+/// is paired with [`JOIN_SYNC_BYTE_BUDGET`]; both must be satisfied before a
+/// full-block parse is allowed on the render path.
 pub(crate) const JOIN_SYNC_LINE_BUDGET: usize = 4_096;
+
+/// Source bytes a joinable block may contain before its whole-span parse must
+/// move off the render path. This starts at the same 256 KiB bound Hane already
+/// uses for incremental Markdown re-synchronization work. The concrete value is
+/// a tuning parameter; the invariant is that a block must satisfy both this
+/// byte budget and [`JOIN_SYNC_LINE_BUDGET`] before synchronous full parsing.
+pub(crate) const JOIN_SYNC_BYTE_BUDGET: usize = 256 * 1024;
+
+/// Whether reading, copying, joining and parsing this whole block is bounded
+/// enough for the synchronous render path. The same predicate is used by
+/// `EditorView::schedule_joined_parse`: failing either limit must both prevent
+/// a synchronous whole-block parse and make the block eligible for a cached
+/// background [`JoinedParse`], otherwise a byte-large, low-line-count block
+/// could fall between the two policies and never receive shared semantics.
+pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usize>) -> bool {
+    let bytes = block
+        .source_range
+        .end
+        .0
+        .saturating_sub(block.source_range.start.0);
+    span.len() <= JOIN_SYNC_LINE_BUDGET && bytes <= JOIN_SYNC_BYTE_BUDGET
+}
 
 /// Presents the lines of one indexed Markdown block that reach `visible`.
 ///
@@ -86,9 +102,9 @@ pub(crate) const JOIN_SYNC_LINE_BUDGET: usize = 4_096;
 /// never inspects the source for fences or pipes.
 ///
 /// `joined`, when given, is a cached whole-span parse for this exact block
-/// (see [`JoinedParse`]); it is what lets a block whose span outgrows
-/// [`JOIN_SYNC_LINE_BUDGET`] still resolve a marker pair arbitrarily far
-/// apart without this function reading the whole span itself on every call.
+/// (see [`JoinedParse`]); it is what lets a block that exceeds either sync
+/// budget still resolve a marker pair arbitrarily far apart without this
+/// function reading the whole span itself on every call.
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
@@ -149,9 +165,9 @@ pub(crate) fn expected_block_disclosures(
 }
 
 /// Lines read from `document` to build a [`BlockWindow`] for `block`: the
-/// whole block span when it is joinable, small enough, and no cached
-/// [`JoinedParse`] already supplies whole-span context — matching exactly
-/// when `presented_block` itself reads the whole span rather than just
+/// whole block span when it is joinable, satisfies both synchronous budgets,
+/// and no cached [`JoinedParse`] already supplies whole-span context — matching
+/// exactly when `presented_block` itself reads the whole span rather than just
 /// `render` — or `render` alone otherwise.
 struct BlockContext {
     trailing_blank_lines: usize,
@@ -170,7 +186,7 @@ fn block_context(
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
-    let context = if joinable && joined.is_none() && span.len() <= JOIN_SYNC_LINE_BUDGET {
+    let context = if joinable && joined.is_none() && block_fits_sync_join_budget(block, span) {
         span.clone()
     } else {
         render.clone()
@@ -185,7 +201,7 @@ fn block_context(
         .collect::<Vec<_>>();
     // Computed from editor state against the block's whole source range, not
     // from `ranges`/`texts` above, so a joinable block whose `context` is
-    // `render` alone (a cached `JoinedParse` above `JOIN_SYNC_LINE_BUDGET`;
+    // `render` alone (a cached `JoinedParse` or either sync budget exceeded;
     // see the branch above) still reports a caret/selection/IME range that
     // sits on one of its own off-screen physical lines instead of losing it
     // to a reconstruction that only ever saw the visible ones.
@@ -262,7 +278,7 @@ fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
         .when(display.tint == BlockTint::Muted, |element| {
             element.text_color(rgb(theme.quote_foreground))
         })
-        .when_some(surface_color(display.surface, theme), |element, color| {
+        .when_some(surface_color(display.surface), |element, color| {
             element.bg(rgb(color))
         })
 }
@@ -680,6 +696,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_byte_large_low_line_count_paragraph_does_not_sync_parse_the_whole_block() {
+        // The line-count budget alone would classify this three-line paragraph
+        // as small, but its source exceeds the byte budget. With no cached
+        // JoinedParse, presenting only the middle line must therefore stay on
+        // the bounded render-window path instead of copying and parsing the
+        // complete block synchronously. The opening/closing Strong markers are
+        // deliberately outside the visible line, so resolving Bold here would
+        // prove that the whole block was still read.
+        let half = "x".repeat(JOIN_SYNC_BYTE_BUDGET / 2 + 32);
+        let source = format!("**{half}\n{half}\nend**\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one paragraph block");
+        let span = block_line_span(editor.document(), &block).expect("block spans lines");
+        assert!(span.len() <= JOIN_SYNC_LINE_BUDGET);
+        assert!(!block_fits_sync_join_budget(&block, &span));
+
+        let visible = 1..2;
+        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
+        assert_eq!(visual.lines.len(), 1);
+        assert_eq!(visual.lines[0].line_id, 1);
+        assert!(
+            visual.lines[0]
+                .style_runs
+                .iter()
+                .all(|run| run.kind != hane_presentation::StyleKind::Bold),
+            "a byte-large block must not be whole-span parsed synchronously just because it has few lines"
+        );
+    }
+
     /// A paragraph of 100,000 lines with no blank line in it, so the whole
     /// document is one block (see `VisualBlock`'s doc in `hane_presentation`).
     fn huge_paragraph() -> String {
@@ -695,13 +742,12 @@ mod tests {
     fn a_huge_joinable_paragraph_presents_only_its_visible_window_without_a_cached_parse() {
         // Without a cached whole-span `JoinedParse`, `presented_block` must not
         // read, join and reparse this whole 100,000-line paragraph on this
-        // call: `JOIN_SYNC_LINE_BUDGET` bounds it to `visible`'s own lines
-        // instead. The Strong construct's markers sit at the very start and
-        // very end of the block, nowhere near `visible`, so this also proves
-        // the bound is actually in effect: were the whole span still read and
-        // parsed here, the construct would resolve regardless of the window,
-        // exactly as it does in the smaller `a_marker_pair_far_apart_resolves_
-        // regardless_of_the_visible_window` case above.
+        // call: the sync budgets bound it to `visible`'s own lines instead.
+        // The Strong construct's markers sit at the very start and very end of
+        // the block, nowhere near `visible`, so this also proves the bound is
+        // actually in effect: were the whole span still read and parsed here,
+        // the construct would resolve regardless of the window, exactly as it
+        // does in the smaller `a_marker_pair_far_apart_resolves_...` case above.
         let source = huge_paragraph();
         let editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
