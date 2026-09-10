@@ -67,8 +67,13 @@ jobs:
             exit 0
           fi
           checkpoint_sha="$(git rev-parse refs/remotes/origin/checkpoint/pr-102-focused)"
+          checkpoint_base="$(git show -s --format=%B "$checkpoint_sha" | sed -n 's/^Hane-Checkpoint-Base: //p' | tail -n 1)"
+          if [[ "$checkpoint_base" != "$ORIGINAL_SHA" ]]; then
+            echo "Ignoring checkpoint for base ${checkpoint_base:-unknown}; current PR head is ${ORIGINAL_SHA}."
+            exit 0
+          fi
           if ! git merge-base --is-ancestor "$ORIGINAL_SHA" "$checkpoint_sha"; then
-            echo 'Ignoring checkpoint that does not descend from the current PR head.'
+            echo 'Ignoring checkpoint that does not descend from its recorded PR head.'
             exit 0
           fi
           if ! git diff --quiet "$ORIGINAL_SHA".."$checkpoint_sha" -- .github/workflows; then
@@ -78,7 +83,7 @@ jobs:
           git checkout --detach "$checkpoint_sha"
           echo "sha=$checkpoint_sha" >> "$GITHUB_OUTPUT"
           echo 'restored=true' >> "$GITHUB_OUTPUT"
-          echo "Restored source checkpoint ${checkpoint_sha} on top of ${ORIGINAL_SHA}."
+          echo "Restored source checkpoint ${checkpoint_sha} for exact base ${ORIGINAL_SHA}."
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -99,7 +104,7 @@ jobs:
 
           FINDING 1 ONLY: Preserve Hane's viewport-bounded rendering contract for huge joinable paragraphs. A 100,000-line single paragraph must not make the UI render path synchronously read, copy, concatenate, or parse the whole paragraph on a viewport cache miss. At the same time, CommonMark emphasis / inline-code delimiters may be far outside the viewport, so correctness must come from cached/background full-block parsing or another architecture that keeps render-time source work bounded. This solution must also resolve the earlier review concern that arbitrary fixed context windows change rendering based on scroll position.
 
-          IMPORTANT: A checkpoint from an earlier interrupted run may already be present. Inspect `git diff` before investigating. Preserve useful existing work and continue from it; do not restart a solved part from scratch.
+          IMPORTANT: A checkpoint from an earlier interrupted run may already be present. Inspect `git diff` and `git log -3` before investigating. Preserve useful existing work and continue from it; do not restart a solved part from scratch.
 
           Work rules:
           - Read AGENTS.md, then inspect only the code directly needed for this finding.
@@ -107,7 +112,7 @@ jobs:
           - Add focused regression coverage for this finding, including a huge single-paragraph viewport-bounded case.
           - Do NOT work on disclosure-cache consistency or standalone-image continuity yet unless a tiny compile-enabling adjustment is unavoidable.
           - Do NOT run the whole workspace test suite; use only narrowly relevant tests while implementing. Final validation is a later workflow step.
-          - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
+          - Do NOT modify .github/workflows and do not merge.
           - Stop once FINDING 1 and its focused tests are complete. Do not keep exploring unrelated improvements.
           EOF
           claude -p --max-turns 160 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-1.txt"
@@ -117,7 +122,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
           ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
@@ -125,21 +129,34 @@ jobs:
           mkdir -p "$checkpoint_dir"
           git status --porcelain=v1 > "$checkpoint_dir/status.txt"
           git rev-parse HEAD > "$checkpoint_dir/head.txt"
+          printf '%s\n' "$ORIGINAL_SHA" > "$checkpoint_dir/base.txt"
           git diff --binary "$ORIGINAL_SHA" > "$checkpoint_dir/source.patch"
           git ls-files --others --exclude-standard -z > "$checkpoint_dir/untracked.zlist"
           if [[ -s "$checkpoint_dir/untracked.zlist" ]]; then
             tar --null -T "$checkpoint_dir/untracked.zlist" -czf "$checkpoint_dir/untracked.tar.gz"
           fi
+          dirty="$(git status --porcelain=v1)"
+          head_sha="$(git rev-parse HEAD)"
           if git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD \
             && git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
             && git diff --quiet -- .github/workflows \
             && git diff --cached --quiet -- .github/workflows \
             && [[ -z "$(git ls-files --others --exclude-standard -- .github/workflows)" ]] \
-            && [[ -n "$(git status --porcelain=v1)" ]]; then
+            && { [[ "$head_sha" != "$ORIGINAL_SHA" ]] || [[ -n "$dirty" ]]; }; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -A
-            git commit -m 'checkpoint: PR 102 focused repair 1' >/dev/null || true
+            if [[ -n "$dirty" ]]; then
+              git add -A
+              git commit -m "checkpoint: PR 102 focused repair 1
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 1" >/dev/null || true
+            else
+              git commit --allow-empty -m "checkpoint: PR 102 focused repair 1
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 1" >/dev/null
+            fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
           fi
@@ -163,7 +180,7 @@ jobs:
           cat > "$RUNNER_TEMP/focused-2.txt" <<'EOF'
           Continue Hane PR #102 in the EXISTING working tree. Solve exactly ONE reviewer finding in this invocation.
 
-          First inspect `git diff` and the existing checkpointed changes. Do not restart or redesign FINDING 1.
+          First inspect `git diff` and `git log -3` to understand the existing checkpointed changes. Do not restart or redesign FINDING 1.
 
           FINDING 2 ONLY: Make shared multi-line disclosure semantics exactly consistent with `EditorView::disclosures_are_current`, so placing the caret / selection / IME inside an active multi-line paragraph does not invalidate and rebuild the presentation/layout cache every frame. Preserve correct progressive disclosure across markers that span physical lines.
 
@@ -173,7 +190,7 @@ jobs:
           - Do NOT revisit the huge-paragraph architecture except for a tiny compile-enabling fix if required.
           - Do NOT work on standalone-image continuity yet.
           - Do NOT run broad workspace tests; run only focused tests needed for this finding.
-          - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
+          - Do NOT modify .github/workflows and do not merge.
           - Stop once FINDING 2 and its focused tests are complete.
           EOF
           claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-2.txt"
@@ -183,7 +200,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
           ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
@@ -191,21 +207,34 @@ jobs:
           mkdir -p "$checkpoint_dir"
           git status --porcelain=v1 > "$checkpoint_dir/status.txt"
           git rev-parse HEAD > "$checkpoint_dir/head.txt"
+          printf '%s\n' "$ORIGINAL_SHA" > "$checkpoint_dir/base.txt"
           git diff --binary "$ORIGINAL_SHA" > "$checkpoint_dir/source.patch"
           git ls-files --others --exclude-standard -z > "$checkpoint_dir/untracked.zlist"
           if [[ -s "$checkpoint_dir/untracked.zlist" ]]; then
             tar --null -T "$checkpoint_dir/untracked.zlist" -czf "$checkpoint_dir/untracked.tar.gz"
           fi
+          dirty="$(git status --porcelain=v1)"
+          head_sha="$(git rev-parse HEAD)"
           if git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD \
             && git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
             && git diff --quiet -- .github/workflows \
             && git diff --cached --quiet -- .github/workflows \
             && [[ -z "$(git ls-files --others --exclude-standard -- .github/workflows)" ]] \
-            && [[ -n "$(git status --porcelain=v1)" ]]; then
+            && { [[ "$head_sha" != "$ORIGINAL_SHA" ]] || [[ -n "$dirty" ]]; }; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -A
-            git commit -m 'checkpoint: PR 102 focused repair 2' >/dev/null || true
+            if [[ -n "$dirty" ]]; then
+              git add -A
+              git commit -m "checkpoint: PR 102 focused repair 2
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 2" >/dev/null || true
+            else
+              git commit --allow-empty -m "checkpoint: PR 102 focused repair 2
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 2" >/dev/null
+            fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
           fi
@@ -229,7 +258,7 @@ jobs:
           cat > "$RUNNER_TEMP/focused-3.txt" <<'EOF'
           Continue Hane PR #102 in the EXISTING working tree. Solve exactly ONE reviewer finding in this invocation.
 
-          First inspect `git diff` and the existing checkpointed changes. Do not restart or redesign FINDING 1 or FINDING 2.
+          First inspect `git diff` and `git log -3` to understand the existing checkpointed changes. Do not restart or redesign FINDING 1 or FINDING 2.
 
           FINDING 3 ONLY: A standalone Markdown image physical line inside one paragraph must NOT split the paragraph's shared CommonMark inline parse context. Delimiters opened before the image and closed after it must still resolve correctly. The image line itself must continue to render through Hane's dedicated image presentation path when inactive.
 
@@ -238,7 +267,7 @@ jobs:
           - Make the smallest correct change and add an explicit regression test with an image line between distant delimiters.
           - Do NOT revisit the other two findings except for a tiny compile-enabling fix if required.
           - Do NOT run broad workspace tests; run only focused tests needed for this finding.
-          - Do NOT modify .github/workflows, do not merge, and leave changes uncommitted.
+          - Do NOT modify .github/workflows and do not merge.
           - Stop once FINDING 3 and its focused tests are complete.
           EOF
           claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-3.txt"
@@ -248,7 +277,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
           ORIGINAL_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set +e
@@ -256,21 +284,34 @@ jobs:
           mkdir -p "$checkpoint_dir"
           git status --porcelain=v1 > "$checkpoint_dir/status.txt"
           git rev-parse HEAD > "$checkpoint_dir/head.txt"
+          printf '%s\n' "$ORIGINAL_SHA" > "$checkpoint_dir/base.txt"
           git diff --binary "$ORIGINAL_SHA" > "$checkpoint_dir/source.patch"
           git ls-files --others --exclude-standard -z > "$checkpoint_dir/untracked.zlist"
           if [[ -s "$checkpoint_dir/untracked.zlist" ]]; then
             tar --null -T "$checkpoint_dir/untracked.zlist" -czf "$checkpoint_dir/untracked.tar.gz"
           fi
+          dirty="$(git status --porcelain=v1)"
+          head_sha="$(git rev-parse HEAD)"
           if git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD \
             && git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
             && git diff --quiet -- .github/workflows \
             && git diff --cached --quiet -- .github/workflows \
             && [[ -z "$(git ls-files --others --exclude-standard -- .github/workflows)" ]] \
-            && [[ -n "$(git status --porcelain=v1)" ]]; then
+            && { [[ "$head_sha" != "$ORIGINAL_SHA" ]] || [[ -n "$dirty" ]]; }; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add -A
-            git commit -m 'checkpoint: PR 102 focused repair 3' >/dev/null || true
+            if [[ -n "$dirty" ]]; then
+              git add -A
+              git commit -m "checkpoint: PR 102 focused repair 3
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 3" >/dev/null || true
+            else
+              git commit --allow-empty -m "checkpoint: PR 102 focused repair 3
+
+Hane-Checkpoint-Base: ${ORIGINAL_SHA}
+Hane-Checkpoint-Finding: 3" >/dev/null
+            fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
           fi
