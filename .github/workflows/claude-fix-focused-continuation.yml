@@ -118,7 +118,7 @@ jobs:
           claude -p --max-turns 160 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-1.txt"
 
       - name: Save checkpoint after repair 1
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair1.outcome != 'skipped' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -161,7 +161,7 @@ jobs:
           exit 0
 
       - name: Upload checkpoint after repair 1
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair1.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-102-focused-checkpoint-1-${{ github.run_id }}
@@ -194,7 +194,7 @@ jobs:
           claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-2.txt"
 
       - name: Save checkpoint after repair 2
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair2.outcome != 'skipped' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -237,7 +237,7 @@ jobs:
           exit 0
 
       - name: Upload checkpoint after repair 2
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair2.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-102-focused-checkpoint-2-${{ github.run_id }}
@@ -269,7 +269,7 @@ jobs:
           claude -p --max-turns 100 --permission-mode bypassPermissions < "$RUNNER_TEMP/focused-3.txt"
 
       - name: Save checkpoint after repair 3
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair3.outcome != 'skipped' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -312,7 +312,7 @@ jobs:
           exit 0
 
       - name: Upload checkpoint after repair 3
-        if: ${{ always() && !cancelled() }}
+        if: ${{ always() && !cancelled() && steps.repair3.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-102-focused-checkpoint-3-${{ github.run_id }}
