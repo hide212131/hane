@@ -89,7 +89,7 @@ jobs:
           set -e
 
           if [[ "$status" -ne 0 ]]; then
-            if ! grep -q 'Reached max turns' "$RUNNER_TEMP/focused-pass1.log"; then
+            if ! grep -Eq 'Reached (max|maximum number of) turns' "$RUNNER_TEMP/focused-pass1.log"; then
               echo "::error::Claude failed for a reason other than max-turn exhaustion."
               exit "$status"
             fi
