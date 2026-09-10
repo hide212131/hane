@@ -1002,6 +1002,20 @@ fn marker_is_disclosed(
     let Some(disclosure) = disclosure else {
         return false;
     };
+    // Continuation prefixes belong to their quote even when their source start
+    // differs from the block's start. Consult the parser's ownership metadata:
+    // enclosing a marker by range alone would also disclose inactive child
+    // inline constructs (and prefixes of nested quotes).
+    if let Some((_, owner)) = parsed
+        .quote_markers
+        .iter()
+        .find(|(range, _)| *range == marker)
+    {
+        return parsed
+            .tree
+            .node(*owner)
+            .is_some_and(|quote| range_touches(quote.source_range, disclosure));
+    }
     range_touches(marker, disclosure)
         || parsed
             .tree
@@ -1015,7 +1029,12 @@ fn marker_is_disclosed(
         || parsed
             .tree
             .blocks()
-            .filter(|(_, node)| syntax_display(node.kind).node_block.is_some())
+            .filter(|(_, node)| {
+                matches!(
+                    node.kind,
+                    NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
+                )
+            })
             .any(|(_, block)| {
                 marker.start == block.source_range.start
                     && marker.end <= block.source_range.end
@@ -2286,6 +2305,83 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn quote_disclosure_does_not_expand_inactive_nested_quote_or_inline_markers() {
+        let source = "> outer\n> > **nested**";
+        let start = 40;
+        let visual = present_markdown_with_disclosure(
+            0,
+            Revision(1),
+            SourceRange::new(start, start + source.len()),
+            source,
+            26.0,
+            Some(SourceRange::empty(start + 4)),
+        );
+        assert_eq!(visual.visual_text, "> outer\n> nested");
+    }
+
+    #[test]
+    fn quote_disclosure_uses_prefix_ownership_across_viewports() {
+        let texts = ["> **first**\n", "> second"];
+        let start = 50;
+        let split = start + texts[0].len();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: SourceRange::new(start, split),
+                text: texts[0],
+                disclosure: None,
+            },
+            BlockLine {
+                line: 1,
+                range: SourceRange::new(split, split + texts[1].len()),
+                text: texts[1],
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Quote,
+            source_range: SourceRange::new(start, lines[1].range.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+        // Empty ranges represent carets; non-empty ranges also cover selection
+        // and IME disclosure. Neither should disclose the inactive strong span.
+        for disclosure in [
+            SourceRange::empty(split + 4),
+            SourceRange::new(split + 3, split + 6),
+        ] {
+            let wide_window = BlockWindow {
+                span: 0..2,
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 0..2,
+                joined: Some(&joined),
+                block_disclosure: Some(disclosure),
+            };
+            let wide = present_block(&block, Revision(1), &wide_window, 26.0);
+            assert_eq!(wide.lines[0].visual_text, "> first");
+            assert_eq!(wide.lines[1].visual_text, "> second");
+            for index in 0..2 {
+                let narrow_window = BlockWindow {
+                    lines: &lines[index..index + 1],
+                    render: index..index + 1,
+                    ..wide_window.clone()
+                };
+                let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+                assert_eq!(narrow.lines[0].visual_text, wide.lines[index].visual_text);
+                assert_eq!(
+                    narrow.lines[0].source_map.segments,
+                    wide.lines[index].source_map.segments
+                );
+            }
+        }
     }
 
     #[test]

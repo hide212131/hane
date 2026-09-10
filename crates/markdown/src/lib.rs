@@ -224,6 +224,10 @@ pub struct MarkdownParse {
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
     pub markers: Vec<SourceRange>,
+    /// Quote prefixes paired with their owning quote node. Continuation-line
+    /// prefixes cannot be associated with an owner by comparing source starts.
+    /// Kept before range merging so nested, adjacent prefixes retain ownership.
+    pub quote_markers: Vec<(SourceRange, NodeId)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,12 +553,18 @@ fn quote_markers(
     markers
 }
 
+struct DerivedMarkers {
+    markers: Vec<SourceRange>,
+    quote_markers: Vec<(SourceRange, NodeId)>,
+}
+
 /// Derives marker source ranges by lexing only inside the source ranges that
 /// pulldown-cmark already attributed to each node. The event ranges stay
 /// authoritative; this only recovers open/close delimiter positions that the
 /// event stream does not expose. Returned ranges are sorted and merged.
-fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
+fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
+    let mut quote_owners = Vec::new();
     for (id, block) in tree.blocks() {
         let relative = block.source_range.start.0.saturating_sub(range.start.0);
         let tail = source.get(relative..).unwrap_or_default();
@@ -574,7 +584,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
                 }
             }
             NodeKind::Quote => {
-                markers.extend(quote_markers(tree, id, range, source));
+                for marker in quote_markers(tree, id, range, source) {
+                    markers.push(marker);
+                    quote_owners.push((marker, id));
+                }
             }
             NodeKind::ListItem { .. } => {
                 let prefix = tail
@@ -673,7 +686,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
             merged.push(marker);
         }
     }
-    merged
+    DerivedMarkers {
+        markers: merged,
+        quote_markers: quote_owners,
+    }
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -814,7 +830,8 @@ pub fn parse_document(
         revision,
         source_range,
         tree,
-        markers,
+        markers: markers.markers,
+        quote_markers: markers.quote_markers,
     }
 }
 
