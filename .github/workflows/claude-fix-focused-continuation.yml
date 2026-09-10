@@ -177,19 +177,34 @@ jobs:
           HEAD_REF: ${{ steps.target.outputs.ref }}
         run: |
           set -euo pipefail
-          changed="$(git status --porcelain=v1 | cut -c4-)"
-          if [[ -z "$changed" ]]; then
-            echo '::error::Focused repair completed without producing a change.'
+
+          # Claude is instructed not to commit, but treat that as an advisory
+          # constraint. Any commit it creates must still descend from the exact
+          # reviewed head, and workflow files must be unchanged across the full
+          # ORIGINAL_SHA..HEAD history as well as index/worktree/untracked state.
+          if ! git merge-base --is-ancestor "$ORIGINAL_SHA" HEAD; then
+            echo '::error::Focused repair changed history away from the reviewed PR head.'
             exit 1
           fi
-
-          # Reject every workflow-tree mutation, including modifications,
-          # staged changes, new files, deletions, and renames whose source OR
-          # destination is under .github/workflows.
-          if ! git diff --quiet -- .github/workflows \
+          if ! git diff --quiet "$ORIGINAL_SHA"..HEAD -- .github/workflows \
+            || ! git diff --quiet -- .github/workflows \
             || ! git diff --cached --quiet -- .github/workflows \
             || [[ -n "$(git ls-files --others --exclude-standard -- .github/workflows)" ]]; then
             echo '::error::Focused repair attempted to change workflow files.'
+            exit 1
+          fi
+
+          # The workflow, not Claude, owns the pushed commit. If an invocation
+          # committed ordinary source changes anyway, fold them back into the
+          # index without losing its work so the final push remains one guarded
+          # commit rooted at ORIGINAL_SHA.
+          if [[ "$(git rev-parse HEAD)" != "$ORIGINAL_SHA" ]]; then
+            git reset --soft "$ORIGINAL_SHA"
+          fi
+
+          changed="$(git status --porcelain=v1)"
+          if [[ -z "$changed" ]]; then
+            echo '::error::Focused repair completed without producing a change.'
             exit 1
           fi
 
