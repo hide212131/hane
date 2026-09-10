@@ -15,11 +15,11 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{IndexedBlock, NodeKind};
+use hane_markdown::IndexedBlock;
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset, block_line_span,
-    present_block, trailing_blank_lines,
+    InlineDisplay, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset, block_is_joinable,
+    block_line_span, present_block, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -28,24 +28,19 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
 
-/// How far a joined paragraph's inline parse may reach past the drawn window to
-/// find a marker's other half — see [`present_block`]'s `render`/`lines` split.
-/// Bounded so a document with no blank line in it, which tiles into one
-/// arbitrarily large paragraph block, cannot force reading the whole document
-/// just to draw a handful of on-screen lines.
-const JOIN_CONTEXT_LINES: usize = 200;
-
 /// Presents the lines of one indexed Markdown block that reach `visible`.
 ///
 /// A block is not bounded — a document without a blank line in it is a single
 /// paragraph — so only the lines inside the visible window are drawn; the rest
-/// are counted and stand in as space. For a paragraph, the source fetched for
-/// parsing reaches up to [`JOIN_CONTEXT_LINES`] beyond `visible` on either side
-/// (still clipped to the block), because CommonMark resolves `**`/`_`/`` ` ``
-/// across the whole paragraph and a marker whose other half falls outside what
-/// was read cannot be recognized. Which lines are literal code or table syntax
-/// is decided in presentation, from the block kind; this crate never inspects
-/// the source for fences or pipes.
+/// are counted and stand in as space. For a joinable block (see
+/// [`block_is_joinable`]) the source fetched for parsing is the block's whole
+/// span, not just `visible`, because CommonMark resolves `**`/`_`/`` ` `` across
+/// the whole paragraph and a marker whose other half falls outside what was
+/// read cannot be recognized — a fixed window around `visible` would still miss
+/// a match that falls further away, and the same construct would render
+/// differently depending on scroll position. Which lines are literal code or
+/// table syntax is decided in presentation, from the block kind; this crate
+/// never inspects the source for fences or pipes.
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
@@ -54,9 +49,8 @@ pub(crate) fn presented_block(
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let context = if block.kind == NodeKind::Paragraph {
-        span.start.max(render.start.saturating_sub(JOIN_CONTEXT_LINES))
-            ..span.end.min(render.end.saturating_add(JOIN_CONTEXT_LINES))
+    let context = if block_is_joinable(block.kind) {
+        span.clone()
     } else {
         render.clone()
     };
@@ -544,5 +538,36 @@ mod tests {
         assert!(inline_display_for(&(bold..bold + "bold".len()), &block.style_runs).bold);
         let italic = block.visual_text.find("italic").unwrap();
         assert!(inline_display_for(&(italic..italic + "italic".len()), &block.style_runs).italic);
+    }
+
+    #[test]
+    fn a_marker_pair_far_apart_resolves_regardless_of_the_visible_window() {
+        // A blank-line-free paragraph long enough that a fixed-radius join
+        // window around the scrolled viewport would miss one side of this
+        // Strong construct entirely: the closing marker is written more than
+        // 200 lines below the opening one, and neither is inside `visible`.
+        let mut source = String::from("**bold\n");
+        for line in 0..300 {
+            source.push_str(&format!("filler line {line}\n"));
+        }
+        source.push_str("end**\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one paragraph block");
+        let visible = 150..155;
+        let visual = presented_block(&editor, &block, &visible).expect("block presents");
+        let rendered = visual
+            .lines
+            .iter()
+            .find(|line| line.line_id as usize == 152)
+            .expect("line inside the visible window is presented");
+        assert!(
+            rendered
+                .style_runs
+                .iter()
+                .any(|run| run.kind == hane_presentation::StyleKind::Bold),
+            "the Strong construct must resolve even though both its markers sit \
+             outside a fixed-radius window around the scrolled viewport"
+        );
     }
 }

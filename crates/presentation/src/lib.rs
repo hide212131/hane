@@ -343,6 +343,23 @@ pub const fn block_line_context(kind: NodeKind) -> LineContext {
     syntax_display(kind).line_context
 }
 
+/// True when a top-level block's contiguous plain-text lines are parsed
+/// together (`present_joined_run`) instead of one physical line at a time, so
+/// CommonMark inline constructs — `**`/`_`/`` ` `` — that cross a soft line
+/// break resolve the way a single whole-paragraph parse would.
+///
+/// A blockquote's or a list item's paragraph content presents
+/// `LineContext::Normal` the same as a top-level paragraph, and its inline
+/// content joins the same way; marker derivation gives every quoted physical
+/// line its own `> ` marker so joining does not lose it, and a list item's own
+/// bullet is already scoped to the one line it starts on. The caller that
+/// supplies parsing context for a joined block (see [`BlockWindow::lines`])
+/// must reach this same set of kinds, or a marker whose match lies outside the
+/// render window will not resolve.
+pub const fn block_is_joinable(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::Paragraph | NodeKind::Quote | NodeKind::List { .. })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlockKind {
     #[default]
@@ -747,14 +764,7 @@ pub fn present_block(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
-    // A standalone paragraph's continuation lines are one run of inline content,
-    // so its emphasis, strong emphasis and code spans are parsed together
-    // (`present_joined_run`) rather than one physical line at a time. A list
-    // item or a blockquote also presents `LineContext::Normal`, but joining
-    // there would also have to re-derive their per-line bullet/`> ` markers,
-    // which is out of this construct's scope, so only a top-level paragraph
-    // qualifies.
-    let joinable = block.kind == NodeKind::Paragraph;
+    let joinable = block_is_joinable(block.kind);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     let mut index = 0;
     while index < window.lines.len() {
@@ -1286,6 +1296,22 @@ fn is_plain_text_line(line: BlockLine<'_>) -> bool {
         .is_none()
 }
 
+/// Union of every line's own disclosure in a joined run, so a shared construct
+/// that spans more than one physical line discloses consistently on every line
+/// that carries one of its markers, not only the line the caret/selection/IME
+/// happens to sit on. Reconstructs the original caret point or selection/IME
+/// extent: each line's own disclosure is already that extent clipped to the
+/// line, so the union of all of them is the extent itself.
+fn merged_disclosure(lines: &[BlockLine<'_>]) -> Option<SourceRange> {
+    lines
+        .iter()
+        .filter_map(|line| line.disclosure)
+        .reduce(|a, b| SourceRange {
+            start: a.start.min(b.start),
+            end: a.end.max(b.end),
+        })
+}
+
 /// Presents a run of a standalone paragraph's contiguous physical lines from
 /// one shared parse of their joined source, so emphasis, strong emphasis and
 /// code spans that cross a physical line boundary resolve the way a single
@@ -1305,6 +1331,12 @@ fn present_joined_run(
         whole_source: &joined_source,
         parsed: &parsed,
     };
+    // A single active disclosure (caret, selection or IME) may touch a shared
+    // construct whose markers live on different physical lines; `marker_is_disclosed`
+    // only expands a marker whose enclosing span reaches the disclosure it is
+    // given, so every line of the run is offered the same, run-wide disclosure
+    // rather than only the one line that literally owns the caret.
+    let disclosure = merged_disclosure(lines);
     for line in lines {
         if !render.contains(&line.line) {
             continue;
@@ -1315,7 +1347,7 @@ fn present_joined_run(
             line.range,
             line.text,
             line_height,
-            line.disclosure,
+            disclosure,
             &shared,
         );
         presented.context = LineContext::Normal;
@@ -1995,6 +2027,58 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn disclosure_on_one_line_of_a_shared_construct_reaches_every_line_that_carries_it() {
+        // A caret on the line that owns a shared Strong's opening `**` must also
+        // expand the closing `**` on the other physical line: the two markers
+        // belong to one active construct, so a partial disclosure would show one
+        // marker and hide the other for the same bold run.
+        let line0 = "This is **bold\n";
+        let line1 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + line1.len());
+        let caret = range0.start.0 + line0.find("bold").unwrap();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: Some(SourceRange::empty(caret)),
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: line1,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range1.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..2,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        let closing_marker = range1.start.0 + line1.find("**").unwrap();
+        assert!(
+            visual.lines[1].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker on the line without its own disclosure must still expand"
+        );
     }
 
     #[test]

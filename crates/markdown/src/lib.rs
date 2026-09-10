@@ -415,11 +415,21 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
                 }
             }
             NodeKind::Quote => {
-                if tail.starts_with("> ") {
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0,
-                        block.source_range.start.0 + 2,
-                    ));
+                // CommonMark repeats the `> ` prefix on every quoted physical
+                // line, not only the block's first, so a multi-line quote
+                // parsed as one shared slice (`present_joined_run`) needs a
+                // marker per line to hide each one.
+                let end_relative = block.source_range.end.0.saturating_sub(range.start.0);
+                let body = tail.get(..end_relative - relative).unwrap_or(tail);
+                let mut offset = relative;
+                for line in body.split_inclusive('\n') {
+                    if line.starts_with("> ") {
+                        markers.push(SourceRange::new(
+                            range.start.0 + offset,
+                            range.start.0 + offset + 2,
+                        ));
+                    }
+                    offset += line.len();
                 }
             }
             NodeKind::ListItem { .. } => {

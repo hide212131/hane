@@ -59,9 +59,10 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "multi-line quote",
         source: "> first\n> second",
         tree_paths: &[&[NodeKind::Quote, NodeKind::Paragraph, NodeKind::Text]],
-        // One quote node spans both lines, so the whole-document parse derives a
-        // single prefix; the per-line presentation below hides both.
-        markers: &["> "],
+        // One quote node spans both lines; the whole-document parse derives a
+        // prefix marker for each so the shared multi-line parse in
+        // `present_joined_run` can hide both.
+        markers: &["> ", "> "],
         block_kinds: &[BlockKind::Quote, BlockKind::Quote],
         visual_lines: &["first", "second"],
     },
@@ -131,6 +132,31 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["`", "`"],
         block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
         visual_lines: &["See code", "across lines"],
+    },
+    MarkdownFixture {
+        name: "strong emphasis spanning a soft line break inside a list item",
+        // A list item's paragraph content joins across physical lines the same
+        // way a top-level paragraph does; the bullet stays a per-line marker.
+        source: "- **bold\n  across**",
+        tree_paths: &[&[
+            NodeKind::List { ordered: false },
+            NodeKind::ListItem { task: None },
+            NodeKind::Strong,
+        ]],
+        markers: &["- ", "**", "**"],
+        block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
+        visual_lines: &["bold", "  across"],
+    },
+    MarkdownFixture {
+        name: "strong emphasis spanning a soft line break inside a quote",
+        // Every quoted physical line carries its own `> ` marker (see
+        // `derive_markers`), so joining the quote's paragraph across lines does
+        // not lose either line's prefix.
+        source: "> **bold\n> across**",
+        tree_paths: &[&[NodeKind::Quote, NodeKind::Paragraph, NodeKind::Strong]],
+        markers: &["> ", "**", "> ", "**"],
+        block_kinds: &[BlockKind::Quote, BlockKind::Quote],
+        visual_lines: &["bold", "across"],
     },
     MarkdownFixture {
         name: "nested strong and emphasis",
