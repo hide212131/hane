@@ -147,15 +147,13 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             if [[ -n "$dirty" ]]; then
               git add -A
-              git commit -m "checkpoint: PR 102 focused repair 1
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 1" >/dev/null || true
+              git commit -m 'checkpoint: PR 102 focused repair 1' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 1' >/dev/null || true
             else
-              git commit --allow-empty -m "checkpoint: PR 102 focused repair 1
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 1" >/dev/null
+              git commit --allow-empty -m 'checkpoint: PR 102 focused repair 1' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 1' >/dev/null
             fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
@@ -225,15 +223,13 @@ Hane-Checkpoint-Finding: 1" >/dev/null
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             if [[ -n "$dirty" ]]; then
               git add -A
-              git commit -m "checkpoint: PR 102 focused repair 2
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 2" >/dev/null || true
+              git commit -m 'checkpoint: PR 102 focused repair 2' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 2' >/dev/null || true
             else
-              git commit --allow-empty -m "checkpoint: PR 102 focused repair 2
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 2" >/dev/null
+              git commit --allow-empty -m 'checkpoint: PR 102 focused repair 2' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 2' >/dev/null
             fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
@@ -302,15 +298,13 @@ Hane-Checkpoint-Finding: 2" >/dev/null
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             if [[ -n "$dirty" ]]; then
               git add -A
-              git commit -m "checkpoint: PR 102 focused repair 3
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 3" >/dev/null || true
+              git commit -m 'checkpoint: PR 102 focused repair 3' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 3' >/dev/null || true
             else
-              git commit --allow-empty -m "checkpoint: PR 102 focused repair 3
-
-Hane-Checkpoint-Base: ${ORIGINAL_SHA}
-Hane-Checkpoint-Finding: 3" >/dev/null
+              git commit --allow-empty -m 'checkpoint: PR 102 focused repair 3' \
+                -m "Hane-Checkpoint-Base: ${ORIGINAL_SHA}" \
+                -m 'Hane-Checkpoint-Finding: 3' >/dev/null
             fi
             gh auth setup-git
             git push --force origin HEAD:refs/heads/checkpoint/pr-102-focused || true
