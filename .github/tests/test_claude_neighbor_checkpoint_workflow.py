@@ -19,13 +19,21 @@ def test_neighbor_worker_is_single_finding_and_checkpointed():
 
 
 def test_failed_paid_invocation_still_reaches_checkpoint_steps():
-    save = "if: ${{ always() && !cancelled() && steps.repair.outcome != 'skipped' }}"
-    assert WORKFLOW.count(save) == 2
-    assert "git diff --binary \"$ORIGINAL_SHA\"" in WORKFLOW
+    checkpoint_condition = (
+        "if: ${{ always() && !cancelled() "
+        "&& steps.repair.outcome != 'skipped' }}"
+    )
+    assert WORKFLOW.count(checkpoint_condition) == 2
+    assert 'git diff --binary "$ORIGINAL_SHA"' in WORKFLOW
     assert "actions/upload-artifact@v4" in WORKFLOW
 
 
 def test_restore_is_bound_to_exact_head_and_finding():
-    assert '[[ "$checkpoint_base" != "$ORIGINAL_SHA"' in WORKFLOW
+    assert '"$checkpoint_base" != "$ORIGINAL_SHA"' in WORKFLOW
     assert '"$checkpoint_finding" != \'neighbor-row-target\'' in WORKFLOW
     assert 'git merge-base --is-ancestor "$ORIGINAL_SHA" "$checkpoint_sha"' in WORKFLOW
+
+
+def test_final_push_refuses_to_overwrite_a_moved_pr():
+    assert 'if [[ "$current_sha" != "$ORIGINAL_SHA" ]]' in WORKFLOW
+    assert "refusing to push over newer work" in WORKFLOW
