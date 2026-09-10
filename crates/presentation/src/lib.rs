@@ -357,7 +357,10 @@ pub const fn block_line_context(kind: NodeKind) -> LineContext {
 /// must reach this same set of kinds, or a marker whose match lies outside the
 /// render window will not resolve.
 pub const fn block_is_joinable(kind: NodeKind) -> bool {
-    matches!(kind, NodeKind::Paragraph | NodeKind::Quote | NodeKind::List { .. })
+    matches!(
+        kind,
+        NodeKind::Paragraph | NodeKind::Quote | NodeKind::List { .. }
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -735,12 +738,23 @@ pub struct BlockWindow<'a> {
     /// whole paragraph, not just the lines that happen to be drawn; a marker
     /// whose other half sits outside `lines` still cannot be recognized, so
     /// the caller should give enough of the paragraph to close every marker
-    /// that opens inside `render`.
+    /// that opens inside `render` — unless `joined` already supplies that
+    /// context, in which case `lines` only needs to cover `render`.
     pub lines: &'a [BlockLine<'a>],
     /// The subset of `lines` (by document line number) to actually turn into
     /// presented [`VisualLine`]s. Lines in `lines` outside this range are
     /// parsing context only and are not drawn.
     pub render: Range<usize>,
+    /// A joinable block's whole-span parse, already computed. When present,
+    /// a joined run is presented against this instead of rejoining and
+    /// reparsing `lines`, so a caller that keeps this cached across
+    /// presentation calls (see [`parse_joined_span`]) can hand `render`'s own
+    /// lines alone as `lines` — a viewport miss on an already-parsed block
+    /// then costs proportionally to what is drawn, not to the whole block,
+    /// while still resolving a marker pair arbitrarily far apart the way a
+    /// single whole-paragraph parse would, regardless of where the viewport
+    /// happens to sit.
+    pub joined: Option<&'a JoinedParse>,
 }
 
 /// Display kind for a whole block. The syntax-display table distinguishes a
@@ -764,55 +778,41 @@ pub fn present_block(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
-    let joinable = block_is_joinable(block.kind);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
-    let mut index = 0;
-    while index < window.lines.len() {
-        let line = window.lines[index];
+    for run in disclosure_runs(block.kind, window) {
+        if run.len() > 1 {
+            present_joined_run(
+                &window.lines[run.clone()],
+                revision,
+                line_height,
+                &window.render,
+                window.joined,
+                &mut lines,
+            );
+            continue;
+        }
+        let line = window.lines[run.start];
+        if !window.render.contains(&line.line) {
+            continue;
+        }
         let line_context = if line.line < content_end {
             context
         } else {
             LineContext::Normal
         };
-        let mut run_end = index + 1;
-        if joinable && line_context == LineContext::Normal && is_plain_text_line(line) {
-            while run_end < window.lines.len() {
-                let next = window.lines[run_end];
-                let next_context = if next.line < content_end {
-                    context
-                } else {
-                    LineContext::Normal
-                };
-                if next_context != LineContext::Normal || !is_plain_text_line(next) {
-                    break;
-                }
-                run_end += 1;
-            }
+        let mut presented = present_polished_line(
+            line.line as u64,
+            revision,
+            line.range,
+            line.text,
+            line_height,
+            line.disclosure,
+            line_context,
+        );
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
         }
-        if run_end - index > 1 {
-            present_joined_run(
-                &window.lines[index..run_end],
-                revision,
-                line_height,
-                &window.render,
-                &mut lines,
-            );
-        } else if window.render.contains(&line.line) {
-            let mut presented = present_polished_line(
-                line.line as u64,
-                revision,
-                line.range,
-                line.text,
-                line_height,
-                line.disclosure,
-                line_context,
-            );
-            while presented.visual_text.ends_with(['\r', '\n']) {
-                presented.visual_text.pop();
-            }
-            lines.push(presented);
-        }
-        index = run_end;
+        lines.push(presented);
     }
     let lines_before = lines.first().map_or(0, |line| {
         (line.line_id as usize).saturating_sub(window.span.start)
@@ -1281,19 +1281,122 @@ fn code_span_padding(parsed: &MarkdownParse, whole_source: &str) -> Vec<SourceRa
         .collect()
 }
 
-/// True for a line [`present_block`] may fold into a joined multi-line parse:
-/// ordinary paragraph text, as opposed to a standalone image line that
-/// [`present_polished_line`] presents on its own. Matches the condition that
-/// function uses to choose `present_image` over `present_markdown_with_disclosure`,
-/// so a line grouped by this check is exactly one that would have gone through
-/// the shared parse anyway.
-fn is_plain_text_line(line: BlockLine<'_>) -> bool {
-    parse_standalone_image(line.text)
-        .filter(|_| {
-            line.disclosure
-                .is_none_or(|active| !range_touches(line.range, active))
-        })
-        .is_none()
+/// The standalone image `source` presents as, when nothing currently discloses
+/// it. Shared by [`present_polished_line`]'s own single-line dispatch and
+/// [`present_joined_run`]'s per-line dispatch inside a joined multi-line run,
+/// so both agree on exactly which physical lines render through
+/// [`present_image`] rather than the shared/self-contained markdown parse —
+/// an image line's disclosure state is its own, not the run-wide merged one a
+/// joined run otherwise shares (see [`merged_disclosure`]), since only a
+/// disclosure that actually touches this line's own range should reveal its
+/// raw markup.
+fn inactive_standalone_image<'a>(
+    source: &'a str,
+    range: SourceRange,
+    disclosure: Option<SourceRange>,
+) -> Option<StandaloneImage<'a>> {
+    parse_standalone_image(source)
+        .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
+}
+
+/// Groups `window.lines` into the runs [`present_block`] presents from: a run
+/// of two or more contiguous lines in a joinable block's normal flow, sharing
+/// one whole-paragraph parse and one run-wide merged disclosure (see
+/// [`merged_disclosure`]), or a single line presented and disclosed on its
+/// own. Returns index ranges into `window.lines`, in order. Needs no parse,
+/// so [`expected_disclosures`] can reuse the exact same grouping
+/// [`present_block`] itself derives without doing the whole-paragraph parse
+/// that grouping feeds into.
+///
+/// A standalone image line stays inside its run rather than splitting it: a
+/// delimiter pair CommonMark resolves across the whole paragraph (see
+/// [`present_joined_run`]) must still close correctly when an image line sits
+/// between the two halves, even though that image line itself renders through
+/// [`present_image`] rather than the shared parse (see
+/// [`inactive_standalone_image`]).
+fn disclosure_runs(block_kind: NodeKind, window: &BlockWindow<'_>) -> Vec<Range<usize>> {
+    let context = block_line_context(block_kind);
+    let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    let joinable = block_is_joinable(block_kind);
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < window.lines.len() {
+        let line = window.lines[index];
+        let line_context = if line.line < content_end {
+            context
+        } else {
+            LineContext::Normal
+        };
+        let mut run_end = index + 1;
+        if joinable && line_context == LineContext::Normal {
+            while run_end < window.lines.len() {
+                let next = window.lines[run_end];
+                let next_context = if next.line < content_end {
+                    context
+                } else {
+                    LineContext::Normal
+                };
+                if next_context != LineContext::Normal {
+                    break;
+                }
+                run_end += 1;
+            }
+        }
+        runs.push(index..run_end);
+        index = run_end;
+    }
+    runs
+}
+
+/// Disclosure [`present_block`] would currently assign to each of
+/// `window.render`'s lines, paired with that line's document line number: the
+/// run-wide merged disclosure (see [`merged_disclosure`]) for a non-empty line
+/// inside a joined multi-line run — even one whose own [`BlockLine::disclosure`]
+/// is `None`, because the caret, selection or IME sits on a different physical
+/// line of the same shared construct — or the line's own disclosure otherwise.
+/// An empty line (the blank run trailing the document's last block; see
+/// [`block_line_span`]) never gets the merged value even when grouped into the
+/// run, matching `present_markdown_from_parse`'s own early return for empty
+/// source, which presents it via [`present_plain`] with no disclosure at all.
+/// Neither does an inactive standalone image line grouped into the run — see
+/// [`inactive_standalone_image`] — since [`present_joined_run`] renders it
+/// through [`present_image`], which always reports no disclosure of its own.
+///
+/// Computed without parsing, from the same grouping [`present_block`] derives
+/// (see [`disclosure_runs`]), so a caller checking whether a cached
+/// [`VisualBlock`]'s disclosures are still current (see
+/// `EditorView::disclosures_are_current`) gets exactly the value a fresh
+/// [`present_block`] call would assign instead of risking the two definitions
+/// of "current" falling out of sync — which otherwise invalidates and rebuilds
+/// the cache every frame the caret sits inside an active multi-line paragraph,
+/// since a per-line-only recomputation never agrees with the run-wide value a
+/// joined run's other lines were actually presented with.
+pub fn expected_disclosures(
+    block_kind: NodeKind,
+    window: &BlockWindow<'_>,
+) -> Vec<(usize, Option<SourceRange>)> {
+    let mut out = Vec::new();
+    for run in disclosure_runs(block_kind, window) {
+        let lines = &window.lines[run];
+        let joined = lines.len() > 1;
+        let merged = joined.then(|| merged_disclosure(lines)).flatten();
+        for line in lines {
+            if window.render.contains(&line.line) {
+                let disclosure = if joined
+                    && !line.text.is_empty()
+                    && inactive_standalone_image(line.text, line.range, line.disclosure).is_none()
+                {
+                    merged
+                } else if joined {
+                    None
+                } else {
+                    line.disclosure
+                };
+                out.push((line.line, disclosure));
+            }
+        }
+    }
+    out
 }
 
 /// Union of every line's own disclosure in a joined run, so a shared construct
@@ -1312,24 +1415,105 @@ fn merged_disclosure(lines: &[BlockLine<'_>]) -> Option<SourceRange> {
         })
 }
 
+/// One joinable block's whole-span parse, kept independent of which lines a
+/// particular presentation call is drawing.
+///
+/// CommonMark resolves `**`/`_`/`` ` `` across a whole paragraph, so
+/// presenting it correctly needs a parse of its entire joined source — but a
+/// block has no size limit (see [`VisualBlock`]), and only the lines that
+/// reach the viewport need to be turned into [`VisualLine`]s. Splitting the
+/// two lets a caller compute this once, off the render path for a block too
+/// large to reparse on every viewport miss, and reuse it for every window
+/// drawn from the block afterward (see [`BlockWindow::joined`]) — so the
+/// result of a marker pair arbitrarily far apart does not depend on where the
+/// viewport happens to sit, the way a fixed context window around it would.
+#[derive(Clone, Debug)]
+pub struct JoinedParse {
+    /// Byte range the joined source was read from; a stale cache (an edit
+    /// touched the block, or the index re-tiled it) is one whose block no
+    /// longer reports this same range.
+    pub source_range: SourceRange,
+    pub joined_source: String,
+    pub parsed: MarkdownParse,
+}
+
+/// Parses `lines` joined into one source, from texts the caller already has
+/// in hand. Used both as [`present_joined_run`]'s fallback when no cached
+/// [`JoinedParse`] is available, and to build one from a bounded run of
+/// [`BlockLine`]s.
+pub fn parse_joined_block(lines: &[BlockLine<'_>], revision: Revision) -> JoinedParse {
+    let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
+    let joined_source = lines.iter().map(|line| line.text).collect::<String>();
+    let parsed = parse_document(revision, joined_range, &joined_source);
+    JoinedParse {
+        source_range: joined_range,
+        joined_source,
+        parsed,
+    }
+}
+
+/// Reads and parses one joinable block's whole content span directly from
+/// `document`, independent of any particular viewport. Meant to run off the
+/// render path (see [`BlockWindow::joined`]): a single read and parse whose
+/// cost scales with the block's size, which for a joinable block has no
+/// upper bound. `content` excludes the block's trailing blank run, matching
+/// what [`present_block`] itself treats as the construct's own lines.
+pub fn parse_joined_span(
+    document: &RopeBuffer,
+    content: Range<usize>,
+    revision: Revision,
+) -> Option<JoinedParse> {
+    if content.is_empty() {
+        return None;
+    }
+    let start = document
+        .line_range(hane_document::LineId(content.start))
+        .ok()?
+        .start;
+    let end = document
+        .line_range(hane_document::LineId(content.end - 1))
+        .ok()?
+        .end;
+    let joined_range = SourceRange::new(start.0, end.0);
+    let joined_source = document.text(joined_range).ok()?;
+    let parsed = parse_document(revision, joined_range, &joined_source);
+    Some(JoinedParse {
+        source_range: joined_range,
+        joined_source,
+        parsed,
+    })
+}
+
 /// Presents a run of a standalone paragraph's contiguous physical lines from
 /// one shared parse of their joined source, so emphasis, strong emphasis and
 /// code spans that cross a physical line boundary resolve the way a single
 /// whole-paragraph parse would. See [`present_markdown_from_parse`] for why a
 /// per-line parse cannot see these on its own.
+///
+/// `joined`, when given, is a whole-block parse computed elsewhere (see
+/// [`JoinedParse`]) and is used as the shared parse directly instead of
+/// rejoining and reparsing `lines`; only `lines` themselves still have to be
+/// this run's own, since each is presented against its own physical range
+/// regardless of which parse supplied it.
 fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
     line_height: f32,
     render: &Range<usize>,
+    joined: Option<&JoinedParse>,
     out: &mut Vec<VisualLine>,
 ) {
-    let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
-    let joined_source = lines.iter().map(|line| line.text).collect::<String>();
-    let parsed = parse_document(revision, joined_range, &joined_source);
+    let computed;
+    let joined = match joined {
+        Some(joined) => joined,
+        None => {
+            computed = parse_joined_block(lines, revision);
+            &computed
+        }
+    };
     let shared = SharedParse {
-        whole_source: &joined_source,
-        parsed: &parsed,
+        whole_source: &joined.joined_source,
+        parsed: &joined.parsed,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
     // construct whose markers live on different physical lines; `marker_is_disclosed`
@@ -1341,15 +1525,31 @@ fn present_joined_run(
         if !render.contains(&line.line) {
             continue;
         }
-        let mut presented = present_markdown_from_parse(
-            line.line as u64,
-            revision,
-            line.range,
-            line.text,
-            line_height,
-            disclosure,
-            &shared,
-        );
+        // An inactive standalone image line keeps rendering through its own
+        // dedicated path even while joined into the run for parse purposes —
+        // only the surrounding text lines' delimiters need the shared parse;
+        // the image line's own disclosure (not the run-wide merged one)
+        // decides whether it is presently being edited as raw markup instead.
+        let mut presented = match inactive_standalone_image(line.text, line.range, line.disclosure)
+        {
+            Some(image) => present_image(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                image,
+            ),
+            None => present_markdown_from_parse(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                disclosure,
+                &shared,
+            ),
+        };
         presented.context = LineContext::Normal;
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
@@ -1377,9 +1577,7 @@ pub fn present_polished_line(
     // and table recognition that would otherwise mis-read the literal text.
     let mut block = if context == LineContext::FencedCode {
         present_fenced_code_line(line_id, revision, range, source, line_height)
-    } else if let Some(image) = parse_standalone_image(source)
-        .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
-    {
+    } else if let Some(image) = inactive_standalone_image(source, range, disclosure) {
         present_image(line_id, revision, range, source, line_height, image)
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
@@ -2069,6 +2267,7 @@ mod tests {
             trailing_blank_lines: 0,
             lines: &lines,
             render: 0..2,
+            joined: None,
         };
         let visual = present_block(&block, Revision(1), &window, 26.0);
         let closing_marker = range1.start.0 + line1.find("**").unwrap();
@@ -2078,6 +2277,117 @@ mod tests {
                     && segment.source_range.start.0 == closing_marker
             }),
             "the closing marker on the line without its own disclosure must still expand"
+        );
+
+        // `expected_disclosures` must agree with what `present_block` itself
+        // just assigned to every line of the run, including the one without
+        // its own `BlockLine::disclosure` — a caller comparing a cached
+        // presentation's disclosures against this instead of each line's own,
+        // unmerged disclosure is what lets it recognize the cache as current
+        // while the caret sits inside a joined multi-line run (see
+        // `EditorView::disclosures_are_current`).
+        let expected = expected_disclosures(NodeKind::Paragraph, &window);
+        assert_eq!(
+            expected,
+            visual
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn standalone_image_line_inside_a_run_does_not_split_the_shared_parse() {
+        // A `**`/`_`/`` ` `` pair distant enough to sit on either side of a
+        // standalone image line's own physical line must still resolve as one
+        // shared construct: the image line is its own presentation (rendered
+        // through `present_image`, not the joined parse), but it must not act
+        // as a run boundary that forces the paragraph's two halves into
+        // separate, self-contained parses.
+        let line0 = "This is **bold\n";
+        let image_line = "![alt](dest)\n";
+        let line2 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + image_line.len());
+        let range2 = SourceRange::new(range1.end.0, range1.end.0 + line2.len());
+        let caret = range0.start.0 + line0.find("bold").unwrap();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: Some(SourceRange::empty(caret)),
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: image_line,
+                disclosure: None,
+            },
+            BlockLine {
+                line: 2,
+                range: range2,
+                text: line2,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range2.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 3,
+        };
+        let window = BlockWindow {
+            span: 0..3,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..3,
+            joined: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines.len(), 3);
+
+        // The closing `**` on the far side of the image line must still be
+        // recognized as the same Strong construct's marker and expand,
+        // exactly as if the image line were not there.
+        let closing_marker = range2.start.0 + line2.find("**").unwrap();
+        assert!(
+            visual.lines[2].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker across the image line must still expand"
+        );
+
+        // The image line itself must still go through Hane's dedicated image
+        // presentation path, not the shared markdown parse.
+        assert_eq!(visual.lines[1].kind, BlockKind::Image);
+        assert_eq!(
+            visual.lines[1].image,
+            Some(ImagePresentation {
+                alt: "alt".to_owned(),
+                destination: "dest".to_owned(),
+            })
+        );
+        assert_eq!(visual.lines[1].disclosure, None);
+
+        // `expected_disclosures` must still agree with what `present_block`
+        // actually assigned, including the image line's own hardcoded `None`
+        // even though the run's merged disclosure (from the caret on line 0)
+        // is `Some`.
+        let expected = expected_disclosures(NodeKind::Paragraph, &window);
+        assert_eq!(
+            expected,
+            visual
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
         );
     }
 

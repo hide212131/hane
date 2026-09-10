@@ -18,8 +18,8 @@ use hane_editor::Editor;
 use hane_markdown::IndexedBlock;
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset, block_is_joinable,
-    block_line_span, present_block, trailing_blank_lines,
+    InlineDisplay, JoinedParse, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset,
+    block_is_joinable, block_line_span, expected_disclosures, present_block, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -27,6 +27,22 @@ use std::ops::Range;
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
 }
+
+/// Lines a joinable block's own span may reach before `presented_block` stops
+/// reading and reparsing all of it synchronously on every viewport miss.
+///
+/// A block is not bounded — a document without a blank line in it is a single
+/// paragraph (see [`VisualBlock`] in `hane_presentation`) — so nothing here
+/// can assume a joinable block's whole span is cheap to read. Below this
+/// budget the whole span is still read and parsed inline, exactly as before,
+/// which keeps a normal-sized paragraph resolving a far-apart marker pair
+/// synchronously with no caller-supplied [`JoinedParse`] required. Above it,
+/// `presented_block` reads only `visible`'s own lines unless the caller
+/// already has a cached whole-span parse (see
+/// `EditorView::schedule_joined_parse`, which computes one off the render
+/// path and is what resolves the rest correctly without a fixed context
+/// window whose result would depend on where the viewport happens to sit).
+pub(crate) const JOIN_SYNC_LINE_BUDGET: usize = 4_096;
 
 /// Presents the lines of one indexed Markdown block that reach `visible`.
 ///
@@ -41,15 +57,90 @@ fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: boo
 /// differently depending on scroll position. Which lines are literal code or
 /// table syntax is decided in presentation, from the block kind; this crate
 /// never inspects the source for fences or pipes.
+///
+/// `joined`, when given, is a cached whole-span parse for this exact block
+/// (see [`JoinedParse`]); it is what lets a block whose span outgrows
+/// [`JOIN_SYNC_LINE_BUDGET`] still resolve a marker pair arbitrarily far
+/// apart without this function reading the whole span itself on every call.
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let context = if block_is_joinable(block.kind) {
+    let ctx = block_context(editor, block, &span, &render, joined)?;
+    let lines = block_lines(editor, &ctx);
+    Some(present_block(
+        block,
+        document.revision(),
+        &BlockWindow {
+            trailing_blank_lines: ctx.trailing_blank_lines,
+            span,
+            lines: &lines,
+            render,
+            joined,
+        },
+        DEFAULT_LINE_HEIGHT,
+    ))
+}
+
+/// Disclosure `presented_block` would currently assign to each line of
+/// `render` in this block, without presenting it.
+///
+/// Cheap enough to call every frame the caret, selection or IME sits inside
+/// the block: it groups `render`'s lines the same way `present_block` itself
+/// does (see `hane_presentation::disclosure_runs`) and reads no more source
+/// than `presented_block` would for the same `render`/`joined` pair, so a
+/// cache-currentness check compares like for like instead of drifting from
+/// what a fresh presentation would produce for a run joined across physical
+/// lines.
+pub(crate) fn expected_block_disclosures(
+    editor: &Editor,
+    block: &IndexedBlock,
+    render: &Range<usize>,
+    joined: Option<&JoinedParse>,
+) -> Option<Vec<(usize, Option<SourceRange>)>> {
+    let document = editor.document();
+    let span = block_line_span(document, block)?;
+    let ctx = block_context(editor, block, &span, render, joined)?;
+    let lines = block_lines(editor, &ctx);
+    Some(expected_disclosures(
+        block.kind,
+        &BlockWindow {
+            trailing_blank_lines: ctx.trailing_blank_lines,
+            span,
+            lines: &lines,
+            render: render.clone(),
+            joined,
+        },
+    ))
+}
+
+/// Lines read from `document` to build a [`BlockWindow`] for `block`: the
+/// whole block span when it is joinable, small enough, and no cached
+/// [`JoinedParse`] already supplies whole-span context — matching exactly
+/// when `presented_block` itself reads the whole span rather than just
+/// `render` — or `render` alone otherwise.
+struct BlockContext {
+    trailing_blank_lines: usize,
+    context: Range<usize>,
+    ranges: Vec<SourceRange>,
+    texts: Vec<String>,
+}
+
+fn block_context(
+    editor: &Editor,
+    block: &IndexedBlock,
+    span: &Range<usize>,
+    render: &Range<usize>,
+    joined: Option<&JoinedParse>,
+) -> Option<BlockContext> {
+    let document = editor.document();
+    let joinable = block_is_joinable(block.kind);
+    let context = if joinable && joined.is_none() && span.len() <= JOIN_SYNC_LINE_BUDGET {
         span.clone()
     } else {
         render.clone()
@@ -62,27 +153,26 @@ pub(crate) fn presented_block(
         .iter()
         .map(|range| document.text(*range).unwrap_or_default())
         .collect::<Vec<_>>();
-    let lines = context
-        .zip(&ranges)
-        .zip(&texts)
+    Some(BlockContext {
+        trailing_blank_lines: trailing_blank_lines(document, span),
+        context,
+        ranges,
+        texts,
+    })
+}
+
+fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
+    ctx.context
+        .clone()
+        .zip(&ctx.ranges)
+        .zip(&ctx.texts)
         .map(|((line, range), text)| BlockLine {
             line,
             range: *range,
             text,
             disclosure: disclosure_for_line(editor, line, *range),
         })
-        .collect::<Vec<_>>();
-    Some(present_block(
-        block,
-        document.revision(),
-        &BlockWindow {
-            trailing_blank_lines: trailing_blank_lines(document, &span),
-            span,
-            lines: &lines,
-            render,
-        },
-        DEFAULT_LINE_HEIGHT,
-    ))
+        .collect()
 }
 
 /// Source range whose Markdown markers this line discloses: the caret's own
@@ -382,7 +472,7 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX))
+                presented_block(editor, &block, &(0..usize::MAX), None)
                     .expect("block presents")
                     .lines
             })
@@ -555,7 +645,7 @@ mod tests {
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one paragraph block");
         let visible = 150..155;
-        let visual = presented_block(&editor, &block, &visible).expect("block presents");
+        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
         let rendered = visual
             .lines
             .iter()
@@ -568,6 +658,90 @@ mod tests {
                 .any(|run| run.kind == hane_presentation::StyleKind::Bold),
             "the Strong construct must resolve even though both its markers sit \
              outside a fixed-radius window around the scrolled viewport"
+        );
+    }
+
+    /// A paragraph of 100,000 lines with no blank line in it, so the whole
+    /// document is one block (see `VisualBlock`'s doc in `hane_presentation`).
+    fn huge_paragraph() -> String {
+        let mut source = String::from("**bold\n");
+        for line in 0..100_000 {
+            source.push_str(&format!("filler line {line}\n"));
+        }
+        source.push_str("end**\n");
+        source
+    }
+
+    #[test]
+    fn a_huge_joinable_paragraph_presents_only_its_visible_window_without_a_cached_parse() {
+        // Without a cached whole-span `JoinedParse`, `presented_block` must not
+        // read, join and reparse this whole 100,000-line paragraph on this
+        // call: `JOIN_SYNC_LINE_BUDGET` bounds it to `visible`'s own lines
+        // instead. The Strong construct's markers sit at the very start and
+        // very end of the block, nowhere near `visible`, so this also proves
+        // the bound is actually in effect: were the whole span still read and
+        // parsed here, the construct would resolve regardless of the window,
+        // exactly as it does in the smaller `a_marker_pair_far_apart_resolves_
+        // regardless_of_the_visible_window` case above.
+        let source = huge_paragraph();
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one paragraph block");
+        let visible = 50_000..50_005;
+        let visual = presented_block(&editor, &block, &visible, None).expect("block presents");
+        assert!(
+            visual
+                .lines
+                .iter()
+                .all(|line| visible.contains(&(line.line_id as usize))),
+            "only the visible window's lines are presented, not the whole block"
+        );
+        assert!(
+            visual
+                .lines
+                .iter()
+                .flat_map(|line| &line.style_runs)
+                .all(|run| run.kind != hane_presentation::StyleKind::Bold),
+            "a marker pair far outside the visible window does not resolve when \
+             the block is too large to read and reparse synchronously and no \
+             cached whole-span parse was supplied"
+        );
+    }
+
+    #[test]
+    fn a_cached_whole_span_parse_resolves_a_huge_paragraphs_markers_regardless_of_scroll_position()
+    {
+        // The counterpart to the test above: once a `JoinedParse` covering the
+        // whole block is available (as `EditorView::schedule_joined_parse`
+        // computes off the render path), the same far-apart Strong construct
+        // resolves correctly for a window deep inside the paragraph, with no
+        // dependency on where that window happens to sit — resolving the
+        // review concern that a fixed context window's result would change
+        // with scroll position.
+        let source = huge_paragraph();
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one paragraph block");
+        let document = editor.document();
+        let span = block_line_span(document, &block).expect("block spans lines");
+        let content_end = span.end - hane_presentation::trailing_blank_lines(document, &span);
+        let joined = hane_presentation::parse_joined_span(
+            document,
+            span.start..content_end,
+            document.revision(),
+        )
+        .expect("the whole span parses");
+        let visible = 50_000..50_005;
+        let visual =
+            presented_block(&editor, &block, &visible, Some(&joined)).expect("block presents");
+        assert!(
+            visual
+                .lines
+                .iter()
+                .flat_map(|line| &line.style_runs)
+                .any(|run| run.kind == hane_presentation::StyleKind::Bold),
+            "a cached whole-span parse resolves the Strong construct even for a \
+             window far from either of its markers"
         );
     }
 }

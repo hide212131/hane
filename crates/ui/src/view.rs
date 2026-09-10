@@ -20,7 +20,9 @@ use crate::capture::InputCapture;
 use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
-use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
+use crate::line::{
+    JOIN_SYNC_LINE_BUDGET, block_element, expected_block_disclosures, presented_block, row_element,
+};
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
@@ -40,8 +42,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockLayout, HeightIndex, LineShaper, VerticalMove, VisualBlock, VisualLine, VisualOffset,
-    block_heights, block_line_span, layout_block,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, VisualLine,
+    VisualOffset, block_heights, block_is_joinable, block_line_span, layout_block,
+    parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
@@ -354,6 +357,26 @@ pub struct EditorView {
     /// run while retaining measured heights on both sides.
     height_blocks: HeightBlocks,
     document_parse_job_running: bool,
+    /// Whole-span parse of a joinable block too large for `presented_block` to
+    /// read and reparse synchronously on every viewport miss (see
+    /// `JOIN_SYNC_LINE_BUDGET`), keyed like `block_cache`. Populated by
+    /// `schedule_joined_parse`, off the render path, and is what lets such a
+    /// block still resolve a marker pair arbitrarily far apart without this
+    /// view reading the whole block on every scroll.
+    joined_parse_cache: HashMap<BlockId, JoinedBlockCache>,
+    /// Blocks with a `schedule_joined_parse` background job in flight, so a
+    /// block already being parsed is not queued again on the next frame.
+    joined_parse_jobs: HashSet<BlockId>,
+}
+
+/// One joinable block's cached whole-span parse (see
+/// `EditorView::joined_parse_cache`), and the block identity it was computed
+/// for. An entry whose `revision` or `source_range` no longer matches the
+/// index's current answer for the block is stale and is not used.
+struct JoinedBlockCache {
+    revision: Revision,
+    source_range: SourceRange,
+    parse: JoinedParse,
 }
 
 /// The caret rectangle, in coordinates relative to the top-left of the content
@@ -611,6 +634,8 @@ impl EditorView {
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
+            joined_parse_cache: HashMap::new(),
+            joined_parse_jobs: HashSet::new(),
         }
     }
 
@@ -840,6 +865,11 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.block_index = BlockIndexState::new();
+        // A `BlockId` is only unique within the document it was assigned by;
+        // a cached whole-span parse keyed by one could otherwise be reused
+        // for an unrelated block in whatever document replaced it.
+        self.joined_parse_cache.clear();
+        self.joined_parse_jobs.clear();
     }
 
     fn remember_recent(&mut self, path: &Path) {
@@ -1918,6 +1948,7 @@ impl EditorView {
                 // Formal boundaries can disagree with what the bounded local
                 // parse showed, so every cached presentation is re-derived once.
                 view.block_cache.clear();
+                view.joined_parse_cache.clear();
                 let (granularity, len) = view.desired_layout();
                 if granularity == Granularity::Blocks && len == heights.len() {
                     view.install_heights(granularity, heights);
@@ -1930,6 +1961,80 @@ impl EditorView {
             });
         })
         .detach();
+    }
+
+    /// Coalesced per-block background job producing the whole-span parse of a
+    /// joinable block whose span outgrows [`JOIN_SYNC_LINE_BUDGET`] — the
+    /// case `presented_block` itself cannot read and reparse synchronously on
+    /// every viewport miss without making a single huge paragraph's render
+    /// cost scale with its length. One job per block at a time; mirrors
+    /// [`Self::schedule_document_parse`]'s snapshot-and-spawn shape but at
+    /// block granularity, and is what resolves a marker pair arbitrarily far
+    /// apart in such a block without a fixed context window whose result
+    /// would depend on where the viewport happens to sit.
+    fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
+        let revision = self.editor().document().revision();
+        for block in blocks {
+            if !block_is_joinable(block.kind) {
+                continue;
+            }
+            // Re-fetched every iteration (cheap: a reference, not a clone) so
+            // its borrow never has to outlive the mutable `self` access below.
+            let document = self.editor().document();
+            let Some(span) = block_line_span(document, block) else {
+                continue;
+            };
+            if span.len() <= JOIN_SYNC_LINE_BUDGET {
+                continue;
+            }
+            if self.joined_parse_jobs.contains(&block.id)
+                || self
+                    .joined_parse_cache
+                    .get(&block.id)
+                    .is_some_and(|cached| {
+                        cached.revision == revision && cached.source_range == block.source_range
+                    })
+            {
+                continue;
+            }
+            let content = span.start
+                ..span
+                    .end
+                    .saturating_sub(trailing_blank_lines(document, &span));
+            let snapshot = document.clone();
+            self.joined_parse_jobs.insert(block.id);
+            let id = block.id;
+            let source_range = block.source_range;
+            let key = self.document_key();
+            cx.spawn(async move |view, cx| {
+                let parse = cx
+                    .background_executor()
+                    .spawn(async move { parse_joined_span(&snapshot, content, revision) })
+                    .await;
+                let _ = view.update(cx, |view, cx| {
+                    view.joined_parse_jobs.remove(&id);
+                    if view.document_key() != key {
+                        return;
+                    }
+                    if let Some(parse) = parse {
+                        view.joined_parse_cache.insert(
+                            id,
+                            JoinedBlockCache {
+                                revision,
+                                source_range,
+                                parse,
+                            },
+                        );
+                        // The next viewport miss on this block should read the
+                        // cache instead of the presentation this view already
+                        // built from a bounded, render-window-only parse.
+                        view.block_cache.remove(&id);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     pub(crate) fn report_error(&mut self, operation: &str, error: BufferError) {
@@ -2124,7 +2229,7 @@ impl EditorView {
             .block_cache
             .get(&indexed.id)
             .filter(|block| block.matches(&indexed) && block.covers(&window))
-            .filter(|block| self.disclosures_are_current(block));
+            .filter(|block| self.disclosures_are_current(&indexed, block));
         if let Some(block) = drawn
             && let Some(entry) = self.layout_cache.get(&indexed.id).filter(|entry| {
                 entry.is_valid(
@@ -2136,7 +2241,16 @@ impl EditorView {
         {
             return Some((block.clone(), entry.layout.clone()));
         }
-        let visual = presented_block(self.editor(), &indexed, &window)?;
+        let revision = self.editor().document().revision();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        let visual = presented_block(
+            self.editor(),
+            &indexed,
+            &window,
+            joined.map(|cached| &cached.parse),
+        )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
     }
@@ -2543,13 +2657,21 @@ impl EditorView {
             if reusable
                 && cached.matches(block)
                 && cached.covers(visible)
-                && self.disclosures_are_current(&cached)
+                && self.disclosures_are_current(block, &cached)
             {
                 self.block_cache.insert(block.id, cached.clone());
                 return Some((cached, true));
             }
         }
-        let presented = presented_block(self.sessions.active().editor(), block, visible)?;
+        let joined = self.joined_parse_cache.get(&block.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == block.source_range
+        });
+        let presented = presented_block(
+            self.sessions.active().editor(),
+            block,
+            visible,
+            joined.map(|cached| &cached.parse),
+        )?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
     }
@@ -2592,18 +2714,37 @@ impl EditorView {
     }
 
     /// True while every line of a cached block still discloses what the caret,
-    /// selection and IME say it should. Cheap: a block holds a handful of lines.
-    fn disclosures_are_current(&self, block: &VisualBlock) -> bool {
-        let editor = self.sessions.active().editor();
-        block.lines.iter().all(|line| {
-            let expected = editor
-                .document()
-                .line_range(LineId(line.line_id as usize))
-                .ok()
-                .filter(|range| *range == line.source_range)
-                .and_then(|range| disclosure_for_line(editor, line.line_id as usize, range));
-            expected == line.disclosure
-        })
+    /// selection and IME say it should.
+    ///
+    /// Compares against [`expected_block_disclosures`] rather than each line's
+    /// own disclosure in isolation, because a shared construct joined across
+    /// physical lines discloses with one merged, run-wide value (see
+    /// `hane_presentation::merged_disclosure`) — a per-line-only recomputation
+    /// would disagree with that value on every line but the one the caret,
+    /// selection or IME actually sits on, and invalidate the cache every frame
+    /// the caret sits inside an active multi-line paragraph.
+    fn disclosures_are_current(&self, indexed: &IndexedBlock, block: &VisualBlock) -> bool {
+        let revision = self.editor().document().revision();
+        let render = block.span.start + block.lines_before
+            ..block.span.start + block.lines_before + block.lines.len();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        let Some(expected) = expected_block_disclosures(
+            self.editor(),
+            indexed,
+            &render,
+            joined.map(|cached| &cached.parse),
+        ) else {
+            return false;
+        };
+        expected.len() == block.lines.len()
+            && expected
+                .iter()
+                .zip(&block.lines)
+                .all(|((line, disclosure), visual)| {
+                    *line as u64 == visual.line_id && *disclosure == visual.disclosure
+                })
     }
 }
 
@@ -2634,7 +2775,7 @@ fn neighbor_row_target(
     } else {
         span.end.saturating_sub(1)..span.end
     };
-    let visual = presented_block(editor, &indexed, &window)?;
+    let visual = presented_block(editor, &indexed, &window, None)?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -3164,6 +3305,7 @@ impl Render for EditorView {
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
         let blocks = self.visible_blocks(visible.clone());
+        self.schedule_joined_parse(&blocks, cx);
         // Keep a margin of presentations around the viewport so scrolling back
         // does not re-present, and drop the rest.
         let retained = self
@@ -3178,6 +3320,8 @@ impl Render for EditorView {
         self.block_cache.retain(|id, _| retained.contains(id));
 
         self.layout_cache.retain(|id, _| retained.contains(id));
+        self.joined_parse_cache
+            .retain(|id, _| retained.contains(id));
 
         let lines = self.visible_line_window(&blocks, &visible);
         let mut rendered = Vec::with_capacity(blocks.len());
@@ -3859,7 +4003,7 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX))
+                presented_block(editor, &block, &(0..usize::MAX), None)
                     .expect("block presents")
                     .lines
             })
@@ -3984,7 +4128,7 @@ mod tests {
         let lines = editor.document().line_count();
 
         let block = index.block(0).unwrap();
-        let visual = presented_block(&editor, &block, &(40_000..40_050)).unwrap();
+        let visual = presented_block(&editor, &block, &(40_000..40_050), None).unwrap();
         assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
         assert_eq!(visual.lines_before, 40_000);
         assert_eq!(visual.lines_after, lines - 40_050);
@@ -4025,7 +4169,8 @@ mod tests {
     fn a_presented_block_carries_all_of_its_lines() {
         let editor = Editor::new("```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n");
         let index = BlockIndex::from_buffer(editor.document());
-        let code = presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX)).unwrap();
+        let code =
+            presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX), None).unwrap();
         assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
         assert_eq!(code.source_range, index.block(0).unwrap().source_range);
         assert_eq!(
@@ -4036,6 +4181,56 @@ mod tests {
             code.matches(&index.block(0).unwrap()),
             "a freshly presented block matches the index it came from"
         );
+    }
+
+    #[gpui::test]
+    fn disclosures_are_current_reuses_a_joined_runs_shared_disclosure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A caret sitting inside "bold" on the first physical line discloses
+        // the whole shared Strong construct, including its closing marker on
+        // the second physical line, which therefore caches a disclosure of
+        // its own even though the caret never touches it (see
+        // `merged_disclosure`). Comparing that line's cached disclosure
+        // against its *own*, unmerged disclosure would never match while the
+        // caret sits here, rebuilding the block on every frame instead of
+        // reusing it.
+        let text = "This is **bold\nacross lines** ok\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            let caret = SourceOffset(text.find("bold").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(caret))
+                .unwrap();
+            let indexed = view.block_at_offset(caret).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let visual = presented_block(view.editor(), &indexed, &span, None).unwrap();
+            assert_eq!(
+                visual.lines.len(),
+                3,
+                "the joined run's two lines plus the trailing empty line the final newline owns"
+            );
+            assert!(
+                visual.lines[1].disclosure.is_some(),
+                "the line without its own caret still carries the run's merged disclosure"
+            );
+            assert!(
+                view.disclosures_are_current(&indexed, &visual),
+                "an unmoved caret must not invalidate a joined run's cached disclosure"
+            );
+
+            // Moving off the shared construct entirely must still invalidate
+            // the cache: the fix must not make disclosures look current
+            // unconditionally.
+            let elsewhere = SourceOffset(text.find(" ok").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(elsewhere))
+                .unwrap();
+            assert!(
+                !view.disclosures_are_current(&indexed, &visual),
+                "moving off the disclosed construct must still invalidate the cache"
+            );
+        });
     }
 
     #[test]
@@ -4088,8 +4283,13 @@ mod tests {
         ordinal: usize,
         shaper: &FixedAdvanceShaper,
     ) -> (VisualBlock, BlockLayout) {
-        let block = presented_block(editor, &index.block(ordinal).unwrap(), &(0..usize::MAX))
-            .expect("block presents");
+        let block = presented_block(
+            editor,
+            &index.block(ordinal).unwrap(),
+            &(0..usize::MAX),
+            None,
+        )
+        .expect("block presents");
         let layout = layout_block(&block, TEST_WIDTH, shaper);
         (block, layout)
     }

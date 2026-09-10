@@ -67,6 +67,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     render: span.clone(),
                     span,
                     lines: &lines,
+                    joined: None,
                 },
                 LINE_HEIGHT,
             )
