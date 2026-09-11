@@ -5,7 +5,8 @@
 Hane の Issue から実装、レビュー、実アプリ検証、修正、マージ判断までを、複数の coding agent と検証層に役割を分けて自動化する。
 
 この文書を運用設計の正本とする。役割分担そのものを採用する理由は
-[ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。
+[ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。ChatGPT / Work を上流の設計工程として位置づけ、Claude Code への明示的な handoff を定義する理由は
+[ADR-0026](adr/0026-work-design-handoff.md) に残す。ADR-0026 は ADR-0023 の三者分離を置き換えない。
 
 Local GUI validator の構成、信頼条件、依頼・結果の契約、段階的な実装順序は
 [Local GUI validation 設計](local-gui-validation.md) で具体化する。Computer Use を必須にせず、
@@ -16,15 +17,16 @@ GitHub-hosted macOS を優先し、必要な場合だけ通常アカウントを
 
 ## 基本方針
 
-1つの agent に実装、レビュー、実アプリ検証、進行判断をすべて任せない。
+1つの agent に設計、実装、レビュー、実アプリ検証、進行判断をすべて任せない。
 
+- **Work（ChatGPT）** は要求整理・調査・詳細設計を担当する。実装対象のコード・テスト・ビルド設定は変更せず、branch 作成・commit / push・Pull Request 作成には進まない。責務・終了条件・handoff の詳細は「Work（ChatGPT）」節を参照する。
 - **Claude Code** は実装を担当する。
 - **Codex** は Pull Request のコードレビューを担当する。ただし Codex の code review 使用量上限に達したことが明示的に報告された場合に限り、trusted workflow が対象 exact head SHA の review を GitHub Copilot Code Review に置き換える（詳細は下記「Codex」節を参照）。
 - **Local GUI validator** はローカル macOS 上で Hane を起動し、実アプリの GUI 挙動を検証する。
 - **GitHub Copilot** は Codex の指摘、GUI validation、Pull Request、CI の状態を読み、次の処理を判断する。
 - **GitHub Actions** はトリガー、権限、状態遷移、最終的な機械的チェックを担当する。
 
-ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Copilot = judge** は変更しない。Local GUI validator はこの3者を置き換えず、コードレビューや CI では確認しにくい実アプリの挙動を補完する独立した検証層とする。
+ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Copilot = judge** は変更しない。Local GUI validator はこの3者を置き換えず、コードレビューや CI では確認しにくい実アプリの挙動を補完する独立した検証層とする。ADR-0026 で明文化する **Work = planner/designer** も、この3者の上流に位置する補足であり、既存の判断や `/implement` の起動契約を置き換えない。
 
 AI の判断と、GitHub 上で実際に変更を加える処理を分ける。特にマージは Copilot の判断だけでは実行せず、CI、Codex review、GUI validation、対象 commit、未解決レビューなどを機械的に確認する。
 
@@ -95,19 +97,88 @@ CI + Codex review
 
 ## 各 agent / validator の責務
 
+### Work（ChatGPT）
+
+Work は設計側に限定する。要求整理・調査・詳細設計・ADR・受け入れ条件の整備までを担当し、製品実装には進まない。役割を採用する理由は [ADR-0026](adr/0026-work-design-handoff.md) に残す。
+
+#### 担当する範囲
+
+- 要求整理、リポジトリ調査、詳細設計、ADR の起票・更新、受け入れ条件の整備。
+- 調査のためのコード閲覧と検証（読み取り、ローカルでの動作確認など）。
+- 依頼された設計文書・ADR の整備（`docs/**` の編集）。
+
+#### 終了条件（実装に進まない）
+
+- 実装対象のソースコード・テストコード・ビルド設定を変更しない。
+- 製品実装のための branch 作成、commit / push、Pull Request 作成に進まない。
+- Issue が実装可能な状態になった時点で設計作業を終了する。それ以上の詳細化（実装ファイルや手順の逐一固定）は行わない。
+
+#### Issue の書き方
+
+Issue は背景・解決したい問題・要求・設計上の決定・制約・受け入れ条件を中心にする。決定済みの設計とその根拠、および未決事項を区別し、具体的な変更ファイル・関数・手順を必須実装として過剰に固定しない。矛盾や実装を阻む未決事項があれば Issue に明記し、Claude Code の判断に委ねる。新規 Issue を作る場合の項目構成は Issue テンプレート（`.github/ISSUE_TEMPLATE/`）を参照する。
+
+設計状態は Issue 本文に「設計中」「設計完了（実装未起動）」のように人向けの文章で書く。新しいラベルや機械可読な状態は追加しない。標準ラベル、`gui-validation-required`、`agentic-auto-merge` は既存の運用のまま使う。PR state machine（`implementing` / `waiting-*` / `fix-requested` / `ready-to-merge` / `blocked` / `merged`、[状態管理](#状態管理)）は Pull Request と head SHA の検証状態を表すものであり、Issue の設計状態とは分離する。
+
+#### Work 向け再利用可能タスク指示（例）
+
+ChatGPT / Work のセッションに渡す指示の例。完了条件と禁止範囲を明記する。
+
+```text
+あなたは Hane の設計担当（planner/designer）です。次を厳守してください。
+
+- 対象 Issue の要求整理・調査・詳細設計・ADR 作成・受け入れ条件の整備までを行う。
+- 実装対象のソースコード・テストコード・ビルド設定を変更しない。
+- 製品実装のための branch 作成、commit / push、Pull Request 作成を行わない。
+- 調査のためのコード閲覧・検証、依頼された設計文書・ADR の整備は行ってよい。
+- Issue が実装可能な状態になった時点で設計作業を終了する。
+- 決定済みの設計・根拠と未決事項を区別して書き、具体的な変更ファイル・手順を必須実装として過剰に固定しない。
+- 完了したら Issue 本文に「設計引き渡し」節を追記し、下記「設計完了 handoff の書式」の項目を記録する。
+- `/implement` コメントの投稿は行わない。実装開始の要否と起動は、write / maintain / admin 権限を持つ利用者が判断する。
+```
+
+#### 設計完了 handoff の書式
+
+設計を終えた Issue には、次の項目を持つ「設計引き渡し」節を置く。
+
+```text
+## 設計引き渡し
+
+設計状態: 設計中 | 設計完了（実装未起動）
+成果物・制約・受け入れ条件: <Issue 内の該当節へのリンクまたは要約>
+実装を阻む未決事項: なし | <未決事項の内容>
+実装担当: Claude Code。レビュー: Codex。進行判断: GitHub Copilot。
+起動状況: 未起動 | `/implement` 投稿済み（コメント URL） | 実装中（Pull Request URL）
+```
+
+#### ケース別の振る舞い
+
+1. **設計のみを依頼された場合**: 上記の「設計引き渡し」節を Issue 本文に記録し、起動状況を「未起動」とする。`/implement` は投稿しない。
+2. **実装まで依頼済みの場合**: 「設計引き渡し」節を記録したうえで、write / maintain / admin 権限を持つ利用者が既存コメント・Pull Request・進行中の Actions run を確認し、重複がなければ本文完全一致の `/implement` を単独コメントとして投稿する。handoff の説明は Issue 本文または別コメントに置き、`/implement` コメント本文には含めない。
+3. **既存の実装が進行中の場合**: 既存コメント・Pull Request・Actions run から「依頼投稿済み」「Claude 実装開始」「Pull Request 作成済み」のどこまで進んでいるかを証拠で確認する。設計のみで実装済みとは扱わない。進行中であれば重複起動を避け、再承認は求めない。
+
+設計完了の記述そのものは実装承認や merge-ready の証拠として扱わない。実装開始の唯一の起動条件は、権限を持つ利用者による本文完全一致の `/implement` コメントである（[実装開始](#実装開始)を参照）。
+
+#### 行動指示としての限界
+
+このガードは agent への行動指示であり、OS 権限などによる強制的な隔離ではない。Work のローカルな操作を GitHub Actions から技術的に防止することはできない。一方、実装開始の唯一の経路である `/implement` は、投稿者の実効権限検証・本文完全一致・Issue 単位の concurrency・既存 PR 確認を既存の Actions（`implement.yml`）がすでに強制しているため、この役割分担の導入にあたって workflow の YAML・script・状態遷移は変更しない。
+
 ### Claude Code
 
 Claude Code はコードを書く側に限定する。
 
 初回実装では次を行う。
 
-- 元 Issue とリポジトリ内の設計文書を読む。
+- 元 Issue とリポジトリ内の設計文書（関連する ADR を含む）を読む。
 - 必要なコードとテストを変更する。
 - Hane の標準検証を実行する。
 - 作業用 branch に commit / push する。
 - Pull Request を作成する。
 
 修正時は、同じ Pull Request の最新 Codex review、GUI validation 結果、Copilot の判断を読み、妥当な指摘へ対応して同じ branch に push する。新しい Pull Request は作らない。
+
+#### Work からの Issue を受け取ったときの判断
+
+Work（ChatGPT）が設計した Issue（「Work（ChatGPT）」節を参照）を実装するときは、Issue 本文・関連 ADR・既存コードを読んだうえで、要求と決定済みの制約を守る範囲で具体的な実装方法（対象ファイル、関数構成、実装手順）を Claude Code 自身が最終判断する。Issue に書かれた具体的な変更ファイル・手順は、そう明記されていない限り必須の指定ではなく、設計時点の参考情報として扱う。要求や決定済み制約と矛盾する記述、実装を阻む未決事項を見つけた場合は、その内容を報告し、要求を独自に変更しない。
 
 #### 入力の信頼境界
 
@@ -405,9 +476,11 @@ Issue 上の明示的なコマンドで始める。
 /implement
 ```
 
-Issue 作成だけでは自動実装を始めない。誤作動と意図しないコスト消費を防ぐためである。
+Issue 作成、設計完了の記述、ラベル操作だけでは自動実装を始めない。誤作動と意図しないコスト消費を防ぐためである。
 
 Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の実効権限を検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
+
+`/implement` は本文完全一致の単独コメントとして投稿する。設計状態や成果物へのリンクなどの handoff 説明はこのコメントに含めず、Issue 本文または別コメントに置く。これにより「handoff 説明のコメント」と「実装を開始させるコメント」を区別する（Work の責務と handoff の書式は「[Work（ChatGPT）](#workchatgpt)」節を参照）。
 
 `author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに `GET /repos/{owner}/{repo}/collaborators/{username}/permission` などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
 

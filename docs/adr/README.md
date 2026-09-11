@@ -33,6 +33,7 @@
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 | [ADR-0023](0023-ai-agent-development-workflow.md) | AI agent 開発の実装・レビュー・進行判断の分離 |
 | [ADR-0024](0024-local-gui-validation.md) | ローカル GUI 検証を Computer Use の承認から切り離し、非公開リポジトリで実行を制御する（実装前） |
+| [ADR-0026](0026-work-design-handoff.md) | Work（ChatGPT）を上流の planner/designer とし、Claude Code への明示的な handoff を定義する（ADR-0023 を補足） |
 
 ## Superseded / amended
 

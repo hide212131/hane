@@ -48,3 +48,7 @@ Copilot coding agent に「Claude に実装を依頼し、Codex にレビュー�
 ## 棄却した案: 単一 agent で実装からマージまで行う
 
 構成は単純になるが、実装とレビューの独立性がなくなる。また、agent に広い書き込み権限を与える必要が生じるため採用しない。
+
+## 関連
+
+上流の要求整理・調査・詳細設計を担う Work（ChatGPT）の役割と、Claude Code への明示的な handoff は、この ADR が定義する実装・レビュー・進行判断の三者分離を置き換えず、[ADR-0026](0026-work-design-handoff.md) で補足する。
