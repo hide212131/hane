@@ -1112,21 +1112,13 @@ pub fn present_markdown_with_disclosure(
         source,
         line_height,
         disclosure,
-        &SharedParse {
-            whole_source: source,
-            parsed: &parsed,
-        },
+        &SharedParse { parsed: &parsed },
     )
 }
 
-/// A parse [`present_markdown_from_parse`] presents one physical line of, plus
-/// the text it was parsed from. For a self-contained parse `whole_source` is
-/// that line's own `source`; for a joined multi-line run (see
-/// [`present_joined_run`]) it is every line's text concatenated, since
-/// `parsed` may then describe delimiters and spans on a different physical
-/// line than the one being presented.
+/// A parse [`present_markdown_from_parse`] projects one physical line from.
+/// It may describe delimiters, padding and spans on other physical lines.
 struct SharedParse<'a> {
-    whole_source: &'a str,
     parsed: &'a MarkdownParse,
 }
 
@@ -1184,12 +1176,11 @@ fn present_markdown_from_parse(
     let mut visual = String::with_capacity(source.len());
     let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    // A code span whose content both opens and closes on whitespace hides one
-    // leading and one trailing byte of it, the same display-only normalization
-    // CommonMark §6.1 applies to a code span's rendered content. Folded into the
-    // marker list so it hides, discloses and clips exactly like a real marker.
+    // Padding is derived with the parser's semantic code content, excluding
+    // container prefixes. A normalized newline can cover multiple source bytes.
+    // It hides, discloses and clips exactly like a real delimiter.
     let mut markers = parsed.markers.clone();
-    markers.extend(code_span_padding(parsed, shared.whole_source));
+    markers.extend(parsed.code_padding.iter().copied());
     markers.sort_by_key(|marker| (marker.start, marker.end));
     // Only markers wholly inside this physical line's range are this line's to
     // show or hide; a shared multi-line parse also carries every other line's
@@ -1289,46 +1280,6 @@ fn present_markdown_from_parse(
         disclosure,
         image: None,
     }
-}
-
-/// Byte ranges of a code span's leading and trailing padding, for every code
-/// span in `parsed` whose content both opens and closes on whitespace (a line
-/// ending counts, since CommonMark §6.1 first converts one to a space) without
-/// being made of whitespace alone. Each returned range is exactly the one byte
-/// that display trims; [`present_markdown_from_parse`] folds them into its
-/// marker list so they hide, disclose and clip exactly like a real delimiter,
-/// leaving the source itself untouched.
-fn code_span_padding(parsed: &MarkdownParse, whole_source: &str) -> Vec<SourceRange> {
-    let base = parsed.source_range.start.0;
-    let is_pad = |byte: u8| matches!(byte, b' ' | b'\n' | b'\r');
-    parsed
-        .tree
-        .iter()
-        .filter(|(_, node)| node.kind == NodeKind::InlineCode)
-        .filter_map(|(_, node)| {
-            let start = node.source_range.start.0;
-            let end = node.source_range.end.0;
-            let text = whole_source.get(start - base..end - base)?;
-            let marker_len = text.bytes().take_while(|byte| *byte == b'`').count();
-            if marker_len == 0 || marker_len * 2 > text.len() {
-                return None;
-            }
-            let content_start = start + marker_len;
-            let content_end = end - marker_len;
-            let content = whole_source.get(content_start - base..content_end - base)?;
-            let bytes = content.as_bytes();
-            let padded = bytes.first().copied().is_some_and(is_pad)
-                && bytes.last().copied().is_some_and(is_pad)
-                && !bytes.iter().copied().all(is_pad);
-            padded.then(|| {
-                [
-                    SourceRange::new(content_start, content_start + 1),
-                    SourceRange::new(content_end - 1, content_end),
-                ]
-            })
-        })
-        .flatten()
-        .collect()
 }
 
 /// The standalone image `source` presents as, when nothing currently discloses
@@ -1613,7 +1564,6 @@ fn present_joined_run(
         }
     };
     let shared = SharedParse {
-        whole_source: &joined.joined_source,
         parsed: &joined.parsed,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
@@ -2396,6 +2346,89 @@ mod tests {
                 assert_eq!(
                     narrow[0].source_map.segments,
                     wide[index].source_map.segments
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_padding_inside_containers_preserves_shared_projection_and_source() {
+        for (source, expected) in [
+            ("> `\n> x\n> `", vec!["", "x", ""]),
+            ("> `\r\n> x\r\n> `", vec!["", "x", ""]),
+            ("> > `\n> > x\n> > `", vec!["", "x", ""]),
+            ("> ` \n>  `", vec![" ", " "]),
+            ("> ` x\n> y `", vec!["x", "y"]),
+            ("- `\n  x\n  `", vec!["", "  x", "  "]),
+        ] {
+            let mut offset = 50;
+            let lines: Vec<_> = source
+                .split_inclusive('\n')
+                .enumerate()
+                .map(|(line, text)| {
+                    let start = offset;
+                    offset += text.len();
+                    BlockLine {
+                        line,
+                        range: SourceRange::new(start, offset),
+                        text,
+                        disclosure: None,
+                    }
+                })
+                .collect();
+            let block = IndexedBlock {
+                ordinal: 0,
+                id: BlockId(0),
+                kind: if source.starts_with('>') {
+                    NodeKind::Quote
+                } else {
+                    NodeKind::List { ordered: false }
+                },
+                source_range: SourceRange::new(50, offset),
+                revision: Revision(1),
+                confidence: Confidence::Formal,
+                line_count: lines.len(),
+            };
+            let joined = parse_joined_block(&lines, Revision(1));
+            let window = BlockWindow {
+                span: 0..lines.len(),
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 0..lines.len(),
+                joined: Some(&joined),
+                block_disclosure: None,
+            };
+            let wide = present_block(&block, Revision(1), &window, 26.0);
+            for (index, line) in wide.lines.iter().enumerate() {
+                assert_eq!(
+                    line.visual_text, expected[index],
+                    "{source:?}, line {index}"
+                );
+                assert_ne!(line.kind, BlockKind::Unsupported);
+                assert!(segments_tile_range(
+                    lines[index].range,
+                    &line.source_map.segments
+                ));
+                let narrow_window = BlockWindow {
+                    lines: &lines[index..index + 1],
+                    render: index..index + 1,
+                    ..window.clone()
+                };
+                let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+                assert_eq!(
+                    narrow.lines[0].source_map.segments,
+                    line.source_map.segments
+                );
+            }
+            let active_window = BlockWindow {
+                block_disclosure: Some(SourceRange::empty(50 + source.find('`').unwrap() + 1)),
+                ..window
+            };
+            let active = present_block(&block, Revision(1), &active_window, 26.0);
+            for (index, line) in active.lines.iter().enumerate() {
+                assert_eq!(
+                    line.visual_text,
+                    lines[index].text.trim_end_matches(['\r', '\n'])
                 );
             }
         }

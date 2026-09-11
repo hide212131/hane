@@ -228,6 +228,9 @@ pub struct MarkdownParse {
     /// prefixes cannot be associated with an owner by comparing source starts.
     /// Kept before range merging so nested, adjacent prefixes retain ownership.
     pub quote_markers: Vec<(SourceRange, NodeId)>,
+    /// Padding removed from inline code after container prefixes and line
+    /// endings are interpreted. Derived against the parser's code content.
+    pub code_padding: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,12 +518,12 @@ fn consume_containers(
 /// Recover a quote's markers from its actual ancestor containers, not a fixed
 /// byte width per depth. Lazy continuation lines fail the prefix scan and have
 /// no marker. List-item padding is measured on that item's opening line.
-fn quote_markers(
+fn ancestor_containers(
     tree: &MarkdownTree,
     id: NodeId,
     range: SourceRange,
     source: &str,
-) -> Vec<SourceRange> {
+) -> Option<Vec<PrefixContainer>> {
     let ancestors: Vec<_> = tree.ancestors(id).skip(1).collect();
     let mut containers = Vec::new();
     for ancestor in ancestors.into_iter().rev() {
@@ -534,18 +537,25 @@ fn quote_markers(
                     .split_inclusive('\n')
                     .next()
                     .unwrap_or("");
-                let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
-                else {
-                    return Vec::new();
-                };
-                let Some(indent) = cursor.list_item(line.as_bytes()) else {
-                    return Vec::new();
-                };
+                let mut cursor = consume_containers(&containers, line_start, line.as_bytes())?;
+                let indent = cursor.list_item(line.as_bytes())?;
                 containers.push(PrefixContainer::ListItem { start, indent });
             }
             _ => {}
         }
     }
+    Some(containers)
+}
+
+fn quote_markers(
+    tree: &MarkdownTree,
+    id: NodeId,
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let Some(containers) = ancestor_containers(tree, id, range, source) else {
+        return Vec::new();
+    };
     let node = tree.node(id).expect("quote exists");
     let start = node.source_range.start.0 - range.start.0;
     let end = node.source_range.end.0 - range.start.0;
@@ -560,6 +570,88 @@ fn quote_markers(
         line_start += line.len();
     }
     markers
+}
+
+struct ParsedCodeSpan {
+    node: NodeId,
+    content: String,
+}
+
+/// Project code content back to source before choosing padding. Source spans
+/// include container prefixes; those bytes are not part of Event::Code's text.
+fn code_padding(
+    tree: &MarkdownTree,
+    codes: &[ParsedCodeSpan],
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let mut padding = Vec::new();
+    for code in codes {
+        let node = tree.node(code.node).expect("code node exists");
+        let start = node.source_range.start.0 - range.start.0;
+        let end = node.source_range.end.0 - range.start.0;
+        let delimiter = source[start..end]
+            .bytes()
+            .take_while(|b| *b == b'`')
+            .count();
+        let Some(containers) = ancestor_containers(tree, code.node, range, source) else {
+            continue;
+        };
+        let mut cursor = start + delimiter;
+        let end = end - delimiter;
+        let mut normalized = String::new();
+        let mut first = None;
+        let mut last = None;
+        while cursor < end {
+            let from = cursor;
+            let byte = source.as_bytes()[cursor];
+            let is_break = matches!(byte, b'\r' | b'\n');
+            let character = if is_break {
+                cursor += 1;
+                if byte == b'\r' && source.as_bytes().get(cursor) == Some(&b'\n') {
+                    cursor += 1;
+                }
+                ' '
+            } else {
+                let character = source[cursor..].chars().next().expect("source character");
+                cursor += character.len_utf8();
+                character
+            };
+            let unit = absolute_range(range.start.0, from..cursor);
+            first.get_or_insert(unit);
+            last = Some(unit);
+            normalized.push(character);
+            if is_break {
+                // Lazy continuation may carry only some ancestor prefixes.
+                let line = &source.as_bytes()[cursor..end];
+                let mut prefix = PrefixCursor::default();
+                for container in &containers {
+                    let before = prefix;
+                    let matched = match container {
+                        PrefixContainer::Quote => prefix.quote(line).is_some(),
+                        PrefixContainer::ListItem { indent, .. } => {
+                            prefix.indent(line, *indent) == *indent
+                        }
+                    };
+                    if !matched {
+                        prefix = before;
+                        break;
+                    }
+                }
+                cursor += prefix.byte;
+            }
+        }
+        // The parser is authoritative: only emit padding when removing one
+        // semantic space from each end reproduces its actual code content.
+        if normalized.starts_with(' ')
+            && normalized.ends_with(' ')
+            && normalized.bytes().any(|byte| byte != b' ')
+            && normalized.get(1..normalized.len() - 1) == Some(code.content.as_str())
+        {
+            padding.extend([first.expect("nonempty code"), last.expect("nonempty code")]);
+        }
+    }
+    padding
 }
 
 struct DerivedMarkers {
@@ -766,7 +858,8 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 /// pairs push and pop; every other event becomes a leaf under the open
 /// container. Unmodeled tags still push a node so the stack stays balanced and
 /// their source range remains reachable.
-fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
+fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<ParsedCodeSpan>) {
+    let mut codes = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -817,8 +910,12 @@ fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
             Event::Text(_) => {
                 push(&mut nodes, &open, NodeKind::Text, range);
             }
-            Event::Code(_) => {
-                push(&mut nodes, &open, NodeKind::InlineCode, range);
+            Event::Code(content) => {
+                let node = push(&mut nodes, &open, NodeKind::InlineCode, range);
+                codes.push(ParsedCodeSpan {
+                    node,
+                    content: content.into_string(),
+                });
             }
             Event::Html(_) => {
                 push(&mut nodes, &open, NodeKind::Html, range);
@@ -840,7 +937,7 @@ fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
             }
         }
     }
-    MarkdownTree { nodes }
+    (MarkdownTree { nodes }, codes)
 }
 
 /// Parses a source slice into a node tree and retains the byte range of every
@@ -852,20 +949,58 @@ pub fn parse_document(
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let tree = build_tree(source_range, source);
+    let (tree, codes) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
+    let code_padding = code_padding(&tree, &codes, source_range, source);
     MarkdownParse {
         revision,
         source_range,
         tree,
         markers: markers.markers,
         quote_markers: markers.quote_markers,
+        code_padding,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_padding_tracks_semantic_spaces_instead_of_container_bytes() {
+        for (source, expected) in [
+            ("` code `", vec![(1, 2), (6, 7)]),
+            // pulldown-cmark 0.13.4 returns " x " for these CRLF spans.
+            // Our one-newline projection must not invent padding when it
+            // disagrees with the parser; retain the complete source ranges.
+            ("`\r\nx\r\n`", vec![]),
+            ("> `\r\n> x\r\n> `", vec![]),
+            ("> ` \n>  `", vec![]),
+            ("` `", vec![]),
+            ("`code `", vec![]),
+            ("` \t `", vec![(1, 2), (3, 4)]),
+        ] {
+            let base = 31;
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(base, base + source.len()),
+                source,
+            );
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(base + start, base + end))
+                .collect();
+            assert_eq!(parsed.code_padding, expected, "{source:?}");
+            for padding in &parsed.code_padding {
+                assert!(
+                    parsed
+                        .markers
+                        .iter()
+                        .all(|marker| !padding.intersects(*marker))
+                );
+            }
+        }
+    }
 
     #[test]
     fn commonmark_ranges_remain_absolute_for_unicode_and_nested_styles() {
