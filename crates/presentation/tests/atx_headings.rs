@@ -1,11 +1,14 @@
 mod support;
 use hane_markdown::NodeKind;
-use hane_presentation::BlockKind;
-use support::{MarkdownFixture, verify};
+use hane_presentation::{
+    BlockKind,
+    StyleKind::{CodeBlock, InlineCode, Italic, Link},
+};
+use support::{MarkdownFixture, style, verify};
 
 #[test]
 fn atx_headings_preserve_display_disclosure_positions_and_source() {
-    for fixture in [
+    const FIXTURES: &[MarkdownFixture] = &[
         MarkdownFixture {
             name: "ATX levels and empty headings",
             source: "# H1\n## H2 ##\n### H3\n#### H4\n##### H5\n###### H6\n#\n## ###",
@@ -24,6 +27,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Heading(2),
             ],
             visual_lines: &["H1", "H2", "H3", "H4", "H5", "H6", "", ""],
+            style_runs: &[&[], &[], &[], &[], &[], &[], &[], &[]],
         },
         MarkdownFixture {
             name: "ATX tabs spaces and inline syntax",
@@ -36,6 +40,11 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
             markers: &["##\t  ", "*", "*", "[", "](url)", "`", "`", "\t###\t"],
             block_kinds: &[BlockKind::Heading(2)],
             visual_lines: &["  羽 link code"],
+            style_runs: &[&[
+                style(Italic, 2, 5),
+                style(Link, 6, 10),
+                style(InlineCode, 11, 15),
+            ]],
         },
         MarkdownFixture {
             name: "ATX literal hashes and escapes retain source spelling",
@@ -48,6 +57,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Heading(3),
             ],
             visual_lines: &["foo###", "foo \\###", "foo ### bar"],
+            style_runs: &[&[], &[], &[]],
         },
         MarkdownFixture {
             name: "ATX paragraph interruption",
@@ -60,6 +70,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Paragraph,
             ],
             visual_lines: &["before", "title", "after"],
+            style_runs: &[&[], &[], &[]],
         },
         MarkdownFixture {
             name: "invalid ATX is literal",
@@ -72,6 +83,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Paragraph,
             ],
             visual_lines: &["#foo", "####### foo", "\\# foo"],
+            style_runs: &[&[], &[], &[]],
         },
         MarkdownFixture {
             name: "ATX inside containers uses existing container display",
@@ -91,6 +103,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Heading(3),
             ],
             visual_lines: &["quote", "", "item"],
+            style_runs: &[&[], &[], &[]],
         },
         MarkdownFixture {
             name: "ATX in code stays literal",
@@ -105,8 +118,16 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::CodeBlock,
             ],
             visual_lines: &["    # indented", "", "```", "## fenced ###", "```"],
+            style_runs: &[
+                &[style(CodeBlock, 0, 14)],
+                &[],
+                &[style(CodeBlock, 0, 3)],
+                &[style(CodeBlock, 0, 13)],
+                &[style(CodeBlock, 0, 3)],
+            ],
         },
-    ] {
-        verify(&fixture);
+    ];
+    for fixture in FIXTURES {
+        verify(fixture);
     }
 }
