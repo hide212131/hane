@@ -62,6 +62,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
+/// Bound whole-block CPU work across all blocks and document switches in this
+/// view. Do not queue missed viewports: a completion wakes the current viewport.
+const MAX_JOINED_PARSE_JOBS: usize = 2;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const MAIN_MIN_WIDTH: f32 = 280.0;
@@ -368,6 +371,9 @@ pub struct EditorView {
     /// Blocks with a `schedule_joined_parse` background job in flight, so a
     /// block already being parsed is not queued again on the next frame.
     joined_parse_jobs: HashMap<BlockId, JoinedParseJob>,
+    /// Includes detached jobs from previous documents until their completion.
+    /// Unlike the per-document deduplication map, replacement must not reset it.
+    joined_parse_jobs_running: usize,
 }
 
 /// Identity of a background request. A late completion must not clear the
@@ -646,6 +652,7 @@ impl EditorView {
             document_parse_job_running: false,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
+            joined_parse_jobs_running: 0,
         }
     }
 
@@ -1977,7 +1984,7 @@ impl EditorView {
     /// joinable block that exceeds either synchronous line or byte budget — the
     /// case `presented_block` itself cannot read and reparse synchronously on
     /// every viewport miss without making a single huge paragraph's render
-    /// cost scale with its length. One job per block at a time; mirrors
+    /// cost scale with its length. One job per block, bounded across documents; mirrors
     /// [`Self::schedule_document_parse`]'s snapshot-and-spawn shape but at
     /// block granularity, and is what resolves a marker pair arbitrarily far
     /// apart in such a block without a fixed context window whose result
@@ -1985,6 +1992,11 @@ impl EditorView {
     fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
         let revision = self.editor().document().revision();
         for block in blocks {
+            if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
+                // No backlog of obsolete viewport requests. Completion notifies
+                // the view so its current visible blocks can request a free slot.
+                break;
+            }
             if !block_is_joinable(block.kind) {
                 continue;
             }
@@ -2020,21 +2032,24 @@ impl EditorView {
                 source_range,
             };
             self.joined_parse_jobs.insert(id, job);
+            self.joined_parse_jobs_running += 1;
             cx.spawn(async move |view, cx| {
                 let parse = cx
                     .background_executor()
                     .spawn(async move { parse_joined_span(&snapshot, content, revision) })
                     .await;
                 let _ = view.update(cx, |view, cx| {
+                    // Release capacity even for an old document. Dropping a
+                    // Task cannot interrupt synchronous parse already polling;
+                    // capacity remains charged until it really finishes.
+                    view.joined_parse_jobs_running -= 1;
+                    cx.notify();
                     if view.document_key() != job.document
                         || view.joined_parse_jobs.get(&id) != Some(&job)
                     {
                         return;
                     }
                     view.joined_parse_jobs.remove(&id);
-                    // Even a rejected result releases this block for a new
-                    // request on the next frame, without evicting valid rows.
-                    cx.notify();
                     // Resolve against the already-published current index;
                     // never parse source synchronously to validate a result.
                     // A provisional request can retry once the formal index
@@ -4337,6 +4352,87 @@ mod tests {
                     .any(|run| run.kind == hane_presentation::StyleKind::Bold)
             );
         });
+    }
+
+    #[gpui::test]
+    fn joined_parse_work_is_bounded_across_scrolling_and_document_switches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for switch_document in [false, true] {
+            let paragraph = "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET + 1);
+            let text = (0..8)
+                .map(|i| format!("{i} **{paragraph}\nend**\n\n"))
+                .collect::<String>();
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "First", cx));
+            let current = view.update(cx, |view, cx| {
+                let index = BlockIndex::from_buffer(view.editor().document());
+                // Rapid viewport changes before background completions must not
+                // accumulate a parse of every paragraph we passed through.
+                for ordinal in 0..8 {
+                    view.schedule_joined_parse(&[index.block(ordinal).unwrap()], cx);
+                    assert!(view.joined_parse_jobs_running <= MAX_JOINED_PARSE_JOBS);
+                }
+                assert_eq!(view.joined_parse_jobs_running, MAX_JOINED_PARSE_JOBS);
+                assert_eq!(view.joined_parse_jobs.len(), MAX_JOINED_PARSE_JOBS);
+                if switch_document {
+                    // Repeat real session replacement, which clears the block
+                    // map but must leave detached work charged against the cap.
+                    for title in ["Second", "Third"] {
+                        view.sessions.open_untitled(&text, title);
+                        view.on_document_replaced();
+                        let index = BlockIndex::from_buffer(view.editor().document());
+                        for ordinal in 0..8 {
+                            view.schedule_joined_parse(&[index.block(ordinal).unwrap()], cx);
+                        }
+                        assert!(view.joined_parse_jobs.is_empty());
+                        assert_eq!(view.joined_parse_jobs_running, MAX_JOINED_PARSE_JOBS);
+                    }
+                }
+                let document = view.sessions.active().editor().document();
+                let index = BlockIndex::from_buffer(document);
+                let current = index.block(7).unwrap();
+                view.block_index
+                    .publish(index, IndexSource::Formal, document);
+                current
+            });
+            // Model the render wakeup: only the final viewport is requested
+            // again when capacity is released, including old-document results.
+            let wakeups = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_wakeups = wakeups.clone();
+            let _subscription = cx.update(|cx| {
+                cx.observe(&view, move |view, cx| {
+                    observed_wakeups.set(observed_wakeups.get() + 1);
+                    view.update(cx, |view, cx| {
+                        view.schedule_joined_parse(&[current], cx);
+                        assert!(view.joined_parse_jobs_running <= MAX_JOINED_PARSE_JOBS);
+                    });
+                })
+            });
+            cx.run_until_parked();
+            assert!(
+                wakeups.get() > 0,
+                "completion must wake the current viewport"
+            );
+            view.update(cx, |view, _| {
+                assert_eq!(view.joined_parse_jobs_running, 0);
+                assert!(view.joined_parse_jobs.is_empty());
+                let cached = &view.joined_parse_cache[&current.id];
+                assert_eq!(cached.revision, view.editor().document().revision());
+                assert_eq!(cached.source_range, current.source_range);
+                // No backlog: traversed intermediate blocks were never parsed.
+                let index = view.current_index().unwrap();
+                for ordinal in MAX_JOINED_PARSE_JOBS..7 {
+                    assert!(
+                        !view
+                            .joined_parse_cache
+                            .contains_key(&index.block(ordinal).unwrap().id)
+                    );
+                }
+                if switch_document {
+                    assert_eq!(view.joined_parse_cache.len(), 1);
+                }
+            });
+        }
     }
 
     #[gpui::test]
