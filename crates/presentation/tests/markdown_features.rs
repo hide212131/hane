@@ -144,18 +144,60 @@ const FIXTURES: &[MarkdownFixture] = &[
     },
     MarkdownFixture {
         name: "code span spanning a soft line break",
-        // CommonMark 0.31.2 §6.1 Example 335: a line ending inside a code span
-        // normalizes to a single space rather than splitting the span. Hane's
-        // per-source-line editor model presents that normalized boundary as a
-        // line break rather than a synthesized space character, so this fixture
-        // is the evidence that the span stays one `InlineCode` node (one pair of
-        // markers) spanning both editor lines instead of two unmatched halves.
+        // A line ending inside a code span normalizes to a single space rather
+        // than splitting the span (CommonMark §6.1). Hane's per-source-line
+        // editor model presents that normalized boundary as a line break
+        // rather than a synthesized space character, so this fixture is the
+        // evidence that the span stays one `InlineCode` node (one pair of
+        // markers) spanning both editor lines instead of two unmatched
+        // halves. The exact input and expected values of CommonMark 0.31.2
+        // §6.1 Example 335 are covered separately below.
         source: "See `code\nacross` lines",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
         markers: &["`", "`"],
         block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
         visual_lines: &["See code", "across lines"],
         style_runs: &[&[style(InlineCode, 4, 9)], &[style(InlineCode, 0, 6)]],
+    },
+    MarkdownFixture {
+        name: "code span example 335: interior line endings and trailing spaces",
+        // CommonMark 0.31.2 §6.1 Example 335 (`vendor/pulldown-cmark/tests/suite/spec.rs`'s
+        // `spec_test_335`): a code span opened and closed by a bare `` `` ``
+        // line, with `foo`, `bar  ` (two trailing spaces) and `baz` on the
+        // lines between. Line endings normalize to a single space each, and
+        // the one leading/trailing space produced that way is stripped, so
+        // the reference HTML is `<code>foo bar   baz</code>` — the two
+        // original trailing spaces on `bar  ` survive between the two
+        // collapsed line-ending spaces. Hane's editor model keeps each
+        // physical line's own content instead of collapsing lines into one,
+        // so this checks the same interior whitespace is preserved per line
+        // and that the delimiter-only first and last lines disclose no other
+        // visible text.
+        source: "``\nfoo\nbar  \nbaz\n``",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["``", "``"],
+        block_kinds: &[
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+            BlockKind::Paragraph,
+        ],
+        visual_lines: &["", "foo", "bar  ", "baz", ""],
+        style_runs: &[
+            &[],
+            // `foo` and `bar  ` each end mid-span, so their run retains the
+            // mapped newline byte that becomes the next line's leading space
+            // even though visual_text omits it (same convention as the
+            // soft-line-break fixtures above).
+            &[style(InlineCode, 0, 4)],
+            &[style(InlineCode, 0, 6)],
+            // `baz` is the last content line; its trailing newline is the
+            // stripped closing padding, not a semantic space, so the run
+            // matches visual_text exactly.
+            &[style(InlineCode, 0, 3)],
+            &[],
+        ],
     },
     MarkdownFixture {
         name: "strong emphasis spanning a soft line break inside a list item",
