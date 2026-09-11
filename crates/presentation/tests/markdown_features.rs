@@ -127,6 +127,12 @@ const FIXTURES: &[MarkdownFixture] = &[
     },
     MarkdownFixture {
         name: "code span spanning a soft line break",
+        // CommonMark 0.31.2 §6.1 Example 335: a line ending inside a code span
+        // normalizes to a single space rather than splitting the span. Hane's
+        // per-source-line editor model presents that normalized boundary as a
+        // line break rather than a synthesized space character, so this fixture
+        // is the evidence that the span stays one `InlineCode` node (one pair of
+        // markers) spanning both editor lines instead of two unmatched halves.
         source: "See `code\nacross` lines",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
         markers: &["`", "`"],
@@ -160,6 +166,9 @@ const FIXTURES: &[MarkdownFixture] = &[
     },
     MarkdownFixture {
         name: "nested strong and emphasis",
+        // Not a single numbered CommonMark example; kept as the evidence that
+        // Strong and Emphasis compose — the inner Emphasis style unions into
+        // the outer Strong run without leaking italics past the outer `**`.
         source: "**bold *and italic* still bold**",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::Strong, NodeKind::Emphasis]],
         markers: &["**", "*", "*", "**"],
@@ -169,6 +178,10 @@ const FIXTURES: &[MarkdownFixture] = &[
     MarkdownFixture {
         name: "emphasis follows CommonMark word-boundary rules",
         // `_` cannot open or close emphasis inside a word; `*` can.
+        // CommonMark 0.31.2 §6.2 Example 360: `foo_bar_baz` stays literal
+        // because `_` is flanked by word characters on both sides. Example
+        // 355: `foo*bar*baz` becomes emphasis because `*` has no such
+        // restriction.
         source: "foo_bar_baz and foo*bar*baz",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::Emphasis]],
         markers: &["*", "*"],
@@ -197,6 +210,86 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["`", "`"],
         block_kinds: &[BlockKind::Paragraph],
         visual_lines: &["pad code pad"],
+    },
+    MarkdownFixture {
+        name: "code span (CommonMark 0.31.2 §6.1 Example 328): simple case",
+        source: "`foo`",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["`", "`"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo"],
+    },
+    MarkdownFixture {
+        name: "code span (CommonMark 0.31.2 §6.1 Example 329): double-backtick \
+               fence enclosing an inner backtick and its padding spaces",
+        source: "`` foo ` bar ``",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["``", "``"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo ` bar"],
+    },
+    MarkdownFixture {
+        name: "code span (CommonMark 0.31.2 §6.1 Example 338): a backslash inside \
+               a code span is literal, not an escape, so it does not protect the \
+               following backtick from closing the span",
+        source: r"`foo\`bar`",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["`", "`"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo\\bar`"],
+    },
+    MarkdownFixture {
+        name: "code span (CommonMark 0.31.2 §6.1 Example 347): mismatched \
+               backtick-string lengths never form a code span",
+        source: "```foo``",
+        tree_paths: &[],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["```foo``"],
+    },
+    MarkdownFixture {
+        name: "code span (CommonMark 0.31.2 §6.1 Example 348): an unclosed \
+               backtick never forms a code span",
+        source: "`foo",
+        tree_paths: &[],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["`foo"],
+    },
+    MarkdownFixture {
+        name: "emphasis (CommonMark 0.31.2 §6.2 Example 350): basic *...*",
+        source: "*foo bar*",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::Emphasis]],
+        markers: &["*", "*"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo bar"],
+    },
+    MarkdownFixture {
+        name: "emphasis (CommonMark 0.31.2 §6.2 Example 351): an opener \
+               immediately followed by whitespace cannot open emphasis",
+        source: "a * foo bar*",
+        tree_paths: &[],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["a * foo bar*"],
+    },
+    MarkdownFixture {
+        name: "emphasis (CommonMark 0.31.2 §6.2 Example 357): basic _..._",
+        source: "_foo bar_",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::Emphasis]],
+        markers: &["_", "_"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo bar"],
+    },
+    MarkdownFixture {
+        name: "emphasis (CommonMark 0.31.2 §6.2 Example 365): a closer \
+               immediately preceded by whitespace is not right-flanking, so it \
+               cannot close and the delimiter run never finds a matching pair",
+        source: "_foo bar _",
+        tree_paths: &[],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["_foo bar _"],
     },
 ];
 
