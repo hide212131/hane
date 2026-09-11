@@ -43,11 +43,14 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/4"
+PROCEDURE_VERSION = "hosted-gui-interaction/5"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
-    "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力の"
-    "およびOSスクロールの基本スモーク確認に限定される。全フォーカス移動・ダイアログ表示等の"
+    "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
+    "OSスクロール、および太字/斜体複合・複数行 inline code・quote・list における"
+    "marker/本文境界へのクリック・ドラッグ選択・区切り記号の追加削除の基本スモーク確認に"
+    "限定される。太字・斜体の見た目そのものはこの結果では証明されない（OCR は座標特定にのみ"
+    "使用し、presentation の style-run はここでは検証しない）。全フォーカス移動・ダイアログ表示等の"
     "網羅的な GUI 検証はまだ証明されていない。"
 )
 
@@ -64,6 +67,50 @@ IME_ROMAJI = "nihongo"
 # first-candidate conversion for this common word; it is recorded as an
 # expectation, not guaranteed, since it depends on the runner's IME state.
 IME_EXPECTED_TEXT = "日本語"
+
+# Representative constructs from Issue #101 / ADR-0025: a bold+italic
+# combination, an inline code span whose delimiters sit on different source
+# lines (joined by a soft line break), a quote, and a list item.
+INLINE_FIXTURE_ORIGINAL = (
+    "# hosted gui interaction inline syntax spike\n"
+    "\n"
+    "**bold *italic* combo** boundary line.\n"
+    "\n"
+    "this inline `code\n"
+    "span` crosses a line.\n"
+    "\n"
+    "> quote with **bold** inside.\n"
+    "\n"
+    "- list item with *italic* inside.\n"
+)
+
+# Each pattern uses just enough lookaround context to be unambiguous within
+# the whole fixture even though the literal marker glyphs ("**", "*", "`")
+# repeat across lines. The same patterns drive both the real OS-level click
+# (scripts/hosted_gui_interaction.swift, via OCR) and the expected saved-byte
+# computation below, so the two cannot silently drift apart.
+BOLD_ITALIC_OPEN_RE = r"\*\*(?=bold \*italic)"
+BOLD_ITALIC_CLOSE_RE = r"(?<=combo)\*\*"
+CODE_SPAN_OPEN_RE = r"`(?=code)"
+QUOTE_BOLD_OPEN_RE = r"(?<=quote with )\*\*(?=bold)"
+LIST_ITALIC_OPEN_RE = r"(?<=item with )\*(?=italic)"
+DRAG_SELECT_START_RE = r"(?<=bold )\*(?=italic)"
+DRAG_SELECT_END_RE = r"(?<=italic)\*(?= combo)"
+DELIMITER_CLOSE_RE = r"(?<=loose)\*$"
+BOUNDARY_MARK = "Z"
+
+
+def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
+    """Compute the expected byte content after clicking pattern's edge and typing.
+
+    Mirrors clickText/typeSave in the swift helper: `edge='end'` inserts right
+    after the matched marker, `edge='start'` inserts right before it.
+    """
+    match = re.search(pattern, text)
+    if not match:
+        raise ValueError(f"pattern not found in expected fixture text: {pattern}")
+    position = match.end() if edge == "end" else match.start()
+    return text[:position] + insertion + text[position:]
 
 
 def load_pinned_gui_validate(control_dir: Path):
@@ -480,6 +527,259 @@ def run_scroll_scenario(module, env, target_dir, swift_helper, base_run_dir, bin
             "reason": reason_for(steps), "evidence": {"fixture_path": str(fixture)}}
 
 
+def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseline,
+                         pattern, edge, insertion, helper_timeout, poll_timeout):
+    """Click an OCR-located marker/content boundary, type, save, verify the
+    exact expected bytes, then undo+save and verify the document reverted."""
+    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot_path), pattern, edge], helper_timeout)
+    if not ok:
+        return False, f"境界へのクリックに失敗した: {err}"
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), insertion], helper_timeout)
+    if not ok:
+        return False, f"境界への入力に失敗した: {err}"
+    expected = insert_at_match(baseline, pattern, insertion, edge=edge)
+    matched, actual = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
+    if not matched:
+        return False, f"境界クリック挿入後の内容が期待値と一致しない: actual={actual.decode('utf-8', errors='replace')!r}"
+    ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+    if not ok:
+        return False, f"undo に失敗した: {err}"
+    matched, actual = wait_for_fixture_bytes(fixture_path, baseline.encode("utf-8"), poll_timeout)
+    if not matched:
+        return False, f"undo 後に元の内容へ戻らない: actual={actual.decode('utf-8', errors='replace')!r}"
+    return True, None
+
+
+def run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                       name, checks, helper_timeout, poll_timeout):
+    pid = current_pid(process_holder)
+    if pid is None or window_id is None:
+        return skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")
+    for index, (pattern, edge) in enumerate(checks):
+        capture_step = capture_named(module, env, config, window_id, run_dir, f"{name}_{index}")
+        if capture_step["result"] != "pass":
+            return make_step(name, "blocked", reason=f"境界確認用の撮影に失敗した: {capture_step.get('reason')}")
+        screenshot = run_dir / f"{name}_{index}.png"
+        ok, reason = boundary_edit_check(
+            swift_helper, screenshot, pid, config.fixture_path, INLINE_FIXTURE_ORIGINAL,
+            pattern, edge, BOUNDARY_MARK, helper_timeout, poll_timeout,
+        )
+        if not ok:
+            return make_step(name, "fail", reason=reason)
+    return make_step(name, "pass")
+
+
+def run_drag_select_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                          helper_timeout, poll_timeout):
+    name = "drag_select_delete_undo_redo"
+    pid = current_pid(process_holder)
+    if pid is None or window_id is None:
+        return skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")
+    capture_step = capture_named(module, env, config, window_id, run_dir, "drag_select_state0")
+    if capture_step["result"] != "pass":
+        return make_step(name, "blocked", reason=f"撮影に失敗した: {capture_step.get('reason')}")
+    screenshot = run_dir / "drag_select_state0.png"
+    ok, _out, err = run_helper(swift_helper, ["drag-select-text", str(pid), str(screenshot),
+                                              DRAG_SELECT_START_RE, "start", DRAG_SELECT_END_RE, "end"], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"ドラッグ選択に失敗した: {err}")
+    ok, _out, err = run_helper(swift_helper, ["delete-selection-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"選択範囲の削除に失敗した: {err}")
+    deleted_expected = INLINE_FIXTURE_ORIGINAL.replace("*italic*", "", 1)
+
+    def expect(expected_text, failure_reason):
+        matched, actual = wait_for_fixture_bytes(config.fixture_path, expected_text.encode("utf-8"), poll_timeout)
+        return None if matched else make_step(name, "fail", reason=f"{failure_reason}: actual={actual.decode('utf-8', errors='replace')!r}")
+
+    failed = expect(deleted_expected, "ドラッグ選択範囲の削除結果が一致しない")
+    if failed:
+        return failed
+    ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"undo に失敗した: {err}")
+    failed = expect(INLINE_FIXTURE_ORIGINAL, "undo 後に元の内容へ戻らない")
+    if failed:
+        return failed
+    ok, _out, err = run_helper(swift_helper, ["redo-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"redo に失敗した: {err}")
+    failed = expect(deleted_expected, "redo 後に削除結果へ戻らない")
+    if failed:
+        return failed
+    ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"最終 undo に失敗した: {err}")
+    failed = expect(INLINE_FIXTURE_ORIGINAL, "最終 undo 後に元の内容へ戻らない")
+    if failed:
+        return failed
+    return make_step(name, "pass")
+
+
+def run_delimiter_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                        helper_timeout, poll_timeout):
+    name = "delimiter_unclosed_then_closed"
+    pid = current_pid(process_holder)
+    if pid is None or window_id is None:
+        return skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")
+
+    def expect(expected_text, failure_reason):
+        matched, actual = wait_for_fixture_bytes(config.fixture_path, expected_text.encode("utf-8"), poll_timeout)
+        return None if matched else make_step(name, "fail", reason=f"{failure_reason}: actual={actual.decode('utf-8', errors='replace')!r}")
+
+    ok, _out, err = run_helper(swift_helper, ["end-doc-type-save", str(pid), " *loose"], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"文末への未閉鎖区切り記号入力に失敗した: {err}")
+    unclosed_expected = INLINE_FIXTURE_ORIGINAL + " *loose"
+    failed = expect(unclosed_expected, "未閉鎖の区切り記号を含む保存内容が一致しない")
+    if failed:
+        return failed
+    # Auxiliary evidence only: this screenshot is not itself used to judge
+    # pass/fail (the byte comparisons above/below are authoritative), since
+    # OCR alone must not be treated as proof of "reverts to plain text".
+    capture_named(module, env, config, window_id, run_dir, "delimiter_unclosed")
+
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "*"], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"区切り記号の閉鎖入力に失敗した: {err}")
+    closed_expected = unclosed_expected + "*"
+    failed = expect(closed_expected, "区切り記号を閉じた後の保存内容が一致しない")
+    if failed:
+        return failed
+
+    capture_step = capture_named(module, env, config, window_id, run_dir, "delimiter_closed")
+    if capture_step["result"] != "pass":
+        return make_step(name, "blocked", reason=f"撮影に失敗した: {capture_step.get('reason')}")
+    screenshot = run_dir / "delimiter_closed.png"
+    ok, _out, err = run_helper(swift_helper, ["drag-select-text", str(pid), str(screenshot),
+                                              DELIMITER_CLOSE_RE, "start", DELIMITER_CLOSE_RE, "end"], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"閉じ区切り記号のドラッグ選択に失敗した: {err}")
+    ok, _out, err = run_helper(swift_helper, ["delete-selection-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"閉じ区切り記号の削除に失敗した: {err}")
+    failed = expect(unclosed_expected, "区切り記号を削除して未閉鎖へ戻す結果が一致しない")
+    if failed:
+        return failed
+
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "*"], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked", reason=f"区切り記号の再閉鎖入力に失敗した: {err}")
+    failed = expect(closed_expected, "区切り記号を再度閉じた後の保存内容が一致しない")
+    if failed:
+        return failed
+    return make_step(name, "pass")
+
+
+def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_dir, binary_path,
+                                expected_sha, request_id, startup_timeout, window_timeout,
+                                helper_timeout, poll_timeout, priority) -> dict:
+    run_dir = base_run_dir / "inline_syntax_boundary"
+    fixture_path = run_dir / "inline-fixture.md"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fixture_path.write_text(INLINE_FIXTURE_ORIGINAL, encoding="utf-8")
+
+    steps: list[dict] = []
+    process_holder: dict = {"process": None}
+    config = make_config(
+        module, workspace_dir=target_dir, scenario="inline-syntax-boundary",
+        expected_sha=expected_sha, request_id=request_id, generation="1", run_dir=run_dir,
+        fixture_path=fixture_path, features=["timing-probe"], extra_env={},
+        startup_timeout=startup_timeout, window_timeout=window_timeout,
+    )
+
+    try:
+        session_steps, window_id = open_session(module, env, config, binary_path, process_holder, "before")
+        steps += session_steps
+
+        steps.append(run_boundary_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            "boundary_click_edit_bold_italic",
+            [(BOLD_ITALIC_OPEN_RE, "end"), (BOLD_ITALIC_CLOSE_RE, "start")],
+            helper_timeout, poll_timeout,
+        ))
+        steps.append(run_boundary_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            "boundary_click_edit_code_span", [(CODE_SPAN_OPEN_RE, "end")],
+            helper_timeout, poll_timeout,
+        ))
+        steps.append(run_boundary_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            "boundary_click_edit_quote", [(QUOTE_BOLD_OPEN_RE, "end")],
+            helper_timeout, poll_timeout,
+        ))
+        steps.append(run_boundary_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            "boundary_click_edit_list", [(LIST_ITALIC_OPEN_RE, "end")],
+            helper_timeout, poll_timeout,
+        ))
+        steps.append(run_drag_select_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout,
+        ))
+        steps.append(run_delimiter_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout,
+        ))
+
+        if window_id is not None:
+            steps.append(capture_named(module, env, config, window_id, run_dir, "after"))
+    finally:
+        steps.append(close_session(module, env, process_holder))
+
+    pre_reopen_result = worst_result(steps, priority)
+    if pre_reopen_result != "pass":
+        for name in ("launch_reopen", "window_discovery_reopen", "capture_reopen",
+                     "visible_saved_text", "reopen_content_check", "cleanup_reopen"):
+            steps.append(skipped_step(name, "再オープン前の工程が pass しなかった"))
+        return {"name": "inline_syntax_boundary", "steps": steps,
+                "result": worst_result(steps, priority), "reason": reason_for(steps),
+                "evidence": {"fixture_path": str(fixture_path), "run_dir": str(run_dir)}}
+
+    expected_final = INLINE_FIXTURE_ORIGINAL + " *loose*"
+    reopen_dir = run_dir / "reopen"
+    reopen_process_holder: dict = {"process": None}
+    reopen_config = make_config(
+        module, workspace_dir=target_dir, scenario="inline-syntax-boundary-reopen",
+        expected_sha=expected_sha, request_id=request_id, generation="2", run_dir=reopen_dir,
+        fixture_path=fixture_path, features=["timing-probe"], extra_env={},
+        startup_timeout=startup_timeout, window_timeout=window_timeout,
+    )
+    try:
+        launch_step = module.do_launch(env, reopen_config, binary_path, reopen_process_holder)
+        steps.append({**launch_step, "name": "launch_reopen"})
+        reopen_window_id = None
+        if launch_step["result"] != "pass":
+            steps.append(skipped_step("window_discovery_reopen", "launch_reopen が pass しなかった"))
+            steps.append(skipped_step("capture_reopen", "launch_reopen が pass しなかった"))
+        else:
+            window_step, reopen_window_id = module.do_window_discovery(env, reopen_config, reopen_process_holder["process"])
+            steps.append({**window_step, "name": "window_discovery_reopen"})
+            if window_step["result"] != "pass":
+                steps.append(skipped_step("capture_reopen", "window_discovery_reopen が pass しなかった"))
+            else:
+                steps.append(capture_named(module, env, reopen_config, reopen_window_id, reopen_dir, "reopen"))
+        steps.append(verify_visible_text(swift_helper, reopen_dir / "reopen.png", "loose", helper_timeout))
+        matched, actual = wait_for_fixture_bytes(fixture_path, expected_final.encode("utf-8"), 1.0)
+        steps.append(make_step(
+            "reopen_content_check", "pass" if matched else "fail",
+            reason=None if matched else "再オープン後もフィクスチャ内容が期待通りであることを確認できない",
+            note="ファイル内容の一致は再オープンの証跡の一部に過ぎず、描画結果そのものの証明ではない",
+            actual=actual.decode("utf-8", errors="replace"),
+        ))
+    finally:
+        cleanup_step = close_session(module, env, reopen_process_holder)
+        steps.append({**cleanup_step, "name": "cleanup_reopen"})
+
+    return {
+        "name": "inline_syntax_boundary",
+        "steps": steps,
+        "result": worst_result(steps, priority),
+        "reason": reason_for(steps),
+        "evidence": {"fixture_path": str(fixture_path), "run_dir": str(run_dir)},
+    }
+
+
 def env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if not value:
@@ -591,6 +891,7 @@ def main() -> int:
                         ("ascii_edit_save_undo_redo_reopen", run_ascii_scenario),
                         ("japanese_ime_input", run_ime_scenario),
                         ("os_scroll", run_scroll_scenario),
+                        ("inline_syntax_boundary", run_inline_syntax_scenario),
                     ):
                         try:
                             scenarios.append(run_scenario(

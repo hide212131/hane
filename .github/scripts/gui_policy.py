@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 POLICY = 'v1'
-PROCEDURE = 'hosted-gui-interaction/4'
+PROCEDURE = 'hosted-gui-interaction/5'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
@@ -14,12 +14,21 @@ REQUIRED_STEPS = {
     'ascii_edit_save_undo_redo_reopen': {'launch', 'window_discovery', 'edit_save', 'append_save', 'undo_save', 'redo_save', 'capture_before', 'capture_after', 'capture_reopen', 'visible_saved_text', 'reopen_content_check', 'cleanup'},
     'japanese_ime_input': {'query_current_source', 'list_input_sources', 'select_japanese_source', 'launch', 'window_discovery', 'ime_input_save', 'capture_before', 'capture_after', 'cleanup', 'restore_input_source'},
     'os_scroll': {'launch', 'window_discovery', 'capture_before', 'os_wheel', 'capture_after', 'visible_scroll', 'scroll_preserves_document', 'cleanup'},
+    'inline_syntax_boundary': {'launch', 'window_discovery', 'capture_before',
+                                'boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
+                                'boundary_click_edit_quote', 'boundary_click_edit_list',
+                                'drag_select_delete_undo_redo', 'delimiter_unclosed_then_closed',
+                                'capture_after', 'cleanup',
+                                'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
+                                'visible_saved_text', 'reopen_content_check', 'cleanup_reopen'},
 }
 REQUIRED_IMAGES = ['ascii_edit_save_undo_redo_reopen/before.png',
                    'ascii_edit_save_undo_redo_reopen/after.png',
                    'ascii_edit_save_undo_redo_reopen/reopen/reopen.png',
                    'japanese_ime_input/before.png', 'japanese_ime_input/after.png',
-                   'os_scroll/before.png', 'os_scroll/after.png']
+                   'os_scroll/before.png', 'os_scroll/after.png',
+                   'inline_syntax_boundary/before.png', 'inline_syntax_boundary/after.png',
+                   'inline_syntax_boundary/reopen/reopen.png']
 
 
 def latest(statuses):

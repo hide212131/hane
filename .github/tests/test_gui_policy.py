@@ -113,6 +113,12 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(passing_result())
 
+    def test_dropping_the_inline_syntax_scenario_from_a_receipt_cannot_pass(self):
+        raw = passing_result()
+        raw['scenarios'] = [s for s in raw['scenarios'] if s['name'] != 'inline_syntax_boundary']
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
     def test_expired_or_reversed_result_rejected(self):
         for field, value in [('started_at', '2026-09-08T23:59:00Z'),
                              ('finished_at', '2026-09-09T01:01:00Z'),
@@ -158,6 +164,15 @@ class RequirementAndReviewTests(unittest.TestCase):
         self.assertTrue(policy.review_ready(statuses, SHA))
         route['state'] = 'pending'
         self.assertFalse(policy.review_ready(statuses, SHA))
+
+    def test_inline_syntax_boundary_required_steps_cover_representative_constructs(self):
+        steps = policy.REQUIRED_STEPS['inline_syntax_boundary']
+        for required in ('boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
+                         'boundary_click_edit_quote', 'boundary_click_edit_list',
+                         'drag_select_delete_undo_redo', 'delimiter_unclosed_then_closed',
+                         'reopen_content_check'):
+            self.assertIn(required, steps)
+        self.assertTrue(any(name.startswith('inline_syntax_boundary/') for name in policy.REQUIRED_IMAGES))
 
     def test_gui_status_requires_exact_sha_and_matching_terminal_state(self):
         row = {'state': 'success', 'description': f'GUI pass {policy.STATUS_VERSION} {SHA[:12]} g123-1'}

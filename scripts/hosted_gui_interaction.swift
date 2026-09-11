@@ -181,12 +181,156 @@ func recognizeText(_ path: String) {
     } catch { fail("OCR failed: \(error)") }
 }
 
-func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
+// Locate the first OCR line whose recognized text matches `pattern` (an ICU
+// regular expression, may use lookaround to disambiguate repeated marker
+// glyphs such as "**" occurring on several lines) and return the matched
+// substring's normalized bounding box (Vision convention: origin bottom-left,
+// 0...1 of the image). Used only to compute a click point; it is never used
+// to judge whether bold/italic rendering "looks right".
+func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["en-US", "ja-JP"]
+    do {
+        try VNImageRequestHandler(url: URL(fileURLWithPath: path), options: [:]).perform([request])
+    } catch { fail("OCR failed: \(error)") }
+    guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        fail("invalid regex pattern: \(pattern)")
+    }
+    for observation in request.results ?? [] {
+        guard let candidate = observation.topCandidates(1).first else { continue }
+        let text = candidate.string
+        let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: fullRange), let range = Range(match.range, in: text) else { continue }
+        guard let box = try? candidate.boundingBox(for: range) else { continue }
+        return box.boundingBox
+    }
+    fail("no OCR match for pattern: \(pattern)")
+}
+
+func windowBounds(_ pid: pid_t) -> CGRect {
     guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
           let row = windows.first(where: { ($0[kCGWindowOwnerPID as String] as? Int) == Int(pid) && ($0[kCGWindowLayer as String] as? Int) == 0 }),
           let dictionary = row[kCGWindowBounds as String] as? [String: Any],
           let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary)
     else { fail("target window bounds unavailable") }
+    return bounds
+}
+
+// `screencapture -l <windowid>` crops exactly to the window's content, so a
+// Vision-normalized (0...1, bottom-left origin) box maps directly onto the
+// same 0...1 fraction of the window's own bounds — no pixel/point scale
+// factor is needed.
+func screenPoint(_ bounds: CGRect, _ normalized: CGRect, _ edge: String) -> CGPoint {
+    let xNorm: CGFloat = edge == "start" ? normalized.minX : normalized.maxX
+    let yNormFromTop = 1 - (normalized.minY + normalized.height / 2)
+    return CGPoint(x: bounds.minX + xNorm * bounds.width, y: bounds.minY + yNormFromTop * bounds.height)
+}
+
+func focus(_ pid: pid_t) {
+    runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
+    Thread.sleep(forTimeInterval: 0.2)
+}
+
+func postClick(_ point: CGPoint) {
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
+    else { fail("could not create OS pointer events") }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.05)
+    up.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.3)
+}
+
+// Click at the marker/content boundary located by OCR on an already-taken
+// screenshot. `edge` selects the left ("start") or right ("end") edge of the
+// matched marker glyph(s), so callers can place the caret immediately before
+// or immediately after a delimiter.
+func clickText(_ pid: pid_t, _ screenshotPath: String, _ pattern: String, _ edge: String) {
+    guard edge == "start" || edge == "end" else { fail("edge must be start or end") }
+    let box = findTextMatch(screenshotPath, pattern)
+    let point = screenPoint(windowBounds(pid), box, edge)
+    focus(pid)
+    postClick(point)
+    print("clicked at \(point.x),\(point.y) for pattern \(pattern) edge=\(edge)")
+}
+
+// Real OS-level drag selection between two OCR-located marker boundaries
+// (mouse down at the first point, dragged, mouse up at the second).
+func dragSelectText(_ pid: pid_t, _ screenshotPath: String, _ pattern1: String, _ edge1: String, _ pattern2: String, _ edge2: String) {
+    guard edge1 == "start" || edge1 == "end", edge2 == "start" || edge2 == "end" else { fail("edge must be start or end") }
+    let bounds = windowBounds(pid)
+    let from = screenPoint(bounds, findTextMatch(screenshotPath, pattern1), edge1)
+    let to = screenPoint(bounds, findTextMatch(screenshotPath, pattern2), edge2)
+    focus(pid)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: from, mouseButton: .left),
+          let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: to, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: to, mouseButton: .left)
+    else { fail("could not create OS pointer events") }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.1)
+    drag.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.1)
+    up.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.3)
+    print("dragged from \(from.x),\(from.y) to \(to.x),\(to.y)")
+}
+
+// Type at the current caret (no select-all, unlike selectAllTypeSave) and
+// save. Used after clickText/dragSelectText has already placed the caret or
+// selection.
+func typeSave(_ pid: pid_t, _ text: String) {
+    let escaped = escapeForAppleScript(text)
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            keystroke "\(escaped)"
+            delay 0.2
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
+func deleteSelectionSave(_ pid: pid_t) {
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            key code 51
+            delay 0.2
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
+func endDocTypeSave(_ pid: pid_t, _ text: String) {
+    let escaped = escapeForAppleScript(text)
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            key code 125 using command down
+            delay 0.2
+            keystroke "\(escaped)"
+            delay 0.2
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
+func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
+    let bounds = windowBounds(pid)
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
     Thread.sleep(forTimeInterval: 0.3)
     let point = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -205,7 +349,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save> ...")
+    fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|click-text|drag-select-text|type-save|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -241,6 +385,25 @@ case "type-romaji-commit-save":
         fail("type-romaji-commit-save requires PID, romaji text and source ID")
     }
     selectAllTypeRomajiCommitSave(pid, arguments[2], arguments[3])
+case "click-text":
+    guard arguments.count == 5, let pid = pid_t(arguments[1]) else {
+        fail("click-text requires PID, screenshot path, regex pattern and edge")
+    }
+    clickText(pid, arguments[2], arguments[3], arguments[4])
+case "drag-select-text":
+    guard arguments.count == 7, let pid = pid_t(arguments[1]) else {
+        fail("drag-select-text requires PID, screenshot path, pattern1, edge1, pattern2, edge2")
+    }
+    dragSelectText(pid, arguments[2], arguments[3], arguments[4], arguments[5], arguments[6])
+case "type-save":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("type-save requires PID and text") }
+    typeSave(pid, arguments[2])
+case "delete-selection-save":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("delete-selection-save requires PID") }
+    deleteSelectionSave(pid)
+case "end-doc-type-save":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("end-doc-type-save requires PID and text") }
+    endDocTypeSave(pid, arguments[2])
 default:
     fail("unknown command: \(command)")
 }
