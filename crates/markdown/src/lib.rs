@@ -224,6 +224,13 @@ pub struct MarkdownParse {
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
     pub markers: Vec<SourceRange>,
+    /// Quote prefixes paired with their owning quote node. Continuation-line
+    /// prefixes cannot be associated with an owner by comparing source starts.
+    /// Kept before range merging so nested, adjacent prefixes retain ownership.
+    pub quote_markers: Vec<(SourceRange, NodeId)>,
+    /// Padding removed from inline code after container prefixes and line
+    /// endings are interpreted. Derived against the parser's code content.
+    pub code_padding: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,13 +397,301 @@ pub const fn has_delimiter_markers(kind: NodeKind) -> bool {
     )
 }
 
+/// A cursor in a physical line's container prefix. Tabs can be partially
+/// consumed by CommonMark containers, so byte offsets and columns differ.
+#[derive(Clone, Copy, Default)]
+struct PrefixCursor {
+    byte: usize,
+    column: usize,
+    pending_spaces: usize,
+}
+
+impl PrefixCursor {
+    fn space(&mut self, line: &[u8]) -> bool {
+        if self.pending_spaces > 0 {
+            self.pending_spaces -= 1;
+        } else {
+            match line.get(self.byte) {
+                Some(b' ') => {}
+                Some(b'\t') => self.pending_spaces = 3 - self.column % 4,
+                _ => return false,
+            }
+            self.byte += 1;
+        }
+        self.column += 1;
+        true
+    }
+
+    fn indent(&mut self, line: &[u8], limit: usize) -> usize {
+        let start = self.column;
+        while self.column - start < limit && self.space(line) {}
+        self.column - start
+    }
+
+    fn quote(&mut self, line: &[u8]) -> Option<std::ops::Range<usize>> {
+        self.indent(line, 3);
+        if self.pending_spaces != 0 || line.get(self.byte) != Some(&b'>') {
+            return None;
+        }
+        let start = self.byte;
+        self.byte += 1;
+        self.column += 1;
+        self.space(line);
+        Some(start..self.byte)
+    }
+
+    fn list_item(&mut self, line: &[u8]) -> Option<usize> {
+        let start_column = self.column;
+        self.indent(line, 3);
+        if self.pending_spaces != 0 {
+            return None;
+        }
+        let marker = self.byte;
+        match line.get(self.byte) {
+            Some(b'-' | b'+' | b'*') => self.byte += 1,
+            Some(b'0'..=b'9') => {
+                while self.byte - marker < 9 && line.get(self.byte).is_some_and(u8::is_ascii_digit)
+                {
+                    self.byte += 1;
+                }
+                if !matches!(line.get(self.byte), Some(b'.' | b')')) {
+                    return None;
+                }
+                self.byte += 1;
+            }
+            _ => return None,
+        }
+        self.column += self.byte - marker;
+        // An empty opening line has one implicit padding column, including
+        // when the marker touches EOL or has several trailing spaces/tabs.
+        // This matches the parser's empty-list-item continuation indentation.
+        if line[self.byte..]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return Some(self.column - start_column + 1);
+        }
+        let after_marker = *self;
+        let padding = self.indent(line, 5);
+        if padding == 0 {
+            return None;
+        }
+        // Five or more spaces mean one padding column followed by content
+        // indentation, rather than a wider list-item container.
+        if padding > 4 {
+            *self = after_marker;
+            self.space(line);
+        }
+        Some(self.column - start_column)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrefixContainer {
+    Quote,
+    ListItem { start: usize, indent: usize },
+}
+
+fn consume_containers(
+    containers: &[PrefixContainer],
+    line_start: usize,
+    line: &[u8],
+) -> Option<PrefixCursor> {
+    let mut cursor = PrefixCursor::default();
+    for container in containers {
+        match *container {
+            PrefixContainer::Quote => {
+                cursor.quote(line)?;
+            }
+            PrefixContainer::ListItem { start, indent } => {
+                if (line_start..line_start + line.len()).contains(&start) {
+                    cursor.list_item(line)?;
+                } else if cursor.indent(line, indent) != indent {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(cursor)
+}
+
+/// CommonMark treats CR, LF and CRLF as line endings, independently of the
+/// editor's LF-based RopeBuffer lines. Keep the original bytes for source maps.
+fn markdown_line_start(source: &str, mut at: usize) -> usize {
+    if source.as_bytes().get(at) == Some(&b'\n') && at > 0 && source.as_bytes()[at - 1] == b'\r' {
+        at -= 1;
+    }
+    source[..at].rfind(['\r', '\n']).map_or(0, |at| at + 1)
+}
+
+fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if source.is_empty() {
+            return None;
+        }
+        let end = source.find(['\r', '\n']).map_or(source.len(), |at| {
+            at + if source.as_bytes()[at] == b'\r' && source.as_bytes().get(at + 1) == Some(&b'\n')
+            {
+                2
+            } else {
+                1
+            }
+        });
+        let (line, rest) = source.split_at(end);
+        source = rest;
+        Some(line)
+    })
+}
+
+/// Recover a quote's markers from its actual ancestor containers, not a fixed
+/// byte width per depth. Lazy continuation lines fail the prefix scan and have
+/// no marker. List-item padding is measured on that item's opening line.
+fn ancestor_containers(
+    tree: &MarkdownTree,
+    id: NodeId,
+    range: SourceRange,
+    source: &str,
+) -> Option<Vec<PrefixContainer>> {
+    let ancestors: Vec<_> = tree.ancestors(id).skip(1).collect();
+    let mut containers = Vec::new();
+    for ancestor in ancestors.into_iter().rev() {
+        let node = tree.node(ancestor).expect("ancestor exists");
+        match node.kind {
+            NodeKind::Quote => containers.push(PrefixContainer::Quote),
+            NodeKind::ListItem { .. } => {
+                let start = node.source_range.start.0 - range.start.0;
+                let line_start = markdown_line_start(source, start);
+                let line = markdown_lines(&source[line_start..]).next().unwrap_or("");
+                let mut cursor = consume_containers(&containers, line_start, line.as_bytes())?;
+                let indent = cursor.list_item(line.as_bytes())?;
+                containers.push(PrefixContainer::ListItem { start, indent });
+            }
+            _ => {}
+        }
+    }
+    Some(containers)
+}
+
+fn quote_markers(
+    tree: &MarkdownTree,
+    id: NodeId,
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let Some(containers) = ancestor_containers(tree, id, range, source) else {
+        return Vec::new();
+    };
+    let node = tree.node(id).expect("quote exists");
+    let start = node.source_range.start.0 - range.start.0;
+    let end = node.source_range.end.0 - range.start.0;
+    let mut line_start = markdown_line_start(source, start);
+    let mut markers = Vec::new();
+    for line in markdown_lines(&source[line_start..end]) {
+        if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
+            && let Some(marker) = cursor.quote(line.as_bytes())
+        {
+            markers.push(absolute_range(range.start.0 + line_start, marker));
+        }
+        line_start += line.len();
+    }
+    markers
+}
+
+struct ParsedCodeSpan {
+    node: NodeId,
+    content: String,
+}
+
+/// Project code content back to source before choosing padding. Source spans
+/// include container prefixes; those bytes are not part of Event::Code's text.
+fn code_padding(
+    tree: &MarkdownTree,
+    codes: &[ParsedCodeSpan],
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let mut padding = Vec::new();
+    for code in codes {
+        let node = tree.node(code.node).expect("code node exists");
+        let start = node.source_range.start.0 - range.start.0;
+        let end = node.source_range.end.0 - range.start.0;
+        let delimiter = source[start..end]
+            .bytes()
+            .take_while(|b| *b == b'`')
+            .count();
+        let Some(containers) = ancestor_containers(tree, code.node, range, source) else {
+            continue;
+        };
+        let mut cursor = start + delimiter;
+        let end = end - delimiter;
+        let mut normalized = String::new();
+        let mut first = None;
+        let mut last = None;
+        while cursor < end {
+            let from = cursor;
+            let byte = source.as_bytes()[cursor];
+            let is_break = matches!(byte, b'\r' | b'\n');
+            let character = if is_break {
+                cursor += 1;
+                if byte == b'\r' && source.as_bytes().get(cursor) == Some(&b'\n') {
+                    cursor += 1;
+                }
+                ' '
+            } else {
+                let character = source[cursor..].chars().next().expect("source character");
+                cursor += character.len_utf8();
+                character
+            };
+            let unit = absolute_range(range.start.0, from..cursor);
+            first.get_or_insert(unit);
+            last = Some(unit);
+            normalized.push(character);
+            if is_break {
+                // Lazy continuation may carry only some ancestor prefixes.
+                let line = &source.as_bytes()[cursor..end];
+                let mut prefix = PrefixCursor::default();
+                for container in &containers {
+                    let before = prefix;
+                    let matched = match container {
+                        PrefixContainer::Quote => prefix.quote(line).is_some(),
+                        PrefixContainer::ListItem { indent, .. } => {
+                            prefix.indent(line, *indent) == *indent
+                        }
+                    };
+                    if !matched {
+                        prefix = before;
+                        break;
+                    }
+                }
+                cursor += prefix.byte;
+            }
+        }
+        // The parser is authoritative: only emit padding when removing one
+        // semantic space from each end reproduces its actual code content.
+        if normalized.starts_with(' ')
+            && normalized.ends_with(' ')
+            && normalized.bytes().any(|byte| byte != b' ')
+            && normalized.get(1..normalized.len() - 1) == Some(code.content.as_str())
+        {
+            padding.extend([first.expect("nonempty code"), last.expect("nonempty code")]);
+        }
+    }
+    padding
+}
+
+struct DerivedMarkers {
+    markers: Vec<SourceRange>,
+    quote_markers: Vec<(SourceRange, NodeId)>,
+}
+
 /// Derives marker source ranges by lexing only inside the source ranges that
 /// pulldown-cmark already attributed to each node. The event ranges stay
 /// authoritative; this only recovers open/close delimiter positions that the
 /// event stream does not expose. Returned ranges are sorted and merged.
-fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
+fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
-    for (_, block) in tree.blocks() {
+    let mut quote_owners = Vec::new();
+    for (id, block) in tree.blocks() {
         let relative = block.source_range.start.0.saturating_sub(range.start.0);
         let tail = source.get(relative..).unwrap_or_default();
         match block.kind {
@@ -434,11 +729,9 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
                 }
             }
             NodeKind::Quote => {
-                if tail.starts_with("> ") {
-                    markers.push(SourceRange::new(
-                        block.source_range.start.0,
-                        block.source_range.start.0 + 2,
-                    ));
+                for marker in quote_markers(tree, id, range, source) {
+                    markers.push(marker);
+                    quote_owners.push((marker, id));
                 }
             }
             NodeKind::ListItem { .. } => {
@@ -538,7 +831,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<
             merged.push(marker);
         }
     }
-    merged
+    DerivedMarkers {
+        markers: merged,
+        quote_markers: quote_owners,
+    }
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -587,7 +883,8 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 /// pairs push and pop; every other event becomes a leaf under the open
 /// container. Unmodeled tags still push a node so the stack stays balanced and
 /// their source range remains reachable.
-fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
+fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<ParsedCodeSpan>) {
+    let mut codes = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -638,8 +935,12 @@ fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
             Event::Text(_) => {
                 push(&mut nodes, &open, NodeKind::Text, range);
             }
-            Event::Code(_) => {
-                push(&mut nodes, &open, NodeKind::InlineCode, range);
+            Event::Code(content) => {
+                let node = push(&mut nodes, &open, NodeKind::InlineCode, range);
+                codes.push(ParsedCodeSpan {
+                    node,
+                    content: content.into_string(),
+                });
             }
             Event::Html(_) => {
                 push(&mut nodes, &open, NodeKind::Html, range);
@@ -661,7 +962,7 @@ fn build_tree(source_range: SourceRange, source: &str) -> MarkdownTree {
             }
         }
     }
-    MarkdownTree { nodes }
+    (MarkdownTree { nodes }, codes)
 }
 
 /// Parses a source slice into a node tree and retains the byte range of every
@@ -673,19 +974,56 @@ pub fn parse_document(
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let tree = build_tree(source_range, source);
+    let (tree, codes) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
+    let code_padding = code_padding(&tree, &codes, source_range, source);
     MarkdownParse {
         revision,
         source_range,
         tree,
-        markers,
+        markers: markers.markers,
+        quote_markers: markers.quote_markers,
+        code_padding,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_padding_tracks_semantic_spaces_instead_of_container_bytes() {
+        for (source, expected) in [
+            ("` code `", vec![(1, 2), (6, 7)]),
+            // A CRLF contributes one semantic space but covers two source bytes.
+            ("`\r\nx\r\n`", vec![(1, 3), (4, 6)]),
+            ("> `\r\n> x\r\n> `", vec![(3, 5), (8, 10)]),
+            ("> ` \n>  `", vec![]),
+            ("` `", vec![]),
+            ("`code `", vec![]),
+            ("` \t `", vec![(1, 2), (3, 4)]),
+        ] {
+            let base = 31;
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(base, base + source.len()),
+                source,
+            );
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(base + start, base + end))
+                .collect();
+            assert_eq!(parsed.code_padding, expected, "{source:?}");
+            for padding in &parsed.code_padding {
+                assert!(
+                    parsed
+                        .markers
+                        .iter()
+                        .all(|marker| !padding.intersects(*marker))
+                );
+            }
+        }
+    }
 
     #[test]
     fn commonmark_ranges_remain_absolute_for_unicode_and_nested_styles() {
@@ -879,6 +1217,177 @@ mod tests {
             ordered.markers.first().copied(),
             Some(SourceRange::new(0, 3))
         );
+    }
+
+    #[test]
+    fn quote_markers_follow_each_lines_actual_container_prefixes() {
+        for (source, expected) in [
+            (
+                "> > first\n> > second\n",
+                vec![(0, 2), (2, 4), (10, 12), (12, 14)],
+            ),
+            (">>first\n>>second\n", vec![(0, 1), (1, 2), (8, 9), (9, 10)]),
+            (
+                "  > > first\n >  >second\n",
+                vec![(2, 4), (4, 6), (13, 15), (16, 17)],
+            ),
+            (
+                ">\t>first\n>\t>second\n",
+                vec![(0, 2), (2, 3), (9, 11), (11, 12)],
+            ),
+            (
+                "> > first\n> lazy\nlazy too\n> > last\n",
+                vec![(0, 2), (2, 4), (10, 12), (26, 28), (28, 30)],
+            ),
+            (
+                "> > first\r\n> > second\r\n",
+                vec![(0, 2), (2, 4), (11, 13), (13, 15)],
+            ),
+            (
+                "> > 日本\n> > 語\n",
+                vec![(0, 2), (2, 4), (11, 13), (13, 15)],
+            ),
+        ] {
+            // A nonzero slice origin catches accidental mixing of local and
+            // absolute positions, including on the first physical line.
+            let base = 37;
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(base, base + source.len()),
+                source,
+            );
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(base + start, base + end))
+                .collect();
+            assert_eq!(parsed.markers, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn quote_markers_follow_commonmark_line_endings_with_raw_offsets() {
+        for newline in ["\r", "\n", "\r\n"] {
+            for template in [
+                "> 日本\n> 語\n",
+                "> > first\n> > second\n",
+                "intro\n\n- > first\n  > second\n",
+                "intro\n\n> -\n>   > first\n>   > second\n",
+            ] {
+                let source = template.replace('\n', newline);
+                let base = 37;
+                let parsed = parse_document(
+                    Revision(1),
+                    SourceRange::new(base, base + source.len()),
+                    &source,
+                );
+                let mut actual: Vec<_> = parsed.quote_markers.iter().map(|(r, _)| *r).collect();
+                actual.sort_by_key(|r| r.start);
+                let expected: Vec<_> = source
+                    .match_indices('>')
+                    .map(|(at, _)| SourceRange::new(base + at, base + at + 2))
+                    .collect();
+                assert_eq!(actual, expected, "source: {source:?}");
+            }
+        }
+        let source = "> first\r> second\r\n> third\n> fourth";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let expected: Vec<_> = source
+            .match_indices('>')
+            .map(|(at, _)| SourceRange::new(at, at + 2))
+            .collect();
+        assert_eq!(parsed.markers, expected);
+    }
+
+    #[test]
+    fn markdown_line_scan_preserves_bytes_and_does_not_split_crlf() {
+        let source = "日\r本\r\n語\nlast";
+        assert_eq!(
+            markdown_lines(source).collect::<Vec<_>>(),
+            ["日\r", "本\r\n", "語\n", "last"]
+        );
+        assert_eq!(markdown_line_start(source, 4), 4);
+        assert_eq!(markdown_line_start(source, 8), 4); // Inside CRLF.
+        assert_eq!(markdown_line_start(source, 9), 9);
+    }
+
+    #[test]
+    fn quote_markers_follow_list_ancestors_without_hiding_literal_greater_than() {
+        for (source, expected) in [
+            ("- > first\n  > second\n", vec![(2, 4), (12, 14)]),
+            (
+                "> - > first\n>   > second\n",
+                vec![(0, 2), (4, 6), (12, 14), (16, 18)],
+            ),
+            ("1) > first\n   > second\n", vec![(3, 5), (14, 16)]),
+            (
+                "- > first\n  lazy > literal\n  > last\n",
+                vec![(2, 4), (29, 31)],
+            ),
+            (
+                "> ```\n> > literal\n> ```\n",
+                vec![(0, 2), (6, 8), (18, 20)],
+            ),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let actual: Vec<_> = parsed
+                .tree
+                .blocks()
+                .filter(|(_, node)| node.kind == NodeKind::Quote)
+                .flat_map(|(id, _)| quote_markers(&parsed.tree, id, parsed.source_range, source))
+                .collect();
+            let mut actual = actual;
+            actual.sort_by_key(|marker| marker.start);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(start, end)| SourceRange::new(start, end))
+                .collect();
+            assert_eq!(actual, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn quote_markers_follow_list_items_with_an_empty_opening_line() {
+        for marker in ["-", "1.", "1)"] {
+            for padding in ["", " ", "   ", "\t"] {
+                for newline in ["\n", "\r", "\r\n"] {
+                    let indent = " ".repeat(marker.len() + 1);
+                    let source = format!(
+                        "{marker}{padding}{newline}{indent}> first{newline}{indent}> second"
+                    );
+                    let base = 37;
+                    let parsed = parse_document(
+                        Revision(1),
+                        SourceRange::new(base, base + source.len()),
+                        &source,
+                    );
+                    let (quote_id, quote) = parsed
+                        .tree
+                        .blocks()
+                        .find(|(_, node)| node.kind == NodeKind::Quote)
+                        .expect("the parser recognizes the nested quote");
+                    assert!(matches!(
+                        parsed.tree.node(quote.parent.unwrap()).unwrap().kind,
+                        NodeKind::ListItem { .. }
+                    ));
+                    let expected: Vec<_> = source
+                        .match_indices('>')
+                        .map(|(at, _)| SourceRange::new(base + at, base + at + 2))
+                        .collect();
+                    assert_eq!(
+                        quote_markers(&parsed.tree, quote_id, parsed.source_range, &source),
+                        expected,
+                        "source: {source:?}"
+                    );
+                    for range in expected {
+                        assert!(
+                            parsed.markers.contains(&range),
+                            "missing {range:?} in {source:?}"
+                        );
+                        assert!(parsed.quote_markers.contains(&(range, quote_id)));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

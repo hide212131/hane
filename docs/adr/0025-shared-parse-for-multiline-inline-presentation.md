@@ -78,6 +78,8 @@ JoinedParse / shared semantic snapshot
 
 navigation、disclosure、single-line presentation のために独自に Markdown を再 parse する経路を増やさない。
 
+marker と code padding を source 順に並べた表示計画、および block / inline span の source range 索引は、shared snapshot の構築時に作成して同じ snapshot に保持する。各 physical line の projection は、その行に属する marker と交差する span のみを検索する。quote marker の所有者は表示計画に保持し、disclosure のために全 quote marker を再走査しない。style / block kind / disclosure も含め、可視行ごとに全 block の marker を copy・sort したり、parse tree 全体を再走査したりしない。
+
 ### 4. UI thread の synchronous full-block parse を有界にする
 
 同期 parse の可否を physical line 数だけで判断しない。総 source byte 数にも上限を設ける。

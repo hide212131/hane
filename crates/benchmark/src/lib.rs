@@ -274,8 +274,11 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
                 buffer.revision(),
                 &BlockWindow {
                     trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+                    render: span.clone(),
                     span,
                     lines: &lines,
+                    joined: None,
+                    block_disclosure: None,
                 },
                 26.0,
             );

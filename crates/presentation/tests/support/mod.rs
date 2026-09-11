@@ -167,8 +167,11 @@ fn present_document(buffer: &RopeBuffer, cursor: Option<usize>) -> Vec<VisualLin
             buffer.revision(),
             &BlockWindow {
                 trailing_blank_lines: trailing_blank_lines(buffer, &span),
+                render: line..end,
                 span,
                 lines: &block_lines,
+                joined: None,
+                block_disclosure: None,
             },
             LINE_HEIGHT,
         );

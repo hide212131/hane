@@ -59,9 +59,10 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "multi-line quote",
         source: "> first\n> second",
         tree_paths: &[&[NodeKind::Quote, NodeKind::Paragraph, NodeKind::Text]],
-        // One quote node spans both lines, so the whole-document parse derives a
-        // single prefix; the per-line presentation below hides both.
-        markers: &["> "],
+        // One quote node spans both lines; the whole-document parse derives a
+        // prefix marker for each so the shared multi-line parse in
+        // `present_joined_run` can hide both.
+        markers: &["> ", "> "],
         block_kinds: &[BlockKind::Quote, BlockKind::Quote],
         visual_lines: &["first", "second"],
     },
@@ -112,6 +113,90 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["[", "](https://example.com)"],
         block_kinds: &[BlockKind::Paragraph],
         visual_lines: &["see Hane now"],
+    },
+    MarkdownFixture {
+        name: "strong emphasis spanning a soft line break",
+        // CommonMark §6.2 treats a soft break as whitespace inside one run of
+        // inline content, so `**` opened on one physical line closes on the
+        // next. `present_block` must parse both lines together to see that.
+        source: "This is **bold\nacross lines** ok",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::Strong]],
+        markers: &["**", "**"],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        visual_lines: &["This is bold", "across lines ok"],
+    },
+    MarkdownFixture {
+        name: "code span spanning a soft line break",
+        source: "See `code\nacross` lines",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["`", "`"],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        visual_lines: &["See code", "across lines"],
+    },
+    MarkdownFixture {
+        name: "strong emphasis spanning a soft line break inside a list item",
+        // A list item's paragraph content joins across physical lines the same
+        // way a top-level paragraph does; the bullet stays a per-line marker.
+        source: "- **bold\n  across**",
+        tree_paths: &[&[
+            NodeKind::List { ordered: false },
+            NodeKind::ListItem { task: None },
+            NodeKind::Strong,
+        ]],
+        markers: &["- ", "**", "**"],
+        block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
+        visual_lines: &["bold", "  across"],
+    },
+    MarkdownFixture {
+        name: "strong emphasis spanning a soft line break inside a quote",
+        // Every quoted physical line carries its own `> ` marker (see
+        // `derive_markers`), so joining the quote's paragraph across lines does
+        // not lose either line's prefix.
+        source: "> **bold\n> across**",
+        tree_paths: &[&[NodeKind::Quote, NodeKind::Paragraph, NodeKind::Strong]],
+        markers: &["> ", "**", "> ", "**"],
+        block_kinds: &[BlockKind::Quote, BlockKind::Quote],
+        visual_lines: &["bold", "across"],
+    },
+    MarkdownFixture {
+        name: "nested strong and emphasis",
+        source: "**bold *and italic* still bold**",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::Strong, NodeKind::Emphasis]],
+        markers: &["**", "*", "*", "**"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["bold and italic still bold"],
+    },
+    MarkdownFixture {
+        name: "emphasis follows CommonMark word-boundary rules",
+        // `_` cannot open or close emphasis inside a word; `*` can.
+        source: "foo_bar_baz and foo*bar*baz",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::Emphasis]],
+        markers: &["*", "*"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["foo_bar_baz and foobarbaz"],
+    },
+    MarkdownFixture {
+        name: "code span content is never reinterpreted as markup",
+        // The `**` inside the code span stays literal text; only the `**`
+        // outside it becomes Strong.
+        source: "code contains **not bold** literally: `a **b** c`",
+        tree_paths: &[
+            &[NodeKind::Paragraph, NodeKind::Strong],
+            &[NodeKind::Paragraph, NodeKind::InlineCode],
+        ],
+        markers: &["**", "**", "`", "`"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["code contains not bold literally: a **b** c"],
+    },
+    MarkdownFixture {
+        name: "code span padding is trimmed for display only",
+        // CommonMark §6.1: content that both opens and closes on a space, and
+        // is not all spaces, has one space trimmed from each end on display.
+        source: "pad ` code ` pad",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::InlineCode]],
+        markers: &["`", "`"],
+        block_kinds: &[BlockKind::Paragraph],
+        visual_lines: &["pad code pad"],
     },
 ];
 

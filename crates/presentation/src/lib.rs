@@ -48,8 +48,8 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeKind, has_delimiter_markers,
-    is_table_delimiter, parse_document,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeId, NodeKind,
+    has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 
@@ -341,6 +341,26 @@ pub enum LineContext {
 /// it reads only the block kind the index published.
 pub const fn block_line_context(kind: NodeKind) -> LineContext {
     syntax_display(kind).line_context
+}
+
+/// True when a top-level block's contiguous plain-text lines are parsed
+/// together (`present_joined_run`) instead of one physical line at a time, so
+/// CommonMark inline constructs — `**`/`_`/`` ` `` — that cross a soft line
+/// break resolve the way a single whole-paragraph parse would.
+///
+/// A blockquote's or a list item's paragraph content presents
+/// `LineContext::Normal` the same as a top-level paragraph, and its inline
+/// content joins the same way; marker derivation gives every quoted physical
+/// line its own `> ` marker so joining does not lose it, and a list item's own
+/// bullet is already scoped to the one line it starts on. The caller that
+/// supplies parsing context for a joined block (see [`BlockWindow::lines`])
+/// must reach this same set of kinds, or a marker whose match lies outside the
+/// render window will not resolve.
+pub const fn block_is_joinable(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Paragraph | NodeKind::Quote | NodeKind::List { .. }
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -712,8 +732,38 @@ pub struct BlockWindow<'a> {
     /// blocks into the block above, and those lines are not part of the
     /// construct — a blank line after a closing fence is not code.
     pub trailing_blank_lines: usize,
-    /// The contiguous run inside `span` to present. Everything else is clipped.
+    /// Lines available to build the [`VisualBlock`] from. For a joinable
+    /// paragraph (see [`present_block`]) this may reach beyond `render` on
+    /// either side, because CommonMark resolves `**`/`_`/`` ` `` across the
+    /// whole paragraph, not just the lines that happen to be drawn; a marker
+    /// whose other half sits outside `lines` still cannot be recognized, so
+    /// the caller should give enough of the paragraph to close every marker
+    /// that opens inside `render` — unless `joined` already supplies that
+    /// context, in which case `lines` only needs to cover `render`.
     pub lines: &'a [BlockLine<'a>],
+    /// The subset of `lines` (by document line number) to actually turn into
+    /// presented [`VisualLine`]s. Lines in `lines` outside this range are
+    /// parsing context only and are not drawn.
+    pub render: Range<usize>,
+    /// A joinable block's whole-span parse, already computed. When present,
+    /// a joined run is presented against this instead of rejoining and
+    /// reparsing `lines`, so a caller that keeps this cached across
+    /// presentation calls (see [`parse_joined_span`]) can hand `render`'s own
+    /// lines alone as `lines` — a viewport miss on an already-parsed block
+    /// then costs proportionally to what is drawn, not to the whole block,
+    /// while still resolving a marker pair arbitrarily far apart the way a
+    /// single whole-paragraph parse would, regardless of where the viewport
+    /// happens to sit.
+    pub joined: Option<&'a JoinedParse>,
+    /// Caret, selection or IME range touching this block's whole span,
+    /// computed by the caller directly from editor state rather than
+    /// reconstructed from `lines`. A joined run's own [`merged_disclosure`]
+    /// only sees the physical lines `lines` actually carries, which for a
+    /// block presented from `render` alone (see [`JoinedParse`]) excludes any
+    /// off-screen line of the same shared construct; this field is what lets
+    /// a caret sitting on one of those off-screen lines still disclose the
+    /// construct's markers on the lines that are drawn.
+    pub block_disclosure: Option<SourceRange>,
 }
 
 /// Display kind for a whole block. The syntax-display table distinguishes a
@@ -723,7 +773,7 @@ fn block_display_kind(kind: NodeKind) -> BlockKind {
     syntax_display(kind).indexed_block
 }
 
-/// Presents the visible lines of one indexed Markdown block.
+/// Presents `window.render`'s lines of one indexed Markdown block.
 ///
 /// Every line is presented in the context its block kind implies, except the
 /// blank run closing the block. The trailing newline each line's visual text
@@ -737,34 +787,46 @@ pub fn present_block(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
-    let lines = window
-        .lines
-        .iter()
-        .map(|line| {
-            let context = if line.line < content_end {
-                context
-            } else {
-                LineContext::Normal
-            };
-            let mut presented = present_polished_line(
-                line.line as u64,
+    let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
+    for run in disclosure_runs(block.kind, window) {
+        if run_uses_shared_parse(run.len(), window.joined) {
+            present_joined_run(
+                &window.lines[run.clone()],
                 revision,
-                line.range,
-                line.text,
                 line_height,
-                line.disclosure,
-                context,
+                &window.render,
+                window.joined,
+                window.block_disclosure,
+                &mut lines,
             );
-            while presented.visual_text.ends_with(['\r', '\n']) {
-                presented.visual_text.pop();
-            }
-            presented
-        })
-        .collect::<Vec<_>>();
-    let lines_before = window
-        .lines
-        .first()
-        .map_or(0, |line| line.line.saturating_sub(window.span.start));
+            continue;
+        }
+        let line = window.lines[run.start];
+        if !window.render.contains(&line.line) {
+            continue;
+        }
+        let line_context = if line.line < content_end {
+            context
+        } else {
+            LineContext::Normal
+        };
+        let mut presented = present_polished_line(
+            line.line as u64,
+            revision,
+            line.range,
+            line.text,
+            line_height,
+            line.disclosure,
+            line_context,
+        );
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
+        }
+        lines.push(presented);
+    }
+    let lines_before = lines.first().map_or(0, |line| {
+        (line.line_id as usize).saturating_sub(window.span.start)
+    });
     let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
     VisualBlock {
         id: block.id,
@@ -933,38 +995,46 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
 }
 
 fn marker_is_disclosed(
-    marker: SourceRange,
+    marker: &ProjectedMarker,
     parsed: &MarkdownParse,
+    nodes: &SourceIndex<NodeId>,
     disclosure: Option<SourceRange>,
 ) -> bool {
     let Some(disclosure) = disclosure else {
         return false;
     };
-    range_touches(marker, disclosure)
-        || parsed
+    // Quote prefixes disclose only their actual owner, not nested constructs.
+    if let Some(owner) = marker.quote_owner {
+        return parsed
             .tree
-            .iter()
-            .filter(|(_, node)| has_delimiter_markers(node.kind))
-            .any(|(_, span)| {
-                span.source_range.start <= marker.start
-                    && marker.end <= span.source_range.end
-                    && range_touches(span.source_range, disclosure)
-            })
-        || parsed
-            .tree
-            .blocks()
-            .filter(|(_, node)| syntax_display(node.kind).node_block.is_some())
-            .any(|(_, block)| {
-                (marker.start == block.source_range.start
-                    || (matches!(block.kind, NodeKind::Heading(_))
-                        && block
-                            .children
-                            .last()
-                            .and_then(|id| parsed.tree.node(*id))
-                            .is_none_or(|child| child.source_range.end <= marker.start)))
-                    && marker.end <= block.source_range.end
-                    && range_touches(block.source_range, disclosure)
-            })
+            .node(owner)
+            .is_some_and(|quote| range_touches(quote.source_range, disclosure));
+    }
+    let marker = marker.range;
+    if range_touches(marker, disclosure) {
+        return true;
+    }
+    nodes.intersecting(marker).into_iter().any(|id| {
+        let span = parsed.tree.node(*id).expect("indexed node");
+        let owns_marker = if has_delimiter_markers(span.kind) {
+            span.source_range.start <= marker.start && marker.end <= span.source_range.end
+        } else if matches!(
+            span.kind,
+            NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
+        ) {
+            (marker.start == span.source_range.start
+                || (matches!(span.kind, NodeKind::Heading(_))
+                    && span
+                        .children
+                        .last()
+                        .and_then(|id| parsed.tree.node(*id))
+                        .is_none_or(|child| child.source_range.end <= marker.start)))
+                && marker.end <= span.source_range.end
+        } else {
+            false
+        };
+        owns_marker && range_touches(span.source_range, disclosure)
+    })
 }
 
 /// Returns true when `segments` tile `range` contiguously, so every source byte
@@ -1024,26 +1094,93 @@ pub fn present_markdown_with_disclosure(
         return block;
     }
     let parsed = parse_document(revision, range, source);
+    let projection = ProjectionIndex::new(&parsed);
+    present_markdown_from_parse(
+        line_id,
+        revision,
+        range,
+        source,
+        line_height,
+        disclosure,
+        &SharedParse {
+            parsed: &parsed,
+            projection: &projection,
+        },
+    )
+}
+
+/// A parse [`present_markdown_from_parse`] projects one physical line from.
+/// It may describe delimiters, padding and spans on other physical lines.
+struct SharedParse<'a> {
+    parsed: &'a MarkdownParse,
+    projection: &'a ProjectionIndex,
+}
+
+/// Presents one physical line from an already-parsed tree instead of parsing
+/// `source` alone.
+///
+/// CommonMark treats a soft line break inside a paragraph as whitespace within
+/// one continuous run of inline content, not as a boundary: `**bold` opened on
+/// one physical line can close with `**` on the next, and the same is true of
+/// `_..._`  and a backtick-delimited code span. Presenting each physical line as
+/// its own self-contained parse — which [`present_markdown_with_disclosure`]
+/// does, because caret, selection and IME still address physical lines — cannot
+/// see that, since the delimiter that closes the construct sits outside the
+/// slice being parsed. [`present_block`] instead parses every line of a
+/// multi-line paragraph together and calls this once per line with the shared
+/// result, so `shared.parsed`'s markers and tree may describe delimiters and
+/// spans that live partly or wholly on a different physical line; this clips
+/// them to `range` exactly as a self-contained parse already clips a node that
+/// escapes it.
+fn present_markdown_from_parse(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    shared: &SharedParse<'_>,
+) -> VisualLine {
+    if source.is_empty() {
+        let mut block = present_plain(line_id, revision, range, source);
+        block.estimated_height = line_height;
+        return block;
+    }
+    let parsed = shared.parsed;
     // An ATX heading nested in an existing quote/list still carries its
-    // heading level. Container layout remains owned by the indexed block.
-    let kind = parsed
-        .tree
-        .blocks()
-        .find_map(|(_, block)| match block.kind {
+    // heading level. Only nodes intersecting this physical line contribute:
+    // the shared tree also contains other headings and trailing blank lines.
+    // Container layout remains owned by the indexed block.
+    let mut nodes = shared.projection.nodes.intersecting(range);
+    // Keep the tree's original order when multiple enclosing blocks apply.
+    nodes.sort_unstable();
+    let blocks = || {
+        nodes
+            .iter()
+            .filter_map(|id| parsed.tree.node(**id))
+            .filter(|node| node.kind.is_block())
+    };
+    let kind = blocks()
+        .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             _ => None,
         })
-        .or_else(|| {
-            parsed
-                .tree
-                .blocks()
-                .find_map(|(_, block)| syntax_display(block.kind).node_block)
-        })
+        .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
-    let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
+    // The ordered plan belongs to the semantic snapshot. Binary search avoids
+    // copying or walking off-screen markers for each physical line.
+    let plan = &shared.projection.markers;
+    let start = plan.partition_point(|marker| marker.range.start < range.start);
+    let end = plan.partition_point(|marker| marker.range.start < range.end);
+    let markers_on_line = &plan[start..end];
+    let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    for &marker in &parsed.markers {
+    for planned in markers_on_line {
+        let marker = planned.range;
+        if marker.end > range.end {
+            continue;
+        }
         if source_cursor < marker.start.0 {
             append_segment(
                 &mut visual,
@@ -1054,7 +1191,7 @@ pub fn present_markdown_with_disclosure(
                 Visibility::Visible,
             );
         }
-        let expanded = marker_is_disclosed(marker, &parsed, disclosure);
+        let expanded = marker_is_disclosed(planned, parsed, &shared.projection.nodes, disclosure);
         append_segment(
             &mut visual,
             &mut segments,
@@ -1093,11 +1230,14 @@ pub fn present_markdown_with_disclosure(
         return present_raw_source(line_id, revision, range, source, line_height);
     }
     let source_map = SourceMap { segments };
-    let mut style_runs = parsed
-        .tree
+    // A style run's node may also span lines that are not this one; clipping to
+    // `range` (as already done here) and letting `source_to_visual` fail outside
+    // it is what discards the part that belongs elsewhere.
+    let mut style_runs = nodes
         .iter()
-        .filter(|(_, node)| has_delimiter_markers(node.kind))
-        .filter_map(|(_, span)| {
+        .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| has_delimiter_markers(node.kind))
+        .filter_map(|span| {
             let style = syntax_display(span.kind).inline_style?;
             let clipped = SourceRange {
                 start: span.source_range.start.max(range.start),
@@ -1133,6 +1273,444 @@ pub fn present_markdown_with_disclosure(
     }
 }
 
+/// The standalone image `source` presents as, when nothing currently discloses
+/// it. Shared by [`present_polished_line`]'s own single-line dispatch and
+/// [`present_joined_run`]'s per-line dispatch inside a joined multi-line run,
+/// so both agree on exactly which physical lines render through
+/// [`present_image`] rather than the shared/self-contained markdown parse —
+/// an image line's disclosure state is its own, not the run-wide merged one a
+/// joined run otherwise shares (see [`merged_disclosure`]), since only a
+/// disclosure that actually touches this line's own range should reveal its
+/// raw markup.
+fn inactive_standalone_image<'a>(
+    source: &'a str,
+    range: SourceRange,
+    disclosure: Option<SourceRange>,
+) -> Option<StandaloneImage<'a>> {
+    parse_standalone_image(source)
+        .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
+}
+
+/// Whether a [`disclosure_runs`] run should be presented and disclosed with
+/// shared-parse semantics — one whole-paragraph parse and one run-wide merged
+/// disclosure (see [`merged_disclosure`]) — rather than as a single
+/// self-contained line.
+///
+/// True whenever [`disclosure_runs`] itself joined two or more physical
+/// lines, but also whenever a caller already holds a valid whole-block
+/// [`JoinedParse`]: `window.lines` can be trimmed down to just `window.render`
+/// once one exists (see `presented_block`'s `JOIN_SYNC_LINE_BUDGET` seam in
+/// `hane-ui`), which collapses the run to one physical line even though the
+/// block's own construct still spans more than the one line being drawn. A
+/// one-line run must then still resolve markers against the cached
+/// whole-block parse instead of a lone-line reparse that never saw the rest
+/// of the construct — the same Markdown must not change marker visibility or
+/// style depending on how many physical lines happen to be in the render
+/// window.
+fn run_uses_shared_parse(run_len: usize, joined: Option<&JoinedParse>) -> bool {
+    run_len > 1 || joined.is_some()
+}
+
+/// Groups `window.lines` into the runs [`present_block`] presents from: a run
+/// of two or more contiguous lines in a joinable block's normal flow, sharing
+/// one whole-paragraph parse and one run-wide merged disclosure (see
+/// [`merged_disclosure`]), or a single line presented and disclosed on its
+/// own. Returns index ranges into `window.lines`, in order. Needs no parse,
+/// so [`expected_disclosures`] can reuse the exact same grouping
+/// [`present_block`] itself derives without doing the whole-paragraph parse
+/// that grouping feeds into.
+///
+/// A standalone image line stays inside its run rather than splitting it: a
+/// delimiter pair CommonMark resolves across the whole paragraph (see
+/// [`present_joined_run`]) must still close correctly when an image line sits
+/// between the two halves, even though that image line itself renders through
+/// [`present_image`] rather than the shared parse (see
+/// [`inactive_standalone_image`]).
+///
+/// Whether a returned run is actually presented with shared-parse semantics
+/// is [`run_uses_shared_parse`]'s call, not this function's: a run can come
+/// back one line long here and still need the shared parse, when
+/// `window.joined` is already available.
+fn disclosure_runs(block_kind: NodeKind, window: &BlockWindow<'_>) -> Vec<Range<usize>> {
+    let context = block_line_context(block_kind);
+    let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    let joinable = block_is_joinable(block_kind);
+    let mut runs = Vec::new();
+    let mut index = 0;
+    while index < window.lines.len() {
+        let line = window.lines[index];
+        let line_context = if line.line < content_end {
+            context
+        } else {
+            LineContext::Normal
+        };
+        let mut run_end = index + 1;
+        if joinable && line_context == LineContext::Normal {
+            while run_end < window.lines.len() {
+                let next = window.lines[run_end];
+                let next_context = if next.line < content_end {
+                    context
+                } else {
+                    LineContext::Normal
+                };
+                if next_context != LineContext::Normal {
+                    break;
+                }
+                run_end += 1;
+            }
+        }
+        runs.push(index..run_end);
+        index = run_end;
+    }
+    runs
+}
+
+/// Disclosure [`present_block`] would currently assign to each of
+/// `window.render`'s lines, paired with that line's document line number: the
+/// run-wide merged disclosure (see [`merged_disclosure`]) for a non-empty line
+/// inside a run [`run_uses_shared_parse`] says presents with shared-parse
+/// semantics — even one whose own [`BlockLine::disclosure`] is `None`, because
+/// the caret, selection or IME sits on a different physical line of the same
+/// shared construct, or because that other line is off-screen entirely and
+/// only reachable through `window.joined` — or the line's own disclosure
+/// otherwise.
+/// An empty line (the blank run trailing the document's last block; see
+/// [`block_line_span`]) never gets the merged value even when grouped into the
+/// run, matching `present_markdown_from_parse`'s own early return for empty
+/// source, which presents it via [`present_plain`] with no disclosure at all.
+/// Neither does an inactive standalone image line grouped into the run — see
+/// [`inactive_standalone_image`] — since [`present_joined_run`] renders it
+/// through [`present_image`], which always reports no disclosure of its own.
+///
+/// Computed without parsing, from the same grouping [`present_block`] derives
+/// (see [`disclosure_runs`]), so a caller checking whether a cached
+/// [`VisualBlock`]'s disclosures are still current (see
+/// `EditorView::disclosures_are_current`) gets exactly the value a fresh
+/// [`present_block`] call would assign instead of risking the two definitions
+/// of "current" falling out of sync — which otherwise invalidates and rebuilds
+/// the cache every frame the caret sits inside an active multi-line paragraph,
+/// since a per-line-only recomputation never agrees with the run-wide value a
+/// joined run's other lines were actually presented with.
+pub fn expected_disclosures(
+    block_kind: NodeKind,
+    window: &BlockWindow<'_>,
+) -> Vec<(usize, Option<SourceRange>)> {
+    let mut out = Vec::new();
+    for run in disclosure_runs(block_kind, window) {
+        let lines = &window.lines[run];
+        let shared_parse = run_uses_shared_parse(lines.len(), window.joined);
+        let merged = shared_parse
+            .then(|| joined_run_disclosure(lines, window.block_disclosure))
+            .flatten();
+        for line in lines {
+            if window.render.contains(&line.line) {
+                let disclosure = if shared_parse
+                    && !line.text.is_empty()
+                    && inactive_standalone_image(line.text, line.range, line.disclosure).is_none()
+                {
+                    merged
+                } else if shared_parse {
+                    None
+                } else {
+                    line.disclosure
+                };
+                out.push((line.line, disclosure));
+            }
+        }
+    }
+    out
+}
+
+/// Union of every line's own disclosure in a joined run, so a shared construct
+/// that spans more than one physical line discloses consistently on every line
+/// that carries one of its markers, not only the line the caret/selection/IME
+/// happens to sit on. Reconstructs the original caret point or selection/IME
+/// extent: each line's own disclosure is already that extent clipped to the
+/// line, so the union of all of them is the extent itself.
+fn merged_disclosure(lines: &[BlockLine<'_>]) -> Option<SourceRange> {
+    lines
+        .iter()
+        .filter_map(|line| line.disclosure)
+        .reduce(union_disclosure)
+}
+
+fn union_disclosure(a: SourceRange, b: SourceRange) -> SourceRange {
+    SourceRange {
+        start: a.start.min(b.start),
+        end: a.end.max(b.end),
+    }
+}
+
+/// The disclosure a joined run of `lines` presents against: [`merged_disclosure`]'s
+/// reconstruction from `lines`' own per-line disclosures, unioned with
+/// `block_disclosure`. `lines` may be only the block's visible slice (see
+/// [`BlockWindow::block_disclosure`]), so a caret/selection/IME range that
+/// falls on an off-screen physical line of the same shared construct would
+/// otherwise never surface here.
+fn joined_run_disclosure(
+    lines: &[BlockLine<'_>],
+    block_disclosure: Option<SourceRange>,
+) -> Option<SourceRange> {
+    [merged_disclosure(lines), block_disclosure]
+        .into_iter()
+        .flatten()
+        .reduce(union_disclosure)
+}
+
+/// Balanced interval index. Each subtree stores its greatest source end, so
+/// a long enclosing construct does not force a scan of unrelated short spans.
+#[derive(Clone, Debug)]
+struct SourceIndex<T> {
+    entries: Vec<(SourceRange, T)>,
+    max_ends: Vec<SourceOffset>,
+}
+
+impl<T> SourceIndex<T> {
+    fn new(mut entries: Vec<(SourceRange, T)>) -> Self {
+        entries.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut index = Self {
+            max_ends: vec![SourceOffset(0); entries.len()],
+            entries,
+        };
+        index.build(0, index.entries.len());
+        index
+    }
+
+    fn build(&mut self, start: usize, end: usize) -> SourceOffset {
+        if start == end {
+            return SourceOffset(0);
+        }
+        let mid = start + (end - start) / 2;
+        let max = self.entries[mid]
+            .0
+            .end
+            .max(self.build(start, mid))
+            .max(self.build(mid + 1, end));
+        self.max_ends[mid] = max;
+        max
+    }
+
+    fn intersecting(&self, range: SourceRange) -> Vec<&T> {
+        let mut result = Vec::new();
+        self.query(0, self.entries.len(), range, &mut result, &mut 0);
+        result
+    }
+
+    fn query<'a>(
+        &'a self,
+        start: usize,
+        end: usize,
+        range: SourceRange,
+        result: &mut Vec<&'a T>,
+        visited: &mut usize,
+    ) {
+        if start == end {
+            return;
+        }
+        let mid = start + (end - start) / 2;
+        *visited += 1;
+        if self.max_ends[mid] <= range.start || self.entries[start].0.start >= range.end {
+            return;
+        }
+        self.query(start, mid, range, result, visited);
+        let (source, value) = &self.entries[mid];
+        if source.intersects(range) {
+            result.push(value);
+        }
+        self.query(mid + 1, end, range, result, visited);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedMarker {
+    range: SourceRange,
+    quote_owner: Option<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectionIndex {
+    markers: Vec<ProjectedMarker>,
+    nodes: SourceIndex<NodeId>,
+}
+
+impl ProjectionIndex {
+    fn new(parsed: &MarkdownParse) -> Self {
+        let owners = parsed
+            .quote_markers
+            .iter()
+            .map(|(range, owner)| ((range.start, range.end), *owner))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut markers = parsed
+            .markers
+            .iter()
+            .chain(&parsed.code_padding)
+            .map(|range| ProjectedMarker {
+                range: *range,
+                quote_owner: owners.get(&(range.start, range.end)).copied(),
+            })
+            .collect::<Vec<_>>();
+        markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+        let nodes = SourceIndex::new(
+            parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| node.kind.is_block() || has_delimiter_markers(node.kind))
+                .map(|(id, node)| (node.source_range, id))
+                .collect(),
+        );
+        Self { markers, nodes }
+    }
+}
+
+/// One joinable block's whole-span parse, kept independent of which lines a
+/// particular presentation call is drawing.
+///
+/// CommonMark resolves `**`/`_`/`` ` `` across a whole paragraph, so
+/// presenting it correctly needs a parse of its entire joined source — but a
+/// block has no size limit (see [`VisualBlock`]), and only the lines that
+/// reach the viewport need to be turned into [`VisualLine`]s. Splitting the
+/// two lets a caller compute this once, off the render path for a block too
+/// large to reparse on every viewport miss, and reuse it for every window
+/// drawn from the block afterward (see [`BlockWindow::joined`]) — so the
+/// result of a marker pair arbitrarily far apart does not depend on where the
+/// viewport happens to sit, the way a fixed context window around it would.
+#[derive(Clone, Debug)]
+pub struct JoinedParse {
+    /// Byte range the joined source was read from; a stale cache (an edit
+    /// touched the block, or the index re-tiled it) is one whose block no
+    /// longer reports this same range.
+    pub source_range: SourceRange,
+    pub joined_source: String,
+    pub parsed: MarkdownParse,
+    projection: ProjectionIndex,
+}
+
+/// Parses `lines` joined into one source, from texts the caller already has
+/// in hand. Used both as [`present_joined_run`]'s fallback when no cached
+/// [`JoinedParse`] is available, and to build one from a bounded run of
+/// [`BlockLine`]s.
+pub fn parse_joined_block(lines: &[BlockLine<'_>], revision: Revision) -> JoinedParse {
+    let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
+    let joined_source = lines.iter().map(|line| line.text).collect::<String>();
+    let parsed = parse_document(revision, joined_range, &joined_source);
+    let projection = ProjectionIndex::new(&parsed);
+    JoinedParse {
+        source_range: joined_range,
+        joined_source,
+        parsed,
+        projection,
+    }
+}
+
+/// Reads and parses one joinable block's whole content span directly from
+/// `document`, independent of any particular viewport. Meant to run off the
+/// render path (see [`BlockWindow::joined`]): a single read and parse whose
+/// cost scales with the block's size, which for a joinable block has no
+/// upper bound. `content` excludes the block's trailing blank run, matching
+/// what [`present_block`] itself treats as the construct's own lines.
+pub fn parse_joined_span(
+    document: &RopeBuffer,
+    content: Range<usize>,
+    revision: Revision,
+) -> Option<JoinedParse> {
+    if content.is_empty() {
+        return None;
+    }
+    let start = document
+        .line_range(hane_document::LineId(content.start))
+        .ok()?
+        .start;
+    let end = document
+        .line_range(hane_document::LineId(content.end - 1))
+        .ok()?
+        .end;
+    let joined_range = SourceRange::new(start.0, end.0);
+    let joined_source = document.text(joined_range).ok()?;
+    let parsed = parse_document(revision, joined_range, &joined_source);
+    let projection = ProjectionIndex::new(&parsed);
+    Some(JoinedParse {
+        source_range: joined_range,
+        joined_source,
+        parsed,
+        projection,
+    })
+}
+
+/// Presents a run of a standalone paragraph's contiguous physical lines from
+/// one shared parse of their joined source, so emphasis, strong emphasis and
+/// code spans that cross a physical line boundary resolve the way a single
+/// whole-paragraph parse would. See [`present_markdown_from_parse`] for why a
+/// per-line parse cannot see these on its own.
+///
+/// `joined`, when given, is a whole-block parse computed elsewhere (see
+/// [`JoinedParse`]) and is used as the shared parse directly instead of
+/// rejoining and reparsing `lines`; only `lines` themselves still have to be
+/// this run's own, since each is presented against its own physical range
+/// regardless of which parse supplied it.
+fn present_joined_run(
+    lines: &[BlockLine<'_>],
+    revision: Revision,
+    line_height: f32,
+    render: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    block_disclosure: Option<SourceRange>,
+    out: &mut Vec<VisualLine>,
+) {
+    let computed;
+    let joined = match joined {
+        Some(joined) => joined,
+        None => {
+            computed = parse_joined_block(lines, revision);
+            &computed
+        }
+    };
+    let shared = SharedParse {
+        parsed: &joined.parsed,
+        projection: &joined.projection,
+    };
+    // A single active disclosure (caret, selection or IME) may touch a shared
+    // construct whose markers live on different physical lines; `marker_is_disclosed`
+    // only expands a marker whose enclosing span reaches the disclosure it is
+    // given, so every line of the run is offered the same, run-wide disclosure
+    // rather than only the one line that literally owns the caret.
+    let disclosure = joined_run_disclosure(lines, block_disclosure);
+    for line in lines {
+        if !render.contains(&line.line) {
+            continue;
+        }
+        // An inactive standalone image line keeps rendering through its own
+        // dedicated path even while joined into the run for parse purposes —
+        // only the surrounding text lines' delimiters need the shared parse;
+        // the image line's own disclosure (not the run-wide merged one)
+        // decides whether it is presently being edited as raw markup instead.
+        let mut presented = match inactive_standalone_image(line.text, line.range, line.disclosure)
+        {
+            Some(image) => present_image(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                image,
+            ),
+            None => present_markdown_from_parse(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                disclosure,
+                &shared,
+            ),
+        };
+        presented.context = LineContext::Normal;
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
+        }
+        out.push(presented);
+    }
+}
+
 /// Presents one physical source line with Phase 4 block polish. The block-level
 /// [`LineContext`] is supplied by the caller from the document context index;
 /// standalone image recognition is local to this source slice. Presentation owns
@@ -1152,9 +1730,7 @@ pub fn present_polished_line(
     // and table recognition that would otherwise mis-read the literal text.
     let mut block = if context == LineContext::FencedCode {
         present_fenced_code_line(line_id, revision, range, source, line_height)
-    } else if let Some(image) = parse_standalone_image(source)
-        .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
-    {
+    } else if let Some(image) = inactive_standalone_image(source, range, disclosure) {
         present_image(line_id, revision, range, source, line_height, image)
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
@@ -1641,6 +2217,102 @@ pub fn anchored_scroll_y(
 mod tests {
     use super::*;
     #[test]
+    fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
+        // A prefix-max-only index would scan all preceding spans because the
+        // enclosing construct reaches the end. Subtree maxima must prune them.
+        let mut ranges = vec![(SourceRange::new(0, 1_000_000), 0)];
+        ranges.extend((1..100_000).map(|i| (SourceRange::new(i * 10, i * 10 + 5), i)));
+        let index = SourceIndex::new(ranges);
+        let mut hits = Vec::new();
+        let mut visited = 0;
+        index.query(
+            0,
+            index.entries.len(),
+            SourceRange::new(999_980, 999_985),
+            &mut hits,
+            &mut visited,
+        );
+        hits.sort();
+        assert_eq!(hits, vec![&0, &99_998]);
+        assert!(
+            visited < 100,
+            "visited {visited} nodes for two intersecting spans"
+        );
+    }
+
+    #[test]
+    fn cached_hundred_thousand_line_quote_projects_only_viewport_markers() {
+        let source = format!("> **opening\n{}> closing**\n", "> plain\n".repeat(99_998));
+        let mut start = 40;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(start, start + text.len());
+                start = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(7));
+        assert_eq!(joined.projection.markers.len(), 100_002);
+        let shared = SharedParse {
+            parsed: &joined.parsed,
+            projection: &joined.projection,
+        };
+        // The caret is off-screen inside the strong span. Prefix ownership and
+        // both distant delimiters still use the same complete snapshot.
+        let disclosure = Some(SourceRange::empty(lines[1].range.start.0 + 3));
+        for line in &lines[99_950..] {
+            let presented = present_markdown_from_parse(
+                line.line as u64,
+                Revision(7),
+                line.range,
+                line.text,
+                26.0,
+                disclosure,
+                &shared,
+            );
+            assert_eq!(presented.visual_text, line.text);
+            assert!(
+                presented
+                    .style_runs
+                    .iter()
+                    .any(|run| run.kind == StyleKind::Bold)
+            );
+            assert!(segments_tile_range(
+                line.range,
+                &presented.source_map.segments
+            ));
+            assert!(
+                presented.source_map.segments.capacity() <= 5,
+                "mapping storage must depend on this line's markers, not all 100,002"
+            );
+            let hidden = present_markdown_from_parse(
+                line.line as u64,
+                Revision(7),
+                line.range,
+                line.text,
+                26.0,
+                None,
+                &shared,
+            );
+            assert_eq!(
+                hidden.visual_text,
+                if line.line == 99_999 {
+                    "closing\n"
+                } else {
+                    "plain\n"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn plain_presentation_preserves_markdown_source_bytes() {
         let text = "**日本語**";
         let block = present_plain(3, Revision(2), SourceRange::new(10, 10 + text.len()), text);
@@ -1802,6 +2474,584 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn shared_heading_kinds_follow_each_physical_lines_source_range() {
+        for (source, expected) in [
+            (
+                "> ## first\n> plain\n> ### second\n\n",
+                &[
+                    BlockKind::Heading(2),
+                    BlockKind::Quote,
+                    BlockKind::Heading(3),
+                    BlockKind::Paragraph,
+                ][..],
+            ),
+            (
+                "- ## first\n  plain\n  ### second\n",
+                &[
+                    BlockKind::Heading(2),
+                    BlockKind::ListItem,
+                    BlockKind::Heading(3),
+                ][..],
+            ),
+        ] {
+            let mut offset = 50;
+            let lines = source
+                .split_inclusive('\n')
+                .enumerate()
+                .map(|(line, text)| {
+                    let range = SourceRange::new(offset, offset + text.len());
+                    offset = range.end.0;
+                    BlockLine {
+                        line,
+                        range,
+                        text,
+                        disclosure: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let joined = parse_joined_block(&lines, Revision(1));
+            let mut wide = Vec::new();
+            present_joined_run(
+                &lines,
+                Revision(1),
+                26.0,
+                &(0..lines.len()),
+                None,
+                None,
+                &mut wide,
+            );
+            for (index, &expected_kind) in expected.iter().enumerate() {
+                assert_eq!(
+                    wide[index].kind, expected_kind,
+                    "line {index} in {source:?}"
+                );
+                let mut narrow = Vec::new();
+                present_joined_run(
+                    &lines[index..index + 1],
+                    Revision(1),
+                    26.0,
+                    &(index..index + 1),
+                    Some(&joined),
+                    None,
+                    &mut narrow,
+                );
+                assert_eq!(narrow[0].kind, expected_kind);
+                assert_eq!(narrow[0].estimated_height, wide[index].estimated_height);
+                assert_eq!(narrow[0].visual_text, wide[index].visual_text);
+                assert_eq!(
+                    narrow[0].source_map.segments,
+                    wide[index].source_map.segments
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_padding_inside_containers_preserves_shared_projection_and_source() {
+        for (source, expected) in [
+            ("> `\n> x\n> `", vec!["", "x", ""]),
+            ("> `\r\n> x\r\n> `", vec!["", "x", ""]),
+            ("> > `\n> > x\n> > `", vec!["", "x", ""]),
+            ("> ` \n>  `", vec![" ", " "]),
+            ("> ` x\n> y `", vec!["x", "y"]),
+            ("- `\n  x\n  `", vec!["", "  x", "  "]),
+        ] {
+            let mut offset = 50;
+            let lines: Vec<_> = source
+                .split_inclusive('\n')
+                .enumerate()
+                .map(|(line, text)| {
+                    let start = offset;
+                    offset += text.len();
+                    BlockLine {
+                        line,
+                        range: SourceRange::new(start, offset),
+                        text,
+                        disclosure: None,
+                    }
+                })
+                .collect();
+            let block = IndexedBlock {
+                ordinal: 0,
+                id: BlockId(0),
+                kind: if source.starts_with('>') {
+                    NodeKind::Quote
+                } else {
+                    NodeKind::List { ordered: false }
+                },
+                source_range: SourceRange::new(50, offset),
+                revision: Revision(1),
+                confidence: Confidence::Formal,
+                line_count: lines.len(),
+            };
+            let joined = parse_joined_block(&lines, Revision(1));
+            let window = BlockWindow {
+                span: 0..lines.len(),
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 0..lines.len(),
+                joined: Some(&joined),
+                block_disclosure: None,
+            };
+            let wide = present_block(&block, Revision(1), &window, 26.0);
+            for (index, line) in wide.lines.iter().enumerate() {
+                assert_eq!(
+                    line.visual_text, expected[index],
+                    "{source:?}, line {index}"
+                );
+                assert_ne!(line.kind, BlockKind::Unsupported);
+                assert!(segments_tile_range(
+                    lines[index].range,
+                    &line.source_map.segments
+                ));
+                let narrow_window = BlockWindow {
+                    lines: &lines[index..index + 1],
+                    render: index..index + 1,
+                    ..window.clone()
+                };
+                let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+                assert_eq!(
+                    narrow.lines[0].source_map.segments,
+                    line.source_map.segments
+                );
+            }
+            let active_window = BlockWindow {
+                block_disclosure: Some(SourceRange::empty(50 + source.find('`').unwrap() + 1)),
+                ..window
+            };
+            let active = present_block(&block, Revision(1), &active_window, 26.0);
+            for (index, line) in active.lines.iter().enumerate() {
+                assert_eq!(
+                    line.visual_text,
+                    lines[index].text.trim_end_matches(['\r', '\n'])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quote_disclosure_does_not_expand_inactive_nested_quote_or_inline_markers() {
+        let source = "> outer\n> > **nested**";
+        let start = 40;
+        let visual = present_markdown_with_disclosure(
+            0,
+            Revision(1),
+            SourceRange::new(start, start + source.len()),
+            source,
+            26.0,
+            Some(SourceRange::empty(start + 4)),
+        );
+        assert_eq!(visual.visual_text, "> outer\n> nested");
+    }
+
+    #[test]
+    fn quote_disclosure_uses_prefix_ownership_across_viewports() {
+        let texts = ["> **first**\n", "> second"];
+        let start = 50;
+        let split = start + texts[0].len();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: SourceRange::new(start, split),
+                text: texts[0],
+                disclosure: None,
+            },
+            BlockLine {
+                line: 1,
+                range: SourceRange::new(split, split + texts[1].len()),
+                text: texts[1],
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Quote,
+            source_range: SourceRange::new(start, lines[1].range.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+        // Empty ranges represent carets; non-empty ranges also cover selection
+        // and IME disclosure. Neither should disclose the inactive strong span.
+        for disclosure in [
+            SourceRange::empty(split + 4),
+            SourceRange::new(split + 3, split + 6),
+        ] {
+            let wide_window = BlockWindow {
+                span: 0..2,
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 0..2,
+                joined: Some(&joined),
+                block_disclosure: Some(disclosure),
+            };
+            let wide = present_block(&block, Revision(1), &wide_window, 26.0);
+            assert_eq!(wide.lines[0].visual_text, "> first");
+            assert_eq!(wide.lines[1].visual_text, "> second");
+            for index in 0..2 {
+                let narrow_window = BlockWindow {
+                    lines: &lines[index..index + 1],
+                    render: index..index + 1,
+                    ..wide_window.clone()
+                };
+                let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+                assert_eq!(narrow.lines[0].visual_text, wide.lines[index].visual_text);
+                assert_eq!(
+                    narrow.lines[0].source_map.segments,
+                    wide.lines[index].source_map.segments
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disclosure_on_one_line_of_a_shared_construct_reaches_every_line_that_carries_it() {
+        // A caret on the line that owns a shared Strong's opening `**` must also
+        // expand the closing `**` on the other physical line: the two markers
+        // belong to one active construct, so a partial disclosure would show one
+        // marker and hide the other for the same bold run.
+        let line0 = "This is **bold\n";
+        let line1 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + line1.len());
+        let caret = range0.start.0 + line0.find("bold").unwrap();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: Some(SourceRange::empty(caret)),
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: line1,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range1.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..2,
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        let closing_marker = range1.start.0 + line1.find("**").unwrap();
+        assert!(
+            visual.lines[1].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker on the line without its own disclosure must still expand"
+        );
+
+        // `expected_disclosures` must agree with what `present_block` itself
+        // just assigned to every line of the run, including the one without
+        // its own `BlockLine::disclosure` — a caller comparing a cached
+        // presentation's disclosures against this instead of each line's own,
+        // unmerged disclosure is what lets it recognize the cache as current
+        // while the caret sits inside a joined multi-line run (see
+        // `EditorView::disclosures_are_current`).
+        let expected = expected_disclosures(NodeKind::Paragraph, &window);
+        assert_eq!(
+            expected,
+            visual
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn standalone_image_line_inside_a_run_does_not_split_the_shared_parse() {
+        // A `**`/`_`/`` ` `` pair distant enough to sit on either side of a
+        // standalone image line's own physical line must still resolve as one
+        // shared construct: the image line is its own presentation (rendered
+        // through `present_image`, not the joined parse), but it must not act
+        // as a run boundary that forces the paragraph's two halves into
+        // separate, self-contained parses.
+        let line0 = "This is **bold\n";
+        let image_line = "![alt](dest)\n";
+        let line2 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + image_line.len());
+        let range2 = SourceRange::new(range1.end.0, range1.end.0 + line2.len());
+        let caret = range0.start.0 + line0.find("bold").unwrap();
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: Some(SourceRange::empty(caret)),
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: image_line,
+                disclosure: None,
+            },
+            BlockLine {
+                line: 2,
+                range: range2,
+                text: line2,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range2.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 3,
+        };
+        let window = BlockWindow {
+            span: 0..3,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..3,
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines.len(), 3);
+
+        // The closing `**` on the far side of the image line must still be
+        // recognized as the same Strong construct's marker and expand,
+        // exactly as if the image line were not there.
+        let closing_marker = range2.start.0 + line2.find("**").unwrap();
+        assert!(
+            visual.lines[2].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker across the image line must still expand"
+        );
+
+        // The image line itself must still go through Hane's dedicated image
+        // presentation path, not the shared markdown parse.
+        assert_eq!(visual.lines[1].kind, BlockKind::Image);
+        assert_eq!(
+            visual.lines[1].image,
+            Some(ImagePresentation {
+                alt: "alt".to_owned(),
+                destination: "dest".to_owned(),
+            })
+        );
+        assert_eq!(visual.lines[1].disclosure, None);
+
+        // `expected_disclosures` must still agree with what `present_block`
+        // actually assigned, including the image line's own hardcoded `None`
+        // even though the run's merged disclosure (from the caret on line 0)
+        // is `Some`.
+        let expected = expected_disclosures(NodeKind::Paragraph, &window);
+        assert_eq!(
+            expected,
+            visual
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn one_physical_line_render_window_with_cached_joined_parse_matches_a_wider_window() {
+        // `presented_block` (in `hane-ui`) trims `window.lines` down to just
+        // `window.render` once a cached `JoinedParse` is available (see
+        // `JOIN_SYNC_LINE_BUDGET`), which can leave `disclosure_runs` a run
+        // only one physical line long even though the block's own construct —
+        // a `**` pair here — spans a second, off-screen line. `present_block`
+        // must still resolve it against the cached whole-block parse instead
+        // of falling back to a lone-line, self-contained reparse that never
+        // sees the closing marker: the rendered line's marker visibility,
+        // style runs and source map must come out identical whether the
+        // render window is one line or both.
+        let line0 = "This is **bold\n";
+        let line1 = "across lines** ok";
+        let start = 50;
+        let range0 = SourceRange::new(start, start + line0.len());
+        let range1 = SourceRange::new(range0.end.0, range0.end.0 + line1.len());
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: range0,
+                text: line0,
+                disclosure: None,
+            },
+            BlockLine {
+                line: 1,
+                range: range1,
+                text: line1,
+                disclosure: None,
+            },
+        ];
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(range0.start.0, range1.end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 2,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+
+        let wide_window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..2,
+            joined: Some(&joined),
+            block_disclosure: None,
+        };
+        let wide = present_block(&block, Revision(1), &wide_window, 26.0);
+
+        let narrow_lines = &lines[0..1];
+        let narrow_window = BlockWindow {
+            span: 0..2,
+            trailing_blank_lines: 0,
+            lines: narrow_lines,
+            render: 0..1,
+            joined: Some(&joined),
+            block_disclosure: None,
+        };
+        let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+
+        assert_eq!(narrow.lines.len(), 1);
+        assert_eq!(narrow.lines[0].visual_text, wide.lines[0].visual_text);
+        assert_eq!(narrow.lines[0].style_runs, wide.lines[0].style_runs);
+        assert_eq!(
+            narrow.lines[0].source_map.segments,
+            wide.lines[0].source_map.segments
+        );
+        // Without the shared parse, line 0's lone `**` would be unmatched and
+        // stay literal instead of hiding as an opening Strong marker.
+        assert!(
+            narrow.lines[0]
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::HiddenMarkup),
+            "the opening marker must resolve against the cached whole-block parse, not a lone-line reparse"
+        );
+
+        // `expected_disclosures` must agree with what `present_block` itself
+        // just assigned, for the same trimmed window.
+        let expected = expected_disclosures(NodeKind::Paragraph, &narrow_window);
+        assert_eq!(
+            expected,
+            narrow
+                .lines
+                .iter()
+                .map(|line| (line.line_id as usize, line.disclosure))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn standalone_image_line_does_not_split_a_run_with_distant_delimiters() {
+        // Same guarantee as `standalone_image_line_inside_a_run_does_not_split_the_shared_parse`,
+        // but with several plain lines separating the image line from each
+        // delimiter instead of the image sitting immediately next to both —
+        // the run's shared parse must not narrow to a self-contained window
+        // around the image line.
+        let lines_text = [
+            "This text has **bold that continues\n",
+            "through several\n",
+            "![alt](dest)\n",
+            "more plain lines\n",
+            "until it finally ends** here",
+        ];
+        let mut ranges = Vec::new();
+        let mut cursor = 50;
+        for text in &lines_text {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let caret = ranges[0].start.0 + lines_text[0].find("bold").unwrap();
+        let lines: Vec<BlockLine<'_>> = lines_text
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(index, (text, range))| BlockLine {
+                line: index,
+                range: *range,
+                text,
+                disclosure: (index == 0).then(|| SourceRange::empty(caret)),
+            })
+            .collect();
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Paragraph,
+            source_range: SourceRange::new(ranges[0].start.0, ranges[4].end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: lines.len(),
+        };
+        let window = BlockWindow {
+            span: 0..lines.len(),
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..lines.len(),
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines.len(), lines.len());
+
+        // The opening `**` (line 0) and the closing `**` (line 4) are five
+        // physical lines apart with an image line between them; both must
+        // still resolve as the same Strong construct's markers.
+        let opening_marker = ranges[0].start.0 + lines_text[0].find("**").unwrap();
+        assert!(
+            visual.lines[0].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == opening_marker
+            }),
+            "the opening marker before the image line must still expand"
+        );
+        let closing_marker = ranges[4].start.0 + lines_text[4].find("**").unwrap();
+        assert!(
+            visual.lines[4].source_map.segments.iter().any(|segment| {
+                segment.visibility == Visibility::ExpandedMarkup
+                    && segment.source_range.start.0 == closing_marker
+            }),
+            "the closing marker after the image line must still expand"
+        );
+
+        // The image line itself still renders through the dedicated image
+        // path rather than the shared markdown parse.
+        assert_eq!(visual.lines[2].kind, BlockKind::Image);
+        assert_eq!(
+            visual.lines[2].image,
+            Some(ImagePresentation {
+                alt: "alt".to_owned(),
+                destination: "dest".to_owned(),
+            })
+        );
     }
 
     #[test]
