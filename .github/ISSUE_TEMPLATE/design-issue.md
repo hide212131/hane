@@ -2,7 +2,7 @@
 name: 設計 Issue（Work → Claude Code）
 about: ChatGPT / Work で整理した要求・設計を Claude Code の実装に引き渡すための Issue テンプレート
 title: ""
-labels: []
+labels: ""
 assignees: ""
 ---
 
