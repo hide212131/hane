@@ -1,6 +1,6 @@
 use crate::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, Point,
+    FontStyle, FontWeight, GlyphId, IsZero, LineLayout, Pixels, PlatformTextSystem, Point,
     RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString, Size,
     point, px, size, swap_rgba_pa_to_bgra,
 };
@@ -387,7 +387,7 @@ impl MacTextSystemState {
                 font_kit::canvas::RasterizationOptions::GrayscaleAa,
             )?
             .into();
-        if self.synthetic_oblique.contains(&params.font_id) {
+        if self.synthetic_oblique.contains(&params.font_id) && !bounds.is_zero() {
             // Core Graphics antialiasing can extend one pixel beyond the
             // transformed outline. Reserve that fringe on every edge.
             bounds.origin.x -= DevicePixels(1);
@@ -1004,6 +1004,28 @@ mod tests {
             glyphs.iter().map(|g| g.1).collect::<Vec<_>>(),
             vec![0, 3, 6]
         );
+    }
+
+    #[test]
+    fn hane_oblique_preserves_empty_glyph_bounds() {
+        use crate::{IsZero, RenderGlyphParams, point};
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Hiragino Sans").italic()).unwrap();
+        for ch in [' ', '\u{3000}'] {
+            let glyph_id = fonts.glyph_for_char(font_id, ch).unwrap();
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: px(24.),
+                subpixel_variant: point(0, 0),
+                scale_factor: 2.,
+                is_emoji: false,
+            };
+            assert!(
+                fonts.glyph_raster_bounds(&params).unwrap().is_zero(),
+                "blank glyphs must stay excluded from sprite allocation and painting"
+            );
+        }
     }
 
     #[test]
