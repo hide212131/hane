@@ -515,6 +515,34 @@ fn consume_containers(
     Some(cursor)
 }
 
+/// CommonMark treats CR, LF and CRLF as line endings, independently of the
+/// editor's LF-based RopeBuffer lines. Keep the original bytes for source maps.
+fn markdown_line_start(source: &str, mut at: usize) -> usize {
+    if source.as_bytes().get(at) == Some(&b'\n') && at > 0 && source.as_bytes()[at - 1] == b'\r' {
+        at -= 1;
+    }
+    source[..at].rfind(['\r', '\n']).map_or(0, |at| at + 1)
+}
+
+fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if source.is_empty() {
+            return None;
+        }
+        let end = source.find(['\r', '\n']).map_or(source.len(), |at| {
+            at + if source.as_bytes()[at] == b'\r' && source.as_bytes().get(at + 1) == Some(&b'\n')
+            {
+                2
+            } else {
+                1
+            }
+        });
+        let (line, rest) = source.split_at(end);
+        source = rest;
+        Some(line)
+    })
+}
+
 /// Recover a quote's markers from its actual ancestor containers, not a fixed
 /// byte width per depth. Lazy continuation lines fail the prefix scan and have
 /// no marker. List-item padding is measured on that item's opening line.
@@ -532,11 +560,8 @@ fn ancestor_containers(
             NodeKind::Quote => containers.push(PrefixContainer::Quote),
             NodeKind::ListItem { .. } => {
                 let start = node.source_range.start.0 - range.start.0;
-                let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
-                let line = source[line_start..]
-                    .split_inclusive('\n')
-                    .next()
-                    .unwrap_or("");
+                let line_start = markdown_line_start(source, start);
+                let line = markdown_lines(&source[line_start..]).next().unwrap_or("");
                 let mut cursor = consume_containers(&containers, line_start, line.as_bytes())?;
                 let indent = cursor.list_item(line.as_bytes())?;
                 containers.push(PrefixContainer::ListItem { start, indent });
@@ -559,9 +584,9 @@ fn quote_markers(
     let node = tree.node(id).expect("quote exists");
     let start = node.source_range.start.0 - range.start.0;
     let end = node.source_range.end.0 - range.start.0;
-    let mut line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+    let mut line_start = markdown_line_start(source, start);
     let mut markers = Vec::new();
-    for line in source[line_start..end].split_inclusive('\n') {
+    for line in markdown_lines(&source[line_start..end]) {
         if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
             && let Some(marker) = cursor.quote(line.as_bytes())
         {
@@ -1240,6 +1265,52 @@ mod tests {
     }
 
     #[test]
+    fn quote_markers_follow_commonmark_line_endings_with_raw_offsets() {
+        for newline in ["\r", "\n", "\r\n"] {
+            for template in [
+                "> 日本\n> 語\n",
+                "> > first\n> > second\n",
+                "intro\n\n- > first\n  > second\n",
+                "intro\n\n> -\n>   > first\n>   > second\n",
+            ] {
+                let source = template.replace('\n', newline);
+                let base = 37;
+                let parsed = parse_document(
+                    Revision(1),
+                    SourceRange::new(base, base + source.len()),
+                    &source,
+                );
+                let mut actual: Vec<_> = parsed.quote_markers.iter().map(|(r, _)| *r).collect();
+                actual.sort_by_key(|r| r.start);
+                let expected: Vec<_> = source
+                    .match_indices('>')
+                    .map(|(at, _)| SourceRange::new(base + at, base + at + 2))
+                    .collect();
+                assert_eq!(actual, expected, "source: {source:?}");
+            }
+        }
+        let source = "> first\r> second\r\n> third\n> fourth";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let expected: Vec<_> = source
+            .match_indices('>')
+            .map(|(at, _)| SourceRange::new(at, at + 2))
+            .collect();
+        assert_eq!(parsed.markers, expected);
+    }
+
+    #[test]
+    fn markdown_line_scan_preserves_bytes_and_does_not_split_crlf() {
+        let source = "日\r本\r\n語\nlast";
+        assert_eq!(
+            markdown_lines(source).collect::<Vec<_>>(),
+            ["日\r", "本\r\n", "語\n", "last"]
+        );
+        assert_eq!(markdown_line_start(source, 4), 4);
+        assert_eq!(markdown_line_start(source, 8), 4); // Inside CRLF.
+        assert_eq!(markdown_line_start(source, 9), 9);
+    }
+
+    #[test]
     fn quote_markers_follow_list_ancestors_without_hiding_literal_greater_than() {
         for (source, expected) in [
             ("- > first\n  > second\n", vec![(2, 4), (12, 14)]),
@@ -1278,7 +1349,7 @@ mod tests {
     fn quote_markers_follow_list_items_with_an_empty_opening_line() {
         for marker in ["-", "1.", "1)"] {
             for padding in ["", " ", "   ", "\t"] {
-                for newline in ["\n", "\r\n"] {
+                for newline in ["\n", "\r", "\r\n"] {
                     let indent = " ".repeat(marker.len() + 1);
                     let source = format!(
                         "{marker}{padding}{newline}{indent}> first{newline}{indent}> second"
