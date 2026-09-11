@@ -395,7 +395,7 @@ pub(crate) fn row_element(
                     .when(segment.display.monospace, |element| {
                         element.font_family("ui-monospace")
                     })
-                    .when(segment.display.code_background, |element| {
+                    .when(segment_shows_code_background(segment), |element| {
                         element.text_bg(rgb(theme.code_background))
                     })
                     .when(segment.display.link_color, |element| {
@@ -434,6 +434,18 @@ struct LineSegment {
     cursor_before: bool,
     /// Inline render policy for this stretch, supplied by presentation.
     display: InlineDisplay,
+}
+
+/// Whether a segment's div should carry the code span's `text_bg`.
+///
+/// GPUI paints a `TextStyleRefinement::background_color` (set by `text_bg`)
+/// as part of the glyph run, above the box's own `StyleRefinement::background`
+/// (set by `bg`) regardless of which method was chained first or last on the
+/// element — the two live in unrelated fields painted by unrelated passes. A
+/// segment inside a selected code span sets both, so leaving this unguarded
+/// hides the selection highlight entirely underneath the code background.
+fn segment_shows_code_background(segment: &LineSegment) -> bool {
+    segment.display.code_background && !segment.selected
 }
 
 /// Combined inline policy for every style run that fully covers `range`.
@@ -499,6 +511,53 @@ fn cursor_overlay(theme: Theme) -> Div {
 mod tests {
     use super::*;
     use hane_markdown::BlockIndex;
+
+    fn code_segment(selected: bool) -> LineSegment {
+        LineSegment {
+            visual_range: 0..1,
+            selected,
+            marked: false,
+            cursor_before: false,
+            display: InlineDisplay {
+                code_background: true,
+                ..InlineDisplay::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_selected_code_segment_shows_the_selection_not_the_code_background() {
+        // Issue #117: `text_bg` (code background) and `bg` (selection) are
+        // unrelated GPUI fields painted by unrelated passes, so setting both on
+        // the same div is not "last write wins" — `text_bg` always paints over
+        // `bg`. Applying it here would hide the selection highlight entirely.
+        assert!(!segment_shows_code_background(&code_segment(true)));
+    }
+
+    #[test]
+    fn an_unselected_code_segment_keeps_its_code_background() {
+        assert!(segment_shows_code_background(&code_segment(false)));
+    }
+
+    #[test]
+    fn a_selection_crossing_into_a_code_span_marks_the_overlap_as_both() {
+        // Proves the precondition the fix above guards against: partitioning a
+        // selection that reaches into a code run does produce a segment that is
+        // simultaneously `selected` and `code_background`, not two disjoint
+        // segments that would have sidestepped the conflict on their own.
+        let style_runs = [hane_presentation::StyleRun {
+            visual_range: hane_presentation::VisualRange::new(3, 9),
+            kind: hane_presentation::StyleKind::InlineCode,
+        }];
+        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs);
+        let overlap = segments
+            .iter()
+            .find(|segment| segment.visual_range == (3..6))
+            .expect("the selected half of the code run is its own segment");
+        assert!(overlap.selected);
+        assert!(overlap.display.code_background);
+        assert!(!segment_shows_code_background(overlap));
+    }
 
     /// Presents a document the way the renderer does: index first, then one
     /// `present_block` call per block.
