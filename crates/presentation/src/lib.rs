@@ -48,8 +48,8 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeKind, has_delimiter_markers,
-    is_table_delimiter, parse_document,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeId, NodeKind,
+    has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 
@@ -995,57 +995,46 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
 }
 
 fn marker_is_disclosed(
-    marker: SourceRange,
+    marker: &ProjectedMarker,
     parsed: &MarkdownParse,
+    nodes: &SourceIndex<NodeId>,
     disclosure: Option<SourceRange>,
 ) -> bool {
     let Some(disclosure) = disclosure else {
         return false;
     };
-    // Continuation prefixes belong to their quote even when their source start
-    // differs from the block's start. Consult the parser's ownership metadata:
-    // enclosing a marker by range alone would also disclose inactive child
-    // inline constructs (and prefixes of nested quotes).
-    if let Some((_, owner)) = parsed
-        .quote_markers
-        .iter()
-        .find(|(range, _)| *range == marker)
-    {
+    // Quote prefixes disclose only their actual owner, not nested constructs.
+    if let Some(owner) = marker.quote_owner {
         return parsed
             .tree
-            .node(*owner)
+            .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
-    range_touches(marker, disclosure)
-        || parsed
-            .tree
-            .iter()
-            .filter(|(_, node)| has_delimiter_markers(node.kind))
-            .any(|(_, span)| {
-                span.source_range.start <= marker.start
-                    && marker.end <= span.source_range.end
-                    && range_touches(span.source_range, disclosure)
-            })
-        || parsed
-            .tree
-            .blocks()
-            .filter(|(_, node)| {
-                matches!(
-                    node.kind,
-                    NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
-                )
-            })
-            .any(|(_, block)| {
-                (marker.start == block.source_range.start
-                    || (matches!(block.kind, NodeKind::Heading(_))
-                        && block
-                            .children
-                            .last()
-                            .and_then(|id| parsed.tree.node(*id))
-                            .is_none_or(|child| child.source_range.end <= marker.start)))
-                    && marker.end <= block.source_range.end
-                    && range_touches(block.source_range, disclosure)
-            })
+    let marker = marker.range;
+    if range_touches(marker, disclosure) {
+        return true;
+    }
+    nodes.intersecting(marker).into_iter().any(|id| {
+        let span = parsed.tree.node(*id).expect("indexed node");
+        let owns_marker = if has_delimiter_markers(span.kind) {
+            span.source_range.start <= marker.start && marker.end <= span.source_range.end
+        } else if matches!(
+            span.kind,
+            NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
+        ) {
+            (marker.start == span.source_range.start
+                || (matches!(span.kind, NodeKind::Heading(_))
+                    && span
+                        .children
+                        .last()
+                        .and_then(|id| parsed.tree.node(*id))
+                        .is_none_or(|child| child.source_range.end <= marker.start)))
+                && marker.end <= span.source_range.end
+        } else {
+            false
+        };
+        owns_marker && range_touches(span.source_range, disclosure)
+    })
 }
 
 /// Returns true when `segments` tile `range` contiguously, so every source byte
@@ -1105,6 +1094,7 @@ pub fn present_markdown_with_disclosure(
         return block;
     }
     let parsed = parse_document(revision, range, source);
+    let projection = ProjectionIndex::new(&parsed);
     present_markdown_from_parse(
         line_id,
         revision,
@@ -1112,7 +1102,10 @@ pub fn present_markdown_with_disclosure(
         source,
         line_height,
         disclosure,
-        &SharedParse { parsed: &parsed },
+        &SharedParse {
+            parsed: &parsed,
+            projection: &projection,
+        },
     )
 }
 
@@ -1120,6 +1113,7 @@ pub fn present_markdown_with_disclosure(
 /// It may describe delimiters, padding and spans on other physical lines.
 struct SharedParse<'a> {
     parsed: &'a MarkdownParse,
+    projection: &'a ProjectionIndex,
 }
 
 /// Presents one physical line from an already-parsed tree instead of parsing
@@ -1157,39 +1151,36 @@ fn present_markdown_from_parse(
     // heading level. Only nodes intersecting this physical line contribute:
     // the shared tree also contains other headings and trailing blank lines.
     // Container layout remains owned by the indexed block.
-    let kind = parsed
-        .tree
-        .blocks()
-        .filter(|(_, block)| block.source_range.intersects(range))
-        .find_map(|(_, block)| match block.kind {
+    let mut nodes = shared.projection.nodes.intersecting(range);
+    // Keep the tree's original order when multiple enclosing blocks apply.
+    nodes.sort_unstable();
+    let blocks = || {
+        nodes
+            .iter()
+            .filter_map(|id| parsed.tree.node(**id))
+            .filter(|node| node.kind.is_block())
+    };
+    let kind = blocks()
+        .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             _ => None,
         })
-        .or_else(|| {
-            parsed
-                .tree
-                .blocks()
-                .filter(|(_, block)| block.source_range.intersects(range))
-                .find_map(|(_, block)| syntax_display(block.kind).node_block)
-        })
+        .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
         .unwrap_or_default();
     let mut visual = String::with_capacity(source.len());
-    let mut segments = Vec::with_capacity(parsed.markers.len() * 2 + 1);
+    // The ordered plan belongs to the semantic snapshot. Binary search avoids
+    // copying or walking off-screen markers for each physical line.
+    let plan = &shared.projection.markers;
+    let start = plan.partition_point(|marker| marker.range.start < range.start);
+    let end = plan.partition_point(|marker| marker.range.start < range.end);
+    let markers_on_line = &plan[start..end];
+    let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
-    // Padding is derived with the parser's semantic code content, excluding
-    // container prefixes. A normalized newline can cover multiple source bytes.
-    // It hides, discloses and clips exactly like a real delimiter.
-    let mut markers = parsed.markers.clone();
-    markers.extend(parsed.code_padding.iter().copied());
-    markers.sort_by_key(|marker| (marker.start, marker.end));
-    // Only markers wholly inside this physical line's range are this line's to
-    // show or hide; a shared multi-line parse also carries every other line's
-    // markers, which belong to the [`VisualLine`] built for that line instead.
-    let markers_on_line = markers
-        .iter()
-        .copied()
-        .filter(|marker| marker.start >= range.start && marker.end <= range.end);
-    for marker in markers_on_line {
+    for planned in markers_on_line {
+        let marker = planned.range;
+        if marker.end > range.end {
+            continue;
+        }
         if source_cursor < marker.start.0 {
             append_segment(
                 &mut visual,
@@ -1200,7 +1191,7 @@ fn present_markdown_from_parse(
                 Visibility::Visible,
             );
         }
-        let expanded = marker_is_disclosed(marker, parsed, disclosure);
+        let expanded = marker_is_disclosed(planned, parsed, &shared.projection.nodes, disclosure);
         append_segment(
             &mut visual,
             &mut segments,
@@ -1242,11 +1233,11 @@ fn present_markdown_from_parse(
     // A style run's node may also span lines that are not this one; clipping to
     // `range` (as already done here) and letting `source_to_visual` fail outside
     // it is what discards the part that belongs elsewhere.
-    let mut style_runs = parsed
-        .tree
+    let mut style_runs = nodes
         .iter()
-        .filter(|(_, node)| has_delimiter_markers(node.kind))
-        .filter_map(|(_, span)| {
+        .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| has_delimiter_markers(node.kind))
+        .filter_map(|span| {
             let style = syntax_display(span.kind).inline_style?;
             let clipped = SourceRange {
                 start: span.source_range.start.max(range.start),
@@ -1466,6 +1457,111 @@ fn joined_run_disclosure(
         .reduce(union_disclosure)
 }
 
+/// Balanced interval index. Each subtree stores its greatest source end, so
+/// a long enclosing construct does not force a scan of unrelated short spans.
+#[derive(Clone, Debug)]
+struct SourceIndex<T> {
+    entries: Vec<(SourceRange, T)>,
+    max_ends: Vec<SourceOffset>,
+}
+
+impl<T> SourceIndex<T> {
+    fn new(mut entries: Vec<(SourceRange, T)>) -> Self {
+        entries.sort_by_key(|(range, _)| (range.start, range.end));
+        let mut index = Self {
+            max_ends: vec![SourceOffset(0); entries.len()],
+            entries,
+        };
+        index.build(0, index.entries.len());
+        index
+    }
+
+    fn build(&mut self, start: usize, end: usize) -> SourceOffset {
+        if start == end {
+            return SourceOffset(0);
+        }
+        let mid = start + (end - start) / 2;
+        let max = self.entries[mid]
+            .0
+            .end
+            .max(self.build(start, mid))
+            .max(self.build(mid + 1, end));
+        self.max_ends[mid] = max;
+        max
+    }
+
+    fn intersecting(&self, range: SourceRange) -> Vec<&T> {
+        let mut result = Vec::new();
+        self.query(0, self.entries.len(), range, &mut result, &mut 0);
+        result
+    }
+
+    fn query<'a>(
+        &'a self,
+        start: usize,
+        end: usize,
+        range: SourceRange,
+        result: &mut Vec<&'a T>,
+        visited: &mut usize,
+    ) {
+        if start == end {
+            return;
+        }
+        let mid = start + (end - start) / 2;
+        *visited += 1;
+        if self.max_ends[mid] <= range.start || self.entries[start].0.start >= range.end {
+            return;
+        }
+        self.query(start, mid, range, result, visited);
+        let (source, value) = &self.entries[mid];
+        if source.intersects(range) {
+            result.push(value);
+        }
+        self.query(mid + 1, end, range, result, visited);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedMarker {
+    range: SourceRange,
+    quote_owner: Option<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectionIndex {
+    markers: Vec<ProjectedMarker>,
+    nodes: SourceIndex<NodeId>,
+}
+
+impl ProjectionIndex {
+    fn new(parsed: &MarkdownParse) -> Self {
+        let owners = parsed
+            .quote_markers
+            .iter()
+            .map(|(range, owner)| ((range.start, range.end), *owner))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut markers = parsed
+            .markers
+            .iter()
+            .chain(&parsed.code_padding)
+            .map(|range| ProjectedMarker {
+                range: *range,
+                quote_owner: owners.get(&(range.start, range.end)).copied(),
+            })
+            .collect::<Vec<_>>();
+        markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+        let nodes = SourceIndex::new(
+            parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| node.kind.is_block() || has_delimiter_markers(node.kind))
+                .map(|(id, node)| (node.source_range, id))
+                .collect(),
+        );
+        Self { markers, nodes }
+    }
+}
+
 /// One joinable block's whole-span parse, kept independent of which lines a
 /// particular presentation call is drawing.
 ///
@@ -1486,6 +1582,7 @@ pub struct JoinedParse {
     pub source_range: SourceRange,
     pub joined_source: String,
     pub parsed: MarkdownParse,
+    projection: ProjectionIndex,
 }
 
 /// Parses `lines` joined into one source, from texts the caller already has
@@ -1496,10 +1593,12 @@ pub fn parse_joined_block(lines: &[BlockLine<'_>], revision: Revision) -> Joined
     let joined_range = SourceRange::new(lines[0].range.start.0, lines[lines.len() - 1].range.end.0);
     let joined_source = lines.iter().map(|line| line.text).collect::<String>();
     let parsed = parse_document(revision, joined_range, &joined_source);
+    let projection = ProjectionIndex::new(&parsed);
     JoinedParse {
         source_range: joined_range,
         joined_source,
         parsed,
+        projection,
     }
 }
 
@@ -1528,10 +1627,12 @@ pub fn parse_joined_span(
     let joined_range = SourceRange::new(start.0, end.0);
     let joined_source = document.text(joined_range).ok()?;
     let parsed = parse_document(revision, joined_range, &joined_source);
+    let projection = ProjectionIndex::new(&parsed);
     Some(JoinedParse {
         source_range: joined_range,
         joined_source,
         parsed,
+        projection,
     })
 }
 
@@ -1565,6 +1666,7 @@ fn present_joined_run(
     };
     let shared = SharedParse {
         parsed: &joined.parsed,
+        projection: &joined.projection,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
     // construct whose markers live on different physical lines; `marker_is_disclosed`
@@ -2114,6 +2216,102 @@ pub fn anchored_scroll_y(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
+        // A prefix-max-only index would scan all preceding spans because the
+        // enclosing construct reaches the end. Subtree maxima must prune them.
+        let mut ranges = vec![(SourceRange::new(0, 1_000_000), 0)];
+        ranges.extend((1..100_000).map(|i| (SourceRange::new(i * 10, i * 10 + 5), i)));
+        let index = SourceIndex::new(ranges);
+        let mut hits = Vec::new();
+        let mut visited = 0;
+        index.query(
+            0,
+            index.entries.len(),
+            SourceRange::new(999_980, 999_985),
+            &mut hits,
+            &mut visited,
+        );
+        hits.sort();
+        assert_eq!(hits, vec![&0, &99_998]);
+        assert!(
+            visited < 100,
+            "visited {visited} nodes for two intersecting spans"
+        );
+    }
+
+    #[test]
+    fn cached_hundred_thousand_line_quote_projects_only_viewport_markers() {
+        let source = format!("> **opening\n{}> closing**\n", "> plain\n".repeat(99_998));
+        let mut start = 40;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(start, start + text.len());
+                start = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(7));
+        assert_eq!(joined.projection.markers.len(), 100_002);
+        let shared = SharedParse {
+            parsed: &joined.parsed,
+            projection: &joined.projection,
+        };
+        // The caret is off-screen inside the strong span. Prefix ownership and
+        // both distant delimiters still use the same complete snapshot.
+        let disclosure = Some(SourceRange::empty(lines[1].range.start.0 + 3));
+        for line in &lines[99_950..] {
+            let presented = present_markdown_from_parse(
+                line.line as u64,
+                Revision(7),
+                line.range,
+                line.text,
+                26.0,
+                disclosure,
+                &shared,
+            );
+            assert_eq!(presented.visual_text, line.text);
+            assert!(
+                presented
+                    .style_runs
+                    .iter()
+                    .any(|run| run.kind == StyleKind::Bold)
+            );
+            assert!(segments_tile_range(
+                line.range,
+                &presented.source_map.segments
+            ));
+            assert!(
+                presented.source_map.segments.capacity() <= 5,
+                "mapping storage must depend on this line's markers, not all 100,002"
+            );
+            let hidden = present_markdown_from_parse(
+                line.line as u64,
+                Revision(7),
+                line.range,
+                line.text,
+                26.0,
+                None,
+                &shared,
+            );
+            assert_eq!(
+                hidden.visual_text,
+                if line.line == 99_999 {
+                    "closing\n"
+                } else {
+                    "plain\n"
+                }
+            );
+        }
+    }
+
     #[test]
     fn plain_presentation_preserves_markdown_source_bytes() {
         let text = "**日本語**";
