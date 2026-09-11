@@ -671,9 +671,14 @@ mod tests {
         // depend on the emphasized text being ASCII: `*漢字*` marks the same
         // bytes italic as `*bold*` marks bold, through the identical
         // `StyleKind::Italic` -> `InlineDisplay` path.
-        let editor = Editor::new("*漢字ひらがな* and **太字**");
+        //
+        // The source deliberately does not start with a marker byte: `Editor::new`
+        // always places the caret at offset 0, and the disclosure policy keeps a
+        // marker visible when the caret touches it, so a paragraph that opened with
+        // `*` would leave that one marker undisclosed regardless of script.
+        let editor = Editor::new("emphasis: *漢字ひらがな* and **太字**");
         let block = &presented_lines(&editor)[0];
-        assert_eq!(block.visual_text, "漢字ひらがな and 太字");
+        assert_eq!(block.visual_text, "emphasis: 漢字ひらがな and 太字");
 
         let italic = block.visual_text.find("漢字ひらがな").unwrap();
         let italic_range = italic..italic + "漢字ひらがな".len();
