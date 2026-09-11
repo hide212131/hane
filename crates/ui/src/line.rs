@@ -666,6 +666,25 @@ mod tests {
     }
 
     #[test]
+    fn cjk_emphasis_is_italic_through_the_same_render_policy_as_ascii() {
+        // The render policy the paint layer reads (`InlineDisplay`) must not
+        // depend on the emphasized text being ASCII: `*漢字*` marks the same
+        // bytes italic as `*bold*` marks bold, through the identical
+        // `StyleKind::Italic` -> `InlineDisplay` path.
+        let editor = Editor::new("*漢字ひらがな* and **太字**");
+        let block = &presented_lines(&editor)[0];
+        assert_eq!(block.visual_text, "漢字ひらがな and 太字");
+
+        let italic = block.visual_text.find("漢字ひらがな").unwrap();
+        let italic_range = italic..italic + "漢字ひらがな".len();
+        assert!(inline_display_for(&italic_range, &block.style_runs).italic);
+
+        let bold = block.visual_text.find("太字").unwrap();
+        let bold_range = bold..bold + "太字".len();
+        assert!(inline_display_for(&bold_range, &block.style_runs).bold);
+    }
+
+    #[test]
     fn a_marker_pair_far_apart_resolves_regardless_of_the_visible_window() {
         // A blank-line-free paragraph long enough that a fixed-radius join
         // window around the scrolled viewport would miss one side of this
