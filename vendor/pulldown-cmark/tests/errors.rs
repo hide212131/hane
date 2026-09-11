@@ -1,4 +1,35 @@
-use pulldown_cmark::{Options, Parser};
+use pulldown_cmark::{Event, Options, Parser};
+
+#[test]
+fn code_span_line_endings_normalize_once_and_preserve_source_offsets() {
+    // CommonMark 0.31.2 sections 2.1 and 6.1: CRLF is one line ending,
+    // and each line ending becomes one space before optional edge trimming.
+    for ending in ["\n", "\r\n", "\r"] {
+        for (source, expected) in [
+            (format!("before `{ending}x{ending}` after"), "x"),
+            (format!("before `羽{ending}x` after"), "羽 x"),
+            (format!("before ` {ending} ` after"), "   "),
+            (format!("before `{ending}` after"), " "),
+            (format!("> before `{ending}> x{ending}> ` after"), "x"),
+            (format!("- before `{ending}  x{ending}  ` after"), "x"),
+            (format!("> before ` {ending}>  ` after"), "   "),
+        ] {
+            let code_events = Parser::new(&source)
+                .into_offset_iter()
+                .filter_map(|(event, range)| match event {
+                    Event::Code(text) => Some((text, range)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(code_events.len(), 1, "{source:?}");
+            let (text, range) = &code_events[0];
+            assert_eq!(text.as_ref(), expected, "{source:?}");
+            let original_range = source.find('`').unwrap()..source.rfind('`').unwrap() + 1;
+            assert_eq!(*range, original_range, "{source:?}");
+            assert_eq!(&source[range.clone()], &source[original_range]);
+        }
+    }
+}
 
 fn parse(md: &str) {
     let parser = Parser::new(md);

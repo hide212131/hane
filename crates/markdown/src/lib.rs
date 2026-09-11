@@ -970,11 +970,9 @@ mod tests {
     fn code_padding_tracks_semantic_spaces_instead_of_container_bytes() {
         for (source, expected) in [
             ("` code `", vec![(1, 2), (6, 7)]),
-            // pulldown-cmark 0.13.4 returns " x " for these CRLF spans.
-            // Our one-newline projection must not invent padding when it
-            // disagrees with the parser; retain the complete source ranges.
-            ("`\r\nx\r\n`", vec![]),
-            ("> `\r\n> x\r\n> `", vec![]),
+            // A CRLF contributes one semantic space but covers two source bytes.
+            ("`\r\nx\r\n`", vec![(1, 3), (4, 6)]),
+            ("> `\r\n> x\r\n> `", vec![(3, 5), (8, 10)]),
             ("> ` \n>  `", vec![]),
             ("` `", vec![]),
             ("`code `", vec![]),

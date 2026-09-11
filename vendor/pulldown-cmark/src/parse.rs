@@ -1342,6 +1342,10 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                 buf.push_str(&spanned_text[start_ix..ix]);
                 buf.push(' ');
                 ix += 1;
+                // CRLF is one line ending, normalized to the single space above.
+                if c == b'\r' && spanned_bytes.get(ix) == Some(&b'\n') {
+                    ix += 1;
+                }
                 ix += skip_container_prefixes(&self.tree, &spanned_bytes[ix..], self.options);
                 start_ix = ix;
             } else if c == b'\\'
