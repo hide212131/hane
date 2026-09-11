@@ -169,8 +169,8 @@ mod tests {
             let editor = Editor::new("*漢字ひらがな* *ascii* **太字** **bold**");
             let index = BlockIndex::from_buffer(editor.document());
             let block = index.blocks().next().expect("one paragraph block");
-            let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
-                .expect("block presents");
+            let visual =
+                presented_block(&editor, &block, &(0..usize::MAX), None).expect("block presents");
             let line = &visual.lines[0];
 
             let range_of = |needle: &str| {
