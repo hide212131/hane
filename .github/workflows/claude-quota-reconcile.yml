@@ -113,6 +113,11 @@ jobs:
                 continue
               fi
               retry_after="$(jq -r '.retry_after' <<< "$parsed")"
+              current_pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+              if ! jq -e --arg sha "$target_sha" \
+                '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+                continue
+              fi
               wait_count="$(
                 jq -r --arg short "$short_sha" \
                   '[.[] | select(.context == "hane/claude-fix" and ((.description // "") | test("^Claude fix quota wait until [0-9T:Z-]+ for " + $short + "$")))] | length' \
@@ -136,7 +141,9 @@ jobs:
               post_stall_comment "$pr_number" "$target_sha" \
                 "Claudeのsession利用上限に到達しました。${retry_after} 以降に自動再試行します。" "$latest_url"
               echo "- PR #${pr_number}: quota wait until ${retry_after}; cause ${latest_url}" >> "$GITHUB_STEP_SUMMARY"
-              continue
+              # A fresh quota hit is repository-wide evidence. Do not wake another PR
+              # in the same reconcile run and immediately consume the same shared limit.
+              break
             fi
 
             decision="$(python3 -I .github/scripts/claude_quota_state.py recovery --sha "$target_sha" < "$statuses_file")"
@@ -145,6 +152,10 @@ jobs:
             fi
             retry_after="$(jq -r '.retry_after' <<< "$decision")"
             retry_number="$(jq -r '.retry_number' <<< "$decision")"
+
+            if jq -e 'any(.[]; (.context // "") | startswith("hane/claude-fix-manual/"))' "$statuses_file" >/dev/null; then
+              continue
+            fi
 
             routing="$(python3 -I .github/scripts/claude_fix_state.py routing --sha "$target_sha" --manual false < "$statuses_file" | jq -r '.allowed')"
             if [[ "$routing" != true ]]; then
