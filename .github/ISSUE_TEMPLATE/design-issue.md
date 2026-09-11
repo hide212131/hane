@@ -41,7 +41,7 @@ assignees: ""
 
 ## 受け入れ条件
 
-- [ ] 
+- [ ] （満たしたかを検証できる受け入れ条件を記入）
 
 ## 実装時の判断
 
@@ -52,10 +52,11 @@ Claude Code が既存コードと関連文書を確認したうえで最終判�
 
 ## 設計引き渡し
 
-<!-- 設計完了 handoff の書式。書き方の例は docs/agentic-development-workflow.md の「Work（ChatGPT）」節を参照。 -->
+<!-- 要求・範囲・設計判断と根拠・制約・検証可能な受け入れ条件が揃い、実装を阻む未決事項がなければ設計完了とする。残る場合は設計中に留める。
+設計完了 handoff の書式。書き方の例は docs/agentic-development-workflow.md の「Work（ChatGPT）」節を参照。 -->
 
 設計状態: 設計中 / 設計完了（実装未起動）
 成果物・制約・受け入れ条件: 本文参照
 実装を阻む未決事項: なし / <内容>
 実装担当: Claude Code。レビュー: Codex。進行判断: GitHub Copilot。
-起動状況: 未起動 / `/implement` 投稿済み（コメント URL） / 実装中（Pull Request URL）
+起動状況: 未起動 / 依頼投稿済み（コメント URL） / Claude 実装開始（Actions run URL） / PR 作成済み（PR URL）

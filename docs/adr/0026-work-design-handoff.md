@@ -34,14 +34,15 @@ Hane の agentic development workflow に、ADR-0023 が定義する実装・レ
 - 標準ラベル、`gui-validation-required`、`agentic-auto-merge` などの既存ラベル運用は変更しない。
 - PR state machine（`implementing` / `waiting-*` / `fix-requested` / `ready-to-merge` / `blocked` / `merged`、[docs/agentic-development-workflow.md#状態管理](../agentic-development-workflow.md#状態管理)）は Pull Request と head SHA の検証状態を表すものであり、Issue の設計状態とは分離したまま扱う。
 
-### 実装は明示的な `/implement` でのみ開始する
+### 初回実装は明示的な `/implement` で開始する
 
 Issue 作成・設計完了の記述・ラベル操作だけでは実装を開始しない。この不変条件は ADR-0023 の運用を継続するものであり、変更しない。
 
 - 実装を依頼された場合は、既存コメント・Pull Request・進行中の Actions run を確認し、重複起動を避ける。
-- 権限を持つ利用者の文脈から、本文完全一致の `/implement` を単独コメントとして投稿する。
+- Work は権限を持つ利用者の文脈から、本文完全一致の `/implement` を単独コメントとして投稿できる。必要な投稿権限が利用できなければコマンドを利用者へ引き渡し、未起動と報告する。
 - handoff の説明（設計状態、成果物、制約、未決事項の有無など）は Issue 本文または別コメントに置き、`/implement` コメント本文には含めない。
 - 設計のみを依頼された場合は起動しない。既に実装まで依頼されていれば、設計完了の記述だけを理由に再承認を求める必要はない。
+- PR 作成後の修正は既存の Copilot routing / final judge と Claude fix に従い、再度 `/implement` を要求しない。
 - 既存 Issue はテンプレートや新しい状態表記を持たなくても、既存の `/implement` 手順でそのまま利用できる。
 
 ### ガードは共通指示に置き、workflow は変更しない
@@ -53,7 +54,7 @@ Issue 作成・設計完了の記述・ラベル操作だけでは実装を開�
 - 設計工程と実装工程の境界が、共通指示（AGENTS.md）・Claude Code への指示（CLAUDE.md）・Issue テンプレートという、実際に読み込まれる文書に明示される。
 - ADR-0023 の三者分離と `/implement` の起動契約（本文完全一致、権限検証、重複起動防止）を変更せずに、上流の設計工程を追加できる。
 - 新しいラベル・機械状態・workflow 変更を追加しないため、既存の PR 状態管理、review fallback、GUI 判定、merge gate、権限制御との非互換を生まない。
-- 設計完了の記述は実装承認や merge-ready の証拠として扱われない。実装開始の唯一の起動条件は、権限を持つ利用者による本文完全一致の `/implement` コメントのままである。
+- 設計完了の記述は実装承認や merge-ready の証拠として扱われない。初回実装の起動条件は、権限を持つ利用者による本文完全一致の `/implement` コメントのままである。
 
 ## 棄却した案
 
@@ -63,4 +64,4 @@ Issue の設計状態を GitHub のラベルや別の機械可読な状態とし
 
 ### `.github/workflows` を変更して Work の関与を強制的に制限する
 
-Work（ChatGPT）はリポジトリの GitHub Actions の外側で動作するため、workflow 側の変更では Work のローカルな設計作業や誤操作を防げない。実装開始の唯一のトリガーである `/implement` の権限検証・重複起動防止・Issue 単位の concurrency は既存の `implement.yml` がすでに強制しており、この決定はその契約を利用するだけで足りる。ADR-0023 の三者分離自体も変更しないため、workflow の変更は不要と判断する。
+Work（ChatGPT）はリポジトリの GitHub Actions の外側で動作するため、workflow 側の変更では Work のローカルな設計作業や誤操作を防げない。初回実装のトリガーである `/implement` の権限検証・重複起動防止・Issue 単位の concurrency は既存の `implement.yml` がすでに強制しており、この決定はその契約を利用するだけで足りる。ADR-0023 の三者分離自体も変更しないため、workflow の変更は不要と判断する。
