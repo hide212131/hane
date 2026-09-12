@@ -41,7 +41,13 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
-      - name: Reconcile AADW status comments
+      - name: Reconcile current-head AADW status comments
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/aadw_notification_reconcile.py --lookback-seconds 7200
+
+      - name: Reconcile prior-head AADW status comments
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_prior_head_reconcile.py --lookback-seconds 7200
