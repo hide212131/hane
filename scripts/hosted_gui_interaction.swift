@@ -90,7 +90,6 @@ func selectAllTypeSave(_ pid: pid_t, _ text: String) {
     """)
 }
 
-
 func appendSave(_ pid: pid_t, _ text: String) {
     let escaped = escapeForAppleScript(text)
     runAppleScript("""
@@ -204,7 +203,7 @@ func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: fullRange), let range = Range(match.range, in: text) else { continue }
         guard let box = try? candidate.boundingBox(for: range) else { continue }
-        return box.boundingBox
+        return box
     }
     fail("no OCR match for pattern: \(pattern)")
 }
