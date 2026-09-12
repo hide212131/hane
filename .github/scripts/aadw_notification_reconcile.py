@@ -26,7 +26,7 @@ _GUI_GENERATION = re.compile(r" g([1-9][0-9]*)-([1-9][0-9]*)$")
 _ROUTING_OK = re.compile(
     r"Copilot routing: (?:fix|continue-validation|blocked|workflow changes require owner) for [0-9a-f]{12}$"
 )
-_GUI_NORMAL = re.compile(r"GUI (?:pass|fail) v[0-9]+ [0-9a-f]{12} g[1-9][0-9]*-[1-9][0-9]*$")
+_GUI_NORMAL = re.compile(r"GUI (?:pass|fail|blocked) v[0-9]+ [0-9a-f]{12} g[1-9][0-9]*-[1-9][0-9]*$")
 _FINAL_NORMAL = re.compile(r"Final (?:ready|merged|fix|blocked) v[0-9]+ [0-9a-f]{12} e[0-9a-f]+$")
 _FALLBACK_MARKER = re.compile(
     r"process=codex-review-fallback kind=pr number=([1-9][0-9]*) sha=([0-9a-f]{40}) "
