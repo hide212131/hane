@@ -83,7 +83,7 @@ class Tests(unittest.TestCase):
         f = Fake()
         self.start(f)
         action = reconcile.reconcile(f.call, REPO, '777', '2', 'failure')
-        self.assertEqual(action, 'updated')
+        self.assertEqual(action, 'update')
         self.assertEqual(len(f.issue_comments[130]), 1)
         body = f.issue_comments[130][0]['body']
         self.assertIn('異常終了', body)
@@ -95,7 +95,7 @@ class Tests(unittest.TestCase):
         self.start(f)
         f.prs = [pr()]
         action = reconcile.reconcile(f.call, REPO, '777', '2', 'success')
-        self.assertEqual(action, 'updated')
+        self.assertEqual(action, 'update')
         self.assertEqual(len(f.issue_comments[130]), 1)
         body = f.issue_comments[130][0]['body']
         self.assertIn('正常終了', body)
