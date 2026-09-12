@@ -177,6 +177,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("run=990 attempt=2", gh.comments[0]["body"])
 
     def test_fallback_compat_status_does_not_rewrite_original_codex_lifecycle(self):
+        review_url = "https://github.com/hide212131/hane/pull/131#pullrequestreview-900"
         marker = f"<!-- hane-aadw: process=codex-review-fallback kind=pr number=131 sha={SHA} run=555 attempt=1 -->"
         comments = [{
             "id": 9,
@@ -187,10 +188,10 @@ class ReconcileTests(unittest.TestCase):
             status(50, "hane/codex-review", "pending", "Codex review pending for " + SHA[:12], run=100),
             status(51, "hane/codex-review", "error", "Codex review controller failed for " + SHA[:12], run=100,
                    created="2026-09-12T02:56:00Z"),
-            status(52, "hane/review-source", "success", "Review source: Copilot fallback for " + SHA[:12], run=999,
-                   created="2026-09-12T02:57:00Z"),
+            status(52, "hane/review-source", "success", "Review source: Copilot fallback for " + SHA[:12],
+                   created="2026-09-12T02:57:00Z", target_url=review_url),
             status(53, "hane/codex-review", "success", "Codex review clean for " + SHA[:12],
-                   created="2026-09-12T02:58:00Z", target_url="https://github.com/hide212131/hane/pull/131"),
+                   created="2026-09-12T02:58:00Z", target_url=review_url),
         ], comments=comments)
         subject.reconcile(gh.call, REPO, now=NOW)
         self.assertEqual(len(gh.comments), 2)
@@ -199,6 +200,23 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("異常終了", codex)
         self.assertNotIn("正常終了", codex)
         self.assertIn("正常終了", fallback)
+
+    def test_late_real_codex_result_with_different_url_is_not_discarded_as_fallback(self):
+        fallback_url = "https://github.com/hide212131/hane/pull/131#pullrequestreview-900"
+        codex_url = "https://github.com/hide212131/hane/pull/131#pullrequestreview-901"
+        rows = [
+            status(50, "hane/codex-review", "pending", "Codex review pending for " + SHA[:12], run=100),
+            status(51, "hane/codex-review", "error", "Codex review controller failed for " + SHA[:12], run=100,
+                   created="2026-09-12T02:56:00Z"),
+            status(52, "hane/review-source", "success", "Review source: Copilot fallback for " + SHA[:12],
+                   created="2026-09-12T02:57:00Z", target_url=fallback_url),
+            status(53, "hane/codex-review", "failure", "Codex findings for " + SHA[:12],
+                   created="2026-09-12T02:57:30Z", target_url=codex_url),
+            status(54, "hane/codex-review", "success", "Codex review clean for " + SHA[:12],
+                   created="2026-09-12T02:58:00Z", target_url=fallback_url),
+        ]
+        filtered = subject.codex_lifecycle_rows(rows)
+        self.assertEqual([row["id"] for row in filtered], [50, 51, 53])
 
     def test_fallback_terminal_updates_observer_start_comment(self):
         marker = f"<!-- hane-aadw: process=codex-review-fallback kind=pr number=131 sha={SHA} run=555 attempt=1 -->"

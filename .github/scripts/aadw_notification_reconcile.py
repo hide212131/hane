@@ -133,29 +133,30 @@ def build_generations(statuses):
 def codex_lifecycle_rows(statuses):
     """Exclude fallback compatibility results from the normal Codex lifecycle.
 
-    The fallback workflow writes ``hane/review-source`` and then a compatible
-    ``hane/codex-review`` clean/findings status for downstream consumers.  That
-    compatibility row belongs to the fallback lifecycle, not to the original
-    Codex execution that already terminated abnormally.  A later fresh Codex
-    pending clears this fallback association.
+    The fallback workflow writes a successful ``hane/review-source`` status and
+    then a compatible ``hane/codex-review`` clean/findings status with the same
+    Copilot review URL.  That shared target URL is durable provenance for the
+    fallback result.  Use it instead of temporal adjacency so a late real Codex
+    result cannot be discarded merely because it arrived between those writes.
     """
-    rows = []
-    fallback = False
-    for row in sorted(statuses, key=lambda item: item.get("id", 0)):
-        context = row.get("context")
+    fallback_targets = {}
+    for row in statuses:
         description = row.get("description") or ""
-        if context == "hane/review-source":
-            fallback = (
-                row.get("state") == "success"
-                and description.startswith("Review source: Copilot fallback for ")
-            )
+        target_url = row.get("target_url") or ""
+        if (
+            row.get("context") == "hane/review-source"
+            and row.get("state") == "success"
+            and description.startswith("Review source: Copilot fallback for ")
+            and target_url
+            and isinstance(row.get("id"), int)
+        ):
+            fallback_targets[target_url] = max(fallback_targets.get(target_url, -1), row["id"])
+
+    rows = []
+    for row in sorted(statuses, key=lambda item: item.get("id", 0)):
+        if row.get("context") != "hane/codex-review":
             continue
-        if context != "hane/codex-review":
-            continue
-        if row.get("state") == "pending":
-            fallback = False
-            rows.append(row)
-            continue
+        description = row.get("description") or ""
         compatible = (
             row.get("state") in ("success", "failure")
             and (
@@ -163,8 +164,8 @@ def codex_lifecycle_rows(statuses):
                 or description.startswith("Codex findings for ")
             )
         )
-        if fallback and compatible:
-            fallback = False
+        marker_id = fallback_targets.get(row.get("target_url") or "")
+        if compatible and marker_id is not None and row.get("id", -1) > marker_id:
             continue
         rows.append(row)
     return rows
