@@ -1,9 +1,9 @@
-"""Reconcile AADW process statuses into human-readable PR Conversation comments.
+"""Reconcile durable AADW commit statuses into Issue/PR lifecycle comments.
 
-This controller deliberately reads the durable commit-status history instead of
-requiring every producer workflow to duplicate comment-writing logic.  A
-`pending` status starts one notification generation; later statuses in the same
-context update that generation until another `pending` starts a new one.
+Producer workflows keep commit statuses as the machine-readable source of truth.
+This controller mirrors those histories into Conversation comments so every
+user-visible process exposes start/normal-end/abnormal-end without duplicating
+comment logic in each producer workflow.
 """
 import argparse
 import datetime as dt
@@ -13,7 +13,6 @@ import sys
 
 import aadw_notify
 
-TRUSTED_AUTHORS = None  # owner is added dynamically from repository name
 CONTEXTS = {
     "hane/codex-review": "codex-review",
     "hane/copilot-routing": "copilot-pre-gui-routing",
@@ -21,9 +20,12 @@ CONTEXTS = {
     "hane/gui-requirement": "gui-requirement",
 }
 _ACTION_RUN = re.compile(r"/actions/runs/([1-9][0-9]*)(?:/attempts/([1-9][0-9]*))?(?:[/?#]|$)")
-_SHORT_SHA = re.compile(r"[0-9a-f]{12}")
 _ROUTING_OK = re.compile(
     r"Copilot routing: (?:fix|continue-validation|blocked|workflow changes require owner) for [0-9a-f]{12}$"
+)
+_FALLBACK_MARKER = re.compile(
+    r"process=codex-review-fallback kind=pr number=([1-9][0-9]*) sha=([0-9a-f]{40}) "
+    r"run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->"
 )
 
 
@@ -56,19 +58,11 @@ def run_identity(target_url, fallback_id, seen):
             return run_id, match.group(2)
         seen[run_id] = seen.get(run_id, 0) + 1
         return run_id, str(seen[run_id])
-    # Orphan terminal statuses are rare (usually recovery writes). Use the
-    # status id only as a stable marker key; the rendered link stays the actual
-    # status target URL rather than pretending that this is an Actions run id.
     return str(fallback_id), "1"
 
 
 def build_generations(statuses):
-    """Return notification generations ordered by status id.
-
-    A pending status opens a new generation. Terminal corrections/recovery
-    statuses without a new pending update the current generation unless they
-    clearly point at a different Actions run.
-    """
+    """Group one context's append-only status history into process runs."""
     generations = []
     current = None
     seen_runs = {}
@@ -87,7 +81,6 @@ def build_generations(statuses):
             }
             generations.append(current)
             continue
-
         if current is None or (row_run and row_run != current["run_id"]):
             run_id, attempt = run_identity(row.get("target_url"), row.get("id"), seen_runs)
             current = {
@@ -117,48 +110,31 @@ def outcome(context, status):
     return "failure"
 
 
-def marker(process, pr_number, sha, generation_id):
-    return (
-        f"<!-- hane-aadw-status: process={process} kind=pr number={pr_number} "
-        f"sha={sha} generation={generation_id} -->"
-    )
+def recent(generation, cutoff):
+    latest_at = parse_time(generation["latest"].get("created_at"))
+    start_at = parse_time((generation.get("start") or {}).get("created_at"))
+    return bool((latest_at and latest_at >= cutoff) or (start_at and start_at >= cutoff))
 
 
-def render(process, state, pr_number, sha, generation, repository, detail):
-    label = aadw_notify.PROCESSES[process]
-    state_label = aadw_notify.STATE_LABELS[state]
-    source = generation.get("start") or generation["latest"]
-    run_url = source.get("target_url") or generation["latest"].get("target_url") or ""
-    lines = [
-        f"### AADW: {label} — {state_label}",
-        "",
-        f"対象: PR #{pr_number} (SHA `{sha[:12]}`)",
-    ]
-    if run_url:
-        lines.append(f"実行・証跡: {run_url}")
-    if detail:
-        lines += ["", detail]
-    lines += ["", marker(process, pr_number, sha, generation["generation_id"])]
-    return "\n".join(lines) + "\n"
-
-
-def notify_generation(call, repository, pr_number, sha, context, generation, review_source=None):
+def notify_generation(call, repository, pr_number, sha, context, generation, source=None):
     process = CONTEXTS[context]
     state = outcome(context, generation["latest"])
     description = generation["latest"].get("description") or "状態の説明はありません。"
     detail = f"状態: {description}"
-    if context == "hane/codex-review" and review_source:
-        detail += f"\nレビュー実施者: {review_source}"
-    marker_text = marker(process, pr_number, sha, generation["generation_id"])
-    body = render(process, state, pr_number, sha, generation, repository, detail)
-    existing = aadw_notify.find_comment(call, repository, pr_number, marker_text)
-    if existing:
-        if (existing.get("body") or "") == body:
-            return "noop"
-        call(f"repos/{repository}/issues/comments/{existing['id']}", {"body": body}, "PATCH")
-        return "update"
-    call(f"repos/{repository}/issues/{pr_number}/comments", {"body": body}, "POST")
-    return "create"
+    if context == "hane/codex-review" and source:
+        detail += f"\nレビュー実施者: {source}"
+    return aadw_notify.notify(
+        call,
+        state=state,
+        process=process,
+        kind="pr",
+        number=pr_number,
+        sha=sha,
+        repository=repository,
+        run_id=generation["run_id"],
+        attempt=generation["attempt"],
+        detail=detail,
+    )["action"]
 
 
 def review_source(statuses):
@@ -169,6 +145,61 @@ def review_source(statuses):
         and (row.get("description") or "").startswith("Review source: Copilot fallback for ")
     ]
     return "GitHub Copilot fallback" if rows else None
+
+
+def active_fallback_run(call, repository, pr_number, sha):
+    found = []
+    for comment in pages(call, f"repos/{repository}/issues/{pr_number}/comments"):
+        if comment.get("user", {}).get("login") != "github-actions[bot]":
+            continue
+        body = comment.get("body") or ""
+        match = _FALLBACK_MARKER.search(body)
+        if (
+            match
+            and match.group(1) == str(pr_number)
+            and match.group(2) == sha
+            and "— 処理開始" in body
+        ):
+            found.append((comment.get("id", 0), match.group(3), match.group(4)))
+    return max(found)[1:] if found else None
+
+
+def reconcile_fallback(call, repository, pr_number, sha, statuses, cutoff):
+    rows = [
+        row for row in statuses
+        if row.get("context") == "hane/review-source"
+        and parse_time(row.get("created_at"))
+        and parse_time(row.get("created_at")) >= cutoff
+    ]
+    if not rows:
+        return "noop"
+    latest = max(rows, key=lambda row: row.get("id", 0))
+    correlation = active_fallback_run(call, repository, pr_number, sha)
+    if not correlation:
+        return "noop"
+    state = (
+        "success"
+        if latest.get("state") == "success"
+        and (latest.get("description") or "").startswith("Review source: Copilot fallback for ")
+        else "failure"
+    )
+    detail = (
+        "Copilotによる代替レビューが完了しました。"
+        if state == "success"
+        else "Copilotによる代替レビューを正常に完了できませんでした。"
+    )
+    return aadw_notify.notify(
+        call,
+        state=state,
+        process="codex-review-fallback",
+        kind="pr",
+        number=pr_number,
+        sha=sha,
+        repository=repository,
+        run_id=correlation[0],
+        attempt=correlation[1],
+        detail=detail,
+    )["action"]
 
 
 def trusted_pr(pr, repository):
@@ -193,15 +224,14 @@ def reconcile_pr(call, repository, pr, cutoff):
     for context, process in CONTEXTS.items():
         rows = [row for row in statuses if row.get("context") == context]
         for generation in build_generations(rows):
-            latest_at = parse_time(generation["latest"].get("created_at"))
-            start_at = parse_time((generation.get("start") or {}).get("created_at"))
-            if not ((latest_at and latest_at >= cutoff) or (start_at and start_at >= cutoff)):
+            if not recent(generation, cutoff):
                 continue
             action = notify_generation(
                 call, repository, number, sha, context, generation,
-                review_source=source if process == "codex-review" else None,
+                source=source if process == "codex-review" else None,
             )
             writes += action != "noop"
+    writes += reconcile_fallback(call, repository, number, sha, statuses, cutoff) != "noop"
     return writes
 
 
