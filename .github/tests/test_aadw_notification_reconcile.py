@@ -181,7 +181,7 @@ class ReconcileTests(unittest.TestCase):
         comments = [{
             "id": 9,
             "user": {"login": "github-actions[bot]"},
-            "body": "### AADW: Copilot代替レビュー — 処理開始\n\n" + marker + "\n",
+            "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
         }]
         gh = Fake([
             status(50, "hane/codex-review", "pending", "Codex review pending for " + SHA[:12], run=100),
@@ -194,8 +194,8 @@ class ReconcileTests(unittest.TestCase):
         ], comments=comments)
         subject.reconcile(gh.call, REPO, now=NOW)
         self.assertEqual(len(gh.comments), 2)
-        codex = next(c["body"] for c in gh.comments if "### AADW: Codexレビュー" in c["body"])
-        fallback = next(c["body"] for c in gh.comments if "### AADW: Copilot代替レビュー" in c["body"])
+        codex = next(c["body"] for c in gh.comments if "process=codex-review kind=pr" in c["body"])
+        fallback = next(c["body"] for c in gh.comments if "process=codex-review-fallback kind=pr" in c["body"])
         self.assertIn("異常終了", codex)
         self.assertNotIn("正常終了", codex)
         self.assertIn("正常終了", fallback)
@@ -205,7 +205,7 @@ class ReconcileTests(unittest.TestCase):
         comments = [{
             "id": 9,
             "user": {"login": "github-actions[bot]"},
-            "body": "### AADW: Copilot代替レビュー — 処理開始\n\n" + marker + "\n",
+            "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
         }]
         gh = Fake([
             status(61, "hane/review-source", "success", "Review source: Copilot fallback for " + SHA[:12], run=999),
