@@ -53,3 +53,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/aadw_observer.py
+
+      - name: Close pending lifecycle on prior heads after source workflow completion
+        if: ${{ always() && github.event_name == 'workflow_run' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_workflow_completion_reconcile.py
