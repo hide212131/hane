@@ -45,6 +45,12 @@ class HelperTests(unittest.TestCase):
                     self.assertIn('integrity mismatch', reason)
                     self.assertEqual(run.call_count, int(when == 'during'))
 
+    def test_body_crop_uses_cgimage_top_left_coordinates(self):
+        source = Path(interaction.__file__).with_name('hosted_gui_interaction.swift').read_text()
+        self.assertIn('let topInset = CGFloat(cgImage.height) * 0.15', source)
+        self.assertRegex(source, r'CGRect\(\s*x: 0,\s*y: topInset,')
+        self.assertNotIn('VNImageRectForNormalizedRect(normalizedBody', source)
+
 
 class InlineSyntaxExpectationTests(unittest.TestCase):
     """Pure source-byte and visible-anchor logic for inline_syntax_boundary."""
