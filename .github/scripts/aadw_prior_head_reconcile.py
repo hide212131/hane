@@ -1,14 +1,20 @@
-"""Recover AADW lifecycle comments whose process started on a prior PR head.
+"""Recover AADW lifecycle comments for recent prior PR heads.
 
-Most AADW status reconciliation can look only at the current PR head.  Claude
+Most AADW status reconciliation can look only at the current PR head. Claude
 fix is different: it may publish `pending` on head A, push head B, and only then
-publish its terminal status back on A.  The ordinary current-head scan would
-therefore leave A's Conversation comment at "処理開始" forever.
+publish its terminal status back on A. A current-head-only scan would then leave
+A's Conversation comment at "処理開始" forever, or miss the start entirely if
+head B arrived before the notification reconciler ran.
 
-This recovery controller treats existing trusted AADW start comments as the
-correlation record, fetches the durable statuses for their recorded SHA, and
-updates the same comment when that exact run/attempt has reached a terminal
-state.  It reuses the parsing and status semantics from aadw_notification_reconcile.
+This controller therefore combines two trusted sources:
+- existing GitHub Actions AADW start comments, which preserve an exact old SHA,
+  run id, and attempt even when the head has moved;
+- the most recent PR commits, which recover a lifecycle even when its start
+  comment was missed before the head changed.
+
+It reuses the status grouping and outcome semantics from
+aadw_notification_reconcile and writes through aadw_notify, so a recovered
+lifecycle updates the same marker when one already exists and remains idempotent.
 """
 import argparse
 import datetime as dt
@@ -24,6 +30,7 @@ _MARKER = re.compile(
     r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
 )
 PROCESS_CONTEXT = {process: context for context, process in lifecycle.CONTEXTS.items()}
+_RECENT_PRIOR_HEADS = 5
 
 
 def prior_starts(call, repository, pr, cutoff):
@@ -53,34 +60,55 @@ def prior_starts(call, repository, pr, cutoff):
     return [(*key, comment) for key, comment in found.items()]
 
 
-def matching_generation(statuses, context, run_id, attempt):
-    rows = [row for row in statuses if row.get('context') == context]
-    candidates = [
-        generation for generation in lifecycle.build_generations(rows)
-        if generation['run_id'] == run_id and generation['attempt'] == attempt
-    ]
-    return candidates[-1] if candidates else None
+def recent_prior_shas(call, repository, pr):
+    current_sha = pr['head']['sha']
+    rows = lifecycle.pages(call, f'repos/{repository}/pulls/{int(pr["number"])}/commits')
+    shas = []
+    for row in rows:
+        sha = row.get('sha')
+        if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha) and sha != current_sha:
+            shas.append(sha)
+    # AADW automatically stops after three completed fixes. Five prior heads
+    # therefore cover the whole normal repair loop with room for manual retry.
+    return shas[-_RECENT_PRIOR_HEADS:]
+
+
+def reconcile_sha(call, repository, number, sha, statuses, cutoff):
+    writes = 0
+    source = lifecycle.review_source(statuses)
+    for context, process in lifecycle.CONTEXTS.items():
+        rows = [row for row in statuses if row.get('context') == context]
+        for generation in lifecycle.build_generations(rows):
+            if not lifecycle.recent(generation, cutoff):
+                continue
+            action = lifecycle.notify_generation(
+                call, repository, number, sha, context, generation,
+                source=source if process == 'codex-review' else None,
+            )
+            writes += action != 'noop'
+    return writes
 
 
 def reconcile_pr(call, repository, pr, cutoff):
     if not lifecycle.trusted_pr(pr, repository):
         return 0
     number = int(pr['number'])
-    cache = {}
+    current_sha = pr['head']['sha']
+
+    # Recent PR commits recover a missed start even when the head moved before
+    # the ordinary current-head reconciler observed its pending status.
+    candidates = set(recent_prior_shas(call, repository, pr))
+
+    # A trusted start comment may refer to an older SHA outside the bounded
+    # commit window. Preserve those explicit correlations as well.
+    for _process, sha, _run_id, _attempt, _comment in prior_starts(call, repository, pr, cutoff):
+        candidates.add(sha)
+
+    candidates.discard(current_sha)
     writes = 0
-    for process, sha, run_id, attempt, _comment in prior_starts(call, repository, pr, cutoff):
-        if sha not in cache:
-            cache[sha] = lifecycle.pages(call, f'repos/{repository}/commits/{sha}/statuses')
-        statuses = cache[sha]
-        context = PROCESS_CONTEXT[process]
-        generation = matching_generation(statuses, context, run_id, attempt)
-        if generation is None or generation['latest'].get('state') == 'pending':
-            continue
-        source = lifecycle.review_source(statuses) if process == 'codex-review' else None
-        action = lifecycle.notify_generation(
-            call, repository, number, sha, context, generation, source=source
-        )
-        writes += action != 'noop'
+    for sha in sorted(candidates):
+        statuses = lifecycle.pages(call, f'repos/{repository}/commits/{sha}/statuses')
+        writes += reconcile_sha(call, repository, number, sha, statuses, cutoff)
     return writes
 
 
