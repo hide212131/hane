@@ -9,6 +9,7 @@
 
 import AppKit
 import Carbon
+import CryptoKit
 import Foundation
 import Vision
 
@@ -205,6 +206,41 @@ func recognizeText(_ path: String) {
     } catch { fail("OCR failed: \(error)") }
 }
 
+// Hash decoded RGBA pixels instead of PNG bytes. This deliberately ignores
+// PNG container metadata, so two captures are equal only when the rendered
+// pixels are equal.
+func imagePixelDigest(_ path: String) {
+    guard let image = NSImage(contentsOfFile: path) else { fail("image could not be loaded: \(path)") }
+    var proposed = CGRect(origin: .zero, size: image.size)
+    guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
+        fail("image has no CGImage: \(path)")
+    }
+    let width = cgImage.width
+    let height = cgImage.height
+    let bytesPerRow = width * 4
+    var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+    let drew = pixels.withUnsafeMutableBytes { raw -> Bool in
+        guard let base = raw.baseAddress,
+              let context = CGContext(
+                data: base,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo.rawValue
+              )
+        else { return false }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return true
+    }
+    guard drew else { fail("could not rasterize image: \(path)") }
+    let digest = SHA256.hash(data: Data(pixels))
+    print(digest.map { String(format: "%02x", $0) }.joined())
+}
+
 // Locate the first OCR line whose recognized text matches `pattern` (an ICU
 // regular expression, may use lookaround to disambiguate repeated marker
 // glyphs such as "**" occurring on several lines) and return the matched
@@ -335,6 +371,27 @@ func moveDocStart(_ pid: pid_t) {
     """)
 }
 
+// Move the caret through the editor with real arrow-key events. This is kept
+// separate from shiftSelect so acceptance tests can prove navigation, rather
+// than inferring it from selection or cleanup behavior.
+func moveCaret(_ pid: pid_t, _ direction: String, _ count: Int) {
+    let codes = ["left": 123, "right": 124, "down": 125, "up": 126]
+    guard let code = codes[direction] else { fail("direction must be left, right, up, or down") }
+    guard count > 0 else { fail("move-caret count must be positive") }
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            repeat \(count) times
+                key code \(code)
+                delay 0.1
+            end repeat
+        end tell
+    end tell
+    """)
+}
+
 func shiftSelect(_ pid: pid_t, _ direction: String, _ count: Int) {
     guard direction == "left" || direction == "right" else { fail("direction must be left or right") }
     guard count > 0 else { fail("shift-select count must be positive") }
@@ -406,13 +463,16 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
 case "ocr":
     guard arguments.count == 2 else { fail("ocr requires screenshot path") }
     recognizeText(arguments[1])
+case "image-digest":
+    guard arguments.count == 2 else { fail("image-digest requires screenshot path") }
+    imagePixelDigest(arguments[1])
 case "wheel":
     guard arguments.count == 3, let pid = pid_t(arguments[1]), let pixels = Int32(arguments[2]) else { fail("wheel requires PID and pixels") }
     scrollEditor(pid, pixels)
@@ -463,6 +523,11 @@ case "type-save":
 case "move-doc-start":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("move-doc-start requires PID") }
     moveDocStart(pid)
+case "move-caret":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else {
+        fail("move-caret requires PID, direction and count")
+    }
+    moveCaret(pid, arguments[2], count)
 case "shift-select":
     guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else {
         fail("shift-select requires PID, direction and count")
