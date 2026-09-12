@@ -46,7 +46,7 @@ macOS の `swift` / `screencapture` / `sips` に依存するため、実際の�
 | `HANE_GUI_VALIDATE_STARTUP_TIMEOUT_SECS` | `15` | `hane_ready` を待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_TIMEOUT_SECS` | `5` | 対象ウィンドウを待つ上限秒数 |
 | `HANE_GUI_VALIDATE_WINDOW_ID_CMD` | なし（既定は `swift window_id.swift`） | ウィンドウ確認コマンドの差し替え。自動テストで実画面なしに注入する用途 |
-| `HANE_GUI_VALIDATE_CAPTURE_CMD` | なし（既定は `screencapture -x -l`） | 撮影コマンドの差し替え。同上 |
+| `HANE_GUI_VALIDATE_CAPTURE_CMD` | なし（既定は `screencapture -x -o -l`） | 撮影コマンドの差し替え。同上。既定経路は window shadow を除外し、ウィンドウ座標と画像座標を一致させる |
 | `HANE_GUI_VALIDATE_CAPTURE_TIMEOUT_SECS` | `15` | 撮影コマンドの完了を待つ上限秒数。超過すると `blocked` として扱う |
 | `HANE_CAPTURE_FIXTURE` | なし | editorで開く既存文書 |
 | `HANE_CAPTURE_CURSOR_OFFSET` | `11` | cursor-boundaryの文字位置。固定文書内の整数 `0`〜`23` |
