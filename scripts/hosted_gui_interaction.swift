@@ -167,6 +167,31 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
     """)
 }
 
+// Type through the selected OS IME at the current caret without select-all.
+// The caller first places the caret at a syntax boundary with clickText.
+func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    focus(pid)
+    selectSource(inputSource)
+    guard currentSourceID() == inputSource else { fail("input source did not become active") }
+    let escaped = escapeForAppleScript(romaji)
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.2
+            keystroke "\(escaped)"
+            delay 0.3
+            key code 49
+            delay 0.3
+            key code 36
+            delay 0.3
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
 func recognizeText(_ path: String) {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
@@ -295,6 +320,39 @@ func typeSave(_ pid: pid_t, _ text: String) {
     """)
 }
 
+// Move away from the edited syntax line so hidden Markdown markers return to
+// their normal presentation before the next OCR-located operation.
+func moveDocStart(_ pid: pid_t) {
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            key code 126 using command down
+            delay 0.2
+        end tell
+    end tell
+    """)
+}
+
+func shiftSelect(_ pid: pid_t, _ direction: String, _ count: Int) {
+    guard direction == "left" || direction == "right" else { fail("direction must be left or right") }
+    guard count > 0 else { fail("shift-select count must be positive") }
+    let code = direction == "right" ? 124 : 123
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            repeat \(count) times
+                key code \(code) using shift down
+                delay 0.1
+            end repeat
+        end tell
+    end tell
+    """)
+}
+
 func deleteSelectionSave(_ pid: pid_t) {
     runAppleScript("""
     tell application "System Events"
@@ -348,7 +406,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|click-text|drag-select-text|type-save|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -384,6 +442,11 @@ case "type-romaji-commit-save":
         fail("type-romaji-commit-save requires PID, romaji text and source ID")
     }
     selectAllTypeRomajiCommitSave(pid, arguments[2], arguments[3])
+case "type-romaji-at-caret-commit-save":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else {
+        fail("type-romaji-at-caret-commit-save requires PID, romaji text and source ID")
+    }
+    typeRomajiAtCaretCommitSave(pid, arguments[2], arguments[3])
 case "click-text":
     guard arguments.count == 5, let pid = pid_t(arguments[1]) else {
         fail("click-text requires PID, screenshot path, regex pattern and edge")
@@ -397,6 +460,14 @@ case "drag-select-text":
 case "type-save":
     guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("type-save requires PID and text") }
     typeSave(pid, arguments[2])
+case "move-doc-start":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("move-doc-start requires PID") }
+    moveDocStart(pid)
+case "shift-select":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else {
+        fail("shift-select requires PID, direction and count")
+    }
+    shiftSelect(pid, arguments[2], count)
 case "delete-selection-save":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("delete-selection-save requires PID") }
     deleteSelectionSave(pid)
