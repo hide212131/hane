@@ -75,6 +75,9 @@ def build_generations(statuses):
     an earlier attempt may have failed before writing any status.  Such
     generations deliberately keep ``attempt=None`` until notification time,
     when the Actions attempt history is correlated by timestamp.
+
+    A terminal status closes its generation.  Later status rows without an
+    Actions URL must never be attached to an already-finished execution.
     """
     generations = []
     current = None
@@ -108,21 +111,63 @@ def build_generations(statuses):
                 current["latest"] = row
                 if current["attempt"] is None and explicit_attempt is not None:
                     current["attempt"] = explicit_attempt
+                current = None
                 continue
 
         if explicit_run is None:
             run_id, attempt = str(row.get("id")), "1"
         else:
             run_id, attempt = explicit_run, explicit_attempt
-        current = {
+        terminal = {
             "generation_id": row.get("id"),
             "start": None,
             "latest": row,
             "run_id": run_id,
             "attempt": attempt,
         }
-        generations.append(current)
+        generations.append(terminal)
+        current = None
     return generations
+
+
+def codex_lifecycle_rows(statuses):
+    """Exclude fallback compatibility results from the normal Codex lifecycle.
+
+    The fallback workflow writes ``hane/review-source`` and then a compatible
+    ``hane/codex-review`` clean/findings status for downstream consumers.  That
+    compatibility row belongs to the fallback lifecycle, not to the original
+    Codex execution that already terminated abnormally.  A later fresh Codex
+    pending clears this fallback association.
+    """
+    rows = []
+    fallback = False
+    for row in sorted(statuses, key=lambda item: item.get("id", 0)):
+        context = row.get("context")
+        description = row.get("description") or ""
+        if context == "hane/review-source":
+            fallback = (
+                row.get("state") == "success"
+                and description.startswith("Review source: Copilot fallback for ")
+            )
+            continue
+        if context != "hane/codex-review":
+            continue
+        if row.get("state") == "pending":
+            fallback = False
+            rows.append(row)
+            continue
+        compatible = (
+            row.get("state") in ("success", "failure")
+            and (
+                description.startswith("Codex review clean for ")
+                or description.startswith("Codex findings for ")
+            )
+        )
+        if fallback and compatible:
+            fallback = False
+            continue
+        rows.append(row)
+    return rows
 
 
 def _attempt_starts(call, repository, run_id, cache):
@@ -294,7 +339,9 @@ def reconcile_pr(call, repository, pr, cutoff):
     attempt_cache = {}
     writes = 0
     for context, process in CONTEXTS.items():
-        rows = [row for row in statuses if row.get("context") == context]
+        rows = codex_lifecycle_rows(statuses) if context == "hane/codex-review" else [
+            row for row in statuses if row.get("context") == context
+        ]
         for generation in build_generations(rows):
             if not recent(generation, cutoff):
                 continue
