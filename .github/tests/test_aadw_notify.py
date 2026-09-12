@@ -15,15 +15,23 @@ REPO = 'hide212131/hane'
 class FakeGitHub:
     """In-memory GitHub API double: comments only, keyed like the real API."""
 
-    def __init__(self, comments=()):
+    def __init__(self, comments=(), race_body=None):
         self.comments = list(comments)
         self.next_id = max([c['id'] for c in self.comments], default=0) + 1
         self.calls = []
+        self.race_body = race_body
+        self.race_injected = False
 
     def call(self, endpoint, payload=None, method=None):
         self.calls.append((endpoint, payload, method))
         if endpoint.startswith(f'repos/{REPO}/issues/comments/'):
             comment_id = int(endpoint.rsplit('/', 1)[1])
+            if method == 'DELETE':
+                for index, comment in enumerate(self.comments):
+                    if comment['id'] == comment_id:
+                        self.comments.pop(index)
+                        return None
+                raise RuntimeError('comment not found')
             for c in self.comments:
                 if c['id'] == comment_id:
                     c['body'] = payload['body']
@@ -31,6 +39,14 @@ class FakeGitHub:
             raise RuntimeError('comment not found')
         if '/comments?' in endpoint:
             return list(self.comments)
+        if self.race_body is not None and not self.race_injected:
+            self.comments.append({
+                'id': self.next_id,
+                'user': {'login': 'github-actions[bot]'},
+                'body': self.race_body,
+            })
+            self.next_id += 1
+            self.race_injected = True
         comment = {'id': self.next_id, 'user': {'login': 'github-actions[bot]'}, 'body': payload['body']}
         self.next_id += 1
         self.comments.append(comment)
@@ -39,6 +55,12 @@ class FakeGitHub:
 
 def call_notify(gh, state, **kwargs):
     return notifier.notify(gh.call, state=state, repository=REPO, run_id='111', attempt='1', **kwargs)
+
+
+def rendered(state, process='codex-review', kind='pr', number=42, sha=SHA, detail=''):
+    marker_text = notifier.marker(process, kind, str(number), sha, '111', '1')
+    return notifier.render(process, state, kind, str(number), sha, '111', '1', REPO,
+                           detail, marker_text)
 
 
 class NotifyTests(unittest.TestCase):
@@ -85,6 +107,23 @@ class NotifyTests(unittest.TestCase):
                 self.assertEqual(result['action'], 'noop')
                 self.assertEqual(gh.comments[0]['body'], terminal_body)
                 self.assertNotIn('— 処理開始', gh.comments[0]['body'])
+
+    def test_concurrent_terminal_converges_earlier_start_to_one_terminal_comment(self):
+        gh = FakeGitHub(race_body=rendered('start'))
+        result = call_notify(gh, 'success', process='codex-review', kind='pr', number=42, sha=SHA)
+        self.assertEqual(result['action'], 'update')
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn('— 正常終了', gh.comments[0]['body'])
+        self.assertTrue(any(method == 'DELETE' for _, _, method in gh.calls))
+
+    def test_concurrent_start_does_not_downgrade_earlier_terminal_and_removes_duplicate(self):
+        gh = FakeGitHub(race_body=rendered('failure'))
+        result = call_notify(gh, 'start', process='codex-review', kind='pr', number=42, sha=SHA)
+        self.assertEqual(result['action'], 'update')
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn('— 異常終了', gh.comments[0]['body'])
+        self.assertNotIn('— 処理開始', gh.comments[0]['body'])
+        self.assertTrue(any(method == 'DELETE' for _, _, method in gh.calls))
 
     def test_retry_new_attempt_does_not_overwrite_previous_run(self):
         gh = FakeGitHub()

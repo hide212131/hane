@@ -51,17 +51,25 @@ def _validate(*, state, process, kind, number, sha, repository, run_id, attempt)
     return number, sha, run_id, attempt
 
 
-def find_comment(call, repository, number, marker_text, actor=_ACTOR):
+def find_comments(call, repository, number, marker_text, actor=_ACTOR):
+    found = []
     for page in range(1, 101):
         comments = call(f'repos/{repository}/issues/{number}/comments?per_page=100&page={page}')
         if not isinstance(comments, list):
             raise RuntimeError('AADW通知の既存コメントを確認できませんでした。')
-        for comment in comments:
-            if comment.get('user', {}).get('login') == actor and marker_text in (comment.get('body') or ''):
-                return comment
+        found.extend(
+            comment for comment in comments
+            if comment.get('user', {}).get('login') == actor
+            and marker_text in (comment.get('body') or '')
+        )
         if len(comments) < 100:
-            return None
+            return found
     raise RuntimeError('AADW通知の既存コメント件数が上限を超えました。')
+
+
+def find_comment(call, repository, number, marker_text, actor=_ACTOR):
+    found = find_comments(call, repository, number, marker_text, actor)
+    return min(found, key=lambda comment: comment.get('id', 0), default=None)
 
 
 def render(process, state, kind, number, sha, run_id, attempt, repository, detail, marker_text):
@@ -77,6 +85,20 @@ def render(process, state, kind, number, sha, run_id, attempt, repository, detai
     return '\n'.join(lines) + '\n'
 
 
+def _apply_to_existing(call, repository, existing, state, body):
+    existing_body = existing.get('body') or ''
+    # Lifecycle state is monotonic for one exact run/attempt. A delayed
+    # pending-status reconcile must not turn a terminal outcome back into
+    # "処理開始" after timeout/cancel or another terminal observation.
+    if state == 'start' and ('— 正常終了' in existing_body or '— 異常終了' in existing_body):
+        return 'noop'
+    if existing_body == body:
+        return 'noop'
+    call(f'repos/{repository}/issues/comments/{existing["id"]}', {'body': body}, 'PATCH')
+    existing['body'] = body
+    return 'update'
+
+
 def notify(call, *, state, process, kind, number, sha, repository, run_id, attempt, detail=''):
     number, sha, run_id, attempt = _validate(
         state=state, process=process, kind=kind, number=number, sha=sha,
@@ -86,18 +108,30 @@ def notify(call, *, state, process, kind, number, sha, repository, run_id, attem
                   (detail or '').strip()[:2000], marker_text)
     existing = find_comment(call, repository, number, marker_text)
     if existing:
-        existing_body = existing.get('body') or ''
-        # Lifecycle state is monotonic for one exact run/attempt. A delayed
-        # pending-status reconcile must not turn a terminal outcome back into
-        # "処理開始" after timeout/cancel or another terminal observation.
-        if state == 'start' and ('— 正常終了' in existing_body or '— 異常終了' in existing_body):
-            return {'action': 'noop', 'id': existing['id']}
-        if existing_body == body:
-            return {'action': 'noop', 'id': existing['id']}
-        call(f'repos/{repository}/issues/comments/{existing["id"]}', {'body': body}, 'PATCH')
-        return {'action': 'update', 'id': existing['id']}
+        action = _apply_to_existing(call, repository, existing, state, body)
+        return {'action': action, 'id': existing['id']}
+
     created = call(f'repos/{repository}/issues/{number}/comments', {'body': body})
-    return {'action': 'create', 'id': created['id']}
+    if not isinstance(created, dict) or not isinstance(created.get('id'), int):
+        raise RuntimeError('AADW通知コメントの作成結果を確認できませんでした。')
+
+    # Direct producer notifications and scheduled reconcile can both observe
+    # "not found" before either POST completes. Re-read after creation and use
+    # the oldest bot-owned exact-marker comment as the deterministic canonical
+    # record. A later creator deletes only its own duplicate, so concurrent
+    # creators cannot delete each other's canonical comment.
+    matches = find_comments(call, repository, number, marker_text)
+    by_id = {comment.get('id'): comment for comment in matches if isinstance(comment.get('id'), int)}
+    by_id.setdefault(created['id'], created)
+    canonical = by_id[min(by_id)]
+    canonical_action = _apply_to_existing(call, repository, canonical, state, body)
+
+    if created['id'] != canonical['id']:
+        call(f'repos/{repository}/issues/comments/{created["id"]}', None, 'DELETE')
+        return {'action': 'update' if canonical_action == 'noop' else canonical_action,
+                'id': canonical['id']}
+    return {'action': 'create' if canonical_action == 'noop' else canonical_action,
+            'id': canonical['id']}
 
 
 def main():
