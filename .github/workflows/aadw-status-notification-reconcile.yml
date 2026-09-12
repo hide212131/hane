@@ -10,6 +10,8 @@ on:
       - Claude automatic fix worker
       - Claude fix reconciliation
       - GUI requirement classification
+      - GUI validation
+      - Copilot final judgement
     types: [in_progress, completed]
   schedule:
     - cron: '*/5 * * * *'
