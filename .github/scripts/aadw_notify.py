@@ -86,7 +86,13 @@ def notify(call, *, state, process, kind, number, sha, repository, run_id, attem
                   (detail or '').strip()[:2000], marker_text)
     existing = find_comment(call, repository, number, marker_text)
     if existing:
-        if (existing.get('body') or '') == body:
+        existing_body = existing.get('body') or ''
+        # Lifecycle state is monotonic for one exact run/attempt. A delayed
+        # pending-status reconcile must not turn a terminal outcome back into
+        # "処理開始" after timeout/cancel or another terminal observation.
+        if state == 'start' and ('— 正常終了' in existing_body or '— 異常終了' in existing_body):
+            return {'action': 'noop', 'id': existing['id']}
+        if existing_body == body:
             return {'action': 'noop', 'id': existing['id']}
         call(f'repos/{repository}/issues/comments/{existing["id"]}', {'body': body}, 'PATCH')
         return {'action': 'update', 'id': existing['id']}
