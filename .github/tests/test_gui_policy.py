@@ -1,6 +1,7 @@
 """GUI receipt boundary regressions; no network, agents, builds, or GUI input."""
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +20,11 @@ REQUEST = {'pr_number': 79, 'sha': SHA, 'control_sha': CONTROL, 'repository': 'o
            'run_id': '123', 'run_attempt': '1', 'generation': '123-1', 'request_id': 'gui-123-1-pr79',
            'created_at': '2026-09-09T00:00:00+00:00', 'expires_at': '2026-09-09T01:00:00+00:00'}
 NOW = datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc)
+DEFAULT_IMAGE = b'\x89PNG\r\n\x1a\n' + b'x' * 200
+BODY_CLOSED_IMAGE = b'\x89PNG\r\n\x1a\n' + b'c' * 200
+BODY_UNCLOSED_IMAGE = b'\x89PNG\r\n\x1a\n' + b'u' * 200
+BODY_CLOSED_SHA = hashlib.sha256(BODY_CLOSED_IMAGE).hexdigest()
+BODY_UNCLOSED_SHA = hashlib.sha256(BODY_UNCLOSED_IMAGE).hexdigest()
 
 
 def _inline_evidence(steps):
@@ -100,9 +106,9 @@ def _inline_evidence(steps):
             unclosed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png',
             closed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png',
             delimiter=delimiter,
-            initial_pixel_digest='1' * 64,
-            unclosed_pixel_digest='2' * 64,
-            closed_pixel_digest='1' * 64,
+            initial_pixel_digest=BODY_CLOSED_SHA,
+            unclosed_pixel_digest=BODY_UNCLOSED_SHA,
+            closed_pixel_digest=BODY_CLOSED_SHA,
             visual_transition_observed=True,
             closed_visual_restored=True,
             unclosed_expected=unclosed, unclosed_actual=unclosed,
@@ -139,7 +145,13 @@ class ReceiptTests(unittest.TestCase):
         for name in policy.REQUIRED_IMAGES:
             path = self.evidence / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b'\x89PNG\r\n\x1a\n' + b'x' * 200)
+            if name.endswith('_unclosed.body.png'):
+                data = BODY_UNCLOSED_IMAGE
+            elif name.endswith('.body.png'):
+                data = BODY_CLOSED_IMAGE
+            else:
+                data = DEFAULT_IMAGE
+            path.write_bytes(data)
 
     def validate(self, raw, conclusion='success'):
         return policy.validate_receipt(raw, REQUEST, self.evidence, conclusion, NOW)
@@ -238,7 +250,7 @@ class ReceiptTests(unittest.TestCase):
         mutations = [
             ('delimiter', '*'),
             ('initial_pixel_digest', '3' * 64),
-            ('unclosed_pixel_digest', '1' * 64),
+            ('unclosed_pixel_digest', BODY_CLOSED_SHA),
             ('visual_transition_observed', False),
             ('closed_visual_restored', False),
         ]
@@ -247,6 +259,20 @@ class ReceiptTests(unittest.TestCase):
             self.inline_step(raw, 'delimiter_toggle_bold_check')[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.validate(raw)
+
+    def test_delimiter_digest_must_match_staged_body_image(self):
+        raw = passing_result()
+        path = self.evidence / 'inline_syntax_boundary/delimiter_toggle_bold_unclosed.body.png'
+        path.write_bytes(BODY_CLOSED_IMAGE)
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_delimiter_body_crop_is_required(self):
+        raw = passing_result()
+        path = self.evidence / 'inline_syntax_boundary/delimiter_toggle_code_closed.body.png'
+        path.unlink()
+        with self.assertRaises(ValueError):
+            self.validate(raw)
 
     def test_delimiter_screenshot_refs_are_bound_to_state(self):
         raw = passing_result()
@@ -316,6 +342,7 @@ class RequirementAndReviewTests(unittest.TestCase):
                          'delimiter_toggle_bold', 'delimiter_toggle_code', 'reopen_content_check'):
             self.assertIn(required, steps)
         self.assertTrue(any(name.startswith('inline_syntax_boundary/') for name in policy.REQUIRED_IMAGES))
+        self.assertTrue(any(name.endswith('.body.png') for name in policy.REQUIRED_IMAGES))
 
     def test_gui_status_requires_exact_sha_and_matching_terminal_state(self):
         row = {'state': 'success', 'description': f'GUI pass {policy.STATUS_VERSION} {SHA[:12]} g123-1'}
