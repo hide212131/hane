@@ -15,6 +15,41 @@ GitHub-hosted macOS を優先し、必要な場合だけ通常アカウントを
 
 追跡 Issue: #44
 
+## 概要
+
+この文書を初めて読む場合は、まずこの節で全体像をつかむ。詳細な基本方針・全体フロー・各 agent / validator の責務は後続の節で説明するので、ここでは重複して書かない。
+
+Hane の agentic development workflow は、次の役割分担で Issue から Pull Request のマージまでを進める。
+
+- **Work（ChatGPT）** が要求整理・詳細設計を担当する。
+- **Claude Code** が実装を担当する。
+- **Codex** が Pull Request のレビューを担当する。
+- **GitHub Copilot** が Codex review・CI・GUI validation の結果を読み、次の処理を判断する。
+- **GitHub Actions** が状態遷移と、マージ前の機械的な安全確認を担う。
+
+UI・操作・描画など実アプリの挙動に影響する変更では、CI やコードレビューに加えて実アプリの GUI validation も行う。
+
+Issue から merge までの大まかな流れは次のとおり。
+
+```text
+Issue
+  ↓
+Work（要求整理・設計）
+  ↓
+Claude Code（実装）
+  ↓
+Pull Request
+  ↓
+CI + review
+  ↓
+必要なら GUI validation
+  ↓
+Copilot が次の処理を判断
+  ├─ fix → Claude Code に戻し、新しい head SHA に対して CI・review・必要な GUI validation をやり直す
+  ├─ blocked → 人へ引き継ぐ
+  └─ ready → deterministic merge gate が現在の head SHA に必要な検証がそろっていることを確認して merge へ進む
+```
+
 ## 基本方針
 
 1つの agent に設計、実装、レビュー、実アプリ検証、進行判断をすべて任せない。
