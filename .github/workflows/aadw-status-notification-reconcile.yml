@@ -1,0 +1,45 @@
+name: AADW status notification reconcile
+
+on:
+  workflow_run:
+    workflows:
+      - Codex review gate
+      - Codex limit Copilot review fallback
+      - Copilot pre-GUI routing
+      - Copilot routing reconciliation
+      - Claude automatic fix worker
+      - Claude fix reconciliation
+      - GUI requirement classification
+    types: [in_progress, completed]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: aadw-status-notification-reconcile
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Check out trusted notification controller
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Reconcile AADW status comments
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_notification_reconcile.py --lookback-seconds 7200
