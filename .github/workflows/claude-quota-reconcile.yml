@@ -1,0 +1,207 @@
+name: Claude quota reconciliation
+
+on:
+  workflow_run:
+    workflows:
+      - Claude automatic fix worker
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-quota-reconcile-serialized
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: read
+      statuses: write
+
+    steps:
+      - name: Check out trusted quota recovery policy
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Reconcile Claude session quota waits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          dispatched=false
+
+          post_stall_comment() {
+            local pr_number="$1"
+            local target_sha="$2"
+            local reason="$3"
+            local cause_url="$4"
+            local marker existing_id body
+            marker="<!-- hane-stall: number=${pr_number} stage=claude-quota sha=${target_sha} -->"
+            existing_id="$(
+              gh api --paginate --slurp "repos/${REPOSITORY}/issues/${pr_number}/comments?per_page=100" \
+                | jq -r --arg marker "$marker" \
+                  '[.[][] | select(.user.login == "github-actions[bot]" and ((.body // "") | contains($marker)))] | max_by(.id) | .id // empty'
+            )"
+            body="$(printf '### Claude自動修正：利用上限待ち\n\n対象: PR #%s / %s\n\n%s\n\n原因実行: %s\n\n%s\n' \
+              "$pr_number" "$target_sha" "$reason" "$cause_url" "$marker")"
+            if [[ -n "$existing_id" ]]; then
+              gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$body" >/dev/null
+            else
+              gh api --method POST "repos/${REPOSITORY}/issues/${pr_number}/comments" -f body="$body" >/dev/null
+            fi
+          }
+
+          while IFS= read -r pr_number; do
+            [[ -z "$pr_number" ]] && continue
+
+            pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+            state="$(jq -r '.state' <<< "$pr")"
+            draft="$(jq -r '.draft' <<< "$pr")"
+            target_sha="$(jq -r '.head.sha' <<< "$pr")"
+            head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr")"
+            pr_author="$(jq -r '.user.login' <<< "$pr")"
+            short_sha="${target_sha:0:12}"
+            if [[ "$state" != open || "$draft" != false || "$head_repo" != "$REPOSITORY" ]]; then
+              continue
+            fi
+            case "$pr_author" in
+              hide212131|'github-actions[bot]'|'claude[bot]') ;;
+              *) continue ;;
+            esac
+
+            statuses_file="$RUNNER_TEMP/claude-quota-statuses-${pr_number}.json"
+            gh api --paginate --slurp "repos/${REPOSITORY}/commits/${target_sha}/statuses?per_page=100" | jq 'add' > "$statuses_file"
+            latest="$(
+              jq -r '[.[] | select(.context == "hane/claude-fix")] | max_by(.id) // {} |
+                [.id // 0, .state // "", .description // "", .target_url // "", .created_at // ""] | @tsv' "$statuses_file"
+            )"
+            latest_state="$(cut -f2 <<< "$latest")"
+            latest_description="$(cut -f3 <<< "$latest")"
+            latest_url="$(cut -f4 <<< "$latest")"
+            latest_created_at="$(cut -f5 <<< "$latest")"
+
+            if [[ "$latest_state" == error && "$latest_description" == "Claude fix failed for ${short_sha}" ]]; then
+              if [[ ! "$latest_url" =~ /actions/runs/([0-9]+) ]]; then
+                continue
+              fi
+              failed_run_id="${BASH_REMATCH[1]}"
+              log_file="$RUNNER_TEMP/claude-quota-${pr_number}-${failed_run_id}.log"
+              : > "$log_file"
+              while IFS= read -r job_id; do
+                [[ -z "$job_id" ]] && continue
+                gh api "repos/${REPOSITORY}/actions/jobs/${job_id}/logs" >> "$log_file" 2>/dev/null || true
+                printf '\n' >> "$log_file"
+              done < <(gh api "repos/${REPOSITORY}/actions/runs/${failed_run_id}/jobs?filter=latest&per_page=100" --jq '.jobs[].id')
+
+              parsed="$(python3 -I .github/scripts/claude_quota_state.py parse-log --now "$latest_created_at" < "$log_file")"
+              if [[ "$(jq -r '.quota_wait' <<< "$parsed")" != true ]]; then
+                continue
+              fi
+              retry_after="$(jq -r '.retry_after' <<< "$parsed")"
+              current_pr="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}")"
+              if ! jq -e --arg sha "$target_sha" \
+                '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+                continue
+              fi
+              wait_count="$(
+                jq -r --arg short "$short_sha" \
+                  '[.[] | select(.context == "hane/claude-fix" and ((.description // "") | test("^Claude fix quota wait until [0-9T:Z-]+ for " + $short + "$")))] | length' \
+                  "$statuses_file"
+              )"
+              if [[ "$wait_count" -ge 2 ]]; then
+                gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+                  -f state=error -f context='hane/claude-fix' \
+                  -f description="Claude fix blocked: quota retry budget for ${short_sha}" \
+                  -f target_url="$latest_url" >/dev/null
+                post_stall_comment "$pr_number" "$target_sha" \
+                  'Claudeのsession利用上限に繰り返し到達したため、自動再試行を2回で停止しました。ownerの確認が必要です。' "$latest_url"
+                echo "- PR #${pr_number}: quota retry budget exhausted for ${short_sha}" >> "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+
+              gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+                -f state=pending -f context='hane/claude-fix' \
+                -f description="Claude fix quota wait until ${retry_after} for ${short_sha}" \
+                -f target_url="$latest_url" >/dev/null
+              post_stall_comment "$pr_number" "$target_sha" \
+                "Claudeのsession利用上限に到達しました。${retry_after} 以降に自動再試行します。" "$latest_url"
+              echo "- PR #${pr_number}: quota wait until ${retry_after}; cause ${latest_url}" >> "$GITHUB_STEP_SUMMARY"
+              # A fresh quota hit is repository-wide evidence. Do not wake another PR
+              # in the same reconcile run and immediately consume the same shared limit.
+              break
+            fi
+
+            decision="$(python3 -I .github/scripts/claude_quota_state.py recovery --sha "$target_sha" < "$statuses_file")"
+            if [[ "$(jq -r '.recover' <<< "$decision")" != true ]]; then
+              continue
+            fi
+            retry_after="$(jq -r '.retry_after' <<< "$decision")"
+            retry_number="$(jq -r '.retry_number' <<< "$decision")"
+
+            if jq -e 'any(.[]; (.context // "") | startswith("hane/claude-fix-manual/"))' "$statuses_file" >/dev/null; then
+              continue
+            fi
+
+            routing="$(python3 -I .github/scripts/claude_fix_state.py routing --sha "$target_sha" --manual false < "$statuses_file" | jq -r '.allowed')"
+            if [[ "$routing" != true ]]; then
+              continue
+            fi
+
+            current_sha="$(gh api "repos/${REPOSITORY}/pulls/${pr_number}" --jq '.head.sha')"
+            if [[ "$current_sha" != "$target_sha" ]]; then
+              continue
+            fi
+
+            lease="$(
+              jq -r --arg short "$short_sha" --arg retry_after "$retry_after" --argjson retry_number "$retry_number" \
+                '[.[] | select(.context == "hane/claude-quota-retry" and
+                  .description == ("Claude quota retry " + ($retry_number|tostring) + " dispatched for " + $short + " after " + $retry_after))] |
+                  max_by(.id) // {} | [.description // "", .created_at // ""] | @tsv' "$statuses_file"
+            )"
+            lease_description="$(cut -f1 <<< "$lease")"
+            lease_created_at="$(cut -f2 <<< "$lease")"
+            expected_lease="Claude quota retry ${retry_number} dispatched for ${short_sha} after ${retry_after}"
+            if [[ "$lease_description" == "$expected_lease" ]]; then
+              lease_epoch="$(date -d "$lease_created_at" +%s 2>/dev/null || echo 0)"
+              now_epoch="$(date -u +%s)"
+              if [[ "$lease_epoch" -gt 0 && $((now_epoch - lease_epoch)) -lt 1800 ]]; then
+                continue
+              fi
+            fi
+
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=pending -f context='hane/claude-quota-retry' \
+              -f description="$expected_lease" \
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+            payload="$(jq -n --argjson pr_number "$pr_number" --arg target_sha "$target_sha" \
+              '{event_type:"hane-claude-fix",client_payload:{pr_number:$pr_number,target_sha:$target_sha}}')"
+            gh api --method POST "repos/${REPOSITORY}/dispatches" --input - <<< "$payload"
+            post_stall_comment "$pr_number" "$target_sha" \
+              "Claudeのsession利用枠の再開時刻を過ぎたため、自動再試行 ${retry_number}/2 を開始しました。" "$latest_url"
+            echo "- PR #${pr_number}: dispatched quota retry ${retry_number}/2 for ${short_sha}" >> "$GITHUB_STEP_SUMMARY"
+            dispatched=true
+            break
+          done < <(
+            gh api --paginate --slurp "repos/${REPOSITORY}/pulls?state=open&per_page=100" \
+              | jq -r '.[][] | select(.draft == false and .head.repo.full_name == .base.repo.full_name) | .number'
+          )
+
+          if [[ "$dispatched" != true ]]; then
+            echo '- No quota retry dispatch was needed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
