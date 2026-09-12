@@ -18,11 +18,16 @@ CONTEXTS = {
     "hane/copilot-routing": "copilot-pre-gui-routing",
     "hane/claude-fix": "claude-fix",
     "hane/gui-requirement": "gui-requirement",
+    "hane/gui-validation": "gui-validation",
+    "hane/final-judge": "final-judge",
 }
 _ACTION_RUN = re.compile(r"/actions/runs/([1-9][0-9]*)(?:/attempts/([1-9][0-9]*))?(?:[/?#]|$)")
+_GUI_GENERATION = re.compile(r" g([1-9][0-9]*)-([1-9][0-9]*)$")
 _ROUTING_OK = re.compile(
     r"Copilot routing: (?:fix|continue-validation|blocked|workflow changes require owner) for [0-9a-f]{12}$"
 )
+_GUI_NORMAL = re.compile(r"GUI (?:pass|fail) v[0-9]+ [0-9a-f]{12} g[1-9][0-9]*-[1-9][0-9]*$")
+_FINAL_NORMAL = re.compile(r"Final (?:ready|merged|fix|blocked) v[0-9]+ [0-9a-f]{12} e[0-9a-f]+$")
 _FALLBACK_MARKER = re.compile(
     r"process=codex-review-fallback kind=pr number=([1-9][0-9]*) sha=([0-9a-f]{40}) "
     r"run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->"
@@ -50,8 +55,12 @@ def parse_time(value):
         return None
 
 
-def run_identity(target_url, fallback_id, seen):
-    match = _ACTION_RUN.search(target_url or "")
+def run_identity(status, fallback_id, seen):
+    description = status.get("description") or ""
+    gui = _GUI_GENERATION.search(description)
+    if gui:
+        return gui.group(1), gui.group(2)
+    match = _ACTION_RUN.search(status.get("target_url") or "")
     if match:
         run_id = match.group(1)
         if match.group(2):
@@ -68,27 +77,24 @@ def build_generations(statuses):
     seen_runs = {}
     for row in sorted(statuses, key=lambda item: item.get("id", 0)):
         state = row.get("state", "")
-        parsed = _ACTION_RUN.search(row.get("target_url") or "")
-        row_run = parsed.group(1) if parsed else None
+        row_run, row_attempt = run_identity(row, row.get("id"), seen_runs)
         if state == "pending":
-            run_id, attempt = run_identity(row.get("target_url"), row.get("id"), seen_runs)
             current = {
                 "generation_id": row.get("id"),
                 "start": row,
                 "latest": row,
-                "run_id": run_id,
-                "attempt": attempt,
+                "run_id": row_run,
+                "attempt": row_attempt,
             }
             generations.append(current)
             continue
-        if current is None or (row_run and row_run != current["run_id"]):
-            run_id, attempt = run_identity(row.get("target_url"), row.get("id"), seen_runs)
+        if current is None or row_run != current["run_id"] or row_attempt != current["attempt"]:
             current = {
                 "generation_id": row.get("id"),
                 "start": None,
                 "latest": row,
-                "run_id": run_id,
-                "attempt": attempt,
+                "run_id": row_run,
+                "attempt": row_attempt,
             }
             generations.append(current)
         else:
@@ -107,6 +113,10 @@ def outcome(context, status):
         return "success" if _ROUTING_OK.fullmatch(description) else "failure"
     if context == "hane/claude-fix":
         return "success" if state == "success" and description.startswith("Claude fix completed for ") else "failure"
+    if context == "hane/gui-validation":
+        return "success" if _GUI_NORMAL.fullmatch(description) else "failure"
+    if context == "hane/final-judge":
+        return "success" if _FINAL_NORMAL.fullmatch(description) else "failure"
     return "failure"
 
 
