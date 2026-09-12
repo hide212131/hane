@@ -14,21 +14,54 @@ REQUIRED_STEPS = {
     'ascii_edit_save_undo_redo_reopen': {'launch', 'window_discovery', 'edit_save', 'append_save', 'undo_save', 'redo_save', 'capture_before', 'capture_after', 'capture_reopen', 'visible_saved_text', 'reopen_content_check', 'cleanup'},
     'japanese_ime_input': {'query_current_source', 'list_input_sources', 'select_japanese_source', 'launch', 'window_discovery', 'ime_input_save', 'capture_before', 'capture_after', 'cleanup', 'restore_input_source'},
     'os_scroll': {'launch', 'window_discovery', 'capture_before', 'os_wheel', 'capture_after', 'visible_scroll', 'scroll_preserves_document', 'cleanup'},
-    'inline_syntax_boundary': {'launch', 'window_discovery', 'capture_before',
-                                'boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
-                                'boundary_click_edit_quote', 'boundary_click_edit_list',
-                                'drag_select_delete_undo_redo', 'delimiter_unclosed_then_closed',
-                                'capture_after', 'cleanup',
-                                'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
-                                'visible_saved_text', 'reopen_content_check', 'cleanup_reopen'},
+    'inline_syntax_boundary': {
+        'launch', 'window_discovery', 'capture_before',
+        'boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
+        'boundary_click_edit_quote', 'boundary_click_edit_list',
+        'capture_boundary_click_edit_bold_italic_0', 'boundary_click_edit_bold_italic_check_0',
+        'capture_boundary_click_edit_bold_italic_1', 'boundary_click_edit_bold_italic_check_1',
+        'capture_boundary_click_edit_code_span_0', 'boundary_click_edit_code_span_check_0',
+        'capture_boundary_click_edit_code_span_1', 'boundary_click_edit_code_span_check_1',
+        'capture_boundary_click_edit_quote_0', 'boundary_click_edit_quote_check_0',
+        'capture_boundary_click_edit_list_0', 'boundary_click_edit_list_check_0',
+        'boundary_ime_input', 'capture_boundary_ime_input', 'boundary_ime_input_check',
+        'restore_boundary_ime_input_source',
+        'drag_select_delete_undo_redo', 'capture_drag_select_state0',
+        'drag_select_delete_undo_redo_check',
+        'delimiter_toggle_star', 'capture_delimiter_toggle_star_unclosed',
+        'capture_delimiter_toggle_star_closed', 'delimiter_toggle_star_check',
+        'delimiter_toggle_bold', 'capture_delimiter_toggle_bold_unclosed',
+        'capture_delimiter_toggle_bold_closed', 'delimiter_toggle_bold_check',
+        'delimiter_toggle_code', 'capture_delimiter_toggle_code_unclosed',
+        'capture_delimiter_toggle_code_closed', 'delimiter_toggle_code_check',
+        'capture_after', 'cleanup',
+        'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
+        'visible_saved_text', 'reopen_content_check', 'cleanup_reopen',
+    },
 }
-REQUIRED_IMAGES = ['ascii_edit_save_undo_redo_reopen/before.png',
-                   'ascii_edit_save_undo_redo_reopen/after.png',
-                   'ascii_edit_save_undo_redo_reopen/reopen/reopen.png',
-                   'japanese_ime_input/before.png', 'japanese_ime_input/after.png',
-                   'os_scroll/before.png', 'os_scroll/after.png',
-                   'inline_syntax_boundary/before.png', 'inline_syntax_boundary/after.png',
-                   'inline_syntax_boundary/reopen/reopen.png']
+REQUIRED_IMAGES = [
+    'ascii_edit_save_undo_redo_reopen/before.png',
+    'ascii_edit_save_undo_redo_reopen/after.png',
+    'ascii_edit_save_undo_redo_reopen/reopen/reopen.png',
+    'japanese_ime_input/before.png', 'japanese_ime_input/after.png',
+    'os_scroll/before.png', 'os_scroll/after.png',
+    'inline_syntax_boundary/before.png', 'inline_syntax_boundary/after.png',
+    'inline_syntax_boundary/reopen/reopen.png',
+    'inline_syntax_boundary/boundary_click_edit_bold_italic_0.png',
+    'inline_syntax_boundary/boundary_click_edit_bold_italic_1.png',
+    'inline_syntax_boundary/boundary_click_edit_code_span_0.png',
+    'inline_syntax_boundary/boundary_click_edit_code_span_1.png',
+    'inline_syntax_boundary/boundary_click_edit_quote_0.png',
+    'inline_syntax_boundary/boundary_click_edit_list_0.png',
+    'inline_syntax_boundary/boundary_ime_input.png',
+    'inline_syntax_boundary/drag_select_state0.png',
+    'inline_syntax_boundary/delimiter_toggle_star_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_star_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_closed.png',
+]
 
 
 def latest(statuses):
@@ -89,6 +122,50 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(timezone.utc)
 
 
+def _require_text(step, *names):
+    for name in names:
+        if not isinstance(step.get(name), str) or not step[name]:
+            raise ValueError(f'missing inline evidence field: {name}')
+
+
+def _validate_inline_evidence(steps):
+    by_name = {step.get('name'): step for step in steps}
+    boundary_checks = (
+        'boundary_click_edit_bold_italic_check_0',
+        'boundary_click_edit_bold_italic_check_1',
+        'boundary_click_edit_code_span_check_0',
+        'boundary_click_edit_code_span_check_1',
+        'boundary_click_edit_quote_check_0',
+        'boundary_click_edit_list_check_0',
+        'boundary_ime_input_check',
+    )
+    for name in boundary_checks:
+        step = by_name[name]
+        _require_text(step, 'screenshot', 'expected_after_insert', 'actual_after_insert',
+                      'expected_after_undo', 'actual_after_undo')
+        if step['expected_after_insert'] != step['actual_after_insert']:
+            raise ValueError('inline insertion evidence mismatch')
+        if step['expected_after_undo'] != step['actual_after_undo']:
+            raise ValueError('inline undo evidence mismatch')
+
+    drag = by_name['drag_select_delete_undo_redo_check']
+    _require_text(drag, 'screenshot', 'deleted_expected', 'deleted_actual',
+                  'undo_actual', 'redo_actual', 'restored_actual')
+    if drag['deleted_expected'] != drag['deleted_actual'] or drag['deleted_expected'] != drag['redo_actual']:
+        raise ValueError('drag-selection evidence mismatch')
+    if drag['undo_actual'] != drag['restored_actual']:
+        raise ValueError('drag-selection restore evidence mismatch')
+
+    for kind in ('star', 'bold', 'code'):
+        step = by_name[f'delimiter_toggle_{kind}_check']
+        _require_text(step, 'unclosed_screenshot', 'closed_screenshot', 'delimiter',
+                      'unclosed_expected', 'unclosed_actual', 'closed_expected', 'closed_actual')
+        if step['unclosed_expected'] != step['unclosed_actual']:
+            raise ValueError('delimiter-unclosed evidence mismatch')
+        if step['closed_expected'] != step['closed_actual']:
+            raise ValueError('delimiter-closed evidence mismatch')
+
+
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     """Fail closed on provenance/shape errors; never upgrade partial evidence."""
     now = now or datetime.now(timezone.utc)
@@ -145,6 +222,8 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                 for name in ('launch', 'window_discovery', 'cleanup'):
                     if sum(s.get('name') == name for s in steps) != 2:
                         raise ValueError('reopen lifecycle incomplete')
+            if scenario['name'] == 'inline_syntax_boundary':
+                _validate_inline_evidence(steps)
         for relative in REQUIRED_IMAGES:
             image = Path(evidence_dir) / relative
             if image.is_symlink() or not image.is_file() or image.stat().st_size < 100:
