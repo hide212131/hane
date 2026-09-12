@@ -78,14 +78,23 @@ REQUIRED_IMAGES = [
     'inline_syntax_boundary/boundary_ime_input.png',
     'inline_syntax_boundary/drag_select_state0.png',
     'inline_syntax_boundary/delimiter_toggle_star_initial_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_star_initial_closed.body.png',
     'inline_syntax_boundary/delimiter_toggle_star_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_star_unclosed.body.png',
     'inline_syntax_boundary/delimiter_toggle_star_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_star_closed.body.png',
     'inline_syntax_boundary/delimiter_toggle_bold_initial_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_initial_closed.body.png',
     'inline_syntax_boundary/delimiter_toggle_bold_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_unclosed.body.png',
     'inline_syntax_boundary/delimiter_toggle_bold_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_closed.body.png',
     'inline_syntax_boundary/delimiter_toggle_code_initial_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_initial_closed.body.png',
     'inline_syntax_boundary/delimiter_toggle_code_unclosed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_unclosed.body.png',
     'inline_syntax_boundary/delimiter_toggle_code_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_closed.body.png',
 ]
 
 
@@ -161,13 +170,20 @@ def _require_image_ref(step, field, relative):
         raise ValueError(f'inline screenshot reference mismatch: {field}')
 
 
+def _artifact_sha256(evidence_dir, relative):
+    path = Path(evidence_dir) / relative
+    if path.is_symlink() or not path.is_file() or path.stat().st_size < 100:
+        raise ValueError('required screenshot missing')
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _delimiter_states(delimiter):
     closed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail'
     unclosed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail'
     return unclosed, closed
 
 
-def _validate_inline_evidence(steps):
+def _validate_inline_evidence(steps, evidence_dir):
     names = [step.get('name') for step in steps]
     if len(names) != len(set(names)):
         raise ValueError('duplicate inline evidence step')
@@ -196,15 +212,11 @@ def _validate_inline_evidence(steps):
         _require_text(step, 'expected_after_insert', 'actual_after_insert',
                       'expected_after_undo', 'actual_after_undo')
         _require_image_ref(step, 'screenshot', image)
-        if (
-            step['expected_after_insert'] != boundary_expected[name]
-            or step['expected_after_insert'] != step['actual_after_insert']
-        ):
+        if (step['expected_after_insert'] != boundary_expected[name]
+                or step['expected_after_insert'] != step['actual_after_insert']):
             raise ValueError('inline insertion evidence mismatch')
-        if (
-            step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
-            or step['expected_after_undo'] != step['actual_after_undo']
-        ):
+        if (step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+                or step['expected_after_undo'] != step['actual_after_undo']):
             raise ValueError('inline undo evidence mismatch')
 
     navigation = {
@@ -231,15 +243,11 @@ def _validate_inline_evidence(steps):
         _require_image_ref(step, 'screenshot', image)
         if step.get('count') != 1 or step['case'] != case or step['direction'] != direction:
             raise ValueError('caret-navigation operation evidence mismatch')
-        if (
-            step['expected_after_move_insert'] != expected
-            or step['actual_after_move_insert'] != expected
-        ):
+        if (step['expected_after_move_insert'] != expected
+                or step['actual_after_move_insert'] != expected):
             raise ValueError('caret-navigation source-position mismatch')
-        if (
-            step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
-            or step['actual_after_undo'] != INLINE_FIXTURE_ORIGINAL
-        ):
+        if (step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+                or step['actual_after_undo'] != INLINE_FIXTURE_ORIGINAL):
             raise ValueError('caret-navigation undo evidence mismatch')
 
     drag = by_name['drag_select_delete_undo_redo_check']
@@ -247,11 +255,9 @@ def _validate_inline_evidence(steps):
                   'undo_actual', 'redo_actual', 'restored_actual')
     _require_image_ref(drag, 'screenshot', 'inline_syntax_boundary/drag_select_state0.png')
     deleted_expected = INLINE_FIXTURE_ORIGINAL.replace('old *italic* com', '', 1)
-    if (
-        drag['deleted_expected'] != deleted_expected
-        or drag['deleted_actual'] != deleted_expected
-        or drag['redo_actual'] != deleted_expected
-    ):
+    if (drag['deleted_expected'] != deleted_expected
+            or drag['deleted_actual'] != deleted_expected
+            or drag['redo_actual'] != deleted_expected):
         raise ValueError('drag-selection evidence mismatch')
     if drag['undo_actual'] != INLINE_FIXTURE_ORIGINAL or drag['restored_actual'] != INLINE_FIXTURE_ORIGINAL:
         raise ValueError('drag-selection restore evidence mismatch')
@@ -261,9 +267,12 @@ def _validate_inline_evidence(steps):
         step = by_name[f'delimiter_toggle_{kind}_check']
         _require_text(step, 'delimiter', 'initial_pixel_digest', 'unclosed_pixel_digest', 'closed_pixel_digest',
                       'unclosed_expected', 'unclosed_actual', 'closed_expected', 'closed_actual')
-        _require_image_ref(step, 'initial_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_initial_closed.png')
-        _require_image_ref(step, 'unclosed_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png')
-        _require_image_ref(step, 'closed_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png')
+        initial = f'inline_syntax_boundary/delimiter_toggle_{kind}_initial_closed.png'
+        unclosed = f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png'
+        closed = f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png'
+        _require_image_ref(step, 'initial_screenshot', initial)
+        _require_image_ref(step, 'unclosed_screenshot', unclosed)
+        _require_image_ref(step, 'closed_screenshot', closed)
         if step['delimiter'] != delimiter:
             raise ValueError('delimiter kind/evidence mismatch')
         expected_unclosed, expected_closed = _delimiter_states(delimiter)
@@ -271,15 +280,20 @@ def _validate_inline_evidence(steps):
             raise ValueError('delimiter-unclosed evidence mismatch')
         if step['closed_expected'] != expected_closed or step['closed_actual'] != expected_closed:
             raise ValueError('delimiter-closed evidence mismatch')
+        body_images = (
+            initial.removesuffix('.png') + '.body.png',
+            unclosed.removesuffix('.png') + '.body.png',
+            closed.removesuffix('.png') + '.body.png',
+        )
         digests = (step['initial_pixel_digest'], step['unclosed_pixel_digest'], step['closed_pixel_digest'])
         if any(not re.fullmatch('[0-9a-f]{64}', digest) for digest in digests):
-            raise ValueError('delimiter pixel-digest evidence invalid')
+            raise ValueError('delimiter body-digest evidence invalid')
+        artifact_digests = tuple(_artifact_sha256(evidence_dir, image) for image in body_images)
+        if digests != artifact_digests:
+            raise ValueError('delimiter body digest does not match artifact')
         if step.get('visual_transition_observed') is not True or step.get('closed_visual_restored') is not True:
             raise ValueError('delimiter visual transition evidence missing')
-        if (
-            step['initial_pixel_digest'] != step['closed_pixel_digest']
-            or step['unclosed_pixel_digest'] == step['closed_pixel_digest']
-        ):
+        if digests[0] != digests[2] or digests[1] == digests[2]:
             raise ValueError('delimiter visual transition evidence mismatch')
 
 
@@ -298,7 +312,6 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     target = raw.get('target', {})
     if (target.get('actual_sha') != request['sha'] or target.get('expected_sha') != request['sha']
             or target.get('sha_matches') is not True or target.get('working_copy_clean') is not True):
-        # A genuine preflight failure is a blocked result, never a pass.
         if raw.get('overall_result') != 'blocked':
             raise ValueError('target identity or clean-checkout mismatch')
     started, finished = parse_time(raw['started_at']), parse_time(raw['finished_at'])
@@ -340,11 +353,9 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                     if sum(s.get('name') == name for s in steps) != 2:
                         raise ValueError('reopen lifecycle incomplete')
             if scenario['name'] == 'inline_syntax_boundary':
-                _validate_inline_evidence(steps)
+                _validate_inline_evidence(steps, evidence_dir)
         for relative in REQUIRED_IMAGES:
-            image = Path(evidence_dir) / relative
-            if image.is_symlink() or not image.is_file() or image.stat().st_size < 100:
-                raise ValueError('required screenshot missing')
+            _artifact_sha256(evidence_dir, relative)
     return outcome
 
 
