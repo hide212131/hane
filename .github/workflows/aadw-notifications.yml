@@ -59,3 +59,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/aadw_workflow_completion_reconcile.py
+
+      - name: Close Copilot fallback lifecycle after workflow completion
+        if: ${{ always() && github.event_name == 'workflow_run' && github.event.workflow_run.name == 'Codex limit Copilot review fallback' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_fallback_completion_reconcile.py
