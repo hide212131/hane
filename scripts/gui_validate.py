@@ -436,7 +436,9 @@ class RealEnvironment(Environment):
         if config.capture_cmd is not None:
             args = [*config.capture_cmd, window_id, str(image_path)]
         else:
-            args = ["screencapture", "-x", "-l", window_id, str(image_path)]
+            # Exclude the macOS window shadow so screenshot coordinates map to
+            # kCGWindowBounds used by the hosted OS-input helper.
+            args = ["screencapture", "-x", "-o", "-l", window_id, str(image_path)]
         try:
             out = subprocess.run(
                 args, capture_output=True, text=True, timeout=config.capture_timeout_seconds
