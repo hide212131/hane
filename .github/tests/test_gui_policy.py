@@ -23,33 +23,90 @@ NOW = datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc)
 
 def _inline_evidence(steps):
     by_name = {step['name']: step for step in steps}
-    boundary = (
-        'boundary_click_edit_bold_italic_check_0',
-        'boundary_click_edit_bold_italic_check_1',
-        'boundary_click_edit_code_span_check_0',
-        'boundary_click_edit_code_span_check_1',
-        'boundary_click_edit_quote_check_0',
-        'boundary_click_edit_list_check_0',
-        'boundary_ime_input_check',
-    )
-    for name in boundary:
+    boundary = {
+        'boundary_click_edit_bold_italic_check_0': (
+            'inline_syntax_boundary/boundary_click_edit_bold_italic_0.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**Zbold', 1),
+        ),
+        'boundary_click_edit_bold_italic_check_1': (
+            'inline_syntax_boundary/boundary_click_edit_bold_italic_1.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('combo**', 'comboZ**', 1),
+        ),
+        'boundary_click_edit_code_span_check_0': (
+            'inline_syntax_boundary/boundary_click_edit_code_span_0.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('`code', '`Zcode', 1),
+        ),
+        'boundary_click_edit_code_span_check_1': (
+            'inline_syntax_boundary/boundary_click_edit_code_span_1.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('span`', 'spanZ`', 1),
+        ),
+        'boundary_click_edit_quote_check_0': (
+            'inline_syntax_boundary/boundary_click_edit_quote_0.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('quote with **bold', 'quote with **Zbold', 1),
+        ),
+        'boundary_click_edit_list_check_0': (
+            'inline_syntax_boundary/boundary_click_edit_list_0.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('item with *italic', 'item with *Zitalic', 1),
+        ),
+        'boundary_ime_input_check': (
+            'inline_syntax_boundary/boundary_ime_input.png',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
+        ),
+    }
+    for name, (screenshot, inserted) in boundary.items():
         by_name[name].update(
-            screenshot=f'inline_syntax_boundary/{name}.png',
-            expected_after_insert='after insert', actual_after_insert='after insert',
-            expected_after_undo='baseline', actual_after_undo='baseline',
+            screenshot=screenshot,
+            expected_after_insert=inserted, actual_after_insert=inserted,
+            expected_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
+            actual_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
         )
+
+    navigation = {
+        'boundary_caret_navigation_check_0': (
+            'inline_syntax_boundary/boundary_caret_navigation_0.png',
+            'left_across_open_marker', 'left',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '*N*bold', 1),
+        ),
+        'boundary_caret_navigation_check_1': (
+            'inline_syntax_boundary/boundary_caret_navigation_1.png',
+            'right_into_visible_text', 'right',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**bNold', 1),
+        ),
+        'boundary_caret_navigation_check_2': (
+            'inline_syntax_boundary/boundary_caret_navigation_2.png',
+            'up_from_multiline_code_close', 'up',
+            policy.INLINE_FIXTURE_ORIGINAL.replace('this inline `code', 'thisN inline `code', 1),
+        ),
+    }
+    for name, (screenshot, case, direction, inserted) in navigation.items():
+        by_name[name].update(
+            screenshot=screenshot, case=case, direction=direction, count=1,
+            expected_after_move_insert=inserted, actual_after_move_insert=inserted,
+            expected_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
+            actual_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
+        )
+
+    deleted = policy.INLINE_FIXTURE_ORIGINAL.replace('old *italic* com', '', 1)
     by_name['drag_select_delete_undo_redo_check'].update(
         screenshot='inline_syntax_boundary/drag_select_state0.png',
-        deleted_expected='deleted', deleted_actual='deleted',
-        undo_actual='baseline', redo_actual='deleted', restored_actual='baseline',
+        deleted_expected=deleted, deleted_actual=deleted,
+        undo_actual=policy.INLINE_FIXTURE_ORIGINAL, redo_actual=deleted,
+        restored_actual=policy.INLINE_FIXTURE_ORIGINAL,
     )
     for kind, delimiter in (('star', '*'), ('bold', '**'), ('code', '`')):
+        unclosed, closed = policy._delimiter_states(delimiter)
         by_name[f'delimiter_toggle_{kind}_check'].update(
+            initial_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_initial_closed.png',
             unclosed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png',
             closed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png',
             delimiter=delimiter,
-            unclosed_expected='unclosed', unclosed_actual='unclosed',
-            closed_expected='closed', closed_actual='closed',
+            initial_pixel_digest='1' * 64,
+            unclosed_pixel_digest='2' * 64,
+            closed_pixel_digest='1' * 64,
+            visual_transition_observed=True,
+            closed_visual_restored=True,
+            unclosed_expected=unclosed, unclosed_actual=unclosed,
+            closed_expected=closed, closed_actual=closed,
         )
 
 
@@ -86,6 +143,10 @@ class ReceiptTests(unittest.TestCase):
 
     def validate(self, raw, conclusion='success'):
         return policy.validate_receipt(raw, REQUEST, self.evidence, conclusion, NOW)
+
+    def inline_step(self, raw, name):
+        inline = next(s for s in raw['scenarios'] if s['name'] == 'inline_syntax_boundary')
+        return next(s for s in inline['steps'] if s['name'] == name)
 
     def test_all_three_terminal_results_are_preserved_for_final_judge(self):
         for result in ('pass', 'fail', 'blocked'):
@@ -153,9 +214,51 @@ class ReceiptTests(unittest.TestCase):
 
     def test_inline_operation_evidence_is_fail_closed(self):
         raw = passing_result()
+        self.inline_step(raw, 'boundary_ime_input_check').pop('actual_after_insert')
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_inline_screenshot_refs_are_bound_to_required_images(self):
+        raw = passing_result()
+        self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')['screenshot'] = (
+            'inline_syntax_boundary/boundary_click_edit_bold_italic_check_0.png'
+        )
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_caret_navigation_evidence_is_fail_closed(self):
+        for field, value in [('direction', 'right'), ('count', 2),
+                             ('actual_after_move_insert', 'wrong source position')]:
+            raw = passing_result()
+            self.inline_step(raw, 'boundary_caret_navigation_check_0')[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_delimiter_kind_and_visual_transition_are_fail_closed(self):
+        mutations = [
+            ('delimiter', '*'),
+            ('initial_pixel_digest', '3' * 64),
+            ('unclosed_pixel_digest', '1' * 64),
+            ('visual_transition_observed', False),
+            ('closed_visual_restored', False),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            self.inline_step(raw, 'delimiter_toggle_bold_check')[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_delimiter_screenshot_refs_are_bound_to_state(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'delimiter_toggle_code_check')
+        step['closed_screenshot'] = step['unclosed_screenshot']
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_duplicate_inline_evidence_step_cannot_pass(self):
+        raw = passing_result()
         inline = next(s for s in raw['scenarios'] if s['name'] == 'inline_syntax_boundary')
-        check = next(s for s in inline['steps'] if s['name'] == 'boundary_ime_input_check')
-        check.pop('actual_after_insert')
+        inline['steps'].append(deepcopy(self.inline_step(raw, 'boundary_ime_input_check')))
         with self.assertRaises(ValueError):
             self.validate(raw)
 
@@ -208,8 +311,8 @@ class RequirementAndReviewTests(unittest.TestCase):
     def test_inline_syntax_boundary_required_steps_cover_representative_constructs(self):
         steps = policy.REQUIRED_STEPS['inline_syntax_boundary']
         for required in ('boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
-                         'boundary_click_edit_quote', 'boundary_click_edit_list', 'boundary_ime_input',
-                         'drag_select_delete_undo_redo', 'delimiter_toggle_star',
+                         'boundary_click_edit_quote', 'boundary_click_edit_list', 'boundary_caret_navigation',
+                         'boundary_ime_input', 'drag_select_delete_undo_redo', 'delimiter_toggle_star',
                          'delimiter_toggle_bold', 'delimiter_toggle_code', 'reopen_content_check'):
             self.assertIn(required, steps)
         self.assertTrue(any(name.startswith('inline_syntax_boundary/') for name in policy.REQUIRED_IMAGES))
