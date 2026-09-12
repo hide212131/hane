@@ -49,8 +49,9 @@ SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
     "OSスクロール、および太字/斜体複合・複数行 inline code・quote・list における"
     "marker/本文境界へのクリック・caret移動・ドラッグ選択・区切り記号の追加削除の基本スモーク確認に"
-    "限定される。区切り記号の未閉鎖/再閉鎖では、caretを中立位置へ移して撮影した描画ピクセルの"
-    "digestが変化し、再閉鎖後に初期閉鎖状態へ戻ることも確認する。OCR は座標特定にのみ使用し、"
+    "限定される。区切り記号の未閉鎖/再閉鎖、および既存の複数行 code span 自体の閉じ backtick の"
+    "削除・再入力では、caretを中立位置へ移して撮影した描画ピクセルのdigestが変化し、"
+    "再閉鎖後に初期閉鎖状態へ戻ることも確認する。OCR は座標特定にのみ使用し、"
     "bold/italic等の意味的なstyle種別そのものはOCRでは判定しない。全フォーカス移動・ダイアログ表示等の"
     "網羅的な GUI 検証はまだ証明されていない。"
 )
@@ -883,6 +884,121 @@ def run_delimiter_toggle_step(module, env, config, swift_helper, process_holder,
     return steps
 
 
+def run_multiline_code_span_toggle_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                                        helper_timeout, poll_timeout) -> list[dict]:
+    name = "multiline_code_span_close_toggle"
+    pid = current_pid(process_holder)
+    if pid is None or window_id is None:
+        return [skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")]
+    steps: list[dict] = []
+    unclosed_expected = INLINE_FIXTURE_ORIGINAL.replace("span`", "span", 1)
+    closed_expected = INLINE_FIXTURE_ORIGINAL
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_initial_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
+    initial_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_initial_closed")
+    steps.append(initial_capture)
+    if initial_capture["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=initial_capture.get("reason")))
+        return steps
+    initial_image = run_dir / f"{name}_initial_closed.png"
+    initial_digest, digest_error = image_pixel_digest(swift_helper, initial_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"初期閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(initial_image), CODE_SPAN_CLOSE_OCR_RE, "end"], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"複数行 code span の閉じ backtick の位置決めに失敗した: {err}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["shift-select", str(pid), "right", "1"], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"閉じ backtick の選択に失敗した: {err}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["delete-selection-save", str(pid)], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"閉じ backtick の削除に失敗した: {err}"))
+        return steps
+    matched, actual = wait_for_fixture_bytes(config.fixture_path, unclosed_expected.encode("utf-8"), poll_timeout)
+    unclosed_actual = _decode(actual)
+    if not matched:
+        steps.append(make_step(name, "fail", reason="複数行 code span の閉じ backtick 削除後の内容が期待値と一致しない"))
+        return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_unclosed_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
+    unclosed_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_unclosed")
+    steps.append(unclosed_capture)
+    if unclosed_capture["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=f"未閉鎖状態の撮影に失敗した: {unclosed_capture.get('reason')}"))
+        return steps
+    unclosed_image = run_dir / f"{name}_unclosed.png"
+    unclosed_digest, digest_error = image_pixel_digest(swift_helper, unclosed_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"未閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(unclosed_image), CODE_SPAN_CLOSE_OCR_RE, "end"], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"再閉鎖位置の位置決めに失敗した: {err}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "`"], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"閉じ backtick の再入力に失敗した: {err}"))
+        return steps
+    matched, actual = wait_for_fixture_bytes(config.fixture_path, closed_expected.encode("utf-8"), poll_timeout)
+    closed_actual = _decode(actual)
+    if not matched:
+        steps.append(make_step(name, "fail", reason="閉じ backtick 再入力後の内容が期待値と一致しない"))
+        return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_closed_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
+    closed_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_closed")
+    steps.append(closed_capture)
+    if closed_capture["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=f"再閉鎖状態の撮影に失敗した: {closed_capture.get('reason')}"))
+        return steps
+    closed_image = run_dir / f"{name}_closed.png"
+    closed_digest, digest_error = image_pixel_digest(swift_helper, closed_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"再閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
+    visual_transition = unclosed_digest != closed_digest
+    visual_restored = initial_digest == closed_digest
+    if not visual_transition or not visual_restored:
+        reason = (
+            "複数行 code span の未閉鎖/再閉鎖で描画ピクセルが変化しない"
+            if not visual_transition else "複数行 code span の再閉鎖後の描画が初期閉鎖状態へ戻らない"
+        )
+        steps.append(make_step(
+            f"{name}_check", "fail", reason=reason,
+            initial_screenshot=str(initial_image), unclosed_screenshot=str(unclosed_image), closed_screenshot=str(closed_image),
+            initial_pixel_digest=initial_digest, unclosed_pixel_digest=unclosed_digest, closed_pixel_digest=closed_digest,
+            visual_transition_observed=visual_transition, closed_visual_restored=visual_restored,
+            unclosed_expected=unclosed_expected, unclosed_actual=unclosed_actual,
+            closed_expected=closed_expected, closed_actual=closed_actual,
+        ))
+        steps.append(make_step(name, "fail", reason=reason))
+        return steps
+    steps.append(make_step(
+        f"{name}_check", "pass",
+        initial_screenshot=str(initial_image), unclosed_screenshot=str(unclosed_image), closed_screenshot=str(closed_image),
+        initial_pixel_digest=initial_digest, unclosed_pixel_digest=unclosed_digest, closed_pixel_digest=closed_digest,
+        visual_transition_observed=True, closed_visual_restored=True,
+        unclosed_expected=unclosed_expected, unclosed_actual=unclosed_actual,
+        closed_expected=closed_expected, closed_actual=closed_actual,
+    ))
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_reset")
+    steps.append(reset)
+    steps.append(make_step(name, "pass" if reset["result"] == "pass" else "blocked", reason=reset.get("reason")))
+    return steps
+
+
 def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_dir, binary_path,
                                expected_sha, request_id, startup_timeout, window_timeout,
                                helper_timeout, poll_timeout, priority) -> dict:
@@ -924,6 +1040,8 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
         for kind, delimiter in (("star", "*"), ("bold", "**"), ("code", "`")):
             steps.extend(run_delimiter_toggle_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
                                                    kind, delimiter, helper_timeout, poll_timeout))
+        steps.extend(run_multiline_code_span_toggle_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                                                         helper_timeout, poll_timeout))
         if window_id is not None:
             steps.append(capture_named(module, env, config, window_id, run_dir, "after"))
     finally:

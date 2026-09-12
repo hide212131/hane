@@ -53,6 +53,9 @@ REQUIRED_STEPS = {
         'delimiter_toggle_code', 'capture_delimiter_toggle_code_initial_closed',
         'capture_delimiter_toggle_code_unclosed', 'capture_delimiter_toggle_code_closed',
         'delimiter_toggle_code_check',
+        'multiline_code_span_close_toggle', 'capture_multiline_code_span_close_toggle_initial_closed',
+        'capture_multiline_code_span_close_toggle_unclosed', 'capture_multiline_code_span_close_toggle_closed',
+        'multiline_code_span_close_toggle_check',
         'capture_after', 'cleanup',
         'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
         'visible_saved_text', 'reopen_content_check', 'cleanup_reopen',
@@ -95,6 +98,12 @@ REQUIRED_IMAGES = [
     'inline_syntax_boundary/delimiter_toggle_code_unclosed.body.png',
     'inline_syntax_boundary/delimiter_toggle_code_closed.png',
     'inline_syntax_boundary/delimiter_toggle_code_closed.body.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_initial_closed.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_initial_closed.body.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_unclosed.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_unclosed.body.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_closed.png',
+    'inline_syntax_boundary/multiline_code_span_close_toggle_closed.body.png',
 ]
 
 
@@ -295,6 +304,36 @@ def _validate_inline_evidence(steps, evidence_dir):
             raise ValueError('delimiter visual transition evidence missing')
         if digests[0] != digests[2] or digests[1] == digests[2]:
             raise ValueError('delimiter visual transition evidence mismatch')
+
+    span_step = by_name['multiline_code_span_close_toggle_check']
+    _require_text(span_step, 'initial_pixel_digest', 'unclosed_pixel_digest', 'closed_pixel_digest',
+                  'unclosed_expected', 'unclosed_actual', 'closed_expected', 'closed_actual')
+    span_initial = 'inline_syntax_boundary/multiline_code_span_close_toggle_initial_closed.png'
+    span_unclosed = 'inline_syntax_boundary/multiline_code_span_close_toggle_unclosed.png'
+    span_closed = 'inline_syntax_boundary/multiline_code_span_close_toggle_closed.png'
+    _require_image_ref(span_step, 'initial_screenshot', span_initial)
+    _require_image_ref(span_step, 'unclosed_screenshot', span_unclosed)
+    _require_image_ref(span_step, 'closed_screenshot', span_closed)
+    span_unclosed_expected = INLINE_FIXTURE_ORIGINAL.replace('span`', 'span', 1)
+    if span_step['unclosed_expected'] != span_unclosed_expected or span_step['unclosed_actual'] != span_unclosed_expected:
+        raise ValueError('multiline code span unclosed evidence mismatch')
+    if span_step['closed_expected'] != INLINE_FIXTURE_ORIGINAL or span_step['closed_actual'] != INLINE_FIXTURE_ORIGINAL:
+        raise ValueError('multiline code span closed evidence mismatch')
+    span_body_images = (
+        span_initial.removesuffix('.png') + '.body.png',
+        span_unclosed.removesuffix('.png') + '.body.png',
+        span_closed.removesuffix('.png') + '.body.png',
+    )
+    span_digests = (span_step['initial_pixel_digest'], span_step['unclosed_pixel_digest'], span_step['closed_pixel_digest'])
+    if any(not re.fullmatch('[0-9a-f]{64}', digest) for digest in span_digests):
+        raise ValueError('multiline code span body-digest evidence invalid')
+    span_artifact_digests = tuple(_artifact_sha256(evidence_dir, image) for image in span_body_images)
+    if span_digests != span_artifact_digests:
+        raise ValueError('multiline code span body digest does not match artifact')
+    if span_step.get('visual_transition_observed') is not True or span_step.get('closed_visual_restored') is not True:
+        raise ValueError('multiline code span visual transition evidence missing')
+    if span_digests[0] != span_digests[2] or span_digests[1] == span_digests[2]:
+        raise ValueError('multiline code span visual transition evidence mismatch')
 
 
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):

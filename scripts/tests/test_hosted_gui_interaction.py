@@ -1,5 +1,6 @@
 """Helper provenance checks without touching a screen or invoking Swift."""
 import hashlib
+import inspect
 from pathlib import Path
 import re
 import subprocess
@@ -131,6 +132,21 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
     def test_unknown_delimiter_is_rejected(self):
         with self.assertRaises(ValueError):
             interaction.delimiter_states('~~~')
+
+    def test_multiline_code_span_close_toggle_targets_the_shared_parse_span(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        self.assertIn('`code\nspan`', text)
+        closing_at = re.search(interaction.CODE_SPAN_CLOSE_RE, text).start()
+        unclosed = text[:closing_at] + text[closing_at + 1:]
+        self.assertEqual(unclosed, text.replace('span`', 'span', 1))
+        source = inspect.getsource(interaction.run_multiline_code_span_toggle_step)
+        self.assertIn("INLINE_FIXTURE_ORIGINAL.replace(\"span`\", \"span\", 1)", source)
+        self.assertIn('CODE_SPAN_CLOSE_OCR_RE', source)
+        self.assertIn('image_pixel_digest', source)
+
+    def test_inline_syntax_scenario_exercises_the_existing_multiline_code_span(self):
+        source = inspect.getsource(interaction.run_inline_syntax_scenario)
+        self.assertIn('run_multiline_code_span_toggle_step(', source)
 
 
 if __name__ == '__main__':

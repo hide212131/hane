@@ -115,6 +115,20 @@ def _inline_evidence(steps):
             closed_expected=closed, closed_actual=closed,
         )
 
+    span_unclosed = policy.INLINE_FIXTURE_ORIGINAL.replace('span`', 'span', 1)
+    by_name['multiline_code_span_close_toggle_check'].update(
+        initial_screenshot='inline_syntax_boundary/multiline_code_span_close_toggle_initial_closed.png',
+        unclosed_screenshot='inline_syntax_boundary/multiline_code_span_close_toggle_unclosed.png',
+        closed_screenshot='inline_syntax_boundary/multiline_code_span_close_toggle_closed.png',
+        initial_pixel_digest=BODY_CLOSED_SHA,
+        unclosed_pixel_digest=BODY_UNCLOSED_SHA,
+        closed_pixel_digest=BODY_CLOSED_SHA,
+        visual_transition_observed=True,
+        closed_visual_restored=True,
+        unclosed_expected=span_unclosed, unclosed_actual=span_unclosed,
+        closed_expected=policy.INLINE_FIXTURE_ORIGINAL, closed_actual=policy.INLINE_FIXTURE_ORIGINAL,
+    )
+
 
 def passing_result():
     scenarios = []
@@ -278,6 +292,28 @@ class ReceiptTests(unittest.TestCase):
         raw = passing_result()
         step = self.inline_step(raw, 'delimiter_toggle_code_check')
         step['closed_screenshot'] = step['unclosed_screenshot']
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_multiline_code_span_toggle_visual_transition_is_fail_closed(self):
+        mutations = [
+            ('initial_pixel_digest', '3' * 64),
+            ('unclosed_pixel_digest', BODY_CLOSED_SHA),
+            ('visual_transition_observed', False),
+            ('closed_visual_restored', False),
+            ('unclosed_actual', policy.INLINE_FIXTURE_ORIGINAL),
+            ('closed_actual', policy.INLINE_FIXTURE_ORIGINAL.replace('span`', 'span', 1)),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            self.inline_step(raw, 'multiline_code_span_close_toggle_check')[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_multiline_code_span_toggle_digest_must_match_staged_body_image(self):
+        raw = passing_result()
+        path = self.evidence / 'inline_syntax_boundary/multiline_code_span_close_toggle_unclosed.body.png'
+        path.write_bytes(BODY_CLOSED_IMAGE)
         with self.assertRaises(ValueError):
             self.validate(raw)
 
