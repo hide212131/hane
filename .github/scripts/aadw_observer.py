@@ -143,7 +143,7 @@ def status_outcome(context, state, description):
     if context == 'hane/gui-validation':
         match = re.search(r'\bGUI (pending|pass|fail|blocked|superseded)\b', description)
         value = match.group(1) if match else ''
-        return (('success', f'検証結果: {value}') if value in ('pass', 'fail')
+        return (('success', f'検証結果: {value}') if value in ('pass', 'fail', 'blocked')
                 else ('failure', f'GUI validationを正常に完了できませんでした{f"（{value}）" if value else ""}。'))
     if context == 'hane/final-judge':
         match = re.search(r'\bFinal (pending|ready|merged|fix|blocked)\b', description)

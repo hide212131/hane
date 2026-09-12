@@ -81,11 +81,12 @@ class Tests(unittest.TestCase):
             'Copilot routing stale for aaaaaaaaaaaa'), '900', '1')
         self.assertIn('異常終了', f.comments[42][0]['body'])
 
-    def test_blocked_gui_is_abnormal_completion(self):
+    def test_blocked_gui_is_normal_completion(self):
         f = Fake()
         observer.handle_status(f.call, REPO, f.status(1, 'hane/gui-validation', 'error',
             'GUI blocked v1 aaaaaaaaaaaa g111-2'), '900', '1')
-        self.assertIn('異常終了', f.comments[42][0]['body'])
+        self.assertIn('正常終了', f.comments[42][0]['body'])
+        self.assertIn('検証結果: blocked', f.comments[42][0]['body'])
 
     def test_untrusted_status_is_ignored(self):
         f = Fake(); event = f.status(1, 'hane/codex-review', 'pending', 'x')
