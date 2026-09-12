@@ -31,7 +31,6 @@ class FakeGitHub:
             raise RuntimeError('comment not found')
         if '/comments?' in endpoint:
             return list(self.comments)
-        # Plain create.
         comment = {'id': self.next_id, 'user': {'login': 'github-actions[bot]'}, 'body': payload['body']}
         self.next_id += 1
         self.comments.append(comment)
@@ -75,6 +74,18 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(result['action'], 'create')
         self.assertIn('異常終了', gh.comments[0]['body'])
 
+    def test_terminal_state_is_not_downgraded_to_start(self):
+        for terminal in ('success', 'failure'):
+            with self.subTest(terminal=terminal):
+                gh = FakeGitHub()
+                call_notify(gh, 'start', process='codex-review', kind='pr', number=42, sha=SHA)
+                call_notify(gh, terminal, process='codex-review', kind='pr', number=42, sha=SHA)
+                terminal_body = gh.comments[0]['body']
+                result = call_notify(gh, 'start', process='codex-review', kind='pr', number=42, sha=SHA)
+                self.assertEqual(result['action'], 'noop')
+                self.assertEqual(gh.comments[0]['body'], terminal_body)
+                self.assertNotIn('— 処理開始', gh.comments[0]['body'])
+
     def test_retry_new_attempt_does_not_overwrite_previous_run(self):
         gh = FakeGitHub()
         notifier.notify(gh.call, state='start', process='claude-fix', kind='pr', number=9, sha=SHA,
@@ -95,7 +106,7 @@ class NotifyTests(unittest.TestCase):
         call_notify(gh, 'start', process='implement', kind='issue', number=130, sha='none')
         call_notify(gh, 'start', process='implement', kind='issue', number=130, sha='none')
         self.assertEqual(len(gh.comments), 1)
-        self.assertEqual(gh.calls[-1][2], None)  # second call was a no-op GET only, no write.
+        self.assertEqual(gh.calls[-1][2], None)
 
     def test_reprocessing_same_terminal_event_does_not_duplicate_patch_noise(self):
         gh = FakeGitHub()
@@ -104,7 +115,7 @@ class NotifyTests(unittest.TestCase):
         writes_before = len([c for c in gh.calls if c[2] == 'PATCH'])
         call_notify(gh, 'success', process='implement', kind='issue', number=130, sha='none', detail='done')
         writes_after = len([c for c in gh.calls if c[2] == 'PATCH'])
-        self.assertEqual(writes_before, writes_after)  # identical body: no redundant PATCH.
+        self.assertEqual(writes_before, writes_after)
         self.assertEqual(len(gh.comments), 1)
 
     def test_unknown_process_is_rejected(self):
