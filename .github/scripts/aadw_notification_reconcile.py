@@ -55,50 +55,89 @@ def parse_time(value):
         return None
 
 
-def run_identity(status, fallback_id, seen):
+def status_identity(status):
+    """Return explicit (run, attempt) evidence without inventing an attempt."""
     description = status.get("description") or ""
     gui = _GUI_GENERATION.search(description)
     if gui:
         return gui.group(1), gui.group(2)
     match = _ACTION_RUN.search(status.get("target_url") or "")
     if match:
-        run_id = match.group(1)
-        if match.group(2):
-            return run_id, match.group(2)
-        seen[run_id] = seen.get(run_id, 0) + 1
-        return run_id, str(seen[run_id])
-    return str(fallback_id), "1"
+        return match.group(1), match.group(2)
+    return None, None
+
+
+def next_attempt(seen, run_id):
+    seen[run_id] = seen.get(run_id, 0) + 1
+    return str(seen[run_id])
+
+
+def remember_attempt(seen, run_id, attempt):
+    try:
+        seen[run_id] = max(seen.get(run_id, 0), int(attempt))
+    except (TypeError, ValueError):
+        pass
 
 
 def build_generations(statuses):
-    """Group one context's append-only status history into process runs."""
+    """Group one context's append-only status history into process runs.
+
+    A pending status opens a generation. A terminal status whose URL omits the
+    attempt number is attached to the currently open generation when the run id
+    matches. This is important because GitHub status target URLs commonly point
+    at /actions/runs/<id> for both pending and terminal writes.
+    """
     generations = []
     current = None
     seen_runs = {}
     for row in sorted(statuses, key=lambda item: item.get("id", 0)):
         state = row.get("state", "")
-        row_run, row_attempt = run_identity(row, row.get("id"), seen_runs)
+        explicit_run, explicit_attempt = status_identity(row)
+
         if state == "pending":
+            if explicit_run is None:
+                run_id, attempt = str(row.get("id")), "1"
+            else:
+                run_id = explicit_run
+                if explicit_attempt is None:
+                    attempt = next_attempt(seen_runs, run_id)
+                else:
+                    attempt = explicit_attempt
+                    remember_attempt(seen_runs, run_id, attempt)
             current = {
                 "generation_id": row.get("id"),
                 "start": row,
                 "latest": row,
-                "run_id": row_run,
-                "attempt": row_attempt,
+                "run_id": run_id,
+                "attempt": attempt,
             }
             generations.append(current)
             continue
-        if current is None or row_run != current["run_id"] or row_attempt != current["attempt"]:
-            current = {
-                "generation_id": row.get("id"),
-                "start": None,
-                "latest": row,
-                "run_id": row_run,
-                "attempt": row_attempt,
-            }
-            generations.append(current)
+
+        if current is not None:
+            same_run = explicit_run is None or explicit_run == current["run_id"]
+            same_attempt = explicit_attempt is None or explicit_attempt == current["attempt"]
+            if same_run and same_attempt:
+                current["latest"] = row
+                continue
+
+        if explicit_run is None:
+            run_id, attempt = str(row.get("id")), "1"
         else:
-            current["latest"] = row
+            run_id = explicit_run
+            if explicit_attempt is None:
+                attempt = next_attempt(seen_runs, run_id)
+            else:
+                attempt = explicit_attempt
+                remember_attempt(seen_runs, run_id, attempt)
+        current = {
+            "generation_id": row.get("id"),
+            "start": None,
+            "latest": row,
+            "run_id": run_id,
+            "attempt": attempt,
+        }
+        generations.append(current)
     return generations
 
 
