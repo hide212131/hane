@@ -63,6 +63,15 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
             with self.subTest(pattern=pattern, edge=edge):
                 self.assertEqual(interaction.insert_at_match(text, pattern, 'Z', edge=edge), expected)
 
+    def test_boundary_ime_expected_bytes_use_the_same_hidden_marker_boundary(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        expected = text.replace('**bold', '**日本語bold', 1)
+        self.assertEqual(
+            interaction.insert_at_match(text, interaction.BOLD_ITALIC_OPEN_RE,
+                                        interaction.IME_EXPECTED_TEXT, edge='end'),
+            expected,
+        )
+
     def test_unmatched_pattern_is_rejected_rather_than_silently_skipped(self):
         with self.assertRaises(ValueError):
             interaction.insert_at_match(interaction.INLINE_FIXTURE_ORIGINAL, r'not-present', 'Z', edge='end')
@@ -104,11 +113,19 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
         self.assertIn('*italic*', text[bold_italic_pos:text.index('\n', bold_italic_pos)])
         self.assertIn('quote with', text[:quote_pos].rsplit('\n', 1)[-1])
 
-    def test_delimiter_selection_anchors_are_visible_and_restore_exact_bytes(self):
-        unclosed = interaction.INLINE_FIXTURE_ORIGINAL + ' *loose'
-        closed = unclosed + '* tail'
-        rendered = 'loose tail'
-        self.assertIsNotNone(re.search(interaction.DELIMITER_SELECT_START_OCR_RE, rendered))
-        self.assertIsNotNone(re.search(interaction.DELIMITER_SELECT_END_OCR_RE, rendered))
-        partially_unclosed = interaction.INLINE_FIXTURE_ORIGINAL + ' *l'
-        self.assertEqual(partially_unclosed + 'oose* tail', closed)
+    def test_each_required_delimiter_has_closed_and_unclosed_exact_bytes(self):
+        for delimiter in ('*', '**', '`'):
+            with self.subTest(delimiter=delimiter):
+                unclosed, closed = interaction.delimiter_states(delimiter)
+                self.assertEqual(unclosed, interaction.INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail')
+                self.assertEqual(closed, interaction.INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail')
+                closing_at = closed.rindex(delimiter, len(interaction.INLINE_FIXTURE_ORIGINAL))
+                self.assertEqual(closed[:closing_at] + closed[closing_at + len(delimiter):], unclosed)
+
+    def test_unknown_delimiter_is_rejected(self):
+        with self.assertRaises(ValueError):
+            interaction.delimiter_states('~~~')
+
+
+if __name__ == '__main__':
+    unittest.main()
