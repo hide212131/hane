@@ -171,6 +171,11 @@ class FakeAPI:
         return path
 
     def api(self, path, body=None, method=None):
+        # AADW notify comments share GitHub's generic /issues/.../comments
+        # endpoint; keep them out of self.merges, which only tracks the
+        # actual pulls/.../merge PUT call this fake was built to assert on.
+        if '/issues/' in path and 'comments' in path:
+            return [] if '?' in path else {'id': 1}
         self.merges.append((path, body, method))
         return {'merged': True, 'sha': 'c' * 40}
 
@@ -206,14 +211,26 @@ class EffectTests(unittest.TestCase):
     def test_refused_or_uncertain_merge_is_blocked_without_repeating_judge(self):
         for response in ({'merged': False, 'message': 'branch protection refused'}, ValueError('network failure')):
             api, data = FakeAPI(), ready()
-            options = {'side_effect': response} if isinstance(response, Exception) else {'return_value': response}
+            merge_calls = []
+            # AADW notify comments share api.api() too; only count the actual
+            # pulls/1/merge attempt, and let everything else (including
+            # notify) reach the real FakeAPI behavior.
+            original = api.api
+
+            def fake_api(path, body=None, method=None, _original=original):
+                if path == 'pulls/1/merge':
+                    merge_calls.append((path, body, method))
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+                return _original(path, body, method)
             with self.subTest(response=response), patch.object(controller, 'snapshot', return_value=data), \
                     patch.object(controller, 'judge', return_value={'decision': 'ready', 'reason': 'passed'}) as judge, \
-                    patch.object(api, 'api', **options) as merge:
+                    patch.object(api, 'api', side_effect=fake_api):
                 controller.process(api, 1, self.directory)
                 controller.process(api, 1, self.directory)
             self.assertEqual(judge.call_count, 1)
-            self.assertEqual(merge.call_count, 1)
+            self.assertEqual(len(merge_calls), 1)
             self.assertEqual(api.writes[-1][2], 'error')
             proof = json.loads((self.directory / '1.json').read_text())
             self.assertEqual(proof['effect'], 'blocked')
