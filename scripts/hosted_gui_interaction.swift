@@ -200,17 +200,24 @@ func recognizeText(_ path: String) {
 }
 
 // Crop a fixed editor-body region from the screenshot, excluding the top 15%
-// where Hane renders the dynamic revision/frame header. The body crop is saved
-// as a PNG evidence artifact and its PNG-byte SHA-256 is printed. Receipt
-// validation recomputes this same digest from the staged crop artifact.
+// where Hane renders the dynamic revision/frame header. CGImage crop rectangles
+// use the image's top-left pixel origin, unlike Vision's normalized bottom-left
+// coordinates, so express this crop directly in CGImage pixel coordinates.
+// The body crop is saved as a PNG evidence artifact and its PNG-byte SHA-256 is
+// printed. Receipt validation recomputes this same digest from the staged crop.
 func imagePixelDigest(_ path: String) {
     guard let image = NSImage(contentsOfFile: path) else { fail("image could not be loaded: \(path)") }
     var proposed = CGRect(origin: .zero, size: image.size)
     guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
         fail("image has no CGImage: \(path)")
     }
-    let normalizedBody = CGRect(x: 0, y: 0, width: 1, height: 0.85)
-    let bodyRect = VNImageRectForNormalizedRect(normalizedBody, cgImage.width, cgImage.height).integral
+    let topInset = CGFloat(cgImage.height) * 0.15
+    let bodyRect = CGRect(
+        x: 0,
+        y: topInset,
+        width: CGFloat(cgImage.width),
+        height: CGFloat(cgImage.height) - topInset
+    ).integral
     guard let body = cgImage.cropping(to: bodyRect) else {
         fail("could not crop editor body: \(path)")
     }
