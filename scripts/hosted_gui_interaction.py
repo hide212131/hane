@@ -84,27 +84,33 @@ INLINE_FIXTURE_ORIGINAL = (
     "- list item with *italic* inside.\n"
 )
 
-# Each pattern uses just enough lookaround context to be unambiguous within
-# the whole fixture even though the literal marker glyphs ("**", "*", "`")
-# repeat across lines. The same patterns drive both the real OS-level click
-# (scripts/hosted_gui_interaction.swift, via OCR) and the expected saved-byte
-# computation below, so the two cannot silently drift apart.
+# Source patterns identify the hidden Markdown delimiters for expected-byte
+# computation. OCR patterns are deliberately separate and contain only text
+# that remains visible while the presentation layer hides those delimiters.
 BOLD_ITALIC_OPEN_RE = r"\*\*(?=bold \*italic)"
 BOLD_ITALIC_CLOSE_RE = r"(?<=combo)\*\*"
 CODE_SPAN_OPEN_RE = r"`(?=code)"
+CODE_SPAN_CLOSE_RE = r"(?<=span)`"
 QUOTE_BOLD_OPEN_RE = r"(?<=quote with )\*\*(?=bold)"
 LIST_ITALIC_OPEN_RE = r"(?<=item with )\*(?=italic)"
-DRAG_SELECT_START_RE = r"(?<=bold )\*(?=italic)"
-DRAG_SELECT_END_RE = r"(?<=italic)\*(?= combo)"
-DELIMITER_CLOSE_RE = r"(?<=loose)\*$"
+
+BOLD_ITALIC_OCR_RE = r"bold italic combo"
+CODE_SPAN_OPEN_OCR_RE = r"code"
+CODE_SPAN_CLOSE_OCR_RE = r"span"
+QUOTE_BOLD_OPEN_OCR_RE = r"bold(?= inside)"
+LIST_ITALIC_OPEN_OCR_RE = r"italic(?= inside)"
+DRAG_SELECT_START_OCR_RE = r"(?<=b)old(?= italic combo)"
+DRAG_SELECT_END_OCR_RE = r"com(?=bo boundary)"
+DELIMITER_SELECT_START_OCR_RE = r"(?<=l)oose"
+DELIMITER_SELECT_END_OCR_RE = r"tail"
 BOUNDARY_MARK = "Z"
 
 
 def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
     """Compute the expected byte content after clicking pattern's edge and typing.
 
-    Mirrors clickText/typeSave in the swift helper: `edge='end'` inserts right
-    after the matched marker, `edge='start'` inserts right before it.
+    `pattern` is a source-text pattern. `edge='end'` inserts immediately after
+    the match and `edge='start'` immediately before it.
     """
     match = re.search(pattern, text)
     if not match:
@@ -528,16 +534,21 @@ def run_scroll_scenario(module, env, target_dir, swift_helper, base_run_dir, bin
 
 
 def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseline,
-                         pattern, edge, insertion, helper_timeout, poll_timeout):
-    """Click an OCR-located marker/content boundary, type, save, verify the
-    exact expected bytes, then undo+save and verify the document reverted."""
-    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot_path), pattern, edge], helper_timeout)
+                         ocr_pattern, ocr_edge, source_pattern, source_edge, insertion,
+                         helper_timeout, poll_timeout):
+    """Click a visible-text OCR anchor, edit a hidden marker/body boundary,
+    verify exact source bytes, then undo+save and verify the original bytes."""
+    ok, _out, err = run_helper(
+        swift_helper,
+        ["click-text", str(pid), str(screenshot_path), ocr_pattern, ocr_edge],
+        helper_timeout,
+    )
     if not ok:
         return False, f"境界へのクリックに失敗した: {err}"
     ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), insertion], helper_timeout)
     if not ok:
         return False, f"境界への入力に失敗した: {err}"
-    expected = insert_at_match(baseline, pattern, insertion, edge=edge)
+    expected = insert_at_match(baseline, source_pattern, insertion, edge=source_edge)
     matched, actual = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
     if not matched:
         return False, f"境界クリック挿入後の内容が期待値と一致しない: actual={actual.decode('utf-8', errors='replace')!r}"
@@ -555,14 +566,15 @@ def run_boundary_step(module, env, config, swift_helper, process_holder, window_
     pid = current_pid(process_holder)
     if pid is None or window_id is None:
         return skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")
-    for index, (pattern, edge) in enumerate(checks):
+    for index, (ocr_pattern, ocr_edge, source_pattern, source_edge) in enumerate(checks):
         capture_step = capture_named(module, env, config, window_id, run_dir, f"{name}_{index}")
         if capture_step["result"] != "pass":
             return make_step(name, "blocked", reason=f"境界確認用の撮影に失敗した: {capture_step.get('reason')}")
         screenshot = run_dir / f"{name}_{index}.png"
         ok, reason = boundary_edit_check(
             swift_helper, screenshot, pid, config.fixture_path, INLINE_FIXTURE_ORIGINAL,
-            pattern, edge, BOUNDARY_MARK, helper_timeout, poll_timeout,
+            ocr_pattern, ocr_edge, source_pattern, source_edge, BOUNDARY_MARK,
+            helper_timeout, poll_timeout,
         )
         if not ok:
             return make_step(name, "fail", reason=reason)
@@ -579,14 +591,18 @@ def run_drag_select_step(module, env, config, swift_helper, process_holder, wind
     if capture_step["result"] != "pass":
         return make_step(name, "blocked", reason=f"撮影に失敗した: {capture_step.get('reason')}")
     screenshot = run_dir / "drag_select_state0.png"
-    ok, _out, err = run_helper(swift_helper, ["drag-select-text", str(pid), str(screenshot),
-                                              DRAG_SELECT_START_RE, "start", DRAG_SELECT_END_RE, "end"], helper_timeout)
+    ok, _out, err = run_helper(
+        swift_helper,
+        ["drag-select-text", str(pid), str(screenshot),
+         DRAG_SELECT_START_OCR_RE, "start", DRAG_SELECT_END_OCR_RE, "end"],
+        helper_timeout,
+    )
     if not ok:
         return make_step(name, "blocked", reason=f"ドラッグ選択に失敗した: {err}")
     ok, _out, err = run_helper(swift_helper, ["delete-selection-save", str(pid)], helper_timeout)
     if not ok:
         return make_step(name, "blocked", reason=f"選択範囲の削除に失敗した: {err}")
-    deleted_expected = INLINE_FIXTURE_ORIGINAL.replace("*italic*", "", 1)
+    deleted_expected = INLINE_FIXTURE_ORIGINAL.replace("old *italic* com", "", 1)
 
     def expect(expected_text, failure_reason):
         matched, actual = wait_for_fixture_bytes(config.fixture_path, expected_text.encode("utf-8"), poll_timeout)
@@ -639,10 +655,10 @@ def run_delimiter_step(module, env, config, swift_helper, process_holder, window
     # OCR alone must not be treated as proof of "reverts to plain text".
     capture_named(module, env, config, window_id, run_dir, "delimiter_unclosed")
 
-    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "*"], helper_timeout)
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "* tail"], helper_timeout)
     if not ok:
         return make_step(name, "blocked", reason=f"区切り記号の閉鎖入力に失敗した: {err}")
-    closed_expected = unclosed_expected + "*"
+    closed_expected = unclosed_expected + "* tail"
     failed = expect(closed_expected, "区切り記号を閉じた後の保存内容が一致しない")
     if failed:
         return failed
@@ -651,18 +667,23 @@ def run_delimiter_step(module, env, config, swift_helper, process_holder, window
     if capture_step["result"] != "pass":
         return make_step(name, "blocked", reason=f"撮影に失敗した: {capture_step.get('reason')}")
     screenshot = run_dir / "delimiter_closed.png"
-    ok, _out, err = run_helper(swift_helper, ["drag-select-text", str(pid), str(screenshot),
-                                              DELIMITER_CLOSE_RE, "start", DELIMITER_CLOSE_RE, "end"], helper_timeout)
+    ok, _out, err = run_helper(
+        swift_helper,
+        ["drag-select-text", str(pid), str(screenshot),
+         DELIMITER_SELECT_START_OCR_RE, "start", DELIMITER_SELECT_END_OCR_RE, "end"],
+        helper_timeout,
+    )
     if not ok:
-        return make_step(name, "blocked", reason=f"閉じ区切り記号のドラッグ選択に失敗した: {err}")
+        return make_step(name, "blocked", reason=f"閉じ区切り記号を含む範囲のドラッグ選択に失敗した: {err}")
     ok, _out, err = run_helper(swift_helper, ["delete-selection-save", str(pid)], helper_timeout)
     if not ok:
-        return make_step(name, "blocked", reason=f"閉じ区切り記号の削除に失敗した: {err}")
-    failed = expect(unclosed_expected, "区切り記号を削除して未閉鎖へ戻す結果が一致しない")
+        return make_step(name, "blocked", reason=f"閉じ区切り記号を含む範囲の削除に失敗した: {err}")
+    partially_unclosed_expected = INLINE_FIXTURE_ORIGINAL + " *l"
+    failed = expect(partially_unclosed_expected, "区切り記号を削除して未閉鎖へ戻す結果が一致しない")
     if failed:
         return failed
 
-    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "*"], helper_timeout)
+    ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), "oose* tail"], helper_timeout)
     if not ok:
         return make_step(name, "blocked", reason=f"区切り記号の再閉鎖入力に失敗した: {err}")
     failed = expect(closed_expected, "区切り記号を再度閉じた後の保存内容が一致しない")
@@ -695,22 +716,31 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
         steps.append(run_boundary_step(
             module, env, config, swift_helper, process_holder, window_id, run_dir,
             "boundary_click_edit_bold_italic",
-            [(BOLD_ITALIC_OPEN_RE, "end"), (BOLD_ITALIC_CLOSE_RE, "start")],
+            [
+                (BOLD_ITALIC_OCR_RE, "start", BOLD_ITALIC_OPEN_RE, "end"),
+                (BOLD_ITALIC_OCR_RE, "end", BOLD_ITALIC_CLOSE_RE, "start"),
+            ],
             helper_timeout, poll_timeout,
         ))
         steps.append(run_boundary_step(
             module, env, config, swift_helper, process_holder, window_id, run_dir,
-            "boundary_click_edit_code_span", [(CODE_SPAN_OPEN_RE, "end")],
+            "boundary_click_edit_code_span",
+            [
+                (CODE_SPAN_OPEN_OCR_RE, "start", CODE_SPAN_OPEN_RE, "end"),
+                (CODE_SPAN_CLOSE_OCR_RE, "end", CODE_SPAN_CLOSE_RE, "start"),
+            ],
             helper_timeout, poll_timeout,
         ))
         steps.append(run_boundary_step(
             module, env, config, swift_helper, process_holder, window_id, run_dir,
-            "boundary_click_edit_quote", [(QUOTE_BOLD_OPEN_RE, "end")],
+            "boundary_click_edit_quote",
+            [(QUOTE_BOLD_OPEN_OCR_RE, "start", QUOTE_BOLD_OPEN_RE, "end")],
             helper_timeout, poll_timeout,
         ))
         steps.append(run_boundary_step(
             module, env, config, swift_helper, process_holder, window_id, run_dir,
-            "boundary_click_edit_list", [(LIST_ITALIC_OPEN_RE, "end")],
+            "boundary_click_edit_list",
+            [(LIST_ITALIC_OPEN_OCR_RE, "start", LIST_ITALIC_OPEN_RE, "end")],
             helper_timeout, poll_timeout,
         ))
         steps.append(run_drag_select_step(
@@ -736,7 +766,7 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
                 "result": worst_result(steps, priority), "reason": reason_for(steps),
                 "evidence": {"fixture_path": str(fixture_path), "run_dir": str(run_dir)}}
 
-    expected_final = INLINE_FIXTURE_ORIGINAL + " *loose*"
+    expected_final = INLINE_FIXTURE_ORIGINAL + " *loose* tail"
     reopen_dir = run_dir / "reopen"
     reopen_process_holder: dict = {"process": None}
     reopen_config = make_config(

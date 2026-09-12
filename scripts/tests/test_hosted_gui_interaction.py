@@ -47,12 +47,7 @@ class HelperTests(unittest.TestCase):
 
 
 class InlineSyntaxExpectationTests(unittest.TestCase):
-    """Pure byte-expectation logic for the inline_syntax_boundary scenario.
-
-    These patterns also drive the real OS-level click in
-    hosted_gui_interaction.swift (via OCR); this test pins their meaning
-    against the fixture text without touching a screen or Swift.
-    """
+    """Pure source-byte and visible-anchor logic for inline_syntax_boundary."""
 
     def test_boundary_insertions_match_the_fixture(self):
         text = interaction.INLINE_FIXTURE_ORIGINAL
@@ -60,6 +55,7 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
             (interaction.BOLD_ITALIC_OPEN_RE, 'end', text.replace('**bold', '**Zbold', 1)),
             (interaction.BOLD_ITALIC_CLOSE_RE, 'start', text.replace('combo**', 'comboZ**', 1)),
             (interaction.CODE_SPAN_OPEN_RE, 'end', text.replace('`code', '`Zcode', 1)),
+            (interaction.CODE_SPAN_CLOSE_RE, 'start', text.replace('span`', 'spanZ`', 1)),
             (interaction.QUOTE_BOLD_OPEN_RE, 'end', text.replace('quote with **bold', 'quote with **Zbold', 1)),
             (interaction.LIST_ITALIC_OPEN_RE, 'end', text.replace('item with *italic', 'item with *Zitalic', 1)),
         ]
@@ -71,17 +67,36 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             interaction.insert_at_match(interaction.INLINE_FIXTURE_ORIGINAL, r'not-present', 'Z', edge='end')
 
-    def test_drag_select_markers_bound_exactly_the_inner_italic_run(self):
-        text = interaction.INLINE_FIXTURE_ORIGINAL
-        start = re.search(interaction.DRAG_SELECT_START_RE, text).start()
-        end = re.search(interaction.DRAG_SELECT_END_RE, text).end()
-        self.assertEqual(text[start:end], '*italic*')
-        self.assertEqual(text.replace('*italic*', '', 1),
-                         text[:start] + text[end:])
+    def test_ocr_locators_match_visible_text_without_hidden_markers(self):
+        rendered_lines = [
+            'bold italic combo boundary line.',
+            'this inline code',
+            'span crosses a line.',
+            'quote with bold inside.',
+            'list item with italic inside.',
+        ]
+        patterns = [
+            interaction.BOLD_ITALIC_OCR_RE,
+            interaction.CODE_SPAN_OPEN_OCR_RE,
+            interaction.CODE_SPAN_CLOSE_OCR_RE,
+            interaction.QUOTE_BOLD_OPEN_OCR_RE,
+            interaction.LIST_ITALIC_OPEN_OCR_RE,
+            interaction.DRAG_SELECT_START_OCR_RE,
+            interaction.DRAG_SELECT_END_OCR_RE,
+        ]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(sum(bool(re.search(pattern, line)) for line in rendered_lines), 1)
+                self.assertNotRegex(pattern, r'\\[\*`]')
 
-    def test_bold_italic_and_quote_bold_patterns_target_different_lines(self):
-        # "**bold" appears on both the combo line and the quote line; the
-        # lookahead context must keep the two patterns from colliding.
+    def test_drag_selection_expected_bytes_cross_hidden_inner_markers(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        selected = 'old *italic* com'
+        self.assertIn(selected, text)
+        self.assertEqual(text.replace(selected, '', 1),
+                         text.replace('**bold *italic* combo**', '**bbo**', 1))
+
+    def test_bold_italic_and_quote_source_patterns_target_different_lines(self):
         text = interaction.INLINE_FIXTURE_ORIGINAL
         bold_italic_pos = re.search(interaction.BOLD_ITALIC_OPEN_RE, text).start()
         quote_pos = re.search(interaction.QUOTE_BOLD_OPEN_RE, text).start()
@@ -89,11 +104,11 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
         self.assertIn('*italic*', text[bold_italic_pos:text.index('\n', bold_italic_pos)])
         self.assertIn('quote with', text[:quote_pos].rsplit('\n', 1)[-1])
 
-    def test_delimiter_close_pattern_matches_only_the_appended_closing_marker(self):
+    def test_delimiter_selection_anchors_are_visible_and_restore_exact_bytes(self):
         unclosed = interaction.INLINE_FIXTURE_ORIGINAL + ' *loose'
-        closed = unclosed + '*'
-        self.assertIsNone(re.search(interaction.DELIMITER_CLOSE_RE, unclosed))
-        match = re.search(interaction.DELIMITER_CLOSE_RE, closed)
-        self.assertIsNotNone(match)
-        self.assertEqual(closed[match.start():match.end()], '*')
-        self.assertEqual(match.end(), len(closed))
+        closed = unclosed + '* tail'
+        rendered = 'loose tail'
+        self.assertIsNotNone(re.search(interaction.DELIMITER_SELECT_START_OCR_RE, rendered))
+        self.assertIsNotNone(re.search(interaction.DELIMITER_SELECT_END_OCR_RE, rendered))
+        partially_unclosed = interaction.INLINE_FIXTURE_ORIGINAL + ' *l'
+        self.assertEqual(partially_unclosed + 'oose* tail', closed)
