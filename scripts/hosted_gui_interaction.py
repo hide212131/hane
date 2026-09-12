@@ -48,9 +48,10 @@ VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
     "OSスクロール、および太字/斜体複合・複数行 inline code・quote・list における"
-    "marker/本文境界へのクリック・ドラッグ選択・区切り記号の追加削除の基本スモーク確認に"
-    "限定される。太字・斜体の見た目そのものはこの結果では証明されない（OCR は座標特定にのみ"
-    "使用し、presentation の style-run はここでは検証しない）。全フォーカス移動・ダイアログ表示等の"
+    "marker/本文境界へのクリック・caret移動・ドラッグ選択・区切り記号の追加削除の基本スモーク確認に"
+    "限定される。区切り記号の未閉鎖/再閉鎖では、caretを中立位置へ移して撮影した描画ピクセルの"
+    "digestが変化し、再閉鎖後に初期閉鎖状態へ戻ることも確認する。OCR は座標特定にのみ使用し、"
+    "bold/italic等の意味的なstyle種別そのものはOCRでは判定しない。全フォーカス移動・ダイアログ表示等の"
     "網羅的な GUI 検証はまだ証明されていない。"
 )
 
@@ -92,6 +93,7 @@ LIST_ITALIC_OPEN_OCR_RE = r"italic(?= inside)"
 DRAG_SELECT_START_OCR_RE = r"(?<=b)old(?= italic combo)"
 DRAG_SELECT_END_OCR_RE = r"com(?=bo boundary)"
 BOUNDARY_MARK = "Z"
+NAVIGATION_MARK = "N"
 JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 
 
@@ -263,6 +265,15 @@ def verify_visible_text(helper, image_path, expected, timeout):
         reason=None if matched else "保存した文書の表示をOCRで確認できない",
         expected=expected, recognized_text=text,
     )
+
+
+def image_pixel_digest(helper, image_path: Path, timeout: float) -> tuple[Optional[str], Optional[str]]:
+    ok, value, error = run_helper(helper, ["image-digest", str(image_path)], timeout)
+    if not ok:
+        return None, error
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None, f"invalid image pixel digest: {value!r}"
+    return value, None
 
 
 def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, binary_path,
@@ -533,6 +544,76 @@ def run_boundary_step(module, env, config, swift_helper, process_holder, window_
     return result
 
 
+def run_boundary_navigation_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                                 helper_timeout, poll_timeout) -> list[dict]:
+    name = "boundary_caret_navigation"
+    pid = current_pid(process_holder)
+    if pid is None or window_id is None:
+        return [skipped_step(name, "対象プロセスの PID またはウィンドウを取得できなかった")]
+    expected_left = INLINE_FIXTURE_ORIGINAL.replace("**bold", f"*{NAVIGATION_MARK}*bold", 1)
+    expected_right = INLINE_FIXTURE_ORIGINAL.replace("**bold", f"**b{NAVIGATION_MARK}old", 1)
+    expected_up = INLINE_FIXTURE_ORIGINAL.replace("this inline `code", f"this{NAVIGATION_MARK} inline `code", 1)
+    cases = (
+        ("left_across_open_marker", BOLD_ITALIC_OCR_RE, "start", "left", expected_left),
+        ("right_into_visible_text", BOLD_ITALIC_OCR_RE, "start", "right", expected_right),
+        ("up_from_multiline_code_close", CODE_SPAN_CLOSE_OCR_RE, "end", "up", expected_up),
+    )
+    steps: list[dict] = []
+    for index, (case_name, ocr_pattern, ocr_edge, direction, expected) in enumerate(cases):
+        reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_reset_before_{index}")
+        steps.append(reset)
+        if reset["result"] != "pass":
+            steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+            return steps
+        label = f"{name}_{index}"
+        capture = capture_named(module, env, config, window_id, run_dir, label)
+        steps.append(capture)
+        if capture["result"] != "pass":
+            steps.append(make_step(name, "blocked", reason=capture.get("reason")))
+            return steps
+        screenshot = run_dir / f"{label}.png"
+        ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot), ocr_pattern, ocr_edge], helper_timeout)
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"caret navigation の境界クリックに失敗した: {err}"))
+            return steps
+        ok, _out, err = run_helper(swift_helper, ["move-caret", str(pid), direction, "1"], helper_timeout)
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"caret {direction} 移動に失敗した: {err}"))
+            return steps
+        ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), NAVIGATION_MARK], helper_timeout)
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"caret 移動後の着地点確認入力に失敗した: {err}"))
+            return steps
+        matched, actual = wait_for_fixture_bytes(config.fixture_path, expected.encode("utf-8"), poll_timeout)
+        detail = {
+            "case": case_name,
+            "screenshot": str(screenshot),
+            "direction": direction,
+            "count": 1,
+            "expected_after_move_insert": expected,
+            "actual_after_move_insert": _decode(actual),
+        }
+        if not matched:
+            steps.append(make_step(f"{name}_check_{index}", "fail", reason="caret 移動後の source 着地点が期待値と一致しない", **detail))
+            steps.append(make_step(name, "fail", reason="caret 移動後の source 着地点が期待値と一致しない"))
+            return steps
+        ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"caret navigation undo に失敗した: {err}"))
+            return steps
+        restored, actual = wait_for_fixture_bytes(config.fixture_path, INLINE_FIXTURE_ORIGINAL.encode("utf-8"), poll_timeout)
+        detail.update(expected_after_undo=INLINE_FIXTURE_ORIGINAL, actual_after_undo=_decode(actual))
+        steps.append(make_step(f"{name}_check_{index}", "pass" if restored else "fail",
+                               reason=None if restored else "caret navigation undo 後に元の内容へ戻らない", **detail))
+        if not restored:
+            steps.append(make_step(name, "fail", reason="caret navigation undo 後に元の内容へ戻らない"))
+            return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_reset_after")
+    steps.append(reset)
+    steps.append(make_step(name, "pass" if reset["result"] == "pass" else "blocked", reason=reset.get("reason")))
+    return steps
+
+
 def run_boundary_ime_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
                           helper_timeout, poll_timeout) -> list[dict]:
     name = "boundary_ime_input"
@@ -687,12 +768,21 @@ def run_delimiter_toggle_step(module, env, config, swift_helper, process_holder,
     if not matched:
         steps.append(make_step(name, "fail", reason=f"{delimiter!r} を追加した内容が期待値と一致しない: actual={_decode(actual)!r}"))
         return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_initial_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
     initial_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_initial_closed")
     steps.append(initial_capture)
     if initial_capture["result"] != "pass":
         steps.append(make_step(name, "blocked", reason=initial_capture.get("reason")))
         return steps
     initial_image = run_dir / f"{name}_initial_closed.png"
+    initial_digest, digest_error = image_pixel_digest(swift_helper, initial_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"初期閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
     ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(initial_image), r"loose", "end"], helper_timeout)
     if not ok:
         steps.append(make_step(name, "blocked", reason=f"閉じ区切り記号の位置決めに失敗した: {err}"))
@@ -710,10 +800,24 @@ def run_delimiter_toggle_step(module, env, config, swift_helper, process_holder,
     if not matched:
         steps.append(make_step(name, "fail", reason=f"{delimiter!r} 削除後の未閉鎖内容が期待値と一致しない"))
         return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_unclosed_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
     unclosed_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_unclosed")
     steps.append(unclosed_capture)
     if unclosed_capture["result"] != "pass":
         steps.append(make_step(name, "blocked", reason=f"未閉鎖状態の撮影に失敗した: {unclosed_capture.get('reason')}"))
+        return steps
+    unclosed_image = run_dir / f"{name}_unclosed.png"
+    unclosed_digest, digest_error = image_pixel_digest(swift_helper, unclosed_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"未閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
+    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(unclosed_image), r"loose", "end"], helper_timeout)
+    if not ok:
+        steps.append(make_step(name, "blocked", reason=f"再閉鎖位置の位置決めに失敗した: {err}"))
         return steps
     ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), delimiter], helper_timeout)
     if not ok:
@@ -724,15 +828,43 @@ def run_delimiter_toggle_step(module, env, config, swift_helper, process_holder,
     if not matched:
         steps.append(make_step(name, "fail", reason=f"{delimiter!r} 再入力後の内容が期待値と一致しない"))
         return steps
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_closed_reset")
+    steps.append(reset)
+    if reset["result"] != "pass":
+        steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+        return steps
     closed_capture = capture_named(module, env, config, window_id, run_dir, f"{name}_closed")
     steps.append(closed_capture)
     if closed_capture["result"] != "pass":
         steps.append(make_step(name, "blocked", reason=f"閉鎖状態の撮影に失敗した: {closed_capture.get('reason')}"))
         return steps
+    closed_image = run_dir / f"{name}_closed.png"
+    closed_digest, digest_error = image_pixel_digest(swift_helper, closed_image, helper_timeout)
+    if digest_error:
+        steps.append(make_step(name, "blocked", reason=f"再閉鎖状態の描画 digest 取得に失敗した: {digest_error}"))
+        return steps
+    visual_transition = unclosed_digest != closed_digest
+    visual_restored = initial_digest == closed_digest
+    if not visual_transition or not visual_restored:
+        reason = (
+            "未閉鎖/再閉鎖で描画ピクセルが変化しない"
+            if not visual_transition else "再閉鎖後の描画が初期閉鎖状態へ戻らない"
+        )
+        steps.append(make_step(
+            f"{name}_check", "fail", reason=reason, delimiter=delimiter,
+            initial_screenshot=str(initial_image), unclosed_screenshot=str(unclosed_image), closed_screenshot=str(closed_image),
+            initial_pixel_digest=initial_digest, unclosed_pixel_digest=unclosed_digest, closed_pixel_digest=closed_digest,
+            visual_transition_observed=visual_transition, closed_visual_restored=visual_restored,
+            unclosed_expected=unclosed_expected, unclosed_actual=unclosed_actual,
+            closed_expected=closed_expected, closed_actual=closed_actual,
+        ))
+        steps.append(make_step(name, "fail", reason=reason))
+        return steps
     steps.append(make_step(
         f"{name}_check", "pass", delimiter=delimiter,
-        unclosed_screenshot=str(run_dir / f"{name}_unclosed.png"),
-        closed_screenshot=str(run_dir / f"{name}_closed.png"),
+        initial_screenshot=str(initial_image), unclosed_screenshot=str(unclosed_image), closed_screenshot=str(closed_image),
+        initial_pixel_digest=initial_digest, unclosed_pixel_digest=unclosed_digest, closed_pixel_digest=closed_digest,
+        visual_transition_observed=True, closed_visual_restored=True,
         unclosed_expected=unclosed_expected, unclosed_actual=unclosed_actual,
         closed_expected=closed_expected, closed_actual=closed_actual,
     ))
@@ -783,6 +915,8 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
         ):
             steps.extend(run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
                                            name, checks, helper_timeout, poll_timeout))
+        steps.extend(run_boundary_navigation_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
+                                                  helper_timeout, poll_timeout))
         steps.extend(run_boundary_ime_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
                                            helper_timeout, poll_timeout))
         steps.extend(run_drag_select_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
