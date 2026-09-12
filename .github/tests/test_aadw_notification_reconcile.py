@@ -1,4 +1,5 @@
 import datetime as dt
+import re
 import sys
 from pathlib import Path
 import unittest
@@ -20,14 +21,16 @@ def status(id_, context, state, description, run=100, created="2026-09-12T02:55:
 
 
 class Fake:
-    def __init__(self, statuses, comments=None):
+    def __init__(self, statuses, comments=None, attempts=None):
         self.statuses = statuses
         self.comments = list(comments or [])
         self.calls = []
         self.next_id = max([c["id"] for c in self.comments], default=0) + 1
+        self.attempts = attempts or {100: ["2026-09-12T02:50:00Z"]}
 
     def call(self, endpoint, payload=None, method=None):
         self.calls.append((endpoint, payload, method))
+        clean = endpoint.split('?', 1)[0]
         if "/pulls?state=open" in endpoint:
             return [{
                 "number": 131, "state": "open", "draft": False,
@@ -36,12 +39,25 @@ class Fake:
             }]
         if f"/commits/{SHA}/statuses" in endpoint:
             return self.statuses
+        match = re.fullmatch(rf"repos/{re.escape(REPO)}/actions/runs/([1-9][0-9]*)(?:/attempts/([1-9][0-9]*))?", clean)
+        if match:
+            run_id = int(match.group(1))
+            starts = self.attempts.get(run_id)
+            if not starts:
+                raise AssertionError(f"missing Actions run {run_id}")
+            if match.group(2) is None:
+                return {"run_attempt": len(starts)}
+            attempt = int(match.group(2))
+            return {"run_attempt": attempt, "run_started_at": starts[attempt - 1]}
         if "/comments?" in endpoint:
             return self.comments
         if "/issues/comments/" in endpoint:
             ident = int(endpoint.rsplit("/", 1)[1])
-            for row in self.comments:
+            for row in list(self.comments):
                 if row["id"] == ident:
+                    if method == "DELETE":
+                        self.comments.remove(row)
+                        return None
                     row["body"] = payload["body"]
                     return row
             raise AssertionError("missing comment")
@@ -72,17 +88,29 @@ class ReconcileTests(unittest.TestCase):
         ]
         generations = subject.build_generations(rows)
         self.assertEqual(len(generations), 1)
-        self.assertEqual((generations[0]["run_id"], generations[0]["attempt"]), ("77", "1"))
+        self.assertEqual((generations[0]["run_id"], generations[0]["attempt"]), ("77", None))
         self.assertEqual(generations[0]["latest"]["id"], 11)
 
-    def test_new_pending_same_run_becomes_attempt_two_generation(self):
+    def test_new_pending_same_run_starts_new_unknown_attempt_generation(self):
         rows = [
             status(10, "hane/gui-requirement", "pending", "GUI requirement classification pending for " + SHA[:12], run=77),
             status(11, "hane/gui-requirement", "success", "GUI validation not required (v1) for " + SHA[:12], run=77),
             status(12, "hane/gui-requirement", "pending", "GUI requirement classification pending for " + SHA[:12], run=77),
         ]
         generations = subject.build_generations(rows)
-        self.assertEqual([(g["run_id"], g["attempt"]) for g in generations], [("77", "1"), ("77", "2")])
+        self.assertEqual([(g["run_id"], g["attempt"]) for g in generations], [("77", None), ("77", None)])
+
+    def test_first_observed_status_can_belong_to_rerun_attempt_two(self):
+        gh = Fake([
+            status(12, "hane/codex-review", "pending", "Codex review pending for " + SHA[:12], run=77,
+                   created="2026-09-12T02:56:00Z"),
+            status(13, "hane/codex-review", "success", "Codex review clean for " + SHA[:12], run=77,
+                   created="2026-09-12T02:57:00Z"),
+        ], attempts={77: ["2026-09-12T02:40:00Z", "2026-09-12T02:55:00Z"]})
+        subject.reconcile(gh.call, REPO, now=NOW)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn("run=77 attempt=2", gh.comments[0]["body"])
+        self.assertIn("/actions/runs/77/attempts/2", gh.comments[0]["body"])
 
     def test_gui_required_failure_status_is_normal_completion(self):
         gh = Fake([

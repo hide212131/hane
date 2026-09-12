@@ -67,29 +67,17 @@ def status_identity(status):
     return None, None
 
 
-def next_attempt(seen, run_id):
-    seen[run_id] = seen.get(run_id, 0) + 1
-    return str(seen[run_id])
-
-
-def remember_attempt(seen, run_id, attempt):
-    try:
-        seen[run_id] = max(seen.get(run_id, 0), int(attempt))
-    except (TypeError, ValueError):
-        pass
-
-
 def build_generations(statuses):
     """Group one context's append-only status history into process runs.
 
-    A pending status opens a generation. A terminal status whose URL omits the
-    attempt number is attached to the currently open generation when the run id
-    matches. This is important because GitHub status target URLs commonly point
-    at /actions/runs/<id> for both pending and terminal writes.
+    A status URL often identifies the Actions run but omits its rerun attempt.
+    Do not derive that attempt from the number of observed status generations:
+    an earlier attempt may have failed before writing any status.  Such
+    generations deliberately keep ``attempt=None`` until notification time,
+    when the Actions attempt history is correlated by timestamp.
     """
     generations = []
     current = None
-    seen_runs = {}
     for row in sorted(statuses, key=lambda item: item.get("id", 0)):
         state = row.get("state", "")
         explicit_run, explicit_attempt = status_identity(row)
@@ -98,12 +86,7 @@ def build_generations(statuses):
             if explicit_run is None:
                 run_id, attempt = str(row.get("id")), "1"
             else:
-                run_id = explicit_run
-                if explicit_attempt is None:
-                    attempt = next_attempt(seen_runs, run_id)
-                else:
-                    attempt = explicit_attempt
-                    remember_attempt(seen_runs, run_id, attempt)
+                run_id, attempt = explicit_run, explicit_attempt
             current = {
                 "generation_id": row.get("id"),
                 "start": row,
@@ -116,20 +99,21 @@ def build_generations(statuses):
 
         if current is not None:
             same_run = explicit_run is None or explicit_run == current["run_id"]
-            same_attempt = explicit_attempt is None or explicit_attempt == current["attempt"]
+            same_attempt = (
+                explicit_attempt is None
+                or current["attempt"] is None
+                or explicit_attempt == current["attempt"]
+            )
             if same_run and same_attempt:
                 current["latest"] = row
+                if current["attempt"] is None and explicit_attempt is not None:
+                    current["attempt"] = explicit_attempt
                 continue
 
         if explicit_run is None:
             run_id, attempt = str(row.get("id")), "1"
         else:
-            run_id = explicit_run
-            if explicit_attempt is None:
-                attempt = next_attempt(seen_runs, run_id)
-            else:
-                attempt = explicit_attempt
-                remember_attempt(seen_runs, run_id, attempt)
+            run_id, attempt = explicit_run, explicit_attempt
         current = {
             "generation_id": row.get("id"),
             "start": None,
@@ -139,6 +123,43 @@ def build_generations(statuses):
         }
         generations.append(current)
     return generations
+
+
+def _attempt_starts(call, repository, run_id, cache):
+    if run_id in cache:
+        return cache[run_id]
+    run = call(f"repos/{repository}/actions/runs/{run_id}")
+    max_attempt = run.get("run_attempt") if isinstance(run, dict) else None
+    if not isinstance(max_attempt, int) or max_attempt < 1:
+        raise RuntimeError(f"Actions run {run_id} のattempt数を取得できませんでした。")
+    starts = []
+    for attempt in range(1, max_attempt + 1):
+        row = call(f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}")
+        started = parse_time(row.get("run_started_at") if isinstance(row, dict) else None)
+        actual = row.get("run_attempt") if isinstance(row, dict) else None
+        if actual != attempt or started is None:
+            raise RuntimeError(f"Actions run {run_id} attempt {attempt} の開始時刻を取得できませんでした。")
+        starts.append((attempt, started))
+    cache[run_id] = starts
+    return starts
+
+
+def resolve_attempt(call, repository, generation, cache=None):
+    explicit = generation.get("attempt")
+    if explicit is not None:
+        return str(explicit)
+    run_id = str(generation.get("run_id") or "")
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise RuntimeError("AADW status generationのrun idが不正です。")
+    evidence = generation.get("start") or generation.get("latest") or {}
+    observed = parse_time(evidence.get("created_at"))
+    if observed is None:
+        raise RuntimeError(f"Actions run {run_id} のattemptを解決するstatus時刻がありません。")
+    starts = _attempt_starts(call, repository, run_id, cache if cache is not None else {})
+    candidates = [(attempt, started) for attempt, started in starts if started <= observed]
+    if not candidates:
+        raise RuntimeError(f"Actions run {run_id} のstatus時刻に対応するattemptがありません。")
+    return str(max(candidates, key=lambda item: item[1])[0])
 
 
 def outcome(context, status):
@@ -165,13 +186,14 @@ def recent(generation, cutoff):
     return bool((latest_at and latest_at >= cutoff) or (start_at and start_at >= cutoff))
 
 
-def notify_generation(call, repository, pr_number, sha, context, generation, source=None):
+def notify_generation(call, repository, pr_number, sha, context, generation, source=None, attempt_cache=None):
     process = CONTEXTS[context]
     state = outcome(context, generation["latest"])
     description = generation["latest"].get("description") or "状態の説明はありません。"
     detail = f"状態: {description}"
     if context == "hane/codex-review" and source:
         detail += f"\nレビュー実施者: {source}"
+    attempt = resolve_attempt(call, repository, generation, attempt_cache)
     return aadw_notify.notify(
         call,
         state=state,
@@ -181,7 +203,7 @@ def notify_generation(call, repository, pr_number, sha, context, generation, sou
         sha=sha,
         repository=repository,
         run_id=generation["run_id"],
-        attempt=generation["attempt"],
+        attempt=attempt,
         detail=detail,
     )["action"]
 
@@ -269,6 +291,7 @@ def reconcile_pr(call, repository, pr, cutoff):
     sha = pr["head"]["sha"]
     statuses = pages(call, f"repos/{repository}/commits/{sha}/statuses")
     source = review_source(statuses)
+    attempt_cache = {}
     writes = 0
     for context, process in CONTEXTS.items():
         rows = [row for row in statuses if row.get("context") == context]
@@ -278,6 +301,7 @@ def reconcile_pr(call, repository, pr, cutoff):
             action = notify_generation(
                 call, repository, number, sha, context, generation,
                 source=source if process == "codex-review" else None,
+                attempt_cache=attempt_cache,
             )
             writes += action != "noop"
     writes += reconcile_fallback(call, repository, number, sha, statuses, cutoff) != "noop"

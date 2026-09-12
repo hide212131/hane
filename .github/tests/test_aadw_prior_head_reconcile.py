@@ -60,6 +60,10 @@ class Fake:
         if clean.startswith(f'repos/{REPO}/commits/') and clean.endswith('/statuses'):
             sha = clean.split('/commits/', 1)[1].split('/statuses', 1)[0]
             return self.old_statuses if sha == OLD else []
+        if clean == f'repos/{REPO}/actions/runs/777':
+            return {'run_attempt': 1}
+        if clean == f'repos/{REPO}/actions/runs/777/attempts/1':
+            return {'run_attempt': 1, 'run_started_at': '2026-09-12T03:00:00Z'}
         if clean == f'repos/{REPO}/issues/131/comments':
             if payload is None:
                 return self.comments
