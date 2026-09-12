@@ -1,0 +1,45 @@
+name: AADW lifecycle notifications
+
+on:
+  status:
+  repository_dispatch:
+    types: [claude-progress-start]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows:
+      - Implement issue with Claude
+      - Codex review gate
+      - Codex limit Copilot review fallback
+      - Copilot pre-GUI routing
+      - Claude automatic fix worker
+      - GUI requirement classification
+      - GUI validation
+      - Copilot final judgement
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Check out trusted AADW notification code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Mirror AADW lifecycle to Issue / PR Conversation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_observer.py

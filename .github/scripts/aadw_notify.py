@@ -1,21 +1,4 @@
-"""Shared Issue/PR start/success/failure notifier for AADW user-visible processes.
-
-Several AADW processes (Codex review, GUI requirement classification, GUI
-validation, Copilot routing/judge, ...) only ever recorded their state as a
-commit status, which is not visible from the Issue/Pull Request Conversation
-tab without opening Actions. This module posts a small, human-readable
-Conversation comment mirroring that state instead.
-
-Identity for a single notified execution is
-(process, kind, number, sha, run_id, run_attempt): a retry/rerun (new
-run_id/attempt) or a new head sha always gets its own comment, so it can never
-overwrite a different execution's result, while re-notifying the same
-execution (start, then later success/failure; or reprocessing the same event)
-updates that one comment in place instead of duplicating it.
-
-Process names are a fixed, trusted table (`PROCESSES`); callers must not pass
-free-form text taken from Issue/PR bodies or comments as the process name.
-"""
+"""Shared Issue/PR lifecycle comments for AADW user-visible processes."""
 import argparse
 import json
 import os
@@ -23,21 +6,17 @@ import re
 import subprocess
 import sys
 
-# Trusted, fixed labels for the AADW processes this module can notify about.
-# Keep in sync with docs/agentic-development-workflow.md.
 PROCESSES = {
     'implement': '/implement によるClaude Code実装',
     'codex-review': 'Codexレビュー',
-    'codex-review-fallback': 'Codexレビュー使用量上限時のCopilot fallback',
+    'codex-review-fallback': 'Codexレビュー利用上限時のCopilot代替レビュー',
     'copilot-pre-gui-routing': 'Copilot pre-GUI routing',
     'claude-fix': 'Claude Codeによる自動修正',
     'gui-requirement': 'GUI validation要否判定',
     'gui-validation': 'GUI validation',
     'final-judge': 'Copilot final judge / deterministic merge gate',
-    'reconcile': 'AADW reconcile/retry',
 }
-
-STATE_LABELS = {'start': '開始', 'success': '正常終了', 'failure': '異常終了'}
+STATE_LABELS = {'start': '処理開始', 'success': '正常終了', 'failure': '異常終了'}
 
 _NUMBER = re.compile(r'[1-9][0-9]*')
 _SHA = re.compile(r'[0-9a-f]{40}')
@@ -61,9 +40,18 @@ def api(endpoint, payload=None, method=None):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
+def _validate(*, state, process, kind, number, sha, repository, run_id, attempt):
+    number, run_id, attempt = str(number), str(run_id), str(attempt)
+    sha = sha or 'none'
+    if (process not in PROCESSES or state not in STATE_LABELS or kind not in ('issue', 'pr')
+            or not _REPO.fullmatch(repository) or not _NUMBER.fullmatch(number)
+            or not _NUMBER.fullmatch(run_id) or not _NUMBER.fullmatch(attempt)
+            or (sha != 'none' and not _SHA.fullmatch(sha))):
+        raise ValueError('invalid AADW notify request')
+    return number, sha, run_id, attempt
+
+
 def find_comment(call, repository, number, marker_text, actor=_ACTOR):
-    # Exhaust pagination so a comment on a later page is never missed and
-    # duplicated by mistake.
     for page in range(1, 101):
         comments = call(f'repos/{repository}/issues/{number}/comments?per_page=100&page={page}')
         if not isinstance(comments, list):
@@ -82,7 +70,7 @@ def render(process, state, kind, number, sha, run_id, attempt, repository, detai
         target += f' (SHA `{sha[:12]}`)'
     run_url = f'https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}'
     lines = [f'### AADW: {PROCESSES[process]} — {STATE_LABELS[state]}', '',
-              f'対象: {target}', f'実行: {run_url}']
+             f'対象: {target}', f'実行: {run_url}']
     if detail:
         lines += ['', detail]
     lines += ['', marker_text]
@@ -90,13 +78,9 @@ def render(process, state, kind, number, sha, run_id, attempt, repository, detai
 
 
 def notify(call, *, state, process, kind, number, sha, repository, run_id, attempt, detail=''):
-    number, run_id, attempt = str(number), str(run_id), str(attempt)
-    sha = sha or 'none'
-    if (process not in PROCESSES or state not in STATE_LABELS or kind not in ('issue', 'pr')
-            or not _REPO.fullmatch(repository) or not _NUMBER.fullmatch(number)
-            or not _NUMBER.fullmatch(run_id) or not _NUMBER.fullmatch(attempt)
-            or (sha != 'none' and not _SHA.fullmatch(sha))):
-        raise ValueError('invalid AADW notify request')
+    number, sha, run_id, attempt = _validate(
+        state=state, process=process, kind=kind, number=number, sha=sha,
+        repository=repository, run_id=run_id, attempt=attempt)
     marker_text = marker(process, kind, number, sha, run_id, attempt)
     body = render(process, state, kind, number, sha, run_id, attempt, repository,
                   (detail or '').strip()[:2000], marker_text)
@@ -106,9 +90,6 @@ def notify(call, *, state, process, kind, number, sha, repository, run_id, attem
             return {'action': 'noop', 'id': existing['id']}
         call(f'repos/{repository}/issues/comments/{existing["id"]}', {'body': body}, 'PATCH')
         return {'action': 'update', 'id': existing['id']}
-    # No prior comment: either this is a fresh "start", or a terminal call
-    # arrives with no matching "start" (e.g. the worker crashed before
-    # posting one). Post the outcome either way rather than staying silent.
     created = call(f'repos/{repository}/issues/{number}/comments', {'body': body})
     return {'action': 'create', 'id': created['id']}
 
