@@ -1,7 +1,6 @@
 name: AADW lifecycle notifications
 
 on:
-  status:
   repository_dispatch:
     types: [claude-progress-start]
   issue_comment:

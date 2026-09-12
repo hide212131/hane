@@ -41,6 +41,15 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Mirror source workflow start
+        if: ${{ github.event_name == 'workflow_run' && github.event.action == 'in_progress' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AADW_SOURCE_WORKFLOW: ${{ github.event.workflow_run.name }}
+          AADW_SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          AADW_SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 -I .github/scripts/aadw_workflow_start_reconcile.py --poll-attempts 15 --poll-seconds 2
+
       - name: Reconcile current-head AADW status comments
         env:
           GH_TOKEN: ${{ github.token }}
