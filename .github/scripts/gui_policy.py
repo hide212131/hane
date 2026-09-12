@@ -196,11 +196,15 @@ def _validate_inline_evidence(steps):
         _require_text(step, 'expected_after_insert', 'actual_after_insert',
                       'expected_after_undo', 'actual_after_undo')
         _require_image_ref(step, 'screenshot', image)
-        if step['expected_after_insert'] != boundary_expected[name]
-                or step['expected_after_insert'] != step['actual_after_insert']:
+        if (
+            step['expected_after_insert'] != boundary_expected[name]
+            or step['expected_after_insert'] != step['actual_after_insert']
+        ):
             raise ValueError('inline insertion evidence mismatch')
-        if step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
-                or step['expected_after_undo'] != step['actual_after_undo']:
+        if (
+            step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+            or step['expected_after_undo'] != step['actual_after_undo']
+        ):
             raise ValueError('inline undo evidence mismatch')
 
     navigation = {
@@ -227,11 +231,15 @@ def _validate_inline_evidence(steps):
         _require_image_ref(step, 'screenshot', image)
         if step.get('count') != 1 or step['case'] != case or step['direction'] != direction:
             raise ValueError('caret-navigation operation evidence mismatch')
-        if step['expected_after_move_insert'] != expected
-                or step['actual_after_move_insert'] != expected:
+        if (
+            step['expected_after_move_insert'] != expected
+            or step['actual_after_move_insert'] != expected
+        ):
             raise ValueError('caret-navigation source-position mismatch')
-        if step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
-                or step['actual_after_undo'] != INLINE_FIXTURE_ORIGINAL:
+        if (
+            step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+            or step['actual_after_undo'] != INLINE_FIXTURE_ORIGINAL
+        ):
             raise ValueError('caret-navigation undo evidence mismatch')
 
     drag = by_name['drag_select_delete_undo_redo_check']
@@ -239,8 +247,11 @@ def _validate_inline_evidence(steps):
                   'undo_actual', 'redo_actual', 'restored_actual')
     _require_image_ref(drag, 'screenshot', 'inline_syntax_boundary/drag_select_state0.png')
     deleted_expected = INLINE_FIXTURE_ORIGINAL.replace('old *italic* com', '', 1)
-    if drag['deleted_expected'] != deleted_expected or drag['deleted_actual'] != deleted_expected
-            or drag['redo_actual'] != deleted_expected:
+    if (
+        drag['deleted_expected'] != deleted_expected
+        or drag['deleted_actual'] != deleted_expected
+        or drag['redo_actual'] != deleted_expected
+    ):
         raise ValueError('drag-selection evidence mismatch')
     if drag['undo_actual'] != INLINE_FIXTURE_ORIGINAL or drag['restored_actual'] != INLINE_FIXTURE_ORIGINAL:
         raise ValueError('drag-selection restore evidence mismatch')
@@ -265,8 +276,10 @@ def _validate_inline_evidence(steps):
             raise ValueError('delimiter pixel-digest evidence invalid')
         if step.get('visual_transition_observed') is not True or step.get('closed_visual_restored') is not True:
             raise ValueError('delimiter visual transition evidence missing')
-        if step['initial_pixel_digest'] != step['closed_pixel_digest']
-                or step['unclosed_pixel_digest'] == step['closed_pixel_digest']:
+        if (
+            step['initial_pixel_digest'] != step['closed_pixel_digest']
+            or step['unclosed_pixel_digest'] == step['closed_pixel_digest']
+        ):
             raise ValueError('delimiter visual transition evidence mismatch')
 
 
