@@ -118,13 +118,13 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("正常終了", gh.comments[0]["body"])
         self.assertIn("run=888 attempt=3", gh.comments[0]["body"])
 
-    def test_gui_blocked_is_abnormal_completion(self):
+    def test_gui_blocked_is_normal_completion(self):
         gh = Fake([
             status(44, "hane/gui-validation", "pending", f"GUI pending v1 {SHA[:12]} g889-1", run=889),
             status(45, "hane/gui-validation", "error", f"GUI blocked v1 {SHA[:12]} g889-1", run=889),
         ])
         subject.reconcile(gh.call, REPO, now=NOW)
-        self.assertIn("異常終了", gh.comments[0]["body"])
+        self.assertIn("正常終了", gh.comments[0]["body"])
 
     def test_final_blocked_is_normal_judge_completion_and_preserves_attempt(self):
         target = "https://github.com/hide212131/hane/actions/runs/990/attempts/2"
