@@ -1,9 +1,7 @@
 """GUI receipt boundary regressions; no network, agents, builds, or GUI input."""
 from copy import deepcopy
 from datetime import datetime, timezone
-import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -23,12 +21,46 @@ REQUEST = {'pr_number': 79, 'sha': SHA, 'control_sha': CONTROL, 'repository': 'o
 NOW = datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc)
 
 
+def _inline_evidence(steps):
+    by_name = {step['name']: step for step in steps}
+    boundary = (
+        'boundary_click_edit_bold_italic_check_0',
+        'boundary_click_edit_bold_italic_check_1',
+        'boundary_click_edit_code_span_check_0',
+        'boundary_click_edit_code_span_check_1',
+        'boundary_click_edit_quote_check_0',
+        'boundary_click_edit_list_check_0',
+        'boundary_ime_input_check',
+    )
+    for name in boundary:
+        by_name[name].update(
+            screenshot=f'inline_syntax_boundary/{name}.png',
+            expected_after_insert='after insert', actual_after_insert='after insert',
+            expected_after_undo='baseline', actual_after_undo='baseline',
+        )
+    by_name['drag_select_delete_undo_redo_check'].update(
+        screenshot='inline_syntax_boundary/drag_select_state0.png',
+        deleted_expected='deleted', deleted_actual='deleted',
+        undo_actual='baseline', redo_actual='deleted', restored_actual='baseline',
+    )
+    for kind, delimiter in (('star', '*'), ('bold', '**'), ('code', '`')):
+        by_name[f'delimiter_toggle_{kind}_check'].update(
+            unclosed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png',
+            closed_screenshot=f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png',
+            delimiter=delimiter,
+            unclosed_expected='unclosed', unclosed_actual='unclosed',
+            closed_expected='closed', closed_actual='closed',
+        )
+
+
 def passing_result():
     scenarios = []
     for name, expected in policy.REQUIRED_STEPS.items():
         steps = [{'name': step, 'result': 'pass'} for step in sorted(expected)]
         if name == 'ascii_edit_save_undo_redo_reopen':
             steps.extend({'name': step, 'result': 'pass'} for step in ('launch', 'window_discovery', 'cleanup'))
+        if name == 'inline_syntax_boundary':
+            _inline_evidence(steps)
         scenarios.append({'name': name, 'result': 'pass', 'steps': steps})
     return {'request_id': REQUEST['request_id'], 'run_id': '123', 'run_attempt': '1',
             'procedure_version': policy.PROCEDURE, 'control': {'sha': CONTROL},
@@ -119,6 +151,14 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(raw)
 
+    def test_inline_operation_evidence_is_fail_closed(self):
+        raw = passing_result()
+        inline = next(s for s in raw['scenarios'] if s['name'] == 'inline_syntax_boundary')
+        check = next(s for s in inline['steps'] if s['name'] == 'boundary_ime_input_check')
+        check.pop('actual_after_insert')
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
     def test_expired_or_reversed_result_rejected(self):
         for field, value in [('started_at', '2026-09-08T23:59:00Z'),
                              ('finished_at', '2026-09-09T01:01:00Z'),
@@ -168,9 +208,9 @@ class RequirementAndReviewTests(unittest.TestCase):
     def test_inline_syntax_boundary_required_steps_cover_representative_constructs(self):
         steps = policy.REQUIRED_STEPS['inline_syntax_boundary']
         for required in ('boundary_click_edit_bold_italic', 'boundary_click_edit_code_span',
-                         'boundary_click_edit_quote', 'boundary_click_edit_list',
-                         'drag_select_delete_undo_redo', 'delimiter_unclosed_then_closed',
-                         'reopen_content_check'):
+                         'boundary_click_edit_quote', 'boundary_click_edit_list', 'boundary_ime_input',
+                         'drag_select_delete_undo_redo', 'delimiter_toggle_star',
+                         'delimiter_toggle_bold', 'delimiter_toggle_code', 'reopen_content_check'):
             self.assertIn(required, steps)
         self.assertTrue(any(name.startswith('inline_syntax_boundary/') for name in policy.REQUIRED_IMAGES))
 
