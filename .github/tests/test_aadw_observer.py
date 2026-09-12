@@ -75,6 +75,12 @@ class Tests(unittest.TestCase):
         self.assertIn('正常終了', f.comments[42][0]['body'])
         self.assertIn('GUI validation必要', f.comments[42][0]['body'])
 
+    def test_stale_routing_is_abnormal_completion(self):
+        f = Fake()
+        observer.handle_status(f.call, REPO, f.status(1, 'hane/copilot-routing', 'error',
+            'Copilot routing stale for aaaaaaaaaaaa'), '900', '1')
+        self.assertIn('異常終了', f.comments[42][0]['body'])
+
     def test_blocked_gui_is_abnormal_completion(self):
         f = Fake()
         observer.handle_status(f.call, REPO, f.status(1, 'hane/gui-validation', 'error',

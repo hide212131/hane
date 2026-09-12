@@ -124,10 +124,12 @@ def status_outcome(context, state, description):
                 if state == 'success' and description.startswith('Review source: Copilot fallback')
                 else ('failure', 'Copilotによる代替レビューを正常に完了できませんでした。'))
     if context == 'hane/copilot-routing':
-        if 'controller failed' in description.lower():
-            return 'failure', 'Copilot routing controllerを正常に完了できませんでした。'
-        match = re.search(r'Copilot routing: ([a-z-]+)', description)
-        return 'success', f'判定結果: {match.group(1) if match else "完了"}'
+        match = re.fullmatch(
+            r'Copilot routing: (fix|continue-validation|blocked|workflow changes require owner) for [0-9a-f]{12}',
+            description,
+        )
+        return (('success', f'判定結果: {match.group(1)}') if match
+                else ('failure', 'Copilot routing controllerを正常に完了できませんでした。'))
     if context == 'hane/claude-fix':
         return (('success', 'Claudeによる修正が完了しました。')
                 if state == 'success' and description.startswith('Claude fix completed')
