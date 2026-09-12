@@ -48,10 +48,16 @@ jobs:
           echo "run=${decision}" >> "$GITHUB_OUTPUT"
 
       - name: Mirror AADW lifecycle to Issue / PR Conversation
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && (github.event_name != 'workflow_run' || github.event.workflow_run.name != 'Implement issue with Claude') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/aadw_observer.py
+
+      - name: Close implement lifecycle after workflow completion
+        if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name == 'Implement issue with Claude' && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_implement_completion_reconcile.py
 
       - name: Close pending lifecycle on prior heads after source workflow completion
         if: ${{ always() && github.event_name == 'workflow_run' && steps.gate.outputs.run == 'true' }}
