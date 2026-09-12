@@ -19,11 +19,12 @@ def pr():
     }
 
 
-def pending(id_=1, run=111, attempt=2):
+def pending(id_=1, run=111, attempt=2, explicit_attempt=True):
+    suffix = f'/attempts/{attempt}' if explicit_attempt else ''
     return {
         'id': id_, 'context': 'hane/claude-fix', 'state': 'pending',
         'description': f'Claude fix running for {OLD[:12]}',
-        'target_url': f'https://github.com/hide212131/hane/actions/runs/{run}/attempts/{attempt}',
+        'target_url': f'https://github.com/hide212131/hane/actions/runs/{run}{suffix}',
         'created_at': '2026-09-12T15:00:00Z',
     }
 
@@ -44,6 +45,12 @@ class Fake:
             return list(self.old_statuses)
         if clean == f'repos/{REPO}/commits/{CURRENT}/statuses':
             return []
+        if clean == f'repos/{REPO}/actions/runs/111':
+            return {'run_attempt': 2}
+        if clean == f'repos/{REPO}/actions/runs/111/attempts/1':
+            return {'run_attempt': 1, 'run_started_at': '2026-09-12T14:00:00Z'}
+        if clean == f'repos/{REPO}/actions/runs/111/attempts/2':
+            return {'run_attempt': 2, 'run_started_at': '2026-09-12T14:59:00Z'}
         if clean == f'repos/{REPO}/issues/42/comments':
             if payload is None:
                 return list(self.comments)
@@ -80,6 +87,13 @@ class Tests(unittest.TestCase):
         self.assertIn('異常終了', body)
         self.assertIn(f'sha={OLD}', body)
         self.assertIn('run=111 attempt=2', body)
+
+    def test_pending_without_attempt_is_resolved_to_completed_attempt(self):
+        fake = Fake([pending(explicit_attempt=False)])
+        self.assertEqual(subject.reconcile(fake.call, REPO, event()), 1)
+        self.assertEqual(len(fake.comments), 1)
+        self.assertIn('run=111 attempt=2', fake.comments[0]['body'])
+        self.assertIn('異常終了', fake.comments[0]['body'])
 
     def test_terminal_status_after_pending_is_not_reclosed(self):
         rows = [

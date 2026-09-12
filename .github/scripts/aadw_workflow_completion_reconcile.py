@@ -48,6 +48,7 @@ def reconcile(call, repository, payload):
         raise RuntimeError('invalid workflow_run correlation')
     conclusion = run.get('conclusion') or 'unknown'
     writes = 0
+    attempt_cache = {}
     for pr in lifecycle.pages(call, f'repos/{repository}/pulls?state=open'):
         if not lifecycle.trusted_pr(pr, repository):
             continue
@@ -57,14 +58,15 @@ def reconcile(call, repository, payload):
             for context, process in lifecycle.CONTEXTS.items():
                 rows = [row for row in statuses if row.get('context') == context]
                 for generation in lifecycle.build_generations(rows):
-                    if (generation['latest'].get('state') != 'pending'
-                            or generation['run_id'] != run_id
-                            or generation['attempt'] != attempt):
+                    if generation['latest'].get('state') != 'pending' or generation['run_id'] != run_id:
+                        continue
+                    actual_attempt = lifecycle.resolve_attempt(call, repository, generation, attempt_cache)
+                    if actual_attempt != attempt:
                         continue
                     result = aadw_notify.notify(
                         call,
                         state='failure', process=process, kind='pr', number=number,
-                        sha=sha, repository=repository, run_id=run_id, attempt=attempt,
+                        sha=sha, repository=repository, run_id=run_id, attempt=actual_attempt,
                         detail=f'workflowが終端状態を記録しないまま終了しました（{conclusion}）。',
                     )
                     writes += result['action'] != 'noop'
