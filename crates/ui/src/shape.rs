@@ -140,3 +140,83 @@ impl LineShaper for WindowShaper {
                 .closest_index_for_x(px(x))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::line::presented_block;
+    use crate::view::EditorView;
+    use hane_editor::Editor;
+    use hane_markdown::BlockIndex;
+
+    /// Issue #101 / PR #120 review: the earlier regression test asserted only
+    /// `InlineDisplay::italic`, which is set one layer above the boundary this
+    /// file owns. It never drove `WindowShaper::runs`, so a gap between "the
+    /// render policy says italic" and "the `TextRun` GPUI/CoreText receives
+    /// says italic" could pass unnoticed. This calls `runs` directly — the
+    /// same private method `shape_fragment` and `wrap_boundaries` both use,
+    /// and what `line.rs`'s painted `element.italic()`/`font_weight` mirrors
+    /// for the non-shaped paint path — and checks a CJK run asks GPUI for the
+    /// identical `FontStyle`/`FontWeight` as the equivalent ASCII run.
+    #[gpui::test]
+    fn cjk_and_ascii_emphasis_produce_the_same_font_style_at_the_shape_rs_boundary(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+
+        cx.update(|window, _| {
+            let shaper = WindowShaper::new(window);
+            let editor = Editor::new("*漢字ひらがな* *ascii* **太字** **bold**");
+            let index = BlockIndex::from_buffer(editor.document());
+            let block = index.blocks().next().expect("one paragraph block");
+            let visual =
+                presented_block(&editor, &block, &(0..usize::MAX), None).expect("block presents");
+            let line = &visual.lines[0];
+
+            let range_of = |needle: &str| {
+                let start = line.visual_text.find(needle).expect("needle present");
+                start..start + needle.len()
+            };
+
+            let cjk_italic = shaper.runs(line, &range_of("漢字ひらがな"));
+            let ascii_italic = shaper.runs(line, &range_of("ascii"));
+            assert!(
+                cjk_italic
+                    .iter()
+                    .all(|run| run.font.style == FontStyle::Italic),
+                "the CJK run must reach GPUI as FontStyle::Italic, not just InlineDisplay::italic"
+            );
+            assert_eq!(
+                cjk_italic
+                    .iter()
+                    .map(|run| run.font.style)
+                    .collect::<Vec<_>>(),
+                ascii_italic
+                    .iter()
+                    .map(|run| run.font.style)
+                    .collect::<Vec<_>>(),
+                "CJK and ASCII italic must request the same FontStyle"
+            );
+
+            let cjk_bold = shaper.runs(line, &range_of("太字"));
+            let ascii_bold = shaper.runs(line, &range_of("bold"));
+            assert!(
+                cjk_bold
+                    .iter()
+                    .all(|run| run.font.weight == FontWeight::BOLD),
+                "the CJK run must reach GPUI as FontWeight::BOLD, not just InlineDisplay::bold"
+            );
+            assert_eq!(
+                cjk_bold
+                    .iter()
+                    .map(|run| run.font.weight)
+                    .collect::<Vec<_>>(),
+                ascii_bold
+                    .iter()
+                    .map(|run| run.font.weight)
+                    .collect::<Vec<_>>(),
+                "CJK and ASCII bold must request the same FontWeight"
+            );
+        });
+    }
+}

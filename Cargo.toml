@@ -11,6 +11,7 @@ members = [
     "crates/ui",
 ]
 resolver = "2"
+exclude = ["vendor/gpui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,3 +41,5 @@ codegen-units = 1
 # CommonMark 0.31.2 ATX closing whitespace fix; see vendor/pulldown-cmark/HANE-PATCH.md.
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }
+# macOS synthetic oblique fallback; see vendor/gpui/HANE-PATCH.md.
+gpui = { path = "vendor/gpui" }
