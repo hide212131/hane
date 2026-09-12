@@ -11,10 +11,10 @@ REPO = "hide212131/hane"
 NOW = dt.datetime(2026, 9, 12, 3, 0, tzinfo=dt.timezone.utc)
 
 
-def status(id_, context, state, description, run=100, created="2026-09-12T02:55:00Z"):
+def status(id_, context, state, description, run=100, created="2026-09-12T02:55:00Z", target_url=None):
     return {
         "id": id_, "context": context, "state": state, "description": description,
-        "target_url": f"https://github.com/hide212131/hane/actions/runs/{run}",
+        "target_url": target_url or f"https://github.com/hide212131/hane/actions/runs/{run}",
         "created_at": created,
     }
 
@@ -65,6 +65,16 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("run=100 attempt=1", gh.comments[0]["body"])
         self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 0)
 
+    def test_terminal_same_run_without_attempt_stays_in_open_generation(self):
+        rows = [
+            status(10, "hane/codex-review", "pending", "Codex review pending for " + SHA[:12], run=77),
+            status(11, "hane/codex-review", "success", "Codex review clean for " + SHA[:12], run=77),
+        ]
+        generations = subject.build_generations(rows)
+        self.assertEqual(len(generations), 1)
+        self.assertEqual((generations[0]["run_id"], generations[0]["attempt"]), ("77", "1"))
+        self.assertEqual(generations[0]["latest"]["id"], 11)
+
     def test_new_pending_same_run_becomes_attempt_two_generation(self):
         rows = [
             status(10, "hane/gui-requirement", "pending", "GUI requirement classification pending for " + SHA[:12], run=77),
@@ -97,6 +107,34 @@ class ReconcileTests(unittest.TestCase):
         ])
         subject.reconcile(gh.call, REPO, now=NOW)
         self.assertIn("正常終了", gh.comments[0]["body"])
+
+    def test_gui_generation_uses_explicit_run_attempt_and_fail_is_normal(self):
+        gh = Fake([
+            status(42, "hane/gui-validation", "pending", f"GUI pending v1 {SHA[:12]} g888-3", run=888),
+            status(43, "hane/gui-validation", "failure", f"GUI fail v1 {SHA[:12]} g888-3", run=888),
+        ])
+        subject.reconcile(gh.call, REPO, now=NOW)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn("正常終了", gh.comments[0]["body"])
+        self.assertIn("run=888 attempt=3", gh.comments[0]["body"])
+
+    def test_gui_blocked_is_abnormal_completion(self):
+        gh = Fake([
+            status(44, "hane/gui-validation", "pending", f"GUI pending v1 {SHA[:12]} g889-1", run=889),
+            status(45, "hane/gui-validation", "error", f"GUI blocked v1 {SHA[:12]} g889-1", run=889),
+        ])
+        subject.reconcile(gh.call, REPO, now=NOW)
+        self.assertIn("異常終了", gh.comments[0]["body"])
+
+    def test_final_blocked_is_normal_judge_completion_and_preserves_attempt(self):
+        target = "https://github.com/hide212131/hane/actions/runs/990/attempts/2"
+        gh = Fake([
+            status(46, "hane/final-judge", "pending", f"Final pending v1 {SHA[:12]} e1234abcd", target_url=target),
+            status(47, "hane/final-judge", "error", f"Final blocked v1 {SHA[:12]} e1234abcd", target_url=target),
+        ])
+        subject.reconcile(gh.call, REPO, now=NOW)
+        self.assertIn("正常終了", gh.comments[0]["body"])
+        self.assertIn("run=990 attempt=2", gh.comments[0]["body"])
 
     def test_codex_fallback_provenance_is_shown(self):
         gh = Fake([
