@@ -147,6 +147,7 @@ CI + Codex review
 必須 CI が失敗した commit や Codex に明確な修正候補がある commit では、GUI 検証時間を使う前に Copilot が修正要否を判断する。GUI validation が不要な Pull Request は、CI と Codex の結果を処理した後に Local GUI validation を省略して final judge へ進む。
 
 ## 各 agent / validator の責務
+
 ### Work（ChatGPT）
 
 Work は設計側に限定する。要求整理・調査・詳細設計・ADR・受け入れ条件の整備までを担当し、製品実装には進まない。役割を採用する理由は [ADR-0026](adr/0026-work-design-handoff.md) に残す。
@@ -196,6 +197,7 @@ ChatGPT / Work のセッションに渡す指示の例。完了条件と禁止�
 - 利用可能な接続に必要な投稿権限がなければ、handoff と単独コマンドを利用者へ渡し、未起動であることを報告する。権限検証は回避しない。
 - 投稿後は依頼コメント・Claude の実行開始・PR 作成をそれぞれの証跡で区別する。引き渡しの確認を理由に製品実装を自分で始めない。
 ```
+
 #### 設計完了 handoff の書式
 
 設計を終えた Issue には、次の項目を持つ「設計引き渡し」節を置く。
@@ -345,6 +347,7 @@ GUI runner の実行時間を無駄にしないため、GUI validation は次を
 Copilot は進行判断を担当する。
 
 GitHub Agentic Workflows の `engine: copilot` を使い、次を入力として判断する。
+
 - 元 Issue
 - Pull Request の差分
 - 現在の head SHA
@@ -646,6 +649,7 @@ Phase 4 のうち、ローカル Mac に依存しないこの分類器だけを�
 - どちらのイベントでも、GitHub API から取得し直した Pull Request の `state` / `draft` / `head.repo.full_name` / `user.login` / 現在の `head.sha` を正本とし、Codex/Copilot の既存 controller と同じ信頼境界（open かつ非 draft、same-repository、author が repository owner または `github-actions[bot]` / `claude[bot]`）を強制する。イベント payload の head SHA ではなく、この再取得結果を分類対象 SHA とする。`workflow_dispatch` はさらに要求された `target_sha` と現在の head が一致することを要求し、不一致は publish せずに fail closed で終了する。
 
 分類ロジック（policy version `v1`）:
+
 1. Pull Request に `gui-validation-required` ラベルが付いていれば `required = true`。
 2. ラベルがない場合、`GET /pulls/{number}/files` を `--paginate` で全ページ取得する。取得自体が失敗した場合は `blocked` とし、`required = false` を推測しない。
 3. 変更ファイルが1件もない場合も証跡不足として `required = true` にfail closeする（`false` を推測しない）。
