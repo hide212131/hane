@@ -9,25 +9,36 @@ REPO = 'hide212131/hane'
 
 
 class Fake:
-    def __init__(self, conclusion='skipped'):
+    def __init__(self, conclusion='skipped', oauth='skipped'):
         self.conclusion = conclusion
+        self.oauth = oauth
         self.calls = []
 
     def call(self, endpoint):
         self.calls.append(endpoint)
         return {'jobs': [
             {'name': 'authorize', 'conclusion': 'success'},
-            {'name': 'implement', 'conclusion': self.conclusion},
+            {
+                'name': 'implement',
+                'conclusion': self.conclusion,
+                'steps': [
+                    {'name': 'Avoid duplicate implementation Pull Requests', 'conclusion': 'success'},
+                    {'name': 'Check Claude OAuth secret', 'conclusion': self.oauth},
+                ],
+            },
         ]}
 
 
-def payload(*, name='Implement issue with Claude', event='issue_comment', run_id=123, attempt=2):
-    return {'workflow_run': {
-        'id': run_id,
-        'run_attempt': attempt,
-        'name': name,
-        'event': event,
-    }}
+def payload(*, name='Implement issue with Claude', event='issue_comment', run_id=123, attempt=2, action='completed'):
+    return {
+        'action': action,
+        'workflow_run': {
+            'id': run_id,
+            'run_attempt': attempt,
+            'name': name,
+            'event': event,
+        },
+    }
 
 
 class Tests(unittest.TestCase):
@@ -39,13 +50,25 @@ class Tests(unittest.TestCase):
             [f'repos/{REPO}/actions/runs/123/attempts/2/jobs?per_page=100'],
         )
 
+    def test_existing_pr_reuse_success_is_ignored(self):
+        fake = Fake('success', oauth='skipped')
+        self.assertFalse(gate.should_observe(fake.call, REPO, payload()))
+
+    def test_actual_successful_implement_job_is_observed(self):
+        fake = Fake('success', oauth='success')
+        self.assertTrue(gate.should_observe(fake.call, REPO, payload()))
+
     def test_actual_failed_implement_job_is_observed(self):
-        fake = Fake('failure')
+        fake = Fake('failure', oauth='failure')
         self.assertTrue(gate.should_observe(fake.call, REPO, payload()))
 
     def test_cancelled_implement_job_is_observed_as_real_execution(self):
-        fake = Fake('cancelled')
+        fake = Fake('cancelled', oauth='success')
         self.assertTrue(gate.should_observe(fake.call, REPO, payload()))
+
+    def test_in_progress_run_is_not_misclassified_as_existing_pr_reuse(self):
+        fake = Fake(None, oauth=None)
+        self.assertTrue(gate.should_observe(fake.call, REPO, payload(action='in_progress')))
 
     def test_other_workflow_run_is_not_filtered(self):
         fake = Fake('skipped')
@@ -62,6 +85,12 @@ class Tests(unittest.TestCase):
     def test_missing_implement_job_fails_closed(self):
         def call(_endpoint):
             return {'jobs': [{'name': 'authorize', 'conclusion': 'success'}]}
+        with self.assertRaises(RuntimeError):
+            gate.should_observe(call, REPO, payload())
+
+    def test_successful_implement_missing_oauth_step_fails_closed(self):
+        def call(_endpoint):
+            return {'jobs': [{'name': 'implement', 'conclusion': 'success', 'steps': []}]}
         with self.assertRaises(RuntimeError):
             gate.should_observe(call, REPO, payload())
 

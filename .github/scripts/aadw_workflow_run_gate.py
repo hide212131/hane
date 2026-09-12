@@ -36,7 +36,28 @@ def should_observe(call, repository, payload):
     matches = [job for job in jobs if job.get('name') == 'implement']
     if len(matches) != 1:
         raise RuntimeError('implement workflow did not expose exactly one implement job')
-    return matches[0].get('conclusion') != 'skipped'
+    job = matches[0]
+    conclusion = job.get('conclusion')
+    if conclusion == 'skipped':
+        return False
+
+    # `/implement` may legitimately reuse an already-open implementation PR.
+    # In that path the implement job itself succeeds, but every execution step
+    # after duplicate detection is skipped and no AADW start marker is created.
+    # Treat that completed run as "no implementation process executed" rather
+    # than asking the completion controller to correlate a lifecycle that does
+    # not exist.  Failures/cancellations are still observed and closed.
+    if payload.get('action') == 'completed' and conclusion == 'success':
+        steps = job.get('steps')
+        if not isinstance(steps, list):
+            raise RuntimeError('implement workflow steps could not be inspected')
+        oauth = [step for step in steps if step.get('name') == 'Check Claude OAuth secret']
+        if len(oauth) != 1:
+            raise RuntimeError('implement workflow did not expose the OAuth guard step')
+        if oauth[0].get('conclusion') == 'skipped':
+            return False
+
+    return True
 
 
 def main():
