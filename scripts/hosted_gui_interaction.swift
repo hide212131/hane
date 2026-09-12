@@ -72,7 +72,6 @@ func escapeForAppleScript(_ s: String) -> String {
     s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
 }
 
-// Select-all, type an ASCII string via synthesized OS key events, then Cmd-S.
 func selectAllTypeSave(_ pid: pid_t, _ text: String) {
     let escaped = escapeForAppleScript(text)
     runAppleScript("""
@@ -138,10 +137,6 @@ func redoSave(_ pid: pid_t) {
     """)
 }
 
-// Select-all, type romaji via synthesized OS key events so the active IME (not this
-// script) performs the conversion, confirm the candidate with space, commit
-// with return, then Cmd-S. This proves OS-input IME behavior; it does
-// not insert Japanese Unicode text directly.
 func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
     Thread.sleep(forTimeInterval: 0.3)
@@ -168,8 +163,6 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
     """)
 }
 
-// Type through the selected OS IME at the current caret without select-all.
-// The caller first places the caret at a syntax boundary with clickText.
 func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
     focus(pid)
     selectSource(inputSource)
@@ -206,47 +199,35 @@ func recognizeText(_ path: String) {
     } catch { fail("OCR failed: \(error)") }
 }
 
-// Hash decoded RGBA pixels instead of PNG bytes. This deliberately ignores
-// PNG container metadata, so two captures are equal only when the rendered
-// pixels are equal.
+// Crop a fixed editor-body region from the screenshot, excluding the top 15%
+// where Hane renders the dynamic revision/frame header. The body crop is saved
+// as a PNG evidence artifact and its PNG-byte SHA-256 is printed. Receipt
+// validation recomputes this same digest from the staged crop artifact.
 func imagePixelDigest(_ path: String) {
     guard let image = NSImage(contentsOfFile: path) else { fail("image could not be loaded: \(path)") }
     var proposed = CGRect(origin: .zero, size: image.size)
     guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
         fail("image has no CGImage: \(path)")
     }
-    let width = cgImage.width
-    let height = cgImage.height
-    let bytesPerRow = width * 4
-    var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
-    let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-    let drew = pixels.withUnsafeMutableBytes { raw -> Bool in
-        guard let base = raw.baseAddress,
-              let context = CGContext(
-                data: base,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: colorSpace,
-                bitmapInfo: bitmapInfo.rawValue
-              )
-        else { return false }
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return true
+    let normalizedBody = CGRect(x: 0, y: 0, width: 1, height: 0.85)
+    let bodyRect = VNImageRectForNormalizedRect(normalizedBody, cgImage.width, cgImage.height).integral
+    guard let body = cgImage.cropping(to: bodyRect) else {
+        fail("could not crop editor body: \(path)")
     }
-    guard drew else { fail("could not rasterize image: \(path)") }
-    let digest = SHA256.hash(data: Data(pixels))
+    let representation = NSBitmapImageRep(cgImage: body)
+    guard let png = representation.representation(using: .png, properties: [:]) else {
+        fail("could not encode editor body crop: \(path)")
+    }
+    let outputPath = (path as NSString).deletingPathExtension + ".body.png"
+    do {
+        try png.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+    } catch {
+        fail("could not write editor body crop \(outputPath): \(error)")
+    }
+    let digest = SHA256.hash(data: png)
     print(digest.map { String(format: "%02x", $0) }.joined())
 }
 
-// Locate the first OCR line whose recognized text matches `pattern` (an ICU
-// regular expression, may use lookaround to disambiguate repeated marker
-// glyphs such as "**" occurring on several lines) and return the matched
-// substring's normalized bounding box (Vision convention: origin bottom-left,
-// 0...1 of the image). Used only to compute a click point; it is never used
-// to judge whether bold/italic rendering "looks right".
 func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
@@ -278,10 +259,6 @@ func windowBounds(_ pid: pid_t) -> CGRect {
     return bounds
 }
 
-// `screencapture -l <windowid>` crops exactly to the window's content, so a
-// Vision-normalized (0...1, bottom-left origin) box maps directly onto the
-// same 0...1 fraction of the window's own bounds — no pixel/point scale
-// factor is needed.
 func screenPoint(_ bounds: CGRect, _ normalized: CGRect, _ edge: String) -> CGPoint {
     let xNorm: CGFloat = edge == "start" ? normalized.minX : normalized.maxX
     let yNormFromTop = 1 - (normalized.minY + normalized.height / 2)
@@ -303,10 +280,6 @@ func postClick(_ point: CGPoint) {
     Thread.sleep(forTimeInterval: 0.3)
 }
 
-// Click at the marker/content boundary located by OCR on an already-taken
-// screenshot. `edge` selects the left ("start") or right ("end") edge of the
-// matched marker glyph(s), so callers can place the caret immediately before
-// or immediately after a delimiter.
 func clickText(_ pid: pid_t, _ screenshotPath: String, _ pattern: String, _ edge: String) {
     guard edge == "start" || edge == "end" else { fail("edge must be start or end") }
     let box = findTextMatch(screenshotPath, pattern)
@@ -316,8 +289,6 @@ func clickText(_ pid: pid_t, _ screenshotPath: String, _ pattern: String, _ edge
     print("clicked at \(point.x),\(point.y) for pattern \(pattern) edge=\(edge)")
 }
 
-// Real OS-level drag selection between two OCR-located marker boundaries
-// (mouse down at the first point, dragged, mouse up at the second).
 func dragSelectText(_ pid: pid_t, _ screenshotPath: String, _ pattern1: String, _ edge1: String, _ pattern2: String, _ edge2: String) {
     guard edge1 == "start" || edge1 == "end", edge2 == "start" || edge2 == "end" else { fail("edge must be start or end") }
     let bounds = windowBounds(pid)
@@ -337,9 +308,6 @@ func dragSelectText(_ pid: pid_t, _ screenshotPath: String, _ pattern1: String, 
     print("dragged from \(from.x),\(from.y) to \(to.x),\(to.y)")
 }
 
-// Type at the current caret (no select-all, unlike selectAllTypeSave) and
-// save. Used after clickText/dragSelectText has already placed the caret or
-// selection.
 func typeSave(_ pid: pid_t, _ text: String) {
     let escaped = escapeForAppleScript(text)
     runAppleScript("""
@@ -356,8 +324,6 @@ func typeSave(_ pid: pid_t, _ text: String) {
     """)
 }
 
-// Move away from the edited syntax line so hidden Markdown markers return to
-// their normal presentation before the next OCR-located operation.
 func moveDocStart(_ pid: pid_t) {
     runAppleScript("""
     tell application "System Events"
@@ -371,9 +337,6 @@ func moveDocStart(_ pid: pid_t) {
     """)
 }
 
-// Move the caret through the editor with real arrow-key events. This is kept
-// separate from shiftSelect so acceptance tests can prove navigation, rather
-// than inferring it from selection or cleanup behavior.
 func moveCaret(_ pid: pid_t, _ direction: String, _ count: Int) {
     let codes = ["left": 123, "right": 124, "down": 125, "up": 126]
     guard let code = codes[direction] else { fail("direction must be left, right, up, or down") }
@@ -484,9 +447,7 @@ case "select-source":
     guard arguments.count == 2 else { fail("select-source requires an input source id") }
     selectSource(arguments[1])
 case "select-all-type-save":
-    guard arguments.count == 3, let pid = pid_t(arguments[1]) else {
-        fail("select-all-type-save requires PID and text")
-    }
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("select-all-type-save requires PID and text") }
     selectAllTypeSave(pid, arguments[2])
 case "append-save":
     guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("append-save requires PID and text") }
@@ -498,24 +459,16 @@ case "redo-save":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("redo-save requires PID") }
     redoSave(pid)
 case "type-romaji-commit-save":
-    guard arguments.count == 4, let pid = pid_t(arguments[1]) else {
-        fail("type-romaji-commit-save requires PID, romaji text and source ID")
-    }
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-commit-save requires PID, romaji text and source ID") }
     selectAllTypeRomajiCommitSave(pid, arguments[2], arguments[3])
 case "type-romaji-at-caret-commit-save":
-    guard arguments.count == 4, let pid = pid_t(arguments[1]) else {
-        fail("type-romaji-at-caret-commit-save requires PID, romaji text and source ID")
-    }
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-commit-save requires PID, romaji text and source ID") }
     typeRomajiAtCaretCommitSave(pid, arguments[2], arguments[3])
 case "click-text":
-    guard arguments.count == 5, let pid = pid_t(arguments[1]) else {
-        fail("click-text requires PID, screenshot path, regex pattern and edge")
-    }
+    guard arguments.count == 5, let pid = pid_t(arguments[1]) else { fail("click-text requires PID, screenshot path, regex pattern and edge") }
     clickText(pid, arguments[2], arguments[3], arguments[4])
 case "drag-select-text":
-    guard arguments.count == 7, let pid = pid_t(arguments[1]) else {
-        fail("drag-select-text requires PID, screenshot path, pattern1, edge1, pattern2, edge2")
-    }
+    guard arguments.count == 7, let pid = pid_t(arguments[1]) else { fail("drag-select-text requires PID, screenshot path, pattern1, edge1, pattern2, edge2") }
     dragSelectText(pid, arguments[2], arguments[3], arguments[4], arguments[5], arguments[6])
 case "type-save":
     guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("type-save requires PID and text") }
@@ -524,14 +477,10 @@ case "move-doc-start":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("move-doc-start requires PID") }
     moveDocStart(pid)
 case "move-caret":
-    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else {
-        fail("move-caret requires PID, direction and count")
-    }
+    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else { fail("move-caret requires PID, direction and count") }
     moveCaret(pid, arguments[2], count)
 case "shift-select":
-    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else {
-        fail("shift-select requires PID, direction and count")
-    }
+    guard arguments.count == 4, let pid = pid_t(arguments[1]), let count = Int(arguments[3]) else { fail("shift-select requires PID, direction and count") }
     shiftSelect(pid, arguments[2], count)
 case "delete-selection-save":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("delete-selection-save requires PID") }
