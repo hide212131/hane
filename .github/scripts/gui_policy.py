@@ -10,6 +10,18 @@ PROCEDURE = 'hosted-gui-interaction/5'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
+INLINE_FIXTURE_ORIGINAL = (
+    '# hosted gui interaction inline syntax spike\n'
+    '\n'
+    '**bold *italic* combo** boundary line.\n'
+    '\n'
+    'this inline `code\n'
+    'span` crosses a line.\n'
+    '\n'
+    '> quote with **bold** inside.\n'
+    '\n'
+    '- list item with *italic* inside.\n'
+)
 REQUIRED_STEPS = {
     'ascii_edit_save_undo_redo_reopen': {'launch', 'window_discovery', 'edit_save', 'append_save', 'undo_save', 'redo_save', 'capture_before', 'capture_after', 'capture_reopen', 'visible_saved_text', 'reopen_content_check', 'cleanup'},
     'japanese_ime_input': {'query_current_source', 'list_input_sources', 'select_japanese_source', 'launch', 'window_discovery', 'ime_input_save', 'capture_before', 'capture_after', 'cleanup', 'restore_input_source'},
@@ -24,16 +36,23 @@ REQUIRED_STEPS = {
         'capture_boundary_click_edit_code_span_1', 'boundary_click_edit_code_span_check_1',
         'capture_boundary_click_edit_quote_0', 'boundary_click_edit_quote_check_0',
         'capture_boundary_click_edit_list_0', 'boundary_click_edit_list_check_0',
+        'boundary_caret_navigation',
+        'capture_boundary_caret_navigation_0', 'boundary_caret_navigation_check_0',
+        'capture_boundary_caret_navigation_1', 'boundary_caret_navigation_check_1',
+        'capture_boundary_caret_navigation_2', 'boundary_caret_navigation_check_2',
         'boundary_ime_input', 'capture_boundary_ime_input', 'boundary_ime_input_check',
         'restore_boundary_ime_input_source',
         'drag_select_delete_undo_redo', 'capture_drag_select_state0',
         'drag_select_delete_undo_redo_check',
-        'delimiter_toggle_star', 'capture_delimiter_toggle_star_unclosed',
-        'capture_delimiter_toggle_star_closed', 'delimiter_toggle_star_check',
-        'delimiter_toggle_bold', 'capture_delimiter_toggle_bold_unclosed',
-        'capture_delimiter_toggle_bold_closed', 'delimiter_toggle_bold_check',
-        'delimiter_toggle_code', 'capture_delimiter_toggle_code_unclosed',
-        'capture_delimiter_toggle_code_closed', 'delimiter_toggle_code_check',
+        'delimiter_toggle_star', 'capture_delimiter_toggle_star_initial_closed',
+        'capture_delimiter_toggle_star_unclosed', 'capture_delimiter_toggle_star_closed',
+        'delimiter_toggle_star_check',
+        'delimiter_toggle_bold', 'capture_delimiter_toggle_bold_initial_closed',
+        'capture_delimiter_toggle_bold_unclosed', 'capture_delimiter_toggle_bold_closed',
+        'delimiter_toggle_bold_check',
+        'delimiter_toggle_code', 'capture_delimiter_toggle_code_initial_closed',
+        'capture_delimiter_toggle_code_unclosed', 'capture_delimiter_toggle_code_closed',
+        'delimiter_toggle_code_check',
         'capture_after', 'cleanup',
         'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
         'visible_saved_text', 'reopen_content_check', 'cleanup_reopen',
@@ -53,12 +72,18 @@ REQUIRED_IMAGES = [
     'inline_syntax_boundary/boundary_click_edit_code_span_1.png',
     'inline_syntax_boundary/boundary_click_edit_quote_0.png',
     'inline_syntax_boundary/boundary_click_edit_list_0.png',
+    'inline_syntax_boundary/boundary_caret_navigation_0.png',
+    'inline_syntax_boundary/boundary_caret_navigation_1.png',
+    'inline_syntax_boundary/boundary_caret_navigation_2.png',
     'inline_syntax_boundary/boundary_ime_input.png',
     'inline_syntax_boundary/drag_select_state0.png',
+    'inline_syntax_boundary/delimiter_toggle_star_initial_closed.png',
     'inline_syntax_boundary/delimiter_toggle_star_unclosed.png',
     'inline_syntax_boundary/delimiter_toggle_star_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_bold_initial_closed.png',
     'inline_syntax_boundary/delimiter_toggle_bold_unclosed.png',
     'inline_syntax_boundary/delimiter_toggle_bold_closed.png',
+    'inline_syntax_boundary/delimiter_toggle_code_initial_closed.png',
     'inline_syntax_boundary/delimiter_toggle_code_unclosed.png',
     'inline_syntax_boundary/delimiter_toggle_code_closed.png',
 ]
@@ -128,42 +153,121 @@ def _require_text(step, *names):
             raise ValueError(f'missing inline evidence field: {name}')
 
 
+def _require_image_ref(step, field, relative):
+    _require_text(step, field)
+    actual = Path(step[field])
+    expected = Path(relative)
+    if len(actual.parts) < len(expected.parts) or actual.parts[-len(expected.parts):] != expected.parts:
+        raise ValueError(f'inline screenshot reference mismatch: {field}')
+
+
+def _delimiter_states(delimiter):
+    closed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail'
+    unclosed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail'
+    return unclosed, closed
+
+
 def _validate_inline_evidence(steps):
+    names = [step.get('name') for step in steps]
+    if len(names) != len(set(names)):
+        raise ValueError('duplicate inline evidence step')
     by_name = {step.get('name'): step for step in steps}
-    boundary_checks = (
-        'boundary_click_edit_bold_italic_check_0',
-        'boundary_click_edit_bold_italic_check_1',
-        'boundary_click_edit_code_span_check_0',
-        'boundary_click_edit_code_span_check_1',
-        'boundary_click_edit_quote_check_0',
-        'boundary_click_edit_list_check_0',
-        'boundary_ime_input_check',
-    )
-    for name in boundary_checks:
+
+    boundary_images = {
+        'boundary_click_edit_bold_italic_check_0': 'inline_syntax_boundary/boundary_click_edit_bold_italic_0.png',
+        'boundary_click_edit_bold_italic_check_1': 'inline_syntax_boundary/boundary_click_edit_bold_italic_1.png',
+        'boundary_click_edit_code_span_check_0': 'inline_syntax_boundary/boundary_click_edit_code_span_0.png',
+        'boundary_click_edit_code_span_check_1': 'inline_syntax_boundary/boundary_click_edit_code_span_1.png',
+        'boundary_click_edit_quote_check_0': 'inline_syntax_boundary/boundary_click_edit_quote_0.png',
+        'boundary_click_edit_list_check_0': 'inline_syntax_boundary/boundary_click_edit_list_0.png',
+        'boundary_ime_input_check': 'inline_syntax_boundary/boundary_ime_input.png',
+    }
+    boundary_expected = {
+        'boundary_click_edit_bold_italic_check_0': INLINE_FIXTURE_ORIGINAL.replace('**bold', '**Zbold', 1),
+        'boundary_click_edit_bold_italic_check_1': INLINE_FIXTURE_ORIGINAL.replace('combo**', 'comboZ**', 1),
+        'boundary_click_edit_code_span_check_0': INLINE_FIXTURE_ORIGINAL.replace('`code', '`Zcode', 1),
+        'boundary_click_edit_code_span_check_1': INLINE_FIXTURE_ORIGINAL.replace('span`', 'spanZ`', 1),
+        'boundary_click_edit_quote_check_0': INLINE_FIXTURE_ORIGINAL.replace('quote with **bold', 'quote with **Zbold', 1),
+        'boundary_click_edit_list_check_0': INLINE_FIXTURE_ORIGINAL.replace('item with *italic', 'item with *Zitalic', 1),
+        'boundary_ime_input_check': INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
+    }
+    for name, image in boundary_images.items():
         step = by_name[name]
-        _require_text(step, 'screenshot', 'expected_after_insert', 'actual_after_insert',
+        _require_text(step, 'expected_after_insert', 'actual_after_insert',
                       'expected_after_undo', 'actual_after_undo')
-        if step['expected_after_insert'] != step['actual_after_insert']:
+        _require_image_ref(step, 'screenshot', image)
+        if step['expected_after_insert'] != boundary_expected[name]
+                or step['expected_after_insert'] != step['actual_after_insert']:
             raise ValueError('inline insertion evidence mismatch')
-        if step['expected_after_undo'] != step['actual_after_undo']:
+        if step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+                or step['expected_after_undo'] != step['actual_after_undo']:
             raise ValueError('inline undo evidence mismatch')
 
+    navigation = {
+        'boundary_caret_navigation_check_0': (
+            'inline_syntax_boundary/boundary_caret_navigation_0.png',
+            'left_across_open_marker', 'left',
+            INLINE_FIXTURE_ORIGINAL.replace('**bold', '*N*bold', 1),
+        ),
+        'boundary_caret_navigation_check_1': (
+            'inline_syntax_boundary/boundary_caret_navigation_1.png',
+            'right_into_visible_text', 'right',
+            INLINE_FIXTURE_ORIGINAL.replace('**bold', '**bNold', 1),
+        ),
+        'boundary_caret_navigation_check_2': (
+            'inline_syntax_boundary/boundary_caret_navigation_2.png',
+            'up_from_multiline_code_close', 'up',
+            INLINE_FIXTURE_ORIGINAL.replace('this inline `code', 'thisN inline `code', 1),
+        ),
+    }
+    for name, (image, case, direction, expected) in navigation.items():
+        step = by_name[name]
+        _require_text(step, 'case', 'direction', 'expected_after_move_insert', 'actual_after_move_insert',
+                      'expected_after_undo', 'actual_after_undo')
+        _require_image_ref(step, 'screenshot', image)
+        if step.get('count') != 1 or step['case'] != case or step['direction'] != direction:
+            raise ValueError('caret-navigation operation evidence mismatch')
+        if step['expected_after_move_insert'] != expected
+                or step['actual_after_move_insert'] != expected:
+            raise ValueError('caret-navigation source-position mismatch')
+        if step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
+                or step['actual_after_undo'] != INLINE_FIXTURE_ORIGINAL:
+            raise ValueError('caret-navigation undo evidence mismatch')
+
     drag = by_name['drag_select_delete_undo_redo_check']
-    _require_text(drag, 'screenshot', 'deleted_expected', 'deleted_actual',
+    _require_text(drag, 'deleted_expected', 'deleted_actual',
                   'undo_actual', 'redo_actual', 'restored_actual')
-    if drag['deleted_expected'] != drag['deleted_actual'] or drag['deleted_expected'] != drag['redo_actual']:
+    _require_image_ref(drag, 'screenshot', 'inline_syntax_boundary/drag_select_state0.png')
+    deleted_expected = INLINE_FIXTURE_ORIGINAL.replace('old *italic* com', '', 1)
+    if drag['deleted_expected'] != deleted_expected or drag['deleted_actual'] != deleted_expected
+            or drag['redo_actual'] != deleted_expected:
         raise ValueError('drag-selection evidence mismatch')
-    if drag['undo_actual'] != drag['restored_actual']:
+    if drag['undo_actual'] != INLINE_FIXTURE_ORIGINAL or drag['restored_actual'] != INLINE_FIXTURE_ORIGINAL:
         raise ValueError('drag-selection restore evidence mismatch')
 
-    for kind in ('star', 'bold', 'code'):
+    expected_delimiters = {'star': '*', 'bold': '**', 'code': '`'}
+    for kind, delimiter in expected_delimiters.items():
         step = by_name[f'delimiter_toggle_{kind}_check']
-        _require_text(step, 'unclosed_screenshot', 'closed_screenshot', 'delimiter',
+        _require_text(step, 'delimiter', 'initial_pixel_digest', 'unclosed_pixel_digest', 'closed_pixel_digest',
                       'unclosed_expected', 'unclosed_actual', 'closed_expected', 'closed_actual')
-        if step['unclosed_expected'] != step['unclosed_actual']:
+        _require_image_ref(step, 'initial_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_initial_closed.png')
+        _require_image_ref(step, 'unclosed_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_unclosed.png')
+        _require_image_ref(step, 'closed_screenshot', f'inline_syntax_boundary/delimiter_toggle_{kind}_closed.png')
+        if step['delimiter'] != delimiter:
+            raise ValueError('delimiter kind/evidence mismatch')
+        expected_unclosed, expected_closed = _delimiter_states(delimiter)
+        if step['unclosed_expected'] != expected_unclosed or step['unclosed_actual'] != expected_unclosed:
             raise ValueError('delimiter-unclosed evidence mismatch')
-        if step['closed_expected'] != step['closed_actual']:
+        if step['closed_expected'] != expected_closed or step['closed_actual'] != expected_closed:
             raise ValueError('delimiter-closed evidence mismatch')
+        digests = (step['initial_pixel_digest'], step['unclosed_pixel_digest'], step['closed_pixel_digest'])
+        if any(not re.fullmatch('[0-9a-f]{64}', digest) for digest in digests):
+            raise ValueError('delimiter pixel-digest evidence invalid')
+        if step.get('visual_transition_observed') is not True or step.get('closed_visual_restored') is not True:
+            raise ValueError('delimiter visual transition evidence missing')
+        if step['initial_pixel_digest'] != step['closed_pixel_digest']
+                or step['unclosed_pixel_digest'] == step['closed_pixel_digest']:
+            raise ValueError('delimiter visual transition evidence mismatch')
 
 
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
