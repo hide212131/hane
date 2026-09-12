@@ -54,6 +54,7 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 | 再オープン | プロセスを終了し、別の設定領域で同じ保存文書を開き、内容と画像を確認 |
 | 日本語IME | 入力方式と親methodを確認し、OS経由のromajiから変換・確定し、保存された日本語を照合 |
 | スクロール・フォーカス等 | OSの操作と、その操作による表示・状態の変化を確認。内部instrumentの設定と区別 |
+| インライン構文（太字・斜体・inline code） | 太字＋斜体複合・複数行にまたがるinline code・quote内・list内のmarker/本文境界をOCRで特定してクリック・ドラッグ選択し、`*`/`**`/backtickの追加削除後の保存byte列を照合。OCRは座標特定のみに使い、見た目の合否判定には使わない |
 
 既存の起動・撮影部品は `scripts/gui_validate.py` と `scripts/window_id.swift`、入力部品は `scripts/phase0_input.swift` にある。実験手順 `scripts/hosted_gui_interaction.py` / `.swift` は基本操作の調査用であり、productionの受領契約や網羅的GUI検証の完成を意味しない。
 
@@ -65,15 +66,15 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 
 結果には上記の対応情報に加え、実際のcheckout SHA・clean状態、binary digestとtoolchain/features、runner image/version、開始・終了時刻、工程・シナリオごとの `pass` / `fail` / `blocked`、理由、証拠の一覧・digestを含める。GitHub Actionsの run ID / attempt は artifact と結果に一致させる。
 
-手順 `hosted-gui-interaction/4` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
+手順 `hosted-gui-interaction/5` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
 
-GUIステータスの版にも手順番号を含める（例: `v1-p4`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
+GUIステータスの版にも手順番号を含める（例: `v1-p5`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
 
-手順4では、対象のCargoビルドより前に信頼するSwiftヘルパーをコンパイルし、呼び出し前後でバイナリのSHA-256を確認する。ビルド後にcontrol checkoutのSwiftソースを読み直さない。同一OSユーザーの悪意ある常駐プロセスに対する完全な隔離を保証するものではない。GUI要否・レビュー・CIが途中で不適格になった世代は実行・報告を止め、書き込み権限のある制御処理が待機状態を無効化する。再び適格になれば新しい世代を開始する。
+手順5では、対象のCargoビルドより前に信頼するSwiftヘルパーをコンパイルし、呼び出し前後でバイナリのSHA-256を確認する。ビルド後にcontrol checkoutのSwiftソースを読み直さない。同一OSユーザーの悪意ある常駐プロセスに対する完全な隔離を保証するものではない。GUI要否・レビュー・CIが途中で不適格になった世代は実行・報告を止め、書き込み権限のある制御処理が待機状態を無効化する。再び適格になれば新しい世代を開始する。
 
 同じ手順版でも、終端結果に対応するreceipt artifactが欠落・期限切れの場合は新世代で再検証する。ステータス公開後のアップロード中は、その実行attemptの完了を待つ。証拠が保存されている終端結果は繰り返さない。
 
-受領処理は本文中の自己申告だけを信頼せず、Actions APIでworkflow、repository、実行元、run/attempt、artifactを照合する。現在のPR headと世代を再取得し、不一致の結果はstaleとして現在判定から除く。同じ世代の終端結果は再処理しない。再実行は新しい世代を発行し、旧結果を消さずに分ける。
+受領処理は本文中の自己申告だけを信じず、Actions APIでworkflow、repository、実行元、run/attempt、artifactを照合する。現在のPR headと世代を再取得し、不一致の結果はstaleとして現在判定から除く。同じ世代の終端結果は再処理しない。再実行は新しい世代を発行し、旧結果を消さずに分ける。
 
 ビルド不能・ジョブ失敗・取消・期限切れで通常の結果が作れない場合も、受領側が実行状態を確認して `blocked` として終端処理する。`pass` / `fail` / `blocked` のいずれでも final judge を起動する。GUIが必要な場合、同じ対象SHA・現世代の `pass` がなければjudgeの `ready` を採用しない。
 

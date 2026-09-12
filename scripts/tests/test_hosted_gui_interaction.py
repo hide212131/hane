@@ -1,6 +1,8 @@
 """Helper provenance checks without touching a screen or invoking Swift."""
 import hashlib
+import inspect
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,3 +45,109 @@ class HelperTests(unittest.TestCase):
                     self.assertEqual(output, '')
                     self.assertIn('integrity mismatch', reason)
                     self.assertEqual(run.call_count, int(when == 'during'))
+
+    def test_body_crop_uses_cgimage_top_left_coordinates(self):
+        source = Path(interaction.__file__).with_name('hosted_gui_interaction.swift').read_text()
+        self.assertIn('let topInset = CGFloat(cgImage.height) * 0.15', source)
+        self.assertRegex(source, r'CGRect\(\s*x: 0,\s*y: topInset,')
+        self.assertNotIn('VNImageRectForNormalizedRect(normalizedBody', source)
+
+
+class InlineSyntaxExpectationTests(unittest.TestCase):
+    """Pure source-byte and visible-anchor logic for inline_syntax_boundary."""
+
+    def test_boundary_insertions_match_the_fixture(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        cases = [
+            (interaction.BOLD_ITALIC_OPEN_RE, 'end', text.replace('**bold', '**Zbold', 1)),
+            (interaction.BOLD_ITALIC_CLOSE_RE, 'start', text.replace('combo**', 'comboZ**', 1)),
+            (interaction.CODE_SPAN_OPEN_RE, 'end', text.replace('`code', '`Zcode', 1)),
+            (interaction.CODE_SPAN_CLOSE_RE, 'start', text.replace('span`', 'spanZ`', 1)),
+            (interaction.QUOTE_BOLD_OPEN_RE, 'end', text.replace('quote with **bold', 'quote with **Zbold', 1)),
+            (interaction.LIST_ITALIC_OPEN_RE, 'end', text.replace('item with *italic', 'item with *Zitalic', 1)),
+        ]
+        for pattern, edge, expected in cases:
+            with self.subTest(pattern=pattern, edge=edge):
+                self.assertEqual(interaction.insert_at_match(text, pattern, 'Z', edge=edge), expected)
+
+    def test_boundary_ime_expected_bytes_use_the_same_hidden_marker_boundary(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        expected = text.replace('**bold', '**日本語bold', 1)
+        self.assertEqual(
+            interaction.insert_at_match(text, interaction.BOLD_ITALIC_OPEN_RE,
+                                        interaction.IME_EXPECTED_TEXT, edge='end'),
+            expected,
+        )
+
+    def test_unmatched_pattern_is_rejected_rather_than_silently_skipped(self):
+        with self.assertRaises(ValueError):
+            interaction.insert_at_match(interaction.INLINE_FIXTURE_ORIGINAL, r'not-present', 'Z', edge='end')
+
+    def test_ocr_locators_match_visible_text_without_hidden_markers(self):
+        rendered_lines = [
+            'bold italic combo boundary line.',
+            'this inline code',
+            'span crosses a line.',
+            'quote with bold inside.',
+            'list item with italic inside.',
+        ]
+        patterns = [
+            interaction.BOLD_ITALIC_OCR_RE,
+            interaction.CODE_SPAN_OPEN_OCR_RE,
+            interaction.CODE_SPAN_CLOSE_OCR_RE,
+            interaction.QUOTE_BOLD_OPEN_OCR_RE,
+            interaction.LIST_ITALIC_OPEN_OCR_RE,
+            interaction.DRAG_SELECT_START_OCR_RE,
+            interaction.DRAG_SELECT_END_OCR_RE,
+        ]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(sum(bool(re.search(pattern, line)) for line in rendered_lines), 1)
+                self.assertNotRegex(pattern, r'\\[\*`]')
+
+    def test_drag_selection_expected_bytes_cross_hidden_inner_markers(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        selected = 'old *italic* com'
+        self.assertIn(selected, text)
+        self.assertEqual(text.replace(selected, '', 1),
+                         text.replace('**bold *italic* combo**', '**bbo**', 1))
+
+    def test_bold_italic_and_quote_source_patterns_target_different_lines(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        bold_italic_pos = re.search(interaction.BOLD_ITALIC_OPEN_RE, text).start()
+        quote_pos = re.search(interaction.QUOTE_BOLD_OPEN_RE, text).start()
+        self.assertNotEqual(bold_italic_pos, quote_pos)
+        self.assertIn('*italic*', text[bold_italic_pos:text.index('\n', bold_italic_pos)])
+        self.assertIn('quote with', text[:quote_pos].rsplit('\n', 1)[-1])
+
+    def test_each_required_delimiter_has_closed_and_unclosed_exact_bytes(self):
+        for delimiter in ('*', '**', '`'):
+            with self.subTest(delimiter=delimiter):
+                unclosed, closed = interaction.delimiter_states(delimiter)
+                self.assertEqual(unclosed, interaction.INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail')
+                self.assertEqual(closed, interaction.INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail')
+                closing_at = closed.rindex(delimiter, len(interaction.INLINE_FIXTURE_ORIGINAL))
+                self.assertEqual(closed[:closing_at] + closed[closing_at + len(delimiter):], unclosed)
+
+    def test_unknown_delimiter_is_rejected(self):
+        with self.assertRaises(ValueError):
+            interaction.delimiter_states('~~~')
+
+    def test_multiline_code_span_close_toggle_targets_the_shared_parse_span(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        self.assertIn('`code\nspan`', text)
+        closing_at = re.search(interaction.CODE_SPAN_CLOSE_RE, text).start()
+        unclosed = text[:closing_at] + text[closing_at + 1:]
+        self.assertEqual(unclosed, text.replace('span`', 'span', 1))
+        source = inspect.getsource(interaction.run_multiline_code_span_toggle_step)
+        self.assertIn("INLINE_FIXTURE_ORIGINAL.replace(\"span`\", \"span\", 1)", source)
+        self.assertIn('CODE_SPAN_CLOSE_OCR_RE', source)
+        self.assertIn('image_pixel_digest', source)
+
+    def test_inline_syntax_scenario_exercises_the_existing_multiline_code_span(self):
+        source = inspect.getsource(interaction.run_inline_syntax_scenario)
+        self.assertIn('run_multiline_code_span_toggle_step(', source)
+
+
+if __name__ == '__main__':
+    unittest.main()
