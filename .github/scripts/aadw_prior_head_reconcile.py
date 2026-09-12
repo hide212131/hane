@@ -9,8 +9,8 @@ head B arrived before the notification reconciler ran.
 This controller therefore combines two trusted sources:
 - existing GitHub Actions AADW start comments, which preserve an exact old SHA,
   run id, and attempt even when the head has moved;
-- the most recent PR commits, which recover a lifecycle even when its start
-  comment was missed before the head changed.
+- every commit currently contained in the PR, which recovers a lifecycle even
+  when its start comment was missed before the head changed.
 
 It reuses the status grouping and outcome semantics from
 aadw_notification_reconcile and writes through aadw_notify, so a recovered
@@ -30,7 +30,6 @@ _MARKER = re.compile(
     r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
 )
 PROCESS_CONTEXT = {process: context for context, process in lifecycle.CONTEXTS.items()}
-_RECENT_PRIOR_HEADS = 5
 
 
 def prior_starts(call, repository, pr, cutoff):
@@ -60,7 +59,7 @@ def prior_starts(call, repository, pr, cutoff):
     return [(*key, comment) for key, comment in found.items()]
 
 
-def recent_prior_shas(call, repository, pr):
+def prior_shas(call, repository, pr):
     current_sha = pr['head']['sha']
     rows = lifecycle.pages(call, f'repos/{repository}/pulls/{int(pr["number"])}/commits')
     shas = []
@@ -68,9 +67,11 @@ def recent_prior_shas(call, repository, pr):
         sha = row.get('sha')
         if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha) and sha != current_sha:
             shas.append(sha)
-    # AADW automatically stops after three completed fixes. Five prior heads
-    # therefore cover the whole normal repair loop with room for manual retry.
-    return shas[-_RECENT_PRIOR_HEADS:]
+    # PR commits are individual commits, not a bounded list of historical head
+    # generations. A prior head can be arbitrarily far from the current tip when
+    # one fix pushes several commits, so do not truncate this candidate set.
+    # `reconcile_sha()` still applies the status lookback before writing.
+    return shas
 
 
 def reconcile_sha(call, repository, number, sha, statuses, cutoff):
@@ -95,12 +96,13 @@ def reconcile_pr(call, repository, pr, cutoff):
     number = int(pr['number'])
     current_sha = pr['head']['sha']
 
-    # Recent PR commits recover a missed start even when the head moved before
-    # the ordinary current-head reconciler observed its pending status.
-    candidates = set(recent_prior_shas(call, repository, pr))
+    # Every PR commit is a candidate because any one of them may have been a
+    # prior branch tip when an AADW process wrote its status.
+    candidates = set(prior_shas(call, repository, pr))
 
-    # A trusted start comment may refer to an older SHA outside the bounded
-    # commit window. Preserve those explicit correlations as well.
+    # A trusted start comment may refer to a SHA no longer present in the
+    # current PR commit list (for example after history rewriting). Preserve
+    # those explicit correlations as well.
     for _process, sha, _run_id, _attempt, _comment in prior_starts(call, repository, pr, cutoff):
         candidates.add(sha)
 

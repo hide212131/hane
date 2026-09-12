@@ -37,6 +37,7 @@ class Fake:
             'body': '### AADW: Claude Codeによる自動修正 — 処理開始\n\n' + marker + '\n',
         }]
         self.next_id = 11
+        self.commit_shas = [OLD, CURRENT]
         self.old_statuses = [
             status(1, 'pending', 'Claude fix running for ' + OLD[:12],
                    'https://github.com/hide212131/hane/actions/runs/777'),
@@ -47,27 +48,21 @@ class Fake:
 
     def call(self, endpoint, payload=None, method=None):
         self.calls.append((endpoint, payload, method))
-        if '/pulls?state=open' in endpoint:
+        clean = endpoint.split('?', 1)[0]
+        if clean.endswith('/pulls') and 'state=open' in endpoint:
             return [{
                 'number': 131, 'state': 'open', 'draft': False,
                 'user': {'login': 'github-actions[bot]'},
                 'head': {'sha': CURRENT, 'repo': {'full_name': REPO}},
             }]
-        if '/pulls/131/commits?' in endpoint:
-            return [{'sha': OLD}, {'sha': CURRENT}]
-        if f'/commits/{OLD}/statuses' in endpoint:
-            return self.old_statuses
-        if '/issues/131/comments?' in endpoint:
-            return self.comments
-        if '/issues/comments/' in endpoint:
-            ident = int(endpoint.rsplit('/', 1)[1])
-            for row in self.comments:
-                if row['id'] == ident:
-                    row['body'] = payload['body']
-                    row['updated_at'] = '2026-09-12T03:06:00Z'
-                    return row
-            raise AssertionError('missing comment')
-        if endpoint.endswith('/issues/131/comments'):
+        if clean == f'repos/{REPO}/pulls/131/commits':
+            return [{'sha': sha} for sha in self.commit_shas]
+        if clean.startswith(f'repos/{REPO}/commits/') and clean.endswith('/statuses'):
+            sha = clean.split('/commits/', 1)[1].split('/statuses', 1)[0]
+            return self.old_statuses if sha == OLD else []
+        if clean == f'repos/{REPO}/issues/131/comments':
+            if payload is None:
+                return self.comments
             row = {
                 'id': self.next_id,
                 'user': {'login': 'github-actions[bot]'},
@@ -78,6 +73,17 @@ class Fake:
             self.next_id += 1
             self.comments.append(row)
             return row
+        if clean.startswith(f'repos/{REPO}/issues/comments/'):
+            ident = int(clean.rsplit('/', 1)[1])
+            for row in list(self.comments):
+                if row['id'] == ident:
+                    if method == 'DELETE':
+                        self.comments.remove(row)
+                        return None
+                    row['body'] = payload['body']
+                    row['updated_at'] = '2026-09-12T03:06:00Z'
+                    return row
+            raise AssertionError('missing comment')
         raise AssertionError(endpoint)
 
 
@@ -99,7 +105,7 @@ class PriorHeadTests(unittest.TestCase):
         self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 0)
         self.assertEqual(len(gh.comments), 1)
 
-    def test_missed_start_is_recovered_from_recent_prior_commit_statuses(self):
+    def test_missed_start_is_recovered_from_prior_commit_statuses(self):
         gh = Fake()
         gh.comments = []
         writes = subject.reconcile(gh.call, REPO, now=NOW)
@@ -109,6 +115,17 @@ class PriorHeadTests(unittest.TestCase):
         self.assertIn('正常終了', body)
         self.assertIn(f'sha={OLD}', body)
         self.assertIn('run=777 attempt=1', body)
+
+    def test_prior_head_is_not_lost_when_more_than_five_commits_follow_it(self):
+        gh = Fake()
+        gh.comments = []
+        gh.commit_shas = [OLD, 'c' * 40, 'd' * 40, 'e' * 40, 'f' * 40, '1' * 40, CURRENT]
+        writes = subject.reconcile(gh.call, REPO, now=NOW)
+        self.assertEqual(writes, 1)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn(f'sha={OLD}', gh.comments[0]['body'])
+        scanned = [call[0] for call in gh.calls if f'/commits/{OLD}/statuses' in call[0]]
+        self.assertTrue(scanned)
 
     def test_old_status_outside_lookback_is_not_backfilled(self):
         gh = Fake()
