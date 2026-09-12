@@ -63,6 +63,18 @@ class Fake:
             return row
         raise AssertionError(endpoint)
 
+    def trigger_comment(self, number=130, actor='hide212131', created_at='2026-09-12T03:00:00Z', ident=10):
+        row = {
+            'id': ident,
+            'user': {'login': actor},
+            'body': '/implement',
+            'created_at': created_at,
+            'issue_url': f'https://api.github.com/repos/{REPO}/issues/{number}',
+        }
+        self.issue_comments.setdefault(number, []).append(row)
+        self.all_comments.append(row)
+        return row
+
 
 class Tests(unittest.TestCase):
     def start(self, fake):
@@ -100,6 +112,45 @@ class Tests(unittest.TestCase):
         body = f.issue_comments[130][0]['body']
         self.assertIn('正常終了', body)
         self.assertIn('実装PR #42', body)
+
+    def test_pre_start_failure_recovers_triggering_implement_comment(self):
+        f = Fake()
+        f.trigger_comment()
+        action = reconcile.reconcile(
+            f.call, REPO, '777', '2', 'failure',
+            actor='hide212131', run_created_at='2026-09-12T03:00:03Z',
+        )
+        self.assertEqual(action, 'create')
+        lifecycle = [c for c in f.issue_comments[130] if 'hane-aadw:' in c['body']]
+        self.assertEqual(len(lifecycle), 1)
+        self.assertIn('異常終了', lifecycle[0]['body'])
+        self.assertIn('run=777 attempt=2', lifecycle[0]['body'])
+
+    def test_trigger_comment_must_be_exact_and_match_actor(self):
+        f = Fake()
+        f.trigger_comment(actor='someone-else')
+        f.all_comments.append({
+            'id': 11,
+            'user': {'login': 'hide212131'},
+            'body': '/implement please',
+            'created_at': '2026-09-12T03:00:01Z',
+            'issue_url': f'https://api.github.com/repos/{REPO}/issues/131',
+        })
+        with self.assertRaises(RuntimeError):
+            reconcile.reconcile(
+                f.call, REPO, '777', '2', 'failure',
+                actor='hide212131', run_created_at='2026-09-12T03:00:03Z',
+            )
+
+    def test_ambiguous_trigger_comments_fail_closed(self):
+        f = Fake()
+        f.trigger_comment(number=130, ident=10)
+        f.trigger_comment(number=131, ident=11)
+        with self.assertRaises(RuntimeError):
+            reconcile.reconcile(
+                f.call, REPO, '777', '2', 'failure',
+                actor='hide212131', run_created_at='2026-09-12T03:00:03Z',
+            )
 
 
 if __name__ == '__main__':
