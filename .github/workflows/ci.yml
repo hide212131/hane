@@ -155,6 +155,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-features
 
+      - name: Test macOS fallback glyph rasterization
+        run: cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::text_system::tests
+
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 

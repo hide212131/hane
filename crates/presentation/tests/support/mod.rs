@@ -3,7 +3,7 @@
 //! A fixture describes one Markdown construct once, and [`verify`] checks every
 //! contract that construct has to satisfy across the whole pipeline: the parse
 //! tree shape, the derived marker ranges, the presented display kind and visual
-//! text, SourceMap round-tripping, disclosure, and the bytes a save would write.
+//! text and style runs, SourceMap round-tripping, disclosure, and the bytes a save would write.
 //!
 //! Adding a Markdown feature means adding a fixture here rather than a bespoke
 //! test per layer. The harness itself makes exactly the two calls `EditorView`
@@ -14,8 +14,8 @@
 use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_markdown::{BlockIndex, MarkdownTree, NodeKind, parse_document};
 use hane_presentation::{
-    BlockKind, BlockLine, BlockWindow, VisualLine, block_line_context, block_line_span,
-    present_block, trailing_blank_lines,
+    BlockKind, BlockLine, BlockWindow, StyleKind, StyleRun, VisualLine, VisualRange,
+    block_line_context, block_line_span, present_block, trailing_blank_lines,
 };
 
 const LINE_HEIGHT: f32 = 26.0;
@@ -32,8 +32,18 @@ pub struct MarkdownFixture {
     pub markers: &'static [&'static str],
     /// Display kind per source line with nothing disclosed.
     pub block_kinds: &'static [BlockKind],
+    /// Exact ordered style runs per line with nothing disclosed, in visual
+    /// UTF-8 byte offsets (including mapped newlines in multi-line spans).
+    pub style_runs: &'static [&'static [StyleRun]],
     /// Visual text per source line with nothing disclosed, newline trimmed.
     pub visual_lines: &'static [&'static str],
+}
+
+pub const fn style(kind: StyleKind, start: usize, end: usize) -> StyleRun {
+    StyleRun {
+        kind,
+        visual_range: VisualRange::new(start, end),
+    }
 }
 
 /// Runs every fixture contract. Panics with the fixture name on the first
@@ -208,8 +218,19 @@ fn verify_lines(fixture: &MarkdownFixture, buffer: &RopeBuffer) {
         "{}: expected visual lines must cover every line",
         fixture.name
     );
+    assert_eq!(
+        fixture.style_runs.len(),
+        lines,
+        "{}: styles must cover every line",
+        fixture.name
+    );
     let presented = present_document(buffer, None);
     for (line, block) in presented.iter().enumerate() {
+        assert_eq!(
+            block.style_runs, fixture.style_runs[line],
+            "{}: line {line} style runs",
+            fixture.name
+        );
         let range = buffer.line_range(LineId(line)).expect("line in range");
         let source = buffer.text(range).expect("line text");
         assert_eq!(

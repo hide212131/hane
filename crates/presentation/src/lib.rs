@@ -2453,6 +2453,75 @@ mod tests {
         assert!(block.height() > 26.0);
     }
 
+    /// Whether some style run of `kind` fully covers `range`, the same rule
+    /// `hane_ui::inline_display_for` applies when combining runs for one
+    /// stretch of visual text.
+    fn style_run_covers(style_runs: &[StyleRun], kind: StyleKind, range: &Range<usize>) -> bool {
+        style_runs.iter().any(|run| {
+            run.kind == kind
+                && range.start >= run.visual_range.start.0
+                && range.end <= run.visual_range.end.0
+        })
+    }
+
+    #[test]
+    fn italic_and_bold_style_runs_fully_cover_cjk_text() {
+        // Both `*text*`/`_text_` delimiters and the `***text***` combination,
+        // matching the ASCII coverage already asserted for Bold in
+        // `phase3_presentation_hides_markers_without_changing_source`, but
+        // with CJK-only emphasis content: the render policy must not depend
+        // on the emphasized text being ASCII.
+        let source = "*漢字ひらがな* and _漢字ひらがな_ and ***漢字ひらがな***";
+        let block = present_markdown(
+            0,
+            Revision(0),
+            SourceRange::new(0, source.len()),
+            source,
+            16.0,
+        );
+        assert_eq!(
+            block.visual_text,
+            "漢字ひらがな and 漢字ひらがな and 漢字ひらがな"
+        );
+
+        let cjk = "漢字ひらがな";
+        let mut occurrences = block.visual_text.match_indices(cjk).map(|(i, _)| i);
+
+        let star = occurrences.next().unwrap();
+        let star_range = star..star + cjk.len();
+        assert!(style_run_covers(
+            &block.style_runs,
+            StyleKind::Italic,
+            &star_range
+        ));
+        assert!(!style_run_covers(
+            &block.style_runs,
+            StyleKind::Bold,
+            &star_range
+        ));
+
+        let underscore = occurrences.next().unwrap();
+        let underscore_range = underscore..underscore + cjk.len();
+        assert!(style_run_covers(
+            &block.style_runs,
+            StyleKind::Italic,
+            &underscore_range
+        ));
+
+        let triple = occurrences.next().unwrap();
+        let triple_range = triple..triple + cjk.len();
+        assert!(style_run_covers(
+            &block.style_runs,
+            StyleKind::Italic,
+            &triple_range
+        ));
+        assert!(style_run_covers(
+            &block.style_runs,
+            StyleKind::Bold,
+            &triple_range
+        ));
+    }
+
     #[test]
     fn disclosure_expands_only_the_active_inline_construct() {
         let source = "**one** and _two_";
