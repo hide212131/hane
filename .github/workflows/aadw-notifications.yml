@@ -39,7 +39,17 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Ignore workflow runs that did not execute an AADW process
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          decision="$(python3 -I .github/scripts/aadw_workflow_run_gate.py)"
+          echo "run=${decision}" >> "$GITHUB_OUTPUT"
+
       - name: Mirror AADW lifecycle to Issue / PR Conversation
+        if: ${{ steps.gate.outputs.run == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/aadw_observer.py
