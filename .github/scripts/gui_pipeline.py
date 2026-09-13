@@ -8,6 +8,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pipeline_api import GitHub
 from gui_policy import CONTEXT, PROCEDURE, STATUS_VERSION, authenticated_receipt, gui_state, parse_time, receipt, review_ready, validate_receipt
 from gui_artifacts import artifact_json
+import aadw_notify
+
+
+def notify(api, request, state, detail=''):
+    # request['generation'] is this exact GUI run's own "run_id-attempt", so a
+    # later/older generation for the same PR never resolves this comment.
+    run_id, attempt = request['generation'].split('-')
+    try:
+        aadw_notify.notify(api.api, state=state, process='gui-validation', kind='pr',
+                           number=request['pr_number'], sha=request['sha'], repository=api.repository,
+                           run_id=run_id, attempt=attempt, detail=detail)
+    except Exception as exc:
+        # Notification is best-effort display; it must never mask the actual
+        # GUI validation result recorded via the commit status above.
+        print(f'AADW notify failed for GUI validation ({request["pr_number"]}, g{request["generation"]}): {exc}', file=sys.stderr)
 
 
 def now():
@@ -34,6 +49,12 @@ def publish(api, request, outcome):
     state = {'pending': 'pending', 'pass': 'success', 'fail': 'failure', 'blocked': 'error'}[outcome]
     api.post_status(request['sha'], CONTEXT, state,
                     f'GUI {outcome} {STATUS_VERSION} {request["sha"][:12]} g{request["generation"]}')
+    # This commit status is the source of truth; the Conversation comment
+    # below is a best-effort human-readable mirror of the same transition.
+    if outcome == 'pending':
+        notify(api, request, 'start')
+    else:
+        notify(api, request, 'success', detail=f'GUI validation結果: {outcome}')
 
 
 def current(api, request, require_claim=True):
@@ -81,6 +102,9 @@ def retire(api, request):
     if current(api, request):
         api.post_status(request['sha'], CONTEXT, 'error',
                         f'GUI superseded {STATUS_VERSION} {request["sha"][:12]} g{request["generation"]}')
+        # This exact generation will never reach pass/fail/blocked now; resolve
+        # its own "start" comment instead of leaving it looking unfinished.
+        notify(api, request, 'failure', detail='対象PRの状態が変わったため、この実行のGUI validationは打ち切られました。')
 
 
 def resolve(api):
@@ -161,6 +185,10 @@ def begin(api, request):
 def report(api, request):
     if not current(api, request):
         print('Stale GUI generation: no status written')
+        # Someone else (usually retire() from a later resolve()) already
+        # superseded this generation; resolve its own comment idempotently
+        # rather than leaving it stuck at "start" if that step was missed.
+        notify(api, request, 'failure', detail='対象PRの状態が変わったため、この実行のGUI validationは打ち切られました。')
         return
     if not eligible(api, request):
         retire(api, request)

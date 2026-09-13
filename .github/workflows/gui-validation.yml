@@ -36,6 +36,7 @@ jobs:
       contents: read
       actions: read
       checks: read
+      issues: write
       pull-requests: read
       statuses: write
     outputs:
@@ -143,6 +144,7 @@ jobs:
       contents: read
       actions: read
       checks: read
+      issues: write
       pull-requests: read
       statuses: write
     steps:

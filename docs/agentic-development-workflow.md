@@ -2,7 +2,7 @@
 
 ## 目的
 
-Hane の Issue から実装、レビュー、実アプリ検証、修正、マージ判断までを、複数の coding agent と検証層に役割を分けて自動化する。
+Hane の Issue から実装、レビュー、実アプリ検証、修正、マージ判断までを、複数の coding agent と検証層に役割を分けて自動化する。この仕組み全体を、以後 **AI Agent Development Workflow（略称 AADW）** と呼ぶ。
 
 この文書を運用設計の正本とする。役割分担そのものを採用する理由は
 [ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。ChatGPT / Work を上流の設計工程として位置づけ、Claude Code への明示的な handoff を定義する理由は
@@ -525,6 +525,37 @@ receiver processing record は少なくとも `pending` / `leased` / `completed`
 judge が `fix` など後続 worker の起動を必要とする結果を出した場合は、judge result の保存と stable child transition ID を持つ worker request の outbox 登録を原子的に保存する。worker request も dispatcher lease と receiver processing lease を使い、親 receiver が完了直前に落ちても後続処理が失われず、重複配送でも二重実行しないようにする。
 
 実装時には、原子的更新または排他が可能な永続領域を状態、durable outbox、receiver processing の正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを状態や routing request の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
+
+## Issue / Pull Request への状態通知（開始・正常終了・異常終了）
+
+AADW の各ユーザー可視な処理は、Actions の画面を開かなくても対象 Issue / Pull Request の Conversation を見るだけで「処理開始」「正常終了」「異常終了」のいずれかを判断できるようにする。この節は、上記の commit status / durable outbox を正本とする状態管理を置き換えず、それを人間向けに映す表示契約を追加するものである。既存の stall report（[Claude Code](#claude-code) の Issue / Pull Request 停止通知）、quota fallback、routing、judge の詳細コメントは、この契約と併存してよく、削除する必要はない。
+
+対象は少なくとも次を含む。
+
+- `/implement` による Claude Code 実装
+- Codex review と、その使用量上限時の Copilot fallback
+- Copilot pre-GUI routing
+- Claude Code による自動修正・再修正
+- GUI validation 要否判定、および GUI validation
+- final judge / deterministic merge gate
+- 上記を回復・再配送する reconcile / retry が、実際に対象 Issue / Pull Request の処理を開始した場合
+
+複数 PR を走査するだけの reconcile / dispatcher は、対象がなかった定期走査までコメントを増やす必要はない。実際に対象を処理した場合だけ通知する。通常 CI の個々のジョブは GitHub 標準の check 表示に委ね、この契約の対象には含めない。
+
+### 実装 (`.github/scripts/aadw_notify.py`)
+
+共有モジュール `aadw_notify` が、Issue / Pull Request コメントの作成・更新を担う。
+
+- 通知対象の実行は `(process, kind, number, head sha, run id, run attempt)` で識別する。同じ実行内で開始→正常終了/異常終了と呼び出しても同じコメントを更新するだけで重複させず、別の run attempt や別の head sha は別コメントとして扱うため、rerun / retry が別実行の結果を誤って上書きしない。同じイベントの再処理は同一コメントへの no-op またはべき等な更新になる。
+- 処理名は `aadw_notify.PROCESSES` に列挙した trusted な固定値のみを使う。Issue / Pull Request 本文やコメントから取った自由記述をそのまま処理名として渡さない。
+- 開始のまま以後の呼び出しがなければ、そのコメントは開始のまま残るため、人が見て未完了と判別できる。
+- コメント投稿・更新自体が失敗した場合は例外を送出し、黙って成功扱いにしない。呼び出し側は、この通知の失敗が本体処理（commit status への記録や実際の判定結果）の成功を意味しない・その逆でもないように、本体処理の記録とは別に扱う。
+
+`final_pipeline.py`（final judge / merge gate）と `gui_pipeline.py`（GUI validation）は、それぞれの commit status 更新(`publish()` / `retire()`)に併せてこの通知を呼び出す。commit status がその処理の正本であり、Conversation コメントはベストエフォートの表示ミラーである。呼び出し失敗はログに残すだけで、本体の commit status 更新や判定結果を変えない。
+
+`/implement` の開始は既存の `repository_dispatch: claude-progress-start` を `aadw_observer.py` が受け取って Issue に表示する。Codex review、Copilot routing、Claude fix、GUI requirement classification、GUI validation、final judge など commit status を正本とする処理は、`aadw-notifications.yml` が trusted な `workflow_run: in_progress` から source workflow の exact `run id / run attempt` を受け取り、対応する pending status を相関して開始表示を作る。`GITHUB_TOKEN` が作成した `status` event から別 workflow が起動することには依存しない。
+
+終端表示と通知漏れの回復は共通 controller に寄せる。`workflow_run: completed` では `aadw_workflow_completion_reconcile.py` などの専用 controller が timeout / cancel / crash や prior head に残った pending を閉じる。`aadw_notification_reconcile.py` と `aadw_prior_head_reconcile.py` は `aadw-status-notification-reconcile.yml` の `workflow_run` と定期実行から commit status 履歴を読み直し、current head / prior head の開始・終端表示をべき等に補完する。run attempt が status に明示されない場合も status 件数から推測せず、Actions の実 attempt 履歴と status 時刻から相関する。Codex 使用量上限時の fallback のように外部 bot コメントが信頼できる起点になる処理は、その外部イベントと completion reconcile を併用する。
 
 ## トリガー
 

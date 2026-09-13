@@ -1,0 +1,63 @@
+name: AADW status notification reconcile
+
+on:
+  workflow_run:
+    workflows:
+      - Codex review gate
+      - Codex limit Copilot review fallback
+      - Copilot pre-GUI routing
+      - Copilot routing reconciliation
+      - Claude automatic fix worker
+      - Claude fix reconciliation
+      - GUI requirement classification
+      - GUI validation
+      - Copilot final judgement
+    types: [in_progress, completed]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: aadw-status-notification-reconcile
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Check out trusted notification controller
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Mirror source workflow start
+        if: ${{ github.event_name == 'workflow_run' && github.event.action == 'in_progress' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AADW_SOURCE_WORKFLOW: ${{ github.event.workflow_run.name }}
+          AADW_SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          AADW_SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 -I .github/scripts/aadw_workflow_start_reconcile.py --poll-attempts 15 --poll-seconds 2
+
+      - name: Reconcile current-head AADW status comments
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_notification_reconcile.py --lookback-seconds 7200
+
+      - name: Reconcile prior-head AADW status comments
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/aadw_prior_head_reconcile.py --lookback-seconds 7200

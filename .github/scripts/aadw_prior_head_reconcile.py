@@ -1,0 +1,154 @@
+"""Recover AADW lifecycle comments for recent prior PR heads.
+
+Most AADW status reconciliation can look only at the current PR head. Claude
+fix is different: it may publish `pending` on head A, push head B, and only then
+publish its terminal status back on A. A current-head-only scan would then leave
+A's Conversation comment at "処理開始" forever, or miss the start entirely if
+head B arrived before the notification reconciler ran.
+
+This controller therefore combines two trusted sources:
+- existing GitHub Actions AADW start comments, which preserve an exact old SHA,
+  run id, and attempt even when the head has moved;
+- every commit currently contained in the PR, which recovers a lifecycle even
+  when its start comment was missed before the head changed.
+
+It reuses the status grouping and outcome semantics from
+aadw_notification_reconcile and writes through aadw_notify, so a recovered
+lifecycle updates the same marker when one already exists and remains idempotent.
+"""
+import argparse
+import datetime as dt
+import os
+import re
+import sys
+
+import aadw_notification_reconcile as lifecycle
+import aadw_notify
+
+_MARKER = re.compile(
+    r'<!-- hane-aadw: process=([a-z0-9-]+) kind=pr number=([1-9][0-9]*) '
+    r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
+)
+PROCESS_CONTEXT = {process: context for context, process in lifecycle.CONTEXTS.items()}
+RECOVERABLE_PROCESSES = set(PROCESS_CONTEXT) | {'codex-review-fallback'}
+
+
+def prior_starts(call, repository, pr, cutoff):
+    number = int(pr['number'])
+    current_sha = pr['head']['sha']
+    found = {}
+    for comment in lifecycle.pages(call, f'repos/{repository}/issues/{number}/comments'):
+        if comment.get('user', {}).get('login') != 'github-actions[bot]':
+            continue
+        body = comment.get('body') or ''
+        if '— 処理開始' not in body:
+            continue
+        match = _MARKER.search(body)
+        if not match:
+            continue
+        process, marker_number, sha, run_id, attempt = match.groups()
+        if marker_number != str(number) or sha == current_sha or process not in RECOVERABLE_PROCESSES:
+            continue
+        created = lifecycle.parse_time(comment.get('created_at'))
+        updated = lifecycle.parse_time(comment.get('updated_at'))
+        if not ((created and created >= cutoff) or (updated and updated >= cutoff)):
+            continue
+        key = (process, sha, run_id, attempt)
+        previous = found.get(key)
+        if previous is None or comment.get('id', 0) > previous.get('id', 0):
+            found[key] = comment
+    return [(*key, comment) for key, comment in found.items()]
+
+
+def prior_shas(call, repository, pr):
+    current_sha = pr['head']['sha']
+    rows = lifecycle.pages(call, f'repos/{repository}/pulls/{int(pr["number"])}/commits')
+    shas = []
+    for row in rows:
+        sha = row.get('sha')
+        if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha) and sha != current_sha:
+            shas.append(sha)
+    # PR commits are individual commits, not a bounded list of historical head
+    # generations. A prior head can be arbitrarily far from the current tip when
+    # one fix pushes several commits, so do not truncate this candidate set.
+    # `reconcile_sha()` still applies the status lookback before writing.
+    return shas
+
+
+def reconcile_sha(call, repository, number, sha, statuses, cutoff):
+    writes = 0
+    for context, process in lifecycle.CONTEXTS.items():
+        rows = lifecycle.codex_lifecycle_rows(statuses) if context == 'hane/codex-review' else [
+            row for row in statuses if row.get('context') == context
+        ]
+        for generation in lifecycle.build_generations(rows):
+            if not lifecycle.recent(generation, cutoff):
+                continue
+            source = (
+                lifecycle.review_source_for_generation(statuses, generation)
+                if process == 'codex-review'
+                else None
+            )
+            action = lifecycle.notify_generation(
+                call, repository, number, sha, context, generation,
+                source=source,
+            )
+            writes += action != 'noop'
+    writes += lifecycle.reconcile_fallback(
+        call, repository, number, sha, statuses, cutoff
+    ) != 'noop'
+    return writes
+
+
+def reconcile_pr(call, repository, pr, cutoff):
+    if not lifecycle.trusted_pr(pr, repository):
+        return 0
+    number = int(pr['number'])
+    current_sha = pr['head']['sha']
+
+    # Every PR commit is a candidate because any one of them may have been a
+    # prior branch tip when an AADW process wrote its status.
+    candidates = set(prior_shas(call, repository, pr))
+
+    # A trusted start comment may refer to a SHA no longer present in the
+    # current PR commit list (for example after history rewriting). Preserve
+    # those explicit correlations as well, including Copilot fallback starts.
+    for _process, sha, _run_id, _attempt, _comment in prior_starts(call, repository, pr, cutoff):
+        candidates.add(sha)
+
+    candidates.discard(current_sha)
+    writes = 0
+    for sha in sorted(candidates):
+        statuses = lifecycle.pages(call, f'repos/{repository}/commits/{sha}/statuses')
+        writes += reconcile_sha(call, repository, number, sha, statuses, cutoff)
+    return writes
+
+
+def reconcile(call, repository, *, lookback_seconds=7200, now=None):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = now - dt.timedelta(seconds=lookback_seconds)
+    writes = 0
+    for pr in lifecycle.pages(call, f'repos/{repository}/pulls?state=open'):
+        writes += reconcile_pr(call, repository, pr, cutoff)
+    return writes
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lookback-seconds', type=int, default=7200)
+    args = parser.parse_args()
+    repository = os.environ.get('GITHUB_REPOSITORY', '')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        print('AADW prior-head reconcile: repositoryが不正です。', file=sys.stderr)
+        return 1
+    try:
+        writes = reconcile(aadw_notify.api, repository, lookback_seconds=max(300, args.lookback_seconds))
+    except Exception as exc:
+        print(f'AADW prior-head reconcileに失敗しました: {exc}', file=sys.stderr)
+        return 1
+    print(f'AADW prior-head reconcile: {writes}件を作成または更新しました。')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
