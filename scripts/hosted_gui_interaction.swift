@@ -252,7 +252,7 @@ func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: fullRange), let range = Range(match.range, in: text) else { continue }
         guard let box = try? candidate.boundingBox(for: range) else { continue }
-        return box
+        return box.boundingBox
     }
     fail("no OCR match for pattern: \(pattern)")
 }
@@ -346,7 +346,7 @@ func moveDocStart(_ pid: pid_t) {
 
 func moveCaret(_ pid: pid_t, _ direction: String, _ count: Int) {
     let codes = ["left": 123, "right": 124, "down": 125, "up": 126]
-    guard let code = codes[direction] else { fail("direction must be left, right, up, or down") }
+    guard let code = codes[direction] else { fail("direction must be left, right, down, or up") }
     guard count > 0 else { fail("move-caret count must be positive") }
     runAppleScript("""
     tell application "System Events"
