@@ -305,12 +305,12 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
         self.assertEqual(detail['actual_landing_source_offset'], 999999)
         self.assertNotIn('undo-save', calls)
 
-    def test_near_canonical_mismatch_is_a_product_suspect_not_a_blocked_procedure(self):
+    def test_near_canonical_mismatch_is_blocked_without_independent_coordinate_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             baseline = interaction.INLINE_FIXTURE_ORIGINAL
             actual = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
             status, reason, detail, calls = self._run(directory, actual)
-        self.assertEqual(status, 'fail')
+        self.assertEqual(status, 'blocked')
         self.assertEqual(detail['landing_classification'], 'boundary_ambiguous_near_canonical')
         self.assertEqual(detail['landing_offset_delta'], 3)
         self.assertIn('#101', reason)

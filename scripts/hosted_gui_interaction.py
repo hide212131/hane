@@ -97,11 +97,13 @@ BOUNDARY_MARK = "Z"
 NAVIGATION_MARK = "N"
 JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 
-# 境界クリック挿入が期待 canonical position からこの文字数を超えて離れて着地した場合は、
-# 「closing marker と後続 visible text が共有する境界での製品 source mapping の疑い」ではなく
-# 「OCR/クリック精度など helper 自身が意図した visual boundary へ到達できなかった」可能性が高いと
-# みなし、製品 fail ではなく procedure の blocked として扱う(Issue #137)。値は対象境界の
-# marker(最大2文字の `**`)+ 直後の空白1文字を含む近傍を許容する程度に小さく保つ。
+# 境界クリック挿入が期待 canonical position からこの文字数を超えて離れて着地した場合の
+# 分類の閾値(診断用途のみ)。click_point は OCR bounding box から算出されており、
+# OS click が意図した visual boundary を指したという独立証拠にはならない。そのため
+# delta の大小によらず、実 EditorView への coordinate-specific event など独立した座標検証
+# なしでは製品 source-mapping 疑いの fail と断定できず、helper/OCR miss の可能性を
+# 区別できないものとして procedure の blocked として扱う(Issue #137)。値は対象境界の
+# marker(最大2文字の `**`)+ 直後の空白1文字を含む近傍かどうかを分類記録するためだけに使う。
 BOUNDARY_LANDING_FAR_MISS_CHARS = 4
 
 # inline_syntax_boundary の各 mutating subtest は、成功経路であっても最大で数回の
@@ -679,10 +681,13 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
                 "到達できなかった疑いが強いため、製品 fail とは区別して procedure blocked とする"
             ), detail
         detail["landing_classification"] = "boundary_ambiguous_near_canonical"
-        return "fail", (
-            f"境界クリックの着地点が期待 canonical position から {delta} 文字という近傍だが一致しない。"
-            "closing marker と後続 visible text が共有する境界での製品 source mapping の疑いがあり、"
-            "#101 側での独立した root-cause 切り分けが必要"
+        return "blocked", (
+            f"境界クリックの着地点が期待 canonical position から {delta} 文字という近傍で一致しない。"
+            "closing marker と後続 visible text が共有する境界での製品 source mapping の疑いはあるが、"
+            "click_point も同じ OCR bounding box から算出されているため OS click が意図した visual "
+            "boundary を指した独立証拠がなく、helper/OCR miss と区別できない。独立した座標検証"
+            "(実 EditorView への coordinate-specific event 等)なしに製品 fail と断定せず、procedure "
+            "blocked として #101 側での root-cause 切り分けを待つ"
         ), detail
     if landing_offset != expected_offset:
         detail["landing_classification"] = "corrupted"
