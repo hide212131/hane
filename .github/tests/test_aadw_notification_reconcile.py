@@ -182,6 +182,7 @@ class ReconcileTests(unittest.TestCase):
         comments = [{
             "id": 9,
             "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-09-12T02:56:30Z",
             "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
         }]
         gh = Fake([
@@ -223,6 +224,7 @@ class ReconcileTests(unittest.TestCase):
         comments = [{
             "id": 9,
             "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-09-12T02:54:00Z",
             "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
         }]
         gh = Fake([
@@ -232,6 +234,22 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(len(gh.comments), 1)
         self.assertIn("正常終了", gh.comments[0]["body"])
         self.assertIn("run=555 attempt=1", gh.comments[0]["body"])
+
+    def test_previous_fallback_source_does_not_close_newer_retry_start(self):
+        marker = f"<!-- hane-aadw: process=codex-review-fallback kind=pr number=131 sha={SHA} run=556 attempt=1 -->"
+        comments = [{
+            "id": 10,
+            "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-09-12T02:59:00Z",
+            "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
+        }]
+        gh = Fake([
+            status(62, "hane/review-source", "success", "Review source: Copilot fallback for " + SHA[:12],
+                   created="2026-09-12T02:58:00Z", target_url="https://github.com/example/old-review"),
+        ], comments=comments)
+        self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 0)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn("処理開始", gh.comments[0]["body"])
 
     def test_old_statuses_are_not_backfilled(self):
         gh = Fake([
