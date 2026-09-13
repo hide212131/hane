@@ -7,6 +7,14 @@
 現行のリファクタリング作業は [`docs/refactor-plan.md`](../refactor-plan.md) と
 [`docs/refactor-execution-plan.md`](../refactor-execution-plan.md) を正とする。
 
+## Proposed
+
+実装・検証を進めている設計判断。承認・実装完了前であり、現行実装の保証を意味しない。
+
+| ADR | 内容 |
+|---|---|
+| [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
+
 ## Active
 
 | ADR | 内容 |
@@ -25,6 +33,7 @@
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 | [ADR-0023](0023-ai-agent-development-workflow.md) | AI agent 開発の実装・レビュー・進行判断の分離 |
 | [ADR-0024](0024-local-gui-validation.md) | ローカル GUI 検証を Computer Use の承認から切り離し、非公開リポジトリで実行を制御する（実装前） |
+| [ADR-0026](0026-work-design-handoff.md) | Work（ChatGPT）を上流の planner/designer とし、Claude Code への明示的な handoff を定義する（ADR-0023 を補足） |
 
 ## Superseded / amended
 

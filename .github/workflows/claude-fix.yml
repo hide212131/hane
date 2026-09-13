@@ -35,6 +35,8 @@ jobs:
         run: |
           cp .hane-control/.github/scripts/claude_fix_state.py "$RUNNER_TEMP/hane-claude-fix-state.py"
           cp .hane-control/.github/scripts/merge_statuses_by_sha.sh "$RUNNER_TEMP/hane-claude-fix-merge-statuses.sh"
+          mkdir -p "$RUNNER_TEMP/hane-final-control"
+          cp .hane-control/.github/scripts/*.py "$RUNNER_TEMP/hane-final-control/"
 
       - name: Resolve automatic fix
         id: target
@@ -129,7 +131,7 @@ jobs:
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
-              -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" >/dev/null
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" >/dev/null
             echo '::warning::Claude automatic fix is disabled for Pull Requests that change workflow files.'
             exit 0
           fi
@@ -248,7 +250,7 @@ jobs:
             review_url="${review#*$'\t'}"
             gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}" --jq '.body // ""' > "$review_body_file"
             gh api --paginate --slurp "repos/${REPOSITORY}/pulls/${PR_NUMBER}/comments?per_page=100" \
-              | jq "[.[][] | select(.user.login == \"${review_bot}\" and .pull_request_review_id == ${review_id}) | {path, line, body}]" \
+              | jq "[.[][] | select((.user.login == \"${review_bot}\" or (\"${review_bot}\" == \"copilot-pull-request-reviewer[bot]\" and .user.login == \"Copilot\")) and .pull_request_review_id == ${review_id}) | {path, line, body}]" \
               > "$findings_file"
           fi
 
@@ -277,9 +279,12 @@ jobs:
           fi
           finding_count="$(jq 'length' "$findings_file")"
 
-          # A fix may be justified by reviewer findings, by trusted CI failure, or both.
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence
+          final_evidence_count="$(jq 'if . == null then 0 else 1 end' "$FINAL_EVIDENCE_PATH")"
+          # An authenticated final-judge receipt also supplies GUI failure evidence.
           # CI-only fix routes are valid even when the reviewer is clean.
-          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 ]]; then
+          if [[ "$finding_count" -eq 0 && "$ci_failure_count" -eq 0 && "$final_evidence_count" -eq 0 ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: missing evidence for ${short_sha}" \
@@ -307,9 +312,10 @@ jobs:
             --slurpfile ci_statuses "$ci_statuses_file" \
             --rawfile copilot_reason_raw "$copilot_reason_file" \
             --slurpfile changed_files "$files_json_file" \
+            --slurpfile final_evidence "$FINAL_EVIDENCE_PATH" \
             '($review_body_raw | rtrimstr("\n")) as $review_body |
              ($copilot_reason_raw | rtrimstr("\n")) as $copilot_reason |
-             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0]}' \
+             {pr_number:$pr_number,target_sha:$target_sha,pr_title:$pr_title,review_source:$review_source,review_url:$review_url,review_body:$review_body,review_findings:$review_findings[0],codex_review_url:$review_url,codex_review_body:$review_body,codex_findings:$review_findings[0],ci_statuses:$ci_statuses[0],copilot_fix_reason:$copilot_reason,changed_files:$changed_files[0],final_judge_evidence:$final_evidence[0]}' \
             > "$RUNNER_TEMP/hane-claude-fix-evidence.json"
 
           gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -391,11 +397,18 @@ jobs:
             echo 'PR moved, closed, or became draft during preparation; skipping paid invocation.'
             exit 0
           fi
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
+          fi
           echo 'granted=true' >> "$GITHUB_OUTPUT"
 
       - name: Run Claude Code fix
         if: ${{ steps.claim.outputs.granted == 'true' }}
         id: claude
+        # A step timeout must still reach the status and notification steps.
+        timeout-minutes: 45
+        continue-on-error: true
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -407,7 +420,7 @@ jobs:
           You are Claude Code, the implementation agent for Hane.
           Pull Request #${PR_NUMBER} is checked out at the exact reviewed commit ${TARGET_SHA}.
 
-          Fix the reviewer findings, trusted CI failures, and Copilot fix reason present in the evidence below.
+          Fix the reviewer findings, trusted CI failures, GUI failures, and Copilot final or pre-GUI fix reason present in the evidence below.
           Use the repository normally: inspect code, run shell commands, Cargo, tests, linters, package managers,
           searches and network tools when useful. Make the smallest correct fix.
           Leave the final changes in the working tree uncommitted. The workflow owns commit and push.
@@ -418,7 +431,7 @@ jobs:
           EOF
 
           claude -p \
-            --max-turns 80 \
+            --max-turns 160 \
             --permission-mode bypassPermissions < "$RUNNER_TEMP/hane-claude-fix-prompt.txt"
           status=$?
           set -e
@@ -440,6 +453,10 @@ jobs:
           set -euo pipefail
           short_sha="${TARGET_SHA:0:12}"
           echo 'workflow_patch=false' >> "$GITHUB_OUTPUT"
+          export FINAL_EVIDENCE_PATH="$RUNNER_TEMP/hane-final-fix-evidence.json"
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
+          fi
 
           if [[ -z "$(git status --porcelain)" ]]; then
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
@@ -505,6 +522,22 @@ jobs:
               -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
             echo 'published=true' >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Recheck the authorization actually used to implement this patch.
+          current_pr="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          if ! jq -e --arg sha "$TARGET_SHA" '.state == "open" and .draft == false and .head.sha == $sha' <<< "$current_pr" >/dev/null; then
+            echo 'PR eligibility changed before push; retaining the local patch only.'
+            exit 0
+          fi
+          statuses="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" | jq 'add')"
+          routing="$(python3 -I "$RUNNER_TEMP/hane-claude-fix-state.py" routing --sha "$TARGET_SHA" --manual "$MANUAL_RETRY" <<< "$statuses" | jq -r '.allowed')"
+          if [[ "$routing" != true ]]; then
+            echo 'A newer decision no longer permits this fix; refusing push.'
+            exit 0
+          fi
+          if [[ -f "$FINAL_EVIDENCE_PATH" ]]; then
+            python3 -I "$RUNNER_TEMP/hane-final-control/final_fix_bridge.py" evidence --verify
           fi
 
           git push "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"
@@ -655,3 +688,83 @@ jobs:
             -f state=error -f context='hane/claude-fix' \
             -f description="Claude fix controller failed for ${short_sha}" \
             -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+
+      - name: Report Claude fix outcome to the Pull Request
+        if: ${{ always() && steps.target.outputs.target_sha != '' && steps.target.outputs.pr_number != '' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          CLAIMED: ${{ steps.claim.outputs.granted }}
+          CLAUDE_EXIT: ${{ steps.claude.outputs.exit_code }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          short_sha="${TARGET_SHA:0:12}"
+          latest="$(gh api --paginate --slurp "repos/${REPOSITORY}/commits/${TARGET_SHA}/statuses?per_page=100" \
+            | jq -r '[.[][] | select(.context == "hane/claude-fix")] | max_by(.id) // {} | .description // ""')"
+          resolved=false
+          case "$latest" in
+            "Claude fix completed for ${short_sha}")
+              reason='この対象commitの自動修正は完了しました。新しいheadのCI・レビュー結果を確認してください。'
+              resolved=true ;;
+            "Claude fix blocked: workflow patch requires owner for ${short_sha}")
+              reason='workflow変更は自動pushできません。実行結果の hane-workflow-fix artifactを確認し、ownerがパッチを適用してください。' ;;
+            "Claude fix blocked"*)
+              reason='実行条件または回数制限により停止しました。実行ログを確認し、必要ならownerが新しい /claude-fix コメントで再試行してください。' ;;
+            "Claude fix produced no changes for ${short_sha}")
+              reason='Claudeは修正差分を作成しませんでした。残っているレビュー指摘を確認してください。' ;;
+            "Claude fix failed for ${short_sha}")
+              reason='Claudeの修正処理が失敗しました。実行ログを確認し、必要ならownerが新しい /claude-fix コメントで再試行してください。' ;;
+            "Claude fix controller failed for ${short_sha}")
+              reason='自動修正controllerが失敗しました。実行ログを確認してください。承認を消費済みの場合は新しい /claude-fix が必要です。' ;;
+            *)
+              if [[ "$JOB_STATUS" == cancelled && "$CLAIMED" == true ]]; then
+                reason='承認取得後に実行が中止されました。結果を確認し、再実行が必要ならownerが新しい /claude-fix コメントを投稿してください。'
+              else
+                exit 0
+              fi ;;
+          esac
+          marker="<!-- hane-stall: number=${PR_NUMBER} stage=claude-fix sha=${TARGET_SHA} -->"
+          existing_id="$(gh api --paginate --slurp "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            | jq -r --arg marker "$marker" '[.[][] | select(.user.login == "github-actions[bot]" and ((.body // "") | contains($marker)))] | max_by(.id) | .id // empty')"
+          if [[ "$resolved" == true && -z "$existing_id" ]]; then exit 0; fi
+          title='Claude自動修正の停止理由'
+          if [[ "$resolved" == true ]]; then title='Claude自動修正：解決済み'; fi
+          body="$(printf '### %s\n\n対象: PR #%s / %s\n\n%s\n\n実行: https://github.com/%s/actions/runs/%s/attempts/%s\n\n%s\n' "$title" "$PR_NUMBER" "$TARGET_SHA" "$reason" "$REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$marker")"
+          if [[ -n "$existing_id" ]]; then
+            gh api --method PATCH "repos/${REPOSITORY}/issues/comments/${existing_id}" -f body="$body" >/dev/null
+          else
+            gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" >/dev/null
+          fi
+
+  report_job_failure:
+    needs: fix
+    if: ${{ always() && (needs.fix.result == 'failure' || needs.fix.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/report_claude_job_failure.py
+          sparse-checkout-cone-mode: false
+      - name: Report worker job failure independently
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_NUMBER: ${{ github.event.client_payload.pr_number }}
+          TARGET_SHA: ${{ github.event.client_payload.target_sha }}
+          STAGE: claude-fix
+          WORKER_RESULT: ${{ needs.fix.result }}
+        run: python3 -I .github/scripts/report_claude_job_failure.py

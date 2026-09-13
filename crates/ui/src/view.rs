@@ -20,7 +20,10 @@ use crate::capture::InputCapture;
 use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
-use crate::line::{block_element, disclosure_for_line, presented_block, row_element};
+use crate::line::{
+    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
+    row_element,
+};
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
@@ -40,8 +43,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockLayout, HeightIndex, LineShaper, VerticalMove, VisualBlock, VisualLine, VisualOffset,
-    block_heights, block_line_span, layout_block,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, VisualLine,
+    VisualOffset, block_heights, block_is_joinable, block_line_span, layout_block,
+    parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
@@ -58,6 +62,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const METRICS_CAPACITY: usize = 4_096;
+/// Bound whole-block CPU work across all blocks and document switches in this
+/// view. Do not queue missed viewports: a completion wakes the current viewport.
+const MAX_JOINED_PARSE_JOBS: usize = 2;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const MAIN_MIN_WIDTH: f32 = 280.0;
@@ -209,6 +216,21 @@ struct TitleRenameAttempt {
     title: String,
 }
 
+/// Which of the sidebar's two selection sources is currently shown
+/// highlighted. The two are tracked separately because they change on
+/// different events — the active session swaps whenever a file or draft is
+/// opened, while `selected_folder` only changes on an explicit folder/root
+/// click — so without this flag both could end up highlighted at once (see
+/// issue #47).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SidebarFocus {
+    /// A file or draft row is highlighted, driven by the active session.
+    #[default]
+    ActiveSession,
+    /// A folder or root row is highlighted, driven by `selected_folder`.
+    Folder,
+}
+
 pub struct EditorView {
     /// Every open document. Holding a set rather than one editor is what lets a
     /// filer add and switch documents without the renderer changing.
@@ -230,8 +252,15 @@ pub struct EditorView {
     work_folder_drafts: HashMap<SessionId, WorkFolderDraft>,
     /// The folder the sidebar currently has selected, used as the target
     /// directory for the next "new note" or "new folder". `None` means the
-    /// work folder root.
+    /// work folder root. This is independent of what the sidebar shows
+    /// highlighted (see `sidebar_focus`): opening a file leaves this
+    /// unchanged, so "select a folder, then create a note" keeps working
+    /// even though the folder row itself stops being highlighted.
     selected_folder: Option<PathBuf>,
+    /// Which selection source (`selected_folder` or the active session) the
+    /// sidebar currently highlights. Exclusive by construction, so a file and
+    /// a folder row can never both show as selected at once.
+    sidebar_focus: SidebarFocus,
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
@@ -308,6 +337,11 @@ pub struct EditorView {
     /// invalidates every layout, which is why it is recorded rather than
     /// recomputed.
     content_width: f32,
+    /// Horizontal offset of the main column from the window's left edge,
+    /// i.e. the sidebar and its resizer when a work folder is open, zero
+    /// otherwise. Row mouse events report window-space coordinates, so this
+    /// has to be subtracted before it is used to hit-test text.
+    main_column_left: f32,
     /// Hash of the window font properties used by `WindowShaper`. Width and
     /// document revision live in each cache entry; this is the remaining global
     /// invalidation generation.
@@ -327,6 +361,38 @@ pub struct EditorView {
     /// run while retaining measured heights on both sides.
     height_blocks: HeightBlocks,
     document_parse_job_running: bool,
+    /// Whole-span parse of a joinable block too large for `presented_block` to
+    /// read and reparse synchronously on every viewport miss (see
+    /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
+    /// `schedule_joined_parse`, off the render path, and is what lets such a
+    /// block still resolve a marker pair arbitrarily far apart without this
+    /// view reading the whole block on every scroll.
+    joined_parse_cache: HashMap<BlockId, JoinedBlockCache>,
+    /// Blocks with a `schedule_joined_parse` background job in flight, so a
+    /// block already being parsed is not queued again on the next frame.
+    joined_parse_jobs: HashMap<BlockId, JoinedParseJob>,
+    /// Includes detached jobs from previous documents until their completion.
+    /// Unlike the per-document deduplication map, replacement must not reset it.
+    joined_parse_jobs_running: usize,
+}
+
+/// Identity of a background request. A late completion must not clear the
+/// in-flight entry of another document or a newer snapshot of the same block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinedParseJob {
+    document: DocumentKey,
+    revision: Revision,
+    source_range: SourceRange,
+}
+
+/// One joinable block's cached whole-span parse (see
+/// `EditorView::joined_parse_cache`), and the block identity it was computed
+/// for. An entry whose `revision` or `source_range` no longer matches the
+/// index's current answer for the block is stale and is not used.
+struct JoinedBlockCache {
+    revision: Revision,
+    source_range: SourceRange,
+    parse: JoinedParse,
 }
 
 /// The caret rectangle, in coordinates relative to the top-left of the content
@@ -548,6 +614,7 @@ impl EditorView {
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
+            sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
@@ -576,12 +643,16 @@ impl EditorView {
             line_owners: HashMap::new(),
             layout_cache: HashMap::new(),
             content_width: 0.0,
+            main_column_left: 0.0,
             layout_font_revision: 0,
             caret_geometry: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
+            joined_parse_cache: HashMap::new(),
+            joined_parse_jobs: HashMap::new(),
+            joined_parse_jobs_running: 0,
         }
     }
 
@@ -750,8 +821,29 @@ impl EditorView {
 
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
+    fn active_session_has_sidebar_row(&self) -> bool {
+        self.work_folder_drafts
+            .contains_key(&self.sessions.active_id())
+            || self.active_session().path().is_some_and(|path| {
+                self.work_folder.as_ref().is_some_and(|folder| {
+                    let mut rows = Vec::new();
+                    flatten_work_folder_tree(
+                        folder.children(),
+                        1,
+                        &self.expanded_folders,
+                        &mut rows,
+                    );
+                    rows.iter().any(|row| {
+                        matches!(&row.node, WorkFolderNode::File(entry) if entry.path() == path)
+                    })
+                })
+            })
+    }
+
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         if id == self.sessions.active_id() {
+            self.sidebar_focus = SidebarFocus::ActiveSession;
+            cx.notify();
             return true;
         }
         let scroll_y = self.scroll_y;
@@ -776,6 +868,10 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // Whatever the sidebar had highlighted before, the document on
+        // screen just changed to a specific file or draft, so that is what
+        // should be highlighted now instead.
+        self.sidebar_focus = SidebarFocus::ActiveSession;
         let lines = self.sessions.active().editor().document().line_count();
         self.granularity = Granularity::Lines;
         self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
@@ -786,6 +882,11 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.block_index = BlockIndexState::new();
+        // A `BlockId` is only unique within the document it was assigned by;
+        // a cached whole-span parse keyed by one could otherwise be reused
+        // for an unrelated block in whatever document replaced it.
+        self.joined_parse_cache.clear();
+        self.joined_parse_jobs.clear();
     }
 
     fn remember_recent(&mut self, path: &Path) {
@@ -1210,6 +1311,7 @@ impl EditorView {
             self.expanded_folders.insert(path.clone());
         }
         self.selected_folder = Some(path);
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -1219,6 +1321,7 @@ impl EditorView {
     /// selects, never toggles.
     fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
         self.selected_folder = None;
+        self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
     }
 
@@ -1862,6 +1965,7 @@ impl EditorView {
                 // Formal boundaries can disagree with what the bounded local
                 // parse showed, so every cached presentation is re-derived once.
                 view.block_cache.clear();
+                view.joined_parse_cache.clear();
                 let (granularity, len) = view.desired_layout();
                 if granularity == Granularity::Blocks && len == heights.len() {
                     view.install_heights(granularity, heights);
@@ -1874,6 +1978,111 @@ impl EditorView {
             });
         })
         .detach();
+    }
+
+    /// Coalesced per-block background job producing the whole-span parse of a
+    /// joinable block that exceeds either synchronous line or byte budget — the
+    /// case `presented_block` itself cannot read and reparse synchronously on
+    /// every viewport miss without making a single huge paragraph's render
+    /// cost scale with its length. One job per block, bounded across documents; mirrors
+    /// [`Self::schedule_document_parse`]'s snapshot-and-spawn shape but at
+    /// block granularity, and is what resolves a marker pair arbitrarily far
+    /// apart in such a block without a fixed context window whose result
+    /// would depend on where the viewport happens to sit.
+    fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
+        let revision = self.editor().document().revision();
+        for block in blocks {
+            if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
+                // No backlog of obsolete viewport requests. Completion notifies
+                // the view so its current visible blocks can request a free slot.
+                break;
+            }
+            if !block_is_joinable(block.kind) {
+                continue;
+            }
+            // Re-fetched every iteration (cheap: a reference, not a clone) so
+            // its borrow never has to outlive the mutable `self` access below.
+            let document = self.editor().document();
+            let Some(span) = block_line_span(document, block) else {
+                continue;
+            };
+            if block_fits_sync_join_budget(block, &span) {
+                continue;
+            }
+            if self.joined_parse_jobs.contains_key(&block.id)
+                || self
+                    .joined_parse_cache
+                    .get(&block.id)
+                    .is_some_and(|cached| {
+                        cached.revision == revision && cached.source_range == block.source_range
+                    })
+            {
+                continue;
+            }
+            let content = span.start
+                ..span
+                    .end
+                    .saturating_sub(trailing_blank_lines(document, &span));
+            let snapshot = document.clone();
+            let id = block.id;
+            let source_range = block.source_range;
+            let job = JoinedParseJob {
+                document: self.document_key(),
+                revision,
+                source_range,
+            };
+            self.joined_parse_jobs.insert(id, job);
+            self.joined_parse_jobs_running += 1;
+            cx.spawn(async move |view, cx| {
+                let parse = cx
+                    .background_executor()
+                    .spawn(async move { parse_joined_span(&snapshot, content, revision) })
+                    .await;
+                let _ = view.update(cx, |view, cx| {
+                    // Release capacity even for an old document. Dropping a
+                    // Task cannot interrupt synchronous parse already polling;
+                    // capacity remains charged until it really finishes.
+                    view.joined_parse_jobs_running -= 1;
+                    cx.notify();
+                    if view.document_key() != job.document
+                        || view.joined_parse_jobs.get(&id) != Some(&job)
+                    {
+                        return;
+                    }
+                    view.joined_parse_jobs.remove(&id);
+                    // Resolve against the already-published current index;
+                    // never parse source synchronously to validate a result.
+                    // A provisional request can retry once the formal index
+                    // arrives and provides an exact block identity and range.
+                    let current = view
+                        .current_index()
+                        .and_then(|index| index.block_at(source_range.start));
+                    if view.editor().document().revision() != revision
+                        || current.is_none_or(|block| {
+                            block.id != id || block.source_range != source_range
+                        })
+                    {
+                        return;
+                    }
+                    if let Some(parse) = parse {
+                        view.joined_parse_cache.insert(
+                            id,
+                            JoinedBlockCache {
+                                revision,
+                                source_range,
+                                parse,
+                            },
+                        );
+                        // The next viewport miss on this block should read the
+                        // cache instead of the presentation this view already
+                        // built from a bounded, render-window-only parse.
+                        view.block_cache.remove(&id);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     pub(crate) fn report_error(&mut self, operation: &str, error: BufferError) {
@@ -1924,7 +2133,7 @@ impl EditorView {
         window: &Window,
     ) -> Option<SourceOffset> {
         let visual = self.rendered_line(line)?;
-        let x = window_x - self.theme.line_horizontal_padding;
+        let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment, x);
         Some(source_offset_for_visual_position(
             self.editor(),
@@ -2068,7 +2277,7 @@ impl EditorView {
             .block_cache
             .get(&indexed.id)
             .filter(|block| block.matches(&indexed) && block.covers(&window))
-            .filter(|block| self.disclosures_are_current(block));
+            .filter(|block| self.disclosures_are_current(&indexed, block));
         if let Some(block) = drawn
             && let Some(entry) = self.layout_cache.get(&indexed.id).filter(|entry| {
                 entry.is_valid(
@@ -2080,13 +2289,30 @@ impl EditorView {
         {
             return Some((block.clone(), entry.layout.clone()));
         }
-        let visual = presented_block(self.editor(), &indexed, &window)?;
+        let revision = self.editor().document().revision();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        let visual = presented_block(
+            self.editor(),
+            &indexed,
+            &window,
+            joined.map(|cached| &cached.parse),
+        )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
     }
 
     /// The caret target on the last row of the block above, or the first row of
     /// the block below.
+    ///
+    /// Resolves the neighbor block first, then looks up `joined_parse_cache`
+    /// with exactly the same revision + source_range validity rule
+    /// `layout_around` uses, so a joinable neighbor beyond
+    /// `JOIN_SYNC_LINE_BUDGET` with a cached whole-span parse presents with the
+    /// same shared-parse semantics vertical navigation would get from any other
+    /// call into `presented_block` — not a navigation-only fallback that never
+    /// sees a marker pair straddling the one line being targeted.
     fn neighbor_row_target(
         &self,
         block: &VisualBlock,
@@ -2094,14 +2320,21 @@ impl EditorView {
         x: f32,
         shaper: &dyn LineShaper,
     ) -> Option<SourceOffset> {
-        neighbor_row_target(
+        let (indexed, window) =
+            neighbor_block_window(self.editor(), self.current_index(), block, down)?;
+        let revision = self.editor().document().revision();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        target_in_neighbor(
             self.editor(),
-            self.current_index(),
-            block,
+            &indexed,
+            window,
             down,
             x,
             self.content_width,
             shaper,
+            joined.map(|cached| &cached.parse),
         )
     }
 
@@ -2487,13 +2720,21 @@ impl EditorView {
             if reusable
                 && cached.matches(block)
                 && cached.covers(visible)
-                && self.disclosures_are_current(&cached)
+                && self.disclosures_are_current(block, &cached)
             {
                 self.block_cache.insert(block.id, cached.clone());
                 return Some((cached, true));
             }
         }
-        let presented = presented_block(self.sessions.active().editor(), block, visible)?;
+        let joined = self.joined_parse_cache.get(&block.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == block.source_range
+        });
+        let presented = presented_block(
+            self.sessions.active().editor(),
+            block,
+            visible,
+            joined.map(|cached| &cached.parse),
+        )?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
     }
@@ -2536,34 +2777,54 @@ impl EditorView {
     }
 
     /// True while every line of a cached block still discloses what the caret,
-    /// selection and IME say it should. Cheap: a block holds a handful of lines.
-    fn disclosures_are_current(&self, block: &VisualBlock) -> bool {
-        let editor = self.sessions.active().editor();
-        block.lines.iter().all(|line| {
-            let expected = editor
-                .document()
-                .line_range(LineId(line.line_id as usize))
-                .ok()
-                .filter(|range| *range == line.source_range)
-                .and_then(|range| disclosure_for_line(editor, line.line_id as usize, range));
-            expected == line.disclosure
-        })
+    /// selection and IME say it should.
+    ///
+    /// Compares against [`expected_block_disclosures`] rather than each line's
+    /// own disclosure in isolation, because a shared construct joined across
+    /// physical lines discloses with one merged, run-wide value (see
+    /// `hane_presentation::merged_disclosure`) — a per-line-only recomputation
+    /// would disagree with that value on every line but the one the caret,
+    /// selection or IME actually sits on, and invalidate the cache every frame
+    /// the caret sits inside an active multi-line paragraph.
+    fn disclosures_are_current(&self, indexed: &IndexedBlock, block: &VisualBlock) -> bool {
+        let revision = self.editor().document().revision();
+        let render = block.span.start + block.lines_before
+            ..block.span.start + block.lines_before + block.lines.len();
+        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
+            cached.revision == revision && cached.source_range == indexed.source_range
+        });
+        let Some(expected) = expected_block_disclosures(
+            self.editor(),
+            indexed,
+            &render,
+            joined.map(|cached| &cached.parse),
+        ) else {
+            return false;
+        };
+        expected.len() == block.lines.len()
+            && expected
+                .iter()
+                .zip(&block.lines)
+                .all(|((line, disclosure), visual)| {
+                    *line as u64 == visual.line_id && *disclosure == visual.disclosure
+                })
     }
 }
 
-/// The caret target one row into the next or previous block, aiming at `x`.
-///
-/// Only the one line of the neighbor that the caret can land on is presented, so
-/// stepping off the edge of a block costs the same whatever the neighbor's size.
-fn neighbor_row_target(
+/// The adjacent `IndexedBlock` a vertical step off the edge of `block` would
+/// land in, and the one-line window on it the caret can land on — the "which
+/// block, which line" half of [`neighbor_row_target`], kept separate from
+/// presenting and laying it out so a caller (see
+/// `EditorView::neighbor_row_target`) can look up a cached [`JoinedParse`] for
+/// the resolved block's own id before presenting it, instead of the resolve
+/// and the presentation being fused into one call that never gets a chance to
+/// supply one.
+fn neighbor_block_window(
     editor: &Editor,
     index: Option<&BlockIndex>,
     block: &VisualBlock,
     down: bool,
-    x: f32,
-    width: f32,
-    shaper: &dyn LineShaper,
-) -> Option<SourceOffset> {
+) -> Option<(IndexedBlock, Range<usize>)> {
     let document = editor.document();
     let probe = if down {
         let next = block.source_range.end;
@@ -2578,7 +2839,28 @@ fn neighbor_row_target(
     } else {
         span.end.saturating_sub(1)..span.end
     };
-    let visual = presented_block(editor, &indexed, &window)?;
+    Some((indexed, window))
+}
+
+/// Presents and lays out an already-resolved neighbor block (see
+/// [`neighbor_block_window`]) and answers the caret target on the row the
+/// caller is stepping onto. `joined`, when the caller has a valid cached
+/// whole-span parse for `indexed`, is threaded straight through to
+/// `presented_block` so a joinable neighbor beyond `JOIN_SYNC_LINE_BUDGET`
+/// resolves the same marker pairs vertical navigation's one-line window would
+/// otherwise never see the other half of.
+#[allow(clippy::too_many_arguments)]
+fn target_in_neighbor(
+    editor: &Editor,
+    indexed: &IndexedBlock,
+    window: Range<usize>,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+    joined: Option<&JoinedParse>,
+) -> Option<SourceOffset> {
+    let visual = presented_block(editor, indexed, &window, joined)?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -2586,6 +2868,33 @@ fn neighbor_row_target(
         layout.lines.len().checked_sub(1)?
     };
     layout.source_at_x(&visual, row, x, shaper)
+}
+
+/// The caret target one row into the next or previous block, aiming at `x`.
+///
+/// Only the one line of the neighbor that the caret can land on is presented, so
+/// stepping off the edge of a block costs the same whatever the neighbor's size,
+/// unless `joined` supplies a cached whole-span parse for it. Test-only: the
+/// real render path is `EditorView::neighbor_row_target`, which resolves the
+/// neighbor itself (see [`neighbor_block_window`]) so it can look up a cached
+/// [`JoinedParse`] by the resolved block's own id before presenting it (see
+/// [`target_in_neighbor`]) — this is the resolve-then-present pair fused back
+/// together for tests that supply `joined` directly instead of through a
+/// cache.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn neighbor_row_target(
+    editor: &Editor,
+    index: Option<&BlockIndex>,
+    block: &VisualBlock,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+    joined: Option<&JoinedParse>,
+) -> Option<SourceOffset> {
+    let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
+    target_in_neighbor(editor, &indexed, window, down, x, width, shaper, joined)
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -3084,6 +3393,7 @@ impl Render for EditorView {
         } else {
             0.0
         };
+        self.main_column_left = sidebar_width;
         self.content_width = text_column_width(
             f32::from(window.viewport_size().width),
             sidebar_width,
@@ -3107,6 +3417,7 @@ impl Render for EditorView {
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
         let blocks = self.visible_blocks(visible.clone());
+        self.schedule_joined_parse(&blocks, cx);
         // Keep a margin of presentations around the viewport so scrolling back
         // does not re-present, and drop the rest.
         let retained = self
@@ -3121,6 +3432,8 @@ impl Render for EditorView {
         self.block_cache.retain(|id, _| retained.contains(id));
 
         self.layout_cache.retain(|id, _| retained.contains(id));
+        self.joined_parse_cache
+            .retain(|id, _| retained.contains(id));
 
         let lines = self.visible_line_window(&blocks, &visible);
         let mut rendered = Vec::with_capacity(blocks.len());
@@ -3295,6 +3608,11 @@ impl Render for EditorView {
                                     row_element(
                                         editor, &visual, &layout, row_index, self.theme, &resolver,
                                     )
+                                    // Lets GPUI-event regression tests read a row's real
+                                    // painted window bounds via `VisualTestContext::debug_bounds`
+                                    // instead of duplicating the render-time offset math. A
+                                    // no-op outside test builds.
+                                    .debug_selector(move || format!("row-{line}-{row_index}"))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |view, event, window, cx| {
@@ -3443,9 +3761,13 @@ impl EditorView {
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
-        let root_is_selected = self.selected_folder.is_none();
+        let root_is_selected = (self.sidebar_focus == SidebarFocus::Folder
+            && self.selected_folder.is_none())
+            || (self.sidebar_focus == SidebarFocus::ActiveSession
+                && !self.active_session_has_sidebar_row());
         let root_row = div()
             .id("work-folder-root")
+            .debug_selector(|| "sidebar-root".to_owned())
             .h(px(SIDEBAR_ROW_HEIGHT))
             .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
             .rounded_sm()
@@ -3478,7 +3800,8 @@ impl EditorView {
                 let left_padding = px(SIDEBAR_ROW_HORIZONTAL_PADDING + 12.0 * row.depth as f32);
                 match row.node {
                     WorkFolderNode::File(entry) => {
-                        let is_active = active_path == Some(entry.path());
+                        let is_active = self.sidebar_focus == SidebarFocus::ActiveSession
+                            && active_path == Some(entry.path());
                         let path = entry.path().to_path_buf();
                         div()
                             .id(("work-folder-entry", index))
@@ -3509,7 +3832,8 @@ impl EditorView {
                             }))
                     }
                     WorkFolderNode::Folder(folder) => {
-                        let is_selected = self.selected_folder.as_deref() == Some(folder.path());
+                        let is_selected = self.sidebar_focus == SidebarFocus::Folder
+                            && self.selected_folder.as_deref() == Some(folder.path());
                         let is_expanded = self.expanded_folders.contains(folder.path());
                         let path = folder.path().to_path_buf();
                         let disclosure = if is_expanded {
@@ -3558,9 +3882,11 @@ impl EditorView {
             .into_iter()
             .filter_map(|id| self.sessions.get(id).map(|session| (id, session)))
             .map(|(id, session)| {
-                let is_active = active_id == id;
+                let is_active =
+                    self.sidebar_focus == SidebarFocus::ActiveSession && active_id == id;
                 div()
                     .id(("work-folder-draft", id.0 as usize))
+                    .debug_selector(|| "sidebar-draft".to_owned())
                     .h(px(SIDEBAR_ROW_HEIGHT))
                     .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                     .rounded_sm()
@@ -3747,6 +4073,7 @@ fn source_offset_for_visual_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line::JOIN_SYNC_LINE_BUDGET;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
@@ -3789,7 +4116,7 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX))
+                presented_block(editor, &block, &(0..usize::MAX), None)
                     .expect("block presents")
                     .lines
             })
@@ -3914,7 +4241,7 @@ mod tests {
         let lines = editor.document().line_count();
 
         let block = index.block(0).unwrap();
-        let visual = presented_block(&editor, &block, &(40_000..40_050)).unwrap();
+        let visual = presented_block(&editor, &block, &(40_000..40_050), None).unwrap();
         assert_eq!(visual.lines.len(), 50, "only the visible lines are built");
         assert_eq!(visual.lines_before, 40_000);
         assert_eq!(visual.lines_after, lines - 40_050);
@@ -3955,7 +4282,8 @@ mod tests {
     fn a_presented_block_carries_all_of_its_lines() {
         let editor = Editor::new("```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n");
         let index = BlockIndex::from_buffer(editor.document());
-        let code = presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX)).unwrap();
+        let code =
+            presented_block(&editor, &index.block(0).unwrap(), &(0..usize::MAX), None).unwrap();
         assert_eq!(code.lines.len(), 5, "four fence lines plus the blank below");
         assert_eq!(code.source_range, index.block(0).unwrap().source_range);
         assert_eq!(
@@ -3966,6 +4294,363 @@ mod tests {
             code.matches(&index.block(0).unwrap()),
             "a freshly presented block matches the index it came from"
         );
+    }
+
+    #[gpui::test]
+    fn byte_large_low_line_count_block_receives_background_shared_semantics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Both delimiters are outside the small visible middle line. The byte
+        // budget excludes synchronous full parsing, so only the real background
+        // scheduler can provide the Strong semantics and invalidate the initial
+        // bounded presentation.
+        let padding = "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET);
+        let text = format!("before **{padding}\nmiddle\nend**\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let indexed = view.update(cx, |view, cx| {
+            let document = view.sessions.active().editor().document();
+            view.block_index.publish(
+                BlockIndex::from_buffer(document),
+                IndexSource::Formal,
+                document,
+            );
+            let indexed = view.block_at_offset(SourceOffset(0)).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            assert!(span.len() <= JOIN_SYNC_LINE_BUDGET);
+            assert!(!block_fits_sync_join_budget(&indexed, &span));
+
+            let (initial, _) = view.cached_block(&indexed, &(1..2)).unwrap();
+            assert_eq!(initial.lines.len(), 1);
+            assert!(
+                initial.lines[0]
+                    .style_runs
+                    .iter()
+                    .all(|run| run.kind != hane_presentation::StyleKind::Bold)
+            );
+            view.schedule_joined_parse(std::slice::from_ref(&indexed), cx);
+            assert!(view.joined_parse_jobs.contains_key(&indexed.id));
+            indexed
+        });
+
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            assert!(!view.joined_parse_jobs.contains_key(&indexed.id));
+            let cached = view.joined_parse_cache.get(&indexed.id).unwrap();
+            assert_eq!(cached.revision, view.editor().document().revision());
+            assert_eq!(cached.source_range, indexed.source_range);
+            let (presented, reused) = view.cached_block(&indexed, &(1..2)).unwrap();
+            assert!(
+                !reused,
+                "publishing shared semantics invalidates the fallback"
+            );
+            assert_eq!(presented.lines.len(), 1);
+            assert!(
+                presented.lines[0]
+                    .style_runs
+                    .iter()
+                    .any(|run| run.kind == hane_presentation::StyleKind::Bold)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn joined_parse_work_is_bounded_across_scrolling_and_document_switches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for switch_document in [false, true] {
+            let paragraph = "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET + 1);
+            let text = (0..8)
+                .map(|i| format!("{i} **{paragraph}\nend**\n\n"))
+                .collect::<String>();
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "First", cx));
+            let current = view.update(cx, |view, cx| {
+                let index = BlockIndex::from_buffer(view.editor().document());
+                // Rapid viewport changes before background completions must not
+                // accumulate a parse of every paragraph we passed through.
+                for ordinal in 0..8 {
+                    view.schedule_joined_parse(&[index.block(ordinal).unwrap()], cx);
+                    assert!(view.joined_parse_jobs_running <= MAX_JOINED_PARSE_JOBS);
+                }
+                assert_eq!(view.joined_parse_jobs_running, MAX_JOINED_PARSE_JOBS);
+                assert_eq!(view.joined_parse_jobs.len(), MAX_JOINED_PARSE_JOBS);
+                if switch_document {
+                    // Repeat real session replacement, which clears the block
+                    // map but must leave detached work charged against the cap.
+                    for title in ["Second", "Third"] {
+                        view.sessions.open_untitled(&text, title);
+                        view.on_document_replaced();
+                        let index = BlockIndex::from_buffer(view.editor().document());
+                        for ordinal in 0..8 {
+                            view.schedule_joined_parse(&[index.block(ordinal).unwrap()], cx);
+                        }
+                        assert!(view.joined_parse_jobs.is_empty());
+                        assert_eq!(view.joined_parse_jobs_running, MAX_JOINED_PARSE_JOBS);
+                    }
+                }
+                let document = view.sessions.active().editor().document();
+                let index = BlockIndex::from_buffer(document);
+                let current = index.block(7).unwrap();
+                view.block_index
+                    .publish(index, IndexSource::Formal, document);
+                current
+            });
+            // Model the render wakeup: only the final viewport is requested
+            // again when capacity is released, including old-document results.
+            let wakeups = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_wakeups = wakeups.clone();
+            let _subscription = cx.update(|cx| {
+                cx.observe(&view, move |view, cx| {
+                    observed_wakeups.set(observed_wakeups.get() + 1);
+                    view.update(cx, |view, cx| {
+                        view.schedule_joined_parse(&[current], cx);
+                        assert!(view.joined_parse_jobs_running <= MAX_JOINED_PARSE_JOBS);
+                    });
+                })
+            });
+            cx.run_until_parked();
+            assert!(
+                wakeups.get() > 0,
+                "completion must wake the current viewport"
+            );
+            view.update(cx, |view, _| {
+                assert_eq!(view.joined_parse_jobs_running, 0);
+                assert!(view.joined_parse_jobs.is_empty());
+                let cached = &view.joined_parse_cache[&current.id];
+                assert_eq!(cached.revision, view.editor().document().revision());
+                assert_eq!(cached.source_range, current.source_range);
+                // No backlog: traversed intermediate blocks were never parsed.
+                let index = view.current_index().unwrap();
+                for ordinal in MAX_JOINED_PARSE_JOBS..7 {
+                    assert!(
+                        !view
+                            .joined_parse_cache
+                            .contains_key(&index.block(ordinal).unwrap().id)
+                    );
+                }
+                if switch_document {
+                    assert_eq!(view.joined_parse_cache.len(), 1);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_rejects_an_old_revision_without_evicting_current_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = format!(
+            "before **{}\nmiddle\nend**\n",
+            "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+        );
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let id = view.update(cx, |view, cx| {
+            let document = view.sessions.active().editor().document();
+            let index = BlockIndex::from_buffer(document);
+            let indexed = index.block(0).unwrap();
+            view.schedule_joined_parse(&[indexed], cx);
+            view.editor_mut().insert_text("new ").unwrap();
+            let document = view.sessions.active().editor().document();
+            view.block_index.publish(
+                BlockIndex::from_buffer(document),
+                IndexSource::Formal,
+                document,
+            );
+            let indexed = view.current_index().unwrap().block(0).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let parse = parse_joined_span(
+                view.editor().document(),
+                span,
+                view.editor().document().revision(),
+            )
+            .unwrap();
+            // A newer request may already have completed after switching away
+            // and back. The late old request must preserve this exact snapshot.
+            view.joined_parse_cache.insert(
+                indexed.id,
+                JoinedBlockCache {
+                    revision: view.editor().document().revision(),
+                    source_range: indexed.source_range,
+                    parse,
+                },
+            );
+            view.cached_block(&indexed, &(1..2)).unwrap();
+            indexed.id
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(!view.joined_parse_jobs.contains_key(&id));
+            assert_eq!(
+                view.joined_parse_cache[&id].revision,
+                view.editor().document().revision()
+            );
+            assert!(
+                view.block_cache.contains_key(&id),
+                "a rejected result must not evict current rows"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_requires_the_current_block_identity_and_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for change_identity in [true, false] {
+            let text = format!(
+                "{}\nsecond\n",
+                "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+            );
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            let id = view.update(cx, |view, cx| {
+                let document = view.sessions.active().editor().document();
+                view.block_index.publish(
+                    BlockIndex::from_buffer(document),
+                    IndexSource::Formal,
+                    document,
+                );
+                let mut request = view.current_index().unwrap().block(0).unwrap();
+                // Model a request whose old block boundaries/identity disagree
+                // with the index that is current when the worker finishes.
+                if change_identity {
+                    request.id = BlockId(999);
+                } else {
+                    request.source_range.end.0 -= 1;
+                }
+                view.schedule_joined_parse(&[request], cx);
+                assert!(view.joined_parse_jobs.contains_key(&request.id));
+                request.id
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, _| {
+                assert!(!view.joined_parse_jobs.contains_key(&id));
+                assert!(view.joined_parse_cache.is_empty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn joined_parse_completion_does_not_clear_another_snapshots_pending_job(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for switch_document in [true, false] {
+            let text = format!(
+                "{}\nsecond\n",
+                "x".repeat(crate::line::JOIN_SYNC_BYTE_BUDGET)
+            );
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+            let (id, current_job) = view.update(cx, |view, cx| {
+                let indexed = BlockIndex::from_buffer(view.editor().document())
+                    .block(0)
+                    .unwrap();
+                view.schedule_joined_parse(&[indexed], cx);
+                if switch_document {
+                    view.sessions.open_untitled(&text, "Other");
+                    view.on_document_replaced();
+                } else {
+                    view.editor_mut().insert_text("new ").unwrap();
+                }
+                let current_job = JoinedParseJob {
+                    document: view.document_key(),
+                    revision: view.editor().document().revision(),
+                    source_range: indexed.source_range,
+                };
+                view.joined_parse_jobs.insert(indexed.id, current_job);
+                (indexed.id, current_job)
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, _| {
+                assert_eq!(view.joined_parse_jobs.get(&id), Some(&current_job));
+                assert!(view.joined_parse_cache.is_empty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn disclosures_are_current_reuses_a_joined_runs_shared_disclosure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A caret sitting inside "bold" on the first physical line discloses
+        // the whole shared Strong construct, including its closing marker on
+        // the second physical line, which therefore caches a disclosure of
+        // its own even though the caret never touches it (see
+        // `merged_disclosure`). Comparing that line's cached disclosure
+        // against its *own*, unmerged disclosure would never match while the
+        // caret sits here, rebuilding the block on every frame instead of
+        // reusing it.
+        let text = "This is **bold\nacross lines** ok\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            let caret = SourceOffset(text.find("bold").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(caret))
+                .unwrap();
+            let indexed = view.block_at_offset(caret).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let visual = presented_block(view.editor(), &indexed, &span, None).unwrap();
+            assert_eq!(
+                visual.lines.len(),
+                3,
+                "the joined run's two lines plus the trailing empty line the final newline owns"
+            );
+            assert!(
+                visual.lines[1].disclosure.is_some(),
+                "the line without its own caret still carries the run's merged disclosure"
+            );
+            assert!(
+                view.disclosures_are_current(&indexed, &visual),
+                "an unmoved caret must not invalidate a joined run's cached disclosure"
+            );
+
+            // Moving off the shared construct entirely must still invalidate
+            // the cache: the fix must not make disclosures look current
+            // unconditionally.
+            let elsewhere = SourceOffset(text.find(" ok").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(elsewhere))
+                .unwrap();
+            assert!(
+                !view.disclosures_are_current(&indexed, &visual),
+                "moving off the disclosed construct must still invalidate the cache"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cached_block_reuses_a_joined_runs_presentation_across_frames(cx: &mut gpui::TestAppContext) {
+        // `disclosures_are_current` is only a guard; the actual per-frame path
+        // is `cached_block`, which the render loop calls every frame. This
+        // exercises that call site directly so a wiring regression there —
+        // not just a regression in the helper itself — would be caught.
+        let text = "This is **bold\nacross lines** ok\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            let caret = SourceOffset(text.find("bold").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(caret))
+                .unwrap();
+            let indexed = view.block_at_offset(caret).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+
+            let (_, first_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(!first_reused, "nothing was cached yet");
+
+            let (_, second_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(
+                second_reused,
+                "an unmoved caret inside a joined run must reuse the cached \
+                 presentation instead of rebuilding it every frame"
+            );
+
+            let elsewhere = SourceOffset(text.find(" ok").unwrap());
+            view.editor_mut()
+                .set_selection(Selection::caret(elsewhere))
+                .unwrap();
+            let (_, third_reused) = view.cached_block(&indexed, &span).unwrap();
+            assert!(
+                !third_reused,
+                "moving off the disclosed construct must still rebuild the presentation"
+            );
+        });
     }
 
     #[test]
@@ -4018,8 +4703,13 @@ mod tests {
         ordinal: usize,
         shaper: &FixedAdvanceShaper,
     ) -> (VisualBlock, BlockLayout) {
-        let block = presented_block(editor, &index.block(ordinal).unwrap(), &(0..usize::MAX))
-            .expect("block presents");
+        let block = presented_block(
+            editor,
+            &index.block(ordinal).unwrap(),
+            &(0..usize::MAX),
+            None,
+        )
+        .expect("block presents");
         let layout = layout_block(&block, TEST_WIDTH, shaper);
         (block, layout)
     }
@@ -4045,9 +4735,17 @@ mod tests {
             "the blank line is the last row of the block"
         );
 
-        let target =
-            neighbor_row_target(&editor, Some(&index), &first, true, x, TEST_WIDTH, &shaper)
-                .expect("there is a block below");
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is a block below");
         let (second, below) = laid_out(&editor, &index, 1, &shaper);
         let point = below
             .point_for_source(&second, target, &shaper)
@@ -4082,6 +4780,7 @@ mod tests {
             0.0,
             TEST_WIDTH,
             &shaper,
+            None,
         )
         .expect("there is a block above");
         assert_eq!(
@@ -4111,11 +4810,95 @@ mod tests {
                     down,
                     0.0,
                     TEST_WIDTH,
-                    &shaper
+                    &shaper,
+                    None,
                 ),
                 None
             );
         }
+    }
+
+    #[test]
+    fn moving_into_a_joinable_neighbor_beyond_the_sync_budget_uses_the_cached_parse() {
+        // The neighbor below `first` is a paragraph whose two `**` markers sit
+        // more than `JOIN_SYNC_LINE_BUDGET` lines apart, so a one-line render
+        // window on it cannot resolve them without a cached whole-span parse
+        // (see `a_huge_joinable_paragraph_presents_only_its_visible_window_
+        // without_a_cached_parse` in `hane_ui::line`). `neighbor_row_target`
+        // must thread a caller-supplied `JoinedParse` through to
+        // `presented_block` — exactly what `EditorView::neighbor_row_target`
+        // does once it resolves the neighbor and consults `joined_parse_cache`
+        // — instead of always running the one-line, no-parse path a
+        // navigation-only policy of its own would.
+        let mut source = String::from("alpha\n\n**bold\n");
+        for line in 0..(JOIN_SYNC_LINE_BUDGET + 200) {
+            source.push_str(&format!("filler line {line}\n"));
+        }
+        source.push_str("end**\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (first, _) = laid_out(&editor, &index, 0, &shaper);
+
+        let second = index.block(1).expect("second block");
+        let document = editor.document();
+        let span = block_line_span(document, &second).expect("block spans lines");
+        let content_end = span.end - trailing_blank_lines(document, &span);
+        let joined = parse_joined_span(document, span.start..content_end, document.revision())
+            .expect("the whole span parses");
+
+        // Aimed at the 3rd column: inside "bold" once the opening `**` hides
+        // as a marker, but still inside the literal `**` when it does not —
+        // the same x lands on a different source offset in each case.
+        let x = 2.0 * 8.0;
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            Some(&joined),
+        )
+        .expect("there is a block below");
+
+        let without_cache = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &first,
+            true,
+            x,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is still a block below without the cache");
+        assert_ne!(
+            target, without_cache,
+            "without the cached parse the opening `**` stays literal instead \
+             of hiding as a marker, so the same aim point must land on a \
+             different source offset"
+        );
+
+        // The one-line neighbor window must resolve to the same source offset
+        // a wider window over the same block would, once both share the
+        // cached whole-span parse — the same guarantee
+        // `one_physical_line_render_window_with_cached_joined_parse_matches_a_
+        // wider_window` establishes for `present_block` itself, carried
+        // through navigation's own call path.
+        let wide_window = span.start..(span.start + 5).min(content_end.max(span.start + 1));
+        let wide_visual = presented_block(&editor, &second, &wide_window, Some(&joined))
+            .expect("the wide window presents");
+        let wide_layout = layout_block(&wide_visual, TEST_WIDTH, &shaper);
+        let wide_target = wide_layout
+            .source_at_x(&wide_visual, 0, x, &shaper)
+            .expect("row 0 exists in the wide window too");
+        assert_eq!(
+            target, wide_target,
+            "the neighbor's one-line window must resolve the same source offset \
+             a wider window would, once both share the cached whole-span parse"
+        );
     }
 
     #[test]
@@ -4857,6 +5640,98 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Issue #47: the sidebar must never show two rows selected at once.
+    // Opening a file after selecting a folder must move the highlight onto
+    // the file (even though `selected_folder` — the new-entry target — stays
+    // put), and explicitly selecting a folder while a file is open must move
+    // the highlight back onto the folder despite that file remaining the
+    // active session underneath.
+    #[gpui::test]
+    fn opening_a_file_and_selecting_a_folder_never_both_show_selected(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("sidebar-exclusive-selection");
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        let note = root.join("dev").join("note.md");
+        std::fs::write(&note, "# Note").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+        });
+
+        // Opening a file must move the highlight onto it, even though the
+        // folder just selected remains the target directory for new entries.
+        view.update(cx, |view, cx| {
+            view.open_work_folder_entry(&note, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert_eq!(
+                view.selected_folder.as_deref(),
+                Some(root.join("dev").as_path()),
+                "the folder selected earlier must still be the new-entry target"
+            );
+        });
+
+        // Explicitly reselecting the folder must move the highlight back,
+        // even though the file above is still the active session.
+        view.update(cx, |view, cx| {
+            view.toggle_and_select_work_folder_folder(root.join("dev"), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder);
+            assert_eq!(
+                view.active_session().path(),
+                Some(note.as_path()),
+                "selecting the folder must not close the still-open file"
+            );
+        });
+
+        view.update(cx, |view, cx| view.open_work_folder_entry(&note, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+            assert!(
+                !view.active_session_has_sidebar_row(),
+                "collapsed folder hides the active file; root is the fallback"
+            );
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn empty_work_folder_has_no_active_sidebar_row(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("sidebar-empty-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, _| {
+            view.work_folder = Some(OsWorkFolderScanner.scan(&root).unwrap());
+            assert!(!view.active_session_has_sidebar_row());
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Issue #39: "new folder" creates an empty subfolder through the
     // filesystem boundary (`FileService::create_dir`), adds it to the work
     // folder tree without a rescan, and shows it expanded.
@@ -5189,5 +6064,319 @@ mod tests {
         assert!(existing.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #95: `offset_at_row_x` translated a mouse event's window-space x
+    // by only the line's horizontal padding, ignoring that an open
+    // work-folder sidebar (and its resizer) shifts the whole main column to
+    // the right. Every row hit test was off by that many pixels whenever a
+    // sidebar was open, so a mouse-down or drag anywhere in the body text
+    // landed on the wrong character. These tests drive the real
+    // `EditorView` render tree through `gpui::TestAppContext::simulate_event`
+    // and check the resulting selection, instead of calling the handlers
+    // directly or testing the coordinate math in isolation.
+
+    /// Predicts the `SourceOffset` a click at `visual_offset` on a row should
+    /// land on, and the real window-space point that should produce it — from
+    /// the row's actual painted bounds (`debug_selector`) and the same glyph
+    /// shaping the renderer used, not from the coordinate translation under
+    /// test.
+    fn row_click(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+        line: usize,
+        row_index: usize,
+        visual_offset: usize,
+    ) -> (gpui::Point<gpui::Pixels>, SourceOffset) {
+        let bounds = cx.debug_bounds(selector).expect("row painted for selector");
+        let fragment = row_fragment(view, cx, line, row_index);
+        cx.update(|window, app| {
+            view.read_with(app, |editor_view, _| {
+                let visual = editor_view.rendered_line(line).expect("line rendered");
+                let shaper = WindowShaper::new(window);
+                let x = f32::from(bounds.origin.x)
+                    + editor_view.theme.line_horizontal_padding
+                    + shaper.x_for_offset(&visual, fragment, visual_offset);
+                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
+                let expected = source_offset_for_visual_position(
+                    editor_view.editor(),
+                    line,
+                    &visual,
+                    visual_offset,
+                );
+                (point(px(x), px(y)), expected)
+            })
+        })
+    }
+
+    /// The row's own stretch of its line's visual text, as painted this
+    /// frame — the same range `on_row_mouse_down`/`on_row_mouse_move` use.
+    fn row_fragment(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+        row_index: usize,
+    ) -> Range<usize> {
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                let (block_id, _) = *editor_view
+                    .line_owners
+                    .get(&line)
+                    .expect("line owner recorded");
+                editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout
+                    .lines[row_index]
+                    .line_visual_range
+                    .clone()
+            })
+        })
+    }
+
+    /// Opens an `EditorView` in a real window for GPUI mouse-event
+    /// regression tests: a fixed size so layout is deterministic, and
+    /// optionally a work-folder sidebar so the main column sits to the right
+    /// of it — the geometry `on_row_mouse_down`/`on_row_mouse_move` have to
+    /// hit-test against. Returns the work folder's temporary root, if any,
+    /// for the caller to clean up.
+    fn open_view_for_mouse_tests<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+        with_sidebar: bool,
+    ) -> (
+        gpui::Entity<EditorView>,
+        &'a mut gpui::VisualTestContext,
+        Option<PathBuf>,
+    ) {
+        let text = text.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        let root = if with_sidebar {
+            let root = draft_test_root("mouse-drag-sidebar");
+            std::fs::create_dir_all(&root).unwrap();
+            let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+            view.update(cx, |view, cx| {
+                view.work_folder = Some(work_folder);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            Some(root)
+        } else {
+            None
+        };
+        (view, cx, root)
+    }
+
+    #[gpui::test]
+    fn clicking_active_draft_after_root_selection_restores_draft_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, root) = open_view_for_mouse_tests(cx, "", true);
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let id = view.read_with(cx, |view, _| view.sessions.active_id());
+        let root_point = cx.debug_bounds("sidebar-root").unwrap().center();
+        cx.simulate_mouse_down(root_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(root_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_focus, SidebarFocus::Folder)
+        });
+        cx.run_until_parked();
+        let draft_point = cx.debug_bounds("sidebar-draft").unwrap().center();
+        cx.simulate_mouse_down(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(draft_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), id);
+            assert_eq!(view.sidebar_focus, SidebarFocus::ActiveSession);
+        });
+        std::fs::remove_dir_all(root.unwrap()).unwrap();
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_start_lands_on_the_clicked_character_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+
+        // A sidebar resize shifts the main column further right; the same
+        // visual offsets must still resolve correctly against the new bounds.
+        view.update(cx, |view, cx| {
+            view.sidebar_width = 320.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_middle_extends_in_either_direction_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let (left_point, left_active) = row_click(&view, cx, "row-0-0", 0, 0, 2);
+        cx.simulate_mouse_move(left_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor,
+                    active: left_active
+                }
+            );
+        });
+        assert!(left_active < anchor);
+
+        let (right_point, right_active) = row_click(&view, cx, "row-0-0", 0, 0, 10);
+        cx.simulate_mouse_move(right_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(right_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor,
+                    active: right_active
+                }
+            );
+        });
+        assert!(right_active > anchor);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_across_lines_keeps_the_original_anchor_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let (move_point, active) = row_click(&view, cx, "row-2-0", 2, 0, 4);
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_ne!(anchor, active);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_from_row_start_lands_on_the_clicked_character_without_a_sidebar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "first row of text\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(0));
+    }
+
+    #[gpui::test]
+    fn drag_selection_lands_on_the_second_row_of_a_soft_wrapped_line_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "wrap word wrap word wrap word wrap word wrap word wrap word";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+        cx.simulate_resize(gpui::size(px(420.0), px(760.0)));
+        cx.run_until_parked();
+
+        let second_row = row_fragment(&view, cx, 0, 1);
+        assert!(
+            second_row.len() >= 3,
+            "line must wrap into a second row with a few characters for this test to be meaningful"
+        );
+        let start_offset = second_row.start;
+        let mid_offset = second_row.start + 3;
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-1", 0, 1, start_offset);
+        let (move_point, active) = row_click(&view, cx, "row-0-1", 0, 1, mid_offset);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_ne!(anchor, active);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "あいうえおかきくけこ\n\nsecond paragraph below";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+
+        // Each character is 3 UTF-8 bytes; 3 and 9 are the boundaries after
+        // the first and third characters.
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 3);
+        let (move_point, active) = row_click(&view, cx, "row-0-0", 0, 0, 9);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection { anchor, active });
+        });
+        assert_eq!(anchor, SourceOffset(3));
+        assert_eq!(active, SourceOffset(9));
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  HANE_PINNED_SHA: 721fda20c897efffb70bec730bf6d29656d70fcb
+  HANE_PINNED_SHA: 3b5e404312a82470e39815840da98bc6358fdb31
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
           source = temp / 'hane-gui-interaction'
           dest = temp / 'hane-gui-artifact'
           dest.mkdir(exist_ok=True)
-          names = {'result.json', 'summary.md', 'hane.log', 'ascii-fixture.md', 'ime-fixture.md', 'scroll-fixture.md'}
+          names = {'result.json', 'summary.md', 'hane.log', 'ascii-fixture.md', 'ime-fixture.md', 'scroll-fixture.md', 'inline-fixture.md'}
           for file in source.rglob('*'):
               relative = file.relative_to(source)
               if 'state' in relative.parts or not file.is_file() or file.is_symlink():

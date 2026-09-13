@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 hane-document.workspace = true
 hane-editor.workspace = true
+
+[dev-dependencies]
+hane-markdown.workspace = true
+hane-presentation.workspace = true

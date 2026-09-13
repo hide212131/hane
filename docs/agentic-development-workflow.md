@@ -2,10 +2,11 @@
 
 ## 目的
 
-Hane の Issue から実装、レビュー、実アプリ検証、修正、マージ判断までを、複数の coding agent と検証層に役割を分けて自動化する。
+Hane の Issue から実装、レビュー、実アプリ検証、修正、マージ判断までを、複数の coding agent と検証層に役割を分けて自動化する。この仕組み全体を、以後 **AI Agent Development Workflow（略称 AADW）** と呼ぶ。
 
 この文書を運用設計の正本とする。役割分担そのものを採用する理由は
-[ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。
+[ADR-0023](adr/0023-ai-agent-development-workflow.md) に残す。ChatGPT / Work を上流の設計工程として位置づけ、Claude Code への明示的な handoff を定義する理由は
+[ADR-0026](adr/0026-work-design-handoff.md) に残す。ADR-0026 は ADR-0023 の三者分離を置き換えない。
 
 Local GUI validator の構成、信頼条件、依頼・結果の契約、段階的な実装順序は
 [Local GUI validation 設計](local-gui-validation.md) で具体化する。Computer Use を必須にせず、
@@ -14,24 +15,88 @@ GitHub-hosted macOS を優先し、必要な場合だけ通常アカウントを
 
 追跡 Issue: #44
 
+## 概要
+
+この文書を初めて読む場合は、まずこの節で全体像をつかむ。詳細な基本方針・全体フロー・各 agent / validator の責務は後続の節で説明するので、ここでは重複して書かない。
+
+Hane の agentic development workflow は、次の役割分担で Issue から Pull Request のマージまでを進める。
+
+- **Work（ChatGPT）** が要求整理・詳細設計を担当する。
+- **Claude Code** が実装を担当する。
+- **Codex** が Pull Request のレビューを担当する。
+- **GitHub Copilot** が Codex review・CI・GUI validation の結果を読み、次の処理を判断する。
+- **GitHub Actions** が状態遷移と、マージ前の機械的な安全確認を担う。
+
+UI・操作・描画など実アプリの挙動に影響する変更では、CI やコードレビューに加えて実アプリの GUI validation も行う。
+
+Issue から merge までの大まかな流れは次のとおり。
+
+```text
+Issue
+  ↓
+Work（要求整理・設計）
+  ↓
+Claude Code（実装）
+  ↓
+Pull Request
+  ↓
+CI + review
+  ↓
+必要なら GUI validation
+  ↓
+Copilot が次の処理を判断
+  ├─ fix → Claude Code に戻し、新しい head SHA に対して CI・review・必要な GUI validation をやり直す
+  ├─ blocked → 人へ引き継ぐ
+  └─ ready → deterministic merge gate が現在の head SHA に必要な検証がそろっていることを確認して merge へ進む
+```
+
 ## 基本方針
 
-1つの agent に実装、レビュー、実アプリ検証、進行判断をすべて任せない。
+1つの agent に設計、実装、レビュー、実アプリ検証、進行判断をすべて任せない。
 
+- **Work（ChatGPT）** は要求整理・調査・詳細設計を担当する。実装対象のコード・テスト・ビルド設定は変更せず、製品実装のための branch 作成・commit / push・Pull Request 作成には進まない。責務・終了条件・handoff の詳細は「Work（ChatGPT）」節を参照する。
 - **Claude Code** は実装を担当する。
-- **Codex** は Pull Request のコードレビューを担当する。
+- **Codex** は Pull Request のコードレビューを担当する。ただし Codex の code review 使用量上限に達したことが明示的に報告された場合に限り、trusted workflow が対象 exact head SHA の review を GitHub Copilot Code Review に置き換える（詳細は下記「Codex」節を参照）。
 - **Local GUI validator** はローカル macOS 上で Hane を起動し、実アプリの GUI 挙動を検証する。
 - **GitHub Copilot** は Codex の指摘、GUI validation、Pull Request、CI の状態を読み、次の処理を判断する。
 - **GitHub Actions** はトリガー、権限、状態遷移、最終的な機械的チェックを担当する。
 
-ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Copilot = judge** は変更しない。Local GUI validator はこの3者を置き換えず、コードレビューや CI では確認しにくい実アプリの挙動を補完する独立した検証層とする。
+ADR-0023 の基本判断である **Claude = implementer / Codex = reviewer / Copilot = judge** は変更しない。Local GUI validator はこの3者を置き換えず、コードレビューや CI では確認しにくい実アプリの挙動を補完する独立した検証層とする。ADR-0026 で明文化する **Work = planner/designer** も、この3者の上流に位置する補足であり、既存の判断や `/implement` の起動契約を置き換えない。
 
 AI の判断と、GitHub 上で実際に変更を加える処理を分ける。特にマージは Copilot の判断だけでは実行せず、CI、Codex review、GUI validation、対象 commit、未解決レビューなどを機械的に確認する。
+
+## Issue・Pull Request・コメントの言語
+
+このワークフローで作成・更新する、人が読む GitHub 上の文章は日本語に統一する。Claude Code、Codex、GitHub Copilot、Local GUI validator、および GitHub Actions の定型投稿に共通で適用する。
+
+- Issue と Pull Request のタイトル・本文（見出し、概要、変更内容、検証結果を含む）は日本語で書く。
+- Issue / Pull Request のコメント、レビュー本文、インラインのレビュー指摘、返信、進捗報告、修正依頼、判断理由、人間への引き継ぎも日本語で書く。
+- 入力の Issue、レビュー、ログが英語でも、説明や要約は日本語にする。
+- コード、コマンド、パス、URL、製品名、ログの引用など、原文を保つ必要があるものはそのまま記載し、周囲の説明を日本語にする。
+- 機械処理の契約は翻訳しない。`/implement`、`@codex review`、ラベル、JSON のキー、`fix` / `ready` / `blocked` などの列挙値、相関マーカーを保持する。JSON 内の人向けの説明・判断理由は日本語にする。
+
+新しい agent prompt やコメント生成処理を追加・変更するときも、この言語方針を適用する。投稿前にタイトル・本文・コメントの説明文が日本語であることと、機械処理用の識別子を変更していないことを確認する。
 
 ## 全体フロー
 
 ```text
-Issue
+Issue（要求）
+  |
+  v
+Work（ChatGPT）: 要求整理・調査・詳細設計・ADR・受け入れ条件
+  |
+  v
+設計完了 handoff（実装を阻む未決事項なし）
+  |
+  +-- 設計のみの依頼 --> 設計終了・実装未起動
+  |
+  v
+実装まで依頼済み: 既存 PR / Actions の重複確認
+  |
+  +-- 進行中 --> 既存実装を継続
+  |
+  v
+未起動: 単独 /implement（投稿者の権限検証）
   |
   v
 Claude Code
@@ -83,19 +148,99 @@ CI + Codex review
 
 ## 各 agent / validator の責務
 
+### Work（ChatGPT）
+
+Work は設計側に限定する。要求整理・調査・詳細設計・ADR・受け入れ条件の整備までを担当し、製品実装には進まない。役割を採用する理由は [ADR-0026](adr/0026-work-design-handoff.md) に残す。
+
+#### 担当する範囲
+
+- 要求整理、リポジトリ調査、詳細設計、ADR の起票・更新、受け入れ条件の整備。
+- 調査のためのコード閲覧と検証（読み取り、ローカルでの動作確認など）。
+- 依頼された設計文書・ADR の整備（`docs/**` の編集）。
+
+#### 終了条件（実装に進まない）
+
+- 実装対象のソースコード・テストコード・ビルド設定を変更しない。
+- 製品実装のための branch 作成、commit / push、Pull Request 作成に進まない。
+- Issue が実装可能な状態になった時点で設計作業を終了する。それ以上の詳細化（実装ファイルや手順の逐一固定）は行わない。
+
+「実装可能」は、次の条件をすべて満たす状態とする。
+
+- 背景・問題・要求と対象範囲が明確である。
+- 設計上の決定と根拠、関連 ADR、守るべき制約が記載されている。
+- 受け入れ条件が、実装後に満たしたかを検証できる形になっている。
+- 実装を阻む矛盾・未決事項がなく、成果物を handoff から参照できる。
+
+要求や制約を確定できない場合は「設計中」に留めて解消する。既存コードを読んで決める具体的な関数構成や実装手順は Claude の裁量であり、設計完了前に固定する必要はない。設計が完了しても、実装の依頼がなければ起動しない。
+
+#### Issue の書き方
+
+Issue は背景・解決したい問題・要求・設計上の決定・制約・受け入れ条件を中心にする。決定済みの設計とその根拠、および未決事項を区別し、具体的な変更ファイル・関数・手順を必須実装として過剰に固定しない。矛盾や実装を阻む未決事項があれば Issue に明記し、「設計中」として解消する。要求と決定済み制約の範囲内で選べる実装方法は Claude Code の判断に委ねる。新規 Issue を作る場合の項目構成は Issue テンプレート（`.github/ISSUE_TEMPLATE/`）を参照する。
+
+設計状態は Issue 本文に「設計中」「設計完了（実装未起動）」のように人向けの文章で書く。新しいラベルや機械可読な状態は追加しない。標準ラベル、`gui-validation-required`、`agentic-auto-merge` は既存の運用のまま使う。PR state machine（`implementing` / `waiting-*` / `fix-requested` / `ready-to-merge` / `blocked` / `merged`、[状態管理](#状態管理)）は Pull Request と head SHA の検証状態を表すものであり、Issue の設計状態とは分離する。
+
+#### Work 向け再利用可能タスク指示（例）
+
+ChatGPT / Work のセッションに渡す指示の例。完了条件と禁止範囲を明記する。
+
+```text
+あなたは Hane の設計担当（planner/designer）です。次を厳守してください。
+
+- 対象 Issue の要求整理・調査・詳細設計・ADR 作成・受け入れ条件の整備までを行う。
+- 実装対象のソースコード・テストコード・ビルド設定を変更しない。
+- 製品実装のための branch 作成、commit / push、Pull Request 作成を行わない。
+- 調査のためのコード閲覧・検証、依頼された設計文書・ADR の整備は行ってよい。
+- 要求・範囲・設計判断と根拠・制約・検証可能な受け入れ条件が揃い、実装を阻む未決事項がなくなった時点で設計作業を終了する。阻害事項が残る場合は「設計中」として解消する。
+- 決定済みの設計・根拠と未決事項を区別して書き、具体的な変更ファイル・手順を必須実装として過剰に固定しない。
+- 完了したら Issue 本文に「設計引き渡し」節を追記し、下記「設計完了 handoff の書式」の項目を記録する。
+- 設計のみの依頼では `/implement` を投稿しない。実装まで依頼済みなら再承認を求めず、既存コメント・PR・進行中 Actions を確認し、重複がなければ write / maintain / admin 権限を持つ利用者の文脈で本文完全一致の `/implement` を単独コメントとして投稿する。
+- 利用可能な接続に必要な投稿権限がなければ、handoff と単独コマンドを利用者へ渡し、未起動であることを報告する。権限検証は回避しない。
+- 投稿後は依頼コメント・Claude の実行開始・PR 作成をそれぞれの証跡で区別する。引き渡しの確認を理由に製品実装を自分で始めない。
+```
+
+#### 設計完了 handoff の書式
+
+設計を終えた Issue には、次の項目を持つ「設計引き渡し」節を置く。
+
+```text
+## 設計引き渡し
+
+設計状態: 設計中 | 設計完了（実装未起動）
+成果物・制約・受け入れ条件: <Issue 内の該当節へのリンクまたは要約>
+実装を阻む未決事項: なし | <未決事項の内容>
+実装担当: Claude Code。レビュー: Codex。進行判断: GitHub Copilot。
+起動状況: 未起動 | 依頼投稿済み（コメント URL） | Claude 実装開始（Actions run URL） | PR 作成済み（PR URL）
+```
+
+#### ケース別の振る舞い
+
+1. **設計のみを依頼された場合**: 上記の「設計引き渡し」節を Issue 本文に記録し、起動状況を「未起動」とする。`/implement` は投稿しない。
+2. **実装まで依頼済みの場合**: 「設計引き渡し」節を記録したうえで、Work が既存コメント・Pull Request・進行中の Actions run を確認し、重複がなければ write / maintain / admin 権限を持つ利用者の文脈から本文完全一致の `/implement` を単独コメントとして投稿する。既にある実装依頼に再承認を求めない。投稿権限が利用できない場合は利用者にコマンドを引き渡し、未起動と報告する。handoff の説明は Issue 本文または別コメントに置き、`/implement` コメント本文には含めない。
+3. **既存の実装が進行中の場合**: 既存コメント・Pull Request・Actions run から「依頼投稿済み」「Claude 実装開始」「Pull Request 作成済み」のどこまで進んでいるかを証拠で確認する。設計のみで実装済みとは扱わない。進行中であれば重複起動を避け、再承認は求めない。
+
+設計完了の記述そのものは実装承認や merge-ready の証拠として扱わない。初回実装の起動条件は、権限を持つ利用者による本文完全一致の `/implement` コメントである。PR 作成後の修正は既存の Copilot routing / final judge と Claude fix の契約に従い、再度 `/implement` を要求しない（[実装開始](#実装開始)を参照）。
+
+#### 行動指示としての限界
+
+このガードは agent への行動指示であり、OS 権限などによる強制的な隔離ではない。Work のローカルな操作を GitHub Actions から技術的に防止することはできない。一方、初回実装の起動経路である `/implement` は、投稿者の実効権限検証・本文完全一致・Issue 単位の concurrency・既存 PR 確認を既存の Actions（`implement.yml`）がすでに強制しているため、この役割分担の導入にあたって workflow の YAML・script・状態遷移は変更しない。
+
 ### Claude Code
 
 Claude Code はコードを書く側に限定する。
 
 初回実装では次を行う。
 
-- 元 Issue とリポジトリ内の設計文書を読む。
+- 元 Issue とリポジトリ内の設計文書（関連する ADR を含む）を読む。
 - 必要なコードとテストを変更する。
 - Hane の標準検証を実行する。
 - 作業用 branch に commit / push する。
 - Pull Request を作成する。
 
 修正時は、同じ Pull Request の最新 Codex review、GUI validation 結果、Copilot の判断を読み、妥当な指摘へ対応して同じ branch に push する。新しい Pull Request は作らない。
+
+#### Work からの Issue を受け取ったときの判断
+
+Work（ChatGPT）が設計した Issue（「Work（ChatGPT）」節を参照）を実装するときは、Issue 本文・関連 ADR・既存コードを読んだうえで、要求と決定済みの制約を守る範囲で具体的な実装方法（対象ファイル、関数構成、実装手順）を Claude Code 自身が最終判断する。Issue に書かれた具体的な変更ファイル・手順は、そう明記されていない限り必須の指定ではなく、設計時点の参考情報として扱う。要求や決定済み制約と矛盾する記述、実装を阻む未決事項を見つけた場合は、その内容を報告し、要求を独自に変更しない。
 
 #### 入力の信頼境界
 
@@ -116,7 +261,35 @@ Codex はレビュー側に限定する。
 
 Codex review は ChatGPT の Codex と GitHub の連携を使う。GitHub Agentic Workflows の `engine: codex` は使わない。後者は API key 認証となり、今回の「ChatGPT のサブスクリプションで Codex を使う」という方針と異なるためである。
 
-Codex を Copilot Review に置き換える案は当面採用しない。
+Codex review を Copilot judge の推論で恒常的に代替する案は当面採用しない。ただし次の narrow な使用量上限 fallback は例外として本番導入済みである。
+
+#### Codex 使用量上限時の Copilot review fallback
+
+`chatgpt-codex-connector[bot]` が Pull Request コメントで **Codex の code review 使用量上限** に達したことを明示的に報告した場合に限り、trusted workflow（`codex-limit-copilot-fallback.yml`）がその exact head SHA の review を GitHub Copilot Code Review に置き換える。
+
+- 対象は次のいずれかの文言を含む `chatgpt-codex-connector[bot]` からのコメントのみとする。
+  - `You have reached your Codex usage limits for code reviews.`
+  - `Codex usage limits have been reached for code reviews.`
+- これは Codex の **一般的な失敗** に対する fallback ではない。timeout、結果不明、controller error、証跡不備、判定できない状態はこれまでどおり fail closed のままとし、Copilot への置き換えは行わない。
+- fallback が有効なのは、対象 Pull Request が open かつ non-draft、同一リポジトリ、かつ信頼できる author（repository owner、`github-actions[bot]`、`claude[bot]`）が作成した場合に限る。open・non-draft・同一リポジトリの条件を満たさない場合はスキップし、author の条件を満たさない場合は失敗する。
+- fallback は常に現在の exact head SHA に紐づく。処理中に PR の head SHA が変わった場合、その fallback は stale として扱い進めない。
+- 対象 SHA にすでに `copilot-pull-request-reviewer[bot]` の exact-head review があれば、新たに review を要求せずそれを再利用する。対象 SHA の `hane/codex-review` がすでに `clean` / `findings` の終端状態であれば、fallback 自体が不要と判断してそのまま終了する。
+
+##### 記録される context（provenance と互換性）
+
+- `hane/review-source` は Copilot fallback の marker であり、`codex-limit-copilot-fallback.yml` だけがこれを書き込む。fallback を使った場合は `Review source: Copilot fallback for <short-sha>` を記録する。通常経路の `codex-review.yml` はこの context を書き込まない。
+- `hane/codex-review` は既存の後続 phase が消費する **互換 context** として維持し、review の実施者が Copilot であっても `clean` / `findings` の終端 semantics をそのまま設定する（context 名は変えない）。
+- そのため、review の provenance（実際の実施者）を知りたい後続処理や運用者は、対象 SHA に `hane/review-source` の成功状態が **存在するかどうか** で判定する。存在すれば Copilot fallback、存在しなければ通常の Codex review である。`hane/codex-review` の文言だけから実施者を推測してはならない。
+
+##### 後続処理への接続
+
+- Copilot fallback が `findings` を返した場合、または対象 SHA の CI が失敗している場合、この workflow 自身が `hane/copilot-routing` に `fix` を記録し、Claude fix workflow を dispatch する。既存の終端 `hane/copilot-routing` 結果（`fix` / `blocked` / `continue-validation` のいずれか）がすでにあれば、新たな判断はせずそれを再利用する。fallback 経路が新規に記録するのは `fix` のみであり、`continue-validation` を新たに生成することはない。
+- Claude fix の証跡収集（`claude-fix.yml`）は `hane/review-source` の fallback marker を検知すると、review の参照元を `chatgpt-codex-connector[bot]` ではなく `copilot-pull-request-reviewer[bot]` に切り替え、その exact-head review 本文と inline comment（finding）を読む。
+- fallback の結果が `clean` で CI も成功している場合は、通常の Codex clean review と同じ経路（GUI validation 要否判定などの既存ルール）で処理を継続する。
+
+##### 実運用実績
+
+この fallback は #69 で実装した。PR #60 の head `c878cec39731af036f537506138f34a8828bb053` では fallback の起動と provenance 記録を確認したが、review 投稿者と inline comment 投稿者の表記差により、指摘ありの review を誤って clean と判定していた。これは clean の検証成功例ではない。#71 で review ID と Copilot の既知の投稿者名を照合して修正する。
 
 ### Local GUI validator
 
@@ -314,7 +487,8 @@ Hane は個人所有リポジトリなので、GitHub Agentic Workflows の Copi
 - 対象 Pull Request 番号
 - current head SHA
 - Codex-reviewed SHA
-- Codex outcome: `clean` / `findings`
+- Codex outcome: `clean` / `findings`（`hane/codex-review` に記録する互換 context。実施者が Codex か Copilot fallback かは含まない）
+- review source: `codex` / `copilot-fallback`（`hane/review-source` の成功状態が存在すれば `copilot-fallback`、存在しなければ `codex`。この context は fallback 使用時のみ書き込まれる）
 - GUI-classified SHA
 - GUI validation required?
 - GUI requirement classification source / policy version
@@ -352,6 +526,37 @@ judge が `fix` など後続 worker の起動を必要とする結果を出し�
 
 実装時には、原子的更新または排他が可能な永続領域を状態、durable outbox、receiver processing の正本として使う。機械可読な Pull Request comment を表示用に併用してよいが、競合制御ができない comment の単純な read-modify-write だけを状態や routing request の正本にはしない。ラベルは人間向けの表示や GUI validation required の強制指定に使ってよいが、状態や GUI requirement classification の正本にはしない。
 
+## Issue / Pull Request への状態通知（開始・正常終了・異常終了）
+
+AADW の各ユーザー可視な処理は、Actions の画面を開かなくても対象 Issue / Pull Request の Conversation を見るだけで「処理開始」「正常終了」「異常終了」のいずれかを判断できるようにする。この節は、上記の commit status / durable outbox を正本とする状態管理を置き換えず、それを人間向けに映す表示契約を追加するものである。既存の stall report（[Claude Code](#claude-code) の Issue / Pull Request 停止通知）、quota fallback、routing、judge の詳細コメントは、この契約と併存してよく、削除する必要はない。
+
+対象は少なくとも次を含む。
+
+- `/implement` による Claude Code 実装
+- Codex review と、その使用量上限時の Copilot fallback
+- Copilot pre-GUI routing
+- Claude Code による自動修正・再修正
+- GUI validation 要否判定、および GUI validation
+- final judge / deterministic merge gate
+- 上記を回復・再配送する reconcile / retry が、実際に対象 Issue / Pull Request の処理を開始した場合
+
+複数 PR を走査するだけの reconcile / dispatcher は、対象がなかった定期走査までコメントを増やす必要はない。実際に対象を処理した場合だけ通知する。通常 CI の個々のジョブは GitHub 標準の check 表示に委ね、この契約の対象には含めない。
+
+### 実装 (`.github/scripts/aadw_notify.py`)
+
+共有モジュール `aadw_notify` が、Issue / Pull Request コメントの作成・更新を担う。
+
+- 通知対象の実行は `(process, kind, number, head sha, run id, run attempt)` で識別する。同じ実行内で開始→正常終了/異常終了と呼び出しても同じコメントを更新するだけで重複させず、別の run attempt や別の head sha は別コメントとして扱うため、rerun / retry が別実行の結果を誤って上書きしない。同じイベントの再処理は同一コメントへの no-op またはべき等な更新になる。
+- 処理名は `aadw_notify.PROCESSES` に列挙した trusted な固定値のみを使う。Issue / Pull Request 本文やコメントから取った自由記述をそのまま処理名として渡さない。
+- 開始のまま以後の呼び出しがなければ、そのコメントは開始のまま残るため、人が見て未完了と判別できる。
+- コメント投稿・更新自体が失敗した場合は例外を送出し、黙って成功扱いにしない。呼び出し側は、この通知の失敗が本体処理（commit status への記録や実際の判定結果）の成功を意味しない・その逆でもないように、本体処理の記録とは別に扱う。
+
+`final_pipeline.py`（final judge / merge gate）と `gui_pipeline.py`（GUI validation）は、それぞれの commit status 更新(`publish()` / `retire()`)に併せてこの通知を呼び出す。commit status がその処理の正本であり、Conversation コメントはベストエフォートの表示ミラーである。呼び出し失敗はログに残すだけで、本体の commit status 更新や判定結果を変えない。
+
+`/implement` の開始は既存の `repository_dispatch: claude-progress-start` を `aadw_observer.py` が受け取って Issue に表示する。Codex review、Copilot routing、Claude fix、GUI requirement classification、GUI validation、final judge など commit status を正本とする処理は、`aadw-notifications.yml` が trusted な `workflow_run: in_progress` から source workflow の exact `run id / run attempt` を受け取り、対応する pending status を相関して開始表示を作る。`GITHUB_TOKEN` が作成した `status` event から別 workflow が起動することには依存しない。
+
+終端表示と通知漏れの回復は共通 controller に寄せる。`workflow_run: completed` では `aadw_workflow_completion_reconcile.py` などの専用 controller が timeout / cancel / crash や prior head に残った pending を閉じる。`aadw_notification_reconcile.py` と `aadw_prior_head_reconcile.py` は `aadw-status-notification-reconcile.yml` の `workflow_run` と定期実行から commit status 履歴を読み直し、current head / prior head の開始・終端表示をべき等に補完する。run attempt が status に明示されない場合も status 件数から推測せず、Actions の実 attempt 履歴と status 時刻から相関する。Codex 使用量上限時の fallback のように外部 bot コメントが信頼できる起点になる処理は、その外部イベントと completion reconcile を併用する。
+
 ## トリガー
 
 初期案では次のイベントを使う。
@@ -364,9 +569,11 @@ Issue 上の明示的なコマンドで始める。
 /implement
 ```
 
-Issue 作成だけでは自動実装を始めない。誤作動と意図しないコスト消費を防ぐためである。
+Issue 作成、設計完了の記述、ラベル操作だけでは自動実装を始めない。誤作動と意図しないコスト消費を防ぐためである。
 
 Hane は公開リポジトリであり、`/implement` コメントの文字列だけを起動条件にすると、任意の第三者が Claude の実行枠と書き込み権限を起動できてしまう。dispatch 前に、コメント投稿者の実効権限を検証し、owner / write 権限保持者以外からの `/implement` は無視する。これを不変条件とする。
+
+`/implement` は本文完全一致の単独コメントとして投稿する。設計状態や成果物へのリンクなどの handoff 説明はこのコメントに含めず、Issue 本文または別コメントに置く。これにより「handoff 説明のコメント」と「実装を開始させるコメント」を区別する（Work の責務と handoff の書式は「[Work（ChatGPT）](#workchatgpt)」節を参照）。
 
 `author_association` の `MEMBER` は組織所属を示すだけで、そのリポジトリへの write 権限を保証しない。collaborator に read／triage のみを与えることもできるため、`author_association` を write 権限の代用にはしない。代わりに `GET /repos/{owner}/{repo}/collaborators/{username}/permission` などで現在の実効権限を取得し、`write` / `maintain` / `admin` の場合のみ許可する。Hane は個人所有リポジトリのため、`author_association` が `OWNER` の場合を明示的に許可する最適化は行ってよい。
 
@@ -397,7 +604,30 @@ Codex の GitHub integration による自動 review は新規 Pull Request 作�
 - Codex review の完了は、記録した head SHA を対象とする submitted review、または指摘なしを示す終端 reaction（👍）のいずれかが観測できた場合のみ true とする。👀 のみの状態では次へ進まない。
 - 👍 の場合は Codex outcome を `clean` とする。submitted review があり、同じ review に inline comment / suggestion がある場合は `findings` とする。
 - `findings` の場合は Local GUI validation を直接起動せず、まず Copilot pre-GUI routing を起動する。
-- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。
+- 一定時間内に上記の完了イベントを観測できない、または head SHA の対応付けが判定できない場合は「未完了」として扱い、fail closed で `ready` に進めない。timeout、結果不明、controller error、証跡不備はすべてこの fail closed 経路であり、Copilot への置き換え対象ではない。
+- 例外は「Codex 使用量上限時の Copilot review fallback」節で定義した narrow なケースのみである。`chatgpt-codex-connector[bot]` が code review 使用量上限到達を明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換え、`hane/codex-review` に終端 `clean` / `findings` を、`hane/review-source` に provenance を記録する。
+
+#### `GITHUB_TOKEN` が作成した Pull Request の起動経路 (`.github/workflows/codex-review-reconcile.yml`)
+
+`codex-review.yml` は `pull_request_target` を主な入口にしているが、GitHub は repository の `GITHUB_TOKEN` が発生させたイベントからは新たな workflow を起動しない。`/implement` が `gh pr create` で作成する same-repository Pull Request はこれに該当し、`pull_request_target` の連鎖に依存すると Codex review が一度も起動しない（PR #79 で発生した停止条件、詳細は #80）。
+
+このため、trusted CI の終端 success を起点に `codex-review.yml` の `workflow_dispatch(pr_number, target_sha)` を明示的に要求する小さな reconciliation workflow を置く。処理の正本は GitHub 側のこの trusted workflow であり、Issue / Pull Request 本文に書かれた指示には従わない。
+
+- トリガー: `CI` workflow の `workflow_run` 完了イベント、`*/10 * * * *` の cron、および手動 `workflow_dispatch`。いずれも `pull_request_target` や `issue_comment` の発火には依存しない。
+- 対象: `state == open`、`draft == false`、`head.repo.full_name` が同一リポジトリ、author が repository owner または `github-actions[bot]` / `claude[bot]` の Pull Request のみ。
+- 起動条件（`.github/scripts/codex_review_reconcile.py` の `decide()` が判定する）: 対象 head SHA の `hane/trusted-ci-generation` が `state == success` かつ `description` が `Trusted CI generation <id> passed` に一致し、かつ `cargo test / clippy (macos-latest)` / `cargo test / clippy (windows-latest)` の個別 status も同じ head SHA で `success` であること。pending / failure / stale / marker 不一致など、これ以外はすべて `ci-not-terminal` として起動しない。
+- 重複防止: 同じ head SHA の `hane/codex-review` が既に終端（`Codex review clean for <short_sha>` の `success`、または `Codex findings for <short_sha>` の `failure`）なら再要求しない。既存の `pending` / `error` なども自動で再要求しない。停止したレビューは owner が `/codex-review` で再開する。この処理はレビューが一度も開始していない SHA の起動漏れだけを回収する。
+- dispatch 直前に対象 Pull Request を再取得し、現在の head SHA が判定時の head SHA と一致することを確認する。不一致なら古い SHA の review を開始せず、次回の起動に委ねる。
+- Claude fix 後の new SHA は同じ contract の下で fresh CI → fresh review を独立に再評価し、旧 SHA の Codex 結果を新 SHA に持ち越さない。
+- `codex-review.yml` 自体の認証・権限・review 契約（`CODEX_GITHUB_TOKEN` の扱いや Codex usage-limit 時の Copilot fallback を含む）は変更しない。この workflow は起動条件の判定と `workflow_dispatch` 呼び出しだけを担う。
+
+#### 手動再レビュー要求 `/codex-review`
+
+repository owner は、open・non-draft・同一リポジトリの Pull Request に `/codex-review` とコメントして controller を再起動できる。PR author も repository owner、`github-actions[bot]`、`claude[bot]` のいずれかである必要がある。owner 以外からの要求や対象条件を満たさない要求は、認可ステップが失敗し Actions run が失敗する。
+
+controller は現在の head SHA を固定し、その SHA の終端 `clean` / `findings` を再利用する。終端 status がなくても、同一 SHA の既存 Codex review に指摘があればそれを再利用する。既存の SHA marker 付き要求コメントも再利用できるため、コマンドは新規レビュー要求を必ず発行するものではない。既存要求後に error がある場合は遅れて届いた完了結果を確認し、再利用できなければ新規要求を発行する。
+
+新規 `@codex review` コメントには repository owner 専用の `CODEX_GITHUB_TOKEN` を使う。Codex はレビュー専用でコードを変更しない。head が変化した場合、結果不明、controller の失敗はいずれも成功として扱わない。
 
 ### GUI requirement classification
 
@@ -582,11 +812,12 @@ Local GUI runner は Pull Request のコードを実際に実行するため、�
 - Pull Request の最新 head SHA に Codex review を実行する。
 - review 完了と `clean` / `findings` を head SHA と対応付けて次の処理へ渡せるようにする。
 - `findings` の場合は GUI より先に Copilot pre-GUI routing へ渡す。
+- Codex の code review 使用量上限を `chatgpt-codex-connector[bot]` が明示的に報告した場合に限り、trusted workflow が exact head の review を GitHub Copilot Code Review に置き換える（#69 で実装、指摘の取り込み修正は #71）。詳細は「Codex」節の「Codex 使用量上限時の Copilot review fallback」を参照。
+- repository owner は Pull Request コメント `/codex-review` で同じ controller を明示的に再起動できる。権限確認、head SHA の記録、終端結果の再利用、fail closed の扱いは「[Codex review](#codex-review)」の「手動再レビュー要求」節に従う。
 
 ### Phase 4: Local GUI validation
 
-実装は [Local GUI validation 設計](local-gui-validation.md) の段階に従い、まず Terminal、
-2026-09-09 に標準 GitHub-hosted macOS の起動・撮影が成功した。次に hosted 上の操作、依頼・結果受領、final judge、merge gate を実証する。ローカル補完は hosted で不足する操作に限って検討する。
+実装は [Local GUI validation 設計](local-gui-validation.md) に従う。2026-09-09 の本番GUI操作、依頼・結果受領、実キャンセル回復、final judge、merge gateの証拠は[本番実証記録](history/gui-validation/2026-09-09-production.md)にまとめる。ローカル補完は hosted で不足する操作に限って検討する。
 起動・撮影の成功だけで包括的な GUI 検証やマージ条件を満たしたことにはしない。
 
 - `gui-validation-required` を force-on の入力とし、trusted workflow が head SHA ごとの GUI requirement classification を保存する。

@@ -1,0 +1,24 @@
+{
+  "platform": "macOS",
+  "build": "cargo build -p hane --features timing-probe",
+  "binary_sha256": "d284e863240c61c636006a74488cce19d15cccd9158246d96de896332060190b",
+  "checks": {
+    "rust": {
+      "passed": 249,
+      "log": "rust.log"
+    },
+    "clippy": {
+      "passed": null,
+      "log": "clippy.log",
+      "result": "success"
+    },
+    "workflow": {
+      "passed": 135,
+      "log": "workflow.log"
+    },
+    "scripts": {
+      "passed": 62,
+      "log": "scripts.log"
+    }
+  }
+}

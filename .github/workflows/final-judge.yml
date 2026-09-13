@@ -1,0 +1,52 @@
+name: Copilot final judgement
+on:
+  workflow_run:
+    workflows: [GUI validation, CI, Codex review gate, Copilot pre-GUI routing]
+    types: [completed]
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional exact PR to reconcile
+        type: string
+permissions:
+  contents: read
+jobs:
+  final:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: hane-validation-state-writer
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - run: npm install -g @github/copilot && copilot --version
+      - name: Judge current evidence and apply deterministic gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: python3 -I .github/scripts/final_pipeline.py
+      - name: Retain final decisions for every outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/final-receipts/*.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "evidence_key": "f496f0a890827ede",
+  "snapshot": {
+    "pr_number": 89,
+    "sha": "f4137529722f1a946596c7c6bb67d1d45bfb4d7a",
+    "repository": "hide212131/hane",
+    "judge_procedure_version": "copilot-final/2",
+    "title": "docs: index verified hosted GUI evidence",
+    "body": "Add a short index of the verified hosted GUI runs with exact SHA and scope boundaries.\n\nThis documentation-only PR is also the controlled no-GUI path for Issue #44's final gate verification. It has no workflow or application changes. Keep it open until #87 and #88 are deployed; then verify policy-derived GUI omission, current CI/review, Copilot final judgement, and opt-in automatic merge. Do not treat the old experiment runs as this PR's GUI evidence.\n",
+    "trusted": true,
+    "mergeable": true,
+    "ci_ready": true,
+    "review_ready": true,
+    "classified": true,
+    "gui_required": false,
+    "statuses": {
+      "hane/codex-review": {
+        "id": 53760655210,
+        "state": "success",
+        "description": "Codex review clean for f4137529722f",
+        "target_url": "https://github.com/hide212131/hane/pull/89#issuecomment-5589776378"
+      },
+      "hane/gui-requirement": {
+        "id": 53760382816,
+        "state": "success",
+        "description": "GUI validation not required (v1) for f4137529722f",
+        "target_url": "https://github.com/hide212131/hane/actions/runs/34261676461"
+      }
+    },
+    "files": [
+      {
+        "filename": "docs/history/gui-validation/README.md",
+        "status": "added",
+        "additions": 12,
+        "deletions": 0
+      }
+    ],
+    "gui_receipt": null,
+    "exact_reviews": [],
+    "unresolved_threads": [],
+    "blocking_reviews": [],
+    "required_checks": [
+      "cargo test / clippy (macos-latest)",
+      "cargo test / clippy (windows-latest)"
+    ],
+    "workflow_changes": false,
+    "auto_merge": true
+  },
+  "run_id": "34292028249",
+  "run_attempt": "1",
+  "copilot": {
+    "decision": "ready",
+    "reason": "Docs-only PR; CI and review ready, GUI correctly omitted per policy (no workflow/app changes), no blocking findings or gate denials."
+  },
+  "gate_denials": [],
+  "effect": "merged",
+  "merge_sha": "77e9e09d413ab7dfa82479d2303289e746dfda8c"
+}

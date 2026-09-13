@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source_sha": "ebee7f158b930bdd2b4225d9a29dcd25f8e16872",
+  "source_pr": 90,
+  "cases": [
+    {
+      "gui_outcome": "pass",
+      "fault_injected": false,
+      "copilot": {
+        "decision": "ready",
+        "reason": "Exact-head evidence complete: ci_ready, review_ready, and classified all true; GUI required and gui_receipt.outcome=pass with matching sha and clean build; codex-review and gui-validation statuses success; no unresolved threads, blocking reviews, or gate denials."
+      },
+      "gate_denials": [],
+      "external_effects": []
+    },
+    {
+      "gui_outcome": "fail",
+      "fault_injected": true,
+      "copilot": {
+        "decision": "blocked",
+        "reason": "GUI is required and gui_receipt.outcome is 'fail' (fault-injected probe: save-content assertion failed), overriding the misleading success status text. Gate denial 'GUI is not pass' applies and cannot be waived, regardless of CI/review readiness."
+      },
+      "gate_denials": [
+        "GUI is not pass"
+      ],
+      "external_effects": []
+    },
+    {
+      "gui_outcome": "blocked",
+      "fault_injected": true,
+      "copilot": {
+        "decision": "blocked",
+        "reason": "gui_receipt.outcome is 'blocked' (scenario ascii_edit_save_undo_redo_reopen fault-injected probe interrupted before input) despite the gui-validation status showing success; the overall GUI result is not a clean pass, and gate_denials explicitly flags GUI as not pass, so merge cannot proceed."
+      },
+      "gate_denials": [
+        "GUI is not pass"
+      ],
+      "external_effects": []
+    }
+  ]
+}

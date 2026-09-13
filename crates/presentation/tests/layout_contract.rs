@@ -64,8 +64,11 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                 buffer.revision(),
                 &BlockWindow {
                     trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+                    render: span.clone(),
                     span,
                     lines: &lines,
+                    joined: None,
+                    block_disclosure: None,
                 },
                 LINE_HEIGHT,
             )
