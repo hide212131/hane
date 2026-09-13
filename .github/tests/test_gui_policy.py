@@ -319,6 +319,24 @@ class ReceiptTests(unittest.TestCase):
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 self.validate(raw)
 
+    def test_degenerate_zero_area_bounding_box_cannot_pass(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        evidence = step['click_evidence']
+        degenerate_box = {'minX': 0.2, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.3}
+        window = evidence['window_bounds']
+        x_norm = degenerate_box['minX'] if evidence['edge'] == 'start' else degenerate_box['maxX']
+        expected_x = window['x'] + x_norm * window['width']
+        y_norm_from_top = 1 - (degenerate_box['minY'] + (degenerate_box['maxY'] - degenerate_box['minY']) / 2)
+        expected_y = window['y'] + y_norm_from_top * window['height']
+        step['click_evidence'] = {
+            **evidence,
+            'bounding_box': degenerate_box,
+            'click_point': {'x': expected_x, 'y': expected_y},
+        }
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
     def test_expected_canonical_offset_must_match_known_fixture_position(self):
         raw = passing_result()
         step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')

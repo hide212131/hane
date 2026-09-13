@@ -216,7 +216,7 @@ def _require_click_evidence(step, expected_text, expected_edge):
     if not isinstance(box, dict):
         raise ValueError('click evidence bounding_box invalid')
     _numeric(box, 'minX', 'maxX', 'minY', 'maxY')
-    if not (0 <= box['minX'] <= box['maxX'] <= 1 and 0 <= box['minY'] <= box['maxY'] <= 1):
+    if not (0 <= box['minX'] < box['maxX'] <= 1 and 0 <= box['minY'] < box['maxY'] <= 1):
         raise ValueError('click evidence bounding_box out of normalized range')
 
     window = evidence['window_bounds']
