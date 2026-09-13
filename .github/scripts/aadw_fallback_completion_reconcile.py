@@ -38,6 +38,17 @@ def fallback_target(call, repository, run_id, attempt):
     return max(found, key=lambda row: row[0], default=None)
 
 
+def attempt_window(call, repository, run_id, attempt):
+    row = call(f'repos/{repository}/actions/runs/{run_id}/attempts/{attempt}')
+    if not isinstance(row, dict) or row.get('run_attempt') != int(attempt):
+        raise RuntimeError('fallback workflow attemptの時刻情報を取得できませんでした。')
+    started_at = lifecycle.parse_time(row.get('run_started_at'))
+    finished_at = lifecycle.parse_time(row.get('updated_at'))
+    if started_at is None or finished_at is None or finished_at < started_at:
+        raise RuntimeError('fallback workflow attemptの開始・完了時刻が不正です。')
+    return started_at, finished_at
+
+
 def reconcile(call, repository, payload):
     if payload.get('action') != 'completed':
         return 0
@@ -50,7 +61,7 @@ def reconcile(call, repository, payload):
     if not target:
         return 0
     _comment_id, pr, sha = target
-    started_at = lifecycle.attempt_started_at(call, repository, run_id, attempt)
+    started_at, finished_at = attempt_window(call, repository, run_id, attempt)
 
     statuses = aadw_observer.pages(call, f'repos/{repository}/commits/{sha}/statuses')
     source = max(
@@ -58,7 +69,7 @@ def reconcile(call, repository, payload):
             row for row in statuses
             if row.get('context') == 'hane/review-source'
             and lifecycle.parse_time(row.get('created_at')) is not None
-            and lifecycle.parse_time(row.get('created_at')) >= started_at
+            and started_at <= lifecycle.parse_time(row.get('created_at')) <= finished_at
         ),
         key=lambda row: row.get('id', -1), default=None,
     )
@@ -73,7 +84,7 @@ def reconcile(call, repository, payload):
     else:
         state = 'failure'
         if run.get('conclusion') == 'success':
-            detail = 'fallback workflowは終了しましたが、現在attempt開始後のexact-head代替レビュー終端証跡がありません。head変更またはstale終了として扱います。'
+            detail = 'fallback workflowは終了しましたが、現在attemptの実行時間内にexact-head代替レビュー終端証跡がありません。head変更またはstale終了として扱います。'
         else:
             detail = f'Copilot代替レビューworkflowが正常終了しませんでした（{run.get("conclusion") or "unknown"}）。'
     result = aadw_notify.notify(
