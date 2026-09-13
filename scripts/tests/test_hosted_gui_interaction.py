@@ -1059,6 +1059,11 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
         self.assertEqual(self.view_rs.read_bytes(), self.original)
         self.assertEqual(self.env.git_dirty_paths(self.snapshot), [])
         self.assertEqual(captured_args[0][0], 'cargo')
+        self.assertEqual(step['tests_executed'], 1)
+        self.assertEqual(step['test_name'], interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME)
+        self.assertTrue(step['restored'])
+        self.assertTrue(step['clean_tree'])
+        self.assertIn(f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok", step['cargo_test_output'])
 
     def test_reports_fail_when_cargo_test_confirms_a_non_canonical_landing(self):
         original_run = subprocess.run

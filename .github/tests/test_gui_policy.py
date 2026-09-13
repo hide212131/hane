@@ -158,6 +158,20 @@ def _inline_evidence(steps):
     )
 
 
+def _coordinate_probe_evidence(steps):
+    step = next(s for s in steps if s['name'] == 'coordinate_independent_probe')
+    step.update(
+        tests_executed=1,
+        test_name=policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME,
+        restored=True, clean_tree=True,
+        cargo_test_output=(
+            'running 1 test\n'
+            f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n'
+            'test result: ok. 1 passed; 0 failed'
+        ),
+    )
+
+
 def passing_result():
     scenarios = []
     for name, expected in policy.REQUIRED_STEPS.items():
@@ -166,6 +180,8 @@ def passing_result():
             steps.extend({'name': step, 'result': 'pass'} for step in ('launch', 'window_discovery', 'cleanup'))
         if name == 'inline_syntax_boundary':
             _inline_evidence(steps)
+        if name == 'coordinate_independent_probe':
+            _coordinate_probe_evidence(steps)
         scenarios.append({'name': name, 'result': 'pass', 'steps': steps})
     return {'request_id': REQUEST['request_id'], 'run_id': '123', 'run_attempt': '1',
             'procedure_version': policy.PROCEDURE, 'control': {'sha': CONTROL},
@@ -201,6 +217,10 @@ class ReceiptTests(unittest.TestCase):
     def inline_step(self, raw, name):
         inline = next(s for s in raw['scenarios'] if s['name'] == 'inline_syntax_boundary')
         return next(s for s in inline['steps'] if s['name'] == name)
+
+    def coordinate_probe_step(self, raw):
+        probe = next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+        return next(s for s in probe['steps'] if s['name'] == 'coordinate_independent_probe')
 
     def test_all_three_terminal_results_are_preserved_for_final_judge(self):
         for result in ('pass', 'fail', 'blocked'):
@@ -263,6 +283,29 @@ class ReceiptTests(unittest.TestCase):
     def test_dropping_the_inline_syntax_scenario_from_a_receipt_cannot_pass(self):
         raw = passing_result()
         raw['scenarios'] = [s for s in raw['scenarios'] if s['name'] != 'inline_syntax_boundary']
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_coordinate_independent_probe_evidence_is_fail_closed(self):
+        mutations = [
+            ('restored', False), ('restored', None),
+            ('clean_tree', False), ('clean_tree', None),
+            ('test_name', 'view::tests::wrong_test'), ('test_name', None),
+            ('tests_executed', 0), ('tests_executed', 2), ('tests_executed', None),
+            ('cargo_test_output', ''), ('cargo_test_output', None),
+            ('cargo_test_output', 'running 1 test\ntest result: ok. 1 passed; 0 failed'),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            self.coordinate_probe_step(raw)[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_coordinate_independent_probe_missing_evidence_fields_cannot_pass(self):
+        raw = passing_result()
+        step = self.coordinate_probe_step(raw)
+        for field in ('restored', 'clean_tree', 'test_name', 'tests_executed', 'cargo_test_output'):
+            del step[field]
         with self.assertRaises(ValueError):
             self.validate(raw)
 

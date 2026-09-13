@@ -64,6 +64,11 @@ REQUIRED_STEPS = {
     },
     'coordinate_independent_probe': {'coordinate_independent_probe'},
 }
+# scripts/hosted_gui_interaction.py の COORDINATE_PROBE_TEST_QUALIFIED_NAME と同じ値。
+# 独立 probe が実際にこの1件の hit-test を実行して pass したことを、cargo test の
+# 生出力から突き合わせて確認するために使う(PR #139 review: `result == "pass"` だけでは
+# hit-test 未実行や証拠欠落の receipt も通ってしまうため)。
+COORDINATE_PROBE_TEST_QUALIFIED_NAME = 'view::tests::boundary_click_lands_on_source_offset_independent_of_ocr'
 REQUIRED_IMAGES = [
     'ascii_edit_save_undo_redo_reopen/before.png',
     'ascii_edit_save_undo_redo_reopen/after.png',
@@ -420,6 +425,23 @@ def _validate_inline_evidence(steps, evidence_dir):
         raise ValueError('multiline code span visual transition evidence mismatch')
 
 
+def _validate_coordinate_probe_evidence(steps):
+    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
+    if step is None:
+        raise ValueError('coordinate-independent probe step missing')
+    if step.get('restored') is not True or step.get('clean_tree') is not True:
+        raise ValueError('coordinate-independent probe restore/clean-tree evidence missing')
+    if step.get('test_name') != COORDINATE_PROBE_TEST_QUALIFIED_NAME:
+        raise ValueError('coordinate-independent probe test name mismatch')
+    if step.get('tests_executed') != 1:
+        raise ValueError('coordinate-independent probe did not execute exactly one hit-test')
+    output = step.get('cargo_test_output')
+    if not isinstance(output, str) or not output.strip():
+        raise ValueError('coordinate-independent probe cargo test output missing')
+    if f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok' not in output:
+        raise ValueError('coordinate-independent probe cargo test output does not confirm target test passed')
+
+
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     """Fail closed on provenance/shape errors; never upgrade partial evidence."""
     now = now or datetime.now(timezone.utc)
@@ -477,6 +499,8 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                         raise ValueError('reopen lifecycle incomplete')
             if scenario['name'] == 'inline_syntax_boundary':
                 _validate_inline_evidence(steps, evidence_dir)
+            if scenario['name'] == 'coordinate_independent_probe':
+                _validate_coordinate_probe_evidence(steps)
         for relative in REQUIRED_IMAGES:
             _artifact_sha256(evidence_dir, relative)
     return outcome

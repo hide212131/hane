@@ -1058,7 +1058,10 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
             cargo_test_output=output_tail, tests_executed=executed,
         )
     if proc.returncode == 0:
-        return make_step(name, "pass", cargo_test_output=output_tail, tests_executed=executed)
+        return make_step(
+            name, "pass", cargo_test_output=output_tail, tests_executed=executed,
+            test_name=COORDINATE_PROBE_TEST_QUALIFIED_NAME, restored=restored, clean_tree=clean,
+        )
     if (COORDINATE_PROBE_FAILURE_MARKER in full_output
             and f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED" in full_output):
         return make_step(
