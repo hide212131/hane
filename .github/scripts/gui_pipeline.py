@@ -66,6 +66,19 @@ def current(api, request, require_claim=True):
     return True
 
 
+def historical_terminal(api, request):
+    """Return this request generation's durable terminal status from history."""
+    found = []
+    for row in api.pages(api.repo(f'commits/{request["sha"]}/statuses')):
+        if row.get('context') != CONTEXT:
+            continue
+        state = gui_state(row, request['sha'])
+        if (state and state[1] == request['generation']
+                and state[0] in ('pass', 'fail', 'blocked')):
+            found.append((row.get('id', 0), state))
+    return max(found, key=lambda item: item[0], default=(None, None))[1]
+
+
 def terminal_receipt_retained(api, pr, state):
     outcome, generation = state
     number = pr['number']
@@ -195,6 +208,15 @@ def report(api, request):
         print(f'GUI {state[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}')
         return
     if state != ('pending', request['generation']):
+        # The PR head may have moved, or another GUI generation may now be the
+        # latest status.  Neither invalidates an already-durable terminal result
+        # for this exact request generation, so inspect the request SHA history
+        # before treating this report rerun as stale.
+        terminal = historical_terminal(api, request)
+        if terminal:
+            notify(api, request, 'success', detail=f'GUI validation結果: {terminal[0]}')
+            print(f'GUI {terminal[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}')
+            return
         print('Stale GUI generation: no status written')
         # Someone else (usually retire() from a later resolve()) already
         # superseded this generation; resolve its own comment idempotently
