@@ -54,6 +54,62 @@ class Tests(unittest.TestCase):
             'GitHub Copilot fallback',
         )
 
+    def test_fallback_routing_terminal_is_not_attached_to_parallel_normal_run(self):
+        normal_run = 'https://github.com/example/actions/runs/100'
+        fallback_run = 'https://github.com/example/actions/runs/200/attempts/2'
+        rows = [
+            {
+                'id': 30,
+                'context': 'hane/copilot-routing',
+                'state': 'pending',
+                'description': 'Copilot routing pending for aaaaaaaaaaaa',
+                'target_url': normal_run,
+            },
+            {
+                'id': 31,
+                'context': 'hane/copilot-routing',
+                'state': 'pending',
+                'description': 'Copilot routing pending for aaaaaaaaaaaa',
+                'target_url': fallback_run,
+            },
+            {
+                'id': 32,
+                'context': 'hane/copilot-routing',
+                'state': 'failure',
+                'description': 'Copilot routing: fix for aaaaaaaaaaaa',
+                'target_url': fallback_run,
+            },
+            {
+                'id': 33,
+                'context': 'hane/copilot-routing',
+                'state': 'success',
+                'description': 'Copilot routing: continue-validation for aaaaaaaaaaaa',
+                'target_url': normal_run,
+            },
+        ]
+        generations = subject.build_generations(rows)
+        fallback = [generation for generation in generations if generation['run_id'] == '200']
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(fallback[0]['attempt'], '2')
+        self.assertEqual(fallback[0]['latest']['id'], 32)
+        self.assertFalse(any(
+            generation['run_id'] == '100' and generation['latest']['id'] == 32
+            for generation in generations
+        ))
+
+    def test_fallback_routing_workflow_records_actual_run_attempt(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / 'workflows'
+            / 'codex-limit-copilot-fallback.yml'
+        ).read_text(encoding='utf-8')
+        self.assertIn(
+            'routing_run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"',
+            workflow,
+        )
+        self.assertIn("-f state=pending -f context='hane/copilot-routing'", workflow)
+        self.assertGreaterEqual(workflow.count('-f target_url="$routing_run_url"'), 2)
+
 
 if __name__ == '__main__':
     unittest.main()
