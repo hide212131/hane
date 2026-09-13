@@ -11,6 +11,7 @@ on:
       - Codex review gate
       - Codex limit Copilot review fallback
       - Copilot pre-GUI routing
+      - Copilot routing reconciliation
       - Claude automatic fix worker
       - GUI requirement classification
       - GUI validation
