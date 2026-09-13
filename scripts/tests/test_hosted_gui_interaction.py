@@ -314,6 +314,41 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
             self.assertEqual(len(undo_calls), 1)
             self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
 
+    def test_force_save_race_is_not_masked_by_a_write_slower_than_a_fixed_settle_window(self):
+        """Codex review on PR #138 (2nd pass): a previous fix only held a match
+        for a fixed short settle window before accepting it. An async write
+        landing later than that fixed window, but still well inside the
+        caller's poll_timeout budget, must still be caught rather than
+        accepted as a clean baseline."""
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            undo_calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    def land_late():
+                        time.sleep(0.7)
+                        fixture_path.write_text('corrupted content left in memory', encoding='utf-8')
+                    threading.Thread(target=land_late).start()
+                    return True, '', ''
+                if args[0] == 'undo-save':
+                    undo_calls.append(args)
+                    fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'move-doc-start':
+                    return True, '', ''
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                step = interaction.restore_scenario_baseline(
+                    None, 1234, fixture_path, interaction.INLINE_FIXTURE_ORIGINAL,
+                    1.0, 1.0, 'boundary_click_edit_bold_italic_state_restore',
+                )
+            self.assertEqual(step['result'], 'pass')
+            self.assertEqual(len(undo_calls), 1)
+            self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
+
 
 class RunMutatingSubtestTests(unittest.TestCase):
     """Issue #136: the per-subtest orchestration wrapper around baseline restore."""

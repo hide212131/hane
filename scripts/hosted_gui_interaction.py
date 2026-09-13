@@ -105,10 +105,13 @@ BASELINE_RESTORE_MAX_UNDOS = 8
 
 # Hane の save_session は書き込みを background executor へ投入して非同期に完了する
 # ため、force-save/undo-save のキー送信が返った直後に読んだ fixture バイト列は、
-# 保存中の古い(baseline と偶然一致する)内容である場合がある。一致を確定と扱う前に
-# この秒数だけ変化がないことを確認し、直後に届く非同期書き込みでの上書きを見逃さ
-# ないようにする。
-BASELINE_SETTLE_SECONDS = 0.3
+# 保存中の古い(baseline と偶然一致する)内容である場合がある。save_session の完了を
+# 明示的に通知する手段がないため、固定の短い settle 秒数では、非同期書き込みが
+# その秒数より遅れて到着する環境で古い baseline を「一致」と誤確定してしまう
+# (Codex review on PR #138)。baseline 復元は fail/blocked 後にしか実行されない
+# 低頻度経路なので、一致を確定する前に呼び出し側から渡された poll_timeout の
+# 残り時間いっぱいまで無変化を確認し、締切までに到着するどんな遅延書き込みも
+# 見逃さないようにする。
 
 
 def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
@@ -214,35 +217,35 @@ def wait_for_fixture_bytes(
 
 
 def wait_for_fixture_settled_bytes(
-    fixture_path: Path, expected: bytes, timeout: float,
-    interval: float = 0.2, settle: float = BASELINE_SETTLE_SECONDS,
+    fixture_path: Path, expected: bytes, timeout: float, interval: float = 0.2,
 ) -> tuple[bool, bytes]:
-    """Like wait_for_fixture_bytes, but a match must survive `settle` seconds
-    of re-reads before being accepted. save_session writes asynchronously in
-    the background executor, so a read right after the save keystroke can
-    observe stale bytes that coincidentally equal `expected` while the real
-    write is still in flight; requiring the match to hold catches that write
-    landing instead of reporting a clean baseline that is about to be
-    overwritten."""
+    """Like wait_for_fixture_bytes, but a match must survive re-reads all the
+    way to `timeout` before being accepted. save_session writes asynchronously
+    in the background executor with no completion signal this harness can
+    observe, so a read right after the save keystroke can observe stale bytes
+    that coincidentally equal `expected` while the real write is still in
+    flight and lands arbitrarily later. A fixed short settle window would
+    still miss writes that land after it elapses, so this holds the match
+    open for the caller's entire remaining budget instead of a fixed
+    constant, catching any write landing before the deadline. This is only
+    called to restore state after a fail/blocked subtest, so spending the
+    full timeout on the success path is acceptable."""
     deadline = time.monotonic() + timeout
     last = b""
+    matched_since: Optional[float] = None
     while True:
         try:
             last = fixture_path.read_bytes()
         except OSError:
             last = b""
+        now = time.monotonic()
         if last == expected:
-            settled_until = time.monotonic() + settle
-            while last == expected and time.monotonic() < settled_until:
-                time.sleep(min(interval, max(settled_until - time.monotonic(), 0.0)))
-                try:
-                    last = fixture_path.read_bytes()
-                except OSError:
-                    last = b""
-            if last == expected:
-                return True, last
-        if time.monotonic() >= deadline:
-            return False, last
+            if matched_since is None:
+                matched_since = now
+        else:
+            matched_since = None
+        if now >= deadline:
+            return matched_since is not None, last
         time.sleep(interval)
 
 
