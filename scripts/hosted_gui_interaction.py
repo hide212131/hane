@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/5"
+PROCEDURE_VERSION = "hosted-gui-interaction/6"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
@@ -97,6 +97,13 @@ BOUNDARY_MARK = "Z"
 NAVIGATION_MARK = "N"
 JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 
+# 境界クリック挿入が期待 canonical position からこの文字数を超えて離れて着地した場合は、
+# 「closing marker と後続 visible text が共有する境界での製品 source mapping の疑い」ではなく
+# 「OCR/クリック精度など helper 自身が意図した visual boundary へ到達できなかった」可能性が高いと
+# みなし、製品 fail ではなく procedure の blocked として扱う(Issue #137)。値は対象境界の
+# marker(最大2文字の `**`)+ 直後の空白1文字を含む近傍を許容する程度に小さく保つ。
+BOUNDARY_LANDING_FAR_MISS_CHARS = 4
+
 # inline_syntax_boundary の各 mutating subtest は、成功経路であっても最大で数回の
 # undo-save までしか積まない(delimiter_toggle の 3 段編集が最長)。fail/blocked 後の
 # baseline 復元はこの上限に余裕を持たせた回数だけ undo-save を試み、それでも一致
@@ -114,12 +121,33 @@ BASELINE_RESTORE_MAX_UNDOS = 8
 # 見逃さないようにする。
 
 
-def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
+def match_insertion_offset(text: str, pattern: str, *, edge: str) -> int:
     match = re.search(pattern, text)
     if not match:
         raise ValueError(f"pattern not found in expected fixture text: {pattern}")
-    position = match.end() if edge == "end" else match.start()
+    return match.end() if edge == "end" else match.start()
+
+
+def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
+    position = match_insertion_offset(text, pattern, edge=edge)
     return text[:position] + insertion + text[position:]
+
+
+def locate_single_insertion_offset(baseline: str, actual: str, insertion: str) -> Optional[int]:
+    """baseline に insertion を 1 箇所だけ挿入すると actual になる、その挿入位置を返す。
+
+    そのような位置が一意に定まらない(挿入以外の破損・複数候補がある等)場合は
+    None を返す。これにより「単一文字が期待と違う場所へ着地した」という
+    helper 自身の到達失敗と、単純な不一致では説明できない破損とを区別できる。
+    """
+    if len(actual) != len(baseline) + len(insertion):
+        return None
+    candidates = [
+        offset
+        for offset in range(len(baseline) + 1)
+        if baseline[:offset] + insertion + baseline[offset:] == actual
+    ]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def delimiter_states(delimiter: str) -> tuple[str, str]:
@@ -589,29 +617,82 @@ def run_mutating_subtest(steps, subtest_steps, name, process_holder, swift_helpe
     return restore_step["result"] == "pass"
 
 
+def parse_click_evidence(stdout: str) -> dict:
+    """click-text の stdout(JSON 1行)から OCR/クリック evidence を取り出す。
+
+    OCR の bounding box そのものを source 境界の真値として扱うのではなく、
+    「OCR が認識した文字列と bounding box」「そこから helper が選んだ実 OS click 座標」を
+    証跡として残すためだけに使う(Issue #137)。フィールド欠落・非 JSON は helper 自身の
+    契約違反として ValueError にし、呼び出し側で製品 fail と区別できる procedure blocked
+    として扱わせる。
+    """
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"click-text の stdout を JSON として解釈できない: {stdout!r}") from exc
+    required = {"matched_text", "bounding_box", "window_bounds", "click_point", "edge"}
+    missing = required - payload.keys()
+    if missing:
+        raise ValueError(f"click-text evidence に必須フィールドが不足している({sorted(missing)}): {stdout!r}")
+    return payload
+
+
 def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseline,
                         ocr_pattern, ocr_edge, source_pattern, source_edge, insertion,
                         helper_timeout, poll_timeout):
     detail = {"screenshot": str(screenshot_path)}
-    ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot_path), ocr_pattern, ocr_edge], helper_timeout)
+    expected_offset = match_insertion_offset(baseline, source_pattern, edge=source_edge)
+    detail["expected_canonical_source_offset"] = expected_offset
+    ok, out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot_path), ocr_pattern, ocr_edge], helper_timeout)
     if not ok:
-        return False, f"境界へのクリックに失敗した: {err}", detail
+        return "fail", f"境界へのクリックに失敗した: {err}", detail
+    try:
+        detail["click_evidence"] = parse_click_evidence(out)
+    except ValueError as exc:
+        return "blocked", (
+            f"click-text から OCR bounding box / 実クリック座標の evidence を取得できず、"
+            f"境界クリックの着地点を検証できない: {exc}"
+        ), detail
     ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), insertion], helper_timeout)
     if not ok:
-        return False, f"境界への入力に失敗した: {err}", detail
+        return "fail", f"境界への入力に失敗した: {err}", detail
     expected = insert_at_match(baseline, source_pattern, insertion, edge=source_edge)
-    matched, actual = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
-    detail.update(expected_after_insert=expected, actual_after_insert=_decode(actual))
+    matched, actual_bytes = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
+    actual = _decode(actual_bytes)
+    detail.update(expected_after_insert=expected, actual_after_insert=actual)
     if not matched:
-        return False, "境界クリック挿入後の内容が期待値と一致しない", detail
+        landing_offset = locate_single_insertion_offset(baseline, actual, insertion)
+        detail["actual_landing_source_offset"] = landing_offset
+        if landing_offset is None:
+            detail["landing_classification"] = "corrupted"
+            return "fail", (
+                "境界クリック挿入後の内容が期待値と一致せず、単一文字挿入として"
+                "着地点を特定できない(破損の疑い)"
+            ), detail
+        delta = abs(landing_offset - expected_offset)
+        detail["landing_offset_delta"] = delta
+        if delta > BOUNDARY_LANDING_FAR_MISS_CHARS:
+            detail["landing_classification"] = "far_miss"
+            return "blocked", (
+                f"境界クリックの着地点が期待 canonical position から {delta} 文字離れており、"
+                "OCR bounding box の誤差や helper 自身のクリック精度が意図した visual boundary へ"
+                "到達できなかった疑いが強いため、製品 fail とは区別して procedure blocked とする"
+            ), detail
+        detail["landing_classification"] = "boundary_ambiguous_near_canonical"
+        return "fail", (
+            f"境界クリックの着地点が期待 canonical position から {delta} 文字という近傍だが一致しない。"
+            "closing marker と後続 visible text が共有する境界での製品 source mapping の疑いがあり、"
+            "#101 側での独立した root-cause 切り分けが必要"
+        ), detail
+    detail["landing_classification"] = "at_canonical"
     ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
     if not ok:
-        return False, f"undo に失敗した: {err}", detail
+        return "fail", f"undo に失敗した: {err}", detail
     matched, actual = wait_for_fixture_bytes(fixture_path, baseline.encode("utf-8"), poll_timeout)
     detail.update(expected_after_undo=baseline, actual_after_undo=_decode(actual))
     if not matched:
-        return False, "undo 後に元の内容へ戻らない", detail
-    return True, None, detail
+        return "fail", "undo 後に元の内容へ戻らない", detail
+    return "pass", None, detail
 
 
 def run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
@@ -628,14 +709,14 @@ def run_boundary_step(module, env, config, swift_helper, process_holder, window_
             result.append(make_step(name, "blocked", reason=f"境界確認用の撮影に失敗した: {capture.get('reason')}"))
             return result
         screenshot = run_dir / f"{label}.png"
-        ok, reason, detail = boundary_edit_check(
+        status, reason, detail = boundary_edit_check(
             swift_helper, screenshot, pid, config.fixture_path, INLINE_FIXTURE_ORIGINAL,
             ocr_pattern, ocr_edge, source_pattern, source_edge, BOUNDARY_MARK,
             helper_timeout, poll_timeout,
         )
-        result.append(make_step(f"{name}_check_{index}", "pass" if ok else "fail", reason=reason, **detail))
-        if not ok:
-            result.append(make_step(name, "fail", reason=reason))
+        result.append(make_step(f"{name}_check_{index}", status, reason=reason, **detail))
+        if status != "pass":
+            result.append(make_step(name, status, reason=reason))
             return result
         reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_reset_{index}")
         result.append(reset)

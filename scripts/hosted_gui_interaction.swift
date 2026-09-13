@@ -252,7 +252,11 @@ func imagePixelDigest(_ path: String) {
     print(digest.map { String(format: "%02x", $0) }.joined())
 }
 
-func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
+// matchedText は正規表現が一致した部分文字列そのもの(bounding box の由来を追跡できる
+// ように、行全体ではなく一致範囲のテキストを返す)。呼び出し側はこの bounding box の
+// 端をそのまま source 境界の真値として扱わず、evidence として残すためだけに使う
+// (Issue #137)。
+func findTextMatch(_ path: String, _ pattern: String) -> (matchedText: String, box: CGRect) {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
@@ -269,7 +273,7 @@ func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: fullRange), let range = Range(match.range, in: text) else { continue }
         guard let box = try? candidate.boundingBox(for: range) else { continue }
-        return box.boundingBox
+        return (String(text[range]), box.boundingBox)
     }
     fail("no OCR match for pattern: \(pattern)")
 }
@@ -304,20 +308,45 @@ func postClick(_ point: CGPoint) {
     Thread.sleep(forTimeInterval: 0.3)
 }
 
+// click-text の stdout は「OCR bounding box の端をそのまま source 境界の真値として使った」
+// のか「そこから選んだ実 OS click 座標」なのかを Python 側の evidence として残せるよう、
+// 1行の JSON で OCR 一致文字列・正規化 bounding box・window bounds・実クリック座標を返す
+// (Issue #137)。この座標自体が意図した visual boundary を正しく指したかどうかは、この
+// stdout だけでは確定できない。呼び出し側が probe 文字入力後の保存 byte という独立した
+// 観測と突き合わせて初めて判定できる。
 func clickText(_ pid: pid_t, _ screenshotPath: String, _ pattern: String, _ edge: String) {
     guard edge == "start" || edge == "end" else { fail("edge must be start or end") }
-    let box = findTextMatch(screenshotPath, pattern)
-    let point = screenPoint(windowBounds(pid), box, edge)
+    let match = findTextMatch(screenshotPath, pattern)
+    let bounds = windowBounds(pid)
+    let point = screenPoint(bounds, match.box, edge)
     focus(pid)
     postClick(point)
-    print("clicked at \(point.x),\(point.y) for pattern \(pattern) edge=\(edge)")
+    let evidence: [String: Any] = [
+        "matched_text": match.matchedText,
+        "bounding_box": [
+            "minX": Double(match.box.minX), "maxX": Double(match.box.maxX),
+            "minY": Double(match.box.minY), "maxY": Double(match.box.maxY),
+        ],
+        "window_bounds": [
+            "x": Double(bounds.minX), "y": Double(bounds.minY),
+            "width": Double(bounds.width), "height": Double(bounds.height),
+        ],
+        "click_point": ["x": Double(point.x), "y": Double(point.y)],
+        "edge": edge,
+        "pattern": pattern,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: evidence),
+          let json = String(data: data, encoding: .utf8) else {
+        fail("could not encode click-text evidence as JSON")
+    }
+    print(json)
 }
 
 func dragSelectText(_ pid: pid_t, _ screenshotPath: String, _ pattern1: String, _ edge1: String, _ pattern2: String, _ edge2: String) {
     guard edge1 == "start" || edge1 == "end", edge2 == "start" || edge2 == "end" else { fail("edge must be start or end") }
     let bounds = windowBounds(pid)
-    let from = screenPoint(bounds, findTextMatch(screenshotPath, pattern1), edge1)
-    let to = screenPoint(bounds, findTextMatch(screenshotPath, pattern2), edge2)
+    let from = screenPoint(bounds, findTextMatch(screenshotPath, pattern1).box, edge1)
+    let to = screenPoint(bounds, findTextMatch(screenshotPath, pattern2).box, edge2)
     focus(pid)
     guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: from, mouseButton: .left),
           let drag = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDragged, mouseCursorPosition: to, mouseButton: .left),

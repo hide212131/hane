@@ -1,6 +1,7 @@
 """Helper provenance checks without touching a screen or invoking Swift."""
 import hashlib
 import inspect
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -150,6 +151,197 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
     def test_inline_syntax_scenario_exercises_the_existing_multiline_code_span(self):
         source = inspect.getsource(interaction.run_inline_syntax_scenario)
         self.assertIn('run_multiline_code_span_toggle_step(', source)
+
+
+class MatchInsertionOffsetTests(unittest.TestCase):
+    """Issue #137: the canonical source offset used to build the expected
+    fixture bytes must be the same offset used later to judge where an
+    actual click landed."""
+
+    def test_offset_reproduces_insert_at_match(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        cases = [
+            (interaction.BOLD_ITALIC_OPEN_RE, 'end'),
+            (interaction.BOLD_ITALIC_CLOSE_RE, 'start'),
+            (interaction.CODE_SPAN_OPEN_RE, 'end'),
+            (interaction.CODE_SPAN_CLOSE_RE, 'start'),
+            (interaction.QUOTE_BOLD_OPEN_RE, 'end'),
+            (interaction.LIST_ITALIC_OPEN_RE, 'end'),
+        ]
+        for pattern, edge in cases:
+            with self.subTest(pattern=pattern, edge=edge):
+                offset = interaction.match_insertion_offset(text, pattern, edge=edge)
+                self.assertEqual(
+                    text[:offset] + 'Z' + text[offset:],
+                    interaction.insert_at_match(text, pattern, 'Z', edge=edge),
+                )
+
+    def test_unmatched_pattern_is_rejected(self):
+        with self.assertRaises(ValueError):
+            interaction.match_insertion_offset(interaction.INLINE_FIXTURE_ORIGINAL, r'not-present', edge='end')
+
+
+class LocateSingleInsertionOffsetTests(unittest.TestCase):
+    """Issue #137: separate a clean single-character landing at the wrong
+    offset (a deterministic, explainable outcome that can be compared against
+    the expected canonical offset) from bytes that cannot be explained as a
+    single insertion at all."""
+
+    def test_locates_the_unique_offset(self):
+        self.assertEqual(
+            interaction.locate_single_insertion_offset('combo** boundary', 'comboZ** boundary', 'Z'), 5)
+
+    def test_locates_the_offset_observed_in_run_34744353175(self):
+        # PR #132 の trusted GUI run で実際に観測された着地: **bold *italic* combo**
+        # の閉じ境界クリックが期待の "comboZ**" ではなく "combo** Zboundary" になった。
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        actual = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+        expected_offset = interaction.match_insertion_offset(
+            baseline, interaction.BOLD_ITALIC_CLOSE_RE, edge='start')
+        landing_offset = interaction.locate_single_insertion_offset(baseline, actual, 'Z')
+        self.assertIsNotNone(landing_offset)
+        self.assertEqual(landing_offset - expected_offset, 3)  # "**" と直後の空白1文字を飛び越えた
+
+    def test_returns_none_when_length_rules_out_a_single_insertion(self):
+        self.assertIsNone(
+            interaction.locate_single_insertion_offset('combo** boundary', 'combo** boundary and more', 'Z'))
+
+    def test_returns_none_when_the_offset_is_ambiguous(self):
+        # 'a' の連続に 'a' を挿入すると、どの位置に挿入しても同じ結果になるため
+        # 単一の着地点として特定できない。
+        self.assertIsNone(interaction.locate_single_insertion_offset('aaaa', 'aaaaa', 'a'))
+
+
+class ParseClickEvidenceTests(unittest.TestCase):
+    """Issue #137: click-text の stdout から OCR bounding box と実クリック座標を
+    evidence として取り出す。取り出せない場合は helper 自身の契約違反として
+    procedure blocked に倒せるよう ValueError にする。"""
+
+    VALID_STDOUT = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'end',
+    })
+
+    def test_parses_well_formed_evidence(self):
+        evidence = interaction.parse_click_evidence(self.VALID_STDOUT)
+        self.assertEqual(evidence['matched_text'], 'combo')
+        self.assertEqual(evidence['click_point'], {'x': 123.0, 'y': 456.0})
+
+    def test_rejects_non_json_stdout(self):
+        with self.assertRaises(ValueError):
+            interaction.parse_click_evidence('clicked at 1,2 for pattern combo edge=end')
+
+    def test_rejects_json_missing_required_fields(self):
+        with self.assertRaises(ValueError):
+            interaction.parse_click_evidence(json.dumps({'matched_text': 'combo'}))
+
+
+class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
+    """Issue #137: click-text の evidence を残しつつ、境界クリック挿入の着地点が
+    期待 canonical position からどれだけ離れているかで「helper 自身が意図した
+    visual boundary へ到達できなかった疑い(procedure blocked)」と「製品 source
+    mapping の疑い(fail、#101 で切り分け)」を区別する。"""
+
+    OCR_EVIDENCE = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'start',
+    })
+
+    def _run(self, directory, final_fixture_content):
+        fixture_path = Path(directory) / 'fixture.md'
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        fixture_path.write_text(baseline, encoding='utf-8')
+        calls = []
+
+        def fake_run_helper(swift_helper, args, timeout):
+            calls.append(args[0])
+            if args[0] == 'click-text':
+                return True, self.OCR_EVIDENCE, ''
+            if args[0] == 'type-save':
+                fixture_path.write_text(final_fixture_content, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'undo-save':
+                fixture_path.write_text(baseline, encoding='utf-8')
+                return True, '', ''
+            raise AssertionError(f'unexpected helper call: {args}')
+
+        with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+            status, reason, detail = interaction.boundary_edit_check(
+                None, Path('/unused.png'), 1234, fixture_path, baseline,
+                interaction.BOLD_ITALIC_OCR_RE, 'end',
+                interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                1.0, 0.0,
+            )
+        return status, reason, detail, calls
+
+    def test_exact_canonical_landing_passes_and_records_click_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            expected = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            status, reason, detail, calls = self._run(directory, expected)
+        self.assertEqual(status, 'pass')
+        self.assertIsNone(reason)
+        self.assertEqual(detail['landing_classification'], 'at_canonical')
+        self.assertEqual(detail['click_evidence']['matched_text'], 'combo')
+        self.assertEqual(calls, ['click-text', 'type-save', 'undo-save'])
+
+    def test_near_canonical_mismatch_is_a_product_suspect_not_a_blocked_procedure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            actual = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            status, reason, detail, calls = self._run(directory, actual)
+        self.assertEqual(status, 'fail')
+        self.assertEqual(detail['landing_classification'], 'boundary_ambiguous_near_canonical')
+        self.assertEqual(detail['landing_offset_delta'], 3)
+        self.assertIn('#101', reason)
+        self.assertNotIn('undo-save', calls)
+
+    def test_far_miss_is_blocked_instead_of_attributed_to_the_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            actual = baseline.replace('list item with', 'list Zitem with', 1)
+            status, reason, detail, calls = self._run(directory, actual)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'far_miss')
+        self.assertGreater(detail['landing_offset_delta'], interaction.BOUNDARY_LANDING_FAR_MISS_CHARS)
+        self.assertNotIn('undo-save', calls)
+
+    def test_corrupted_result_that_is_not_a_single_insertion_stays_a_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status, reason, detail, calls = self._run(directory, 'totally unrelated content')
+        self.assertEqual(status, 'fail')
+        self.assertEqual(detail['landing_classification'], 'corrupted')
+
+    def test_malformed_click_evidence_is_blocked_before_typing_the_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                calls.append(args[0])
+                if args[0] == 'click-text':
+                    return True, 'clicked at 1,2 for pattern combo edge=end', ''
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                status, reason, detail = interaction.boundary_edit_check(
+                    None, Path('/unused.png'), 1234, fixture_path, baseline,
+                    interaction.BOLD_ITALIC_OCR_RE, 'end',
+                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                    1.0, 0.0,
+                )
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(calls, ['click-text'])
+        self.assertNotIn('click_evidence', detail)
 
 
 class RestoreScenarioBaselineTests(unittest.TestCase):

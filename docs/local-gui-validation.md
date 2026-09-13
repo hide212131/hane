@@ -54,7 +54,7 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 | 再オープン | プロセスを終了し、別の設定領域で同じ保存文書を開き、内容と画像を確認 |
 | 日本語IME | 入力方式と親methodを確認し、OS経由のromajiから変換・確定し、保存された日本語を照合 |
 | スクロール・フォーカス等 | OSの操作と、その操作による表示・状態の変化を確認。内部instrumentの設定と区別 |
-| インライン構文（太字・斜体・inline code） | 太字＋斜体複合・複数行にまたがるinline code・quote内・list内のmarker/本文境界をOCRで特定してクリック・ドラッグ選択し、`*`/`**`/backtickの追加削除後の保存byte列を照合。OCRは座標特定のみに使い、見た目の合否判定には使わない |
+| インライン構文（太字・斜体・inline code） | 太字＋斜体複合・複数行にまたがるinline code・quote内・list内のmarker/本文境界をOCRで特定してクリック・ドラッグ選択し、`*`/`**`/backtickの追加削除後の保存byte列を照合。OCRは座標候補の特定のみに使い、文字列矩形の端を境界の真値とは扱わない。境界クリックのevidenceにはOCR一致文字列・bounding box・実クリック座標・probe挿入後の実着地オフセットを残し、期待canonical positionから大きく離れた着地はhelper自身の到達失敗として`blocked`、近傍の不一致は製品側のsource mapping疑いとして`fail`のまま区別する |
 
 既存の起動・撮影部品は `scripts/gui_validate.py` と `scripts/window_id.swift`、入力部品は `scripts/phase0_input.swift` にある。実験手順 `scripts/hosted_gui_interaction.py` / `.swift` は基本操作の調査用であり、productionの受領契約や網羅的GUI検証の完成を意味しない。
 
@@ -66,11 +66,11 @@ hosted は使い捨て環境と個人データの分離に役立つが、悪意�
 
 結果には上記の対応情報に加え、実際のcheckout SHA・clean状態、binary digestとtoolchain/features、runner image/version、開始・終了時刻、工程・シナリオごとの `pass` / `fail` / `blocked`、理由、証拠の一覧・digestを含める。GitHub Actionsの run ID / attempt は artifact と結果に一致させる。
 
-手順 `hosted-gui-interaction/5` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
+手順 `hosted-gui-interaction/6` は、指定コミットの独立したコピーでビルドし、そのコピーのSHAとclean状態を検証する。受領側もこの対応を確認し、macOSの実バージョン、runner imageの識別子・バージョン、CPUアーキテクチャが欠けた結果を `pass` にしない。
 
-GUIステータスの版にも手順番号を含める（例: `v1-p5`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
+GUIステータスの版にも手順番号を含める（例: `v1-p6`）。手順更新前の終端ステータスは再利用せず、現在のCI・レビュー条件が揃った時点で新しい実行世代を開始する。
 
-手順5では、対象のCargoビルドより前に信頼するSwiftヘルパーをコンパイルし、呼び出し前後でバイナリのSHA-256を確認する。ビルド後にcontrol checkoutのSwiftソースを読み直さない。同一OSユーザーの悪意ある常駐プロセスに対する完全な隔離を保証するものではない。GUI要否・レビュー・CIが途中で不適格になった世代は実行・報告を止め、書き込み権限のある制御処理が待機状態を無効化する。再び適格になれば新しい世代を開始する。
+手順6では、対象のCargoビルドより前に信頼するSwiftヘルパーをコンパイルし、呼び出し前後でバイナリのSHA-256を確認する。ビルド後にcontrol checkoutのSwiftソースを読み直さない。同一OSユーザーの悪意ある常駐プロセスに対する完全な隔離を保証するものではない。GUI要否・レビュー・CIが途中で不適格になった世代は実行・報告を止め、書き込み権限のある制御処理が待機状態を無効化する。再び適格になれば新しい世代を開始する。
 
 同じ手順版でも、終端結果に対応するreceipt artifactが欠落・期限切れの場合は新世代で再検証する。ステータス公開後のアップロード中は、その実行attemptの完了を待つ。証拠が保存されている終端結果は繰り返さない。
 
