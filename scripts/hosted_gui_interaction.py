@@ -103,6 +103,13 @@ JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 # しなければ復元失敗として fail-closed にする。
 BASELINE_RESTORE_MAX_UNDOS = 8
 
+# Hane の save_session は書き込みを background executor へ投入して非同期に完了する
+# ため、force-save/undo-save のキー送信が返った直後に読んだ fixture バイト列は、
+# 保存中の古い(baseline と偶然一致する)内容である場合がある。一致を確定と扱う前に
+# この秒数だけ変化がないことを確認し、直後に届く非同期書き込みでの上書きを見逃さ
+# ないようにする。
+BASELINE_SETTLE_SECONDS = 0.3
+
 
 def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
     match = re.search(pattern, text)
@@ -201,6 +208,39 @@ def wait_for_fixture_bytes(
             last = b""
         if last == expected:
             return True, last
+        if time.monotonic() >= deadline:
+            return False, last
+        time.sleep(interval)
+
+
+def wait_for_fixture_settled_bytes(
+    fixture_path: Path, expected: bytes, timeout: float,
+    interval: float = 0.2, settle: float = BASELINE_SETTLE_SECONDS,
+) -> tuple[bool, bytes]:
+    """Like wait_for_fixture_bytes, but a match must survive `settle` seconds
+    of re-reads before being accepted. save_session writes asynchronously in
+    the background executor, so a read right after the save keystroke can
+    observe stale bytes that coincidentally equal `expected` while the real
+    write is still in flight; requiring the match to hold catches that write
+    landing instead of reporting a clean baseline that is about to be
+    overwritten."""
+    deadline = time.monotonic() + timeout
+    last = b""
+    while True:
+        try:
+            last = fixture_path.read_bytes()
+        except OSError:
+            last = b""
+        if last == expected:
+            settled_until = time.monotonic() + settle
+            while last == expected and time.monotonic() < settled_until:
+                time.sleep(min(interval, max(settled_until - time.monotonic(), 0.0)))
+                try:
+                    last = fixture_path.read_bytes()
+                except OSError:
+                    last = b""
+            if last == expected:
+                return True, last
         if time.monotonic() >= deadline:
             return False, last
         time.sleep(interval)
@@ -506,7 +546,10 @@ def restore_scenario_baseline(swift_helper, pid, fixture_path, baseline,
     if not ok:
         return make_step(name, "blocked",
                           reason=f"baseline 復元前の force-save に失敗した: {err}", attempts=0)
-    matched, actual = wait_for_fixture_bytes(fixture_path, baseline_bytes, poll_timeout)
+    # force-save/undo-save のキー送信は save_session の非同期な書き込み完了を待たない
+    # ため、直後の読み取りは書き込み中の古い baseline 相当のバイト列を「一致」と誤認
+    # しうる。settled 版で一致が一定時間保持されることまで確認してから受理する。
+    matched, actual = wait_for_fixture_settled_bytes(fixture_path, baseline_bytes, poll_timeout)
     attempts = 0
     while not matched and attempts < BASELINE_RESTORE_MAX_UNDOS:
         ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
@@ -514,7 +557,7 @@ def restore_scenario_baseline(swift_helper, pid, fixture_path, baseline,
             return make_step(name, "blocked",
                               reason=f"baseline 復元の undo に失敗した: {err}", attempts=attempts)
         attempts += 1
-        matched, actual = wait_for_fixture_bytes(fixture_path, baseline_bytes, poll_timeout)
+        matched, actual = wait_for_fixture_settled_bytes(fixture_path, baseline_bytes, poll_timeout)
     if not matched:
         return make_step(name, "blocked",
                           reason=f"{attempts} 回の undo でも fixture が baseline へ復元できない",

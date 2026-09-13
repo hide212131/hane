@@ -6,6 +6,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -271,6 +273,42 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
                 step = interaction.restore_scenario_baseline(
                     None, 1234, fixture_path, interaction.INLINE_FIXTURE_ORIGINAL,
                     1.0, 0.0, 'boundary_click_edit_bold_italic_state_restore',
+                )
+            self.assertEqual(step['result'], 'pass')
+            self.assertEqual(len(undo_calls), 1)
+            self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
+
+    def test_force_save_race_is_not_masked_by_a_stale_baseline_read(self):
+        """Codex review on PR #138: save_session writes asynchronously in a
+        background executor, so the very first read after force-save's
+        keystroke can still show the old, baseline-matching disk bytes while
+        the real (unsaved) edit is about to land a moment later. Accepting
+        that stale read as a clean match would let the delayed write silently
+        contaminate the next subtest, exactly like Issue #136."""
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            undo_calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    def land_late():
+                        time.sleep(0.05)
+                        fixture_path.write_text('corrupted content left in memory', encoding='utf-8')
+                    threading.Thread(target=land_late).start()
+                    return True, '', ''
+                if args[0] == 'undo-save':
+                    undo_calls.append(args)
+                    fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'move-doc-start':
+                    return True, '', ''
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                step = interaction.restore_scenario_baseline(
+                    None, 1234, fixture_path, interaction.INLINE_FIXTURE_ORIGINAL,
+                    1.0, 1.0, 'boundary_click_edit_bold_italic_state_restore',
                 )
             self.assertEqual(step['result'], 'pass')
             self.assertEqual(len(undo_calls), 1)
