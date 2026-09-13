@@ -97,6 +97,150 @@ BOUNDARY_MARK = "Z"
 NAVIGATION_MARK = "N"
 JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 
+# Issue #137 review (Codex, PR #139): クリックの着地点が OCR/helper 誤差ではなく
+# 製品側 source-mapping の不整合であることを、OCR を一切経由しない実 EditorView・
+# 実 glyph shaping・実 mouse event で独立に確認する probe。crates/** には恒久追加
+# せず、`run_coordinate_independent_probe` がこの一時テスト本体を使い捨ての
+# SHA検証済みクローン (`env.snapshot_checkout`) の `crates/ui/src/view.rs` へ注入し、
+# 実行後に original bytes と clean tree を復元・証明したうえで破棄する。
+COORDINATE_PROBE_TEST_NAME = "boundary_click_lands_on_source_offset_independent_of_ocr"
+
+COORDINATE_PROBE_RUST_SOURCE = r'''
+
+    /// The row's own hidden-markup rendering (no caret touching it), as the
+    /// macOS hosted GUI validator's `click-text` OCR sees it — used only to
+    /// locate the visual x-offset to click at, never as the offset oracle
+    /// below.
+    fn row_visual_text(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+    ) -> String {
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                editor_view
+                    .rendered_line(line)
+                    .expect("line rendered")
+                    .visual_text
+            })
+        })
+    }
+
+    // Issue #137 review (Codex, PR #139): injected temporarily by
+    // scripts/hosted_gui_interaction.py's `run_coordinate_independent_probe`
+    // into a disposable, SHA-verified clone of the exact target commit —
+    // never committed permanently under crates/**. It drives the real
+    // `EditorView` render tree (`debug_bounds`, glyph shaping, `row_click`,
+    // `simulate_mouse_down`/`simulate_mouse_up`) with the caret parked away
+    // from the target constructs, so their `**`/`*`/`` ` ``/`>`/`-` markers
+    // are hidden exactly as the OCR'd screenshot would see them — a
+    // coordinate-specific event with no OCR bounding box in the loop, unlike
+    // `boundary_edit_check` in the validator.
+    //
+    // Every expected offset here is the canonical position derived purely
+    // by searching the source text — never through `source_map`/
+    // `source_offset_for_visual_position` — so a mismatch against the
+    // actual post-click selection is unambiguous, independent evidence of a
+    // product source-mapping defect, not OCR/helper noise. Every case runs
+    // before any assertion, so one mismatch never hides the others, and each
+    // mismatch is collected as `fail` evidence instead of being folded into
+    // the expected value.
+    #[gpui::test]
+    fn boundary_click_lands_on_source_offset_independent_of_ocr(cx: &mut gpui::TestAppContext) {
+        let text = "x\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n\n> quote with **bold**\n\n- list item with *italic*\n";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        let bold_source_line = "**bold *italic* combo** boundary line.";
+        let bold_line_start = text.find(bold_source_line).unwrap();
+        let bold_open_expected = SourceOffset(bold_line_start + 2);
+        // Canonical closing position is right before the "**" marker, not
+        // after it (Issue #137 review: folding the marker length into the
+        // expected value absorbed the very mismatch this probe exists to
+        // surface).
+        let bold_close_expected = SourceOffset(
+            bold_line_start + bold_source_line.find("combo**").unwrap() + "combo".len(),
+        );
+
+        let code_open_source_line = "this inline `code";
+        let code_open_line_start = text.find(code_open_source_line).unwrap();
+        let code_open_expected =
+            SourceOffset(code_open_line_start + code_open_source_line.find('`').unwrap() + 1);
+
+        let code_close_source_line = "span` crosses a line.";
+        let code_close_line_start = text.find(code_close_source_line).unwrap();
+        let code_close_expected = SourceOffset(
+            code_close_line_start + code_close_source_line.find("span`").unwrap() + "span".len(),
+        );
+
+        let quote_source_line = "> quote with **bold**";
+        let quote_line_start = text.find(quote_source_line).unwrap();
+        let quote_open_expected =
+            SourceOffset(quote_line_start + quote_source_line.find("**bold").unwrap() + 2);
+        let quote_close_expected = SourceOffset(
+            quote_line_start + quote_source_line.find("bold**").unwrap() + "bold".len(),
+        );
+
+        let list_source_line = "- list item with *italic*";
+        let list_line_start = text.find(list_source_line).unwrap();
+        let list_open_expected =
+            SourceOffset(list_line_start + list_source_line.find("*italic").unwrap() + 1);
+        let list_close_expected = SourceOffset(
+            list_line_start + list_source_line.find("italic*").unwrap() + "italic".len(),
+        );
+
+        // Clicking a construct discloses its markers on every following
+        // frame (the same "caret inside reveals `**`" behavior the disclosure
+        // tests at line 4568+ cover), so each case below re-parks the caret
+        // on the neutral first line and re-reads the row's hidden-markup
+        // visual text immediately before computing where to click — mirroring
+        // `_move_to_neutral` before every capture in the Python validator.
+        let mut mismatches: Vec<String> = Vec::new();
+        for (selector, line, row_index, needle, edge_offset, canonical) in [
+            ("row-2-0", 2, 0, "bold", 0usize, bold_open_expected),
+            ("row-2-0", 2, 0, "combo", "combo".len(), bold_close_expected),
+            // "this inline `code" / "span` crosses a line." are one soft-wrapped
+            // paragraph block, so the second source line is the block's row 1,
+            // not its own row 0.
+            ("row-4-0", 4, 0, "code", 0, code_open_expected),
+            ("row-5-1", 5, 1, "span", "span".len(), code_close_expected),
+            ("row-7-0", 7, 0, "bold", 0, quote_open_expected),
+            ("row-7-0", 7, 0, "bold", "bold".len(), quote_close_expected),
+            ("row-9-0", 9, 0, "italic", 0, list_open_expected),
+            ("row-9-0", 9, 0, "italic", "italic".len(), list_close_expected),
+        ] {
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(0)))
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let visual = row_visual_text(&view, cx, line);
+            let visual_offset = visual.find(needle).unwrap() + edge_offset;
+
+            let (point, _row_click_predicted) =
+                row_click(&view, cx, selector, line, row_index, visual_offset);
+            cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+            let actual = view.read_with(cx, |view, _| view.editor().selection());
+            if actual != Selection::caret(canonical) {
+                mismatches.push(format!(
+                    "click on {selector} at visual offset {visual_offset} landed on {actual:?}, \
+                     independent of OCR, instead of the canonical source offset {canonical:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "independent GPUI click(s) landed on a non-canonical source offset — product \
+             source-mapping mismatch, not OCR/helper noise:\n{}",
+            mismatches.join("\n")
+        );
+    }
+'''
+
 # 境界クリック挿入が期待 canonical position からこの文字数を超えて離れて着地した場合の
 # 分類の閾値(診断用途のみ)。click_point は OCR bounding box から算出されており、
 # OS click が意図した visual boundary を指したという独立証拠にはならない。そのため
@@ -751,15 +895,17 @@ def confirm_boundary_edit_reproducibility(
     ならないため、`reproducible_mismatch` として証拠に残すだけで procedure blocked
     のまま #101 側での root-cause 切り分けに委ね、fail へは昇格しない。
 
-    OCR と独立した座標証拠は crates/ui/src/view.rs の
-    `boundary_click_lands_on_source_offset_independent_of_ocr`(#[gpui::test])
-    が別途提供する。実 EditorView・実 glyph shaping・実 mouse event で、閉じ
-    marker の直後により可視テキストが続く境界(**combo** の後続、code span の
-    閉じ backtick の後続など)は再現可能に `Bias::After` の tie-break(後続の
-    可視 segment を優先)で marker の手前ではなく直後に着地することを確認して
-    おり、`boundary_ambiguous_near_canonical` は OCR/helper 誤差ではなく既知の
-    決定的挙動であると独立に裏付けている(製品側の root cause 断定・恒久修正は
-    #101 に委ねる、PR #139 review)。"""
+    OCR と独立した座標証拠は `run_coordinate_independent_probe` が別途提供する
+    (Issue #137 review, PR #139: crates/** への恒久追加は禁止のため、使い捨ての
+    SHA検証済みクローンへ `COORDINATE_PROBE_RUST_SOURCE` を一時注入して実行し、
+    original bytes と clean tree を復元・証明したうえで破棄する)。実 EditorView・
+    実 glyph shaping・実 mouse event で、閉じ marker の直後により可視テキストが
+    続く境界(**combo** の後続、code span の閉じ backtick の後続、quote/list内の
+    閉じ marker の後続など)が `Bias::After` の tie-break(後続の可視 segment を
+    優先)で marker の手前ではなく直後に着地するなら、その probe 自身の `fail`
+    として証拠に残る(`boundary_ambiguous_near_canonical` を OCR/helper 誤差と
+    断定しないための独立確認であり、製品側の root cause 断定・恒久修正は #101 に
+    委ねる)。"""
     steps: list[dict] = []
     restore_step = restore_scenario_baseline(
         swift_helper, pid, fixture_path, baseline, helper_timeout, poll_timeout,
@@ -813,6 +959,91 @@ def confirm_boundary_edit_reproducibility(
         f"{reason} 再試行でも別の非 canonical な着地点となり再現しなかったため、"
         "procedure blocked のままとする"
     ), detail, steps
+
+
+def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float) -> dict:
+    """OCR を一切経由しない独立した座標証拠を得るための probe(Issue #137
+    review, PR #139)。`boundary_click_lands_on_source_offset_independent_of_ocr`
+    という `#[gpui::test]` を、`env.snapshot_checkout` が用意した使い捨ての
+    SHA検証済みクローンの `crates/ui/src/view.rs` へ一時的に注入して実行し、
+    直後に original bytes と clean tree(`git status --porcelain`)を復元・証明
+    したうえで破棄する。crates/** へ恒久追加すると、現在の(既知のバグかもしれない)
+    挙動を "expected" として固定してしまい、この probe が独立に確認すべき製品側
+    mismatch をテスト成功として吸収してしまう。
+
+    復元・clean tree の証明ができなければ、cargo test の結果がどうであれ採用せず
+    `blocked` として fail-closed にする。証明できた場合、cargo test の失敗
+    (= 境界クリックの着地点が canonical position と一致しない)は OCR/helper 誤差
+    ではあり得ない独立証拠として `fail` を返す。
+    """
+    name = "coordinate_independent_probe"
+    view_rs = snapshot / "crates" / "ui" / "src" / "view.rs"
+    try:
+        original_bytes = view_rs.read_bytes()
+    except OSError as exc:
+        return make_step(name, "blocked", reason=f"probe 注入対象ファイルを読み込めない: {exc}")
+
+    stripped = original_bytes.rstrip(b"\n")
+    if not stripped.endswith(b"}"):
+        return make_step(name, "blocked", reason="probe 注入位置(tests モジュール終端)を特定できない")
+    insert_at = len(stripped) - 1
+    injected = (
+        original_bytes[:insert_at]
+        + COORDINATE_PROBE_RUST_SOURCE.encode("utf-8")
+        + original_bytes[insert_at:]
+    )
+
+    proc = None
+    test_error = None
+    try:
+        view_rs.write_bytes(injected)
+        args = [
+            "cargo", "test", "--locked",
+            "--manifest-path", str(snapshot / "Cargo.toml"),
+            "-p", "hane-ui", "--lib", COORDINATE_PROBE_TEST_NAME,
+            "--", "--exact",
+        ]
+        try:
+            proc = subprocess.run(args, cwd=snapshot, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            test_error = str(exc)
+    finally:
+        restored = False
+        try:
+            view_rs.write_bytes(original_bytes)
+            restored = view_rs.read_bytes() == original_bytes
+        except OSError:
+            restored = False
+        clean = False
+        if restored:
+            try:
+                clean = env.git_dirty_paths(snapshot) == []
+            except module.EnvError:
+                clean = False
+
+    if not restored or not clean:
+        return make_step(
+            name, "blocked",
+            reason=(
+                "probe 注入後に crates/ui/src/view.rs の original bytes と clean tree を"
+                "復元・証明できなかったため、cargo test の結果を採用せず fail-closed とする"
+            ),
+            restored=restored, clean_tree=clean,
+        )
+    if proc is None:
+        return make_step(name, "blocked", reason=f"独立 probe の cargo test が完了しなかった: {test_error}")
+
+    output_tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-80:])
+    if proc.returncode == 0:
+        return make_step(name, "pass", cargo_test_output=output_tail)
+    return make_step(
+        name, "fail",
+        reason=(
+            "OCR を経由しない独立 GPUI probe が、境界クリックの着地点が期待 canonical "
+            "position と一致しない製品側 source mapping 不整合を確認した(Issue #101)"
+        ),
+        cargo_test_output=output_tail,
+    )
 
 
 def run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
@@ -1463,6 +1694,7 @@ def main() -> int:
     window_timeout = env_float("HANE_GUI_INTERACTION_WINDOW_TIMEOUT_SECS", 30.0)
     helper_timeout = env_float("HANE_GUI_INTERACTION_HELPER_TIMEOUT_SECS", 20.0)
     poll_timeout = env_float("HANE_GUI_INTERACTION_POLL_TIMEOUT_SECS", 10.0)
+    coordinate_probe_timeout = env_float("HANE_GUI_INTERACTION_COORDINATE_PROBE_TIMEOUT_SECS", 600.0)
     os.chdir(target_dir)
     module = load_pinned_gui_validate(control_dir)
     env = module.RealEnvironment()
@@ -1534,6 +1766,26 @@ def main() -> int:
                 finally:
                     for sig, handler in previous.items():
                         signal.signal(sig, handler)
+                # 使い捨てクローンへの一時注入は、直前の app scenario が使っていた
+                # do_build のバイナリ用 snapshot を env が上書きしても安全な、
+                # 全 scenario 終了後にだけ行う(Issue #137 review, PR #139)。
+                try:
+                    probe_snapshot = env.snapshot_checkout(target_dir, expected_sha)
+                except module.EnvError as exc:
+                    scenarios.append({
+                        "name": "coordinate_independent_probe", "steps": [],
+                        "result": "blocked", "reason": str(exc), "evidence": {},
+                    })
+                else:
+                    probe_step = run_coordinate_independent_probe(
+                        env, module, probe_snapshot, coordinate_probe_timeout,
+                    )
+                    scenarios.append({
+                        "name": "coordinate_independent_probe", "steps": [probe_step],
+                        "result": probe_step["result"], "reason": probe_step.get("reason"),
+                        "evidence": {k: v for k, v in probe_step.items()
+                                     if k not in ("name", "result", "reason")},
+                    })
         scenario_results = [s["result"] for s in scenarios] or ["blocked"]
         all_results = [s["result"] for s in top_steps if s["result"] in priority] + [r for r in scenario_results if r in priority]
         overall_result = min(all_results, key=lambda r: priority[r]) if all_results else "blocked"

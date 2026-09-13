@@ -976,5 +976,147 @@ class InlineSyntaxScenarioContaminationTests(unittest.TestCase):
             self.assertIn('復元', skipped_names[name]['reason'])
 
 
+class CoordinateProbeSourceTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): the injected probe payload itself
+    must not fold the known non-canonical landing into the "expected" value,
+    and must cover quote/list boundaries, not just bold/code."""
+
+    def test_closing_boundary_offsets_are_canonical_not_marker_inclusive(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('bold_source_line.find("combo**").unwrap() + "combo".len()', source)
+        self.assertNotIn('"combo**".len()', source)
+        self.assertIn('code_close_source_line.find("span`").unwrap() + "span".len()', source)
+        self.assertNotIn('"span`".len()', source)
+
+    def test_probe_covers_quote_and_list_boundaries(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('"> quote with **bold**"', source)
+        self.assertIn('"- list item with *italic*"', source)
+
+    def test_mismatches_are_collected_instead_of_folded_into_expected(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('mismatches.push', source)
+        self.assertIn('mismatches.is_empty()', source)
+
+
+class RunCoordinateIndependentProbeTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): the independent GPUI probe must
+    never live permanently under crates/**; the validator injects it into a
+    disposable clone, and any failure to prove original-byte/clean-tree
+    restoration must fail closed instead of trusting the cargo test result."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.snapshot = Path(self.tempdir.name) / 'snapshot'
+        view_dir = self.snapshot / 'crates' / 'ui' / 'src'
+        view_dir.mkdir(parents=True)
+        self.view_rs = view_dir / 'view.rs'
+        self.original = b"mod tests {\n    fn existing() {}\n}\n"
+        self.view_rs.write_bytes(self.original)
+        subprocess.run(['git', 'init', '-q', str(self.snapshot)], check=True)
+        subprocess.run(['git', '-C', str(self.snapshot), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.snapshot), '-c', 'user.name=GUI test',
+                        '-c', 'user.email=gui-test@example.invalid', '-c', 'commit.gpgsign=false',
+                        'commit', '-qm', 'seed'], check=True)
+
+        class FakeEnvError(Exception):
+            pass
+
+        class FakeModule:
+            EnvError = FakeEnvError
+
+        class FakeEnv:
+            def git_dirty_paths(self, workspace_dir):
+                out = subprocess.run(['git', 'status', '--porcelain'], cwd=workspace_dir,
+                                      capture_output=True, text=True, check=True)
+                return [line for line in out.stdout.splitlines() if line.strip()]
+
+        self.module = FakeModule()
+        self.env = FakeEnv()
+
+    def test_injects_probe_runs_cargo_test_and_restores_clean_tree_on_pass(self):
+        original_run = subprocess.run
+        captured_args = []
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            captured_args.append(args)
+            # While cargo test "runs", the file on disk must hold the
+            # injected probe source, not the pristine committed content.
+            self.assertIn(interaction.COORDINATE_PROBE_TEST_NAME.encode('utf-8'), self.view_rs.read_bytes())
+            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'pass')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+        self.assertEqual(self.env.git_dirty_paths(self.snapshot), [])
+        self.assertEqual(captured_args[0][0], 'cargo')
+
+    def test_reports_fail_when_cargo_test_confirms_a_non_canonical_landing(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 101, '', 'assertion failed: mismatches.is_empty()')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'fail')
+        self.assertIn('source mapping', step['reason'])
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_fails_closed_when_original_bytes_cannot_be_restored(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+
+        original_write_bytes = Path.write_bytes
+        calls = {'n': 0}
+
+        def flaky_write_bytes(self_path, data):
+            calls['n'] += 1
+            if calls['n'] == 2:  # the restore attempt, right after injection
+                raise OSError('disk full')
+            return original_write_bytes(self_path, data)
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run), \
+             patch.object(Path, 'write_bytes', new=flaky_write_bytes):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertIn('fail-closed', step['reason'])
+        self.assertFalse(step['restored'])
+
+    def test_fails_closed_when_restored_bytes_leave_the_clone_dirty(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run), \
+             patch.object(self.env, 'git_dirty_paths', return_value=[' M crates/ui/src/view.rs']):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertTrue(step['restored'])
+        self.assertFalse(step['clean_tree'])
+
+    def test_blocked_without_running_cargo_test_when_injection_anchor_is_missing(self):
+        self.view_rs.write_bytes(b'not a valid tests module tail')
+        calls = []
+
+        with patch.object(interaction.subprocess, 'run', side_effect=lambda *a, **k: calls.append(a)):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()
