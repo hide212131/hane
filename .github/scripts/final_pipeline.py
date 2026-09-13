@@ -11,6 +11,7 @@ from gui_policy import CONTEXT as GUI_CONTEXT, gui_state, review_ready
 from final_policy import AUTO_LABEL, CONTEXT, JUDGE_PROCEDURE, authenticated_receipt, final_state, fingerprint, gate, may_judge, parse_decision
 from pipeline_api import GitHub
 from gui_artifacts import artifact_json
+import aadw_notify
 
 
 def gui_receipt(api, pr, statuses):
@@ -106,6 +107,18 @@ def publish(api, data, key, result):
     state = {'pending': 'pending', 'ready': 'success', 'merged': 'success', 'fix': 'failure', 'blocked': 'error'}[result]
     api.post_status(data['sha'], CONTEXT, state, f'Final {result} v1 {data["sha"][:12]} e{key}',
                     run_id=f'{os.environ["GITHUB_RUN_ID"]}/attempts/{os.environ["GITHUB_RUN_ATTEMPT"]}')
+    # This commit status is the source of truth; mirror it as a human-readable
+    # Conversation comment so the PR shows started/finished without opening Actions.
+    try:
+        aadw_notify.notify(api.api, state=('start' if result == 'pending' else 'success'),
+                           process='final-judge', kind='pr', number=data['pr_number'], sha=data['sha'],
+                           repository=api.repository, run_id=os.environ['GITHUB_RUN_ID'],
+                           attempt=os.environ['GITHUB_RUN_ATTEMPT'],
+                           detail='' if result == 'pending' else f'判定結果: {result}')
+    except Exception as exc:
+        # Notification is best-effort display; it must never mask the actual
+        # final-judge result recorded via the commit status above.
+        print(f'AADW notify failed for final-judge (PR {data["pr_number"]}): {exc}', file=sys.stderr)
 
 
 def judge(data):

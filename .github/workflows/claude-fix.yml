@@ -131,7 +131,7 @@ jobs:
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
-              -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" >/dev/null
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" >/dev/null
             echo '::warning::Claude automatic fix is disabled for Pull Requests that change workflow files.'
             exit 0
           fi

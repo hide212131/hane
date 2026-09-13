@@ -582,7 +582,7 @@ jobs:
             -f state=error \
             -f context='hane/copilot-routing' \
             -f description="Copilot routing: workflow changes require owner for ${short_sha}" \
-            -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" \
+            -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
             >/dev/null
           gh issue comment "$PR_NUMBER" \
             --repo "$REPOSITORY" \
