@@ -138,7 +138,7 @@ class Tests(unittest.TestCase):
         f.status(1, 'hane/codex-review', 'pending', 'Codex review pending for aaaaaaaaaaaa',
                  'https://github.com/hide212131/hane/actions/runs/111', '2026-09-12T01:59:59Z')
         f.status(2, 'hane/codex-review', 'pending', 'Codex review pending for aaaaaaaaaaaa',
-                 'https://github.com/hide212131/hane/actions/runs/333', '2026-09-12T02:00:01Z')
+                 'https://github.com/hide212131/hane/actions/runs/333', '2026-09-12T02:00:00Z')
         f.workflow_runs = [{'id': 222, 'run_attempt': 1, 'name': 'Codex limit Copilot review fallback',
             'display_title': 'Codex fallback PR #42', 'created_at': '2026-09-12T02:00:02Z',
             'actor': {'login': 'chatgpt-codex-connector[bot]'}}]
