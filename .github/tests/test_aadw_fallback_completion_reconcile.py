@@ -8,7 +8,8 @@ import aadw_notify
 
 REPO = 'hide212131/hane'
 SHA = 'a' * 40
-STARTED_AT = '2026-09-12T10:00:00Z'
+COMMENT_STARTED_AT = '2026-09-12T10:00:00Z'
+RUN_STARTED_AT = '2026-09-12T09:58:00Z'
 
 
 def pr(state='open'):
@@ -33,6 +34,10 @@ class Fake:
             return pr(self.state)
         if clean == f'repos/{REPO}/commits/{SHA}/statuses':
             return list(self.statuses)
+        if clean == f'repos/{REPO}/actions/runs/222':
+            return {'run_attempt': 1}
+        if clean == f'repos/{REPO}/actions/runs/222/attempts/1':
+            return {'run_attempt': 1, 'run_started_at': RUN_STARTED_AT}
         if clean == f'repos/{REPO}/issues/comments':
             return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
@@ -42,7 +47,7 @@ class Fake:
                 'id': self.next_id,
                 'user': {'login': 'github-actions[bot]'},
                 'body': payload['body'],
-                'created_at': STARTED_AT,
+                'created_at': COMMENT_STARTED_AT,
             }
             self.next_id += 1
             self.comments.append(row)
@@ -94,21 +99,21 @@ class Tests(unittest.TestCase):
         self.assertIn('異常終了', fake.comments[0]['body'])
         self.assertIn('stale', fake.comments[0]['body'])
 
-    def test_review_source_success_after_current_start_closes_normally(self):
-        fake = Fake([source_status(7, '2026-09-12T10:01:00Z')])
+    def test_review_source_after_workflow_start_but_before_start_comment_is_valid(self):
+        fake = Fake([source_status(7, '2026-09-12T09:59:00Z')])
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertIn('正常終了', fake.comments[0]['body'])
 
-    def test_previous_fallback_success_before_current_start_is_not_reused(self):
-        fake = Fake([source_status(7, '2026-09-12T09:59:00Z')])
+    def test_previous_fallback_success_before_workflow_start_is_not_reused(self):
+        fake = Fake([source_status(7, '2026-09-12T09:57:00Z')])
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
         self.assertNotIn('正常終了', fake.comments[0]['body'])
 
     def test_closed_pr_is_resolved_from_start_marker(self):
-        fake = Fake([source_status(7, '2026-09-12T10:01:00Z')], state='closed')
+        fake = Fake([source_status(7, '2026-09-12T09:59:00Z')], state='closed')
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertEqual(len(fake.comments), 1)
