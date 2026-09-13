@@ -11,9 +11,9 @@ SHA = 'a' * 40
 STARTED_AT = '2026-09-12T10:00:00Z'
 
 
-def pr():
+def pr(state='open'):
     return {
-        'number': 42, 'state': 'open', 'draft': False,
+        'number': 42, 'state': state, 'draft': False,
         'user': {'login': 'github-actions[bot]'},
         'base': {'repo': {'full_name': REPO}},
         'head': {'sha': SHA, 'repo': {'full_name': REPO}},
@@ -21,17 +21,20 @@ def pr():
 
 
 class Fake:
-    def __init__(self, statuses=()):
+    def __init__(self, statuses=(), state='open'):
         self.statuses = list(statuses)
+        self.state = state
         self.comments = []
         self.next_id = 1
 
     def call(self, endpoint, payload=None, method=None):
         clean = endpoint.split('?', 1)[0]
-        if clean == f'repos/{REPO}/pulls':
-            return [pr()]
+        if clean == f'repos/{REPO}/pulls/42':
+            return pr(self.state)
         if clean == f'repos/{REPO}/commits/{SHA}/statuses':
             return list(self.statuses)
+        if clean == f'repos/{REPO}/issues/comments':
+            return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
             if payload is None:
                 return list(self.comments)
@@ -103,6 +106,14 @@ class Tests(unittest.TestCase):
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
         self.assertNotIn('正常終了', fake.comments[0]['body'])
+
+    def test_closed_pr_is_resolved_from_start_marker(self):
+        fake = Fake([source_status(7, '2026-09-12T10:01:00Z')], state='closed')
+        fake.start()
+        self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
+        self.assertEqual(len(fake.comments), 1)
+        self.assertIn('正常終了', fake.comments[0]['body'])
+        self.assertIn('run=222 attempt=1', fake.comments[0]['body'])
 
     def test_non_success_exit_without_terminal_evidence_is_abnormal(self):
         fake = Fake()
