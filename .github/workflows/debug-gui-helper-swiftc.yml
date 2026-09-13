@@ -1,0 +1,48 @@
+name: Debug GUI helper swiftc
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/debug-gui-helper-swiftc.yml'
+      - 'scripts/hosted_gui_interaction.swift'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          /usr/bin/swiftc --version
+      - name: Prove old helper fails and fixed helper compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo '--- compile current main helper (expected failure) ---'
+          set +e
+          /usr/bin/swiftc scripts/hosted_gui_interaction.swift -o "$RUNNER_TEMP/old-helper" 2>"$RUNNER_TEMP/old.stderr"
+          old_rc=$?
+          set -e
+          cat "$RUNNER_TEMP/old.stderr"
+          if [ "$old_rc" -eq 0 ]; then
+            echo 'Expected current main helper to fail, but it compiled.' >&2
+            exit 1
+          fi
+
+          echo '--- fetch and compile PR #134 helper (expected success) ---'
+          git fetch --depth=1 origin fix/gui-helper-vision-bounding-box
+          git show FETCH_HEAD:scripts/hosted_gui_interaction.swift > "$RUNNER_TEMP/fixed.swift"
+          /usr/bin/swiftc "$RUNNER_TEMP/fixed.swift" -o "$RUNNER_TEMP/fixed-helper"
+          test -x "$RUNNER_TEMP/fixed-helper"
