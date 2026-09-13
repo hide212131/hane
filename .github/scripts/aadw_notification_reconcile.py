@@ -23,6 +23,8 @@ CONTEXTS = {
 }
 _ACTION_RUN = re.compile(r"/actions/runs/([1-9][0-9]*)(?:/attempts/([1-9][0-9]*))?(?:[/?#]|$)")
 _GUI_GENERATION = re.compile(r" g([1-9][0-9]*)-([1-9][0-9]*)$")
+_PR_TARGET = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$")
+_UNCORRELATED_TERMINAL_CONTEXTS = {"hane/claude-fix", "hane/copilot-routing"}
 _ROUTING_OK = re.compile(
     r"Copilot routing: (?:fix|continue-validation|blocked|workflow changes require owner) for [0-9a-f]{12}$"
 )
@@ -78,12 +80,21 @@ def build_generations(statuses):
 
     A terminal status closes its generation. Later status rows without an
     Actions URL must never be attached to an already-finished execution.
+    Terminal-only claude-fix/routing rows that only point at the PR are left
+    uncorrelated until workflow completion appends an exact run/attempt row.
     """
     generations = []
     current = None
     for row in sorted(statuses, key=lambda item: item.get("id", 0)):
         state = row.get("state", "")
         explicit_run, explicit_attempt = status_identity(row)
+        if (
+            state != "pending"
+            and explicit_run is None
+            and row.get("context") in _UNCORRELATED_TERMINAL_CONTEXTS
+            and _PR_TARGET.fullmatch(row.get("target_url") or "")
+        ):
+            continue
 
         if state == "pending":
             if explicit_run is None:
