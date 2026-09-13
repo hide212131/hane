@@ -76,15 +76,21 @@ def prior_shas(call, repository, pr):
 
 def reconcile_sha(call, repository, number, sha, statuses, cutoff):
     writes = 0
-    source = lifecycle.review_source(statuses)
     for context, process in lifecycle.CONTEXTS.items():
-        rows = [row for row in statuses if row.get('context') == context]
+        rows = lifecycle.codex_lifecycle_rows(statuses) if context == 'hane/codex-review' else [
+            row for row in statuses if row.get('context') == context
+        ]
         for generation in lifecycle.build_generations(rows):
             if not lifecycle.recent(generation, cutoff):
                 continue
+            source = (
+                lifecycle.review_source_for_generation(statuses, generation)
+                if process == 'codex-review'
+                else None
+            )
             action = lifecycle.notify_generation(
                 call, repository, number, sha, context, generation,
-                source=source if process == 'codex-review' else None,
+                source=source,
             )
             writes += action != 'noop'
     return writes
