@@ -12,13 +12,6 @@ _MARKER = re.compile(
     r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
 )
 PROCESS_CONTEXT = {process: context for context, process in lifecycle.CONTEXTS.items()}
-# These workflows have legitimate business-terminal paths that historically
-# wrote a PR URL instead of their Actions run URL.  workflow_run completion is
-# the first authoritative place where the exact run/attempt is always known.
-TERMINAL_ONLY_CONTEXTS = {
-    'Claude automatic fix worker': {'hane/claude-fix'},
-    'Copilot pre-GUI routing': {'hane/copilot-routing'},
-}
 
 
 def candidate_shas(call, repository, pr, run_id, attempt):
@@ -75,76 +68,6 @@ def trusted_completion_pr(pr, repository):
     )
 
 
-def normalize_terminal_only(call, repository, workflow_name, run, number, sha, statuses):
-    """Attach run identity to terminal-only statuses and mirror them immediately.
-
-    A terminal status whose URL is only the PR has no trustworthy execution
-    identity.  Use the completed workflow_run window to prove ownership, then
-    append an equivalent status with the exact Actions run/attempt URL.  The
-    append-only correlated status lets scheduled reconciliation recover a lost
-    Conversation write without ever inventing a run from a commit-status id.
-    """
-    contexts = TERMINAL_ONLY_CONTEXTS.get(workflow_name, set())
-    if not contexts:
-        return 0
-    started_at = lifecycle.parse_time(run.get('run_started_at'))
-    finished_at = lifecycle.parse_time(run.get('updated_at'))
-    if started_at is None or finished_at is None:
-        raise RuntimeError('workflow_run terminal normalization requires run_started_at/updated_at')
-    run_id = str(run['id'])
-    attempt = str(run.get('run_attempt') or '1')
-    run_url = f'https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}'
-    writes = 0
-    for row in statuses:
-        if row.get('context') not in contexts or row.get('state') == 'pending':
-            continue
-        explicit_run, _ = lifecycle.status_identity(row)
-        created_at = lifecycle.parse_time(row.get('created_at'))
-        target_url = row.get('target_url') or ''
-        if explicit_run is not None or created_at is None or not (started_at <= created_at <= finished_at):
-            continue
-        if not re.fullmatch(rf'https://github\.com/{re.escape(repository)}/pull/[1-9][0-9]*', target_url):
-            continue
-        context = row['context']
-        description = row.get('description') or ''
-        state = row.get('state') or 'error'
-        already = any(
-            candidate.get('context') == context
-            and candidate.get('state') == state
-            and (candidate.get('description') or '') == description
-            and candidate.get('target_url') == run_url
-            for candidate in statuses
-        )
-        if not already:
-            call(
-                f'repos/{repository}/statuses/{sha}',
-                payload={
-                    'state': state,
-                    'context': context,
-                    'description': description,
-                    'target_url': run_url,
-                },
-                method='POST',
-            )
-            writes += 1
-        process = lifecycle.CONTEXTS[context]
-        notify_state = lifecycle.outcome(context, row)
-        result = aadw_notify.notify(
-            call,
-            state=notify_state,
-            process=process,
-            kind='pr',
-            number=number,
-            sha=sha,
-            repository=repository,
-            run_id=run_id,
-            attempt=attempt,
-            detail=f'状態: {description}',
-        )
-        writes += result['action'] != 'noop'
-    return writes
-
-
 def reconcile(call, repository, payload):
     if payload.get('action') != 'completed':
         return 0
@@ -154,7 +77,6 @@ def reconcile(call, repository, payload):
     if not re.fullmatch(r'[1-9][0-9]*', run_id) or not re.fullmatch(r'[1-9][0-9]*', attempt):
         raise RuntimeError('invalid workflow_run correlation')
     conclusion = run.get('conclusion') or 'unknown'
-    workflow_name = run.get('name') or ''
     writes = 0
     attempt_cache = {}
 
@@ -175,9 +97,6 @@ def reconcile(call, repository, payload):
         shas.update(starts.get(number, set()))
         for sha in shas:
             statuses = lifecycle.pages(call, f'repos/{repository}/commits/{sha}/statuses')
-            writes += normalize_terminal_only(
-                call, repository, workflow_name, run, number, sha, statuses
-            )
             for context, process in lifecycle.CONTEXTS.items():
                 rows = [row for row in statuses if row.get('context') == context]
                 for generation in lifecycle.build_generations(rows):
