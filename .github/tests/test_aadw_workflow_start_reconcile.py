@@ -28,8 +28,12 @@ class Fake:
         clean = endpoint.split('?', 1)[0]
         if clean == f'repos/{REPO}/pulls':
             return [pr()]
+        if clean == f'repos/{REPO}/pulls/42':
+            return pr()
         if clean == f'repos/{REPO}/commits/{SHA}/statuses':
             return list(self.statuses)
+        if clean == f'repos/{REPO}/issues/comments':
+            return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
             if payload is None:
                 return list(self.comments)
@@ -47,6 +51,18 @@ class Fake:
                     row['body'] = payload['body']
                     return row
         raise AssertionError(endpoint)
+
+    def fallback_marker(self, run='777', attempt='1'):
+        self.comments.append({
+            'id': self.next_id,
+            'user': {'login': 'github-actions[bot]'},
+            'body': (
+                '### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 正常終了\n\n'
+                f'<!-- hane-aadw: process=codex-review-fallback kind=pr number=42 sha={SHA} '
+                f'run={run} attempt={attempt} -->\n'
+            ),
+        })
+        self.next_id += 1
 
 
 class Tests(unittest.TestCase):
@@ -100,6 +116,42 @@ class Tests(unittest.TestCase):
         body = f.comments[0]['body']
         self.assertIn('Copilot pre-GUI routing', body)
         self.assertIn('run=777 attempt=3', body)
+
+    def test_fallback_rerun_creates_new_attempt_start_from_prior_marker(self):
+        f = Fake()
+        f.fallback_marker(run='777', attempt='1')
+        writes = start_reconcile.reconcile_start(
+            f.call, REPO, 'Codex limit Copilot review fallback', '777', '2', poll_attempts=1
+        )
+        self.assertEqual(writes, 1)
+        self.assertEqual(len(f.comments), 2)
+        body = f.comments[-1]['body']
+        self.assertIn('処理開始', body)
+        self.assertIn('process=codex-review-fallback', body)
+        self.assertIn('run=777 attempt=2', body)
+        self.assertIn(f'sha={SHA}', body)
+        self.assertEqual(
+            start_reconcile.reconcile_start(
+                f.call, REPO, 'Codex limit Copilot review fallback', '777', '2', poll_attempts=1
+            ),
+            0,
+        )
+
+    def test_fallback_attempt_one_remains_owned_by_limit_comment_observer(self):
+        f = Fake()
+        writes = start_reconcile.reconcile_start(
+            f.call, REPO, 'Codex limit Copilot review fallback', '777', '1', poll_attempts=1
+        )
+        self.assertEqual(writes, 0)
+        self.assertEqual(f.comments, [])
+
+    def test_fallback_rerun_without_prior_same_run_marker_fails_closed(self):
+        f = Fake()
+        f.fallback_marker(run='778', attempt='1')
+        with self.assertRaises(RuntimeError):
+            start_reconcile.reconcile_start(
+                f.call, REPO, 'Codex limit Copilot review fallback', '777', '2', poll_attempts=1
+            )
 
     def test_unrelated_pending_status_is_not_used(self):
         f = Fake()
