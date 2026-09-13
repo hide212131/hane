@@ -661,7 +661,11 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
         ), detail
     ok, _out, err = run_helper(swift_helper, ["type-save", str(pid), insertion], helper_timeout)
     if not ok:
-        return "fail", f"境界への入力に失敗した: {err}", detail
+        return "blocked", (
+            f"境界への入力に失敗した(timeout、起動失敗、integrity mismatch、AppleScript の"
+            f"実行失敗などの helper/実行環境側要因の可能性があり、probe の着地点を観測できて"
+            f"いないため製品 fail と区別して procedure blocked とする): {err}"
+        ), detail
     expected = insert_at_match(baseline, source_pattern, insertion, edge=source_edge)
     matched, actual_bytes = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
     actual = _decode(actual_bytes)

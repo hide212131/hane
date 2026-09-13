@@ -364,6 +364,32 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
         self.assertEqual(calls, ['click-text'])
         self.assertIn('OCR', reason)
 
+    def test_type_save_execution_failure_is_blocked_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                calls.append(args[0])
+                if args[0] == 'click-text':
+                    return True, self.OCR_EVIDENCE, ''
+                if args[0] == 'type-save':
+                    return False, '', 'timeout waiting for helper integrity check'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                status, reason, detail = interaction.boundary_edit_check(
+                    None, Path('/unused.png'), 1234, fixture_path, baseline,
+                    interaction.BOLD_ITALIC_OCR_RE, 'end',
+                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                    1.0, 0.0,
+                )
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(calls, ['click-text', 'type-save'])
+        self.assertIn('timeout', reason)
+
     def test_malformed_click_evidence_is_blocked_before_typing_the_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = Path(directory) / 'fixture.md'
