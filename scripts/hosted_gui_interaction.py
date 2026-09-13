@@ -104,6 +104,16 @@ JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 # SHA検証済みクローン (`env.snapshot_checkout`) の `crates/ui/src/view.rs` へ注入し、
 # 実行後に original bytes と clean tree を復元・証明したうえで破棄する。
 COORDINATE_PROBE_TEST_NAME = "boundary_click_lands_on_source_offset_independent_of_ocr"
+# libtest 上のテスト名は crate ルートからの module path 付きになる(注入先は
+# crates/ui/src/view.rs の `#[cfg(test)] mod tests`)。関数名だけを `--exact` で
+# 渡すと一致するテストが無く `running 0 tests` を終了コード0で返し、独立
+# hit-test を一度も実行せずに `pass` を返してしまう(Issue #137 review, PR #139)。
+COORDINATE_PROBE_TEST_QUALIFIED_NAME = f"view::tests::{COORDINATE_PROBE_TEST_NAME}"
+# probe の assertion failure を示す panic メッセージの一部。cargo test の非0終了が
+# コンパイルエラー・linker/toolchain 障害・Cargo.lock 問題など検証環境側の失敗なのか、
+# probe 自身が製品 source-mapping 不整合を検出した assertion failure なのかを区別する
+# ために使う(Issue #137 review, PR #139)。
+COORDINATE_PROBE_FAILURE_MARKER = "product source-mapping mismatch, not OCR/helper noise"
 
 COORDINATE_PROBE_RUST_SOURCE = r'''
 
@@ -1000,7 +1010,7 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
         args = [
             "cargo", "test", "--locked",
             "--manifest-path", str(snapshot / "Cargo.toml"),
-            "-p", "hane-ui", "--lib", COORDINATE_PROBE_TEST_NAME,
+            "-p", "hane-ui", "--lib", COORDINATE_PROBE_TEST_QUALIFIED_NAME,
             "--", "--exact",
         ]
         try:
@@ -1033,16 +1043,40 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
     if proc is None:
         return make_step(name, "blocked", reason=f"独立 probe の cargo test が完了しなかった: {test_error}")
 
-    output_tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-80:])
+    full_output = proc.stdout + proc.stderr
+    output_tail = "\n".join(full_output.splitlines()[-80:])
+    executed_match = re.search(r"^running (\d+) tests?$", full_output, re.MULTILINE)
+    executed = int(executed_match.group(1)) if executed_match else 0
+    if executed != 1:
+        return make_step(
+            name, "blocked",
+            reason=(
+                f"独立 probe が想定した1件の hit-test を実行しなかった(実行数: {executed})。"
+                "test filter が対象テストに一致しなかった可能性があり、cargo test の"
+                "結果を採用せず fail-closed とする"
+            ),
+            cargo_test_output=output_tail, tests_executed=executed,
+        )
     if proc.returncode == 0:
-        return make_step(name, "pass", cargo_test_output=output_tail)
+        return make_step(name, "pass", cargo_test_output=output_tail, tests_executed=executed)
+    if (COORDINATE_PROBE_FAILURE_MARKER in full_output
+            and f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED" in full_output):
+        return make_step(
+            name, "fail",
+            reason=(
+                "OCR を経由しない独立 GPUI probe が、境界クリックの着地点が期待 canonical "
+                "position と一致しない製品側 source mapping 不整合を確認した(Issue #101)"
+            ),
+            cargo_test_output=output_tail, tests_executed=executed,
+        )
     return make_step(
-        name, "fail",
+        name, "blocked",
         reason=(
-            "OCR を経由しない独立 GPUI probe が、境界クリックの着地点が期待 canonical "
-            "position と一致しない製品側 source mapping 不整合を確認した(Issue #101)"
+            "独立 probe の cargo test が非0終了したが、対象 probe の assertion failure を"
+            "確認できなかった(コンパイルエラー・linker/toolchain 障害・Cargo.lock 問題など"
+            "検証環境側の失敗の可能性があり、製品側 source-mapping 不整合と断定できない)"
         ),
-        cargo_test_output=output_tail,
+        cargo_test_output=output_tail, tests_executed=executed,
     )
 
 

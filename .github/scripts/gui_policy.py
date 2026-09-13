@@ -62,6 +62,7 @@ REQUIRED_STEPS = {
         'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
         'visible_saved_text', 'reopen_content_check', 'cleanup_reopen',
     },
+    'coordinate_independent_probe': {'coordinate_independent_probe'},
 }
 REQUIRED_IMAGES = [
     'ascii_edit_save_undo_redo_reopen/before.png',

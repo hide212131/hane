@@ -1046,7 +1046,12 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
             # While cargo test "runs", the file on disk must hold the
             # injected probe source, not the pristine committed content.
             self.assertIn(interaction.COORDINATE_PROBE_TEST_NAME.encode('utf-8'), self.view_rs.read_bytes())
-            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+            self.assertIn(interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME, args)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed", '',
+            )
 
         with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
             step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
@@ -1061,12 +1066,46 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
         def fake_run(args, **kwargs):
             if args[0] != 'cargo':
                 return original_run(args, **kwargs)
-            return subprocess.CompletedProcess(args, 101, '', 'assertion failed: mismatches.is_empty()')
+            return subprocess.CompletedProcess(
+                args, 101,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
+                "assertion failed: mismatches.is_empty()\n"
+                "product source-mapping mismatch, not OCR/helper noise:\n"
+                "test result: FAILED. 0 passed; 1 failed",
+            )
 
         with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
             step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
         self.assertEqual(step['result'], 'fail')
         self.assertIn('source mapping', step['reason'])
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_reports_blocked_when_nonzero_exit_is_not_the_probe_assertion(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101, '', 'error[E0433]: failed to resolve: use of undeclared crate or module',
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_reports_blocked_when_test_filter_matches_zero_tests(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'running 0 tests\ntest result: ok. 0 passed; 0 failed', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
         self.assertEqual(self.view_rs.read_bytes(), self.original)
 
     def test_fails_closed_when_original_bytes_cannot_be_restored(self):
