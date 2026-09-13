@@ -31,6 +31,17 @@ class FakeGitHub(GitHub):
     def statuses(self, sha):
         return deepcopy(self.rows)
 
+    def pages(self, path, key=None):
+        if '/commits/' in path and '/statuses' in path:
+            result = []
+            for index, (context, row) in enumerate(self.rows.items(), start=1):
+                item = deepcopy(row)
+                item.setdefault('id', index)
+                item['context'] = context
+                result.append(item)
+            return result
+        return super().pages(path, key)
+
     def post_status(self, *args):
         self.writes.append(args)
 
