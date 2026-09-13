@@ -93,6 +93,9 @@ def reconcile_sha(call, repository, number, sha, statuses, cutoff):
                 source=source,
             )
             writes += action != 'noop'
+    writes += lifecycle.reconcile_fallback(
+        call, repository, number, sha, statuses, cutoff
+    ) != 'noop'
     return writes
 
 
