@@ -94,6 +94,15 @@ class Tests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             gate.should_observe(call, REPO, payload())
 
+    def test_routing_reconciliation_completion_is_observed(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / 'workflows'
+            / 'aadw-notifications.yml'
+        ).read_text(encoding='utf-8')
+        self.assertIn('      - Copilot routing reconciliation\n', workflow)
+        self.assertIn('    types: [completed]\n', workflow)
+
 
 if __name__ == '__main__':
     unittest.main()
