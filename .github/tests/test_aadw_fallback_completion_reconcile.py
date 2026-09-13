@@ -8,6 +8,7 @@ import aadw_notify
 
 REPO = 'hide212131/hane'
 SHA = 'a' * 40
+STARTED_AT = '2026-09-12T10:00:00Z'
 
 
 def pr():
@@ -34,7 +35,12 @@ class Fake:
         if clean == f'repos/{REPO}/issues/42/comments':
             if payload is None:
                 return list(self.comments)
-            row = {'id': self.next_id, 'user': {'login': 'github-actions[bot]'}, 'body': payload['body']}
+            row = {
+                'id': self.next_id,
+                'user': {'login': 'github-actions[bot]'},
+                'body': payload['body'],
+                'created_at': STARTED_AT,
+            }
             self.next_id += 1
             self.comments.append(row)
             return row
@@ -45,6 +51,8 @@ class Fake:
                     if method == 'DELETE':
                         self.comments.remove(row)
                         return None
+                    if payload is None:
+                        return dict(row)
                     row['body'] = payload['body']
                     return row
             raise AssertionError('missing comment')
@@ -55,6 +63,15 @@ class Fake:
             self.call, state='start', process='codex-review-fallback', kind='pr', number=42,
             sha=SHA, repository=REPO, run_id='222', attempt='1',
         )
+
+
+def source_status(id_, created_at):
+    return {
+        'id': id_, 'context': 'hane/review-source', 'state': 'success',
+        'description': f'Review source: Copilot fallback for {SHA[:12]}',
+        'target_url': 'https://github.com/example/review',
+        'created_at': created_at,
+    }
 
 
 def event(conclusion='success'):
@@ -74,15 +91,18 @@ class Tests(unittest.TestCase):
         self.assertIn('異常終了', fake.comments[0]['body'])
         self.assertIn('stale', fake.comments[0]['body'])
 
-    def test_review_source_success_closes_active_start_normally(self):
-        fake = Fake([{
-            'id': 7, 'context': 'hane/review-source', 'state': 'success',
-            'description': f'Review source: Copilot fallback for {SHA[:12]}',
-            'target_url': 'https://github.com/example/review',
-        }])
+    def test_review_source_success_after_current_start_closes_normally(self):
+        fake = Fake([source_status(7, '2026-09-12T10:01:00Z')])
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertIn('正常終了', fake.comments[0]['body'])
+
+    def test_previous_fallback_success_before_current_start_is_not_reused(self):
+        fake = Fake([source_status(7, '2026-09-12T09:59:00Z')])
+        fake.start()
+        self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
+        self.assertIn('異常終了', fake.comments[0]['body'])
+        self.assertNotIn('正常終了', fake.comments[0]['body'])
 
     def test_non_success_exit_without_terminal_evidence_is_abnormal(self):
         fake = Fake()
