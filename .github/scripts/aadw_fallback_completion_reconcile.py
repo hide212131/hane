@@ -1,10 +1,40 @@
 """Close an active Copilot fallback lifecycle when its workflow completes."""
 import json
 import os
+import re
 import sys
 
 import aadw_notify
 import aadw_observer
+
+_FALLBACK_START = re.compile(
+    r'process=codex-review-fallback kind=pr number=([1-9][0-9]*) '
+    r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
+)
+
+
+def fallback_target(call, repository, run_id, attempt):
+    """Resolve the exact fallback start even after its PR has been closed."""
+    found = []
+    for comment in aadw_observer.pages(
+        call, f'repos/{repository}/issues/comments?sort=created&direction=desc'
+    ):
+        if comment.get('user', {}).get('login') != 'github-actions[bot]':
+            continue
+        body = comment.get('body') or ''
+        if '— 処理開始' not in body:
+            continue
+        match = _FALLBACK_START.search(body)
+        if not match:
+            continue
+        number, sha, marker_run, marker_attempt = match.groups()
+        if marker_run != run_id or marker_attempt != attempt:
+            continue
+        pr = call(f'repos/{repository}/pulls/{number}')
+        if not aadw_observer.trusted_pr(pr, repository):
+            raise RuntimeError('fallback開始markerが信頼できないPRを指しています。')
+        found.append((comment.get('id', 0), pr, sha))
+    return max(found, key=lambda row: row[0], default=None)
 
 
 def reconcile(call, repository, payload):
@@ -15,7 +45,7 @@ def reconcile(call, repository, payload):
         return 0
     run_id = str(run.get('id') or '')
     attempt = str(run.get('run_attempt') or '1')
-    target = aadw_observer.fallback_target(call, repository, run_id, attempt)
+    target = fallback_target(call, repository, run_id, attempt)
     if not target:
         return 0
     comment_id, pr, sha = target
