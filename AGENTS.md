@@ -14,6 +14,10 @@
 
 Issue に明示された目的・受入条件を、レビュー指摘の全件解消より優先する。`review findings = 0` を Pull Request の完了条件にはしない。merge blocker とするのは、P0 / P1、セキュリティ・データ破壊・権限逸脱、通常経路で再現する明確な不具合、CI failure、または Issue の目的・受入条件を直接満たせなくする P2 とする。rare race、複合障害、極端な rerun / recovery など、元 Issue の成立を直接妨げない指摘は原則として follow-up Issue に分離し、現在の Pull Request の scope を無期限に拡大しない。追加修正に入る前に「元 Issue を完了するために必要か」を確認し、不要なら current PR には含めない。
 
+### 領域ごとの品質基準
+
+エディタ本体の機能は厳密さを優先する。テキスト編集、カーソル・選択、入力・IME、undo / redo、保存・再読込、文書状態、描画と入力の整合性など、利用者の文書内容や編集結果の正しさに関わる処理では、データ損失・破損・誤編集につながる edge case や現実的な race も merge blocker として扱い、必要な回帰テストを追加する。一方、AADW（AI Agent Development Workflow）の通知・reconcile・retry・rerun などの開発運用機能は、通常経路で Issue の目的・受入条件を満たし、失敗時に誤った成功や危険な権限操作を行わないことを基準とする。AADW の rare race、複合障害、極端な rerun / recovery まで完全性を追求して current PR の scope を拡大せず、元 Issue の要望を直接壊さないものは原則 follow-up とする。
+
 ## 設計と実装の役割分担
 
 Hane の agentic development workflow は、要求整理・詳細設計を担当する Work（ChatGPT）、実装を担当する Claude Code、レビューを担当する Codex、進行判断を担当する GitHub Copilot の四者に役割を分ける。Work は製品実装（ソース・テスト・ビルド設定の変更、branch 作成、commit / push、Pull Request 作成）には進まず、Issue が実装可能な状態になった時点で設計作業を終了する。初回実装は、権限を持つ利用者による本文完全一致の `/implement` コメントで開始する。実装まで依頼済みなら Work が利用者の権限で重複確認後に投稿してよく、設計のみの依頼では投稿しない。PR 作成後の修正は既存の Copilot 判定と Claude fix の経路に従う。
