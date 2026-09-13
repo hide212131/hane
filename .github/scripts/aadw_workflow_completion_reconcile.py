@@ -1,4 +1,4 @@
-"""Close AADW pending lifecycles on prior PR heads when their source workflow ends."""
+"""Close AADW pending lifecycles when their source workflow ends."""
 import json
 import os
 import re
@@ -38,6 +38,36 @@ def candidate_shas(call, repository, pr, run_id, attempt):
     return shas
 
 
+def marker_targets(call, repository, run_id, attempt):
+    """Return PR numbers/SHA evidence from trusted starts for this exact run."""
+    found = {}
+    for comment in lifecycle.pages(call, f'repos/{repository}/issues/comments?sort=created&direction=desc'):
+        if comment.get('user', {}).get('login') != 'github-actions[bot]':
+            continue
+        body = comment.get('body') or ''
+        if '— 処理開始' not in body:
+            continue
+        match = _MARKER.search(body)
+        if not match:
+            continue
+        process, number, sha, marker_run, marker_attempt = match.groups()
+        if process not in PROCESS_CONTEXT or marker_run != run_id or marker_attempt != attempt:
+            continue
+        found.setdefault(int(number), set()).add(sha)
+    return found
+
+
+def trusted_completion_pr(pr, repository):
+    owner = repository.split('/', 1)[0]
+    return (
+        isinstance(pr, dict)
+        and pr.get('state') in ('open', 'closed')
+        and (pr.get('head', {}).get('repo') or {}).get('full_name') == repository
+        and pr.get('user', {}).get('login') in (owner, 'github-actions[bot]', 'claude[bot]')
+        and re.fullmatch(r'[0-9a-f]{40}', pr.get('head', {}).get('sha', '')) is not None
+    )
+
+
 def reconcile(call, repository, payload):
     if payload.get('action') != 'completed':
         return 0
@@ -49,11 +79,23 @@ def reconcile(call, repository, payload):
     conclusion = run.get('conclusion') or 'unknown'
     writes = 0
     attempt_cache = {}
+
+    starts = marker_targets(call, repository, run_id, attempt)
+    prs = {}
     for pr in lifecycle.pages(call, f'repos/{repository}/pulls?state=open'):
-        if not lifecycle.trusted_pr(pr, repository):
+        if trusted_completion_pr(pr, repository):
+            prs[int(pr['number'])] = pr
+    for number in starts:
+        if number in prs:
             continue
-        number = int(pr['number'])
-        for sha in candidate_shas(call, repository, pr, run_id, attempt):
+        pr = call(f'repos/{repository}/pulls/{number}')
+        if trusted_completion_pr(pr, repository):
+            prs[number] = pr
+
+    for number, pr in prs.items():
+        shas = candidate_shas(call, repository, pr, run_id, attempt)
+        shas.update(starts.get(number, set()))
+        for sha in shas:
             statuses = lifecycle.pages(call, f'repos/{repository}/commits/{sha}/statuses')
             for context, process in lifecycle.CONTEXTS.items():
                 rows = [row for row in statuses if row.get('context') == context]
