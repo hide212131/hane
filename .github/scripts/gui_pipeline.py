@@ -183,7 +183,18 @@ def begin(api, request):
 
 
 def report(api, request):
-    if not current(api, request):
+    pr = api.pr(request['pr_number'])
+    state = None
+    if api.trusted(pr) and pr['head']['sha'] == request['sha']:
+        state = gui_state(api.statuses(request['sha']).get(CONTEXT, {}), request['sha'])
+    if state and state[1] == request['generation'] and state[0] in ('pass', 'fail', 'blocked'):
+        # A rerun of the report job may observe the terminal status written by
+        # this exact generation before a later step in the original attempt
+        # failed. Preserve that terminal result and only heal its human mirror.
+        notify(api, request, 'success', detail=f'GUI validation結果: {state[0]}')
+        print(f'GUI {state[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}')
+        return
+    if state != ('pending', request['generation']):
         print('Stale GUI generation: no status written')
         # Someone else (usually retire() from a later resolve()) already
         # superseded this generation; resolve its own comment idempotently
