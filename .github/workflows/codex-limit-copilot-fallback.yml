@@ -261,10 +261,16 @@ jobs:
               reason+=" was clean, but CI is failing and requires a fix."
             fi
 
+            routing_run_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
+            gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
+              -f state=pending -f context='hane/copilot-routing' \
+              -f description="Copilot routing pending for ${short_sha}" \
+              -f target_url="$routing_run_url" >/dev/null
+
             gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
               -f state=failure -f context='hane/copilot-routing' \
               -f description="Copilot routing: fix for ${short_sha}" \
-              -f target_url="$review_url" >/dev/null
+              -f target_url="$routing_run_url" >/dev/null
 
             comment_body="Copilot pre-GUI routing for \`${target_sha}\`: **fix** — ${reason}"
             if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
