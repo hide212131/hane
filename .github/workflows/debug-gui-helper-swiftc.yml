@@ -1,0 +1,25 @@
+name: Debug GUI helper swiftc
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/debug-gui-helper-swiftc.yml'
+      - 'scripts/hosted_gui_interaction.swift'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          /usr/bin/swiftc --version
+      - name: Compile hosted GUI helper
+        run: |
+          set -o pipefail
+          /usr/bin/swiftc scripts/hosted_gui_interaction.swift -o "$RUNNER_TEMP/interaction-helper"
