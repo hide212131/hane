@@ -203,6 +203,26 @@ def attempt_started_at(call, repository, run_id, attempt, cache=None):
     raise RuntimeError(f"Actions run {run_id} attempt {attempt} の開始時刻を取得できませんでした。")
 
 
+def attempt_time_window(call, repository, run_id, attempt):
+    """Return the exact attempt's start and optional completed upper bound."""
+    run_id = str(run_id)
+    attempt = str(attempt)
+    if not re.fullmatch(r"[1-9][0-9]*", run_id) or not re.fullmatch(r"[1-9][0-9]*", attempt):
+        raise RuntimeError("Actions run/attemptの相関値が不正です。")
+    row = call(f"repos/{repository}/actions/runs/{run_id}/attempts/{attempt}")
+    if not isinstance(row, dict) or row.get("run_attempt") != int(attempt):
+        raise RuntimeError(f"Actions run {run_id} attempt {attempt} の時刻情報を取得できませんでした。")
+    started = parse_time(row.get("run_started_at"))
+    if started is None:
+        raise RuntimeError(f"Actions run {run_id} attempt {attempt} の開始時刻を取得できませんでした。")
+    finished = None
+    if row.get("status") == "completed" or row.get("conclusion"):
+        finished = parse_time(row.get("updated_at"))
+        if finished is None or finished < started:
+            raise RuntimeError(f"Actions run {run_id} attempt {attempt} の完了時刻を取得できませんでした。")
+    return started, finished
+
+
 def resolve_attempt(call, repository, generation, cache=None):
     explicit = generation.get("attempt")
     if explicit is not None:
@@ -319,14 +339,17 @@ def reconcile_fallback(call, repository, pr_number, sha, statuses, cutoff):
     if not correlation:
         return "noop"
     run_id, attempt = correlation
-    started_at = attempt_started_at(call, repository, run_id, attempt)
-    rows = [
-        row for row in statuses
-        if row.get("context") == "hane/review-source"
-        and parse_time(row.get("created_at"))
-        and parse_time(row.get("created_at")) >= cutoff
-        and parse_time(row.get("created_at")) >= started_at
-    ]
+    started_at, finished_at = attempt_time_window(call, repository, run_id, attempt)
+    rows = []
+    for row in statuses:
+        if row.get("context") != "hane/review-source":
+            continue
+        created_at = parse_time(row.get("created_at"))
+        if created_at is None or created_at < cutoff or created_at < started_at:
+            continue
+        if finished_at is not None and created_at > finished_at:
+            continue
+        rows.append(row)
     if not rows:
         return "noop"
     latest = max(rows, key=lambda row: row.get("id", 0))
