@@ -497,7 +497,16 @@ def _move_to_neutral(swift_helper, pid: int, helper_timeout: float, name: str) -
 def restore_scenario_baseline(swift_helper, pid, fixture_path, baseline,
                                helper_timeout, poll_timeout, name):
     baseline_bytes = baseline.encode("utf-8")
-    matched, actual = wait_for_fixture_bytes(fixture_path, baseline_bytes, 0.0)
+    # 失敗/タイムアウトした mutating subtest は、編集キー送信後・保存キー送信前に
+    # 止まっている可能性がある。その場合ディスク上の fixture は baseline のまま
+    # (未保存)で「一致」に見えてしまい、undo を一度も実行しないまま次の
+    # subtest が汚染された文書状態から始まる(Issue #136 の再発)。比較の前に
+    # 必ず保存させ、in-memory の編集をディスクへ反映させてから判定する。
+    ok, _out, err = run_helper(swift_helper, ["force-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked",
+                          reason=f"baseline 復元前の force-save に失敗した: {err}", attempts=0)
+    matched, actual = wait_for_fixture_bytes(fixture_path, baseline_bytes, poll_timeout)
     attempts = 0
     while not matched and attempts < BASELINE_RESTORE_MAX_UNDOS:
         ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)

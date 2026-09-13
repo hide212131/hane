@@ -160,6 +160,8 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
             undo_calls = []
 
             def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    return True, '', ''
                 if args[0] == 'undo-save':
                     undo_calls.append(args)
                     if len(undo_calls) >= 2:
@@ -185,6 +187,8 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
             undo_calls = []
 
             def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    return True, '', ''
                 if args[0] == 'undo-save':
                     undo_calls.append(args)
                     return True, '', ''
@@ -205,6 +209,8 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
             fixture_path.write_text('corrupted content', encoding='utf-8')
 
             def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    return True, '', ''
                 if args[0] == 'undo-save':
                     return False, '', 'System Events を利用できない'
                 raise AssertionError(f'unexpected helper call: {args}')
@@ -216,6 +222,59 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
                 )
             self.assertEqual(step['result'], 'blocked')
             self.assertIn('System Events', step['reason'])
+
+    def test_reports_blocked_when_force_save_itself_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    return False, '', 'System Events を利用できない'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                step = interaction.restore_scenario_baseline(
+                    None, 1234, fixture_path, interaction.INLINE_FIXTURE_ORIGINAL,
+                    1.0, 0.0, 'boundary_ime_input_state_restore',
+                )
+            self.assertEqual(step['result'], 'blocked')
+            self.assertIn('force-save', step['reason'])
+
+    def test_unsaved_edit_left_by_a_failed_mutating_subtest_is_flushed_and_undone(self):
+        """Issue #136 follow-up (PR #138 review): a mutating AppleScript can fail
+        between its edit keystroke and its own save keystroke, leaving the fixture
+        on disk still byte-identical to baseline while the real app has an unsaved
+        edit in memory. Restoration must not treat that as already-clean; force-save
+        must flush the pending edit to disk before the match is judged, so a real
+        mismatch is discovered and undone."""
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            undo_calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'force-save':
+                    # The app had an uncommitted keystroke edit that the failed
+                    # subtest never got to save; flushing it now reveals the drift.
+                    fixture_path.write_text('corrupted content left in memory', encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'undo-save':
+                    undo_calls.append(args)
+                    fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'move-doc-start':
+                    return True, '', ''
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                step = interaction.restore_scenario_baseline(
+                    None, 1234, fixture_path, interaction.INLINE_FIXTURE_ORIGINAL,
+                    1.0, 0.0, 'boundary_click_edit_bold_italic_state_restore',
+                )
+            self.assertEqual(step['result'], 'pass')
+            self.assertEqual(len(undo_calls), 1)
+            self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
 
 
 class RunMutatingSubtestTests(unittest.TestCase):
