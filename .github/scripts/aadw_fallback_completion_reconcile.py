@@ -18,10 +18,20 @@ def reconcile(call, repository, payload):
     target = aadw_observer.fallback_target(call, repository, run_id, attempt)
     if not target:
         return 0
-    _, pr, sha = target
+    comment_id, pr, sha = target
+    start_comment = call(f'repos/{repository}/issues/comments/{comment_id}')
+    start_created_at = start_comment.get('created_at') if isinstance(start_comment, dict) else None
+    if not isinstance(start_created_at, str) or not start_created_at:
+        raise RuntimeError('fallback開始コメントの作成時刻を取得できませんでした。')
+
     statuses = aadw_observer.pages(call, f'repos/{repository}/commits/{sha}/statuses')
     source = max(
-        (row for row in statuses if row.get('context') == 'hane/review-source'),
+        (
+            row for row in statuses
+            if row.get('context') == 'hane/review-source'
+            and isinstance(row.get('created_at'), str)
+            and row.get('created_at') >= start_created_at
+        ),
         key=lambda row: row.get('id', -1), default=None,
     )
     completed = bool(
@@ -35,7 +45,7 @@ def reconcile(call, repository, payload):
     else:
         state = 'failure'
         if run.get('conclusion') == 'success':
-            detail = 'fallback workflowは終了しましたが、exact-headの代替レビュー終端証跡がありません。head変更またはstale終了として扱います。'
+            detail = 'fallback workflowは終了しましたが、現在run開始後のexact-head代替レビュー終端証跡がありません。head変更またはstale終了として扱います。'
         else:
             detail = f'Copilot代替レビューworkflowが正常終了しませんでした（{run.get("conclusion") or "unknown"}）。'
     result = aadw_notify.notify(
