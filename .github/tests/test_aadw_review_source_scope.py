@@ -110,6 +110,22 @@ class Tests(unittest.TestCase):
         self.assertIn("-f state=pending -f context='hane/copilot-routing'", workflow)
         self.assertGreaterEqual(workflow.count('-f target_url="$routing_run_url"'), 2)
 
+    def test_fallback_routing_publishes_immediate_lifecycle_comments(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / 'workflows'
+            / 'codex-limit-copilot-fallback.yml'
+        ).read_text(encoding='utf-8')
+        pending = workflow.index("-f state=pending -f context='hane/copilot-routing'")
+        start = workflow.index('aadw_notify.py start', pending)
+        terminal = workflow.index("-f state=failure -f context='hane/copilot-routing'", start)
+        success = workflow.index('aadw_notify.py success', terminal)
+        self.assertLess(pending, start)
+        self.assertLess(start, terminal)
+        self.assertLess(terminal, success)
+        self.assertIn('--process copilot-pre-gui-routing', workflow[start:success + 500])
+        self.assertIn('sparse-checkout: .github/scripts/aadw_notify.py', workflow)
+
 
 if __name__ == '__main__':
     unittest.main()
