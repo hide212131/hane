@@ -144,6 +144,31 @@ class PriorHeadTests(unittest.TestCase):
         self.assertEqual(subject.reconcile(gh.call, REPO, lookback_seconds=7200, now=NOW), 0)
         self.assertIn('処理開始', gh.comments[0]['body'])
 
+    def test_prior_head_fallback_compat_status_does_not_create_fake_codex_lifecycle(self):
+        gh = Fake()
+        gh.comments = []
+        review_url = 'https://github.com/example/reviews/123'
+        gh.old_statuses = [
+            {
+                'id': 20,
+                'context': 'hane/review-source',
+                'state': 'success',
+                'description': f'Review source: Copilot fallback for {OLD[:12]}',
+                'target_url': review_url,
+                'created_at': '2026-09-12T03:05:00Z',
+            },
+            {
+                'id': 21,
+                'context': 'hane/codex-review',
+                'state': 'success',
+                'description': f'Codex review clean for {OLD[:12]}',
+                'target_url': review_url,
+                'created_at': '2026-09-12T03:06:00Z',
+            },
+        ]
+        self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 0)
+        self.assertEqual(gh.comments, [])
+
 
 if __name__ == '__main__':
     unittest.main()
