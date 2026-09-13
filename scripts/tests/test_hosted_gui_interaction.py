@@ -290,7 +290,20 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(detail['landing_classification'], 'at_canonical')
         self.assertEqual(detail['click_evidence']['matched_text'], 'combo')
+        self.assertEqual(detail['actual_landing_source_offset'], detail['expected_canonical_source_offset'])
         self.assertEqual(calls, ['click-text', 'type-save', 'undo-save'])
+
+    def test_matched_bytes_with_inconsistent_recomputed_offset_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            expected = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            with patch.object(interaction, 'locate_single_insertion_offset', return_value=999999):
+                status, reason, detail, calls = self._run(directory, expected)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'corrupted')
+        self.assertEqual(detail['actual_landing_source_offset'], 999999)
+        self.assertNotIn('undo-save', calls)
 
     def test_near_canonical_mismatch_is_a_product_suspect_not_a_blocked_procedure(self):
         with tempfile.TemporaryDirectory() as directory:

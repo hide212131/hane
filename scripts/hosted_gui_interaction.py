@@ -660,9 +660,9 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
     matched, actual_bytes = wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
     actual = _decode(actual_bytes)
     detail.update(expected_after_insert=expected, actual_after_insert=actual)
+    landing_offset = locate_single_insertion_offset(baseline, actual, insertion)
+    detail["actual_landing_source_offset"] = landing_offset
     if not matched:
-        landing_offset = locate_single_insertion_offset(baseline, actual, insertion)
-        detail["actual_landing_source_offset"] = landing_offset
         if landing_offset is None:
             detail["landing_classification"] = "corrupted"
             return "fail", (
@@ -683,6 +683,13 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
             f"境界クリックの着地点が期待 canonical position から {delta} 文字という近傍だが一致しない。"
             "closing marker と後続 visible text が共有する境界での製品 source mapping の疑いがあり、"
             "#101 側での独立した root-cause 切り分けが必要"
+        ), detail
+    if landing_offset != expected_offset:
+        detail["landing_classification"] = "corrupted"
+        return "blocked", (
+            "境界クリック挿入後の内容は期待バイト列と一致したが、baseline との差分から"
+            "再算出した実着地点オフセットが期待 canonical position と一致しない"
+            "(evidence 内部矛盾の疑い)"
         ), detail
     detail["landing_classification"] = "at_canonical"
     ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)

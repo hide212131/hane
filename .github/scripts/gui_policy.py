@@ -186,6 +186,32 @@ def _artifact_sha256(evidence_dir, relative):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _require_click_evidence(step):
+    evidence = step.get('click_evidence')
+    if not isinstance(evidence, dict):
+        raise ValueError('missing click-text OCR/click evidence')
+    required = ('matched_text', 'bounding_box', 'window_bounds', 'click_point', 'edge')
+    for field in required:
+        if field not in evidence:
+            raise ValueError(f'click evidence missing field: {field}')
+    if not isinstance(evidence['matched_text'], str) or not evidence['matched_text']:
+        raise ValueError('click evidence matched_text invalid')
+    if evidence['edge'] not in ('start', 'end'):
+        raise ValueError('click evidence edge invalid')
+
+
+def _require_boundary_landing(step):
+    _require_click_evidence(step)
+    expected_offset = step.get('expected_canonical_source_offset')
+    actual_offset = step.get('actual_landing_source_offset')
+    if not isinstance(expected_offset, int) or isinstance(expected_offset, bool) or expected_offset < 0:
+        raise ValueError('missing or invalid expected canonical source offset')
+    if not isinstance(actual_offset, int) or isinstance(actual_offset, bool) or actual_offset < 0:
+        raise ValueError('missing or invalid actual landing source offset')
+    if step.get('landing_classification') != 'at_canonical' or actual_offset != expected_offset:
+        raise ValueError('boundary landing classification/offset evidence mismatch')
+
+
 def _delimiter_states(delimiter):
     closed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail'
     unclosed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail'
@@ -216,6 +242,11 @@ def _validate_inline_evidence(steps, evidence_dir):
         'boundary_click_edit_list_check_0': INLINE_FIXTURE_ORIGINAL.replace('item with *italic', 'item with *Zitalic', 1),
         'boundary_ime_input_check': INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
     }
+    boundary_click_edit_checks = {
+        'boundary_click_edit_bold_italic_check_0', 'boundary_click_edit_bold_italic_check_1',
+        'boundary_click_edit_code_span_check_0', 'boundary_click_edit_code_span_check_1',
+        'boundary_click_edit_quote_check_0', 'boundary_click_edit_list_check_0',
+    }
     for name, image in boundary_images.items():
         step = by_name[name]
         _require_text(step, 'expected_after_insert', 'actual_after_insert',
@@ -227,6 +258,8 @@ def _validate_inline_evidence(steps, evidence_dir):
         if (step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
                 or step['expected_after_undo'] != step['actual_after_undo']):
             raise ValueError('inline undo evidence mismatch')
+        if name in boundary_click_edit_checks:
+            _require_boundary_landing(step)
 
     navigation = {
         'boundary_caret_navigation_check_0': (

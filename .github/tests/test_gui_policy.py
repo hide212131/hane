@@ -59,6 +59,11 @@ def _inline_evidence(steps):
             policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
         ),
     }
+    click_edit_checks = {
+        'boundary_click_edit_bold_italic_check_0', 'boundary_click_edit_bold_italic_check_1',
+        'boundary_click_edit_code_span_check_0', 'boundary_click_edit_code_span_check_1',
+        'boundary_click_edit_quote_check_0', 'boundary_click_edit_list_check_0',
+    }
     for name, (screenshot, inserted) in boundary.items():
         by_name[name].update(
             screenshot=screenshot,
@@ -66,6 +71,17 @@ def _inline_evidence(steps):
             expected_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
             actual_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
         )
+        if name in click_edit_checks:
+            offset = inserted.index('Z')
+            by_name[name].update(
+                click_evidence={
+                    'matched_text': 'probe', 'bounding_box': [0, 0, 10, 10],
+                    'window_bounds': [0, 0, 100, 100], 'click_point': [1, 1], 'edge': 'start',
+                },
+                expected_canonical_source_offset=offset,
+                actual_landing_source_offset=offset,
+                landing_classification='at_canonical',
+            )
 
     navigation = {
         'boundary_caret_navigation_check_0': (
@@ -249,6 +265,28 @@ class ReceiptTests(unittest.TestCase):
         self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')['screenshot'] = (
             'inline_syntax_boundary/boundary_click_edit_bold_italic_check_0.png'
         )
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_boundary_click_landing_evidence_is_fail_closed(self):
+        mutations = [
+            ('click_evidence', None),
+            ('click_evidence', {'matched_text': 'probe'}),
+            ('expected_canonical_source_offset', None),
+            ('actual_landing_source_offset', None),
+            ('landing_classification', 'boundary_ambiguous_near_canonical'),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+            step[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_boundary_click_landing_offset_mismatch_cannot_pass(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        step['actual_landing_source_offset'] = step['expected_canonical_source_offset'] + 1
         with self.assertRaises(ValueError):
             self.validate(raw)
 
