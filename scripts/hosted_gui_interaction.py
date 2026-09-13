@@ -647,7 +647,11 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
     detail["expected_canonical_source_offset"] = expected_offset
     ok, out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot_path), ocr_pattern, ocr_edge], helper_timeout)
     if not ok:
-        return "fail", f"境界へのクリックに失敗した: {err}", detail
+        return "blocked", (
+            f"境界へのクリックに失敗した(OCR が対象文字列を認識できない、window bounds 取得失敗、"
+            f"helper の timeout/integrity mismatch などの helper/OCR 側要因の可能性があり、"
+            f"製品の source mapping を観測する前の procedure blocked とする): {err}"
+        ), detail
     try:
         detail["click_evidence"] = parse_click_evidence(out)
     except ValueError as exc:
@@ -665,6 +669,13 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
     landing_offset = locate_single_insertion_offset(baseline, actual, insertion)
     detail["actual_landing_source_offset"] = landing_offset
     if not matched:
+        if actual == baseline:
+            detail["landing_classification"] = "not_inserted"
+            return "blocked", (
+                "境界クリック挿入後も fixture が baseline のままで、probe が一切挿入されていない。"
+                "OS click が editor 外へ外れた可能性があり、独立した座標証拠なしには"
+                "helper/OCR miss と製品不具合を区別できないため procedure blocked とする"
+            ), detail
         if landing_offset is None:
             detail["landing_classification"] = "corrupted"
             return "fail", (
