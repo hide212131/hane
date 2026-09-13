@@ -113,18 +113,28 @@ class Tests(unittest.TestCase):
         lifecycle = [c for c in f.comments[130] if 'hane-aadw:' in c['body']]
         self.assertEqual(len(lifecycle), 1); self.assertIn('正常終了', lifecycle[0]['body'])
 
-    def test_codex_limit_uses_real_fallback_run(self):
+    def test_codex_limit_uses_pr_specific_fallback_run(self):
         f = Fake(); f.status(1, 'hane/codex-review', 'pending', 'Codex review pending for aaaaaaaaaaaa')
-        f.workflow_runs = [{'id': 222, 'run_attempt': 1, 'name': 'Codex limit Copilot review fallback',
-            'display_title': 'Example PR', 'created_at': '2026-09-12T02:00:01Z',
-            'actor': {'login': 'chatgpt-codex-connector[bot]'}}]
-        payload = {'action': 'created', 'issue': {'number': 42, 'title': 'Example PR', 'pull_request': {'url': 'x'}},
+        f.workflow_runs = [
+            {'id': 221, 'run_attempt': 1, 'name': 'Codex limit Copilot review fallback',
+             'display_title': 'Codex fallback PR #41', 'created_at': '2026-09-12T02:00:00Z',
+             'actor': {'login': 'chatgpt-codex-connector[bot]'}},
+            {'id': 222, 'run_attempt': 1, 'name': 'Codex limit Copilot review fallback',
+             'display_title': 'Codex fallback PR #42', 'created_at': '2026-09-12T02:00:01Z',
+             'actor': {'login': 'chatgpt-codex-connector[bot]'}},
+        ]
+        payload = {'action': 'created', 'issue': {'number': 42, 'title': 'Same title', 'pull_request': {'url': 'x'}},
             'comment': {'user': {'login': 'chatgpt-codex-connector[bot]'}, 'created_at': '2026-09-12T02:00:00Z',
                         'body': 'You have reached your Codex usage limits for code reviews.'}}
         observer.handle_issue_comment(f.call, REPO, payload, '900', '1')
         bodies = [c['body'] for c in f.comments[42]]
         self.assertTrue(any('Codexレビュー — 異常終了' in b for b in bodies))
         self.assertTrue(any('/actions/runs/222/attempts/1' in b and '処理開始' in b for b in bodies))
+        self.assertFalse(any('/actions/runs/221/' in b for b in bodies))
+
+    def test_fallback_workflow_persists_pr_number_in_run_name(self):
+        workflow = (Path(__file__).resolve().parents[1] / 'workflows' / 'codex-limit-copilot-fallback.yml').read_text()
+        self.assertIn('run-name: Codex fallback PR #${{ github.event.issue.number }}', workflow)
 
     def test_fallback_terminal_closes_active_start(self):
         f = Fake()
