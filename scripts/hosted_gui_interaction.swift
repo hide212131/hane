@@ -252,7 +252,7 @@ func findTextMatch(_ path: String, _ pattern: String) -> CGRect {
         let fullRange = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: fullRange), let range = Range(match.range, in: text) else { continue }
         guard let box = try? candidate.boundingBox(for: range) else { continue }
-        return box
+        return box.boundingBox
     }
     fail("no OCR match for pattern: \(pattern)")
 }
