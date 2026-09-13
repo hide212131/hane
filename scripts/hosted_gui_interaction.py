@@ -97,6 +97,22 @@ BOUNDARY_MARK = "Z"
 NAVIGATION_MARK = "N"
 JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 
+# inline_syntax_boundary の各 mutating subtest は、成功経路であっても最大で数回の
+# undo-save までしか積まない(delimiter_toggle の 3 段編集が最長)。fail/blocked 後の
+# baseline 復元はこの上限に余裕を持たせた回数だけ undo-save を試み、それでも一致
+# しなければ復元失敗として fail-closed にする。
+BASELINE_RESTORE_MAX_UNDOS = 8
+
+# Hane の save_session は書き込みを background executor へ投入して非同期に完了する
+# ため、force-save/undo-save のキー送信が返った直後に読んだ fixture バイト列は、
+# 保存中の古い(baseline と偶然一致する)内容である場合がある。save_session の完了を
+# 明示的に通知する手段がないため、固定の短い settle 秒数では、非同期書き込みが
+# その秒数より遅れて到着する環境で古い baseline を「一致」と誤確定してしまう
+# (Codex review on PR #138)。baseline 復元は fail/blocked 後にしか実行されない
+# 低頻度経路なので、一致を確定する前に呼び出し側から渡された poll_timeout の
+# 残り時間いっぱいまで無変化を確認し、締切までに到着するどんな遅延書き込みも
+# 見逃さないようにする。
+
 
 def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
     match = re.search(pattern, text)
@@ -197,6 +213,39 @@ def wait_for_fixture_bytes(
             return True, last
         if time.monotonic() >= deadline:
             return False, last
+        time.sleep(interval)
+
+
+def wait_for_fixture_settled_bytes(
+    fixture_path: Path, expected: bytes, timeout: float, interval: float = 0.2,
+) -> tuple[bool, bytes]:
+    """Like wait_for_fixture_bytes, but a match must survive re-reads all the
+    way to `timeout` before being accepted. save_session writes asynchronously
+    in the background executor with no completion signal this harness can
+    observe, so a read right after the save keystroke can observe stale bytes
+    that coincidentally equal `expected` while the real write is still in
+    flight and lands arbitrarily later. A fixed short settle window would
+    still miss writes that land after it elapses, so this holds the match
+    open for the caller's entire remaining budget instead of a fixed
+    constant, catching any write landing before the deadline. This is only
+    called to restore state after a fail/blocked subtest, so spending the
+    full timeout on the success path is acceptable."""
+    deadline = time.monotonic() + timeout
+    last = b""
+    matched_since: Optional[float] = None
+    while True:
+        try:
+            last = fixture_path.read_bytes()
+        except OSError:
+            last = b""
+        now = time.monotonic()
+        if last == expected:
+            if matched_since is None:
+                matched_since = now
+        else:
+            matched_since = None
+        if now >= deadline:
+            return matched_since is not None, last
         time.sleep(interval)
 
 
@@ -486,6 +535,58 @@ def _decode(data: bytes) -> str:
 def _move_to_neutral(swift_helper, pid: int, helper_timeout: float, name: str) -> dict:
     ok, _out, err = run_helper(swift_helper, ["move-doc-start", str(pid)], helper_timeout)
     return make_step(name, "pass" if ok else "blocked", reason=None if ok else err)
+
+
+def restore_scenario_baseline(swift_helper, pid, fixture_path, baseline,
+                               helper_timeout, poll_timeout, name):
+    baseline_bytes = baseline.encode("utf-8")
+    # 失敗/タイムアウトした mutating subtest は、編集キー送信後・保存キー送信前に
+    # 止まっている可能性がある。その場合ディスク上の fixture は baseline のまま
+    # (未保存)で「一致」に見えてしまい、undo を一度も実行しないまま次の
+    # subtest が汚染された文書状態から始まる(Issue #136 の再発)。比較の前に
+    # 必ず保存させ、in-memory の編集をディスクへ反映させてから判定する。
+    ok, _out, err = run_helper(swift_helper, ["force-save", str(pid)], helper_timeout)
+    if not ok:
+        return make_step(name, "blocked",
+                          reason=f"baseline 復元前の force-save に失敗した: {err}", attempts=0)
+    # force-save/undo-save のキー送信は save_session の非同期な書き込み完了を待たない
+    # ため、直後の読み取りは書き込み中の古い baseline 相当のバイト列を「一致」と誤認
+    # しうる。settled 版で一致が一定時間保持されることまで確認してから受理する。
+    matched, actual = wait_for_fixture_settled_bytes(fixture_path, baseline_bytes, poll_timeout)
+    attempts = 0
+    while not matched and attempts < BASELINE_RESTORE_MAX_UNDOS:
+        ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+        if not ok:
+            return make_step(name, "blocked",
+                              reason=f"baseline 復元の undo に失敗した: {err}", attempts=attempts)
+        attempts += 1
+        matched, actual = wait_for_fixture_settled_bytes(fixture_path, baseline_bytes, poll_timeout)
+    if not matched:
+        return make_step(name, "blocked",
+                          reason=f"{attempts} 回の undo でも fixture が baseline へ復元できない",
+                          expected=baseline, actual=_decode(actual), attempts=attempts)
+    reset = _move_to_neutral(swift_helper, pid, helper_timeout, f"{name}_caret")
+    if reset["result"] != "pass":
+        return make_step(name, "blocked",
+                          reason=f"baseline 復元後の caret 初期化に失敗した: {reset.get('reason')}")
+    return make_step(name, "pass", attempts=attempts)
+
+
+def run_mutating_subtest(steps, subtest_steps, name, process_holder, swift_helper,
+                          fixture_path, baseline, helper_timeout, poll_timeout):
+    steps.extend(subtest_steps)
+    outcome = next((s["result"] for s in reversed(subtest_steps) if s["name"] == name), "blocked")
+    if outcome == "pass":
+        return True
+    pid = current_pid(process_holder)
+    if pid is None:
+        steps.append(make_step(f"{name}_state_restore", "blocked",
+                                reason="対象プロセスの PID を取得できず baseline へ復元できない"))
+        return False
+    restore_step = restore_scenario_baseline(swift_helper, pid, fixture_path, baseline,
+                                              helper_timeout, poll_timeout, f"{name}_state_restore")
+    steps.append(restore_step)
+    return restore_step["result"] == "pass"
 
 
 def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseline,
@@ -1017,7 +1118,8 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
     try:
         session_steps, window_id = open_session(module, env, config, binary_path, process_holder, "before")
         steps += session_steps
-        for name, checks in (
+
+        boundary_click_checks = (
             ("boundary_click_edit_bold_italic", [
                 (BOLD_ITALIC_OCR_RE, "start", BOLD_ITALIC_OPEN_RE, "end"),
                 (BOLD_ITALIC_OCR_RE, "end", BOLD_ITALIC_CLOSE_RE, "start"),
@@ -1028,20 +1130,43 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
             ]),
             ("boundary_click_edit_quote", [(QUOTE_BOLD_OPEN_OCR_RE, "start", QUOTE_BOLD_OPEN_RE, "end")]),
             ("boundary_click_edit_list", [(LIST_ITALIC_OPEN_OCR_RE, "start", LIST_ITALIC_OPEN_RE, "end")]),
-        ):
-            steps.extend(run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                           name, checks, helper_timeout, poll_timeout))
-        steps.extend(run_boundary_navigation_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                                  helper_timeout, poll_timeout))
-        steps.extend(run_boundary_ime_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                           helper_timeout, poll_timeout))
-        steps.extend(run_drag_select_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                          helper_timeout, poll_timeout))
+        )
+        subtests = [
+            (bname, (lambda bname=bname, bchecks=bchecks: run_boundary_step(
+                module, env, config, swift_helper, process_holder, window_id, run_dir,
+                bname, bchecks, helper_timeout, poll_timeout)))
+            for bname, bchecks in boundary_click_checks
+        ]
+        subtests.append(("boundary_caret_navigation", lambda: run_boundary_navigation_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout)))
+        subtests.append(("boundary_ime_input", lambda: run_boundary_ime_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout)))
+        subtests.append(("drag_select_delete_undo_redo", lambda: run_drag_select_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout)))
         for kind, delimiter in (("star", "*"), ("bold", "**"), ("code", "`")):
-            steps.extend(run_delimiter_toggle_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                                   kind, delimiter, helper_timeout, poll_timeout))
-        steps.extend(run_multiline_code_span_toggle_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
-                                                         helper_timeout, poll_timeout))
+            subtests.append((f"delimiter_toggle_{kind}", (lambda kind=kind, delimiter=delimiter: run_delimiter_toggle_step(
+                module, env, config, swift_helper, process_holder, window_id, run_dir,
+                kind, delimiter, helper_timeout, poll_timeout))))
+        subtests.append(("multiline_code_span_close_toggle", lambda: run_multiline_code_span_toggle_step(
+            module, env, config, swift_helper, process_holder, window_id, run_dir,
+            helper_timeout, poll_timeout)))
+
+        # 独立シナリオの fail/blocked が次のシナリオへ漏れないよう、各 subtest 終了後に
+        # baseline 復元を挟む(Issue #136)。復元自体が失敗したら以降を実行せず、
+        # 元の fail/blocked step はそのまま残す(fail-closed)。
+        continue_ok = True
+        for sub_name, thunk in subtests:
+            if not continue_ok:
+                steps.append(skipped_step(sub_name, "直前の subtest の baseline 復元が失敗したため実行しない"))
+                continue
+            continue_ok = run_mutating_subtest(
+                steps, thunk(), sub_name, process_holder, swift_helper,
+                config.fixture_path, INLINE_FIXTURE_ORIGINAL, helper_timeout, poll_timeout,
+            )
+
         if window_id is not None:
             steps.append(capture_named(module, env, config, window_id, run_dir, "after"))
     finally:

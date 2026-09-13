@@ -137,6 +137,23 @@ func redoSave(_ pid: pid_t) {
     """)
 }
 
+func forceSave(_ pid: pid_t) {
+    // Flushes any in-memory edit left over from a mutating AppleScript that
+    // failed or timed out between its edit keystroke and its own save
+    // keystroke, so baseline restoration compares against disk bytes that
+    // actually reflect the app's current document state.
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            keystroke "s" using command down
+            delay 0.3
+        end tell
+    end tell
+    """)
+}
+
 func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
     Thread.sleep(forTimeInterval: 0.3)
@@ -433,7 +450,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -465,6 +482,9 @@ case "undo-save":
 case "redo-save":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("redo-save requires PID") }
     redoSave(pid)
+case "force-save":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("force-save requires PID") }
+    forceSave(pid)
 case "type-romaji-commit-save":
     guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-commit-save requires PID, romaji text and source ID") }
     selectAllTypeRomajiCommitSave(pid, arguments[2], arguments[3])
