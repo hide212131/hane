@@ -43,7 +43,7 @@ def pages(call, path):
     raise RuntimeError("AADW開始通知のページ数が上限を超えました。")
 
 
-def pending_for_source(call, repository, workflow_name, run_id):
+def pending_for_source(call, repository, workflow_name, run_id, started_at):
     context = WORKFLOW_CONTEXT.get(workflow_name)
     if context is None:
         return None
@@ -54,11 +54,14 @@ def pending_for_source(call, repository, workflow_name, run_id):
         sha = pr.get("head", {}).get("sha") or ""
         for row in pages(call, f"repos/{repository}/commits/{sha}/statuses"):
             match = _ACTION_RUN.search(row.get("target_url") or "")
+            created_at = status_reconcile.parse_time(row.get("created_at"))
             if (
                 row.get("context") == context
                 and row.get("state") == "pending"
                 and match
                 and match.group(1) == run_id
+                and created_at is not None
+                and created_at >= started_at
             ):
                 found.append((row.get("id", 0), pr, row))
     return max(found, key=lambda item: item[0], default=None)
@@ -139,9 +142,14 @@ def reconcile_start(
     if workflow_name not in WORKFLOW_CONTEXT:
         return 0
 
+    started_at = status_reconcile.attempt_started_at(
+        call, repository, str(run_id), str(attempt)
+    )
     target = None
     for index in range(max(1, poll_attempts)):
-        target = pending_for_source(call, repository, workflow_name, str(run_id))
+        target = pending_for_source(
+            call, repository, workflow_name, str(run_id), started_at
+        )
         if target:
             break
         if index + 1 < max(1, poll_attempts) and poll_seconds > 0:
