@@ -10,9 +10,9 @@ OLD = 'a' * 40
 CURRENT = 'b' * 40
 
 
-def pr():
+def pr(state='open'):
     return {
-        'number': 42, 'state': 'open', 'draft': False,
+        'number': 42, 'state': state, 'draft': False,
         'user': {'login': 'github-actions[bot]'},
         'base': {'repo': {'full_name': REPO}},
         'head': {'sha': CURRENT, 'repo': {'full_name': REPO}},
@@ -30,15 +30,18 @@ def pending(id_=1, run=111, attempt=2, explicit_attempt=True):
 
 
 class Fake:
-    def __init__(self, old_statuses):
+    def __init__(self, old_statuses, state='open'):
         self.old_statuses = old_statuses
+        self.state = state
         self.comments = []
         self.next_id = 1
 
     def call(self, endpoint, payload=None, method=None):
         clean = endpoint.split('?', 1)[0]
         if clean == f'repos/{REPO}/pulls':
-            return [pr()]
+            return [pr()] if self.state == 'open' else []
+        if clean == f'repos/{REPO}/pulls/42':
+            return pr(self.state)
         if clean == f'repos/{REPO}/pulls/42/commits':
             return [{'sha': OLD}, {'sha': CURRENT}]
         if clean == f'repos/{REPO}/commits/{OLD}/statuses':
@@ -51,6 +54,8 @@ class Fake:
             return {'run_attempt': 1, 'run_started_at': '2026-09-12T14:00:00Z'}
         if clean == f'repos/{REPO}/actions/runs/111/attempts/2':
             return {'run_attempt': 2, 'run_started_at': '2026-09-12T14:59:00Z'}
+        if clean == f'repos/{REPO}/issues/comments':
+            return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
             if payload is None:
                 return list(self.comments)
@@ -76,6 +81,13 @@ def event(conclusion='timed_out', run=111, attempt=2):
         'id': run, 'run_attempt': attempt, 'conclusion': conclusion,
         'name': 'Claude automatic fix worker',
     }}
+
+
+def start_marker():
+    return (
+        f'<!-- hane-aadw: process=claude-fix kind=pr number=42 sha={OLD} '
+        'run=111 attempt=2 -->'
+    )
 
 
 class Tests(unittest.TestCase):
@@ -116,12 +128,8 @@ class Tests(unittest.TestCase):
 
     def test_explicit_start_marker_recovers_sha_outside_commit_list(self):
         fake = Fake([pending()])
-        marker = (
-            f'<!-- hane-aadw: process=claude-fix kind=pr number=42 sha={OLD} '
-            'run=111 attempt=2 -->'
-        )
         fake.comments.append({'id': 8, 'user': {'login': 'github-actions[bot]'},
-                              'body': '### AADW: Claude Codeによる自動修正 — 処理開始\n' + marker})
+                              'body': '### AADW: Claude Codeによる自動修正 — 処理開始\n' + start_marker()})
         original = fake.call
         def call(endpoint, payload=None, method=None):
             if endpoint.split('?', 1)[0] == f'repos/{REPO}/pulls/42/commits':
@@ -130,6 +138,15 @@ class Tests(unittest.TestCase):
         self.assertEqual(subject.reconcile(call, REPO, event()), 1)
         self.assertEqual(len(fake.comments), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
+
+    def test_closed_pr_start_marker_is_still_closed_on_workflow_completion(self):
+        fake = Fake([pending()], state='closed')
+        fake.comments.append({'id': 8, 'user': {'login': 'github-actions[bot]'},
+                              'body': '### AADW: Claude Codeによる自動修正 — 処理開始\n' + start_marker()})
+        self.assertEqual(subject.reconcile(fake.call, REPO, event()), 1)
+        self.assertEqual(len(fake.comments), 1)
+        self.assertIn('異常終了', fake.comments[0]['body'])
+        self.assertIn('run=111 attempt=2', fake.comments[0]['body'])
 
 
 if __name__ == '__main__':
