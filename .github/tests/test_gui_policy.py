@@ -307,6 +307,10 @@ class ReceiptTests(unittest.TestCase):
             lambda e: {**e, 'bounding_box': {**e['bounding_box'], 'minX': 1.5}},
             lambda e: {**e, 'window_bounds': {**e['window_bounds'], 'width': 0}},
             lambda e: {**e, 'click_point': {**e['click_point'], 'x': e['click_point']['x'] + 50}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'x': float('nan')}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'y': float('inf')}},
+            lambda e: {**e, 'bounding_box': {**e['bounding_box'], 'minX': float('nan')}},
+            lambda e: {**e, 'window_bounds': {**e['window_bounds'], 'width': float('inf')}},
         ]
         for mutate in mutations:
             raw = passing_result()

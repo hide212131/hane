@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
@@ -190,7 +191,7 @@ def _artifact_sha256(evidence_dir, relative):
 def _numeric(mapping, *fields):
     for field in fields:
         value = mapping.get(field) if isinstance(mapping, dict) else None
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
             raise ValueError(f'click evidence field not numeric: {field}')
 
 
