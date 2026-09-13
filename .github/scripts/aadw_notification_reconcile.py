@@ -291,29 +291,33 @@ def active_fallback_run(call, repository, pr_number, sha):
             continue
         body = comment.get("body") or ""
         match = _FALLBACK_MARKER.search(body)
+        created_at = parse_time(comment.get("created_at"))
         if (
             match
             and match.group(1) == str(pr_number)
             and match.group(2) == sha
             and "— 処理開始" in body
+            and created_at is not None
         ):
-            found.append((comment.get("id", 0), match.group(3), match.group(4)))
+            found.append((comment.get("id", 0), match.group(3), match.group(4), created_at))
     return max(found)[1:] if found else None
 
 
 def reconcile_fallback(call, repository, pr_number, sha, statuses, cutoff):
+    correlation = active_fallback_run(call, repository, pr_number, sha)
+    if not correlation:
+        return "noop"
+    run_id, attempt, started_at = correlation
     rows = [
         row for row in statuses
         if row.get("context") == "hane/review-source"
         and parse_time(row.get("created_at"))
         and parse_time(row.get("created_at")) >= cutoff
+        and parse_time(row.get("created_at")) >= started_at
     ]
     if not rows:
         return "noop"
     latest = max(rows, key=lambda row: row.get("id", 0))
-    correlation = active_fallback_run(call, repository, pr_number, sha)
-    if not correlation:
-        return "noop"
     state = (
         "success"
         if latest.get("state") == "success"
@@ -333,8 +337,8 @@ def reconcile_fallback(call, repository, pr_number, sha, statuses, cutoff):
         number=pr_number,
         sha=sha,
         repository=repository,
-        run_id=correlation[0],
-        attempt=correlation[1],
+        run_id=run_id,
+        attempt=attempt,
         detail=detail,
     )["action"]
 
