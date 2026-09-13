@@ -195,37 +195,8 @@ def begin(api, request):
     output('proceed', 'true' if allowed else 'false')
 
 
-def report(api, request):
-    pr = api.pr(request['pr_number'])
-    state = None
-    if api.trusted(pr) and pr['head']['sha'] == request['sha']:
-        state = gui_state(api.statuses(request['sha']).get(CONTEXT, {}), request['sha'])
-    if state and state[1] == request['generation'] and state[0] in ('pass', 'fail', 'blocked'):
-        # A rerun of the report job may observe the terminal status written by
-        # this exact generation before a later step in the original attempt
-        # failed. Preserve that terminal result and only heal its human mirror.
-        notify(api, request, 'success', detail=f'GUI validation結果: {state[0]}')
-        print(f'GUI {state[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}')
-        return
-    if state != ('pending', request['generation']):
-        # The PR head may have moved, or another GUI generation may now be the
-        # latest status.  Neither invalidates an already-durable terminal result
-        # for this exact request generation, so inspect the request SHA history
-        # before treating this report rerun as stale.
-        terminal = historical_terminal(api, request)
-        if terminal:
-            notify(api, request, 'success', detail=f'GUI validation結果: {terminal[0]}')
-            print(f'GUI {terminal[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}')
-            return
-        print('Stale GUI generation: no status written')
-        # Someone else (usually retire() from a later resolve()) already
-        # superseded this generation; resolve its own comment idempotently
-        # rather than leaving it stuck at "start" if that step was missed.
-        notify(api, request, 'failure', detail='対象PRの状態が変わったため、この実行のGUI validationは打ち切られました。')
-        return
-    if not eligible(api, request):
-        retire(api, request)
-        return
+def report_receipt(api, request):
+    """Rebuild the receipt deterministically from the downloaded worker evidence."""
     evidence_dir = Path(os.environ['EVIDENCE_DIR'])
     raw = None
     try:
@@ -239,8 +210,53 @@ def report(api, request):
         reason = raw.get('overall_reason', '')
     except Exception as exc:
         outcome, reason = 'blocked', f'GUI receipt rejected or worker incomplete: {exc}'
-    proof = receipt(request, outcome, reason, raw, evidence_dir)
+    return outcome, receipt(request, outcome, reason, raw, evidence_dir)
+
+
+def write_report_receipt(proof):
     Path(os.environ['RECEIPT_PATH']).write_text(json.dumps(proof, ensure_ascii=False, indent=2))
+
+
+def restore_terminal_receipt(api, request, terminal):
+    outcome, proof = report_receipt(api, request)
+    if outcome != terminal[0]:
+        raise ValueError(f'durable GUI terminal {terminal[0]} does not match reconstructed receipt {outcome}')
+    write_report_receipt(proof)
+    notify(api, request, 'success', detail=f'GUI validation結果: {terminal[0]}')
+    print(f'GUI {terminal[0]} already terminal for PR {request["pr_number"]} at {request["sha"]}; receipt restored')
+
+
+def report(api, request):
+    pr = api.pr(request['pr_number'])
+    state = None
+    if api.trusted(pr) and pr['head']['sha'] == request['sha']:
+        state = gui_state(api.statuses(request['sha']).get(CONTEXT, {}), request['sha'])
+    if state and state[1] == request['generation'] and state[0] in ('pass', 'fail', 'blocked'):
+        # The previous attempt may have published the terminal status and then
+        # failed while uploading the receipt artifact. Rebuild the receipt from
+        # the retained worker evidence before healing the human mirror.
+        restore_terminal_receipt(api, request, state)
+        return
+    if state != ('pending', request['generation']):
+        # The PR head may have moved, or another GUI generation may now be the
+        # latest status. Neither invalidates an already-durable terminal result
+        # for this exact request generation, so inspect the request SHA history
+        # before treating this report rerun as stale.
+        terminal = historical_terminal(api, request)
+        if terminal:
+            restore_terminal_receipt(api, request, terminal)
+            return
+        print('Stale GUI generation: no status written')
+        # Someone else (usually retire() from a later resolve()) already
+        # superseded this generation; resolve its own comment idempotently
+        # rather than leaving it stuck at "start" if that step was missed.
+        notify(api, request, 'failure', detail='対象PRの状態が変わったため、この実行のGUI validationは打ち切られました。')
+        return
+    if not eligible(api, request):
+        retire(api, request)
+        return
+    outcome, proof = report_receipt(api, request)
+    write_report_receipt(proof)
     # Recheck after reading artifacts and worker metadata, immediately before POST.
     if current(api, request):
         if not eligible(api, request):
