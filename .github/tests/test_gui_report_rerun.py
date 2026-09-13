@@ -30,6 +30,35 @@ class GuiReportRerunTests(unittest.TestCase):
                     detail=f'GUI validation結果: {outcome}',
                 )
 
+    def test_historical_terminal_is_preserved_after_later_generation_or_head_move(self):
+        terminal = {
+            'id': 41,
+            'context': controller.CONTEXT,
+            'state': 'success',
+            'description': f'GUI pass {STATUS_VERSION} {SHA[:12]} g123-1',
+        }
+        for changed in ('generation', 'head'):
+            with self.subTest(changed=changed):
+                api = FakeGitHub()
+                if changed == 'generation':
+                    api.rows[controller.CONTEXT] = {
+                        'id': 42,
+                        'state': 'pending',
+                        'description': f'GUI pending {STATUS_VERSION} {SHA[:12]} g999-1',
+                    }
+                else:
+                    api.pull['head']['sha'] = 'd' * 40
+                with patch.object(api, 'pages', return_value=[terminal]), \
+                        patch.object(controller, 'notify') as notify:
+                    controller.report(api, REQUEST)
+                self.assertEqual(api.writes, [])
+                notify.assert_called_once_with(
+                    api,
+                    REQUEST,
+                    'success',
+                    detail='GUI validation結果: pass',
+                )
+
 
 if __name__ == '__main__':
     unittest.main()
