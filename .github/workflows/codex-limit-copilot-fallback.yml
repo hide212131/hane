@@ -32,6 +32,14 @@ jobs:
       statuses: write
 
     steps:
+      - name: Check out trusted AADW notifier
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/aadw_notify.py
+          sparse-checkout-cone-mode: false
+
       - name: Replace limited Codex review with Copilot review
         shell: bash
         env:
@@ -267,10 +275,30 @@ jobs:
               -f description="Copilot routing pending for ${short_sha}" \
               -f target_url="$routing_run_url" >/dev/null
 
+            if ! python3 -I .github/scripts/aadw_notify.py start \
+              --process copilot-pre-gui-routing \
+              --kind pr \
+              --number "$PR_NUMBER" \
+              --sha "$target_sha" \
+              --detail="状態: Copilot routing pending for ${short_sha}" >/dev/null
+            then
+              echo '::warning::Failed to publish immediate AADW routing start; commit status remains authoritative.'
+            fi
+
             gh api --method POST "repos/${REPOSITORY}/statuses/${target_sha}" \
               -f state=failure -f context='hane/copilot-routing' \
               -f description="Copilot routing: fix for ${short_sha}" \
               -f target_url="$routing_run_url" >/dev/null
+
+            if ! python3 -I .github/scripts/aadw_notify.py success \
+              --process copilot-pre-gui-routing \
+              --kind pr \
+              --number "$PR_NUMBER" \
+              --sha "$target_sha" \
+              --detail="状態: Copilot routing: fix for ${short_sha}" >/dev/null
+            then
+              echo '::warning::Failed to publish immediate AADW routing completion; commit status remains authoritative.'
+            fi
 
             comment_body="Copilot pre-GUI routing for \`${target_sha}\`: **fix** — ${reason}"
             if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
