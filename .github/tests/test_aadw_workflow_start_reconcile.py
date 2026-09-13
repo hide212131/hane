@@ -23,6 +23,13 @@ class Fake:
         self.comments = []
         self.statuses = []
         self.next_id = 100
+        self.attempts = {
+            '777': [
+                '2026-09-12T02:00:00Z',
+                '2026-09-12T02:10:00Z',
+                '2026-09-12T02:20:00Z',
+            ],
+        }
 
     def call(self, endpoint, payload=None, method=None):
         clean = endpoint.split('?', 1)[0]
@@ -32,6 +39,14 @@ class Fake:
             return pr()
         if clean == f'repos/{REPO}/commits/{SHA}/statuses':
             return list(self.statuses)
+        if clean == f'repos/{REPO}/actions/runs/777':
+            return {'run_attempt': len(self.attempts['777'])}
+        if clean.startswith(f'repos/{REPO}/actions/runs/777/attempts/'):
+            attempt = int(clean.rsplit('/', 1)[1])
+            return {
+                'run_attempt': attempt,
+                'run_started_at': self.attempts['777'][attempt - 1],
+            }
         if clean == f'repos/{REPO}/issues/comments':
             return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
@@ -66,13 +81,14 @@ class Fake:
 
 
 class Tests(unittest.TestCase):
-    def pending(self, context, run='777', description='pending'):
+    def pending(self, context, run='777', description='pending', created='2026-09-12T02:11:00Z', id_=7):
         return {
-            'id': 7,
+            'id': id_,
             'context': context,
             'state': 'pending',
             'description': description,
             'target_url': f'https://github.com/hide212131/hane/actions/runs/{run}',
+            'created_at': created,
         }
 
     def test_exact_workflow_attempt_creates_start(self):
@@ -88,6 +104,57 @@ class Tests(unittest.TestCase):
         self.assertIn('run=777 attempt=2', body)
         self.assertIn('/actions/runs/777/attempts/2', body)
 
+    def test_rerun_waits_for_current_attempt_pending_instead_of_reusing_prior_attempt(self):
+        f = Fake()
+        old_pending = self.pending(
+            'hane/codex-review',
+            description='Codex review pending for aaaaaaaaaaaa',
+            created='2026-09-12T02:01:00Z',
+            id_=7,
+        )
+        new_pending = self.pending(
+            'hane/codex-review',
+            description='Codex review pending for aaaaaaaaaaaa',
+            created='2026-09-12T02:11:00Z',
+            id_=8,
+        )
+        status_reads = {'count': 0}
+
+        def call(endpoint, payload=None, method=None):
+            clean = endpoint.split('?', 1)[0]
+            if clean == f'repos/{REPO}/commits/{SHA}/statuses':
+                status_reads['count'] += 1
+                return [old_pending] if status_reads['count'] == 1 else [old_pending, new_pending]
+            return f.call(endpoint, payload, method)
+
+        writes = start_reconcile.reconcile_start(
+            call,
+            REPO,
+            'Codex review gate',
+            '777',
+            '2',
+            poll_attempts=2,
+            poll_seconds=1,
+            sleeper=lambda _seconds: None,
+        )
+        self.assertEqual(writes, 1)
+        self.assertEqual(status_reads['count'], 2)
+        self.assertEqual(len(f.comments), 1)
+        self.assertIn('run=777 attempt=2', f.comments[0]['body'])
+
+    def test_rerun_with_only_previous_attempt_pending_does_not_create_start(self):
+        f = Fake()
+        f.statuses.append(self.pending(
+            'hane/codex-review',
+            description='Codex review pending for aaaaaaaaaaaa',
+            created='2026-09-12T02:01:00Z',
+        ))
+        writes = start_reconcile.reconcile_start(
+            f.call, REPO, 'Codex review gate', '777', '2', poll_attempts=1
+        )
+        self.assertEqual(writes, 0)
+        self.assertEqual(f.comments, [])
+
     def test_routing_reconciliation_uses_same_routing_context_and_polls(self):
         f = Fake()
         calls = {'count': 0}
@@ -98,7 +165,11 @@ class Tests(unittest.TestCase):
                 calls['count'] += 1
                 if calls['count'] < 2:
                     return []
-                return [self.pending('hane/copilot-routing', description='Copilot routing pending for aaaaaaaaaaaa')]
+                return [self.pending(
+                    'hane/copilot-routing',
+                    description='Copilot routing pending for aaaaaaaaaaaa',
+                    created='2026-09-12T02:21:00Z',
+                )]
             return f.call(endpoint, payload, method)
 
         writes = start_reconcile.reconcile_start(
