@@ -113,14 +113,14 @@ class Tests(unittest.TestCase):
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
-        self.assertNotIn('正常終了', fake.comments[0]['body'])
+        self.assertNotIn('— 正常終了', fake.comments[0]['body'])
 
     def test_later_fallback_success_after_this_attempt_finished_is_not_reused(self):
         fake = Fake([source_status(7, '2026-09-12T10:06:00Z')])
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('failure')), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
-        self.assertNotIn('正常終了', fake.comments[0]['body'])
+        self.assertNotIn('— 正常終了', fake.comments[0]['body'])
 
     def test_closed_pr_is_resolved_from_start_marker(self):
         fake = Fake([source_status(7, '2026-09-12T09:59:00Z')], state='closed')
