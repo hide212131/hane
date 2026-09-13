@@ -749,7 +749,17 @@ def confirm_boundary_edit_reproducibility(
     fail への自動昇格は禁止)。したがって二回の着地点が一致しても、それは実
     EditorView への coordinate-specific event など OCR と独立した座標検証には
     ならないため、`reproducible_mismatch` として証拠に残すだけで procedure blocked
-    のまま #101 側での root-cause 切り分けに委ね、fail へは昇格しない。"""
+    のまま #101 側での root-cause 切り分けに委ね、fail へは昇格しない。
+
+    OCR と独立した座標証拠は crates/ui/src/view.rs の
+    `boundary_click_lands_on_source_offset_independent_of_ocr`(#[gpui::test])
+    が別途提供する。実 EditorView・実 glyph shaping・実 mouse event で、閉じ
+    marker の直後により可視テキストが続く境界(**combo** の後続、code span の
+    閉じ backtick の後続など)は再現可能に `Bias::After` の tie-break(後続の
+    可視 segment を優先)で marker の手前ではなく直後に着地することを確認して
+    おり、`boundary_ambiguous_near_canonical` は OCR/helper 誤差ではなく既知の
+    決定的挙動であると独立に裏付けている(製品側の root cause 断定・恒久修正は
+    #101 に委ねる、PR #139 review)。"""
     steps: list[dict] = []
     restore_step = restore_scenario_baseline(
         swift_helper, pid, fixture_path, baseline, helper_timeout, poll_timeout,

@@ -6379,4 +6379,122 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+
+    /// The row's own hidden-markup rendering (no caret touching it), as the
+    /// macOS hosted GUI validator's `click-text` OCR sees it — used only to
+    /// locate the visual x-offset to click at, never as the offset oracle
+    /// below.
+    fn row_visual_text(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        line: usize,
+    ) -> String {
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                editor_view
+                    .rendered_line(line)
+                    .expect("line rendered")
+                    .visual_text
+            })
+        })
+    }
+
+    // Codex review on PR #139 (Issue #137): the hosted GUI validator
+    // (scripts/hosted_gui_interaction.py boundary_edit_check) can only click
+    // through OCR bounding boxes and a real OS click, so a mismatch there
+    // can never distinguish a genuine source-mapping bug from OCR/helper
+    // measurement error — even retrying the same OCR→click path twice still
+    // isn't independent coordinate evidence. This test drives the real
+    // `EditorView` render tree the same way (`debug_bounds`, glyph shaping,
+    // `row_click`, `simulate_mouse_down`/`simulate_mouse_up`) but with the
+    // caret parked away from the target constructs, so their `**`/`*`/`` ` ``
+    // markers are hidden exactly as the OCR'd screenshot would see them.
+    //
+    // Finding from running this probe: at the *opening* edge of a hidden run
+    // (nothing precedes it at that visual column, e.g. the start of `**bold`
+    // or the `` ` `` before `code`) the landing byte offset matches a
+    // canonical offset derived purely by searching the source text — never
+    // through `source_map`/`source_offset_for_visual_position`. At the
+    // *closing* edge of a hidden run that is followed by more visible text
+    // on the same row (e.g. `combo**` before ` boundary`, or `span\`` before
+    // ` crosses`), the click instead lands `len(marker)` bytes past that
+    // naive offset, landing after the hidden run rather than before it. Both
+    // edges resolve to `SourceMap::visual_to_source`'s `Bias::After`
+    // (crates/presentation/src/lib.rs): when a zero-width `HiddenMarkup`
+    // segment ties two `Visible` segments at the same visual column, it
+    // always keeps the *later* (`.last()`) visible candidate — which is the
+    // segment after the hidden run either way, so a hidden run followed by
+    // more visible content resolves past it. This is reproducible, not OCR
+    // noise, so it independently confirms — without ruling on whether it is
+    // the intended behavior — the `boundary_ambiguous_near_canonical` cases
+    // `confirm_boundary_edit_reproducibility` already leaves as procedure
+    // blocked for #101 to root-cause.
+    #[gpui::test]
+    fn boundary_click_lands_on_source_offset_independent_of_ocr(cx: &mut gpui::TestAppContext) {
+        let text = "x\n\n**bold *italic* combo** boundary line.\n\nthis inline `code\nspan` crosses a line.\n";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        let bold_source_line = "**bold *italic* combo** boundary line.";
+        let bold_line_start = text.find(bold_source_line).unwrap();
+        let bold_open_expected = SourceOffset(bold_line_start + 2);
+        // Naive offset would be right after "combo" (before "**"); the click
+        // actually lands "**".len() further, right after the closing marker.
+        let bold_close_expected = SourceOffset(
+            bold_line_start + bold_source_line.find("combo**").unwrap() + "combo**".len(),
+        );
+
+        let code_open_source_line = "this inline `code";
+        let code_open_line_start = text.find(code_open_source_line).unwrap();
+        let code_open_expected =
+            SourceOffset(code_open_line_start + code_open_source_line.find('`').unwrap() + 1);
+
+        let code_close_source_line = "span` crosses a line.";
+        let code_close_line_start = text.find(code_close_source_line).unwrap();
+        // Naive offset would be right after "span" (before the closing `);
+        // the click actually lands one byte further, right after it.
+        let code_close_expected = SourceOffset(
+            code_close_line_start + code_close_source_line.find("span`").unwrap() + "span`".len(),
+        );
+
+        // Clicking a construct discloses its markers on every following
+        // frame (the same "caret inside reveals `**`" behavior the disclosure
+        // tests at line 4568+ cover), so each case below re-parks the caret
+        // on the neutral first line and re-reads the row's hidden-markup
+        // visual text immediately before computing where to click — mirroring
+        // `_move_to_neutral` before every capture in the Python validator.
+        for (selector, line, row_index, needle, edge_offset, expected) in [
+            ("row-2-0", 2, 0, "bold", 0usize, bold_open_expected),
+            ("row-2-0", 2, 0, "combo", "combo".len(), bold_close_expected),
+            // "this inline `code" / "span` crosses a line." are one soft-wrapped
+            // paragraph block, so the second source line is the block's row 1,
+            // not its own row 0.
+            ("row-4-0", 4, 0, "code", 0, code_open_expected),
+            ("row-5-1", 5, 1, "span", "span".len(), code_close_expected),
+        ] {
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(0)))
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let visual = row_visual_text(&view, cx, line);
+            let visual_offset = visual.find(needle).unwrap() + edge_offset;
+
+            let (point, _row_click_predicted) =
+                row_click(&view, cx, selector, line, row_index, visual_offset);
+            cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().selection(),
+                    Selection::caret(expected),
+                    "click on {selector} at visual offset {visual_offset} must reproducibly \
+                     land on the same source offset every run, independent of OCR"
+                );
+            });
+        }
+    }
 }
