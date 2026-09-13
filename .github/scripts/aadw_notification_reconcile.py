@@ -264,6 +264,26 @@ def review_source(statuses):
     return "GitHub Copilot fallback" if rows else None
 
 
+def review_source_for_generation(statuses, generation):
+    """Return fallback provenance only when it belongs to this review generation."""
+    latest = generation.get("latest") or {}
+    target_url = latest.get("target_url") or ""
+    latest_id = latest.get("id")
+    if not target_url or not isinstance(latest_id, int):
+        return None
+    for row in statuses:
+        if (
+            row.get("context") == "hane/review-source"
+            and row.get("state") == "success"
+            and (row.get("description") or "").startswith("Review source: Copilot fallback for ")
+            and row.get("target_url") == target_url
+            and isinstance(row.get("id"), int)
+            and row["id"] <= latest_id
+        ):
+            return "GitHub Copilot fallback"
+    return None
+
+
 def active_fallback_run(call, repository, pr_number, sha):
     found = []
     for comment in pages(call, f"repos/{repository}/issues/{pr_number}/comments"):
@@ -336,7 +356,6 @@ def reconcile_pr(call, repository, pr, cutoff):
     number = int(pr["number"])
     sha = pr["head"]["sha"]
     statuses = pages(call, f"repos/{repository}/commits/{sha}/statuses")
-    source = review_source(statuses)
     attempt_cache = {}
     writes = 0
     for context, process in CONTEXTS.items():
@@ -346,9 +365,10 @@ def reconcile_pr(call, repository, pr, cutoff):
         for generation in build_generations(rows):
             if not recent(generation, cutoff):
                 continue
+            source = review_source_for_generation(statuses, generation) if process == "codex-review" else None
             action = notify_generation(
                 call, repository, number, sha, context, generation,
-                source=source if process == "codex-review" else None,
+                source=source,
                 attempt_cache=attempt_cache,
             )
             writes += action != "noop"
