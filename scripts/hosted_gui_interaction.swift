@@ -346,7 +346,7 @@ func moveDocStart(_ pid: pid_t) {
 
 func moveCaret(_ pid: pid_t, _ direction: String, _ count: Int) {
     let codes = ["left": 123, "right": 124, "down": 125, "up": 126]
-    guard let code = codes[direction] else { fail("direction must be left, right, down, or up") }
+    guard let code = codes[direction] else { fail("direction must be left, right, up, or down") }
     guard count > 0 else { fail("move-caret count must be positive") }
     runAppleScript("""
     tell application "System Events"
