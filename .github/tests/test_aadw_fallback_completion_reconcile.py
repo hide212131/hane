@@ -10,6 +10,7 @@ REPO = 'hide212131/hane'
 SHA = 'a' * 40
 COMMENT_STARTED_AT = '2026-09-12T10:00:00Z'
 RUN_STARTED_AT = '2026-09-12T09:58:00Z'
+RUN_FINISHED_AT = '2026-09-12T10:05:00Z'
 
 
 def pr(state='open'):
@@ -34,10 +35,12 @@ class Fake:
             return pr(self.state)
         if clean == f'repos/{REPO}/commits/{SHA}/statuses':
             return list(self.statuses)
-        if clean == f'repos/{REPO}/actions/runs/222':
-            return {'run_attempt': 1}
         if clean == f'repos/{REPO}/actions/runs/222/attempts/1':
-            return {'run_attempt': 1, 'run_started_at': RUN_STARTED_AT}
+            return {
+                'run_attempt': 1,
+                'run_started_at': RUN_STARTED_AT,
+                'updated_at': RUN_FINISHED_AT,
+            }
         if clean == f'repos/{REPO}/issues/comments':
             return list(self.comments)
         if clean == f'repos/{REPO}/issues/42/comments':
@@ -109,6 +112,13 @@ class Tests(unittest.TestCase):
         fake = Fake([source_status(7, '2026-09-12T09:57:00Z')])
         fake.start()
         self.assertEqual(subject.reconcile(fake.call, REPO, event('success')), 1)
+        self.assertIn('異常終了', fake.comments[0]['body'])
+        self.assertNotIn('正常終了', fake.comments[0]['body'])
+
+    def test_later_fallback_success_after_this_attempt_finished_is_not_reused(self):
+        fake = Fake([source_status(7, '2026-09-12T10:06:00Z')])
+        fake.start()
+        self.assertEqual(subject.reconcile(fake.call, REPO, event('failure')), 1)
         self.assertIn('異常終了', fake.comments[0]['body'])
         self.assertNotIn('正常終了', fake.comments[0]['body'])
 
