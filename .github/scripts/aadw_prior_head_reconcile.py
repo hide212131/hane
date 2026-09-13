@@ -30,6 +30,7 @@ _MARKER = re.compile(
     r'sha=([0-9a-f]{40}) run=([1-9][0-9]*) attempt=([1-9][0-9]*) -->'
 )
 PROCESS_CONTEXT = {process: context for context, process in lifecycle.CONTEXTS.items()}
+RECOVERABLE_PROCESSES = set(PROCESS_CONTEXT) | {'codex-review-fallback'}
 
 
 def prior_starts(call, repository, pr, cutoff):
@@ -46,7 +47,7 @@ def prior_starts(call, repository, pr, cutoff):
         if not match:
             continue
         process, marker_number, sha, run_id, attempt = match.groups()
-        if marker_number != str(number) or sha == current_sha or process not in PROCESS_CONTEXT:
+        if marker_number != str(number) or sha == current_sha or process not in RECOVERABLE_PROCESSES:
             continue
         created = lifecycle.parse_time(comment.get('created_at'))
         updated = lifecycle.parse_time(comment.get('updated_at'))
@@ -111,7 +112,7 @@ def reconcile_pr(call, repository, pr, cutoff):
 
     # A trusted start comment may refer to a SHA no longer present in the
     # current PR commit list (for example after history rewriting). Preserve
-    # those explicit correlations as well.
+    # those explicit correlations as well, including Copilot fallback starts.
     for _process, sha, _run_id, _attempt, _comment in prior_starts(call, repository, pr, cutoff):
         candidates.add(sha)
 
