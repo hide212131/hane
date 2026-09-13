@@ -17,6 +17,7 @@ import aadw_notify
 WORKFLOW_CONTEXT = {
     "Codex review gate": "hane/codex-review",
     "Copilot pre-GUI routing": "hane/copilot-routing",
+    "Copilot routing reconciliation": "hane/copilot-routing",
     "Claude automatic fix worker": "hane/claude-fix",
     "GUI requirement classification": "hane/gui-requirement",
     "GUI validation": "hane/gui-validation",
