@@ -72,11 +72,11 @@ def build_generations(statuses):
 
     A status URL often identifies the Actions run but omits its rerun attempt.
     Do not derive that attempt from the number of observed status generations:
-    an earlier attempt may have failed before writing any status.  Such
+    an earlier attempt may have failed before writing any status. Such
     generations deliberately keep ``attempt=None`` until notification time,
     when the Actions attempt history is correlated by timestamp.
 
-    A terminal status closes its generation.  Later status rows without an
+    A terminal status closes its generation. Later status rows without an
     Actions URL must never be attached to an already-finished execution.
     """
     generations = []
@@ -135,8 +135,8 @@ def codex_lifecycle_rows(statuses):
 
     The fallback workflow writes a successful ``hane/review-source`` status and
     then a compatible ``hane/codex-review`` clean/findings status with the same
-    Copilot review URL.  That shared target URL is durable provenance for the
-    fallback result.  Use it instead of temporal adjacency so a late real Codex
+    Copilot review URL. That shared target URL is durable provenance for the
+    fallback result. Use it instead of temporal adjacency so a late real Codex
     result cannot be discarded merely because it arrived between those writes.
     """
     fallback_targets = {}
@@ -188,6 +188,19 @@ def _attempt_starts(call, repository, run_id, cache):
         starts.append((attempt, started))
     cache[run_id] = starts
     return starts
+
+
+def attempt_started_at(call, repository, run_id, attempt, cache=None):
+    run_id = str(run_id)
+    attempt = str(attempt)
+    if not re.fullmatch(r"[1-9][0-9]*", run_id) or not re.fullmatch(r"[1-9][0-9]*", attempt):
+        raise RuntimeError("Actions run/attemptの相関値が不正です。")
+    starts = _attempt_starts(call, repository, run_id, cache if cache is not None else {})
+    wanted = int(attempt)
+    for actual, started in starts:
+        if actual == wanted:
+            return started
+    raise RuntimeError(f"Actions run {run_id} attempt {attempt} の開始時刻を取得できませんでした。")
 
 
 def resolve_attempt(call, repository, generation, cache=None):
@@ -291,15 +304,13 @@ def active_fallback_run(call, repository, pr_number, sha):
             continue
         body = comment.get("body") or ""
         match = _FALLBACK_MARKER.search(body)
-        created_at = parse_time(comment.get("created_at"))
         if (
             match
             and match.group(1) == str(pr_number)
             and match.group(2) == sha
             and "— 処理開始" in body
-            and created_at is not None
         ):
-            found.append((comment.get("id", 0), match.group(3), match.group(4), created_at))
+            found.append((comment.get("id", 0), match.group(3), match.group(4)))
     return max(found)[1:] if found else None
 
 
@@ -307,7 +318,8 @@ def reconcile_fallback(call, repository, pr_number, sha, statuses, cutoff):
     correlation = active_fallback_run(call, repository, pr_number, sha)
     if not correlation:
         return "noop"
-    run_id, attempt, started_at = correlation
+    run_id, attempt = correlation
+    started_at = attempt_started_at(call, repository, run_id, attempt)
     rows = [
         row for row in statuses
         if row.get("context") == "hane/review-source"
