@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 
 POLICY = 'v1'
-PROCEDURE = 'hosted-gui-interaction/6'
+PROCEDURE = 'hosted-gui-interaction/7'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')

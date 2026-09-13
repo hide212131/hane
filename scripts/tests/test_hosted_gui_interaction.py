@@ -415,6 +415,155 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
         self.assertNotIn('click_evidence', detail)
 
 
+class RunBoundaryStepReproducibilityConfirmationTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): a `blocked` near-canonical/far-miss
+    landing must not be the final word if an independent second OCR/click
+    attempt reproduces the exact same wrong offset. run_boundary_step is the
+    orchestration layer with access to a fresh screenshot, so the retry lives
+    there rather than inside the single-attempt boundary_edit_check."""
+
+    OCR_EVIDENCE = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'start',
+    })
+
+    def _run(self, directory, type_save_contents):
+        """type_save_contents supplies the fixture bytes written by each
+        successive type-save call, in order (attempt 1, then attempt 2 if a
+        confirmation retry happens)."""
+        fixture_path = Path(directory) / 'fixture.md'
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        fixture_path.write_text(baseline, encoding='utf-8')
+        calls = []
+        type_save_calls = {'count': 0}
+
+        def fake_run_helper(swift_helper, args, timeout):
+            calls.append(args[0])
+            if args[0] == 'click-text':
+                return True, self.OCR_EVIDENCE, ''
+            if args[0] == 'type-save':
+                content = type_save_contents[type_save_calls['count']]
+                type_save_calls['count'] += 1
+                fixture_path.write_text(content, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'undo-save':
+                fixture_path.write_text(baseline, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'force-save':
+                return True, '', ''
+            if args[0] == 'move-doc-start':
+                return True, '', ''
+            raise AssertionError(f'unexpected helper call: {args}')
+
+        def fake_capture_named(module, env, config, window_id, run_dir, label):
+            return {'name': f'capture_{label}', 'result': 'pass', 'reason': None}
+
+        config = SimpleNamespace(fixture_path=fixture_path)
+        process_holder = {'process': SimpleNamespace(pid=1234)}
+        checks = [(
+            interaction.BOLD_ITALIC_OCR_RE, 'end',
+            interaction.BOLD_ITALIC_CLOSE_RE, 'start',
+        )]
+        with patch.object(interaction, 'run_helper', side_effect=fake_run_helper), \
+             patch.object(interaction, 'capture_named', side_effect=fake_capture_named):
+            steps = interaction.run_boundary_step(
+                None, {}, config, None, process_holder, 'window-1', Path(directory),
+                'boundary_click_edit_bold_italic', checks, 1.0, 0.0,
+            )
+        return steps, calls, fixture_path, baseline
+
+    def test_reproduced_mismatch_across_two_independent_attempts_escalates_to_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mismatch = interaction.INLINE_FIXTURE_ORIGINAL.replace(
+                'combo** boundary', 'combo** Zboundary', 1)
+            steps, calls, _fixture_path, _baseline = self._run(directory, [mismatch, mismatch])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'fail')
+        self.assertIn('独立した2回', final_step['reason'])
+        confirm_check = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_0_confirm_check')
+        self.assertEqual(confirm_check['result'], 'blocked')
+        self.assertEqual(confirm_check['landing_classification'], 'boundary_ambiguous_near_canonical')
+        restore_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_0_confirm_restore')
+        self.assertEqual(restore_step['result'], 'pass')
+        self.assertEqual(calls.count('click-text'), 2)
+        self.assertEqual(calls.count('type-save'), 2)
+
+    def test_retry_landing_at_canonical_stays_blocked_as_non_reproducible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            canonical = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            steps, _calls, _fixture_path, _baseline = self._run(directory, [mismatch, canonical])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('再現しなかった', final_step['reason'])
+
+    def test_retry_landing_at_a_different_offset_stays_blocked_as_inconclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            different_mismatch = baseline.replace('boundary line', 'boundaryZ line', 1)
+            steps, _calls, _fixture_path, _baseline = self._run(
+                directory, [mismatch, different_mismatch])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('別の非 canonical', final_step['reason'])
+
+    def test_confirmation_is_skipped_when_baseline_restore_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'click-text':
+                    return True, self.OCR_EVIDENCE, ''
+                if args[0] == 'type-save':
+                    fixture_path.write_text(mismatch, encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'force-save':
+                    return True, '', ''
+                if args[0] == 'undo-save':
+                    return False, '', 'System Events を利用できない'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            def fake_capture_named(module, env, config, window_id, run_dir, label):
+                return {'name': f'capture_{label}', 'result': 'pass', 'reason': None}
+
+            config = SimpleNamespace(fixture_path=fixture_path)
+            process_holder = {'process': SimpleNamespace(pid=1234)}
+            checks = [(
+                interaction.BOLD_ITALIC_OCR_RE, 'end',
+                interaction.BOLD_ITALIC_CLOSE_RE, 'start',
+            )]
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper), \
+                 patch.object(interaction, 'capture_named', side_effect=fake_capture_named):
+                steps = interaction.run_boundary_step(
+                    None, {}, config, None, process_holder, 'window-1', Path(directory),
+                    'boundary_click_edit_bold_italic', checks, 1.0, 0.0,
+                )
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('baseline 復元に失敗した', final_step['reason'])
+        self.assertNotIn('boundary_click_edit_bold_italic_0_confirm_check',
+                          {s['name'] for s in steps})
+
+    def test_non_ambiguous_blocked_classification_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            steps, calls, _fixture_path, _baseline = self._run(directory, [baseline])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        check_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_check_0')
+        self.assertEqual(check_step['landing_classification'], 'not_inserted')
+        self.assertEqual(calls.count('type-save'), 1)
+
+
 class RestoreScenarioBaselineTests(unittest.TestCase):
     """Issue #136: fail/blocked mutating subtests must not leak state forward."""
 

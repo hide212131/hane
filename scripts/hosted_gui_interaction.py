@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/6"
+PROCEDURE_VERSION = "hosted-gui-interaction/7"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
@@ -105,6 +105,18 @@ JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 # 区別できないものとして procedure の blocked として扱う(Issue #137)。値は対象境界の
 # marker(最大2文字の `**`)+ 直後の空白1文字を含む近傍かどうかを分類記録するためだけに使う。
 BOUNDARY_LANDING_FAR_MISS_CHARS = 4
+
+# 上記の分類で procedure blocked となった境界クリックのうち、この集合に該当する
+# ものは baseline へ復元したうえで独立に screenshot・OCR・クリックをやり直し、
+# 同じ非 canonical offset が再現するかどうかを確認する(Issue #137 review: OCR
+# 座標誤差と製品 source mapping 不具合を区別してほしいという指摘への対応)。
+# click_point は毎回 OCR bounding box から再計算されるため、単発の座標誤差が
+# 2 回連続で寸分違わず同じ offset を再現する可能性は低く、再現した場合は
+# helper/OCR miss では説明しづらい決定的な挙動として fail に昇格する。
+# 一方、再試行で canonical に一致した、または別の offset になった場合は、
+# 依然として独立した visual boundary の証拠がないため procedure blocked のまま
+# #101 側での切り分けに委ねる。
+AMBIGUOUS_LANDING_CLASSIFICATIONS = frozenset({"far_miss", "boundary_ambiguous_near_canonical"})
 
 # inline_syntax_boundary の各 mutating subtest は、成功経路であっても最大で数回の
 # undo-save までしか積まない(delimiter_toggle の 3 段編集が最長)。fail/blocked 後の
@@ -722,6 +734,73 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
     return "pass", None, detail
 
 
+def confirm_boundary_edit_reproducibility(
+    module, env, config, swift_helper, pid, window_id, run_dir, label,
+    fixture_path, baseline, ocr_pattern, ocr_edge, source_pattern, source_edge, insertion,
+    helper_timeout, poll_timeout, status, reason, detail,
+) -> tuple[str, str, dict, list[dict]]:
+    """far_miss / boundary_ambiguous_near_canonical で procedure blocked とした
+    境界クリックについて、baseline へ復元したうえで独立に screenshot・OCR・クリックを
+    やり直し、同じ非 canonical offset が再現するかどうかを確認する(Issue #137
+    review: click_point が OCR bounding box の再計算値に過ぎず、正しい visual
+    boundary をクリックした場合の製品 source mapping 不具合と OCR/クリック誤差を
+    区別できないという指摘への対応)。二回とも独立した OCR 認識・クリック座標で
+    寸分違わず同じ offset に着地した場合、単発の座標誤差では説明しづらい再現性
+    として fail に昇格する。再試行で canonical に一致した、または別の offset に
+    なった場合は、依然として独立した visual boundary の証拠がないため procedure
+    blocked のまま #101 側での切り分けに委ねる。"""
+    steps: list[dict] = []
+    restore_step = restore_scenario_baseline(
+        swift_helper, pid, fixture_path, baseline, helper_timeout, poll_timeout,
+        f"{label}_confirm_restore",
+    )
+    steps.append(restore_step)
+    if restore_step["result"] != "pass":
+        return status, (
+            f"{reason} 再現確認のための baseline 復元に失敗したため、独立した再試行は"
+            "行わず procedure blocked のままとする"
+        ), detail, steps
+    confirm_label = f"{label}_confirm"
+    capture = capture_named(module, env, config, window_id, run_dir, confirm_label)
+    steps.append(capture)
+    if capture["result"] != "pass":
+        return status, (
+            f"{reason} 再現確認用の撮影に失敗したため、独立した再試行は行わず"
+            "procedure blocked のままとする"
+        ), detail, steps
+    screenshot = run_dir / f"{confirm_label}.png"
+    status2, reason2, detail2 = boundary_edit_check(
+        swift_helper, screenshot, pid, fixture_path, baseline,
+        ocr_pattern, ocr_edge, source_pattern, source_edge, insertion,
+        helper_timeout, poll_timeout,
+    )
+    steps.append(make_step(f"{confirm_label}_check", status2, reason=reason2, **detail2))
+    landing1 = detail.get("actual_landing_source_offset")
+    landing2 = detail2.get("actual_landing_source_offset")
+    if status2 == "pass":
+        return status, (
+            f"{reason} 独立した再試行では canonical position に着地して再現しなかった"
+            "ため、procedure blocked のままとする"
+        ), detail, steps
+    if landing1 is not None and landing2 is not None and landing1 == landing2:
+        merged_detail = {
+            **detail,
+            "landing_classification": "reproducible_mismatch",
+            "confirmation_landing_source_offset": landing2,
+        }
+        merged_reason = (
+            f"独立した2回の OCR/クリック試行がいずれも同じ source offset {landing1} へ着地し、"
+            f"期待 canonical position {detail.get('expected_canonical_source_offset')} と一致しない。"
+            "OCR bounding box の再計算誤差では説明しづらい再現性があるため、製品の source "
+            "mapping 不具合の疑いが強いと判定して fail に昇格する"
+        )
+        return "fail", merged_reason, merged_detail, steps
+    return status, (
+        f"{reason} 独立した再試行でも別の非 canonical な着地点となり再現しなかったため、"
+        "procedure blocked のままとする"
+    ), detail, steps
+
+
 def run_boundary_step(module, env, config, swift_helper, process_holder, window_id, run_dir,
                       name, checks, helper_timeout, poll_timeout) -> list[dict]:
     pid = current_pid(process_holder)
@@ -741,7 +820,17 @@ def run_boundary_step(module, env, config, swift_helper, process_holder, window_
             ocr_pattern, ocr_edge, source_pattern, source_edge, BOUNDARY_MARK,
             helper_timeout, poll_timeout,
         )
+        if status == "blocked" and detail.get("landing_classification") in AMBIGUOUS_LANDING_CLASSIFICATIONS:
+            status, reason, detail, confirm_steps = confirm_boundary_edit_reproducibility(
+                module, env, config, swift_helper, pid, window_id, run_dir, label,
+                config.fixture_path, INLINE_FIXTURE_ORIGINAL,
+                ocr_pattern, ocr_edge, source_pattern, source_edge, BOUNDARY_MARK,
+                helper_timeout, poll_timeout, status, reason, detail,
+            )
+        else:
+            confirm_steps = []
         result.append(make_step(f"{name}_check_{index}", status, reason=reason, **detail))
+        result.extend(confirm_steps)
         if status != "pass":
             result.append(make_step(name, status, reason=reason))
             return result
