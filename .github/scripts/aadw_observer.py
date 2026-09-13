@@ -301,12 +301,14 @@ def handle_repository_dispatch(call, repository, payload):
     return True
 
 
-def fallback_run(call, repository, title, created_at):
+def fallback_run(call, repository, number, created_at):
+    expected_title = f'Codex fallback PR #{number}'
     for retry in range(10):
         data = call(f'repos/{repository}/actions/runs?event=issue_comment&per_page=100')
         rows = data.get('workflow_runs', []) if isinstance(data, dict) else []
         matches = [r for r in rows if r.get('name') == 'Codex limit Copilot review fallback'
-                   and r.get('display_title') == title and r.get('actor', {}).get('login') == 'chatgpt-codex-connector[bot]'
+                   and r.get('display_title') == expected_title
+                   and r.get('actor', {}).get('login') == 'chatgpt-codex-connector[bot]'
                    and (not created_at or (r.get('created_at') or '') >= created_at)]
         if matches:
             selected = min(matches, key=lambda r: r.get('created_at') or '')
@@ -336,7 +338,7 @@ def handle_issue_comment(call, repository, payload, observer_run, observer_attem
         aadw_notify.notify(call, state='failure', process='codex-review', kind='pr', number=pr['number'], sha=sha,
                            repository=repository, run_id=run_id, attempt=attempt,
                            detail='Codexのコードレビュー利用上限に達したため、通常レビューを完了できませんでした。')
-    run_id, attempt = fallback_run(call, repository, issue.get('title') or '', comment.get('created_at') or '')
+    run_id, attempt = fallback_run(call, repository, pr['number'], comment.get('created_at') or '')
     aadw_notify.notify(call, state='start', process='codex-review-fallback', kind='pr', number=pr['number'], sha=sha,
                        repository=repository, run_id=run_id, attempt=attempt,
                        detail='Codexの利用上限を検出し、Copilot代替レビューを開始しました。')
