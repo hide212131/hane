@@ -417,10 +417,13 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
 
 class RunBoundaryStepReproducibilityConfirmationTests(unittest.TestCase):
     """Issue #137 review (Codex, PR #139): a `blocked` near-canonical/far-miss
-    landing must not be the final word if an independent second OCR/click
-    attempt reproduces the exact same wrong offset. run_boundary_step is the
-    orchestration layer with access to a fresh screenshot, so the retry lives
-    there rather than inside the single-attempt boundary_edit_check."""
+    landing gets a second OCR/click attempt recorded as extra evidence.
+    run_boundary_step is the orchestration layer with access to a fresh
+    screenshot, so the retry lives there rather than inside the single-attempt
+    boundary_edit_check. A later review (Codex, PR #139) clarified that the
+    retry reuses the same OCR->click helper path, so even a reproduced offset
+    is not independent coordinate evidence and must stay `blocked`, never
+    escalate to `fail`."""
 
     OCR_EVIDENCE = json.dumps({
         'matched_text': 'combo',
@@ -475,14 +478,19 @@ class RunBoundaryStepReproducibilityConfirmationTests(unittest.TestCase):
             )
         return steps, calls, fixture_path, baseline
 
-    def test_reproduced_mismatch_across_two_independent_attempts_escalates_to_fail(self):
+    def test_reproduced_mismatch_across_two_attempts_stays_blocked_not_fail(self):
+        """PR #139 review (Codex): both attempts reuse the same OCR->click helper
+        path, so a reproduced offset only proves the OCR/click error is systematic,
+        not that the product's source mapping is wrong. Without an independent
+        coordinate-specific verification, this must stay `blocked`, never `fail`."""
         with tempfile.TemporaryDirectory() as directory:
             mismatch = interaction.INLINE_FIXTURE_ORIGINAL.replace(
                 'combo** boundary', 'combo** Zboundary', 1)
             steps, calls, _fixture_path, _baseline = self._run(directory, [mismatch, mismatch])
         final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
-        self.assertEqual(final_step['result'], 'fail')
-        self.assertIn('独立した2回', final_step['reason'])
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('reproducible_mismatch', final_step['reason'])
+        self.assertNotEqual(final_step['result'], 'fail')
         confirm_check = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_0_confirm_check')
         self.assertEqual(confirm_check['result'], 'blocked')
         self.assertEqual(confirm_check['landing_classification'], 'boundary_ambiguous_near_canonical')

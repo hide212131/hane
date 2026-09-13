@@ -107,15 +107,14 @@ JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
 BOUNDARY_LANDING_FAR_MISS_CHARS = 4
 
 # 上記の分類で procedure blocked となった境界クリックのうち、この集合に該当する
-# ものは baseline へ復元したうえで独立に screenshot・OCR・クリックをやり直し、
-# 同じ非 canonical offset が再現するかどうかを確認する(Issue #137 review: OCR
-# 座標誤差と製品 source mapping 不具合を区別してほしいという指摘への対応)。
-# click_point は毎回 OCR bounding box から再計算されるため、単発の座標誤差が
-# 2 回連続で寸分違わず同じ offset を再現する可能性は低く、再現した場合は
-# helper/OCR miss では説明しづらい決定的な挙動として fail に昇格する。
-# 一方、再試行で canonical に一致した、または別の offset になった場合は、
-# 依然として独立した visual boundary の証拠がないため procedure blocked のまま
-# #101 側での切り分けに委ねる。
+# ものは baseline へ復元したうえでもう一度 screenshot・OCR・クリックをやり直し、
+# 同じ非 canonical offset が再現するかどうかを追加の証拠として記録する(Issue #137
+# review: OCR 座標誤差と製品 source mapping 不具合を区別してほしいという指摘への
+# 対応)。ただし再試行も同じ OCR bounding box→座標算出の helper 経路を使うため、
+# systematic な OCR/クリック誤差があれば製品が正しくても毎回同じ offset へ再現
+# しうる。したがって再現しても実 EditorView への coordinate-specific event など
+# OCR と独立した座標検証にはならず、fail へは昇格しない(PR #139 review)。再現
+# の有無にかかわらず procedure blocked のまま #101 側での切り分けに委ねる。
 AMBIGUOUS_LANDING_CLASSIFICATIONS = frozenset({"far_miss", "boundary_ambiguous_near_canonical"})
 
 # inline_syntax_boundary の各 mutating subtest は、成功経路であっても最大で数回の
@@ -740,15 +739,17 @@ def confirm_boundary_edit_reproducibility(
     helper_timeout, poll_timeout, status, reason, detail,
 ) -> tuple[str, str, dict, list[dict]]:
     """far_miss / boundary_ambiguous_near_canonical で procedure blocked とした
-    境界クリックについて、baseline へ復元したうえで独立に screenshot・OCR・クリックを
+    境界クリックについて、baseline へ復元したうえでもう一度 screenshot・OCR・クリックを
     やり直し、同じ非 canonical offset が再現するかどうかを確認する(Issue #137
     review: click_point が OCR bounding box の再計算値に過ぎず、正しい visual
     boundary をクリックした場合の製品 source mapping 不具合と OCR/クリック誤差を
-    区別できないという指摘への対応)。二回とも独立した OCR 認識・クリック座標で
-    寸分違わず同じ offset に着地した場合、単発の座標誤差では説明しづらい再現性
-    として fail に昇格する。再試行で canonical に一致した、または別の offset に
-    なった場合は、依然として独立した visual boundary の証拠がないため procedure
-    blocked のまま #101 側での切り分けに委ねる。"""
+    区別できないという指摘への対応)。ただし再試行も同じ OCR→座標算出の helper 経路を
+    使うため、systematic な OCR bounding box のずれや helper 自身のクリック誤差が
+    あれば、製品が正しくても毎回同じ間違った offset へ再現しうる(PR #139 review:
+    fail への自動昇格は禁止)。したがって二回の着地点が一致しても、それは実
+    EditorView への coordinate-specific event など OCR と独立した座標検証には
+    ならないため、`reproducible_mismatch` として証拠に残すだけで procedure blocked
+    のまま #101 側での root-cause 切り分けに委ね、fail へは昇格しない。"""
     steps: list[dict] = []
     restore_step = restore_scenario_baseline(
         swift_helper, pid, fixture_path, baseline, helper_timeout, poll_timeout,
@@ -779,7 +780,7 @@ def confirm_boundary_edit_reproducibility(
     landing2 = detail2.get("actual_landing_source_offset")
     if status2 == "pass":
         return status, (
-            f"{reason} 独立した再試行では canonical position に着地して再現しなかった"
+            f"{reason} 再試行では canonical position に着地して再現しなかった"
             "ため、procedure blocked のままとする"
         ), detail, steps
     if landing1 is not None and landing2 is not None and landing1 == landing2:
@@ -789,14 +790,17 @@ def confirm_boundary_edit_reproducibility(
             "confirmation_landing_source_offset": landing2,
         }
         merged_reason = (
-            f"独立した2回の OCR/クリック試行がいずれも同じ source offset {landing1} へ着地し、"
+            f"2回の OCR/クリック試行がいずれも同じ source offset {landing1} へ着地し、"
             f"期待 canonical position {detail.get('expected_canonical_source_offset')} と一致しない。"
-            "OCR bounding box の再計算誤差では説明しづらい再現性があるため、製品の source "
-            "mapping 不具合の疑いが強いと判定して fail に昇格する"
+            "ただし両試行とも同じ OCR bounding box→座標算出の helper 経路を使っており、"
+            "systematic な OCR/クリック誤差があれば製品が正しくても同じ間違った offset へ"
+            "再現しうるため、この再現性だけでは実 EditorView への coordinate-specific event"
+            "などの OCR と独立した座標証拠にならない。fail へは昇格せず、reproducible_mismatch"
+            "として記録したうえで procedure blocked のまま #101 側での root-cause 切り分けに委ねる"
         )
-        return "fail", merged_reason, merged_detail, steps
+        return status, merged_reason, merged_detail, steps
     return status, (
-        f"{reason} 独立した再試行でも別の非 canonical な着地点となり再現しなかったため、"
+        f"{reason} 再試行でも別の非 canonical な着地点となり再現しなかったため、"
         "procedure blocked のままとする"
     ), detail, steps
 
