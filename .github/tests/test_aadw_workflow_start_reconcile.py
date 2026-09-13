@@ -50,15 +50,18 @@ class Fake:
 
 
 class Tests(unittest.TestCase):
+    def pending(self, context, run='777', description='pending'):
+        return {
+            'id': 7,
+            'context': context,
+            'state': 'pending',
+            'description': description,
+            'target_url': f'https://github.com/hide212131/hane/actions/runs/{run}',
+        }
+
     def test_exact_workflow_attempt_creates_start(self):
         f = Fake()
-        f.statuses.append({
-            'id': 7,
-            'context': 'hane/codex-review',
-            'state': 'pending',
-            'description': 'Codex review pending for aaaaaaaaaaaa',
-            'target_url': 'https://github.com/hide212131/hane/actions/runs/777',
-        })
+        f.statuses.append(self.pending('hane/codex-review', description='Codex review pending for aaaaaaaaaaaa'))
         writes = start_reconcile.reconcile_start(
             f.call, REPO, 'Codex review gate', '777', '2', poll_attempts=1
         )
@@ -69,15 +72,38 @@ class Tests(unittest.TestCase):
         self.assertIn('run=777 attempt=2', body)
         self.assertIn('/actions/runs/777/attempts/2', body)
 
+    def test_routing_reconciliation_uses_same_routing_context_and_polls(self):
+        f = Fake()
+        calls = {'count': 0}
+
+        def call(endpoint, payload=None, method=None):
+            clean = endpoint.split('?', 1)[0]
+            if clean == f'repos/{REPO}/commits/{SHA}/statuses':
+                calls['count'] += 1
+                if calls['count'] < 2:
+                    return []
+                return [self.pending('hane/copilot-routing', description='Copilot routing pending for aaaaaaaaaaaa')]
+            return f.call(endpoint, payload, method)
+
+        writes = start_reconcile.reconcile_start(
+            call,
+            REPO,
+            'Copilot routing reconciliation',
+            '777',
+            '3',
+            poll_attempts=2,
+            poll_seconds=1,
+            sleeper=lambda _seconds: None,
+        )
+        self.assertEqual(writes, 1)
+        self.assertGreaterEqual(calls['count'], 2)
+        body = f.comments[0]['body']
+        self.assertIn('Copilot pre-GUI routing', body)
+        self.assertIn('run=777 attempt=3', body)
+
     def test_unrelated_pending_status_is_not_used(self):
         f = Fake()
-        f.statuses.append({
-            'id': 7,
-            'context': 'hane/codex-review',
-            'state': 'pending',
-            'description': 'Codex review pending for aaaaaaaaaaaa',
-            'target_url': 'https://github.com/hide212131/hane/actions/runs/778',
-        })
+        f.statuses.append(self.pending('hane/codex-review', run='778', description='Codex review pending for aaaaaaaaaaaa'))
         writes = start_reconcile.reconcile_start(
             f.call, REPO, 'Codex review gate', '777', '2', poll_attempts=1
         )
