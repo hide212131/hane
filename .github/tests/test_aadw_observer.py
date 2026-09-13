@@ -22,7 +22,7 @@ class Fake:
         self.statuses = {SHA: []}
         self.comments = {}
         self.all_comments = []
-        self.runs = {111: {'run_attempt': 2}}
+        self.runs = {111: {'run_attempt': 2}, 333: {'run_attempt': 1}}
         self.workflow_runs = []
         self.next_id = 1000
 
@@ -50,9 +50,10 @@ class Fake:
             self.next_id += 1; self.comments.setdefault(number, []).append(row); return row
         raise AssertionError(endpoint)
 
-    def status(self, id, context, state, description, url='https://github.com/hide212131/hane/actions/runs/111'):
+    def status(self, id, context, state, description, url='https://github.com/hide212131/hane/actions/runs/111',
+               created_at='2026-09-12T01:59:59Z'):
         row = {'id': id, 'sha': SHA, 'context': context, 'state': state,
-               'description': description, 'target_url': url}
+               'description': description, 'target_url': url, 'created_at': created_at}
         self.statuses[SHA].insert(0, row)
         return {**row, 'sender': {'login': 'github-actions[bot]'}}
 
@@ -131,6 +132,23 @@ class Tests(unittest.TestCase):
         self.assertTrue(any('Codexレビュー — 異常終了' in b for b in bodies))
         self.assertTrue(any('/actions/runs/222/attempts/1' in b and '処理開始' in b for b in bodies))
         self.assertFalse(any('/actions/runs/221/' in b for b in bodies))
+
+    def test_limit_comment_does_not_close_newer_codex_pending(self):
+        f = Fake()
+        f.status(1, 'hane/codex-review', 'pending', 'Codex review pending for aaaaaaaaaaaa',
+                 'https://github.com/hide212131/hane/actions/runs/111', '2026-09-12T01:59:59Z')
+        f.status(2, 'hane/codex-review', 'pending', 'Codex review pending for aaaaaaaaaaaa',
+                 'https://github.com/hide212131/hane/actions/runs/333', '2026-09-12T02:00:01Z')
+        f.workflow_runs = [{'id': 222, 'run_attempt': 1, 'name': 'Codex limit Copilot review fallback',
+            'display_title': 'Codex fallback PR #42', 'created_at': '2026-09-12T02:00:02Z',
+            'actor': {'login': 'chatgpt-codex-connector[bot]'}}]
+        payload = {'action': 'created', 'issue': {'number': 42, 'title': 'Example PR', 'pull_request': {'url': 'x'}},
+            'comment': {'user': {'login': 'chatgpt-codex-connector[bot]'}, 'created_at': '2026-09-12T02:00:00Z',
+                        'body': 'You have reached your Codex usage limits for code reviews.'}}
+        observer.handle_issue_comment(f.call, REPO, payload, '900', '1')
+        bodies = [c['body'] for c in f.comments[42]]
+        self.assertTrue(any('/actions/runs/111/attempts/2' in b and 'Codexレビュー — 異常終了' in b for b in bodies))
+        self.assertFalse(any('/actions/runs/333/' in b for b in bodies))
 
     def test_fallback_workflow_persists_pr_number_in_run_name(self):
         workflow = (Path(__file__).resolve().parents[1] / 'workflows' / 'codex-limit-copilot-fallback.yml').read_text()
