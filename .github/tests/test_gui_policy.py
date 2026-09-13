@@ -60,9 +60,12 @@ def _inline_evidence(steps):
         ),
     }
     click_edit_checks = {
-        'boundary_click_edit_bold_italic_check_0', 'boundary_click_edit_bold_italic_check_1',
-        'boundary_click_edit_code_span_check_0', 'boundary_click_edit_code_span_check_1',
-        'boundary_click_edit_quote_check_0', 'boundary_click_edit_list_check_0',
+        'boundary_click_edit_bold_italic_check_0': ('bold italic combo', 'start'),
+        'boundary_click_edit_bold_italic_check_1': ('bold italic combo', 'end'),
+        'boundary_click_edit_code_span_check_0': ('code', 'start'),
+        'boundary_click_edit_code_span_check_1': ('span', 'end'),
+        'boundary_click_edit_quote_check_0': ('bold', 'start'),
+        'boundary_click_edit_list_check_0': ('italic', 'start'),
     }
     for name, (screenshot, inserted) in boundary.items():
         by_name[name].update(
@@ -73,10 +76,19 @@ def _inline_evidence(steps):
         )
         if name in click_edit_checks:
             offset = inserted.index('Z')
+            matched_text, edge = click_edit_checks[name]
+            box = {'minX': 0.2, 'maxX': 0.6, 'minY': 0.3, 'maxY': 0.4}
+            window = {'x': 10.0, 'y': 20.0, 'width': 400.0, 'height': 300.0}
+            x_norm = box['minX'] if edge == 'start' else box['maxX']
+            y_norm_from_top = 1 - (box['minY'] + (box['maxY'] - box['minY']) / 2)
+            click_point = {
+                'x': window['x'] + x_norm * window['width'],
+                'y': window['y'] + y_norm_from_top * window['height'],
+            }
             by_name[name].update(
                 click_evidence={
-                    'matched_text': 'probe', 'bounding_box': [0, 0, 10, 10],
-                    'window_bounds': [0, 0, 100, 100], 'click_point': [1, 1], 'edge': 'start',
+                    'matched_text': matched_text, 'bounding_box': box,
+                    'window_bounds': window, 'click_point': click_point, 'edge': edge,
                 },
                 expected_canonical_source_offset=offset,
                 actual_landing_source_offset=offset,
@@ -282,6 +294,34 @@ class ReceiptTests(unittest.TestCase):
             step[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.validate(raw)
+
+    def test_click_evidence_field_shapes_and_geometry_are_fail_closed(self):
+        base = passing_result()
+        evidence = self.inline_step(base, 'boundary_click_edit_bold_italic_check_0')['click_evidence']
+        mutations = [
+            lambda e: {**e, 'bounding_box': None},
+            lambda e: {**e, 'window_bounds': 'nonsense'},
+            lambda e: {**e, 'click_point': False},
+            lambda e: {**e, 'matched_text': 'unrelated target text'},
+            lambda e: {**e, 'edge': 'end'},
+            lambda e: {**e, 'bounding_box': {**e['bounding_box'], 'minX': 1.5}},
+            lambda e: {**e, 'window_bounds': {**e['window_bounds'], 'width': 0}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'x': e['click_point']['x'] + 50}},
+        ]
+        for mutate in mutations:
+            raw = passing_result()
+            step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+            step['click_evidence'] = mutate(evidence)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_expected_canonical_offset_must_match_known_fixture_position(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        step['expected_canonical_source_offset'] = 0
+        step['actual_landing_source_offset'] = 0
+        with self.assertRaises(ValueError):
+            self.validate(raw)
 
     def test_boundary_click_landing_offset_mismatch_cannot_pass(self):
         raw = passing_result()

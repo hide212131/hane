@@ -10,6 +10,7 @@ PROCEDURE = 'hosted-gui-interaction/6'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
+BOUNDARY_MARK = 'Z'
 INLINE_FIXTURE_ORIGINAL = (
     '# hosted gui interaction inline syntax spike\n'
     '\n'
@@ -186,7 +187,14 @@ def _artifact_sha256(evidence_dir, relative):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _require_click_evidence(step):
+def _numeric(mapping, *fields):
+    for field in fields:
+        value = mapping.get(field) if isinstance(mapping, dict) else None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f'click evidence field not numeric: {field}')
+
+
+def _require_click_evidence(step, expected_text, expected_edge):
     evidence = step.get('click_evidence')
     if not isinstance(evidence, dict):
         raise ValueError('missing click-text OCR/click evidence')
@@ -196,18 +204,51 @@ def _require_click_evidence(step):
             raise ValueError(f'click evidence missing field: {field}')
     if not isinstance(evidence['matched_text'], str) or not evidence['matched_text']:
         raise ValueError('click evidence matched_text invalid')
+    if evidence['matched_text'] != expected_text:
+        raise ValueError('click evidence matched_text does not match expected boundary target')
     if evidence['edge'] not in ('start', 'end'):
         raise ValueError('click evidence edge invalid')
+    if evidence['edge'] != expected_edge:
+        raise ValueError('click evidence edge does not match expected boundary side')
+
+    box = evidence['bounding_box']
+    if not isinstance(box, dict):
+        raise ValueError('click evidence bounding_box invalid')
+    _numeric(box, 'minX', 'maxX', 'minY', 'maxY')
+    if not (0 <= box['minX'] <= box['maxX'] <= 1 and 0 <= box['minY'] <= box['maxY'] <= 1):
+        raise ValueError('click evidence bounding_box out of normalized range')
+
+    window = evidence['window_bounds']
+    if not isinstance(window, dict):
+        raise ValueError('click evidence window_bounds invalid')
+    _numeric(window, 'x', 'y', 'width', 'height')
+    if window['width'] <= 0 or window['height'] <= 0:
+        raise ValueError('click evidence window_bounds out of range')
+
+    point = evidence['click_point']
+    if not isinstance(point, dict):
+        raise ValueError('click evidence click_point invalid')
+    _numeric(point, 'x', 'y')
+
+    x_norm = box['minX'] if evidence['edge'] == 'start' else box['maxX']
+    expected_x = window['x'] + x_norm * window['width']
+    y_norm_from_top = 1 - (box['minY'] + (box['maxY'] - box['minY']) / 2)
+    expected_y = window['y'] + y_norm_from_top * window['height']
+    tolerance = 1e-6 * max(1.0, window['width'], window['height'])
+    if abs(point['x'] - expected_x) > tolerance or abs(point['y'] - expected_y) > tolerance:
+        raise ValueError('click evidence click_point does not match bounding_box/edge geometry')
 
 
-def _require_boundary_landing(step):
-    _require_click_evidence(step)
+def _require_boundary_landing(step, expected_text, expected_edge, expected_canonical_offset):
+    _require_click_evidence(step, expected_text, expected_edge)
     expected_offset = step.get('expected_canonical_source_offset')
     actual_offset = step.get('actual_landing_source_offset')
     if not isinstance(expected_offset, int) or isinstance(expected_offset, bool) or expected_offset < 0:
         raise ValueError('missing or invalid expected canonical source offset')
     if not isinstance(actual_offset, int) or isinstance(actual_offset, bool) or actual_offset < 0:
         raise ValueError('missing or invalid actual landing source offset')
+    if expected_offset != expected_canonical_offset:
+        raise ValueError('expected canonical source offset does not match known fixture position')
     if step.get('landing_classification') != 'at_canonical' or actual_offset != expected_offset:
         raise ValueError('boundary landing classification/offset evidence mismatch')
 
@@ -242,10 +283,16 @@ def _validate_inline_evidence(steps, evidence_dir):
         'boundary_click_edit_list_check_0': INLINE_FIXTURE_ORIGINAL.replace('item with *italic', 'item with *Zitalic', 1),
         'boundary_ime_input_check': INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
     }
+    # OCR がマッチとして返す文字列は lookaround の zero-width 部分を含まないため、
+    # ここでの期待値は hosted_gui_interaction.py の *_OCR_RE から lookaround を除いた
+    # 実際にキャプチャされるリテラル文字列にする。
     boundary_click_edit_checks = {
-        'boundary_click_edit_bold_italic_check_0', 'boundary_click_edit_bold_italic_check_1',
-        'boundary_click_edit_code_span_check_0', 'boundary_click_edit_code_span_check_1',
-        'boundary_click_edit_quote_check_0', 'boundary_click_edit_list_check_0',
+        'boundary_click_edit_bold_italic_check_0': ('bold italic combo', 'start'),
+        'boundary_click_edit_bold_italic_check_1': ('bold italic combo', 'end'),
+        'boundary_click_edit_code_span_check_0': ('code', 'start'),
+        'boundary_click_edit_code_span_check_1': ('span', 'end'),
+        'boundary_click_edit_quote_check_0': ('bold', 'start'),
+        'boundary_click_edit_list_check_0': ('italic', 'start'),
     }
     for name, image in boundary_images.items():
         step = by_name[name]
@@ -259,7 +306,9 @@ def _validate_inline_evidence(steps, evidence_dir):
                 or step['expected_after_undo'] != step['actual_after_undo']):
             raise ValueError('inline undo evidence mismatch')
         if name in boundary_click_edit_checks:
-            _require_boundary_landing(step)
+            expected_pattern, expected_edge = boundary_click_edit_checks[name]
+            expected_canonical_offset = boundary_expected[name].index(BOUNDARY_MARK)
+            _require_boundary_landing(step, expected_pattern, expected_edge, expected_canonical_offset)
 
     navigation = {
         'boundary_caret_navigation_check_0': (
