@@ -131,7 +131,7 @@ jobs:
             gh api --method POST "repos/${REPOSITORY}/statuses/${TARGET_SHA}" \
               -f state=error -f context='hane/claude-fix' \
               -f description="Claude fix blocked: workflow changes require owner for ${short_sha}" \
-              -f target_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}" >/dev/null
+              -f target_url="https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" >/dev/null
             echo '::warning::Claude automatic fix is disabled for Pull Requests that change workflow files.'
             exit 0
           fi
@@ -576,7 +576,7 @@ jobs:
 
           comment_body="Automatic Claude fix for \`${TARGET_SHA}\` pushed \`${new_sha}\`. Trusted CI, review, and GUI requirement classification follow-up were dispatched for the new head."
           if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            -f body="$comment_body" >/dev/null; then
+              -f body="$comment_body" >/dev/null; then
             echo '::warning::Failed to publish successful-fix notification.'
           fi
           echo 'published=true' >> "$GITHUB_OUTPUT"
@@ -626,7 +626,7 @@ jobs:
             -f target_url="$run_url" >/dev/null
           comment_body="Automatic Claude fix for \`${TARGET_SHA}\` includes \`.github/workflows/**\` changes. The complete binary-capable patch is saved as artifact \`${artifact_name}\` on ${run_url}. Apply it as the repository owner with \`git apply --binary\`."
           if ! gh api --method POST "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            -f body="$comment_body" >/dev/null; then
+              -f body="$comment_body" >/dev/null; then
             echo '::warning::Failed to publish workflow-fix handoff notification.'
           fi
 
