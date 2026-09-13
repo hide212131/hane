@@ -331,14 +331,18 @@ def handle_issue_comment(call, repository, payload, observer_run, observer_attem
         return False
     sha = pr.get('head', {}).get('sha') or ''
     rows = pages(call, f'repos/{repository}/commits/{sha}/statuses')
-    pending = max((r for r in rows if r.get('context') == 'hane/codex-review' and r.get('state') == 'pending'),
+    limit_created = comment.get('created_at') or ''
+    pending = max((r for r in rows
+                   if r.get('context') == 'hane/codex-review' and r.get('state') == 'pending'
+                   and (not limit_created or (isinstance(r.get('created_at'), str)
+                                               and r['created_at'] <= limit_created))),
                   key=lambda r: r.get('id', -1), default=None)
     if pending:
         run_id, attempt = run_from_url(call, repository, pending.get('target_url') or '', observer_run, observer_attempt)
         aadw_notify.notify(call, state='failure', process='codex-review', kind='pr', number=pr['number'], sha=sha,
                            repository=repository, run_id=run_id, attempt=attempt,
                            detail='Codexのコードレビュー利用上限に達したため、通常レビューを完了できませんでした。')
-    run_id, attempt = fallback_run(call, repository, pr['number'], comment.get('created_at') or '')
+    run_id, attempt = fallback_run(call, repository, pr['number'], limit_created)
     aadw_notify.notify(call, state='start', process='codex-review-fallback', kind='pr', number=pr['number'], sha=sha,
                        repository=repository, run_id=run_id, attempt=attempt,
                        detail='Codexの利用上限を検出し、Copilot代替レビューを開始しました。')
