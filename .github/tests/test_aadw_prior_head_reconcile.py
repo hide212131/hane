@@ -169,6 +169,34 @@ class PriorHeadTests(unittest.TestCase):
         self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 0)
         self.assertEqual(gh.comments, [])
 
+    def test_prior_head_fallback_lifecycle_is_recovered_from_marker_and_source(self):
+        gh = Fake()
+        gh.commit_shas = [CURRENT]
+        marker = (
+            f'<!-- hane-aadw: process=codex-review-fallback kind=pr number=131 sha={OLD} '
+            'run=888 attempt=2 -->'
+        )
+        gh.comments = [{
+            'id': 30,
+            'user': {'login': 'github-actions[bot]'},
+            'created_at': '2026-09-12T03:04:00Z',
+            'updated_at': '2026-09-12T03:04:00Z',
+            'body': '### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n' + marker + '\n',
+        }]
+        gh.old_statuses = [{
+            'id': 31,
+            'context': 'hane/review-source',
+            'state': 'success',
+            'description': f'Review source: Copilot fallback for {OLD[:12]}',
+            'target_url': 'https://github.com/example/reviews/888',
+            'created_at': '2026-09-12T03:05:00Z',
+        }]
+        self.assertEqual(subject.reconcile(gh.call, REPO, now=NOW), 1)
+        self.assertEqual(len(gh.comments), 1)
+        self.assertIn('正常終了', gh.comments[0]['body'])
+        self.assertIn(f'sha={OLD}', gh.comments[0]['body'])
+        self.assertIn('run=888 attempt=2', gh.comments[0]['body'])
+
 
 if __name__ == '__main__':
     unittest.main()
