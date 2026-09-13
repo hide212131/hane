@@ -64,6 +64,12 @@ class Fake:
             return {'run_attempt': 1}
         if clean == f'repos/{REPO}/actions/runs/777/attempts/1':
             return {'run_attempt': 1, 'run_started_at': '2026-09-12T03:00:00Z'}
+        if clean == f'repos/{REPO}/actions/runs/888':
+            return {'run_attempt': 2}
+        if clean == f'repos/{REPO}/actions/runs/888/attempts/1':
+            return {'run_attempt': 1, 'run_started_at': '2026-09-12T02:50:00Z'}
+        if clean == f'repos/{REPO}/actions/runs/888/attempts/2':
+            return {'run_attempt': 2, 'run_started_at': '2026-09-12T03:03:00Z'}
         if clean == f'repos/{REPO}/issues/131/comments':
             if payload is None:
                 return self.comments
