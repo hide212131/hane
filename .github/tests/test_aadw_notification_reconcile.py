@@ -26,7 +26,11 @@ class Fake:
         self.comments = list(comments or [])
         self.calls = []
         self.next_id = max([c["id"] for c in self.comments], default=0) + 1
-        self.attempts = attempts or {100: ["2026-09-12T02:50:00Z"]}
+        self.attempts = attempts or {
+            100: ["2026-09-12T02:50:00Z"],
+            555: ["2026-09-12T02:54:00Z"],
+            556: ["2026-09-12T02:59:00Z"],
+        }
 
     def call(self, endpoint, payload=None, method=None):
         self.calls.append((endpoint, payload, method))
@@ -224,7 +228,7 @@ class ReconcileTests(unittest.TestCase):
         comments = [{
             "id": 9,
             "user": {"login": "github-actions[bot]"},
-            "created_at": "2026-09-12T02:54:00Z",
+            "created_at": "2026-09-12T02:58:00Z",
             "body": "### AADW: Codexレビュー利用上限時のCopilot代替レビュー — 処理開始\n\n" + marker + "\n",
         }]
         gh = Fake([
