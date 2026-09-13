@@ -335,7 +335,7 @@ def handle_issue_comment(call, repository, payload, observer_run, observer_attem
     pending = max((r for r in rows
                    if r.get('context') == 'hane/codex-review' and r.get('state') == 'pending'
                    and (not limit_created or (isinstance(r.get('created_at'), str)
-                                               and r['created_at'] <= limit_created))),
+                                               and r['created_at'] < limit_created))),
                   key=lambda r: r.get('id', -1), default=None)
     if pending:
         run_id, attempt = run_from_url(call, repository, pending.get('target_url') or '', observer_run, observer_attempt)
