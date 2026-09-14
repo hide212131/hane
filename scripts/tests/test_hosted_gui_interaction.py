@@ -1043,6 +1043,22 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
             for case in interaction.COORDINATE_PROBE_EXPECTED_CASES
         )
 
+    @staticmethod
+    def _failing_probe_case_lines():
+        lines = []
+        for index, case in enumerate(interaction.COORDINATE_PROBE_EXPECTED_CASES):
+            if index == 0:
+                lines.append(
+                    f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+                    f'"actual_source_offset":2,"classification":"mismatch"}}'
+                )
+            else:
+                lines.append(
+                    f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+                    f'"actual_source_offset":1,"classification":"at_canonical"}}'
+                )
+        return "\n".join(lines)
+
     def test_injects_probe_runs_cargo_test_and_restores_clean_tree_on_pass(self):
         original_run = subprocess.run
         captured_args = []
@@ -1114,7 +1130,8 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
                 return original_run(args, **kwargs)
             return subprocess.CompletedProcess(
                 args, 101,
-                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
+                f"running 1 test\n{self._failing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
                 "assertion failed: mismatches.is_empty()\n"
                 "product source-mapping mismatch, not OCR/helper noise:\n"
                 "test result: FAILED. 0 passed; 1 failed",
@@ -1125,6 +1142,38 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
         self.assertEqual(step['result'], 'fail')
         self.assertIn('source mapping', step['reason'])
         self.assertEqual(self.view_rs.read_bytes(), self.original)
+        # Issue #137 review (Codex, PR #139): a `fail` verdict must carry the
+        # same independent restore/identity/per-case evidence as a `pass`
+        # verdict, not just the reason string, so gui_policy.py can hold a
+        # product-fail receipt to a dedicated fail-only contract.
+        self.assertEqual(step['test_name'], interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME)
+        self.assertEqual(
+            step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED",
+        )
+        self.assertTrue(step['restored'])
+        self.assertTrue(step['clean_tree'])
+        self.assertEqual(step['clean_tree_paths'], [])
+        self.assertEqual(step['original_view_rs_sha256'], step['restored_view_rs_sha256'])
+        self.assertEqual(len(step['probe_cases']), len(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+
+    def test_reports_blocked_when_fail_marker_present_but_case_evidence_is_missing(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
+                "assertion failed: mismatches.is_empty()\n"
+                "product source-mapping mismatch, not OCR/helper noise:\n"
+                "test result: FAILED. 0 passed; 1 failed",
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertIn('fail-closed', step['reason'])
 
     def test_reports_blocked_when_nonzero_exit_is_not_the_probe_assertion(self):
         original_run = subprocess.run

@@ -1147,13 +1147,25 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
         )
     if (COORDINATE_PROBE_FAILURE_MARKER in full_output
             and f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED" in full_output):
+        if target_test_line != f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED" or probe_cases is None:
+            return make_step(
+                name, "blocked",
+                reason=(
+                    "独立 probe の cargo test が製品 source-mapping 不整合を示唆したが、対象テストの"
+                    "失敗行または8件のケース別 evidence 行を出力から確定的に抽出できなかったため、"
+                    "fail-closed とする"
+                ),
+                cargo_test_output=output_tail, tests_executed=executed, **restore_evidence,
+            )
         return make_step(
             name, "fail",
             reason=(
                 "OCR を経由しない独立 GPUI probe が、境界クリックの着地点が期待 canonical "
                 "position と一致しない製品側 source mapping 不整合を確認した(Issue #101)"
             ),
-            cargo_test_output=output_tail, tests_executed=executed, probe_cases=probe_cases,
+            cargo_test_output=output_tail, tests_executed=executed,
+            test_name=COORDINATE_PROBE_TEST_QUALIFIED_NAME, target_test_line=target_test_line,
+            probe_cases=probe_cases, **restore_evidence,
         )
     return make_step(
         name, "blocked",

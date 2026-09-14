@@ -169,6 +169,13 @@ def _passing_probe_cases():
     ]
 
 
+def _failing_probe_cases():
+    cases = _passing_probe_cases()
+    cases[0] = {**cases[0], 'actual_source_offset': cases[0]['canonical_source_offset'] + 1,
+                'classification': 'mismatch'}
+    return cases
+
+
 def _coordinate_probe_evidence(steps):
     step = next(s for s in steps if s['name'] == 'coordinate_independent_probe')
     step.update(
@@ -207,6 +214,24 @@ def passing_result():
                        'image_version': '20260829.0321.1', 'macos_version': '15.7.9'},
             'top_level_steps': [{'name': s, 'result': 'pass'} for s in ('preflight', 'prepare_helper', 'build')],
             'scenarios': scenarios, 'overall_result': 'pass'}
+
+
+def product_fail_result():
+    """A `fail` receipt whose verdict is attributed to the coordinate-independent
+    probe, with the same restore/hash/case evidence contract the `pass` path
+    requires plus at least one genuinely non-canonical case (Issue #137 review,
+    PR #139)."""
+    raw = passing_result()
+    probe_scenario = next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+    step = next(s for s in probe_scenario['steps'] if s['name'] == 'coordinate_independent_probe')
+    step.update(
+        result='fail',
+        target_test_line=f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED',
+        probe_cases=_failing_probe_cases(),
+    )
+    probe_scenario['result'] = 'fail'
+    raw['overall_result'] = 'fail'
+    return raw
 
 
 class ReceiptTests(unittest.TestCase):
@@ -346,6 +371,61 @@ class ReceiptTests(unittest.TestCase):
             self.coordinate_probe_step(raw)['probe_cases'] = mutate(cases)
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 self.validate(raw)
+
+    def test_genuine_product_fail_from_the_probe_is_accepted(self):
+        self.assertEqual(self.validate(product_fail_result(), 'failure'), 'fail')
+
+    def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
+        mutations = [
+            ('result', 'blocked'),
+            ('restored', False), ('restored', None),
+            ('clean_tree', False), ('clean_tree', None),
+            ('clean_tree_paths', [' M crates/ui/src/view.rs']), ('clean_tree_paths', None),
+            ('original_view_rs_sha256', None), ('original_view_rs_sha256', 'not-hex'),
+            ('restored_view_rs_sha256', 'a' * 63 + 'b'),
+            ('test_name', 'view::tests::wrong_test'), ('test_name', None),
+            ('tests_executed', 0), ('tests_executed', 2), ('tests_executed', None),
+            ('cargo_test_output', ''), ('cargo_test_output', None),
+            ('target_test_line', None),
+            ('target_test_line', f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok'),
+            ('probe_cases', None), ('probe_cases', []),
+            ('probe_cases', _failing_probe_cases()[:-1]),
+            # every case rewritten back to at_canonical: no independent evidence of a mismatch survives
+            ('probe_cases', _passing_probe_cases()),
+        ]
+        for field, value in mutations:
+            raw = product_fail_result()
+            self.coordinate_probe_step(raw)[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_product_fail_case_evidence_is_fail_closed(self):
+        cases = _failing_probe_cases()
+        mutations = [
+            lambda c: [{**c[0], 'case': c[1]['case']}, *c[1:]],  # duplicate identity
+            lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
+            lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
+            # classification claims a mismatch that didn't happen
+            lambda c: [{**c[0], 'classification': 'mismatch', 'actual_source_offset': c[0]['canonical_source_offset']},
+                       *c[1:]],
+            # classification claims canonical for an actually non-canonical landing
+            lambda c: [{**c[0], 'classification': 'at_canonical'}, *c[1:]],
+            lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
+        ]
+        for mutate in mutations:
+            raw = product_fail_result()
+            self.coordinate_probe_step(raw)['probe_cases'] = mutate(cases)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_product_fail_contract_does_not_apply_when_probe_itself_did_not_fail(self):
+        # A `fail` overall_result caused by a different scenario, with the probe
+        # untouched (still `pass`), must not be forced through the probe-specific
+        # fail contract — only a probe scenario reporting its own `fail` result
+        # is held to it.
+        raw = passing_result()
+        raw['overall_result'] = 'fail'
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
 
     def test_inline_operation_evidence_is_fail_closed(self):
         raw = passing_result()

@@ -471,10 +471,7 @@ def _coordinate_probe_expected_cases():
     }
 
 
-def _validate_coordinate_probe_evidence(steps):
-    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
-    if step is None:
-        raise ValueError('coordinate-independent probe step missing')
+def _validate_probe_common_evidence(step, expected_target_test_line):
     if step.get('restored') is not True or step.get('clean_tree') is not True:
         raise ValueError('coordinate-independent probe restore/clean-tree evidence missing')
     if step.get('clean_tree_paths') != []:
@@ -492,11 +489,24 @@ def _validate_coordinate_probe_evidence(steps):
     output = step.get('cargo_test_output')
     if not isinstance(output, str) or not output.strip():
         raise ValueError('coordinate-independent probe cargo test output missing')
-    if step.get('target_test_line') != f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok':
-        raise ValueError('coordinate-independent probe cargo test output does not confirm target test passed')
+    if step.get('target_test_line') != expected_target_test_line:
+        raise ValueError('coordinate-independent probe cargo test output does not confirm target test result')
 
-    expected_cases = _coordinate_probe_expected_cases()
-    cases = step.get('probe_cases')
+
+def _validate_probe_case_offset(case, case_id, expected_edge, expected_offset):
+    if case.get('edge') != expected_edge:
+        raise ValueError(f'coordinate-independent probe case {case_id} boundary side mismatch')
+    canonical_offset = case.get('canonical_source_offset')
+    if (not isinstance(canonical_offset, int) or isinstance(canonical_offset, bool)
+            or canonical_offset != expected_offset):
+        raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
+    actual_offset = case.get('actual_source_offset')
+    if not isinstance(actual_offset, int) or isinstance(actual_offset, bool):
+        raise ValueError(f'coordinate-independent probe case {case_id} actual offset missing or invalid')
+    return actual_offset
+
+
+def _iter_probe_cases(cases, expected_cases):
     if not isinstance(cases, list) or len(cases) != len(expected_cases):
         raise ValueError('coordinate-independent probe per-case evidence missing or incomplete')
     seen = set()
@@ -508,20 +518,53 @@ def _validate_coordinate_probe_evidence(steps):
             raise ValueError('coordinate-independent probe case identity missing or duplicated')
         seen.add(case_id)
         expected_edge, expected_offset = expected_cases[case_id]
-        if case.get('edge') != expected_edge:
-            raise ValueError(f'coordinate-independent probe case {case_id} boundary side mismatch')
-        canonical_offset = case.get('canonical_source_offset')
-        actual_offset = case.get('actual_source_offset')
-        if (not isinstance(canonical_offset, int) or isinstance(canonical_offset, bool)
-                or canonical_offset != expected_offset):
-            raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
-        if (not isinstance(actual_offset, int) or isinstance(actual_offset, bool)
-                or actual_offset != expected_offset):
+        yield case_id, expected_edge, expected_offset, case
+    if seen != set(expected_cases):
+        raise ValueError('coordinate-independent probe missing expected case coverage')
+
+
+def _validate_coordinate_probe_evidence(steps):
+    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
+    if step is None:
+        raise ValueError('coordinate-independent probe step missing')
+    _validate_probe_common_evidence(step, f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok')
+
+    expected_cases = _coordinate_probe_expected_cases()
+    cases = step.get('probe_cases')
+    for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
+        actual_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        if actual_offset != expected_offset:
             raise ValueError(f'coordinate-independent probe case {case_id} landed on a non-canonical offset')
         if case.get('classification') != 'at_canonical':
             raise ValueError(f'coordinate-independent probe case {case_id} classification is not at_canonical')
-    if seen != set(expected_cases):
-        raise ValueError('coordinate-independent probe missing expected case coverage')
+
+
+def _validate_coordinate_probe_fail_evidence(steps):
+    """`overall_result='fail'` の独立 probe 専用契約(Issue #137 review, PR #139)。
+
+    `if outcome == 'pass'` の外側で fail/blocked が丸ごと未検証のまま受理されると、
+    case identity・edge・canonical/actual offset・classification・復元 hash・
+    dirty-tree proof が欠落・改変された fail receipt も final judge に通ってしまう
+    ため、helper/OCR/環境障害由来の blocked とは分離して fail 専用に必須化する。
+    """
+    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
+    if step is None:
+        raise ValueError('coordinate-independent probe fail step missing')
+    if step.get('result') != 'fail':
+        raise ValueError('coordinate-independent probe scenario fail is not backed by a fail step')
+    _validate_probe_common_evidence(step, f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED')
+
+    expected_cases = _coordinate_probe_expected_cases()
+    cases = step.get('probe_cases')
+    mismatch_found = False
+    for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
+        actual_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        is_mismatch = actual_offset != expected_offset
+        if case.get('classification') != ('mismatch' if is_mismatch else 'at_canonical'):
+            raise ValueError(f'coordinate-independent probe case {case_id} classification inconsistent with offsets')
+        mismatch_found = mismatch_found or is_mismatch
+    if not mismatch_found:
+        raise ValueError('coordinate-independent probe fail evidence has no non-canonical mismatch case')
 
 
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
@@ -549,6 +592,11 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
         raise ValueError('unknown GUI outcome')
     if job_conclusion not in ('success', 'failure'):
         raise ValueError('worker did not finish normally')
+    if outcome == 'fail':
+        probe_scenario = next((s for s in raw.get('scenarios', [])
+                                if s.get('name') == 'coordinate_independent_probe'), None)
+        if probe_scenario is not None and probe_scenario.get('result') == 'fail':
+            _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
     if outcome == 'pass':
         if job_conclusion != 'success':
             raise ValueError('passing payload from unsuccessful worker')
