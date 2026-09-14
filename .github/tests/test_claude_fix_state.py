@@ -232,6 +232,63 @@ class BudgetTests(unittest.TestCase):
         commits.append(commit(20, commits[-1]["sha"], manual=True))
         self.assertEqual(policy.cycle_budget(commits, {}, commits[-1]["sha"])["completed"], 0)
 
+    def test_repeated_root_cause_signature_escalates_before_three_fixes(self):
+        commits = self.chain(1)
+        sig = "a" * 16
+        rows = {
+            commits[4]["sha"]: [status(1, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {sig} for {commits[4]['sha'][:12]}")],
+            commits[5]["sha"]: [status(2, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {sig} for {commits[5]['sha'][:12]}")],
+        }
+        result = policy.cycle_budget(commits, rows, commits[-1]["sha"])
+        self.assertEqual(result["completed"], 3)
+        self.assertEqual(result["escalate_root_cause_signature"], sig)
+
+    def test_different_root_cause_signatures_do_not_escalate(self):
+        commits = self.chain(1)
+        rows = {
+            commits[4]["sha"]: [status(1, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {'a' * 16} for {commits[4]['sha'][:12]}")],
+            commits[5]["sha"]: [status(2, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {'b' * 16} for {commits[5]['sha'][:12]}")],
+        }
+        result = policy.cycle_budget(commits, rows, commits[-1]["sha"])
+        self.assertEqual(result["completed"], 1)
+        self.assertNotIn("escalate_root_cause_signature", result)
+
+    def test_single_root_cause_occurrence_does_not_escalate(self):
+        commits = self.chain(1)
+        rows = {commits[4]["sha"]: [status(1, "hane/root-cause-signature", "failure",
+            f"Root-cause signature {'a' * 16} for {commits[4]['sha'][:12]}")]}
+        result = policy.cycle_budget(commits, rows, commits[-1]["sha"])
+        self.assertNotIn("escalate_root_cause_signature", result)
+
+    def test_root_cause_signature_outside_the_wrong_state_or_shape_is_ignored(self):
+        commits = self.chain(1)
+        sig = "a" * 16
+        rows = {
+            # Wrong state (not a currently-blocking 'failure' record).
+            commits[4]["sha"]: [status(1, "hane/root-cause-signature", "success",
+                f"Root-cause signature {sig} for {commits[4]['sha'][:12]}")],
+            # Malformed/tampered description shape.
+            commits[5]["sha"]: [status(2, "hane/root-cause-signature", "failure", "not the expected format")],
+        }
+        result = policy.cycle_budget(commits, rows, commits[-1]["sha"])
+        self.assertNotIn("escalate_root_cause_signature", result)
+
+    def test_root_cause_signature_before_the_cycle_boundary_does_not_escalate(self):
+        commits = self.chain(1)
+        sig = "a" * 16
+        rows = {
+            commits[0]["sha"]: [status(1, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {sig} for {commits[0]['sha'][:12]}")],
+            commits[5]["sha"]: [status(2, "hane/root-cause-signature", "failure",
+                f"Root-cause signature {sig} for {commits[5]['sha'][:12]}")],
+        }
+        result = policy.cycle_budget(commits, rows, commits[-1]["sha"])
+        self.assertNotIn("escalate_root_cause_signature", result)
+
 
 def step_script(workflow, name):
     """Extract the production shell, without maintaining a second implementation."""

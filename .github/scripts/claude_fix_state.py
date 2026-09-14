@@ -14,6 +14,8 @@ import sys
 
 MANUAL = re.compile(r"hane/claude-fix-manual/[0-9]+-[0-9]+")
 FIX_SUBJECT = re.compile(r"Automatic Claude fix for Copilot routing decision on ([0-9a-f]{12})")
+ROOT_CAUSE_SIGNATURE_CONTEXT = "hane/root-cause-signature"
+ROOT_CAUSE_SIGNATURE_DESCRIPTION = re.compile(r"Root-cause signature ([0-9a-f]{16}) for [0-9a-f]{12}")
 
 
 def latest_by_context(statuses):
@@ -209,7 +211,42 @@ def cycle_budget(commits, statuses_by_sha, target_sha):
         if "Manual retry: true" in message.splitlines():
             boundary = index
     count = sum(indices[s] >= boundary for s in completed if s != target_sha)
-    return {"completed": count, "boundary_sha": commits[boundary]["sha"] if boundary >= 0 else ""}
+    result = {"completed": count, "boundary_sha": commits[boundary]["sha"] if boundary >= 0 else ""}
+    escalation = repeated_root_cause_signature(commits, statuses_by_sha, boundary)
+    if escalation:
+        # The same GUI root-cause cluster persisted across at least one
+        # completed local fix cycle within the current window: a scoped
+        # automatic fix is not converging. Escalate to design/human review
+        # by consuming the existing max-iteration budget immediately, rather
+        # than waiting for three unrelated fixes to exhaust it.
+        result["completed"] = max(result["completed"], 3)
+        result["escalate_root_cause_signature"] = escalation
+    return result
+
+
+def repeated_root_cause_signature(commits, statuses_by_sha, boundary):
+    """Return the shared signature when the same GUI root-cause cluster
+    (published by final_pipeline.publish_root_cause_signature) is recorded as
+    still blocking on two or more distinct commits within the current
+    fix-cycle window (index >= boundary). Two occurrences mean a fix was
+    completed in between and the identical root cause resurfaced, i.e. the
+    locally scoped fix did not address it. Returns "" when nothing repeats."""
+    indices = {c["sha"]: i for i, c in enumerate(commits)}
+    seen = {}
+    for commit in commits:
+        sha = commit["sha"]
+        if indices[sha] < boundary:
+            continue
+        for status in statuses_by_sha.get(sha, []):
+            if status.get("context") != ROOT_CAUSE_SIGNATURE_CONTEXT or status.get("state") != "failure":
+                continue
+            match = ROOT_CAUSE_SIGNATURE_DESCRIPTION.fullmatch(status.get("description") or "")
+            if match:
+                seen.setdefault(match[1], set()).add(sha)
+    for sig, shas in seen.items():
+        if len(shas) >= 2:
+            return sig
+    return ""
 
 
 def main():

@@ -4,6 +4,7 @@ import json
 import re
 from gui_policy import authenticated_receipt
 from pipeline_api import CI_NAMES
+from root_cause_cluster import blockers as cluster_blockers, from_gui_attribution
 
 CONTEXT = 'hane/final-judge'
 AUTO_LABEL = 'agentic-auto-merge'
@@ -46,8 +47,16 @@ def gate(snapshot):
         errors.append('unexpected or missing repository merge rules')
     if snapshot.get('gui_required'):
         proof = snapshot.get('gui_receipt') or {}
-        if proof.get('outcome') != 'pass':
-            errors.append('GUI is not pass')
+        outcome = proof.get('outcome')
+        if outcome != 'pass':
+            # A 'fail' outcome may be waived ONLY if the trusted controller's
+            # own GUI baseline attribution (computed from authenticated
+            # receipts, never from PR/issue prose) classifies every current
+            # failing scenario/step as pre_existing_independent. 'blocked'
+            # carries no comparable per-scenario evidence and never waives.
+            clusters = from_gui_attribution(snapshot.get('gui_attribution')) if outcome == 'fail' else []
+            if not clusters or cluster_blockers(clusters):
+                errors.append('GUI is not pass')
     if snapshot.get('workflow_changes'):
         errors.append('workflow changes require owner merge')
     return errors

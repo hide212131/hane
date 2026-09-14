@@ -393,6 +393,23 @@ GUI validation が不要な場合、または GUI validation が終端結果 `pa
 
 GUI validation が必須な Pull Request では、GUI result が `pass` で、GUI-validated SHA が現在の head SHA と一致する場合だけ `ready` を許可する。`fail` / `blocked` でも final judge 自体は必ず起動し、`fix` または `blocked` へ進める。未実施または stale の場合も `ready` に進めない。
 
+`fail` は次の GUI baseline attribution ですべての failing cluster が `pre_existing_independent` と証明された場合に限り、deterministic gate (`final_policy.py::gate()`) が GUI blocker を解除できる。`blocked` は per-scenario の比較可能な evidence を持たないため、attribution の有無に関わらず常に blocker のままとする。
+
+#### GUI baseline attribution と root-cause cluster（`.github/scripts/gui_baseline_attribution.py` / `root_cause_cluster.py`）
+
+final judge は、GUI result が `fail` の場合だけ、current head の authenticated GUI receipt と trusted baseline の authenticated GUI receipt を比較し、scenario/top-level step 単位で次のいずれかに分類する。
+
+- `target_acceptance`: 対象 Issue の acceptance に直結する scenario（現在は `coordinate_independent_probe`）。baseline と一致しても常に blocker のままとする。
+- `regression`: baseline ではその scenario/step が失敗していない（または baseline 側で未実行）。blocker のままとする。
+- `unknown`: baseline が存在しない、control SHA / procedure / policy が一致しない、baseline outcome が `fail` でない、または failing step の組み合わせ（症状）が baseline と異なる。fail-closed で blocker のままとする。
+- `pre_existing_independent`: baseline が current PR の base SHA、または trusted controller が `required_from_files` と同じ判定規則で GUI-relevant な変更が無いと確認した最近傍 ancestor（`controller-confirmed-equivalent`）に anchor されており、control SHA / procedure / policy が一致し、baseline outcome が `fail` で、failing step の組み合わせが完全に一致する場合だけ成立する。この分類だけが current PR の GUI blocker から分離できる。
+
+この分類結果は `root_cause_cluster.py` の固定 schema（`blocker` / `follow_up` / `unknown`）へ機械的に写像する。`pre_existing_independent` だけが `follow_up` になり、それ以外はすべて `blocker` または `unknown` として blocker 側に残る。GUI raw receipt の `outcome` と scenario/step evidence 自体は一切書き換えない。
+
+final judge は blocker が残る root-cause cluster の識別子（scenario/step の集合から導出した signature）を `hane/root-cause-signature` commit status として毎回記録する。同一 signature が現在の fix cycle window 内で 2 回以上出現した場合、`claude_fix_state.py::cycle_budget()` は既存の「3 回で打ち切り」予算を即座に消費済み扱いにし、既存の `Claude fix blocked: max iterations` 経路（human review 要求）を local fix の再 dispatch なしに発動させる。owner による明示的な `/claude-fix` はこの escalation を上書きできる。
+
+現時点の制約: 上記は GUI scenario/step の root-cause cluster にのみ適用する。レビューコメント・CI finding を含めた「current findings 全体」の cluster 化、および pre-GUI routing（`copilot-routing.yml`）への cluster 反映は、`.github/workflows/**` の変更が必要なため別途 owner 適用の workflow patch を要する未実装事項として残っている。
+
 ## GitHub Actions の責務
 
 Agent は判断するが、GitHub Actions が制御する。
@@ -737,6 +754,8 @@ Claude は修正、検証、push まで行う。push 後は以前の Codex revie
 
 最大反復回数の初期値は **3回** とする。3回で収束しない場合は `blocked` とし、人間へ引き継ぐ。
 
+同一の GUI root-cause cluster signature が現在の fix cycle window 内で2回以上記録された場合は、3回に達していなくてもこの予算を消費済み扱いにして同じ経路で human review へ引き継ぐ（「GUI baseline attribution と root-cause cluster」を参照）。同じ scoped fix を何度も再 dispatch しない。
+
 ## マージ条件
 
 Copilot の `ready` は「マージしてよい」という最終権限ではなく、機械的なマージ判定へ進める合図とする。
@@ -748,7 +767,7 @@ Copilot の `ready` は「マージしてよい」という最終権限ではな
 - 必須 CI が最新 head SHA で成功している。
 - GUI-classified SHA が最新 head SHA と一致する。
 - merge gate が GUI requirement classification を同じ決定規則で再確認し、保存済みの `GUI validation required?` と矛盾しない。
-- GUI validation required の場合、GUI result が `pass` である。
+- GUI validation required の場合、GUI result が `pass` である。または `fail` で、trusted controller の GUI baseline attribution がすべての failing cluster を `pre_existing_independent` と証明している。
 - GUI validation required の場合、GUI-validated SHA が最新 head SHA と一致する。
 - Pull Request が draft ではない。
 - conflict がない。

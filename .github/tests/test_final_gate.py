@@ -53,6 +53,51 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(may_judge(data))
         api.evidence.assert_called_once_with(api.pr.return_value, statuses=rows)
 
+    def test_snapshot_only_fetches_a_baseline_for_a_fail_outcome(self):
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'head': {'sha': SHA}, 'base': {'sha': 'b' * 40}, 'title': 'GUI result', 'labels': []}
+        api.trusted.return_value = True
+        api.evidence.return_value = dict(ready(), files=[], statuses={})
+        api.pages.return_value = []
+        api.api.return_value = []
+        for outcome, expect_baseline_lookup in (('pass', False), ('fail', True), ('blocked', False)):
+            with self.subTest(outcome=outcome), \
+                    patch.object(controller, 'gui_receipt', return_value={'outcome': outcome, 'result': {}, 'request': {}}), \
+                    patch.object(controller, 'review_threads', return_value=[]), \
+                    patch.object(controller, 'baseline_gui_receipt', return_value=None) as base_lookup:
+                data = controller.snapshot(api, 1)
+            self.assertEqual(base_lookup.called, expect_baseline_lookup)
+            if expect_baseline_lookup:
+                self.assertEqual(data['gui_attribution'], {'baseline': None, 'clusters': [], 'blocking': True})
+            else:
+                self.assertIsNone(data['gui_attribution'])
+
+    def test_gui_attribution_absent_when_gui_not_required(self):
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'head': {'sha': SHA}, 'base': {'sha': 'b' * 40}, 'title': 'Docs', 'labels': []}
+        api.trusted.return_value = True
+        api.evidence.return_value = dict(ready(gui=False), files=[], statuses={})
+        api.pages.return_value = []
+        api.api.return_value = []
+        with patch.object(controller, 'gui_attribution_for') as attrib, \
+                patch.object(controller, 'review_threads', return_value=[]):
+            data = controller.snapshot(api, 1)
+        attrib.assert_not_called()
+        self.assertIsNone(data['gui_attribution'])
+
+    def test_gui_attribution_baseline_lookup_failure_does_not_crash_the_snapshot(self):
+        api = MagicMock(repository='owner/repo')
+        api.pr.return_value = {'head': {'sha': SHA}, 'base': {'sha': 'b' * 40}, 'title': 'GUI fail', 'labels': []}
+        api.trusted.return_value = True
+        api.evidence.return_value = dict(ready(), files=[], statuses={})
+        api.pages.return_value = []
+        api.api.return_value = []
+        with patch.object(controller, 'gui_receipt', return_value={'outcome': 'fail', 'result': {}}), \
+                patch.object(controller, 'review_threads', return_value=[]), \
+                patch.object(controller, 'baseline_gui_receipt', side_effect=RuntimeError('boom')):
+            data = controller.snapshot(api, 1)
+        self.assertEqual(data['gui_attribution'], {'baseline': None, 'clusters': [], 'blocking': True})
+
     def test_no_gui_snapshot_ignores_expired_old_gui_receipt(self):
         api = MagicMock(repository='owner/repo')
         api.pr.return_value = {'title': 'Docs', 'mergeable': True, 'labels': []}
@@ -118,6 +163,37 @@ class PolicyTests(unittest.TestCase):
         request['procedure_version'] = 'hosted-gui-interaction/2'
         with self.assertRaises(ValueError):
             authenticated_receipt(proof, SHA, 1, 'owner/repo', ('pass', '123-2'), run)
+
+    def test_gui_fail_can_be_waived_only_when_every_cluster_is_pre_existing_independent(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        data['gui_attribution'] = {'clusters': [
+            {'kind': 'scenario', 'name': 'os_scroll', 'classification': 'pre_existing_independent'},
+        ]}
+        self.assertEqual(gate(data), [])
+
+    def test_gui_fail_stays_blocked_when_any_cluster_is_not_pre_existing_independent(self):
+        for classification in ('target_acceptance', 'regression', 'unknown'):
+            with self.subTest(classification=classification):
+                data = ready()
+                data['gui_receipt'] = {'outcome': 'fail'}
+                data['gui_attribution'] = {'clusters': [
+                    {'kind': 'scenario', 'name': 'os_scroll', 'classification': 'pre_existing_independent'},
+                    {'kind': 'scenario', 'name': 'coordinate_independent_probe', 'classification': classification},
+                ]}
+                self.assertIn('GUI is not pass', gate(data))
+
+    def test_gui_fail_without_any_attribution_stays_blocked(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        self.assertIn('GUI is not pass', gate(data))
+
+    def test_gui_blocked_outcome_never_waives_even_with_attribution_present(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'blocked'}
+        data['gui_attribution'] = {'clusters': [
+            {'kind': 'scenario', 'name': 'os_scroll', 'classification': 'pre_existing_independent'}]}
+        self.assertIn('GUI is not pass', gate(data))
 
     def test_final_fix_authorization_can_be_superseded(self):
         final = {'id': 10, 'context': 'hane/final-judge', 'state': 'failure',
@@ -318,6 +394,37 @@ class EffectTests(unittest.TestCase):
             controller.process(api, 1, self.directory)
         judge.assert_not_called()
         self.assertEqual(api.writes, [])
+
+class RootCauseSignatureTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1'})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_publishes_signature_status_when_a_blocking_cluster_exists(self):
+        api = FakeAPI()
+        data = dict(ready(), sha=SHA, gui_required=True, gui_attribution={'clusters': [
+            {'kind': 'scenario', 'name': 'os_scroll', 'classification': 'regression'}]})
+        controller.publish_root_cause_signature(api, data)
+        self.assertEqual(len(api.writes), 1)
+        sha, context, state, description = api.writes[0]
+        self.assertEqual((sha, context, state), (SHA, 'hane/root-cause-signature', 'failure'))
+        self.assertTrue(description.startswith('Root-cause signature '))
+        self.assertTrue(description.endswith(f'for {SHA[:12]}'))
+
+    def test_silent_when_every_cluster_is_pre_existing_independent(self):
+        api = FakeAPI()
+        data = dict(ready(), sha=SHA, gui_required=True, gui_attribution={'clusters': [
+            {'kind': 'scenario', 'name': 'os_scroll', 'classification': 'pre_existing_independent'}]})
+        controller.publish_root_cause_signature(api, data)
+        self.assertEqual(api.writes, [])
+
+    def test_silent_when_gui_is_not_required(self):
+        api = FakeAPI()
+        data = dict(ready(), sha=SHA, gui_required=False, gui_attribution=None)
+        controller.publish_root_cause_signature(api, data)
+        self.assertEqual(api.writes, [])
+
 
 class FixEvidenceTests(unittest.TestCase):
     def test_final_fix_receipt_must_match_current_fingerprint(self):
