@@ -93,6 +93,35 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(gate(data))
         self.assertEqual(gate(ready(gui=False)), [])
 
+    def test_gui_attribution_can_clear_a_failing_receipt_only_when_bound_and_clean(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        self.assertTrue(gate(data))
+        data['gui_attribution'] = {'binding': {'pr_number': data['pr_number'], 'head_sha': data['sha']}, 'blocker_count': 0}
+        self.assertEqual(gate(data), [])
+
+    def test_gui_attribution_with_any_unresolved_blocker_does_not_clear(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        data['gui_attribution'] = {'binding': {'pr_number': data['pr_number'], 'head_sha': data['sha']}, 'blocker_count': 1}
+        self.assertTrue(gate(data))
+
+    def test_gui_attribution_bound_to_a_different_head_or_pr_is_ignored(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        for binding in ({'pr_number': data['pr_number'], 'head_sha': 'd' * 40},
+                        {'pr_number': data['pr_number'] + 1, 'head_sha': data['sha']}):
+            with self.subTest(binding=binding):
+                stale = dict(data, gui_attribution={'binding': binding, 'blocker_count': 0})
+                self.assertTrue(gate(stale))
+
+    def test_gui_attribution_does_not_mask_other_denials(self):
+        data = ready()
+        data['gui_receipt'] = {'outcome': 'fail'}
+        data['gui_attribution'] = {'binding': {'pr_number': data['pr_number'], 'head_sha': data['sha']}, 'blocker_count': 0}
+        data['ci_ready'] = False
+        self.assertEqual(gate(data), ['ci_ready'])
+
     def test_exact_json_only_no_surrounding_instructions_or_unknown_decision(self):
         for value in ('{"decision":"ready","reason":"complete"}', '{"decision":"fix","reason":"save failed"}'):
             self.assertIn(parse_decision(value)['decision'], ('ready', 'fix'))

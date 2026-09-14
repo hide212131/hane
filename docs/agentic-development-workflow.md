@@ -737,6 +737,71 @@ Claude は修正、検証、push まで行う。push 後は以前の Codex revie
 
 最大反復回数の初期値は **3回** とする。3回で収束しない場合は `blocked` とし、人間へ引き継ぐ。
 
+## review/fix loop の収束
+
+PR #139 / Issue #137 では、review → fix → fresh review を同一 root-cause cluster に対して1件ずつ細かく繰り返した結果、PR が17 commits・通常コメント115件・review comments 48件まで膨らんだ（#141 事後分析）。長い会話コンテキストはこの増幅の主因ではなく、主因は「finding → fix → new exact head → fresh review」というループを小刻みに繰り返したこと自体にある。
+
+本節は AGENTS.md の既存原則（review findings の全件解消を完了条件にしない、merge blocker を P0/P1・重大な不具合・CI failure・受入条件を直接満たせなくする P2 に限定する、follow-up への分離）を、現在の current findings から次の fix 起動までの具体的な手順として補強する。収束策の正本は常にこの文書とし、役割分担や fail-closed・exact-head・trusted control boundary といった恒久判断自体は変更しない。
+
+### 1. fix 起動前の root-cause cluster 化
+
+current exact head の non-outdated unresolved findings を一度収集したうえで、1 review comment ごとに Claude fix を起動しない。`.github/scripts/review_convergence.py` の `cluster_findings()` は、各 finding に明示的な `cluster` タグ（例: `producer-receipt-evidence-contract`、`pass-fail-blocked-terminal-contract`、`restoration-provenance`、`ime-validation` など）と `severity`（`P0`/`P1`/`P2`/`P3`）を要求し、タグのない finding はその場で拒否する（fail closed）。これにより「1件だけ見つけた指摘をその場で個別 fix する」という進め方自体を構造的に避ける。
+
+同じ cluster に属する指摘は、その設計面の対称ケース（pass/fail/blocked、producer/consumer、正常系/異常系など）を一度横断確認してから1回の fix に渡す。「pass は直したが fail が未検証」のような兄弟指摘を次サイクルへ持ち込まない。
+
+### 2. blocker / follow-up / unknown の分類
+
+`review_convergence.py` の `classify_clusters()` は cluster ごとに次を判定する。
+
+- `P0` / `P1` を含む cluster は常に blocker。
+- `P2` は、対象 Issue の受入条件を直接妨げると明示されている（`blocks_acceptance: true`）場合だけ blocker。
+- それ以外（`P3` や `blocks_acceptance` のない `P2`）は follow-up 候補とし、current PR の merge blocker にしない。
+
+「review finding が存在する」こと自体を fix loop 継続条件にしない。follow-up 候補は元 Issue の scope を無期限に拡大せず、別 Issue として切り出す。
+
+### 3. GUI full-suite failure の attribution（blocker / pre-existing-independent / unknown）
+
+`hane/gui-validation` の受信は scenario 単位で pass/fail/blocked を集約するため、target Issue の root-cause cluster に対応する受入条件（例: 独立 coordinate probe の8ケース）が満たされても、同じ full suite に含まれる別 cluster の failure が overall outcome を fail/blocked にし得る（PR #144 / Issue #143 の実例、#141 事後分析）。
+
+`.github/scripts/gui_attribution.py` はこれを安全に分離するための purely-functional な分類ライブラリである。
+
+- raw GUI receipt の `pass`/`fail`/`blocked` と各 scenario/step の証跡は一切書き換えない。
+- `attribute()` は current PR の `pr_number` / `head_sha` / `base_sha` と、current head receipt・baseline receipt の `control_sha` / `procedure_version` / `policy_version` が一致することを `verify_binding()` で機械的に確認してから分類する。一致しない baseline（別 head、別 base、別 procedure/control、pending など）は例外で拒否する。
+- 現在 fail/blocked の各 unit（scenario + step 等の最小粒度）を、current base SHA に anchor された trusted baseline の同じ unit と比較する。`status` と `signature`（症状を表す比較可能な記述）が完全に一致する場合だけ `pre-existing-independent` とし、それ以外（baseline 未実行、baseline で症状が異なる、baseline 自体が比較不能）はすべて `unknown` として blocker のままにする。単なる過去コメントや prose だけで waive しない。
+- `blocker_count == 0`（non-pass な unit がすべて `pre-existing-independent`）の場合だけ、その PR の GUI blocker を解除できる。
+
+`final_policy.py::gate()` はこの結果を追加的にのみ使う。snapshot に `gui_attribution` がなければ、従来通り `gui_receipt.outcome != pass` を blocker とする既定の fail-closed 挙動のままであり、この節の追加は既存の安全性を弱めない。
+
+現時点では、base SHA に対する trusted baseline GUI 実行そのもの（起動契機、信頼境界、durable outbox 契約）を取得する controller 側の配線は未実装であり、`gui_attribution` は `final_pipeline.py` の snapshot に渡されていない。そのため実運用では、GUI が必須な PR の overall outcome が `pass` でない限り、引き続き blocker のままになる。baseline 実行の配線は follow-up とし、設計する際もこの attribution の binding 契約（head/base/control/procedure/policy の一致必須、不一致・未実施・症状変化は `unknown`）を変えない。
+
+### 4. 同一 cluster で P1 が反復した場合の設計レビューへの切替
+
+同一 root-cause cluster から merge-blocking finding が複数 fix cycle にわたって新たに生じる場合、次の Claude fix をそのまま起動しない。`review_convergence.py` の `design_review_escalations()` は、cluster ごとの「fix 済みのはずの cluster に新しい P0/P1 が生じた cycle 数」が閾値（既定2）に達した時点でその cluster を返す。これは review 回数に上限を設けて問題を無視する仕組みではなく、修正粒度をコード patch から設計へ引き上げるための切替条件である。merge blocker が残る限り merge しない。
+
+対象 cluster が挙がった場合、次のいずれかを判断する。
+
+- current PR 内で該当 cluster の contract / state transition / producer-consumer 対称性を設計レビューし直す。
+- scope を分割する。
+- current Issue の受入条件に不要なら follow-up Issue へ切り出す。
+- PR 自体を作り直す方が安全ならその判断を明示する（PR #145 の扱いを参照）。
+
+PR の性質が「局所的な機能・テスト修正」から「検証基盤・protocol 設計」へ実質的に変化した場合も、commit 数だけでなく同様に設計見直し・scope 分割を検討するシグナルとして扱う。
+
+### 5. 収束性シグナル
+
+`review_convergence.py` の `convergence_signals()` は、少なくとも次を1つの snapshot にまとめる。閾値による自動停止はしないが、異常な増加は「設計または進め方を見直すシグナル」として扱う。
+
+- fix cycle 数（`claude_fix_state.py` の `cycle_budget()` が commit 履歴から算出する値を利用できる）
+- exact-head review 回数
+- current unresolved blocker cluster 数
+- root-cause cluster 数
+- outdated / superseded review 数
+- PR commit 数
+
+### 6. current-state と履歴の分離
+
+current exact head、current non-outdated unresolved review threads、current CI / review / GUI evidence を正本とし、過去 head の findings や GUI 結果は監査履歴として扱う（既存の「[head SHA を中心にした不変条件](#head-sha-を中心にした不変条件)」を review/fix loop の収束判断にも同様に適用する）。head が変われば head 側 evidence は stale とし、base が変われば `gui_attribution` の baseline anchor も再評価する。
+
 ## マージ条件
 
 Copilot の `ready` は「マージしてよい」という最終権限ではなく、機械的なマージ判定へ進める合図とする。

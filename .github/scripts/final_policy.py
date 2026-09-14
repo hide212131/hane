@@ -32,6 +32,26 @@ def final_state(status, sha, key):
     return match[1] if status.get('state') == expected[match[1]] else None
 
 
+def _gui_attribution_clears(snapshot):
+    """Additive, opt-in narrowing of the GUI blocker (Issue #141).
+
+    The raw `gui_receipt.outcome` is never rewritten. A non-pass outcome
+    stays a blocker unless `gui_attribution` is present, is bound to this
+    exact PR/head SHA, and reports zero unresolved blockers — i.e. every
+    non-passing unit was classified `pre-existing-independent` against a
+    trusted baseline anchored to the current base SHA
+    (`gui_attribution.attribute`). Missing or mismatched attribution is
+    fail closed: it changes nothing, preserving prior behavior.
+    """
+    attribution = snapshot.get('gui_attribution')
+    if not isinstance(attribution, dict):
+        return False
+    binding = attribution.get('binding') or {}
+    return (binding.get('pr_number') == snapshot.get('pr_number')
+            and binding.get('head_sha') == snapshot.get('sha')
+            and attribution.get('blocker_count') == 0)
+
+
 def gate(snapshot):
     """Every condition must be known and current. Returns actionable denials."""
     errors = []
@@ -46,7 +66,7 @@ def gate(snapshot):
         errors.append('unexpected or missing repository merge rules')
     if snapshot.get('gui_required'):
         proof = snapshot.get('gui_receipt') or {}
-        if proof.get('outcome') != 'pass':
+        if proof.get('outcome') != 'pass' and not _gui_attribution_clears(snapshot):
             errors.append('GUI is not pass')
     if snapshot.get('workflow_changes'):
         errors.append('workflow changes require owner merge')
