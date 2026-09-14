@@ -263,7 +263,7 @@ class ReceiptTests(unittest.TestCase):
 
     def test_all_three_terminal_results_are_preserved_for_final_judge(self):
         for result in ('pass', 'fail', 'blocked'):
-            raw = passing_result()
+            raw = product_fail_result() if result == 'fail' else passing_result()
             raw['overall_result'] = result
             with self.subTest(result=result):
                 self.assertEqual(self.validate(raw, 'success' if result == 'pass' else 'failure'), result)
@@ -418,14 +418,37 @@ class ReceiptTests(unittest.TestCase):
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 self.validate(raw, 'failure')
 
-    def test_product_fail_contract_does_not_apply_when_probe_itself_did_not_fail(self):
-        # A `fail` overall_result caused by a different scenario, with the probe
-        # untouched (still `pass`), must not be forced through the probe-specific
-        # fail contract — only a probe scenario reporting its own `fail` result
-        # is held to it.
-        raw = passing_result()
-        raw['overall_result'] = 'fail'
-        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+    def test_product_fail_case_offset_out_of_probe_source_range_cannot_be_accepted(self):
+        max_offset = len(policy.COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
+        for out_of_range in (-1, max_offset + 1):
+            cases = _failing_probe_cases()
+            cases[0] = {**cases[0], 'actual_source_offset': out_of_range}
+            raw = product_fail_result()
+            self.coordinate_probe_step(raw)['probe_cases'] = cases
+            with self.subTest(out_of_range=out_of_range), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_fail_outcome_without_a_probe_fail_scenario_cannot_be_accepted(self):
+        # `overall_result='fail'` must always be backed by the coordinate-independent
+        # probe scenario reporting its own `fail` result with full evidence — dropping,
+        # renaming, or downgrading that scenario's result to `blocked` while keeping
+        # `overall_result='fail'` must not silently skip all case-level evidence,
+        # restore-hash, and clean-tree checks (Codex review, PR #139).
+        for mutate in (
+            lambda raw: raw['scenarios'].__setitem__(
+                next(i for i, s in enumerate(raw['scenarios']) if s['name'] == 'coordinate_independent_probe'),
+                {**next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe'), 'name': 'renamed_probe'},
+            ),
+            lambda raw: raw['scenarios'].remove(
+                next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+            ),
+            lambda raw: next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe').__setitem__('result', 'blocked'),
+        ):
+            raw = passing_result()
+            raw['overall_result'] = 'fail'
+            mutate(raw)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
 
     def test_inline_operation_evidence_is_fail_closed(self):
         raw = passing_result()

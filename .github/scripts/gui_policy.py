@@ -501,8 +501,10 @@ def _validate_probe_case_offset(case, case_id, expected_edge, expected_offset):
             or canonical_offset != expected_offset):
         raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
     actual_offset = case.get('actual_source_offset')
-    if not isinstance(actual_offset, int) or isinstance(actual_offset, bool):
-        raise ValueError(f'coordinate-independent probe case {case_id} actual offset missing or invalid')
+    max_offset = len(COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
+    if (not isinstance(actual_offset, int) or isinstance(actual_offset, bool)
+            or not 0 <= actual_offset <= max_offset):
+        raise ValueError(f'coordinate-independent probe case {case_id} actual offset missing or out of source range')
     return actual_offset
 
 
@@ -546,6 +548,11 @@ def _validate_coordinate_probe_fail_evidence(steps):
     case identity・edge・canonical/actual offset・classification・復元 hash・
     dirty-tree proof が欠落・改変された fail receipt も final judge に通ってしまう
     ため、helper/OCR/環境障害由来の blocked とは分離して fail 専用に必須化する。
+
+    呼び出し元は `coordinate_independent_probe` scenario の存在と自己申告
+    `result == 'fail'` を条件にせず常にこの検証を要求する(PR #139 review)。
+    scenario の削除・改名や `result` だけを `blocked` へ書き換える改変では、
+    この専用契約自体を素通りできてしまうため。
     """
     step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
     if step is None:
@@ -595,8 +602,9 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     if outcome == 'fail':
         probe_scenario = next((s for s in raw.get('scenarios', [])
                                 if s.get('name') == 'coordinate_independent_probe'), None)
-        if probe_scenario is not None and probe_scenario.get('result') == 'fail':
-            _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
+        if probe_scenario is None or probe_scenario.get('result') != 'fail':
+            raise ValueError('fail outcome requires the coordinate-independent probe scenario to report its own fail')
+        _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
     if outcome == 'pass':
         if job_conclusion != 'success':
             raise ValueError('passing payload from unsuccessful worker')
