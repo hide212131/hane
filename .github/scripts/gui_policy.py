@@ -65,6 +65,13 @@ REQUIRED_STEPS = {
     'coordinate_independent_probe': {'coordinate_independent_probe'},
 }
 TOP_LEVEL_STEP_NAMES = {'preflight', 'prepare_helper', 'build'}
+# scripts/hosted_gui_interaction.py の run_ascii_scenario は、reopen 前工程が
+# 全 pass の場合にのみ open_session/close_session を再実行するため、この3つの
+# 子 step 名だけ最大2回(初回 + reopen)生成しうる。他のあらゆる scenario の
+# あらゆる子 step 名、および top-level/scenario 名それ自体は、producer が
+# 一度しか生成しない(PR #139 review: 同名の重複証跡を pass の隣に足すだけで
+# 生成不能な fail を偽装できてしまうため、cardinality を拘束する)。
+SCENARIO_REOPEN_DUPLICATE_STEPS = {'launch', 'window_discovery', 'cleanup'}
 # scripts/gui_validate.py の do_preflight/do_build を参照。preflight と
 # prepare_helper は pass/blocked(/skipped) しか生成できず、build のみが
 # ビルド失敗時に result='fail' を生成しうる。overall_result='fail' の
@@ -583,9 +590,44 @@ def _validate_coordinate_probe_fail_evidence(steps):
         raise ValueError('coordinate-independent probe fail evidence has no non-canonical mismatch case')
 
 
+def _validate_producer_cardinality(raw):
+    """`producer` (scripts/hosted_gui_interaction.py) generates each top-level
+    step, each scenario, and each scenario's child steps at most once (or, for
+    the ascii reopen trio, at most twice). A receipt that reports the same
+    name more than that, at any of the three levels, cannot come from a real
+    run — it is evidence of a genuine pass duplicated with a fabricated fail
+    tacked on beside it (PR #139 review)."""
+    top_counts = {}
+    for step in raw.get('top_level_steps', []):
+        name = step.get('name')
+        if name in TOP_LEVEL_STEP_NAMES:
+            top_counts[name] = top_counts.get(name, 0) + 1
+    if any(count > 1 for count in top_counts.values()):
+        raise ValueError('top-level step name reported more than once')
+
+    scenario_names = [s.get('name') for s in raw.get('scenarios', []) if s.get('name') in REQUIRED_STEPS]
+    if len(scenario_names) != len(set(scenario_names)):
+        raise ValueError('scenario name reported more than once')
+
+    for scenario in raw.get('scenarios', []):
+        name = scenario.get('name')
+        if name not in REQUIRED_STEPS:
+            continue
+        duplicate_allowed = SCENARIO_REOPEN_DUPLICATE_STEPS if name == 'ascii_edit_save_undo_redo_reopen' else set()
+        step_counts = {}
+        for step in scenario.get('steps', []):
+            step_name = step.get('name')
+            step_counts[step_name] = step_counts.get(step_name, 0) + 1
+        for step_name, count in step_counts.items():
+            limit = 2 if step_name in duplicate_allowed else 1
+            if count > limit:
+                raise ValueError('scenario step name reported more times than the producer can generate')
+
+
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     """Fail closed on provenance/shape errors; never upgrade partial evidence."""
     now = now or datetime.now(timezone.utc)
+    _validate_producer_cardinality(raw)
     if request.get('procedure_version') != PROCEDURE:
         raise ValueError('requested procedure version mismatch')
     expected = (('request_id', request['request_id']), ('run_id', request['run_id']),

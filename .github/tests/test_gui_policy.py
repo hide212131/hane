@@ -454,6 +454,59 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(raw, 'failure')
 
+    def test_duplicate_top_level_build_step_cannot_fabricate_a_fail(self):
+        # PR #139 review: `do_build` runs at most once per receipt, so a
+        # genuinely passing `build` step next to a second, fabricated `build`
+        # step reporting `fail` can never come from a real run — the producer
+        # cardinality for each top-level step name is at most one.
+        raw = passing_result()
+        raw['top_level_steps'].append({'name': 'build', 'result': 'fail'})
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_duplicate_scenario_name_cannot_fabricate_a_fail(self):
+        # PR #139 review: each scenario name is emitted exactly once by the
+        # producer, so a second scenario object sharing the name of an
+        # otherwise-passing scenario, but reporting `fail` with its own
+        # failing required child step, is fabricated evidence, not a second
+        # genuine run of that scenario.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        fabricated = deepcopy(scenario)
+        fabricated['steps'][0]['result'] = 'fail'
+        fabricated['result'] = 'fail'
+        raw['scenarios'].append(fabricated)
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_duplicate_child_step_cannot_fabricate_a_scenario_fail(self):
+        # PR #139 review: within a single scenario, a required child step
+        # name (other than the ascii reopen trio launch/window_discovery/
+        # cleanup, which the producer can legitimately emit twice) is emitted
+        # at most once. A duplicated child step reporting `fail` next to the
+        # genuine `pass` entry must not be accepted as backing a scenario
+        # fail.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        edit_save = next(s for s in scenario['steps'] if s['name'] == 'edit_save')
+        scenario['steps'].append({**edit_save, 'result': 'fail'})
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_ascii_reopen_trio_may_legitimately_appear_twice(self):
+        # The reopen phase of ascii_edit_save_undo_redo_reopen genuinely
+        # re-runs launch/window_discovery/cleanup, so a receipt reporting
+        # each of them twice (both passing) must still validate.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        for name in ('launch', 'window_discovery', 'cleanup'):
+            self.assertEqual(sum(s['name'] == name for s in scenario['steps']), 2)
+        self.assertEqual(self.validate(raw), 'pass')
+
     def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
         mutations = [
             ('result', 'blocked'),
