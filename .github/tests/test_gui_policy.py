@@ -59,6 +59,14 @@ def _inline_evidence(steps):
             policy.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
         ),
     }
+    click_edit_checks = {
+        'boundary_click_edit_bold_italic_check_0': ('bold italic combo', 'start'),
+        'boundary_click_edit_bold_italic_check_1': ('bold italic combo', 'end'),
+        'boundary_click_edit_code_span_check_0': ('code', 'start'),
+        'boundary_click_edit_code_span_check_1': ('span', 'end'),
+        'boundary_click_edit_quote_check_0': ('bold', 'start'),
+        'boundary_click_edit_list_check_0': ('italic', 'start'),
+    }
     for name, (screenshot, inserted) in boundary.items():
         by_name[name].update(
             screenshot=screenshot,
@@ -66,6 +74,26 @@ def _inline_evidence(steps):
             expected_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
             actual_after_undo=policy.INLINE_FIXTURE_ORIGINAL,
         )
+        if name in click_edit_checks:
+            offset = inserted.index('Z')
+            matched_text, edge = click_edit_checks[name]
+            box = {'minX': 0.2, 'maxX': 0.6, 'minY': 0.3, 'maxY': 0.4}
+            window = {'x': 10.0, 'y': 20.0, 'width': 400.0, 'height': 300.0}
+            x_norm = box['minX'] if edge == 'start' else box['maxX']
+            y_norm_from_top = 1 - (box['minY'] + (box['maxY'] - box['minY']) / 2)
+            click_point = {
+                'x': window['x'] + x_norm * window['width'],
+                'y': window['y'] + y_norm_from_top * window['height'],
+            }
+            by_name[name].update(
+                click_evidence={
+                    'matched_text': matched_text, 'bounding_box': box,
+                    'window_bounds': window, 'click_point': click_point, 'edge': edge,
+                },
+                expected_canonical_source_offset=offset,
+                actual_landing_source_offset=offset,
+                landing_classification='at_canonical',
+            )
 
     navigation = {
         'boundary_caret_navigation_check_0': (
@@ -130,6 +158,49 @@ def _inline_evidence(steps):
     )
 
 
+VIEW_RS_SHA = 'f' * 64
+
+
+def _passing_probe_cases():
+    return [
+        {'case': case, 'edge': edge, 'canonical_source_offset': offset,
+         'actual_anchor_source_offset': offset, 'actual_active_source_offset': offset,
+         'classification': 'at_canonical'}
+        for case, (edge, offset) in policy._coordinate_probe_expected_cases().items()
+    ]
+
+
+def _failing_probe_cases(*, mismatch_field='actual_active_source_offset'):
+    """A residual range selection can leave either endpoint off the canonical
+    offset while the other still matches it; `mismatch_field` picks which one
+    the first case disagrees on, so callers can exercise an active-only
+    mismatch (the caret itself moved) or an anchor-only mismatch (a selection
+    range survived the click even though `active == canonical`) — both of
+    which the Rust probe's `actual == Selection::caret(canonical)` check
+    classifies as `mismatch` (Codex review, PR #139)."""
+    cases = _passing_probe_cases()
+    cases[0] = {**cases[0], mismatch_field: cases[0]['canonical_source_offset'] + 1,
+                'classification': 'mismatch'}
+    return cases
+
+
+def _coordinate_probe_evidence(steps):
+    step = next(s for s in steps if s['name'] == 'coordinate_independent_probe')
+    step.update(
+        tests_executed=1,
+        test_name=policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME,
+        restored=True, clean_tree=True, clean_tree_paths=[],
+        original_view_rs_sha256=VIEW_RS_SHA, restored_view_rs_sha256=VIEW_RS_SHA,
+        target_test_line=f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok',
+        probe_cases=_passing_probe_cases(),
+        cargo_test_output=(
+            'running 1 test\n'
+            f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n'
+            'test result: ok. 1 passed; 0 failed'
+        ),
+    )
+
+
 def passing_result():
     scenarios = []
     for name, expected in policy.REQUIRED_STEPS.items():
@@ -138,6 +209,8 @@ def passing_result():
             steps.extend({'name': step, 'result': 'pass'} for step in ('launch', 'window_discovery', 'cleanup'))
         if name == 'inline_syntax_boundary':
             _inline_evidence(steps)
+        if name == 'coordinate_independent_probe':
+            _coordinate_probe_evidence(steps)
         scenarios.append({'name': name, 'result': 'pass', 'steps': steps})
     return {'request_id': REQUEST['request_id'], 'run_id': '123', 'run_attempt': '1',
             'procedure_version': policy.PROCEDURE, 'control': {'sha': CONTROL},
@@ -149,6 +222,37 @@ def passing_result():
                        'image_version': '20260829.0321.1', 'macos_version': '15.7.9'},
             'top_level_steps': [{'name': s, 'result': 'pass'} for s in ('preflight', 'prepare_helper', 'build')],
             'scenarios': scenarios, 'overall_result': 'pass'}
+
+
+def product_fail_result():
+    """A `fail` receipt whose verdict is attributed to the coordinate-independent
+    probe, with the same restore/hash/case evidence contract the `pass` path
+    requires plus at least one genuinely non-canonical case (Issue #137 review,
+    PR #139)."""
+    raw = passing_result()
+    probe_scenario = next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+    step = next(s for s in probe_scenario['steps'] if s['name'] == 'coordinate_independent_probe')
+    step.update(
+        result='fail',
+        target_test_line=f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED',
+        probe_cases=_failing_probe_cases(),
+    )
+    probe_scenario['result'] = 'fail'
+    raw['overall_result'] = 'fail'
+    return raw
+
+
+def non_probe_product_fail_result():
+    """A `fail` receipt caused by a genuine product regression in one of the
+    independent scenarios (e.g. save/undo/redo/reopen), with the coordinate-
+    independent probe itself still reporting `pass` (Codex review, PR #139:
+    the probe-only evidence contract must not reject fails caused elsewhere)."""
+    raw = passing_result()
+    scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+    scenario['steps'][0]['result'] = 'fail'
+    scenario['result'] = 'fail'
+    raw['overall_result'] = 'fail'
+    return raw
 
 
 class ReceiptTests(unittest.TestCase):
@@ -174,9 +278,13 @@ class ReceiptTests(unittest.TestCase):
         inline = next(s for s in raw['scenarios'] if s['name'] == 'inline_syntax_boundary')
         return next(s for s in inline['steps'] if s['name'] == name)
 
+    def coordinate_probe_step(self, raw):
+        probe = next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+        return next(s for s in probe['steps'] if s['name'] == 'coordinate_independent_probe')
+
     def test_all_three_terminal_results_are_preserved_for_final_judge(self):
         for result in ('pass', 'fail', 'blocked'):
-            raw = passing_result()
+            raw = product_fail_result() if result == 'fail' else passing_result()
             raw['overall_result'] = result
             with self.subTest(result=result):
                 self.assertEqual(self.validate(raw, 'success' if result == 'pass' else 'failure'), result)
@@ -238,6 +346,296 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(raw)
 
+    def test_coordinate_independent_probe_evidence_is_fail_closed(self):
+        mutations = [
+            ('restored', False), ('restored', None),
+            ('clean_tree', False), ('clean_tree', None),
+            ('clean_tree_paths', [' M crates/ui/src/view.rs']), ('clean_tree_paths', None),
+            ('original_view_rs_sha256', None), ('original_view_rs_sha256', 'not-hex'),
+            ('restored_view_rs_sha256', 'a' * 63 + 'b'),
+            ('test_name', 'view::tests::wrong_test'), ('test_name', None),
+            ('tests_executed', 0), ('tests_executed', 2), ('tests_executed', None),
+            ('cargo_test_output', ''), ('cargo_test_output', None),
+            ('target_test_line', None),
+            ('target_test_line', f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED'),
+            ('probe_cases', None), ('probe_cases', []),
+            ('probe_cases', _passing_probe_cases()[:-1]),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            self.coordinate_probe_step(raw)[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_coordinate_independent_probe_missing_evidence_fields_cannot_pass(self):
+        raw = passing_result()
+        step = self.coordinate_probe_step(raw)
+        for field in ('restored', 'clean_tree', 'clean_tree_paths', 'original_view_rs_sha256',
+                      'restored_view_rs_sha256', 'test_name', 'tests_executed', 'cargo_test_output',
+                      'target_test_line', 'probe_cases'):
+            del step[field]
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_coordinate_independent_probe_per_case_evidence_is_fail_closed(self):
+        cases = _passing_probe_cases()
+        mutations = [
+            lambda c: [{**c[0], 'case': 'bold_close'}, *c[1:]],  # duplicate identity
+            lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
+            lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
+            lambda c: [{**c[0], 'actual_active_source_offset': c[0]['actual_active_source_offset'] + 1}, *c[1:]],
+            # anchor-only mismatch: a residual range selection with `active`
+            # still on the canonical offset must not be accepted as an
+            # `at_canonical` pass (Codex review, PR #139).
+            lambda c: [{**c[0], 'actual_anchor_source_offset': c[0]['actual_anchor_source_offset'] + 1}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_anchor_source_offset'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_active_source_offset'}, *c[1:]],
+            lambda c: [{**c[0], 'classification': 'mismatch'}, *c[1:]],
+            lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
+        ]
+        for mutate in mutations:
+            raw = passing_result()
+            self.coordinate_probe_step(raw)['probe_cases'] = mutate(cases)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_genuine_product_fail_from_the_probe_is_accepted(self):
+        self.assertEqual(self.validate(product_fail_result(), 'failure'), 'fail')
+
+    def test_genuine_product_fail_from_a_non_probe_scenario_is_accepted(self):
+        # A save/undo/redo/reopen (or IME/scroll/inline) regression must still be
+        # reportable as `fail` even when the independent probe itself passes; the
+        # probe-only evidence contract applies only when the probe self-reports
+        # `fail` (Codex review, PR #139).
+        self.assertEqual(self.validate(non_probe_product_fail_result(), 'failure'), 'fail')
+
+    def test_non_probe_scenario_fail_without_a_failing_child_step_cannot_be_accepted(self):
+        # Codex review (PR #139): the generator derives a scenario's `result` from
+        # `worst_result(steps, priority)`, so a scenario can never legitimately
+        # report `fail` while every one of its own child steps stays `pass`. A
+        # receipt with that combination is missing/tampered evidence, not a real
+        # product regression, and must be rejected even though the scenario
+        # self-reports `fail`.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_fail_scenario_with_unknown_name_cannot_be_accepted(self):
+        # A scenario name outside the known catalog cannot be trusted as a
+        # genuine product regression, even if it self-reports `fail` with a
+        # failing child step (Codex review, PR #139).
+        raw = non_probe_product_fail_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['name'] = 'not_a_real_scenario'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_fabricated_top_level_fail_step_cannot_be_accepted(self):
+        # Codex review (PR #139): `failing_top_level` must not accept an
+        # arbitrary fabricated step name, nor a known top-level step
+        # (preflight/prepare_helper) that the generator can never actually
+        # report as `fail`. Only `build` can legitimately self-report `fail`.
+        for name in ('fabricated', 'preflight', 'prepare_helper'):
+            raw = passing_result()
+            raw['top_level_steps'].append({'name': name, 'result': 'fail'})
+            raw['overall_result'] = 'fail'
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_genuine_build_fail_top_level_step_is_accepted(self):
+        raw = passing_result()
+        raw['top_level_steps'] = [
+            {'name': 'preflight', 'result': 'pass'},
+            {'name': 'prepare_helper', 'result': 'pass'},
+            {'name': 'build', 'result': 'fail'},
+        ]
+        raw['overall_result'] = 'fail'
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
+    def test_fabricated_scenario_child_step_outside_required_steps_cannot_be_accepted(self):
+        # Codex review (PR #139): a scenario fail must be backed by a failing
+        # child step that is one of that scenario's own required steps, not
+        # an unrelated fabricated step name appended alongside all-passing
+        # required steps.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['steps'].append({'name': 'fabricated', 'result': 'fail'})
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_scenario_fail_backed_only_by_a_fail_incapable_step_cannot_be_accepted(self):
+        # Codex review (PR #139): the intersection check must also confirm the
+        # failing child step is one the producer can actually report as `fail`.
+        # scripts/gui_validate.py::do_capture() only ever returns pass/blocked,
+        # so a `capture_before` marked `fail` next to an otherwise-passing
+        # scenario is fabricated evidence, not a real product regression, even
+        # though `capture_before` is one of the scenario's required steps.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        step = next(s for s in scenario['steps'] if s['name'] == 'capture_before')
+        step['result'] = 'fail'
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_duplicate_top_level_build_step_cannot_fabricate_a_fail(self):
+        # PR #139 review: `do_build` runs at most once per receipt, so a
+        # genuinely passing `build` step next to a second, fabricated `build`
+        # step reporting `fail` can never come from a real run — the producer
+        # cardinality for each top-level step name is at most one.
+        raw = passing_result()
+        raw['top_level_steps'].append({'name': 'build', 'result': 'fail'})
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_duplicate_scenario_name_cannot_fabricate_a_fail(self):
+        # PR #139 review: each scenario name is emitted exactly once by the
+        # producer, so a second scenario object sharing the name of an
+        # otherwise-passing scenario, but reporting `fail` with its own
+        # failing required child step, is fabricated evidence, not a second
+        # genuine run of that scenario.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        fabricated = deepcopy(scenario)
+        fabricated['steps'][0]['result'] = 'fail'
+        fabricated['result'] = 'fail'
+        raw['scenarios'].append(fabricated)
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_duplicate_child_step_cannot_fabricate_a_scenario_fail(self):
+        # PR #139 review: within a single scenario, a required child step
+        # name (other than the ascii reopen trio launch/window_discovery/
+        # cleanup, which the producer can legitimately emit twice) is emitted
+        # at most once. A duplicated child step reporting `fail` next to the
+        # genuine `pass` entry must not be accepted as backing a scenario
+        # fail.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        edit_save = next(s for s in scenario['steps'] if s['name'] == 'edit_save')
+        scenario['steps'].append({**edit_save, 'result': 'fail'})
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_ascii_reopen_trio_may_legitimately_appear_twice(self):
+        # The reopen phase of ascii_edit_save_undo_redo_reopen genuinely
+        # re-runs launch/window_discovery/cleanup, so a receipt reporting
+        # each of them twice (both passing) must still validate.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        for name in ('launch', 'window_discovery', 'cleanup'):
+            self.assertEqual(sum(s['name'] == name for s in scenario['steps']), 2)
+        self.assertEqual(self.validate(raw), 'pass')
+
+    def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
+        mutations = [
+            ('result', 'blocked'),
+            ('restored', False), ('restored', None),
+            ('clean_tree', False), ('clean_tree', None),
+            ('clean_tree_paths', [' M crates/ui/src/view.rs']), ('clean_tree_paths', None),
+            ('original_view_rs_sha256', None), ('original_view_rs_sha256', 'not-hex'),
+            ('restored_view_rs_sha256', 'a' * 63 + 'b'),
+            ('test_name', 'view::tests::wrong_test'), ('test_name', None),
+            ('tests_executed', 0), ('tests_executed', 2), ('tests_executed', None),
+            ('cargo_test_output', ''), ('cargo_test_output', None),
+            ('target_test_line', None),
+            ('target_test_line', f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok'),
+            ('probe_cases', None), ('probe_cases', []),
+            ('probe_cases', _failing_probe_cases()[:-1]),
+            # every case rewritten back to at_canonical: no independent evidence of a mismatch survives
+            ('probe_cases', _passing_probe_cases()),
+        ]
+        for field, value in mutations:
+            raw = product_fail_result()
+            self.coordinate_probe_step(raw)[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_product_fail_case_evidence_is_fail_closed(self):
+        cases = _failing_probe_cases()
+        mutations = [
+            lambda c: [{**c[0], 'case': c[1]['case']}, *c[1:]],  # duplicate identity
+            lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
+            lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
+            # classification claims a mismatch that didn't happen on either endpoint
+            lambda c: [{**c[0], 'classification': 'mismatch',
+                        'actual_anchor_source_offset': c[0]['canonical_source_offset'],
+                        'actual_active_source_offset': c[0]['canonical_source_offset']}, *c[1:]],
+            # classification claims canonical for an actually non-canonical landing
+            lambda c: [{**c[0], 'classification': 'at_canonical'}, *c[1:]],
+            lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_anchor_source_offset'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_active_source_offset'}, *c[1:]],
+        ]
+        for mutate in mutations:
+            raw = product_fail_result()
+            self.coordinate_probe_step(raw)['probe_cases'] = mutate(cases)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_product_fail_case_anchor_only_mismatch_is_accepted(self):
+        # A click that leaves a residual range selection with `active` on the
+        # canonical offset but `anchor` off it is still a real product
+        # source-mapping mismatch (the Rust probe's own `actual ==
+        # Selection::caret(canonical)` check fails on it too), so the policy
+        # must accept it as fail evidence instead of rejecting it as evidence
+        # inconsistency (Codex review, PR #139, Issue #137).
+        raw = product_fail_result()
+        self.coordinate_probe_step(raw)['probe_cases'] = _failing_probe_cases(
+            mismatch_field='actual_anchor_source_offset'
+        )
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
+    def test_product_fail_case_active_only_mismatch_is_accepted(self):
+        raw = product_fail_result()
+        self.coordinate_probe_step(raw)['probe_cases'] = _failing_probe_cases(
+            mismatch_field='actual_active_source_offset'
+        )
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
+    def test_product_fail_case_offset_out_of_probe_source_range_cannot_be_accepted(self):
+        max_offset = len(policy.COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
+        for out_of_range in (-1, max_offset + 1):
+            for field in ('actual_anchor_source_offset', 'actual_active_source_offset'):
+                cases = _failing_probe_cases()
+                cases[0] = {**cases[0], field: out_of_range}
+                raw = product_fail_result()
+                self.coordinate_probe_step(raw)['probe_cases'] = cases
+                with self.subTest(out_of_range=out_of_range, field=field), self.assertRaises(ValueError):
+                    self.validate(raw, 'failure')
+
+    def test_fail_outcome_without_a_probe_fail_scenario_cannot_be_accepted(self):
+        # `overall_result='fail'` must always be backed by the coordinate-independent
+        # probe scenario reporting its own `fail` result with full evidence — dropping,
+        # renaming, or downgrading that scenario's result to `blocked` while keeping
+        # `overall_result='fail'` must not silently skip all case-level evidence,
+        # restore-hash, and clean-tree checks (Codex review, PR #139).
+        for mutate in (
+            lambda raw: raw['scenarios'].__setitem__(
+                next(i for i, s in enumerate(raw['scenarios']) if s['name'] == 'coordinate_independent_probe'),
+                {**next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe'), 'name': 'renamed_probe'},
+            ),
+            lambda raw: raw['scenarios'].remove(
+                next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe')
+            ),
+            lambda raw: next(s for s in raw['scenarios'] if s['name'] == 'coordinate_independent_probe').__setitem__('result', 'blocked'),
+        ):
+            raw = passing_result()
+            raw['overall_result'] = 'fail'
+            mutate(raw)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
     def test_inline_operation_evidence_is_fail_closed(self):
         raw = passing_result()
         self.inline_step(raw, 'boundary_ime_input_check').pop('actual_after_insert')
@@ -249,6 +647,78 @@ class ReceiptTests(unittest.TestCase):
         self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')['screenshot'] = (
             'inline_syntax_boundary/boundary_click_edit_bold_italic_check_0.png'
         )
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_boundary_click_landing_evidence_is_fail_closed(self):
+        mutations = [
+            ('click_evidence', None),
+            ('click_evidence', {'matched_text': 'probe'}),
+            ('expected_canonical_source_offset', None),
+            ('actual_landing_source_offset', None),
+            ('landing_classification', 'boundary_ambiguous_near_canonical'),
+        ]
+        for field, value in mutations:
+            raw = passing_result()
+            step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+            step[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_click_evidence_field_shapes_and_geometry_are_fail_closed(self):
+        base = passing_result()
+        evidence = self.inline_step(base, 'boundary_click_edit_bold_italic_check_0')['click_evidence']
+        mutations = [
+            lambda e: {**e, 'bounding_box': None},
+            lambda e: {**e, 'window_bounds': 'nonsense'},
+            lambda e: {**e, 'click_point': False},
+            lambda e: {**e, 'matched_text': 'unrelated target text'},
+            lambda e: {**e, 'edge': 'end'},
+            lambda e: {**e, 'bounding_box': {**e['bounding_box'], 'minX': 1.5}},
+            lambda e: {**e, 'window_bounds': {**e['window_bounds'], 'width': 0}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'x': e['click_point']['x'] + 50}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'x': float('nan')}},
+            lambda e: {**e, 'click_point': {**e['click_point'], 'y': float('inf')}},
+            lambda e: {**e, 'bounding_box': {**e['bounding_box'], 'minX': float('nan')}},
+            lambda e: {**e, 'window_bounds': {**e['window_bounds'], 'width': float('inf')}},
+        ]
+        for mutate in mutations:
+            raw = passing_result()
+            step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+            step['click_evidence'] = mutate(evidence)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw)
+
+    def test_degenerate_zero_area_bounding_box_cannot_pass(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        evidence = step['click_evidence']
+        degenerate_box = {'minX': 0.2, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.3}
+        window = evidence['window_bounds']
+        x_norm = degenerate_box['minX'] if evidence['edge'] == 'start' else degenerate_box['maxX']
+        expected_x = window['x'] + x_norm * window['width']
+        y_norm_from_top = 1 - (degenerate_box['minY'] + (degenerate_box['maxY'] - degenerate_box['minY']) / 2)
+        expected_y = window['y'] + y_norm_from_top * window['height']
+        step['click_evidence'] = {
+            **evidence,
+            'bounding_box': degenerate_box,
+            'click_point': {'x': expected_x, 'y': expected_y},
+        }
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_expected_canonical_offset_must_match_known_fixture_position(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        step['expected_canonical_source_offset'] = 0
+        step['actual_landing_source_offset'] = 0
+        with self.assertRaises(ValueError):
+            self.validate(raw)
+
+    def test_boundary_click_landing_offset_mismatch_cannot_pass(self):
+        raw = passing_result()
+        step = self.inline_step(raw, 'boundary_click_edit_bold_italic_check_0')
+        step['actual_landing_source_offset'] = step['expected_canonical_source_offset'] + 1
         with self.assertRaises(ValueError):
             self.validate(raw)
 

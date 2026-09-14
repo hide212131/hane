@@ -2,14 +2,16 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
 POLICY = 'v1'
-PROCEDURE = 'hosted-gui-interaction/5'
+PROCEDURE = 'hosted-gui-interaction/7'
 STATUS_VERSION = f'{POLICY}-p{PROCEDURE.rsplit("/", 1)[1]}'
 CONTEXT = 'hane/gui-validation'
 STATUS = re.compile(r'GUI (pending|pass|fail|blocked) ' + re.escape(STATUS_VERSION) + r' ([0-9a-f]{12}) g([0-9]+-[0-9]+)')
+BOUNDARY_MARK = 'Z'
 INLINE_FIXTURE_ORIGINAL = (
     '# hosted gui interaction inline syntax spike\n'
     '\n'
@@ -60,7 +62,56 @@ REQUIRED_STEPS = {
         'launch_reopen', 'window_discovery_reopen', 'capture_reopen',
         'visible_saved_text', 'reopen_content_check', 'cleanup_reopen',
     },
+    'coordinate_independent_probe': {'coordinate_independent_probe'},
 }
+TOP_LEVEL_STEP_NAMES = {'preflight', 'prepare_helper', 'build'}
+# scripts/hosted_gui_interaction.py の run_ascii_scenario は、reopen 前工程が
+# 全 pass の場合にのみ open_session/close_session を再実行するため、この3つの
+# 子 step 名だけ最大2回(初回 + reopen)生成しうる。他のあらゆる scenario の
+# あらゆる子 step 名、および top-level/scenario 名それ自体は、producer が
+# 一度しか生成しない(PR #139 review: 同名の重複証跡を pass の隣に足すだけで
+# 生成不能な fail を偽装できてしまうため、cardinality を拘束する)。
+SCENARIO_REOPEN_DUPLICATE_STEPS = {'launch', 'window_discovery', 'cleanup'}
+# scripts/gui_validate.py の do_preflight/do_build を参照。preflight と
+# prepare_helper は pass/blocked(/skipped) しか生成できず、build のみが
+# ビルド失敗時に result='fail' を生成しうる。overall_result='fail' の
+# top-level 証跡をこの集合の外や fail 不能な工程名に拘束しない実装は、
+# 捏造した top-level step で存在しない製品失敗を公開できてしまう
+# (PR #139 review)。
+TOP_LEVEL_FAIL_CAPABLE_STEPS = {'build'}
+# scripts/hosted_gui_interaction.py の各 scenario 子 step の producer 実装を参照。
+# capture_* 名は常に do_capture 経由(pass/blocked のみ)、cleanup/cleanup_reopen は
+# _cleanup_process 経由(pass/blocked のみ)で、result='fail' を一度も生成しない。
+# 同様に japanese_ime_input の入力ソース照会・選択・復元、os_scroll の os_wheel、
+# inline_syntax_boundary の restore_boundary_ime_input_source も helper/OS 呼び出しの
+# 成否のみで pass/blocked を返す。この集合の外の子 step 名が result='fail' を自己申告
+# することは producer からは起こり得ないので、scenario の fail evidence をこの集合に
+# 拘束しないと、生成不能な fail 証跡(例: capture_before を fail に書き換えるだけの
+# 捏造)が受理されてしまう(Codex review, PR #139)。
+SCENARIO_FAIL_INCAPABLE_STEPS = {
+    'ascii_edit_save_undo_redo_reopen': {'cleanup'},
+    'japanese_ime_input': {
+        'query_current_source', 'list_input_sources', 'select_japanese_source',
+        'restore_input_source', 'cleanup',
+    },
+    'os_scroll': {'os_wheel', 'cleanup'},
+    'inline_syntax_boundary': {'restore_boundary_ime_input_source', 'cleanup', 'cleanup_reopen'},
+}
+
+
+def _scenario_fail_capable_steps(scenario_name):
+    incapable = SCENARIO_FAIL_INCAPABLE_STEPS.get(scenario_name, set())
+    return {
+        step_name for step_name in REQUIRED_STEPS[scenario_name]
+        if step_name not in incapable and not step_name.startswith('capture_')
+    }
+
+
+# scripts/hosted_gui_interaction.py の COORDINATE_PROBE_TEST_QUALIFIED_NAME と同じ値。
+# 独立 probe が実際にこの1件の hit-test を実行して pass したことを、cargo test の
+# 生出力から突き合わせて確認するために使う(PR #139 review: `result == "pass"` だけでは
+# hit-test 未実行や証拠欠落の receipt も通ってしまうため)。
+COORDINATE_PROBE_TEST_QUALIFIED_NAME = 'view::tests::boundary_click_lands_on_source_offset_independent_of_ocr'
 REQUIRED_IMAGES = [
     'ascii_edit_save_undo_redo_reopen/before.png',
     'ascii_edit_save_undo_redo_reopen/after.png',
@@ -186,6 +237,72 @@ def _artifact_sha256(evidence_dir, relative):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _numeric(mapping, *fields):
+    for field in fields:
+        value = mapping.get(field) if isinstance(mapping, dict) else None
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            raise ValueError(f'click evidence field not numeric: {field}')
+
+
+def _require_click_evidence(step, expected_text, expected_edge):
+    evidence = step.get('click_evidence')
+    if not isinstance(evidence, dict):
+        raise ValueError('missing click-text OCR/click evidence')
+    required = ('matched_text', 'bounding_box', 'window_bounds', 'click_point', 'edge')
+    for field in required:
+        if field not in evidence:
+            raise ValueError(f'click evidence missing field: {field}')
+    if not isinstance(evidence['matched_text'], str) or not evidence['matched_text']:
+        raise ValueError('click evidence matched_text invalid')
+    if evidence['matched_text'] != expected_text:
+        raise ValueError('click evidence matched_text does not match expected boundary target')
+    if evidence['edge'] not in ('start', 'end'):
+        raise ValueError('click evidence edge invalid')
+    if evidence['edge'] != expected_edge:
+        raise ValueError('click evidence edge does not match expected boundary side')
+
+    box = evidence['bounding_box']
+    if not isinstance(box, dict):
+        raise ValueError('click evidence bounding_box invalid')
+    _numeric(box, 'minX', 'maxX', 'minY', 'maxY')
+    if not (0 <= box['minX'] < box['maxX'] <= 1 and 0 <= box['minY'] < box['maxY'] <= 1):
+        raise ValueError('click evidence bounding_box out of normalized range')
+
+    window = evidence['window_bounds']
+    if not isinstance(window, dict):
+        raise ValueError('click evidence window_bounds invalid')
+    _numeric(window, 'x', 'y', 'width', 'height')
+    if window['width'] <= 0 or window['height'] <= 0:
+        raise ValueError('click evidence window_bounds out of range')
+
+    point = evidence['click_point']
+    if not isinstance(point, dict):
+        raise ValueError('click evidence click_point invalid')
+    _numeric(point, 'x', 'y')
+
+    x_norm = box['minX'] if evidence['edge'] == 'start' else box['maxX']
+    expected_x = window['x'] + x_norm * window['width']
+    y_norm_from_top = 1 - (box['minY'] + (box['maxY'] - box['minY']) / 2)
+    expected_y = window['y'] + y_norm_from_top * window['height']
+    tolerance = 1e-6 * max(1.0, window['width'], window['height'])
+    if abs(point['x'] - expected_x) > tolerance or abs(point['y'] - expected_y) > tolerance:
+        raise ValueError('click evidence click_point does not match bounding_box/edge geometry')
+
+
+def _require_boundary_landing(step, expected_text, expected_edge, expected_canonical_offset):
+    _require_click_evidence(step, expected_text, expected_edge)
+    expected_offset = step.get('expected_canonical_source_offset')
+    actual_offset = step.get('actual_landing_source_offset')
+    if not isinstance(expected_offset, int) or isinstance(expected_offset, bool) or expected_offset < 0:
+        raise ValueError('missing or invalid expected canonical source offset')
+    if not isinstance(actual_offset, int) or isinstance(actual_offset, bool) or actual_offset < 0:
+        raise ValueError('missing or invalid actual landing source offset')
+    if expected_offset != expected_canonical_offset:
+        raise ValueError('expected canonical source offset does not match known fixture position')
+    if step.get('landing_classification') != 'at_canonical' or actual_offset != expected_offset:
+        raise ValueError('boundary landing classification/offset evidence mismatch')
+
+
 def _delimiter_states(delimiter):
     closed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose{delimiter} tail'
     unclosed = INLINE_FIXTURE_ORIGINAL + f' {delimiter}loose tail'
@@ -216,6 +333,17 @@ def _validate_inline_evidence(steps, evidence_dir):
         'boundary_click_edit_list_check_0': INLINE_FIXTURE_ORIGINAL.replace('item with *italic', 'item with *Zitalic', 1),
         'boundary_ime_input_check': INLINE_FIXTURE_ORIGINAL.replace('**bold', '**日本語bold', 1),
     }
+    # OCR がマッチとして返す文字列は lookaround の zero-width 部分を含まないため、
+    # ここでの期待値は hosted_gui_interaction.py の *_OCR_RE から lookaround を除いた
+    # 実際にキャプチャされるリテラル文字列にする。
+    boundary_click_edit_checks = {
+        'boundary_click_edit_bold_italic_check_0': ('bold italic combo', 'start'),
+        'boundary_click_edit_bold_italic_check_1': ('bold italic combo', 'end'),
+        'boundary_click_edit_code_span_check_0': ('code', 'start'),
+        'boundary_click_edit_code_span_check_1': ('span', 'end'),
+        'boundary_click_edit_quote_check_0': ('bold', 'start'),
+        'boundary_click_edit_list_check_0': ('italic', 'start'),
+    }
     for name, image in boundary_images.items():
         step = by_name[name]
         _require_text(step, 'expected_after_insert', 'actual_after_insert',
@@ -227,6 +355,10 @@ def _validate_inline_evidence(steps, evidence_dir):
         if (step['expected_after_undo'] != INLINE_FIXTURE_ORIGINAL
                 or step['expected_after_undo'] != step['actual_after_undo']):
             raise ValueError('inline undo evidence mismatch')
+        if name in boundary_click_edit_checks:
+            expected_pattern, expected_edge = boundary_click_edit_checks[name]
+            expected_canonical_offset = boundary_expected[name].index(BOUNDARY_MARK)
+            _require_boundary_landing(step, expected_pattern, expected_edge, expected_canonical_offset)
 
     navigation = {
         'boundary_caret_navigation_check_0': (
@@ -336,9 +468,207 @@ def _validate_inline_evidence(steps, evidence_dir):
         raise ValueError('multiline code span visual transition evidence mismatch')
 
 
+# scripts/hosted_gui_interaction.py の COORDINATE_PROBE_RUST_SOURCE に注入される
+# `#[gpui::test]` が使う source text と完全に同じ literal(PR #139 review: 各ケースの
+# canonical offset を、probe が自己申告する値ではなく source bytes から独立に導出
+# して突き合わせるため)。
+COORDINATE_PROBE_SOURCE_TEXT = (
+    'x\n\n**bold *italic* combo** boundary line.\n\n'
+    'this inline `code\nspan` crosses a line.\n\n'
+    '> quote with **bold**\n\n'
+    '- list item with *italic*\n'
+)
+
+
+def _coordinate_probe_expected_cases():
+    text = COORDINATE_PROBE_SOURCE_TEXT
+
+    bold_source_line = '**bold *italic* combo** boundary line.'
+    bold_line_start = text.index(bold_source_line)
+    bold_open = bold_line_start + 2
+    bold_close = bold_line_start + bold_source_line.index('combo**') + len('combo')
+
+    code_open_source_line = 'this inline `code'
+    code_open_line_start = text.index(code_open_source_line)
+    code_open = code_open_line_start + code_open_source_line.index('`') + 1
+
+    code_close_source_line = 'span` crosses a line.'
+    code_close_line_start = text.index(code_close_source_line)
+    code_close = code_close_line_start + code_close_source_line.index('span`') + len('span')
+
+    quote_source_line = '> quote with **bold**'
+    quote_line_start = text.index(quote_source_line)
+    quote_open = quote_line_start + quote_source_line.index('**bold') + 2
+    quote_close = quote_line_start + quote_source_line.index('bold**') + len('bold')
+
+    list_source_line = '- list item with *italic*'
+    list_line_start = text.index(list_source_line)
+    list_open = list_line_start + list_source_line.index('*italic') + 1
+    list_close = list_line_start + list_source_line.index('italic*') + len('italic')
+
+    return {
+        'bold_open': ('start', bold_open), 'bold_close': ('end', bold_close),
+        'code_open': ('start', code_open), 'code_close': ('end', code_close),
+        'quote_open': ('start', quote_open), 'quote_close': ('end', quote_close),
+        'list_open': ('start', list_open), 'list_close': ('end', list_close),
+    }
+
+
+def _validate_probe_common_evidence(step, expected_target_test_line):
+    if step.get('restored') is not True or step.get('clean_tree') is not True:
+        raise ValueError('coordinate-independent probe restore/clean-tree evidence missing')
+    if step.get('clean_tree_paths') != []:
+        raise ValueError('coordinate-independent probe clean-tree evidence missing or not empty')
+    original_sha256 = step.get('original_view_rs_sha256')
+    restored_sha256 = step.get('restored_view_rs_sha256')
+    if not isinstance(original_sha256, str) or not re.fullmatch('[0-9a-f]{64}', original_sha256):
+        raise ValueError('coordinate-independent probe original view.rs SHA-256 missing or invalid')
+    if original_sha256 != restored_sha256:
+        raise ValueError('coordinate-independent probe restored view.rs does not hash-match the original')
+    if step.get('test_name') != COORDINATE_PROBE_TEST_QUALIFIED_NAME:
+        raise ValueError('coordinate-independent probe test name mismatch')
+    if step.get('tests_executed') != 1:
+        raise ValueError('coordinate-independent probe did not execute exactly one hit-test')
+    output = step.get('cargo_test_output')
+    if not isinstance(output, str) or not output.strip():
+        raise ValueError('coordinate-independent probe cargo test output missing')
+    if step.get('target_test_line') != expected_target_test_line:
+        raise ValueError('coordinate-independent probe cargo test output does not confirm target test result')
+
+
+def _validate_probe_case_offset(case, case_id, expected_edge, expected_offset):
+    if case.get('edge') != expected_edge:
+        raise ValueError(f'coordinate-independent probe case {case_id} boundary side mismatch')
+    canonical_offset = case.get('canonical_source_offset')
+    if (not isinstance(canonical_offset, int) or isinstance(canonical_offset, bool)
+            or canonical_offset != expected_offset):
+        raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
+    max_offset = len(COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
+    # Both selection endpoints, not just `active`, must be checked against the
+    # canonical offset: a click that leaves `active == canonical` but
+    # `anchor != canonical` still landed on a range selection, not the caret
+    # the procedure asserts, so an anchor-only mismatch must not be treated as
+    # coordinate-independent evidence of a canonical landing (Codex review, PR #139).
+    anchor_offset = case.get('actual_anchor_source_offset')
+    active_offset = case.get('actual_active_source_offset')
+    for label, offset in (('anchor', anchor_offset), ('active', active_offset)):
+        if (not isinstance(offset, int) or isinstance(offset, bool)
+                or not 0 <= offset <= max_offset):
+            raise ValueError(
+                f'coordinate-independent probe case {case_id} actual {label} offset missing or out of source range'
+            )
+    return anchor_offset, active_offset
+
+
+def _iter_probe_cases(cases, expected_cases):
+    if not isinstance(cases, list) or len(cases) != len(expected_cases):
+        raise ValueError('coordinate-independent probe per-case evidence missing or incomplete')
+    seen = set()
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError('coordinate-independent probe case evidence malformed')
+        case_id = case.get('case')
+        if case_id not in expected_cases or case_id in seen:
+            raise ValueError('coordinate-independent probe case identity missing or duplicated')
+        seen.add(case_id)
+        expected_edge, expected_offset = expected_cases[case_id]
+        yield case_id, expected_edge, expected_offset, case
+    if seen != set(expected_cases):
+        raise ValueError('coordinate-independent probe missing expected case coverage')
+
+
+def _validate_coordinate_probe_evidence(steps):
+    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
+    if step is None:
+        raise ValueError('coordinate-independent probe step missing')
+    _validate_probe_common_evidence(step, f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok')
+
+    expected_cases = _coordinate_probe_expected_cases()
+    cases = step.get('probe_cases')
+    for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
+        anchor_offset, active_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        if anchor_offset != expected_offset or active_offset != expected_offset:
+            raise ValueError(f'coordinate-independent probe case {case_id} landed on a non-canonical offset')
+        if case.get('classification') != 'at_canonical':
+            raise ValueError(f'coordinate-independent probe case {case_id} classification is not at_canonical')
+
+
+def _validate_coordinate_probe_fail_evidence(steps):
+    """`overall_result='fail'` の独立 probe 専用契約(Issue #137 review, PR #139)。
+
+    `if outcome == 'pass'` の外側で fail/blocked が丸ごと未検証のまま受理されると、
+    case identity・edge・canonical/actual offset・classification・復元 hash・
+    dirty-tree proof が欠落・改変された fail receipt も final judge に通ってしまう
+    ため、helper/OCR/環境障害由来の blocked とは分離して fail 専用に必須化する。
+
+    この専用契約は `coordinate_independent_probe` scenario 自身が
+    `result == 'fail'` を自己申告した場合にのみ適用する(PR #139 review)。
+    ascii_edit_save_undo_redo_reopen・japanese_ime_input・os_scroll・
+    inline_syntax_boundary など他 scenario の製品不具合による正当な
+    overall_result='fail' まで、probe 自身の fail を一律には要求しない。
+    """
+    step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
+    if step is None:
+        raise ValueError('coordinate-independent probe fail step missing')
+    if step.get('result') != 'fail':
+        raise ValueError('coordinate-independent probe scenario fail is not backed by a fail step')
+    _validate_probe_common_evidence(step, f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED')
+
+    expected_cases = _coordinate_probe_expected_cases()
+    cases = step.get('probe_cases')
+    mismatch_found = False
+    for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
+        anchor_offset, active_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        # A range selection left behind by the click (anchor != active) is a
+        # mismatch even when `active` alone lands on the canonical offset —
+        # matching the Rust probe's own `actual == Selection::caret(canonical)`
+        # check, which fails on any such residual selection (Codex review, PR #139).
+        is_mismatch = anchor_offset != expected_offset or active_offset != expected_offset
+        if case.get('classification') != ('mismatch' if is_mismatch else 'at_canonical'):
+            raise ValueError(f'coordinate-independent probe case {case_id} classification inconsistent with offsets')
+        mismatch_found = mismatch_found or is_mismatch
+    if not mismatch_found:
+        raise ValueError('coordinate-independent probe fail evidence has no non-canonical mismatch case')
+
+
+def _validate_producer_cardinality(raw):
+    """`producer` (scripts/hosted_gui_interaction.py) generates each top-level
+    step, each scenario, and each scenario's child steps at most once (or, for
+    the ascii reopen trio, at most twice). A receipt that reports the same
+    name more than that, at any of the three levels, cannot come from a real
+    run — it is evidence of a genuine pass duplicated with a fabricated fail
+    tacked on beside it (PR #139 review)."""
+    top_counts = {}
+    for step in raw.get('top_level_steps', []):
+        name = step.get('name')
+        if name in TOP_LEVEL_STEP_NAMES:
+            top_counts[name] = top_counts.get(name, 0) + 1
+    if any(count > 1 for count in top_counts.values()):
+        raise ValueError('top-level step name reported more than once')
+
+    scenario_names = [s.get('name') for s in raw.get('scenarios', []) if s.get('name') in REQUIRED_STEPS]
+    if len(scenario_names) != len(set(scenario_names)):
+        raise ValueError('scenario name reported more than once')
+
+    for scenario in raw.get('scenarios', []):
+        name = scenario.get('name')
+        if name not in REQUIRED_STEPS:
+            continue
+        duplicate_allowed = SCENARIO_REOPEN_DUPLICATE_STEPS if name == 'ascii_edit_save_undo_redo_reopen' else set()
+        step_counts = {}
+        for step in scenario.get('steps', []):
+            step_name = step.get('name')
+            step_counts[step_name] = step_counts.get(step_name, 0) + 1
+        for step_name, count in step_counts.items():
+            limit = 2 if step_name in duplicate_allowed else 1
+            if count > limit:
+                raise ValueError('scenario step name reported more times than the producer can generate')
+
+
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     """Fail closed on provenance/shape errors; never upgrade partial evidence."""
     now = now or datetime.now(timezone.utc)
+    _validate_producer_cardinality(raw)
     if request.get('procedure_version') != PROCEDURE:
         raise ValueError('requested procedure version mismatch')
     expected = (('request_id', request['request_id']), ('run_id', request['run_id']),
@@ -361,6 +691,33 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
         raise ValueError('unknown GUI outcome')
     if job_conclusion not in ('success', 'failure'):
         raise ValueError('worker did not finish normally')
+    if outcome == 'fail':
+        scenarios = raw.get('scenarios', [])
+        probe_scenario = next((s for s in scenarios if s.get('name') == 'coordinate_independent_probe'), None)
+        if probe_scenario is not None and probe_scenario.get('result') == 'fail':
+            _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
+        else:
+            failing_top_level = False
+            for step in raw.get('top_level_steps', []):
+                if step.get('result') != 'fail':
+                    continue
+                if step.get('name') not in TOP_LEVEL_STEP_NAMES:
+                    raise ValueError('top-level fail is not a known top-level step')
+                if step.get('name') not in TOP_LEVEL_FAIL_CAPABLE_STEPS:
+                    raise ValueError('top-level step cannot report its own fail')
+                failing_top_level = True
+            failing_scenario = False
+            for scenario in scenarios:
+                if scenario.get('result') != 'fail':
+                    continue
+                if scenario.get('name') not in REQUIRED_STEPS:
+                    raise ValueError('fail scenario is not a known scenario name')
+                failing_names = {s.get('name') for s in scenario.get('steps', []) if s.get('result') == 'fail'}
+                if not failing_names & _scenario_fail_capable_steps(scenario['name']):
+                    raise ValueError('scenario fail is not backed by any failing required step that can produce fail')
+                failing_scenario = True
+            if not failing_top_level and not failing_scenario:
+                raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')
     if outcome == 'pass':
         if job_conclusion != 'success':
             raise ValueError('passing payload from unsuccessful worker')
@@ -393,6 +750,8 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                         raise ValueError('reopen lifecycle incomplete')
             if scenario['name'] == 'inline_syntax_boundary':
                 _validate_inline_evidence(steps, evidence_dir)
+            if scenario['name'] == 'coordinate_independent_probe':
+                _validate_coordinate_probe_evidence(steps)
         for relative in REQUIRED_IMAGES:
             _artifact_sha256(evidence_dir, relative)
     return outcome

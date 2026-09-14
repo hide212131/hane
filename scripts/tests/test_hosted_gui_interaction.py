@@ -1,6 +1,7 @@
 """Helper provenance checks without touching a screen or invoking Swift."""
 import hashlib
 import inspect
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -150,6 +151,425 @@ class InlineSyntaxExpectationTests(unittest.TestCase):
     def test_inline_syntax_scenario_exercises_the_existing_multiline_code_span(self):
         source = inspect.getsource(interaction.run_inline_syntax_scenario)
         self.assertIn('run_multiline_code_span_toggle_step(', source)
+
+
+class MatchInsertionOffsetTests(unittest.TestCase):
+    """Issue #137: the canonical source offset used to build the expected
+    fixture bytes must be the same offset used later to judge where an
+    actual click landed."""
+
+    def test_offset_reproduces_insert_at_match(self):
+        text = interaction.INLINE_FIXTURE_ORIGINAL
+        cases = [
+            (interaction.BOLD_ITALIC_OPEN_RE, 'end'),
+            (interaction.BOLD_ITALIC_CLOSE_RE, 'start'),
+            (interaction.CODE_SPAN_OPEN_RE, 'end'),
+            (interaction.CODE_SPAN_CLOSE_RE, 'start'),
+            (interaction.QUOTE_BOLD_OPEN_RE, 'end'),
+            (interaction.LIST_ITALIC_OPEN_RE, 'end'),
+        ]
+        for pattern, edge in cases:
+            with self.subTest(pattern=pattern, edge=edge):
+                offset = interaction.match_insertion_offset(text, pattern, edge=edge)
+                self.assertEqual(
+                    text[:offset] + 'Z' + text[offset:],
+                    interaction.insert_at_match(text, pattern, 'Z', edge=edge),
+                )
+
+    def test_unmatched_pattern_is_rejected(self):
+        with self.assertRaises(ValueError):
+            interaction.match_insertion_offset(interaction.INLINE_FIXTURE_ORIGINAL, r'not-present', edge='end')
+
+
+class LocateSingleInsertionOffsetTests(unittest.TestCase):
+    """Issue #137: separate a clean single-character landing at the wrong
+    offset (a deterministic, explainable outcome that can be compared against
+    the expected canonical offset) from bytes that cannot be explained as a
+    single insertion at all."""
+
+    def test_locates_the_unique_offset(self):
+        self.assertEqual(
+            interaction.locate_single_insertion_offset('combo** boundary', 'comboZ** boundary', 'Z'), 5)
+
+    def test_locates_the_offset_observed_in_run_34744353175(self):
+        # PR #132 の trusted GUI run で実際に観測された着地: **bold *italic* combo**
+        # の閉じ境界クリックが期待の "comboZ**" ではなく "combo** Zboundary" になった。
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        actual = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+        expected_offset = interaction.match_insertion_offset(
+            baseline, interaction.BOLD_ITALIC_CLOSE_RE, edge='start')
+        landing_offset = interaction.locate_single_insertion_offset(baseline, actual, 'Z')
+        self.assertIsNotNone(landing_offset)
+        self.assertEqual(landing_offset - expected_offset, 3)  # "**" と直後の空白1文字を飛び越えた
+
+    def test_returns_none_when_length_rules_out_a_single_insertion(self):
+        self.assertIsNone(
+            interaction.locate_single_insertion_offset('combo** boundary', 'combo** boundary and more', 'Z'))
+
+    def test_returns_none_when_the_offset_is_ambiguous(self):
+        # 'a' の連続に 'a' を挿入すると、どの位置に挿入しても同じ結果になるため
+        # 単一の着地点として特定できない。
+        self.assertIsNone(interaction.locate_single_insertion_offset('aaaa', 'aaaaa', 'a'))
+
+
+class ParseClickEvidenceTests(unittest.TestCase):
+    """Issue #137: click-text の stdout から OCR bounding box と実クリック座標を
+    evidence として取り出す。取り出せない場合は helper 自身の契約違反として
+    procedure blocked に倒せるよう ValueError にする。"""
+
+    VALID_STDOUT = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'end',
+    })
+
+    def test_parses_well_formed_evidence(self):
+        evidence = interaction.parse_click_evidence(self.VALID_STDOUT)
+        self.assertEqual(evidence['matched_text'], 'combo')
+        self.assertEqual(evidence['click_point'], {'x': 123.0, 'y': 456.0})
+
+    def test_rejects_non_json_stdout(self):
+        with self.assertRaises(ValueError):
+            interaction.parse_click_evidence('clicked at 1,2 for pattern combo edge=end')
+
+    def test_rejects_json_missing_required_fields(self):
+        with self.assertRaises(ValueError):
+            interaction.parse_click_evidence(json.dumps({'matched_text': 'combo'}))
+
+
+class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
+    """Issue #137: click-text の evidence を残しつつ、境界クリック挿入の着地点が
+    期待 canonical position からどれだけ離れているかで「helper 自身が意図した
+    visual boundary へ到達できなかった疑い(procedure blocked)」と「製品 source
+    mapping の疑い(fail、#101 で切り分け)」を区別する。"""
+
+    OCR_EVIDENCE = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'start',
+    })
+
+    def _run(self, directory, final_fixture_content):
+        fixture_path = Path(directory) / 'fixture.md'
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        fixture_path.write_text(baseline, encoding='utf-8')
+        calls = []
+
+        def fake_run_helper(swift_helper, args, timeout):
+            calls.append(args[0])
+            if args[0] == 'click-text':
+                return True, self.OCR_EVIDENCE, ''
+            if args[0] == 'type-save':
+                fixture_path.write_text(final_fixture_content, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'undo-save':
+                fixture_path.write_text(baseline, encoding='utf-8')
+                return True, '', ''
+            raise AssertionError(f'unexpected helper call: {args}')
+
+        with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+            status, reason, detail = interaction.boundary_edit_check(
+                None, Path('/unused.png'), 1234, fixture_path, baseline,
+                interaction.BOLD_ITALIC_OCR_RE, 'end',
+                interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                1.0, 0.0,
+            )
+        return status, reason, detail, calls
+
+    def test_exact_canonical_landing_passes_and_records_click_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            expected = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            status, reason, detail, calls = self._run(directory, expected)
+        self.assertEqual(status, 'pass')
+        self.assertIsNone(reason)
+        self.assertEqual(detail['landing_classification'], 'at_canonical')
+        self.assertEqual(detail['click_evidence']['matched_text'], 'combo')
+        self.assertEqual(detail['actual_landing_source_offset'], detail['expected_canonical_source_offset'])
+        self.assertEqual(calls, ['click-text', 'type-save', 'undo-save'])
+
+    def test_matched_bytes_with_inconsistent_recomputed_offset_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            expected = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            with patch.object(interaction, 'locate_single_insertion_offset', return_value=999999):
+                status, reason, detail, calls = self._run(directory, expected)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'corrupted')
+        self.assertEqual(detail['actual_landing_source_offset'], 999999)
+        self.assertNotIn('undo-save', calls)
+
+    def test_near_canonical_mismatch_is_blocked_without_independent_coordinate_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            actual = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            status, reason, detail, calls = self._run(directory, actual)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'boundary_ambiguous_near_canonical')
+        self.assertEqual(detail['landing_offset_delta'], 3)
+        self.assertIn('#101', reason)
+        self.assertNotIn('undo-save', calls)
+
+    def test_far_miss_is_blocked_instead_of_attributed_to_the_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            actual = baseline.replace('list item with', 'list Zitem with', 1)
+            status, reason, detail, calls = self._run(directory, actual)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'far_miss')
+        self.assertGreater(detail['landing_offset_delta'], interaction.BOUNDARY_LANDING_FAR_MISS_CHARS)
+        self.assertNotIn('undo-save', calls)
+
+    def test_corrupted_result_that_is_not_a_single_insertion_stays_a_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status, reason, detail, calls = self._run(directory, 'totally unrelated content')
+        self.assertEqual(status, 'fail')
+        self.assertEqual(detail['landing_classification'], 'corrupted')
+
+    def test_unmodified_fixture_after_insertion_is_blocked_as_not_inserted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            status, reason, detail, calls = self._run(directory, baseline)
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(detail['landing_classification'], 'not_inserted')
+        self.assertNotIn('undo-save', calls)
+
+    def test_click_text_execution_failure_is_blocked_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                calls.append(args[0])
+                if args[0] == 'click-text':
+                    return False, '', 'OCR で対象文字列を認識できない'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                status, reason, detail = interaction.boundary_edit_check(
+                    None, Path('/unused.png'), 1234, fixture_path, baseline,
+                    interaction.BOLD_ITALIC_OCR_RE, 'end',
+                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                    1.0, 0.0,
+                )
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(calls, ['click-text'])
+        self.assertIn('OCR', reason)
+
+    def test_type_save_execution_failure_is_blocked_not_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                calls.append(args[0])
+                if args[0] == 'click-text':
+                    return True, self.OCR_EVIDENCE, ''
+                if args[0] == 'type-save':
+                    return False, '', 'timeout waiting for helper integrity check'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                status, reason, detail = interaction.boundary_edit_check(
+                    None, Path('/unused.png'), 1234, fixture_path, baseline,
+                    interaction.BOLD_ITALIC_OCR_RE, 'end',
+                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                    1.0, 0.0,
+                )
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(calls, ['click-text', 'type-save'])
+        self.assertIn('timeout', reason)
+
+    def test_malformed_click_evidence_is_blocked_before_typing_the_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            calls = []
+
+            def fake_run_helper(swift_helper, args, timeout):
+                calls.append(args[0])
+                if args[0] == 'click-text':
+                    return True, 'clicked at 1,2 for pattern combo edge=end', ''
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
+                status, reason, detail = interaction.boundary_edit_check(
+                    None, Path('/unused.png'), 1234, fixture_path, baseline,
+                    interaction.BOLD_ITALIC_OCR_RE, 'end',
+                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
+                    1.0, 0.0,
+                )
+        self.assertEqual(status, 'blocked')
+        self.assertEqual(calls, ['click-text'])
+        self.assertNotIn('click_evidence', detail)
+
+
+class RunBoundaryStepReproducibilityConfirmationTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): a `blocked` near-canonical/far-miss
+    landing gets a second OCR/click attempt recorded as extra evidence.
+    run_boundary_step is the orchestration layer with access to a fresh
+    screenshot, so the retry lives there rather than inside the single-attempt
+    boundary_edit_check. A later review (Codex, PR #139) clarified that the
+    retry reuses the same OCR->click helper path, so even a reproduced offset
+    is not independent coordinate evidence and must stay `blocked`, never
+    escalate to `fail`."""
+
+    OCR_EVIDENCE = json.dumps({
+        'matched_text': 'combo',
+        'bounding_box': {'minX': 0.1, 'maxX': 0.2, 'minY': 0.3, 'maxY': 0.4},
+        'window_bounds': {'x': 0.0, 'y': 0.0, 'width': 800.0, 'height': 600.0},
+        'click_point': {'x': 123.0, 'y': 456.0},
+        'edge': 'start',
+    })
+
+    def _run(self, directory, type_save_contents):
+        """type_save_contents supplies the fixture bytes written by each
+        successive type-save call, in order (attempt 1, then attempt 2 if a
+        confirmation retry happens)."""
+        fixture_path = Path(directory) / 'fixture.md'
+        baseline = interaction.INLINE_FIXTURE_ORIGINAL
+        fixture_path.write_text(baseline, encoding='utf-8')
+        calls = []
+        type_save_calls = {'count': 0}
+
+        def fake_run_helper(swift_helper, args, timeout):
+            calls.append(args[0])
+            if args[0] == 'click-text':
+                return True, self.OCR_EVIDENCE, ''
+            if args[0] == 'type-save':
+                content = type_save_contents[type_save_calls['count']]
+                type_save_calls['count'] += 1
+                fixture_path.write_text(content, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'undo-save':
+                fixture_path.write_text(baseline, encoding='utf-8')
+                return True, '', ''
+            if args[0] == 'force-save':
+                return True, '', ''
+            if args[0] == 'move-doc-start':
+                return True, '', ''
+            raise AssertionError(f'unexpected helper call: {args}')
+
+        def fake_capture_named(module, env, config, window_id, run_dir, label):
+            return {'name': f'capture_{label}', 'result': 'pass', 'reason': None}
+
+        config = SimpleNamespace(fixture_path=fixture_path)
+        process_holder = {'process': SimpleNamespace(pid=1234)}
+        checks = [(
+            interaction.BOLD_ITALIC_OCR_RE, 'end',
+            interaction.BOLD_ITALIC_CLOSE_RE, 'start',
+        )]
+        with patch.object(interaction, 'run_helper', side_effect=fake_run_helper), \
+             patch.object(interaction, 'capture_named', side_effect=fake_capture_named):
+            steps = interaction.run_boundary_step(
+                None, {}, config, None, process_holder, 'window-1', Path(directory),
+                'boundary_click_edit_bold_italic', checks, 1.0, 0.0,
+            )
+        return steps, calls, fixture_path, baseline
+
+    def test_reproduced_mismatch_across_two_attempts_stays_blocked_not_fail(self):
+        """PR #139 review (Codex): both attempts reuse the same OCR->click helper
+        path, so a reproduced offset only proves the OCR/click error is systematic,
+        not that the product's source mapping is wrong. Without an independent
+        coordinate-specific verification, this must stay `blocked`, never `fail`."""
+        with tempfile.TemporaryDirectory() as directory:
+            mismatch = interaction.INLINE_FIXTURE_ORIGINAL.replace(
+                'combo** boundary', 'combo** Zboundary', 1)
+            steps, calls, _fixture_path, _baseline = self._run(directory, [mismatch, mismatch])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('reproducible_mismatch', final_step['reason'])
+        self.assertNotEqual(final_step['result'], 'fail')
+        confirm_check = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_0_confirm_check')
+        self.assertEqual(confirm_check['result'], 'blocked')
+        self.assertEqual(confirm_check['landing_classification'], 'boundary_ambiguous_near_canonical')
+        restore_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_0_confirm_restore')
+        self.assertEqual(restore_step['result'], 'pass')
+        self.assertEqual(calls.count('click-text'), 2)
+        self.assertEqual(calls.count('type-save'), 2)
+
+    def test_retry_landing_at_canonical_stays_blocked_as_non_reproducible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            canonical = interaction.insert_at_match(
+                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
+            steps, _calls, _fixture_path, _baseline = self._run(directory, [mismatch, canonical])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('再現しなかった', final_step['reason'])
+
+    def test_retry_landing_at_a_different_offset_stays_blocked_as_inconclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+            different_mismatch = baseline.replace('boundary line', 'boundaryZ line', 1)
+            steps, _calls, _fixture_path, _baseline = self._run(
+                directory, [mismatch, different_mismatch])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('別の非 canonical', final_step['reason'])
+
+    def test_confirmation_is_skipped_when_baseline_restore_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            fixture_path.write_text(baseline, encoding='utf-8')
+            mismatch = baseline.replace('combo** boundary', 'combo** Zboundary', 1)
+
+            def fake_run_helper(swift_helper, args, timeout):
+                if args[0] == 'click-text':
+                    return True, self.OCR_EVIDENCE, ''
+                if args[0] == 'type-save':
+                    fixture_path.write_text(mismatch, encoding='utf-8')
+                    return True, '', ''
+                if args[0] == 'force-save':
+                    return True, '', ''
+                if args[0] == 'undo-save':
+                    return False, '', 'System Events を利用できない'
+                raise AssertionError(f'unexpected helper call: {args}')
+
+            def fake_capture_named(module, env, config, window_id, run_dir, label):
+                return {'name': f'capture_{label}', 'result': 'pass', 'reason': None}
+
+            config = SimpleNamespace(fixture_path=fixture_path)
+            process_holder = {'process': SimpleNamespace(pid=1234)}
+            checks = [(
+                interaction.BOLD_ITALIC_OCR_RE, 'end',
+                interaction.BOLD_ITALIC_CLOSE_RE, 'start',
+            )]
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper), \
+                 patch.object(interaction, 'capture_named', side_effect=fake_capture_named):
+                steps = interaction.run_boundary_step(
+                    None, {}, config, None, process_holder, 'window-1', Path(directory),
+                    'boundary_click_edit_bold_italic', checks, 1.0, 0.0,
+                )
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        self.assertIn('baseline 復元に失敗した', final_step['reason'])
+        self.assertNotIn('boundary_click_edit_bold_italic_0_confirm_check',
+                          {s['name'] for s in steps})
+
+    def test_non_ambiguous_blocked_classification_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = interaction.INLINE_FIXTURE_ORIGINAL
+            steps, calls, _fixture_path, _baseline = self._run(directory, [baseline])
+        final_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic')
+        self.assertEqual(final_step['result'], 'blocked')
+        check_step = next(s for s in steps if s['name'] == 'boundary_click_edit_bold_italic_check_0')
+        self.assertEqual(check_step['landing_classification'], 'not_inserted')
+        self.assertEqual(calls.count('type-save'), 1)
 
 
 class RestoreScenarioBaselineTests(unittest.TestCase):
@@ -554,6 +974,304 @@ class InlineSyntaxScenarioContaminationTests(unittest.TestCase):
                     'multiline_code_span_close_toggle'):
             self.assertIn(name, skipped_names, f'{name} should be skipped after a failed baseline restore')
             self.assertIn('復元', skipped_names[name]['reason'])
+
+
+class CoordinateProbeSourceTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): the injected probe payload itself
+    must not fold the known non-canonical landing into the "expected" value,
+    and must cover quote/list boundaries, not just bold/code."""
+
+    def test_closing_boundary_offsets_are_canonical_not_marker_inclusive(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('bold_source_line.find("combo**").unwrap() + "combo".len()', source)
+        self.assertNotIn('"combo**".len()', source)
+        self.assertIn('code_close_source_line.find("span`").unwrap() + "span".len()', source)
+        self.assertNotIn('"span`".len()', source)
+
+    def test_probe_covers_quote_and_list_boundaries(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('"> quote with **bold**"', source)
+        self.assertIn('"- list item with *italic*"', source)
+
+    def test_mismatches_are_collected_instead_of_folded_into_expected(self):
+        source = interaction.COORDINATE_PROBE_RUST_SOURCE
+        self.assertIn('mismatches.push', source)
+        self.assertIn('mismatches.is_empty()', source)
+
+
+class RunCoordinateIndependentProbeTests(unittest.TestCase):
+    """Issue #137 review (Codex, PR #139): the independent GPUI probe must
+    never live permanently under crates/**; the validator injects it into a
+    disposable clone, and any failure to prove original-byte/clean-tree
+    restoration must fail closed instead of trusting the cargo test result."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.snapshot = Path(self.tempdir.name) / 'snapshot'
+        view_dir = self.snapshot / 'crates' / 'ui' / 'src'
+        view_dir.mkdir(parents=True)
+        self.view_rs = view_dir / 'view.rs'
+        self.original = b"mod tests {\n    fn existing() {}\n}\n"
+        self.view_rs.write_bytes(self.original)
+        subprocess.run(['git', 'init', '-q', str(self.snapshot)], check=True)
+        subprocess.run(['git', '-C', str(self.snapshot), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.snapshot), '-c', 'user.name=GUI test',
+                        '-c', 'user.email=gui-test@example.invalid', '-c', 'commit.gpgsign=false',
+                        'commit', '-qm', 'seed'], check=True)
+
+        class FakeEnvError(Exception):
+            pass
+
+        class FakeModule:
+            EnvError = FakeEnvError
+
+        class FakeEnv:
+            def git_dirty_paths(self, workspace_dir):
+                out = subprocess.run(['git', 'status', '--porcelain'], cwd=workspace_dir,
+                                      capture_output=True, text=True, check=True)
+                return [line for line in out.stdout.splitlines() if line.strip()]
+
+        self.module = FakeModule()
+        self.env = FakeEnv()
+
+    @staticmethod
+    def _passing_probe_case_lines():
+        return "\n".join(
+            f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+            f'"actual_anchor_source_offset":1,"actual_active_source_offset":1,"classification":"at_canonical"}}'
+            for case in interaction.COORDINATE_PROBE_EXPECTED_CASES
+        )
+
+    @staticmethod
+    def _failing_probe_case_lines():
+        # index 0 leaves a range selection (anchor != canonical) with
+        # `active == canonical`: the Rust probe's own `actual ==
+        # Selection::caret(canonical)` check still classifies this as a
+        # mismatch, so the receipt must carry both endpoints for the policy to
+        # reach the same verdict (Codex review, PR #139).
+        lines = []
+        for index, case in enumerate(interaction.COORDINATE_PROBE_EXPECTED_CASES):
+            if index == 0:
+                lines.append(
+                    f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+                    f'"actual_anchor_source_offset":2,"actual_active_source_offset":1,"classification":"mismatch"}}'
+                )
+            else:
+                lines.append(
+                    f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+                    f'"actual_anchor_source_offset":1,"actual_active_source_offset":1,"classification":"at_canonical"}}'
+                )
+        return "\n".join(lines)
+
+    def test_injects_probe_runs_cargo_test_and_restores_clean_tree_on_pass(self):
+        original_run = subprocess.run
+        captured_args = []
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            captured_args.append(args)
+            # While cargo test "runs", the file on disk must hold the
+            # injected probe source, not the pristine committed content.
+            self.assertIn(interaction.COORDINATE_PROBE_TEST_NAME.encode('utf-8'), self.view_rs.read_bytes())
+            self.assertIn(interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME, args)
+            self.assertIn('--nocapture', args)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\n{self._passing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed", '',
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'pass')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+        self.assertEqual(self.env.git_dirty_paths(self.snapshot), [])
+        self.assertEqual(captured_args[0][0], 'cargo')
+        self.assertEqual(step['tests_executed'], 1)
+        self.assertEqual(step['test_name'], interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME)
+        self.assertTrue(step['restored'])
+        self.assertTrue(step['clean_tree'])
+        self.assertEqual(step['clean_tree_paths'], [])
+        self.assertEqual(step['original_view_rs_sha256'], hashlib.sha256(self.original).hexdigest())
+        self.assertEqual(step['restored_view_rs_sha256'], step['original_view_rs_sha256'])
+        self.assertEqual(step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok")
+        self.assertIn(f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok", step['cargo_test_output'])
+        self.assertEqual(len(step['probe_cases']), len(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+        self.assertEqual({case['case'] for case in step['probe_cases']}, set(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+
+    def test_reports_blocked_when_success_line_is_truncated_out_of_the_log_tail(self):
+        """Codex review, PR #139: a normal hosted run's stderr compile output can
+        exceed 80 lines, pushing stdout's own success line out of a naive
+        stdout+stderr tail. The target line must still be recovered from the
+        untruncated output instead of falsely fail-closing a real pass."""
+        original_run = subprocess.run
+        noisy_stderr = "\n".join(f"warning: unused variable `x{i}`" for i in range(200))
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\n{self._passing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed",
+                noisy_stderr,
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'pass')
+        self.assertNotIn(f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok", step['cargo_test_output'])
+        self.assertEqual(step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok")
+
+    def test_reports_fail_when_cargo_test_confirms_a_non_canonical_landing(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101,
+                f"running 1 test\n{self._failing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
+                "assertion failed: mismatches.is_empty()\n"
+                "product source-mapping mismatch, not OCR/helper noise:\n"
+                "test result: FAILED. 0 passed; 1 failed",
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'fail')
+        self.assertIn('source mapping', step['reason'])
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+        # Issue #137 review (Codex, PR #139): a `fail` verdict must carry the
+        # same independent restore/identity/per-case evidence as a `pass`
+        # verdict, not just the reason string, so gui_policy.py can hold a
+        # product-fail receipt to a dedicated fail-only contract.
+        self.assertEqual(step['test_name'], interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME)
+        self.assertEqual(
+            step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED",
+        )
+        self.assertTrue(step['restored'])
+        self.assertTrue(step['clean_tree'])
+        self.assertEqual(step['clean_tree_paths'], [])
+        self.assertEqual(step['original_view_rs_sha256'], step['restored_view_rs_sha256'])
+        self.assertEqual(len(step['probe_cases']), len(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+
+    def test_reports_blocked_when_fail_marker_present_but_case_evidence_is_missing(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED\n",
+                "assertion failed: mismatches.is_empty()\n"
+                "product source-mapping mismatch, not OCR/helper noise:\n"
+                "test result: FAILED. 0 passed; 1 failed",
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertIn('fail-closed', step['reason'])
+
+    def test_reports_blocked_when_nonzero_exit_is_not_the_probe_assertion(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 101, '', 'error[E0433]: failed to resolve: use of undeclared crate or module',
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_reports_blocked_when_test_filter_matches_zero_tests(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'running 0 tests\ntest result: ok. 0 passed; 0 failed', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_reports_blocked_when_per_case_evidence_is_incomplete_on_a_zero_exit(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed", '',
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_fails_closed_when_original_bytes_cannot_be_restored(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+
+        original_write_bytes = Path.write_bytes
+        calls = {'n': 0}
+
+        def flaky_write_bytes(self_path, data):
+            calls['n'] += 1
+            if calls['n'] == 2:  # the restore attempt, right after injection
+                raise OSError('disk full')
+            return original_write_bytes(self_path, data)
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run), \
+             patch.object(Path, 'write_bytes', new=flaky_write_bytes):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertIn('fail-closed', step['reason'])
+        self.assertFalse(step['restored'])
+
+    def test_fails_closed_when_restored_bytes_leave_the_clone_dirty(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(args, 0, 'test result: ok', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run), \
+             patch.object(self.env, 'git_dirty_paths', return_value=[' M crates/ui/src/view.rs']):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertTrue(step['restored'])
+        self.assertFalse(step['clean_tree'])
+
+    def test_blocked_without_running_cargo_test_when_injection_anchor_is_missing(self):
+        self.view_rs.write_bytes(b'not a valid tests module tail')
+        calls = []
+
+        with patch.object(interaction.subprocess, 'run', side_effect=lambda *a, **k: calls.append(a)):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(calls, [])
 
 
 if __name__ == '__main__':
