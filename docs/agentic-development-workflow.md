@@ -737,6 +737,60 @@ Claude は修正、検証、push まで行う。push 後は以前の Codex revie
 
 最大反復回数の初期値は **3回** とする。3回で収束しない場合は `blocked` とし、人間へ引き継ぐ。
 
+## レビュー修正ループの収束
+
+review → fix → fresh review を細かく繰り返すと、Pull Request の commit 数とコメント数が際限なく増え、収束性が悪化する。[AGENTS.md の「Issue の目的と完了条件」](../AGENTS.md) にある blocker / follow-up の分離を、Claude Code が review 結果を fix へ渡すときの具体的な手順として明文化する。品質基準そのものは下げず、root-cause 単位でレビュー・修正し、元 Issue に必要な blocker と follow-up に分離すべき改善を区別する。実例は #141 の実装経緯、および #139 / #137 の事後分析コメント、#143 / #144 の current-state 実例を参照する。
+
+### fix 前に current findings を root-cause cluster 化する
+
+Claude Code は、Copilot pre-GUI routing / final judge / Claude fix worker が渡す current exact head の findings（Codex review の inline comment、CI failure、GUI validation 結果、Copilot judge の理由）を、見つけた順に1件ずつ fix する対象にしない。
+
+1. current exact head の non-outdated / unresolved な findings を一度に集める。1 件の review comment を起点に個別の Claude fix cycle を起動しない。
+2. 同じ原因・同じ設計面に属する findings を root-cause cluster にまとめる。例: producer / receipt-policy 間の evidence contract、pass / fail / blocked の terminal contract、restoration / clean-tree provenance、IME validation。独立した root cause は混ぜない。
+3. 各 cluster について、pass / fail / blocked、producer / consumer、正常系 / 異常系などの対称ケースを横断確認してから修正する。1件の指摘にだけ局所修正を当てて、同じ cluster の兄弟ケースを次サイクルの新規指摘として残さない（「pass は直したが fail が未検証」「producer は直したが policy が未対応」のような repeat を避ける）。
+
+### blocker と follow-up を分類してから直す
+
+各 cluster を、[AGENTS.md](../AGENTS.md) の merge blocker 基準（P0 / P1、セキュリティ・データ破壊・権限逸脱、通常経路で再現する明確な不具合、CI failure、Issue の目的・受入条件を直接満たせなくする P2）に照らして、current PR の blocker か follow-up Issue 候補かに分類してから fix へ進む。
+
+- 「既存・独立の cluster」として follow-up へ分離できるのは、current base SHA に対する trusted baseline と current head が、同一 procedure / policy・比較可能な evidence signature で同じ failure を示すなど、機械的に検証できる provenance がある場合に限る。単なる過去コメントや推測だけで waive しない。
+- baseline が未実行、症状が変わった、比較できないなど判断できない cluster は `unknown` として fail-closed に blocker のまま扱う。`unknown` を勝手に follow-up 化しない。必要なら同じ内容の無意味な full-suite rerun ではなく、該当 cluster を比較できる trusted baseline 検証を追加取得する。
+- 「review finding が存在する」こと自体を fix loop 継続条件にしない。follow-up に分類した cluster は current PR の merge blocker から外し、元 Issue の受入条件に不要なら別 Issue へ切り出す。
+
+### focused review の乱発を防ぐ
+
+通常の exact-head review が current scope を十分に確認できる場合、個別の focused review を重ねて Claude fix cycle を追加起動しない。focused review を追加するのは、通常 review では確認できない明確な理由がある場合に限り、その理由を Pull Request コメントに明記する。
+
+### 同種の P1 が繰り返される場合は設計見直しへ切り替える
+
+同一 root-cause cluster から merge-blocking な指摘（主に P0 / P1）が複数 fix cycle 続けて出た場合、次の cycle を「さらに1件の局所 fix」として起動しない。次のいずれかを Pull Request コメントで明示してから進める。
+
+- current PR 内で該当 cluster の contract / state transition / producer-consumer 対称性を設計レビューし、まとめて作り直す。
+- scope を分割する。
+- current Issue の受入条件に不要なら follow-up Issue へ切り出す。
+- PR 自体を作り直す方が安全ならその判断を明示する。
+
+これは review 回数に上限を設けて指摘を無視する運用ではない。merge blocker が残る限り merge しない。修正粒度をコード patch から設計へ引き上げるための切替条件である。
+
+会話セッションを新しくすること自体は、current-state の誤認を減らす手段であり、この切替条件の代わりにはならない（#139 の事後分析: 会話セッションの長期化は loop 未収束の主因ではなく、同一 root-cause cluster への小刻みな finding → fix → fresh review の反復が主因だった）。また、PR の目的を満たす過程で実装の性質が局所的な機能・テスト修正から検証基盤・プロトコル設計へ実質的に変化した場合も、commit 数だけに頼らず設計見直しや scope 分割を検討するシグナルとして扱う。
+
+### current-state 作業と履歴を分離する
+
+長期化した Pull Request では、過去 head の findings を current findings と混同しない。current exact head、current non-outdated unresolved review thread、current CI / review / GUI evidence を正本とし、過去 head は監査履歴として扱う。head が変われば head 側 evidence は stale であり、base が変われば regression baseline も再評価する。既存の「head SHA を中心にした不変条件」節、control SHA / procedure / generation の trust boundary は変更しない。
+
+full-suite の検証結果を一つの terminal status として扱う場合、scope 外の独立した failure が全体 status を failure にして current PR を不要な fix loop へ戻すことがある。GUI overall が fail だからといって全件を current PR blocker にするのも、target Issue の該当 cluster が pass したから残りを全部無視するのも正しくない。上記の cluster 単位の blocker / follow-up / `unknown` 分類を、full-suite の raw な pass/fail/blocked 記録を書き換えずに適用する。
+
+### 収束性を観測可能にする
+
+fix を起動する前後で、少なくとも次を Pull Request の判断材料として確認できるようにする。既存の commit status 履歴・Pull Request API から都度算出すればよく、新しい正本の状態フィールドを追加する必要はない。閾値による自動停止は行わないが、異常な増加は設計または進め方を見直すシグナルとして扱う。
+
+- fix cycle 数（自動修正の反復回数、および「Claude automatic fix の手動再試行」による `/claude-fix` 回数）
+- exact-head review 回数（Codex review、Codex 使用量上限時の Copilot fallback review、`/codex-review` による再要求を含む）
+- current unresolved blocker 数（上記の分類で blocker とした cluster の件数）
+- root-cause cluster 数
+- outdated / superseded review 数（現在の head で outdated / resolved 済みの review thread 数）
+- Pull Request の commit 数
+
 ## マージ条件
 
 Copilot の `ready` は「マージしてよい」という最終権限ではなく、機械的なマージ判定へ進める合図とする。

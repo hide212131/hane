@@ -14,6 +14,14 @@
 
 Issue に明示された目的・受入条件を、レビュー指摘の全件解消より優先する。`review findings = 0` を Pull Request の完了条件にはしない。merge blocker とするのは、P0 / P1、セキュリティ・データ破壊・権限逸脱、通常経路で再現する明確な不具合、CI failure、または Issue の目的・受入条件を直接満たせなくする P2 とする。rare race、複合障害、極端な rerun / recovery など、元 Issue の成立を直接妨げない指摘は原則として follow-up Issue に分離し、現在の Pull Request の scope を無期限に拡大しない。追加修正に入る前に「元 Issue を完了するために必要か」を確認し、不要なら current PR には含めない。
 
+### レビュー・修正ループの収束
+
+同一 Pull Request で review → fix → fresh review を細かく繰り返すと、指摘 1 件ごとの局所 fix が積み重なり収束しなくなる。fix に入る前に、current exact head の non-outdated unresolved findings（review comment、CI failure、GUI validation 結果、Copilot judge の理由）を一度に集め、同じ原因・同じ設計面に属するものを root-cause cluster にまとめる。1 件の指摘だけを直すのではなく、その cluster が示す pass/fail/blocked、producer/consumer、正常系/異常系などの対称ケースを横断確認してから修正し、次サイクルの兄弟指摘を減らす。
+
+各 cluster は、上記の merge blocker 基準に照らして current PR の blocker か follow-up 候補かに分類する。current base に対する trusted baseline と current head が、同一 procedure・比較可能な evidence signature で同じ症状を示すなど、機械的に検証できる provenance がある場合に限り既存・独立の cluster として follow-up に分離してよい。過去コメントや推測だけで waive せず、比較できない場合は `unknown` として fail-closed に blocker のまま扱う。同一 root-cause cluster から merge-blocking な指摘（主に P0 / P1）が複数 fix cycle 続けて出た場合は、さらに 1 件の局所 fix を続けず、cluster 全体の設計レビュー、scope 分割、follow-up Issue への切り出し、PR の作り直しのいずれかに切り替える。通常の exact-head review で current scope を十分確認できる場合は、個別の focused review を重ねて fix cycle を増やさない。
+
+詳細な手順と収束性の確認材料は [開発ワークフローのレビュー・修正ループの収束](docs/agentic-development-workflow.md#レビュー修正ループの収束) に従う。
+
 ### 領域ごとの品質基準
 
 エディタ本体の機能は厳密さを優先する。テキスト編集、カーソル・選択、入力・IME、undo / redo、保存・再読込、文書状態、描画と入力の整合性など、利用者の文書内容や編集結果の正しさに関わる処理では、データ損失・破損・誤編集につながる edge case や現実的な race も merge blocker として扱い、必要な回帰テストを追加する。一方、AADW（AI Agent Development Workflow）の通知・reconcile・retry・rerun などの開発運用機能は、通常経路で Issue の目的・受入条件を満たし、失敗時に誤った成功や危険な権限操作を行わないことを基準とする。AADW の rare race、複合障害、極端な rerun / recovery まで完全性を追求して current PR の scope を拡大せず、元 Issue の要望を直接壊さないものは原則 follow-up とする。
