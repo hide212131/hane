@@ -4310,6 +4310,32 @@ mod tests {
         );
     }
 
+    // Codex review on PR #144: a standalone image with leading indentation
+    // (`  ![alt](x)`) collapses the indentation's end, the hidden `![`, and
+    // the start of the visible alt text to the same visual offset. Without a
+    // marker edge the boundary defaulted to closing-side, landing a click
+    // just before `![` in the indentation instead of just after it at the
+    // start of the alt text.
+    #[test]
+    fn hidden_image_opening_marker_boundary_lands_after_the_marker() {
+        let text = "  ![alt](x)\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  alt");
+        let visual_offset = line.visual_text.find("alt").unwrap();
+        // "![alt](x)" starts at source offset 2; the opening `![` ends at 4,
+        // right where "alt" begins in the source.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            SourceOffset(text.find("alt").unwrap())
+        );
+    }
+
     #[test]
     fn moving_down_through_forty_lines_scrolls_cursor_to_viewport_bottom() {
         let text = (1..=40)

@@ -1891,7 +1891,7 @@ fn present_image(
         source_range: SourceRange::new(base + visual_prefix, base + image.prefix_end),
         visual_range: VisualRange::new(visual_prefix, visual_prefix),
         visibility: Visibility::HiddenMarkup,
-        marker_edge: None,
+        marker_edge: Some(MarkerEdge::Opening),
     });
     segments.push(MappingSegment {
         source_range: SourceRange::new(base + image.alt_start, base + image.alt_end),
@@ -1904,7 +1904,7 @@ fn present_image(
         source_range: SourceRange::new(base + image.suffix_start, base + image.suffix_end),
         visual_range: VisualRange::new(visual_end, visual_end),
         visibility: Visibility::HiddenMarkup,
-        marker_edge: None,
+        marker_edge: Some(MarkerEdge::Closing),
     });
     if image.suffix_end < source.len() {
         segments.push(MappingSegment {
