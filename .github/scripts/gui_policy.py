@@ -605,8 +605,19 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
         probe_scenario = next((s for s in scenarios if s.get('name') == 'coordinate_independent_probe'), None)
         if probe_scenario is not None and probe_scenario.get('result') == 'fail':
             _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
-        elif not any(s.get('result') == 'fail' for s in raw.get('top_level_steps', []) + scenarios):
-            raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')
+        else:
+            failing_top_level = any(s.get('result') == 'fail' for s in raw.get('top_level_steps', []))
+            failing_scenario = False
+            for scenario in scenarios:
+                if scenario.get('result') != 'fail':
+                    continue
+                if scenario.get('name') not in REQUIRED_STEPS:
+                    raise ValueError('fail scenario is not a known scenario name')
+                if not any(s.get('result') == 'fail' for s in scenario.get('steps', [])):
+                    raise ValueError('scenario fail is not backed by any failing child step')
+                failing_scenario = True
+            if not failing_top_level and not failing_scenario:
+                raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')
     if outcome == 'pass':
         if job_conclusion != 'success':
             raise ValueError('passing payload from unsuccessful worker')

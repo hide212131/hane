@@ -395,6 +395,30 @@ class ReceiptTests(unittest.TestCase):
         # `fail` (Codex review, PR #139).
         self.assertEqual(self.validate(non_probe_product_fail_result(), 'failure'), 'fail')
 
+    def test_non_probe_scenario_fail_without_a_failing_child_step_cannot_be_accepted(self):
+        # Codex review (PR #139): the generator derives a scenario's `result` from
+        # `worst_result(steps, priority)`, so a scenario can never legitimately
+        # report `fail` while every one of its own child steps stays `pass`. A
+        # receipt with that combination is missing/tampered evidence, not a real
+        # product regression, and must be rejected even though the scenario
+        # self-reports `fail`.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
+    def test_fail_scenario_with_unknown_name_cannot_be_accepted(self):
+        # A scenario name outside the known catalog cannot be trusted as a
+        # genuine product regression, even if it self-reports `fail` with a
+        # failing child step (Codex review, PR #139).
+        raw = non_probe_product_fail_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['name'] = 'not_a_real_scenario'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
     def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
         mutations = [
             ('result', 'blocked'),
