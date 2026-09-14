@@ -737,6 +737,68 @@ Claude は修正、検証、push まで行う。push 後は以前の Codex revie
 
 最大反復回数の初期値は **3回** とする。3回で収束しない場合は `blocked` とし、人間へ引き継ぐ。
 
+## review/fix loop の収束
+
+PR #139（#137 対応）では、同一 root-cause cluster に対する `finding → fix → new exact head → fresh review` を1件ずつ細かく繰り返した結果、17 commits・通常コメント 115件・review comments 48件まで PR が肥大化した（Issue #141）。会話セッションの長期化はこの増幅の主因ではなく、GitHub 上のこの反復パターン自体が主因だった。AGENTS.md の既存原則（review findings 全件解消を完了条件にしない、merge blocker の限定、follow-up への分離）は維持したまま、次の運用ルールで反復を収束させる。品質基準は下げない。
+
+### current findings を root-cause cluster 化してから fix へ渡す
+
+`claude-fix.yml` は現在も current exact head の review findings をまとめて1回のバッチとして Claude Code に渡しており、1 review comment ごとに fix を起動する構造にはなっていない。この節は、そのバッチの中身をどう扱うかを定める。
+
+Copilot pre-GUI routing / final judge が `fix` と判断する前に、current exact head の non-outdated unresolved findings を同一の原因・同一の設計面に属するものへ cluster 化する。分類は `.github/scripts/review_convergence.py` の `parse_cluster_decision()` が定義する固定スキーマに従い、schema 違反・不明な `classification`・重複 id・空 cluster は fail closed で拒否する。
+
+```json
+{
+  "clusters": [
+    {
+      "cluster_id": "evidence-contract",
+      "root_cause": "producer / receipt-policy 間の evidence contract",
+      "classification": "blocker",
+      "finding_ids": ["..."]
+    }
+  ]
+}
+```
+
+- `classification` は `blocker` / `follow_up` / `unknown` のいずれか。
+  - `blocker`: AGENTS.md の merge blocker 定義（P0 / P1、セキュリティ・データ破壊・権限逸脱、通常経路で再現する明確な不具合、CI failure、または Issue の目的・受入条件を直接満たせなくする P2）に該当するもの。current PR で必ず扱う。
+  - `follow_up`: 元 Issue を直接妨げない指摘。current PR の merge blocker にはせず、follow-up Issue 候補として記録する。
+  - `unknown`: blocker か follow-up か判定できないもの。`review_convergence.blocking_finding_ids()` は `unknown` を `blocker` と同じく blocking 側に含める。判定できないことを理由に安全側へ倒さず waive してはならない。
+- 独立した root cause は同じ cluster に混ぜない。同じ cluster にまとめてよいのは、pass/fail/blocked の terminal contract、producer/consumer 間の evidence contract のような、同一の設計面に属する指摘だけ。
+- 「review finding が存在する」こと自体を fix loop の継続条件にしない。`follow_up` に分類した finding は current PR の blocker にしない。
+
+### cluster 単位で兄弟問題を横断確認してから fix する
+
+1件の finding にだけ局所修正を当てない。fix する際は、その cluster が示す設計面について pass/fail/blocked、producer/consumer、正常系/異常系などの対称ケースを一度確認する。「pass は直したが fail が未検証」「producer は直したが policy が未対応」のような次サイクルの兄弟指摘を減らすことが目的であり、機械的な強制はしない。
+
+### focused review の乱発を防ぐ
+
+通常の exact-head review が current scope を十分に確認できる場合、個別の focused review を重ねない。追加する場合は、通常 review で確認できない明確な理由がある場合に限定する。`review_convergence.exact_head_review_count()` は同一 head SHA に対する終端 review 回数を数える。この値が不自然に増える場合は focused review の乱発シグナルとして扱う。
+
+### 同一 cluster で merge-blocking な指摘が反復したら設計レビューへ切り替える
+
+`review_convergence.should_escalate_design_review()` は、同一 `root_cause` の `blocker` 分類が連続 fix cycle で規定回数（既定2回）以上続いた cluster を返す。該当する cluster がある場合、次の Claude fix を直ちに起動せず、その cluster の contract / state transition / producer-consumer 対称性を一度設計レビューする。これは review 回数に上限を設けて問題を無視するものではなく、修正粒度をコード patch から設計へ引き上げるための切替条件である。設計レビューの結果として、PR 内での設計整理、scope 分割、current Issue の受入条件に不要な部分の follow-up Issue への切り出し、PR 自体の作り直しのいずれかを選ぶ。いずれを選んでも、merge blocker が残る限り merge しない。
+
+### 収束性を観測可能にする
+
+`review_convergence.convergence_signals()` は少なくとも次を返す。
+
+- `fix_cycle_count`（`claude_fix_state.cycle_budget()` の `completed` を再利用する）
+- `exact_head_review_count`
+- `current_blocker_count`
+- `cluster_count`
+- `blocker_cluster_count`
+- `outdated_review_count`
+- `commit_count`
+
+閾値だけで自動停止はしないが、異常な増加は「設計または進め方を見直すシグナル」として扱う。PR の目的を満たす過程で実装の性質が局所的な機能・テスト修正から検証基盤・protocol 設計へ変化した場合も、同様のシグナルとして扱う(PR #139 事後分析)。
+
+### current-state 作業と履歴を分離する
+
+current exact head、current non-outdated unresolved review thread、current CI / review / GUI evidence を正本とし、過去 head の findings は監査履歴として扱う。`review_convergence.outdated_review_count()` は、current head 以外の commit に記録された終端 Codex review を数える。この値は current blocker には含めない。[head SHA を中心にした不変条件](#head-sha-を中心にした不変条件)は review finding の扱いにも同様に適用する。
+
+GUI validation の full-suite receipt のように、target Issue の root-cause acceptance と無関係な独立 cluster が同じ terminal status に同居する場合の扱い（現在 head と trusted baseline を比較した `pre-existing-independent` / `unknown` の分類）は、この一般ルールの上に別途 baseline-attribution の trusted evidence 契約を必要とする、より大きい実装であり本節の scope 外とする。current head 固有の独立 cluster を `follow_up` として扱うには、baseline との比較など機械的に検証できる provenance が必要であり、単なる過去コメントや推測だけでは waive しない。
+
 ## マージ条件
 
 Copilot の `ready` は「マージしてよい」という最終権限ではなく、機械的なマージ判定へ進める合図とする。
