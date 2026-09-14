@@ -419,6 +419,41 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(raw, 'failure')
 
+    def test_fabricated_top_level_fail_step_cannot_be_accepted(self):
+        # Codex review (PR #139): `failing_top_level` must not accept an
+        # arbitrary fabricated step name, nor a known top-level step
+        # (preflight/prepare_helper) that the generator can never actually
+        # report as `fail`. Only `build` can legitimately self-report `fail`.
+        for name in ('fabricated', 'preflight', 'prepare_helper'):
+            raw = passing_result()
+            raw['top_level_steps'].append({'name': name, 'result': 'fail'})
+            raw['overall_result'] = 'fail'
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(raw, 'failure')
+
+    def test_genuine_build_fail_top_level_step_is_accepted(self):
+        raw = passing_result()
+        raw['top_level_steps'] = [
+            {'name': 'preflight', 'result': 'pass'},
+            {'name': 'prepare_helper', 'result': 'pass'},
+            {'name': 'build', 'result': 'fail'},
+        ]
+        raw['overall_result'] = 'fail'
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
+    def test_fabricated_scenario_child_step_outside_required_steps_cannot_be_accepted(self):
+        # Codex review (PR #139): a scenario fail must be backed by a failing
+        # child step that is one of that scenario's own required steps, not
+        # an unrelated fabricated step name appended alongside all-passing
+        # required steps.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        scenario['steps'].append({'name': 'fabricated', 'result': 'fail'})
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
     def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
         mutations = [
             ('result', 'blocked'),

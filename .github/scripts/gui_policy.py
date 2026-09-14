@@ -64,6 +64,14 @@ REQUIRED_STEPS = {
     },
     'coordinate_independent_probe': {'coordinate_independent_probe'},
 }
+TOP_LEVEL_STEP_NAMES = {'preflight', 'prepare_helper', 'build'}
+# scripts/gui_validate.py の do_preflight/do_build を参照。preflight と
+# prepare_helper は pass/blocked(/skipped) しか生成できず、build のみが
+# ビルド失敗時に result='fail' を生成しうる。overall_result='fail' の
+# top-level 証跡をこの集合の外や fail 不能な工程名に拘束しない実装は、
+# 捏造した top-level step で存在しない製品失敗を公開できてしまう
+# (PR #139 review)。
+TOP_LEVEL_FAIL_CAPABLE_STEPS = {'build'}
 # scripts/hosted_gui_interaction.py の COORDINATE_PROBE_TEST_QUALIFIED_NAME と同じ値。
 # 独立 probe が実際にこの1件の hit-test を実行して pass したことを、cargo test の
 # 生出力から突き合わせて確認するために使う(PR #139 review: `result == "pass"` だけでは
@@ -606,15 +614,24 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
         if probe_scenario is not None and probe_scenario.get('result') == 'fail':
             _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
         else:
-            failing_top_level = any(s.get('result') == 'fail' for s in raw.get('top_level_steps', []))
+            failing_top_level = False
+            for step in raw.get('top_level_steps', []):
+                if step.get('result') != 'fail':
+                    continue
+                if step.get('name') not in TOP_LEVEL_STEP_NAMES:
+                    raise ValueError('top-level fail is not a known top-level step')
+                if step.get('name') not in TOP_LEVEL_FAIL_CAPABLE_STEPS:
+                    raise ValueError('top-level step cannot report its own fail')
+                failing_top_level = True
             failing_scenario = False
             for scenario in scenarios:
                 if scenario.get('result') != 'fail':
                     continue
                 if scenario.get('name') not in REQUIRED_STEPS:
                     raise ValueError('fail scenario is not a known scenario name')
-                if not any(s.get('result') == 'fail' for s in scenario.get('steps', [])):
-                    raise ValueError('scenario fail is not backed by any failing child step')
+                failing_names = {s.get('name') for s in scenario.get('steps', []) if s.get('result') == 'fail'}
+                if not failing_names & REQUIRED_STEPS[scenario['name']]:
+                    raise ValueError('scenario fail is not backed by any failing required step')
                 failing_scenario = True
             if not failing_top_level and not failing_scenario:
                 raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')
