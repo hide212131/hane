@@ -114,6 +114,24 @@ COORDINATE_PROBE_TEST_QUALIFIED_NAME = f"view::tests::{COORDINATE_PROBE_TEST_NAM
 # probe 自身が製品 source-mapping 不整合を検出した assertion failure なのかを区別する
 # ために使う(Issue #137 review, PR #139)。
 COORDINATE_PROBE_FAILURE_MARKER = "product source-mapping mismatch, not OCR/helper noise"
+# 対象テストの成功行そのもの。stdout+stderr を末尾で切り詰めた `cargo_test_output`
+# とは別に、切り詰めの影響を受けない全文検索でこの行を確定的に抽出・保持する
+# (Codex review, PR #139: 通常の hosted 実行では stderr のコンパイル出力だけで
+# 80行を超え、成功時でも stdout 側のこの行が tail から脱落して fail-closed に
+# 拒否されていた)。
+COORDINATE_PROBE_TARGET_LINE_RE = re.compile(
+    r"^test " + re.escape(COORDINATE_PROBE_TEST_QUALIFIED_NAME) + r" \.\.\. (ok|FAILED)$",
+    re.MULTILINE,
+)
+# 各ケースの構造化 evidence 行(case identity・意図した visual boundary/side・
+# canonical offset・実 GPUI caret/source offset・classification)。libtest は
+# 既定で成功したテストの stdout を握りつぶすため、`--nocapture` と組み合わせて
+# 使う(Codex review, PR #139)。
+COORDINATE_PROBE_CASE_LINE_RE = re.compile(r"^COORDINATE_PROBE_CASE (\{.*\})$", re.MULTILINE)
+COORDINATE_PROBE_EXPECTED_CASES = (
+    "bold_open", "bold_close", "code_open", "code_close",
+    "quote_open", "quote_close", "list_open", "list_close",
+)
 
 COORDINATE_PROBE_RUST_SOURCE = r'''
 
@@ -205,19 +223,31 @@ COORDINATE_PROBE_RUST_SOURCE = r'''
         // on the neutral first line and re-reads the row's hidden-markup
         // visual text immediately before computing where to click — mirroring
         // `_move_to_neutral` before every capture in the Python validator.
+        // Issue #137 review (Codex, PR #139): a bare pass/fail on the whole
+        // libtest run only proves *some* GPUI click landed correctly, not
+        // which of the 8 boundary constructs did. Each case below prints a
+        // single-line, machine-parseable `COORDINATE_PROBE_CASE {...}` JSON
+        // record — case identity, intended visual boundary/side, the
+        // canonical source offset computed above (independent of
+        // `source_map`), and the actual post-click GPUI selection — *before*
+        // the mismatch check, so the validator (`.github/scripts/gui_policy.py`)
+        // can verify per-case evidence for a `pass` receipt instead of
+        // trusting a single test name/count. `--nocapture` (see
+        // `run_coordinate_independent_probe`) is required for these lines to
+        // reach `cargo test`'s stdout on a passing run.
         let mut mismatches: Vec<String> = Vec::new();
-        for (selector, line, row_index, needle, edge_offset, canonical) in [
-            ("row-2-0", 2, 0, "bold", 0usize, bold_open_expected),
-            ("row-2-0", 2, 0, "combo", "combo".len(), bold_close_expected),
+        for (case, edge, selector, line, row_index, needle, edge_offset, canonical) in [
+            ("bold_open", "start", "row-2-0", 2, 0, "bold", 0usize, bold_open_expected),
+            ("bold_close", "end", "row-2-0", 2, 0, "combo", "combo".len(), bold_close_expected),
             // "this inline `code" / "span` crosses a line." are one soft-wrapped
             // paragraph block, so the second source line is the block's row 1,
             // not its own row 0.
-            ("row-4-0", 4, 0, "code", 0, code_open_expected),
-            ("row-5-1", 5, 1, "span", "span".len(), code_close_expected),
-            ("row-7-0", 7, 0, "bold", 0, quote_open_expected),
-            ("row-7-0", 7, 0, "bold", "bold".len(), quote_close_expected),
-            ("row-9-0", 9, 0, "italic", 0, list_open_expected),
-            ("row-9-0", 9, 0, "italic", "italic".len(), list_close_expected),
+            ("code_open", "start", "row-4-0", 4, 0, "code", 0, code_open_expected),
+            ("code_close", "end", "row-5-1", 5, 1, "span", "span".len(), code_close_expected),
+            ("quote_open", "start", "row-7-0", 7, 0, "bold", 0, quote_open_expected),
+            ("quote_close", "end", "row-7-0", 7, 0, "bold", "bold".len(), quote_close_expected),
+            ("list_open", "start", "row-9-0", 9, 0, "italic", 0, list_open_expected),
+            ("list_close", "end", "row-9-0", 9, 0, "italic", "italic".len(), list_close_expected),
         ] {
             view.update(cx, |view, cx| {
                 view.editor_mut()
@@ -235,7 +265,14 @@ COORDINATE_PROBE_RUST_SOURCE = r'''
             cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
             cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
             let actual = view.read_with(cx, |view, _| view.editor().selection());
-            if actual != Selection::caret(canonical) {
+            let at_canonical = actual == Selection::caret(canonical);
+            println!(
+                "COORDINATE_PROBE_CASE {{\"case\":\"{case}\",\"edge\":\"{edge}\",\"canonical_source_offset\":{},\"actual_source_offset\":{},\"classification\":\"{}\"}}",
+                canonical.0,
+                actual.active.0,
+                if at_canonical { "at_canonical" } else { "mismatch" },
+            );
+            if !at_canonical {
                 mismatches.push(format!(
                     "click on {selector} at visual offset {visual_offset} landed on {actual:?}, \
                      independent of OCR, instead of the canonical source offset {canonical:?}"
@@ -1011,7 +1048,10 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
             "cargo", "test", "--locked",
             "--manifest-path", str(snapshot / "Cargo.toml"),
             "-p", "hane-ui", "--lib", COORDINATE_PROBE_TEST_QUALIFIED_NAME,
-            "--", "--exact",
+            # `--nocapture`: libtest hides a test's stdout unless it fails, which
+            # would silently drop every `COORDINATE_PROBE_CASE` evidence line on
+            # the success path this probe exists to prove (Codex review, PR #139).
+            "--", "--exact", "--nocapture",
         ]
         try:
             proc = subprocess.run(args, cwd=snapshot, capture_output=True, text=True, timeout=timeout)
@@ -1019,17 +1059,34 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
             test_error = str(exc)
     finally:
         restored = False
+        restored_bytes = None
         try:
             view_rs.write_bytes(original_bytes)
-            restored = view_rs.read_bytes() == original_bytes
+            restored_bytes = view_rs.read_bytes()
+            restored = restored_bytes == original_bytes
         except OSError:
             restored = False
+        dirty_paths = None
         clean = False
         if restored:
             try:
-                clean = env.git_dirty_paths(snapshot) == []
+                dirty_paths = env.git_dirty_paths(snapshot)
+                clean = dirty_paths == []
             except module.EnvError:
                 clean = False
+
+    # SHA-256 (rather than the in-process boolean comparison above alone) so the
+    # validator can independently re-check restoration from the receipt without
+    # trusting a self-reported `restored=True`, and the exact `git status
+    # --porcelain` lines instead of a self-reported `clean_tree=True` boolean
+    # (Codex review, PR #139: missing/tampered/dirty receipts must fail closed).
+    original_sha256 = hashlib.sha256(original_bytes).hexdigest()
+    restored_sha256 = hashlib.sha256(restored_bytes).hexdigest() if restored_bytes is not None else None
+    restore_evidence = dict(
+        restored=restored, clean_tree=clean,
+        original_view_rs_sha256=original_sha256, restored_view_rs_sha256=restored_sha256,
+        clean_tree_paths=dirty_paths,
+    )
 
     if not restored or not clean:
         return make_step(
@@ -1038,7 +1095,7 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
                 "probe 注入後に crates/ui/src/view.rs の original bytes と clean tree を"
                 "復元・証明できなかったため、cargo test の結果を採用せず fail-closed とする"
             ),
-            restored=restored, clean_tree=clean,
+            **restore_evidence,
         )
     if proc is None:
         return make_step(name, "blocked", reason=f"独立 probe の cargo test が完了しなかった: {test_error}")
@@ -1057,10 +1114,36 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
             ),
             cargo_test_output=output_tail, tests_executed=executed,
         )
+    # `output_tail` keeps only the log's last 80 lines for diagnostics, so a
+    # normal hosted run's compiler/stderr noise can push the target test's own
+    # success line out of it even when the test passed. Extract that line, and
+    # each case's structured evidence, from the untruncated `full_output`
+    # instead (Codex review, PR #139).
+    target_line_match = COORDINATE_PROBE_TARGET_LINE_RE.search(full_output)
+    target_test_line = target_line_match.group(0) if target_line_match else None
+    probe_cases = None
+    try:
+        parsed_cases = [json.loads(raw) for raw in COORDINATE_PROBE_CASE_LINE_RE.findall(full_output)]
+    except (ValueError, TypeError):
+        parsed_cases = []
+    if len(parsed_cases) == len(COORDINATE_PROBE_EXPECTED_CASES) and all(
+        isinstance(case, dict) for case in parsed_cases
+    ):
+        probe_cases = parsed_cases
     if proc.returncode == 0:
+        if target_test_line != f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok" or probe_cases is None:
+            return make_step(
+                name, "blocked",
+                reason=(
+                    "独立 probe の cargo test が0終了したが、対象テストの成功行または8件の"
+                    "ケース別 evidence 行を出力から確定的に抽出できなかったため、fail-closed とする"
+                ),
+                cargo_test_output=output_tail, tests_executed=executed, **restore_evidence,
+            )
         return make_step(
             name, "pass", cargo_test_output=output_tail, tests_executed=executed,
-            test_name=COORDINATE_PROBE_TEST_QUALIFIED_NAME, restored=restored, clean_tree=clean,
+            test_name=COORDINATE_PROBE_TEST_QUALIFIED_NAME, target_test_line=target_test_line,
+            probe_cases=probe_cases, **restore_evidence,
         )
     if (COORDINATE_PROBE_FAILURE_MARKER in full_output
             and f"test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED" in full_output):
@@ -1070,7 +1153,7 @@ def run_coordinate_independent_probe(env, module, snapshot: Path, timeout: float
                 "OCR を経由しない独立 GPUI probe が、境界クリックの着地点が期待 canonical "
                 "position と一致しない製品側 source mapping 不整合を確認した(Issue #101)"
             ),
-            cargo_test_output=output_tail, tests_executed=executed,
+            cargo_test_output=output_tail, tests_executed=executed, probe_cases=probe_cases,
         )
     return make_step(
         name, "blocked",

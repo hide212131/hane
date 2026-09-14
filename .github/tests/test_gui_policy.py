@@ -158,12 +158,26 @@ def _inline_evidence(steps):
     )
 
 
+VIEW_RS_SHA = 'f' * 64
+
+
+def _passing_probe_cases():
+    return [
+        {'case': case, 'edge': edge, 'canonical_source_offset': offset, 'actual_source_offset': offset,
+         'classification': 'at_canonical'}
+        for case, (edge, offset) in policy._coordinate_probe_expected_cases().items()
+    ]
+
+
 def _coordinate_probe_evidence(steps):
     step = next(s for s in steps if s['name'] == 'coordinate_independent_probe')
     step.update(
         tests_executed=1,
         test_name=policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME,
-        restored=True, clean_tree=True,
+        restored=True, clean_tree=True, clean_tree_paths=[],
+        original_view_rs_sha256=VIEW_RS_SHA, restored_view_rs_sha256=VIEW_RS_SHA,
+        target_test_line=f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok',
+        probe_cases=_passing_probe_cases(),
         cargo_test_output=(
             'running 1 test\n'
             f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n'
@@ -290,10 +304,16 @@ class ReceiptTests(unittest.TestCase):
         mutations = [
             ('restored', False), ('restored', None),
             ('clean_tree', False), ('clean_tree', None),
+            ('clean_tree_paths', [' M crates/ui/src/view.rs']), ('clean_tree_paths', None),
+            ('original_view_rs_sha256', None), ('original_view_rs_sha256', 'not-hex'),
+            ('restored_view_rs_sha256', 'a' * 63 + 'b'),
             ('test_name', 'view::tests::wrong_test'), ('test_name', None),
             ('tests_executed', 0), ('tests_executed', 2), ('tests_executed', None),
             ('cargo_test_output', ''), ('cargo_test_output', None),
-            ('cargo_test_output', 'running 1 test\ntest result: ok. 1 passed; 0 failed'),
+            ('target_test_line', None),
+            ('target_test_line', f'test {policy.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... FAILED'),
+            ('probe_cases', None), ('probe_cases', []),
+            ('probe_cases', _passing_probe_cases()[:-1]),
         ]
         for field, value in mutations:
             raw = passing_result()
@@ -304,10 +324,28 @@ class ReceiptTests(unittest.TestCase):
     def test_coordinate_independent_probe_missing_evidence_fields_cannot_pass(self):
         raw = passing_result()
         step = self.coordinate_probe_step(raw)
-        for field in ('restored', 'clean_tree', 'test_name', 'tests_executed', 'cargo_test_output'):
+        for field in ('restored', 'clean_tree', 'clean_tree_paths', 'original_view_rs_sha256',
+                      'restored_view_rs_sha256', 'test_name', 'tests_executed', 'cargo_test_output',
+                      'target_test_line', 'probe_cases'):
             del step[field]
         with self.assertRaises(ValueError):
             self.validate(raw)
+
+    def test_coordinate_independent_probe_per_case_evidence_is_fail_closed(self):
+        cases = _passing_probe_cases()
+        mutations = [
+            lambda c: [{**c[0], 'case': 'bold_close'}, *c[1:]],  # duplicate identity
+            lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
+            lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
+            lambda c: [{**c[0], 'actual_source_offset': c[0]['actual_source_offset'] + 1}, *c[1:]],
+            lambda c: [{**c[0], 'classification': 'mismatch'}, *c[1:]],
+            lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
+        ]
+        for mutate in mutations:
+            raw = passing_result()
+            self.coordinate_probe_step(raw)['probe_cases'] = mutate(cases)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                self.validate(raw)
 
     def test_inline_operation_evidence_is_fail_closed(self):
         raw = passing_result()

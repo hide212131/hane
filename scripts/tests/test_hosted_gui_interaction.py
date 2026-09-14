@@ -1035,6 +1035,14 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
         self.module = FakeModule()
         self.env = FakeEnv()
 
+    @staticmethod
+    def _passing_probe_case_lines():
+        return "\n".join(
+            f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
+            f'"actual_source_offset":1,"classification":"at_canonical"}}'
+            for case in interaction.COORDINATE_PROBE_EXPECTED_CASES
+        )
+
     def test_injects_probe_runs_cargo_test_and_restores_clean_tree_on_pass(self):
         original_run = subprocess.run
         captured_args = []
@@ -1047,9 +1055,11 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
             # injected probe source, not the pristine committed content.
             self.assertIn(interaction.COORDINATE_PROBE_TEST_NAME.encode('utf-8'), self.view_rs.read_bytes())
             self.assertIn(interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME, args)
+            self.assertIn('--nocapture', args)
             return subprocess.CompletedProcess(
                 args, 0,
-                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                f"running 1 test\n{self._passing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
                 "test result: ok. 1 passed; 0 failed", '',
             )
 
@@ -1063,7 +1073,38 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
         self.assertEqual(step['test_name'], interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME)
         self.assertTrue(step['restored'])
         self.assertTrue(step['clean_tree'])
+        self.assertEqual(step['clean_tree_paths'], [])
+        self.assertEqual(step['original_view_rs_sha256'], hashlib.sha256(self.original).hexdigest())
+        self.assertEqual(step['restored_view_rs_sha256'], step['original_view_rs_sha256'])
+        self.assertEqual(step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok")
         self.assertIn(f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok", step['cargo_test_output'])
+        self.assertEqual(len(step['probe_cases']), len(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+        self.assertEqual({case['case'] for case in step['probe_cases']}, set(interaction.COORDINATE_PROBE_EXPECTED_CASES))
+
+    def test_reports_blocked_when_success_line_is_truncated_out_of_the_log_tail(self):
+        """Codex review, PR #139: a normal hosted run's stderr compile output can
+        exceed 80 lines, pushing stdout's own success line out of a naive
+        stdout+stderr tail. The target line must still be recovered from the
+        untruncated output instead of falsely fail-closing a real pass."""
+        original_run = subprocess.run
+        noisy_stderr = "\n".join(f"warning: unused variable `x{i}`" for i in range(200))
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\n{self._passing_probe_case_lines()}\n"
+                f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed",
+                noisy_stderr,
+            )
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'pass')
+        self.assertNotIn(f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok", step['cargo_test_output'])
+        self.assertEqual(step['target_test_line'], f"test {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok")
 
     def test_reports_fail_when_cargo_test_confirms_a_non_canonical_landing(self):
         original_run = subprocess.run
@@ -1107,6 +1148,23 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
             if args[0] != 'cargo':
                 return original_run(args, **kwargs)
             return subprocess.CompletedProcess(args, 0, 'running 0 tests\ntest result: ok. 0 passed; 0 failed', '')
+
+        with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
+            step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)
+        self.assertEqual(step['result'], 'blocked')
+        self.assertEqual(self.view_rs.read_bytes(), self.original)
+
+    def test_reports_blocked_when_per_case_evidence_is_incomplete_on_a_zero_exit(self):
+        original_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            if args[0] != 'cargo':
+                return original_run(args, **kwargs)
+            return subprocess.CompletedProcess(
+                args, 0,
+                f"running 1 test\ntest {interaction.COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed", '',
+            )
 
         with patch.object(interaction.subprocess, 'run', side_effect=fake_run):
             step = interaction.run_coordinate_independent_probe(self.env, self.module, self.snapshot, 5.0)

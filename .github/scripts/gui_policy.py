@@ -425,12 +425,66 @@ def _validate_inline_evidence(steps, evidence_dir):
         raise ValueError('multiline code span visual transition evidence mismatch')
 
 
+# scripts/hosted_gui_interaction.py の COORDINATE_PROBE_RUST_SOURCE に注入される
+# `#[gpui::test]` が使う source text と完全に同じ literal(PR #139 review: 各ケースの
+# canonical offset を、probe が自己申告する値ではなく source bytes から独立に導出
+# して突き合わせるため)。
+COORDINATE_PROBE_SOURCE_TEXT = (
+    'x\n\n**bold *italic* combo** boundary line.\n\n'
+    'this inline `code\nspan` crosses a line.\n\n'
+    '> quote with **bold**\n\n'
+    '- list item with *italic*\n'
+)
+
+
+def _coordinate_probe_expected_cases():
+    text = COORDINATE_PROBE_SOURCE_TEXT
+
+    bold_source_line = '**bold *italic* combo** boundary line.'
+    bold_line_start = text.index(bold_source_line)
+    bold_open = bold_line_start + 2
+    bold_close = bold_line_start + bold_source_line.index('combo**') + len('combo')
+
+    code_open_source_line = 'this inline `code'
+    code_open_line_start = text.index(code_open_source_line)
+    code_open = code_open_line_start + code_open_source_line.index('`') + 1
+
+    code_close_source_line = 'span` crosses a line.'
+    code_close_line_start = text.index(code_close_source_line)
+    code_close = code_close_line_start + code_close_source_line.index('span`') + len('span')
+
+    quote_source_line = '> quote with **bold**'
+    quote_line_start = text.index(quote_source_line)
+    quote_open = quote_line_start + quote_source_line.index('**bold') + 2
+    quote_close = quote_line_start + quote_source_line.index('bold**') + len('bold')
+
+    list_source_line = '- list item with *italic*'
+    list_line_start = text.index(list_source_line)
+    list_open = list_line_start + list_source_line.index('*italic') + 1
+    list_close = list_line_start + list_source_line.index('italic*') + len('italic')
+
+    return {
+        'bold_open': ('start', bold_open), 'bold_close': ('end', bold_close),
+        'code_open': ('start', code_open), 'code_close': ('end', code_close),
+        'quote_open': ('start', quote_open), 'quote_close': ('end', quote_close),
+        'list_open': ('start', list_open), 'list_close': ('end', list_close),
+    }
+
+
 def _validate_coordinate_probe_evidence(steps):
     step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
     if step is None:
         raise ValueError('coordinate-independent probe step missing')
     if step.get('restored') is not True or step.get('clean_tree') is not True:
         raise ValueError('coordinate-independent probe restore/clean-tree evidence missing')
+    if step.get('clean_tree_paths') != []:
+        raise ValueError('coordinate-independent probe clean-tree evidence missing or not empty')
+    original_sha256 = step.get('original_view_rs_sha256')
+    restored_sha256 = step.get('restored_view_rs_sha256')
+    if not isinstance(original_sha256, str) or not re.fullmatch('[0-9a-f]{64}', original_sha256):
+        raise ValueError('coordinate-independent probe original view.rs SHA-256 missing or invalid')
+    if original_sha256 != restored_sha256:
+        raise ValueError('coordinate-independent probe restored view.rs does not hash-match the original')
     if step.get('test_name') != COORDINATE_PROBE_TEST_QUALIFIED_NAME:
         raise ValueError('coordinate-independent probe test name mismatch')
     if step.get('tests_executed') != 1:
@@ -438,8 +492,36 @@ def _validate_coordinate_probe_evidence(steps):
     output = step.get('cargo_test_output')
     if not isinstance(output, str) or not output.strip():
         raise ValueError('coordinate-independent probe cargo test output missing')
-    if f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok' not in output:
+    if step.get('target_test_line') != f'test {COORDINATE_PROBE_TEST_QUALIFIED_NAME} ... ok':
         raise ValueError('coordinate-independent probe cargo test output does not confirm target test passed')
+
+    expected_cases = _coordinate_probe_expected_cases()
+    cases = step.get('probe_cases')
+    if not isinstance(cases, list) or len(cases) != len(expected_cases):
+        raise ValueError('coordinate-independent probe per-case evidence missing or incomplete')
+    seen = set()
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError('coordinate-independent probe case evidence malformed')
+        case_id = case.get('case')
+        if case_id not in expected_cases or case_id in seen:
+            raise ValueError('coordinate-independent probe case identity missing or duplicated')
+        seen.add(case_id)
+        expected_edge, expected_offset = expected_cases[case_id]
+        if case.get('edge') != expected_edge:
+            raise ValueError(f'coordinate-independent probe case {case_id} boundary side mismatch')
+        canonical_offset = case.get('canonical_source_offset')
+        actual_offset = case.get('actual_source_offset')
+        if (not isinstance(canonical_offset, int) or isinstance(canonical_offset, bool)
+                or canonical_offset != expected_offset):
+            raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
+        if (not isinstance(actual_offset, int) or isinstance(actual_offset, bool)
+                or actual_offset != expected_offset):
+            raise ValueError(f'coordinate-independent probe case {case_id} landed on a non-canonical offset')
+        if case.get('classification') != 'at_canonical':
+            raise ValueError(f'coordinate-independent probe case {case_id} classification is not at_canonical')
+    if seen != set(expected_cases):
+        raise ValueError('coordinate-independent probe missing expected case coverage')
 
 
 def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
