@@ -1067,6 +1067,11 @@ fn marker_is_disclosed(
 /// `source_range` starts before the marker at the container's indentation,
 /// which would otherwise make the `start == marker.start` check below miss
 /// it entirely for an indented item.
+///
+/// An ATX heading is not in [`has_delimiter_markers`] (its markers are
+/// derived block-side, not from a delimiter pair the inline scanner walks),
+/// so it is classified separately here rather than being folded into that
+/// set.
 fn marker_edge(
     planned: &ProjectedMarker,
     parsed: &MarkdownParse,
@@ -1078,11 +1083,22 @@ fn marker_edge(
     let marker = planned.range;
     nodes.intersecting(marker).into_iter().find_map(|id| {
         let span = parsed.tree.node(*id)?;
-        if !has_delimiter_markers(span.kind) {
+        let is_heading = matches!(span.kind, NodeKind::Heading(_));
+        if !has_delimiter_markers(span.kind) && !is_heading {
             return None;
         }
         if span.source_range.start == marker.start {
             Some(MarkerEdge::Opening)
+        } else if is_heading {
+            // A heading's own source range can include the block's trailing
+            // newline, which the derived closing marker's end excludes, so the
+            // end-alignment check below never matches; a marker positioned
+            // after all of the heading's content is its closing sequence.
+            span.children
+                .last()
+                .and_then(|child_id| parsed.tree.node(*child_id))
+                .is_none_or(|child| child.source_range.end <= marker.start)
+                .then_some(MarkerEdge::Closing)
         } else if span.source_range.end == marker.end {
             Some(MarkerEdge::Closing)
         } else {

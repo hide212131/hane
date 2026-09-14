@@ -4085,17 +4085,25 @@ fn source_offset_for_visual_position(
 /// though the node's own source range can start before the marker (at the
 /// container's indentation). A marker with no resolvable edge at all (not
 /// expected for markers this crate derives) keeps the closing-side default.
+///
+/// Two adjacent constructs with no visible gap (e.g. `[a](x)[b](y)`) collapse
+/// a closing marker and the next construct's opening marker onto the very
+/// same point. Picking whichever of them happens to appear first at that
+/// point would arbitrarily favor the closing side; instead an opening edge
+/// anywhere at the point wins, since a click there is visually at the start
+/// of the following visible content, not the end of the preceding content.
 fn collapsed_boundary_bias(block: &VisualLine, visual_offset: usize) -> Bias {
-    let edge = block.source_map.segments.iter().find_map(|segment| {
+    let mut edges = block.source_map.segments.iter().filter_map(|segment| {
         let at_point = segment.visual_range.start.0 == visual_offset
             && segment.visual_range.end.0 == visual_offset;
         (at_point && segment.visibility == Visibility::HiddenMarkup)
             .then_some(segment.marker_edge)
             .flatten()
     });
-    match edge {
-        Some(MarkerEdge::Opening) => Bias::After,
-        Some(MarkerEdge::Closing) | None => Bias::Before,
+    if edges.any(|edge| edge == MarkerEdge::Opening) {
+        Bias::After
+    } else {
+        Bias::Before
     }
 }
 
@@ -4333,6 +4341,63 @@ mod tests {
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, line, visual_offset),
             SourceOffset(text.find("alt").unwrap())
+        );
+    }
+
+    // Codex review on PR #144: an indented ATX heading (`  ## title`) collapses
+    // the indentation's end and the start of the visible title to the same
+    // visual offset, the same shape as the indented list/image cases above.
+    // `Heading` was not in `has_delimiter_markers`, so `marker_edge` never
+    // classified its opening marker and the boundary fell back to the
+    // closing-side default, landing a click just before `## ` in the
+    // indentation instead of just after it at the start of the title.
+    #[test]
+    fn hidden_heading_marker_boundary_lands_after_the_marker_even_when_indented() {
+        let text = "  ## title\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  title");
+        let visual_offset = line.visual_text.find("title").unwrap();
+        // "  ## title" hides the marker `## ` (source offsets 2..5); canonical
+        // is source offset 5, just after the marker and before "title", not
+        // offset 2, just before the marker in the leading indentation.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            SourceOffset(text.find("title").unwrap())
+        );
+    }
+
+    // Codex review on PR #144: two adjacent links with no visible gap between
+    // them (`[a](x)[b](y)`) collapse the first link's closing marker and the
+    // second link's opening marker onto the exact same visual point.
+    // `find_map` picked whichever segment happened to be first in source
+    // order at that point — the first link's closing marker — so a click at
+    // the start of "b" landed at the end of "a" instead, and subsequent input
+    // edited the first link rather than the second.
+    #[test]
+    fn adjacent_links_boundary_lands_after_the_second_links_opening_marker() {
+        let text = "[a](x)[b](y)\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "ab");
+        let visual_offset = line.visual_text.find('b').unwrap();
+        // The boundary between "a" and "b" sits where the first link's
+        // closing marker and the second link's opening marker both collapse:
+        // canonical is source offset 7, the start of "b", not offset 2, the
+        // end of "a".
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            SourceOffset(text.find('b').unwrap())
         );
     }
 
