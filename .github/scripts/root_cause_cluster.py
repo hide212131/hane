@@ -63,7 +63,10 @@ def from_gui_attribution(attribution):
     never to 'follow_up'.
     """
     clusters = []
-    for unit in (attribution or {}).get('clusters', []):
+    source = attribution.get('clusters', []) if isinstance(attribution, dict) else []
+    for unit in source:
+        if not isinstance(unit, dict):
+            continue
         classification = unit.get('classification')
         category = GUI_CLASSIFICATION_CATEGORY.get(classification, 'unknown')
         clusters.append(validate_cluster({
