@@ -4056,9 +4056,16 @@ fn source_offset_for_visual_position(
     block: &VisualLine,
     visual_offset: usize,
 ) -> SourceOffset {
+    // A hidden closing marker (e.g. the trailing `**` of bold text) collapses
+    // to zero visual width, so its own visual position is indistinguishable
+    // from the start of whatever visible text follows it on the same line.
+    // `Bias::Before` resolves that shared point to the end of the visible
+    // content the marker closes, per the collapsed-boundary contract (ADR-0004):
+    // a click there must land on visible content, not skip past hidden markup
+    // into unrelated content that happens to sit right after it.
     block
         .source_map
-        .visual_to_source(VisualOffset(visual_offset), Bias::After)
+        .visual_to_source(VisualOffset(visual_offset), Bias::Before)
         .map(|candidate| candidate.source_offset)
         .or_else(|| {
             editor
@@ -4152,6 +4159,50 @@ mod tests {
         assert_eq!(
             source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len()),
             SourceOffset(14)
+        );
+    }
+
+    // Issue #143: a hidden closing marker collapses to zero visual width, so
+    // when visible text immediately follows it on the same line, the marker's
+    // own visual position is indistinguishable from that following text's
+    // start. The canonical position for a click there must stay on the
+    // content the marker closes (just before the marker), not jump past it
+    // into unrelated following content.
+    #[test]
+    fn hidden_closing_marker_boundary_lands_before_the_marker_not_after_it() {
+        let editor = Editor::new("**bold** more");
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "bold more");
+        // The shared boundary between "bold" and " more" sits right where the
+        // closing `**` collapsed to nothing: canonical is the end of "bold"
+        // (source offset 6, just before the marker), not the start of " more"
+        // (source offset 8, just after it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, "bold".len()),
+            SourceOffset(6)
+        );
+    }
+
+    #[test]
+    fn hidden_closing_marker_boundary_lands_before_the_marker_across_a_joined_multiline_span() {
+        // CommonMark resolves a backtick-delimited code span across a soft
+        // line break, so the closing marker for `co` on the first physical
+        // line lands on the second: `present_block` joins both lines' shared
+        // parse the same way it would for a multiline bold or emphasis run.
+        let editor = Editor::new("start `co\nde` end");
+        let lines = presented_lines(&editor);
+
+        let second = &lines[1];
+        assert_eq!(second.visual_text, "de end");
+        // The shared boundary between "de" and " end" sits where the closing
+        // backtick collapsed to nothing: canonical is the end of "de" (source
+        // offset 12, just before the marker), not the start of " end" (source
+        // offset 13, just after it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 1, second, "de".len()),
+            SourceOffset(12)
         );
     }
 
