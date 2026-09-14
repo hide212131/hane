@@ -267,8 +267,9 @@ COORDINATE_PROBE_RUST_SOURCE = r'''
             let actual = view.read_with(cx, |view, _| view.editor().selection());
             let at_canonical = actual == Selection::caret(canonical);
             println!(
-                "COORDINATE_PROBE_CASE {{\"case\":\"{case}\",\"edge\":\"{edge}\",\"canonical_source_offset\":{},\"actual_source_offset\":{},\"classification\":\"{}\"}}",
+                "COORDINATE_PROBE_CASE {{\"case\":\"{case}\",\"edge\":\"{edge}\",\"canonical_source_offset\":{},\"actual_anchor_source_offset\":{},\"actual_active_source_offset\":{},\"classification\":\"{}\"}}",
                 canonical.0,
+                actual.anchor.0,
                 actual.active.0,
                 if at_canonical { "at_canonical" } else { "mismatch" },
             );

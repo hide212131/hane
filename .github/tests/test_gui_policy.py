@@ -163,15 +163,23 @@ VIEW_RS_SHA = 'f' * 64
 
 def _passing_probe_cases():
     return [
-        {'case': case, 'edge': edge, 'canonical_source_offset': offset, 'actual_source_offset': offset,
+        {'case': case, 'edge': edge, 'canonical_source_offset': offset,
+         'actual_anchor_source_offset': offset, 'actual_active_source_offset': offset,
          'classification': 'at_canonical'}
         for case, (edge, offset) in policy._coordinate_probe_expected_cases().items()
     ]
 
 
-def _failing_probe_cases():
+def _failing_probe_cases(*, mismatch_field='actual_active_source_offset'):
+    """A residual range selection can leave either endpoint off the canonical
+    offset while the other still matches it; `mismatch_field` picks which one
+    the first case disagrees on, so callers can exercise an active-only
+    mismatch (the caret itself moved) or an anchor-only mismatch (a selection
+    range survived the click even though `active == canonical`) — both of
+    which the Rust probe's `actual == Selection::caret(canonical)` check
+    classifies as `mismatch` (Codex review, PR #139)."""
     cases = _passing_probe_cases()
-    cases[0] = {**cases[0], 'actual_source_offset': cases[0]['canonical_source_offset'] + 1,
+    cases[0] = {**cases[0], mismatch_field: cases[0]['canonical_source_offset'] + 1,
                 'classification': 'mismatch'}
     return cases
 
@@ -375,7 +383,13 @@ class ReceiptTests(unittest.TestCase):
             lambda c: [{**c[0], 'case': 'bold_close'}, *c[1:]],  # duplicate identity
             lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
             lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
-            lambda c: [{**c[0], 'actual_source_offset': c[0]['actual_source_offset'] + 1}, *c[1:]],
+            lambda c: [{**c[0], 'actual_active_source_offset': c[0]['actual_active_source_offset'] + 1}, *c[1:]],
+            # anchor-only mismatch: a residual range selection with `active`
+            # still on the canonical offset must not be accepted as an
+            # `at_canonical` pass (Codex review, PR #139).
+            lambda c: [{**c[0], 'actual_anchor_source_offset': c[0]['actual_anchor_source_offset'] + 1}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_anchor_source_offset'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_active_source_offset'}, *c[1:]],
             lambda c: [{**c[0], 'classification': 'mismatch'}, *c[1:]],
             lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
         ]
@@ -553,12 +567,15 @@ class ReceiptTests(unittest.TestCase):
             lambda c: [{**c[0], 'case': c[1]['case']}, *c[1:]],  # duplicate identity
             lambda c: [{**c[0], 'edge': 'end'}, *c[1:]],  # wrong boundary side
             lambda c: [{**c[0], 'canonical_source_offset': c[0]['canonical_source_offset'] + 1}, *c[1:]],
-            # classification claims a mismatch that didn't happen
-            lambda c: [{**c[0], 'classification': 'mismatch', 'actual_source_offset': c[0]['canonical_source_offset']},
-                       *c[1:]],
+            # classification claims a mismatch that didn't happen on either endpoint
+            lambda c: [{**c[0], 'classification': 'mismatch',
+                        'actual_anchor_source_offset': c[0]['canonical_source_offset'],
+                        'actual_active_source_offset': c[0]['canonical_source_offset']}, *c[1:]],
             # classification claims canonical for an actually non-canonical landing
             lambda c: [{**c[0], 'classification': 'at_canonical'}, *c[1:]],
             lambda c: [{**c[0], 'case': 'not_a_real_case'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_anchor_source_offset'}, *c[1:]],
+            lambda c: [{k: v for k, v in c[0].items() if k != 'actual_active_source_offset'}, *c[1:]],
         ]
         for mutate in mutations:
             raw = product_fail_result()
@@ -566,15 +583,36 @@ class ReceiptTests(unittest.TestCase):
             with self.subTest(mutate=mutate), self.assertRaises(ValueError):
                 self.validate(raw, 'failure')
 
+    def test_product_fail_case_anchor_only_mismatch_is_accepted(self):
+        # A click that leaves a residual range selection with `active` on the
+        # canonical offset but `anchor` off it is still a real product
+        # source-mapping mismatch (the Rust probe's own `actual ==
+        # Selection::caret(canonical)` check fails on it too), so the policy
+        # must accept it as fail evidence instead of rejecting it as evidence
+        # inconsistency (Codex review, PR #139, Issue #137).
+        raw = product_fail_result()
+        self.coordinate_probe_step(raw)['probe_cases'] = _failing_probe_cases(
+            mismatch_field='actual_anchor_source_offset'
+        )
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
+    def test_product_fail_case_active_only_mismatch_is_accepted(self):
+        raw = product_fail_result()
+        self.coordinate_probe_step(raw)['probe_cases'] = _failing_probe_cases(
+            mismatch_field='actual_active_source_offset'
+        )
+        self.assertEqual(self.validate(raw, 'failure'), 'fail')
+
     def test_product_fail_case_offset_out_of_probe_source_range_cannot_be_accepted(self):
         max_offset = len(policy.COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
         for out_of_range in (-1, max_offset + 1):
-            cases = _failing_probe_cases()
-            cases[0] = {**cases[0], 'actual_source_offset': out_of_range}
-            raw = product_fail_result()
-            self.coordinate_probe_step(raw)['probe_cases'] = cases
-            with self.subTest(out_of_range=out_of_range), self.assertRaises(ValueError):
-                self.validate(raw, 'failure')
+            for field in ('actual_anchor_source_offset', 'actual_active_source_offset'):
+                cases = _failing_probe_cases()
+                cases[0] = {**cases[0], field: out_of_range}
+                raw = product_fail_result()
+                self.coordinate_probe_step(raw)['probe_cases'] = cases
+                with self.subTest(out_of_range=out_of_range, field=field), self.assertRaises(ValueError):
+                    self.validate(raw, 'failure')
 
     def test_fail_outcome_without_a_probe_fail_scenario_cannot_be_accepted(self):
         # `overall_result='fail'` must always be backed by the coordinate-independent

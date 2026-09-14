@@ -543,12 +543,21 @@ def _validate_probe_case_offset(case, case_id, expected_edge, expected_offset):
     if (not isinstance(canonical_offset, int) or isinstance(canonical_offset, bool)
             or canonical_offset != expected_offset):
         raise ValueError(f'coordinate-independent probe case {case_id} canonical offset mismatch')
-    actual_offset = case.get('actual_source_offset')
     max_offset = len(COORDINATE_PROBE_SOURCE_TEXT.encode('utf-8'))
-    if (not isinstance(actual_offset, int) or isinstance(actual_offset, bool)
-            or not 0 <= actual_offset <= max_offset):
-        raise ValueError(f'coordinate-independent probe case {case_id} actual offset missing or out of source range')
-    return actual_offset
+    # Both selection endpoints, not just `active`, must be checked against the
+    # canonical offset: a click that leaves `active == canonical` but
+    # `anchor != canonical` still landed on a range selection, not the caret
+    # the procedure asserts, so an anchor-only mismatch must not be treated as
+    # coordinate-independent evidence of a canonical landing (Codex review, PR #139).
+    anchor_offset = case.get('actual_anchor_source_offset')
+    active_offset = case.get('actual_active_source_offset')
+    for label, offset in (('anchor', anchor_offset), ('active', active_offset)):
+        if (not isinstance(offset, int) or isinstance(offset, bool)
+                or not 0 <= offset <= max_offset):
+            raise ValueError(
+                f'coordinate-independent probe case {case_id} actual {label} offset missing or out of source range'
+            )
+    return anchor_offset, active_offset
 
 
 def _iter_probe_cases(cases, expected_cases):
@@ -577,8 +586,8 @@ def _validate_coordinate_probe_evidence(steps):
     expected_cases = _coordinate_probe_expected_cases()
     cases = step.get('probe_cases')
     for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
-        actual_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
-        if actual_offset != expected_offset:
+        anchor_offset, active_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        if anchor_offset != expected_offset or active_offset != expected_offset:
             raise ValueError(f'coordinate-independent probe case {case_id} landed on a non-canonical offset')
         if case.get('classification') != 'at_canonical':
             raise ValueError(f'coordinate-independent probe case {case_id} classification is not at_canonical')
@@ -609,8 +618,12 @@ def _validate_coordinate_probe_fail_evidence(steps):
     cases = step.get('probe_cases')
     mismatch_found = False
     for case_id, expected_edge, expected_offset, case in _iter_probe_cases(cases, expected_cases):
-        actual_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
-        is_mismatch = actual_offset != expected_offset
+        anchor_offset, active_offset = _validate_probe_case_offset(case, case_id, expected_edge, expected_offset)
+        # A range selection left behind by the click (anchor != active) is a
+        # mismatch even when `active` alone lands on the canonical offset —
+        # matching the Rust probe's own `actual == Selection::caret(canonical)`
+        # check, which fails on any such residual selection (Codex review, PR #139).
+        is_mismatch = anchor_offset != expected_offset or active_offset != expected_offset
         if case.get('classification') != ('mismatch' if is_mismatch else 'at_canonical'):
             raise ValueError(f'coordinate-independent probe case {case_id} classification inconsistent with offsets')
         mismatch_found = mismatch_found or is_mismatch

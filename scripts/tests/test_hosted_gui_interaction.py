@@ -1039,23 +1039,28 @@ class RunCoordinateIndependentProbeTests(unittest.TestCase):
     def _passing_probe_case_lines():
         return "\n".join(
             f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
-            f'"actual_source_offset":1,"classification":"at_canonical"}}'
+            f'"actual_anchor_source_offset":1,"actual_active_source_offset":1,"classification":"at_canonical"}}'
             for case in interaction.COORDINATE_PROBE_EXPECTED_CASES
         )
 
     @staticmethod
     def _failing_probe_case_lines():
+        # index 0 leaves a range selection (anchor != canonical) with
+        # `active == canonical`: the Rust probe's own `actual ==
+        # Selection::caret(canonical)` check still classifies this as a
+        # mismatch, so the receipt must carry both endpoints for the policy to
+        # reach the same verdict (Codex review, PR #139).
         lines = []
         for index, case in enumerate(interaction.COORDINATE_PROBE_EXPECTED_CASES):
             if index == 0:
                 lines.append(
                     f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
-                    f'"actual_source_offset":2,"classification":"mismatch"}}'
+                    f'"actual_anchor_source_offset":2,"actual_active_source_offset":1,"classification":"mismatch"}}'
                 )
             else:
                 lines.append(
                     f'COORDINATE_PROBE_CASE {{"case":"{case}","edge":"start","canonical_source_offset":1,'
-                    f'"actual_source_offset":1,"classification":"at_canonical"}}'
+                    f'"actual_anchor_source_offset":1,"actual_active_source_offset":1,"classification":"at_canonical"}}'
                 )
         return "\n".join(lines)
 
