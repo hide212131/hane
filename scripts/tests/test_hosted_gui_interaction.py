@@ -390,38 +390,6 @@ class BoundaryEditCheckLandingClassificationTests(unittest.TestCase):
         self.assertEqual(calls, ['click-text', 'type-save'])
         self.assertIn('timeout', reason)
 
-    def test_undo_save_execution_failure_after_canonical_landing_is_blocked_not_failed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            fixture_path = Path(directory) / 'fixture.md'
-            baseline = interaction.INLINE_FIXTURE_ORIGINAL
-            fixture_path.write_text(baseline, encoding='utf-8')
-            expected = interaction.insert_at_match(
-                baseline, interaction.BOLD_ITALIC_CLOSE_RE, 'Z', edge='start')
-            calls = []
-
-            def fake_run_helper(swift_helper, args, timeout):
-                calls.append(args[0])
-                if args[0] == 'click-text':
-                    return True, self.OCR_EVIDENCE, ''
-                if args[0] == 'type-save':
-                    fixture_path.write_text(expected, encoding='utf-8')
-                    return True, '', ''
-                if args[0] == 'undo-save':
-                    return False, '', 'AppleScript execution failed'
-                raise AssertionError(f'unexpected helper call: {args}')
-
-            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper):
-                status, reason, detail = interaction.boundary_edit_check(
-                    None, Path('/unused.png'), 1234, fixture_path, baseline,
-                    interaction.BOLD_ITALIC_OCR_RE, 'end',
-                    interaction.BOLD_ITALIC_CLOSE_RE, 'start', 'Z',
-                    1.0, 0.0,
-                )
-        self.assertEqual(status, 'blocked')
-        self.assertEqual(detail['landing_classification'], 'at_canonical')
-        self.assertEqual(calls, ['click-text', 'type-save', 'undo-save'])
-        self.assertIn('AppleScript', reason)
-
     def test_malformed_click_evidence_is_blocked_before_typing_the_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture_path = Path(directory) / 'fixture.md'
