@@ -234,6 +234,19 @@ def product_fail_result():
     return raw
 
 
+def non_probe_product_fail_result():
+    """A `fail` receipt caused by a genuine product regression in one of the
+    independent scenarios (e.g. save/undo/redo/reopen), with the coordinate-
+    independent probe itself still reporting `pass` (Codex review, PR #139:
+    the probe-only evidence contract must not reject fails caused elsewhere)."""
+    raw = passing_result()
+    scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+    scenario['steps'][0]['result'] = 'fail'
+    scenario['result'] = 'fail'
+    raw['overall_result'] = 'fail'
+    return raw
+
+
 class ReceiptTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -374,6 +387,13 @@ class ReceiptTests(unittest.TestCase):
 
     def test_genuine_product_fail_from_the_probe_is_accepted(self):
         self.assertEqual(self.validate(product_fail_result(), 'failure'), 'fail')
+
+    def test_genuine_product_fail_from_a_non_probe_scenario_is_accepted(self):
+        # A save/undo/redo/reopen (or IME/scroll/inline) regression must still be
+        # reportable as `fail` even when the independent probe itself passes; the
+        # probe-only evidence contract applies only when the probe self-reports
+        # `fail` (Codex review, PR #139).
+        self.assertEqual(self.validate(non_probe_product_fail_result(), 'failure'), 'fail')
 
     def test_product_fail_evidence_missing_or_tampered_cannot_be_accepted(self):
         mutations = [

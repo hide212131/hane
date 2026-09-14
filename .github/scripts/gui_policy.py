@@ -549,10 +549,11 @@ def _validate_coordinate_probe_fail_evidence(steps):
     dirty-tree proof が欠落・改変された fail receipt も final judge に通ってしまう
     ため、helper/OCR/環境障害由来の blocked とは分離して fail 専用に必須化する。
 
-    呼び出し元は `coordinate_independent_probe` scenario の存在と自己申告
-    `result == 'fail'` を条件にせず常にこの検証を要求する(PR #139 review)。
-    scenario の削除・改名や `result` だけを `blocked` へ書き換える改変では、
-    この専用契約自体を素通りできてしまうため。
+    この専用契約は `coordinate_independent_probe` scenario 自身が
+    `result == 'fail'` を自己申告した場合にのみ適用する(PR #139 review)。
+    ascii_edit_save_undo_redo_reopen・japanese_ime_input・os_scroll・
+    inline_syntax_boundary など他 scenario の製品不具合による正当な
+    overall_result='fail' まで、probe 自身の fail を一律には要求しない。
     """
     step = next((s for s in steps if s.get('name') == 'coordinate_independent_probe'), None)
     if step is None:
@@ -600,11 +601,12 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
     if job_conclusion not in ('success', 'failure'):
         raise ValueError('worker did not finish normally')
     if outcome == 'fail':
-        probe_scenario = next((s for s in raw.get('scenarios', [])
-                                if s.get('name') == 'coordinate_independent_probe'), None)
-        if probe_scenario is None or probe_scenario.get('result') != 'fail':
-            raise ValueError('fail outcome requires the coordinate-independent probe scenario to report its own fail')
-        _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
+        scenarios = raw.get('scenarios', [])
+        probe_scenario = next((s for s in scenarios if s.get('name') == 'coordinate_independent_probe'), None)
+        if probe_scenario is not None and probe_scenario.get('result') == 'fail':
+            _validate_coordinate_probe_fail_evidence(probe_scenario.get('steps', []))
+        elif not any(s.get('result') == 'fail' for s in raw.get('top_level_steps', []) + scenarios):
+            raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')
     if outcome == 'pass':
         if job_conclusion != 'success':
             raise ValueError('passing payload from unsuccessful worker')
