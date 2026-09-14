@@ -16,45 +16,59 @@ AI サービスの利用上限や障害を完全自動で隠蔽しようとし�
 
 ---
 
-## 2. 全体構造
+## 2. 初期 v2 の全体構造
 
-AADW v2 は、意味を判断する **Commander** と、GitHub 上の進行を管理する **Orchestrator** を分離する。
+初期 v2 では **ChatGPT を唯一の Commander** とする。
+
+GitHub Copilot Commander は初期実装に含めない。ChatGPT Commander と Orchestrator の経路が十分に安定した後、同じ Commander 契約を利用する追加実装として検討する。
 
 ```text
-                      ┌─────────────────────┐
-                      │      Commander      │
-                      │                     │
-                      │ Primary: Copilot    │
-                      │ Fallback: ChatGPT   │
-                      └──────────┬──────────┘
-                                 │
-                            方針を判断
-                                 │
-                                 ▼
-                      ┌─────────────────────┐
-                      │ AADW Orchestrator   │
-                      │   GitHub Actions    │
-                      └──────────┬──────────┘
-                                 │
-              ┌──────────────────┼───────────────────┐
-              ▼                  ▼                   ▼
-           Claude              Codex              GUI Validator
-          implement            review               validate
-              │                  │                   │
-              └──────────────────┴───────────────────┘
-                                 │
-                                 ▼
-                        Deterministic Gate
-                                 │
-                                 ▼
-                               merge
+                         ┌─────────────────────┐
+                         │      ChatGPT        │
+                         │      Commander      │
+                         └──────────┬──────────┘
+                                    │
+                               方針を判断
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ AADW Orchestrator   │
+                         │   GitHub Actions    │
+                         └──────────┬──────────┘
+                                    │
+                 ┌──────────────────┼───────────────────┐
+                 ▼                  ▼                   ▼
+              Claude              Codex              GUI Validator
+             implement            review               validate
+                 │                  │                   │
+                 └──────────────────┴───────────────────┘
+                                    │
+                                    ▼
+                           Deterministic Gate
+                                    │
+                                    ▼
+                                  merge
 ```
 
-GitHub Copilot を通常時の Commander とする。
-
-GitHub Copilot が credit / quota / service availability などの理由で利用できない場合は、利用者が ChatGPT を呼び出し、同じ司令方針で Commander を代行させる。
+ChatGPT は意味を理解して方針を決める。
 
 GitHub Actions は AI の意味判断を代替しない。認証、現在状態の確認、worker 起動、結果の検証、状態遷移、merge の機械的な安全確認を担当する。
+
+### 2.1 ChatGPT を自動起動しない
+
+初期 v2 では、GitHub から ChatGPT を常駐 worker として自動起動する仕組みは作らない。
+
+Commander の判断が必要になった時点で Orchestrator は安全に停止し、Pull Request に `ChatGPT commander required` と表示する。
+
+利用者が ChatGPT に、たとえば次のように依頼する。
+
+```text
+Hane PR #123 の AADW Commander として続きを進めて
+```
+
+ChatGPT は current GitHub state を読み直して判断し、Commander Decision を GitHub に返す。
+
+この手動 handoff は初期 v2 の正式な正常経路であり、暫定的な workaround ではない。
 
 ---
 
@@ -65,6 +79,8 @@ GitHub Actions は AI の意味判断を代替しない。認証、現在状態�
 実装前の要求整理、調査、設計、受け入れ条件を担当する。
 
 製品コードを変更しない。Issue が実装可能な状態になった時点で設計を終了する。
+
+同じ ChatGPT が実装後に Commander を担当してよいが、Work と Commander の責務は区別する。
 
 ### 3.2 Claude Code
 
@@ -84,11 +100,9 @@ Issue の受け入れ条件に対応する focused GUI scenario を実行する�
 
 製品コードを変更しない。
 
-### 3.5 Commander
+### 3.5 ChatGPT Commander
 
 意味を理解し、次の方針を判断する。
-
-通常は GitHub Copilot、fallback は ChatGPT とする。
 
 Commander が判断する例:
 
@@ -106,6 +120,8 @@ GitHub Actions 上の trusted な通常プログラムとする。
 AI は使わない。
 
 Orchestrator は current Pull Request / current head SHA / worker receipt / Commander Decision を検証し、次に必要な worker を一つだけ起動する。
+
+Commander Decision が必要なのに存在しない場合は、ChatGPT Commander の呼び出し待ちとして安全に停止する。
 
 Orchestrator 自身は、review finding の意味や GUI failure の原因を判断しない。
 
@@ -147,15 +163,15 @@ prior-head の複数 status を読み合わせて current state を復元する�
 
 ### 4.2 Commander と Orchestrator を混ぜない
 
-Commander は意味判断をする。
+ChatGPT Commander は意味判断をする。
 
 Orchestrator は現在状態を検証し、許可された副作用を実行する。
 
-Commander に repository write / merge 権限を持たせない。
+Commander の判断だけで repository mutation や merge を実行しない。
 
 ### 4.3 AI の判断だけでは merge しない
 
-Copilot も ChatGPT も merge を実行しない。
+ChatGPT は merge を実行しない。
 
 最終 merge は Deterministic Gate の機械的な確認を必須とする。
 
@@ -175,9 +191,9 @@ Copilot も ChatGPT も merge を実行しない。
 
 ## 5. Commander Policy
 
-Copilot と ChatGPT で別々の判断ルールを持たない。
+ChatGPT Commander はこの文書の Commander Policy を正本として使う。
 
-両者はこの文書の Commander Policy を正本として使う。
+将来 GitHub Copilot Commander を追加する場合も、同じ Policy を利用する。Copilot 専用の判断基準は作らない。
 
 将来ルールが大きくなった場合は `docs/aadw-command-policy.md` へ分離してよいが、複数箇所へコピーしない。
 
@@ -237,7 +253,7 @@ cluster の classification は次の3種類だけとする。
 
 ## 6. Commander Request
 
-Commander は GitHub 全体を自由に推測して判断しない。
+Commander は過去の会話や記憶だけで current state を推測して判断しない。
 
 Orchestrator が current exact head に必要な情報をまとめ、Commander Request を生成する。
 
@@ -276,7 +292,7 @@ head または evidence が変われば、古い Request は無効になる。
 
 ## 7. Commander Decision
 
-Copilot と ChatGPT は同じ schema で結果を返す。
+ChatGPT Commander は固定 schema で結果を返す。
 
 概念 schema:
 
@@ -287,7 +303,7 @@ Copilot と ChatGPT は同じ schema で結果を返す。
   "policy_version": 1,
   "head_sha": "a1b2c3...",
   "evidence_fingerprint": "sha256:...",
-  "commander": "github-copilot",
+  "commander": "chatgpt",
   "decision": "fix",
   "reason": "current Issue の受け入れ条件を直接妨げる問題がある",
   "clusters": [
@@ -327,44 +343,28 @@ Orchestrator が current state を再確認し、次の validation または Gat
 
 ---
 
-## 8. GitHub Copilot Commander
+## 8. ChatGPT Commander の起動と返却
 
-通常時は GitHub Copilot を Commander とする。
+### 8.1 Orchestrator 側の待機
 
-Copilot には Commander Request と Commander Policy を与える。
-
-Copilot は structured Commander Decision を返すだけとする。
-
-repository write、workflow write、merge 権限を与えない。
-
-自由文だけを workflow command として扱わず、schema validation を必須とする。
-
----
-
-## 9. ChatGPT Fallback Commander
-
-### 9.1 fallback 条件
-
-Copilot が次のような外部要因で利用できない場合、Orchestrator は無理に自動 fallback せず、安全に停止する。
-
-- credit exhausted。
-- quota exhausted。
-- service unavailable。
-- Commander invocation が provider 側理由で実行できない。
-
-PR の AADW Status に、Copilot が unavailable で ChatGPT fallback を利用できることを表示する。
-
-### 9.2 起動
-
-ChatGPT は GitHub から常時自動起動される worker にはしない。
-
-利用者が ChatGPT に、たとえば次のように依頼する。
+Commander 判断が必要になったら、Orchestrator は `aadw-v2/commander = pending` とし、PR の AADW Status に次を表示する。
 
 ```text
-Hane PR #123 の AADW Commander を代行して
+Commander: ChatGPT required
+Request: aadw-v2-123-a1b2c3-review-01
 ```
 
-ChatGPT は過去の会話だけで判断せず、GitHub から current state を読み直す。
+この時点で勝手に `continue` や `fix` を選ばない。
+
+### 8.2 利用者による起動
+
+利用者が ChatGPT に次のように依頼する。
+
+```text
+Hane PR #123 の AADW Commander として続きを進めて
+```
+
+ChatGPT は current GitHub state を読み直す。
 
 最低限、次を確認する。
 
@@ -378,23 +378,9 @@ ChatGPT は過去の会話だけで判断せず、GitHub から current state �
 - fix / review cycle。
 - Commander Policy。
 
-### 9.3 Copilot と同じ方針を使う
+### 8.3 GitHub への返却
 
-ChatGPT fallback だから品質基準を緩めない。
-
-Copilot と同じ Request、Policy、Decision schema を使う。
-
-違いは `commander` フィールドだけとする。
-
-```json
-{
-  "commander": "chatgpt-fallback"
-}
-```
-
-### 9.4 GitHub への返却
-
-ChatGPT は判断後、Pull Request に機械可読な Commander Decision を返せるようにする。
+ChatGPT は判断後、Pull Request に機械可読な Commander Decision を返す。
 
 概念例:
 
@@ -408,7 +394,7 @@ ChatGPT は判断後、Pull Request に機械可読な Commander Decision を返
   "policy_version": 1,
   "head_sha": "a1b2c3...",
   "evidence_fingerprint": "sha256:...",
-  "commander": "chatgpt-fallback",
+  "commander": "chatgpt",
   "decision": "fix",
   "reason": "...",
   "clusters": [],
@@ -426,12 +412,11 @@ Orchestrator はコメントを見つけただけでは受理しない。
 - `evidence_fingerprint` が current evidence と一致。
 - `policy_version` が current version。
 - schema が正しい。
-- fallback が現在許可されている。
 - trusted actor からの入力である。
 
 ChatGPT の GitHub connector がどの actor として投稿するかは実装時に live test で確認する。repository owner として信頼できない actor になる場合は、owner による明示的な accept 操作を一度要求する。
 
-### 9.5 stale 防止
+### 8.4 stale 防止
 
 ChatGPT が調査している途中で head または evidence が変わった場合、その Decision は無効とする。
 
@@ -439,7 +424,7 @@ Decision を受理する直前に Orchestrator が current head と evidence fin
 
 ---
 
-## 10. Orchestrator
+## 9. Orchestrator
 
 Orchestrator は起動するたび、current state を GitHub から確認する。
 
@@ -451,10 +436,10 @@ Orchestrator は起動するたび、current state を GitHub から確認する
 3. trust 条件を確認
 4. CI を確認
 5. Review を確認
-6. 必要なら Commander Request
-7. Decision が fix なら Claude Fix
+6. 必要なら Commander Request を生成して ChatGPT 待ち
+7. validated Decision が fix なら Claude Fix
 8. Review/Commander が通れば必要な GUI validation
-9. GUI fail/blocked なら必要に応じて Commander Request
+9. GUI fail/blocked なら必要に応じて Commander Request を生成して ChatGPT 待ち
 10. Deterministic Gate
 ```
 
@@ -466,7 +451,7 @@ GitHub Actions の暗黙のイベント連鎖へ依存せず、`workflow_dispatc
 
 ---
 
-## 11. CI
+## 10. CI
 
 CI は current exact head に対して実行する。
 
@@ -480,11 +465,11 @@ CI failure をそのまま `continue` にしてはいけない。
 
 ---
 
-## 12. Review
+## 11. Review
 
 Codex は current exact head 全体をレビューする。
 
-Review の current findings を Commander が一度に確認し、root-cause cluster にまとめる。
+Review の current findings を ChatGPT Commander が一度に確認し、root-cause cluster にまとめる。
 
 例:
 
@@ -504,7 +489,7 @@ focused review が必要な場合は、通常 review では確認できない理
 
 ---
 
-## 13. Claude Fix
+## 12. Claude Fix
 
 Commander Decision が `fix` の場合、Orchestrator が current blocker cluster をまとめて Claude へ渡す。
 
@@ -530,9 +515,9 @@ current head == target SHA
 
 ---
 
-## 14. GUI Validation
+## 13. GUI Validation
 
-### 14.1 focused scenario
+### 13.1 focused scenario
 
 GUI validation は current Issue の受け入れ条件に対応する focused scenario を中心にする。
 
@@ -540,7 +525,7 @@ GUI validation は current Issue の受け入れ条件に対応する focused sc
 
 full regression が必要なら nightly / scheduled validation として分け、unrelated failure が自動的に current PR を止めないようにする。
 
-### 14.2 scenario isolation
+### 13.2 scenario isolation
 
 各 mutating scenario は独立した fixture / application state で実行する。
 
@@ -560,7 +545,7 @@ test
 
 前の scenario の編集結果や失敗を次へ持ち越さない。
 
-### 14.3 outcome
+### 13.3 outcome
 
 GUI outcome は次の3種類とする。
 
@@ -570,11 +555,11 @@ GUI outcome は次の3種類とする。
 
 OCR で座標を特定できない、runner が起動できない、fixture を既知状態へ戻せない、証拠が不足する、といった問題を製品 `fail` と混同しない。
 
-### 14.4 Commander への接続
+### 13.4 Commander への接続
 
 `pass` の場合、意味判断が不要なら次へ進む。
 
-`fail` / `blocked` の場合は Commander に判断を求められる。
+`fail` / `blocked` の場合は ChatGPT Commander に判断を求められる。
 
 Commander は evidence に基づき、たとえば次を区別する。
 
@@ -590,7 +575,7 @@ pre-existing independent と判断する場合は、current base に anchor さ�
 
 ---
 
-## 15. Worker Receipt
+## 14. Worker Receipt
 
 各 worker は共通 schema の receipt を残す。
 
@@ -619,7 +604,7 @@ receipt は current exact head に binding する。
 
 ---
 
-## 16. 状態表現
+## 15. 状態表現
 
 v2 の current status は少数に絞る。
 
@@ -636,7 +621,7 @@ aadw-v2/gate
 
 status の意味は通常の意味に揃える。
 
-- `pending`: 実行待ち / 実行中。
+- `pending`: 実行待ち / 実行中 / ChatGPT Commander 待ち。
 - `success`: その step が正常に完了。
 - `failure`: 対象に実際の問題がある。
 - `error`: 実行環境、AI provider、証拠不足などで判定不能。
@@ -647,7 +632,7 @@ v1 の `hane/*` status は v2 では読まない。
 
 ---
 
-## 17. PR 上の状態表示
+## 16. PR 上の状態表示
 
 大量の lifecycle comment を作らない。
 
@@ -662,19 +647,21 @@ Head: a1b2c3
 
 CI          ✅ pass
 Review      ✅ completed
-Commander   ⚠️ GitHub Copilot unavailable
-Fallback    ▶ ChatGPT available
+Commander   ⏸ ChatGPT required
 GUI         — waiting
 Gate        — waiting
 
 Commander Request:
 aadw-v2-123-a1b2c3-review-01
+
+Next:
+ChatGPT に「PR #123 の AADW Commander として続きを進めて」と依頼してください。
 ```
 
-ChatGPT fallback 後は、たとえば次のように更新する。
+ChatGPT Decision が受理された後は、たとえば次のように更新する。
 
 ```text
-Commander   ✅ ChatGPT fallback: fix
+Commander   ✅ ChatGPT: fix
 Fix         ▶ Claude running
 ```
 
@@ -682,7 +669,7 @@ Fix         ▶ Claude running
 
 ---
 
-## 18. Watchdog
+## 17. Watchdog
 
 イベント取りこぼしによる永久停止を防ぐため、小さな Watchdog を一つだけ置く。
 
@@ -702,7 +689,7 @@ recovery logic を Watchdog と Orchestrator に二重実装しない。
 
 ---
 
-## 19. Concurrency と重複防止
+## 18. Concurrency と重複防止
 
 同じ PR を複数 Orchestrator が同時に処理しない。
 
@@ -726,7 +713,7 @@ worker は開始時に current head と既存 terminal receipt を確認し、�
 
 ---
 
-## 20. Deterministic Gate
+## 19. Deterministic Gate
 
 Commander が `continue` を返しただけでは merge しない。
 
@@ -751,11 +738,11 @@ Gate が current exact head に対して機械的に条件を確認する。
 
 ---
 
-## 21. AI provider unavailable の扱い
+## 20. AI provider unavailable の扱い
 
 AI の quota / credit / service availability を複雑な内部状態機械へ変換しない。
 
-Claude / Codex / Copilot が provider 側理由で利用できない場合、その step は明確な `error` / `blocked` として停止する。
+Claude / Codex / ChatGPT が provider 側理由で利用できない場合、その step は明確な `error` / `blocked` として停止する。
 
 初期 v2 では次を実装しない。
 
@@ -764,11 +751,11 @@ Claude / Codex / Copilot が provider 側理由で利用できない場合、そ
 - provider availability 専用 retry dispatcher。
 - 自動 fallback reviewer の多段連鎖。
 
-Copilot Commander については、利用者が ChatGPT fallback を明示的に呼び出せることを正式な回復経路とする。
+ChatGPT Commander が利用できない場合は人へ引き継ぎ、別 AI へ自動 fallback しない。
 
 ---
 
-## 22. Trust Boundary
+## 21. Trust Boundary
 
 Orchestrator / Gate / schema validator は default branch 上の trusted code を使う。
 
@@ -784,7 +771,7 @@ AI credential と通常の GitHub orchestration credential を分ける。
 
 ---
 
-## 23. Workflow 構成
+## 22. Workflow 構成
 
 初期 v2 は workflow 数を少なく保つ。
 
@@ -818,7 +805,7 @@ workflow YAML は主に trigger、permissions、runner、script invocation を�
 
 ---
 
-## 24. 正常経路
+## 23. 初期 v2 の正常経路
 
 ```text
 Issue
@@ -833,77 +820,53 @@ CI
  ↓
 Codex review
  ↓
-必要なら Commander
- ├─ GitHub Copilot
- │
- │ unavailable
- │     ↓
- │ ChatGPT fallback
- │
- ├─ fix
- │    ↓
- │ Claude fix
- │    ↓
- │ new SHA
- │    ↓
- │ CI からやり直す
- │
- ├─ blocked
- │    ↓
- │ human
- │
- └─ continue
-      ↓
+意味判断が必要?
+ ├─ no ──────────────┐
+ │                    │
+ └─ yes               │
+      ↓                │
+Orchestrator が        │
+Commander Request 作成 │
+      ↓                │
+ChatGPT required       │
+      ↓                │
+利用者が ChatGPT に    │
+続きを依頼             │
+      ↓                │
+ChatGPT Commander      │
+ ├─ fix                │
+ │    ↓                │
+ │ Claude fix          │
+ │    ↓                │
+ │ new SHA             │
+ │    ↓                │
+ │ CI からやり直す     │
+ │                     │
+ ├─ blocked → human    │
+ │                     │
+ └─ continue ──────────┘
+             ↓
 必要なら focused GUI
-      ↓
-必要なら Commander
-      ↓
+             ↓
+fail / blocked で意味判断が必要なら
+再び ChatGPT Commander
+             ↓
 Deterministic Gate
-      ↓
+             ↓
 merge
 ```
 
----
+初期 v2 では「ChatGPT に続きを依頼する」操作を正常経路に含める。
 
-## 25. Copilot credit 枯渇時の経路
-
-```text
-Copilot Commander Request
-        ↓
-Copilot credit / quota unavailable
-        ↓
-aadw-v2/commander = error
-        ↓
-PR Status:
-"ChatGPT fallback available"
-        ↓
-利用者:
-「PR #123 の AADW Commander を代行して」
-        ↓
-ChatGPT:
-current exact state を GitHub から取得
-        ↓
-Commander Policy を読む
-        ↓
-同じ Commander Decision schema を生成
-        ↓
-GitHub へ Decision を返す
-        ↓
-Orchestrator が current head / fingerprint / schema / actor を再検証
-        ↓
-通常 workflow に復帰
-```
-
-fallback のためだけに別の開発フローを作らない。
+まずこの経路を安定させる。Commander 自動化は後から行う。
 
 ---
 
-## 26. 設計上の禁止事項
+## 24. 設計上の禁止事項
 
 AADW v2 では、原則として次を追加しない。
 
-- Copilot 専用の状態機械。
-- ChatGPT 専用の状態機械。
+- ChatGPT 専用とは別の意味判断状態機械。
 - 一つの edge case 専用 reconcile workflow。
 - 過去 SHA の複数 status を組み合わせた current state 推定。
 - PR comment 件数からの状態推定。
@@ -918,7 +881,7 @@ AADW v2 では、原則として次を追加しない。
 
 ---
 
-## 27. 実装順序
+## 25. 実装順序
 
 v2 を一度に作らない。
 
@@ -937,11 +900,14 @@ PR #150 merge 後の minimal CI だけの状態から、次の順で導入する
 - Review Receipt を標準化する。
 - current exact head 以外の review を current state に使わない。
 
-### Phase 3: GitHub Copilot Commander
+### Phase 3: ChatGPT Commander
 
-- Commander Request を生成する。
+- Commander Request schema を固定する。
 - Commander Decision schema を固定する。
 - root-cause cluster と `fix / continue / blocked` を実装する。
+- PR で `ChatGPT commander required` を表示できるようにする。
+- ChatGPT が current GitHub state を読み、Decision を返す運用を live test する。
+- actor / request / SHA / fingerprint / policy version の受理条件を確認する。
 
 ### Phase 4: Claude Fix
 
@@ -949,39 +915,45 @@ PR #150 merge 後の minimal CI だけの状態から、次の順で導入する
 - existing PR branch を修正する。
 - start / push effect boundary で exact-head guard を行う。
 
-### Phase 5: ChatGPT Commander Fallback
-
-- Copilot unavailable を明確に表示する。
-- ChatGPT が current GitHub state を読み、同じ Decision schema を返せるようにする。
-- actor / request / SHA / fingerprint / policy version の受理条件を live test する。
-
-### Phase 6: Focused GUI Validation
+### Phase 5: Focused GUI Validation
 
 - Issue acceptance に対応する scenario を定義する。
 - scenario isolation を実装する。
 - `pass / fail / blocked` receipt を標準化する。
 
-### Phase 7: Deterministic Gate
+### Phase 6: Deterministic Gate
 
 - current exact-head evidence だけを使って merge 条件を検証する。
 - expected head SHA を指定して merge する。
 
-### Phase 8: Watchdog
+### Phase 7: Watchdog
 
 - Orchestrator の起動取りこぼしだけを回収する。
 - recovery business logic は持たない。
 
+### Phase 8: GitHub Copilot Commander（将来拡張）
+
+Phase 1〜7 の ChatGPT Commander 経路が安定してから着手する。
+
+- ChatGPT と同じ Commander Policy を使う。
+- 同じ Commander Request / Decision schema を使う。
+- Orchestrator 側に Copilot 専用の状態機械を作らない。
+- Copilot が利用できなくても ChatGPT Commander 経路がそのまま使えるようにする。
+
+Phase 8 は AADW v2 初期完成の必須条件には含めない。
+
 ---
 
-## 28. 完成条件
+## 26. 初期完成条件
 
-AADW v2 は「考え得る recovery をすべて自動化した」ことを完成条件にしない。
+AADW v2 初期版は「考え得る recovery をすべて自動化した」ことを完成条件にしない。
 
-次を満たせば完成とする。
+次を満たせば初期完成とする。
 
-- 通常時は GitHub Copilot が Commander として一貫して動く。
-- Copilot が使えない場合、ChatGPT が同じ Commander Policy / Request / Decision schema で代行できる。
-- ChatGPT fallback 後も同じ Orchestrator 経路へ戻れる。
+- ChatGPT が Commander として一貫した Policy で判断できる。
+- Commander が必要な地点で Orchestrator が安全に止まり、ChatGPT 呼び出し待ちを明示できる。
+- 利用者が ChatGPT に PR 継続を依頼すると、ChatGPT が current GitHub state を読み直して判断できる。
+- ChatGPT Decision が同じ Orchestrator 経路へ戻る。
 - current exact head 以外の証拠や Decision では進行・merge できない。
 - review finding を root-cause cluster 単位で一回の Fix に渡せる。
 - fix 後は新しい head SHA ですべて再検証される。
@@ -991,36 +963,32 @@ AADW v2 は「考え得る recovery をすべて自動化した」ことを完�
 - merge は Deterministic Gate だけが許可する。
 - Orchestrator 以外に状態遷移ロジックを増殖させない。
 - Watchdog は Orchestrator 再起動だけを行う。
-- Pull Request を見れば、現在の工程、Commander、停止理由、次に必要な操作が分かる。
+- Pull Request を見れば、現在の工程、停止理由、次に必要な操作が分かる。
+
+GitHub Copilot Commander はこの初期完成条件には含めない。
 
 ---
 
-## 29. 最終原則
+## 27. 最終原則
 
-AADW v2 の司令塔は GitHub Copilot とする。
-
-ただし AADW v2 を GitHub Copilot そのものには依存させない。
-
-依存関係は次の形にする。
+初期 AADW v2 の司令塔は **ChatGPT** とする。
 
 ```text
-          Commander Policy
-                │
-         ┌──────┴──────┐
-         ▼             ▼
- GitHub Copilot     ChatGPT
-         │             │
-         └──────┬──────┘
-                ▼
-        Commander Decision
-                │
-                ▼
-         AADW Orchestrator
+      Commander Policy
+             │
+             ▼
+          ChatGPT
+             │
+             ▼
+    Commander Decision
+             │
+             ▼
+     AADW Orchestrator
 ```
 
-Copilot が止まっても、司令方針と current evidence は失われない。
+まずこの一つの経路を安定させる。
 
-ChatGPT は非常用の別ワークフローではなく、**同じ司令席に一時的に座る代替 Commander** として扱う。
+GitHub Copilot を追加するときも、別の仕組みを作るのではなく、同じ Commander Policy / Request / Decision contract に接続するだけにする。
 
 新機能を追加するときは常に、次を確認する。
 
@@ -1031,4 +999,4 @@ ChatGPT は非常用の別ワークフローではなく、**同じ司令席に�
 
 AADW v2 は、AI を止まらなくするシステムではない。
 
-**AI が成功すれば確実に次へ進み、失敗すれば分かりやすく安全に止まり、必要なら別 Commander が同じ方針で引き継げるシステム**とする。
+**ChatGPT が current evidence を読んで正しく司令し、GitHub Actions がその判断を安全に実行できるシステムを先に完成させる。自動 Commander の追加は、その後に行う。**
