@@ -43,9 +43,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, VisualLine,
-    VisualOffset, block_heights, block_is_joinable, block_line_span, layout_block,
-    parse_joined_span, trailing_blank_lines,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    VisualBlock, VisualLine, VisualOffset, block_heights, block_is_joinable, block_line_span,
+    layout_block, parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
@@ -4056,16 +4056,12 @@ fn source_offset_for_visual_position(
     block: &VisualLine,
     visual_offset: usize,
 ) -> SourceOffset {
-    // A hidden closing marker (e.g. the trailing `**` of bold text) collapses
-    // to zero visual width, so its own visual position is indistinguishable
-    // from the start of whatever visible text follows it on the same line.
-    // `Bias::Before` resolves that shared point to the end of the visible
-    // content the marker closes, per the collapsed-boundary contract (ADR-0004):
-    // a click there must land on visible content, not skip past hidden markup
-    // into unrelated content that happens to sit right after it.
     block
         .source_map
-        .visual_to_source(VisualOffset(visual_offset), Bias::Before)
+        .visual_to_source(
+            VisualOffset(visual_offset),
+            collapsed_boundary_bias(block, visual_offset),
+        )
         .map(|candidate| candidate.source_offset)
         .or_else(|| {
             editor
@@ -4075,6 +4071,30 @@ fn source_offset_for_visual_position(
                 .map(|range| range.start)
         })
         .unwrap_or(block.source_range.start)
+}
+
+/// A hidden marker (e.g. the trailing `**` of bold text, or the opening `` ` ``
+/// of a code span) collapses to zero visual width, so its own visual position
+/// is indistinguishable from the visible text on whichever side is unrelated
+/// content. Per the collapsed-boundary contract (ADR-0004), a click there must
+/// land on the visible content the marker actually belongs to: just before it
+/// for a closing marker (content it closes sits to the left), just after it
+/// for an opening marker (content it opens sits to the right). `MarkerEdge`
+/// carries that distinction from the parse tree; a hidden marker with no
+/// meaningful side (e.g. a quote/list prefix at the start of a line, which has
+/// no competing visible content on its left) keeps the closing-side default.
+fn collapsed_boundary_bias(block: &VisualLine, visual_offset: usize) -> Bias {
+    let edge = block.source_map.segments.iter().find_map(|segment| {
+        let at_point = segment.visual_range.start.0 == visual_offset
+            && segment.visual_range.end.0 == visual_offset;
+        (at_point && segment.visibility == Visibility::HiddenMarkup)
+            .then_some(segment.marker_edge)
+            .flatten()
+    });
+    match edge {
+        Some(MarkerEdge::Opening) => Bias::After,
+        Some(MarkerEdge::Closing) | None => Bias::Before,
+    }
 }
 
 #[cfg(test)]
@@ -4170,7 +4190,16 @@ mod tests {
     // into unrelated following content.
     #[test]
     fn hidden_closing_marker_boundary_lands_before_the_marker_not_after_it() {
-        let editor = Editor::new("**bold** more");
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        // The default caret sits at source offset 0, which is also where the
+        // bold construct's own opening marker starts: `range_touches` treats
+        // a caret exactly at a construct's start as touching it, which would
+        // disclose (un-hide) the markers this test needs hidden. Move the
+        // caret past the construct first, as the other cases below already do.
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
         let lines = presented_lines(&editor);
 
         let line = &lines[0];
@@ -4203,6 +4232,49 @@ mod tests {
         assert_eq!(
             source_offset_for_visual_position(&editor, 1, second, "de".len()),
             SourceOffset(12)
+        );
+    }
+
+    // Codex review on PR #144: a hidden *opening* marker (e.g. the leading
+    // backtick of a code span) shares its collapsed visual position with the
+    // end of whatever unrelated text precedes it, the mirror image of the
+    // closing-marker case above. The canonical position for a click there
+    // must land just after the marker, inside the content it opens, not just
+    // before it in the unrelated preceding text.
+    #[test]
+    fn hidden_opening_marker_boundary_lands_after_the_marker_not_before_it() {
+        let editor = Editor::new("this inline `code`");
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "this inline code");
+        // The shared boundary between "this inline " and "code" sits right
+        // where the opening backtick collapsed to nothing: canonical is the
+        // start of "code" (source offset 13, just after the marker), not the
+        // end of "this inline " (source offset 12, just before it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, "this inline ".len()),
+            SourceOffset(13)
+        );
+    }
+
+    // Mirrors the hosted GUI validator's `quote_open` probe
+    // (`scripts/hosted_gui_interaction.py`): an opening marker nested inside a
+    // blockquote container must resolve the same way a top-level one does.
+    #[test]
+    fn hidden_opening_marker_boundary_inside_a_quote_lands_after_the_marker() {
+        let text = "> quote with **bold**";
+        let editor = Editor::new(text);
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "> quote with bold");
+        let visual_offset = line.visual_text.find("bold").unwrap();
+        // "**bold**" starts at source offset 13; the opening `**` ends at 15,
+        // right where "bold" begins in the source.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            SourceOffset(text.find("**bold").unwrap() + 2)
         );
     }
 
