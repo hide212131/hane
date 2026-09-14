@@ -454,6 +454,22 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(raw, 'failure')
 
+    def test_scenario_fail_backed_only_by_a_fail_incapable_step_cannot_be_accepted(self):
+        # Codex review (PR #139): the intersection check must also confirm the
+        # failing child step is one the producer can actually report as `fail`.
+        # scripts/gui_validate.py::do_capture() only ever returns pass/blocked,
+        # so a `capture_before` marked `fail` next to an otherwise-passing
+        # scenario is fabricated evidence, not a real product regression, even
+        # though `capture_before` is one of the scenario's required steps.
+        raw = passing_result()
+        scenario = next(s for s in raw['scenarios'] if s['name'] == 'ascii_edit_save_undo_redo_reopen')
+        step = next(s for s in scenario['steps'] if s['name'] == 'capture_before')
+        step['result'] = 'fail'
+        scenario['result'] = 'fail'
+        raw['overall_result'] = 'fail'
+        with self.assertRaises(ValueError):
+            self.validate(raw, 'failure')
+
     def test_duplicate_top_level_build_step_cannot_fabricate_a_fail(self):
         # PR #139 review: `do_build` runs at most once per receipt, so a
         # genuinely passing `build` step next to a second, fabricated `build`

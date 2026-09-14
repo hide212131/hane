@@ -79,6 +79,34 @@ SCENARIO_REOPEN_DUPLICATE_STEPS = {'launch', 'window_discovery', 'cleanup'}
 # 捏造した top-level step で存在しない製品失敗を公開できてしまう
 # (PR #139 review)。
 TOP_LEVEL_FAIL_CAPABLE_STEPS = {'build'}
+# scripts/hosted_gui_interaction.py の各 scenario 子 step の producer 実装を参照。
+# capture_* 名は常に do_capture 経由(pass/blocked のみ)、cleanup/cleanup_reopen は
+# _cleanup_process 経由(pass/blocked のみ)で、result='fail' を一度も生成しない。
+# 同様に japanese_ime_input の入力ソース照会・選択・復元、os_scroll の os_wheel、
+# inline_syntax_boundary の restore_boundary_ime_input_source も helper/OS 呼び出しの
+# 成否のみで pass/blocked を返す。この集合の外の子 step 名が result='fail' を自己申告
+# することは producer からは起こり得ないので、scenario の fail evidence をこの集合に
+# 拘束しないと、生成不能な fail 証跡(例: capture_before を fail に書き換えるだけの
+# 捏造)が受理されてしまう(Codex review, PR #139)。
+SCENARIO_FAIL_INCAPABLE_STEPS = {
+    'ascii_edit_save_undo_redo_reopen': {'cleanup'},
+    'japanese_ime_input': {
+        'query_current_source', 'list_input_sources', 'select_japanese_source',
+        'restore_input_source', 'cleanup',
+    },
+    'os_scroll': {'os_wheel', 'cleanup'},
+    'inline_syntax_boundary': {'restore_boundary_ime_input_source', 'cleanup', 'cleanup_reopen'},
+}
+
+
+def _scenario_fail_capable_steps(scenario_name):
+    incapable = SCENARIO_FAIL_INCAPABLE_STEPS.get(scenario_name, set())
+    return {
+        step_name for step_name in REQUIRED_STEPS[scenario_name]
+        if step_name not in incapable and not step_name.startswith('capture_')
+    }
+
+
 # scripts/hosted_gui_interaction.py の COORDINATE_PROBE_TEST_QUALIFIED_NAME と同じ値。
 # 独立 probe が実際にこの1件の hit-test を実行して pass したことを、cargo test の
 # 生出力から突き合わせて確認するために使う(PR #139 review: `result == "pass"` だけでは
@@ -672,8 +700,8 @@ def validate_receipt(raw, request, evidence_dir, job_conclusion, now=None):
                 if scenario.get('name') not in REQUIRED_STEPS:
                     raise ValueError('fail scenario is not a known scenario name')
                 failing_names = {s.get('name') for s in scenario.get('steps', []) if s.get('result') == 'fail'}
-                if not failing_names & REQUIRED_STEPS[scenario['name']]:
-                    raise ValueError('scenario fail is not backed by any failing required step')
+                if not failing_names & _scenario_fail_capable_steps(scenario['name']):
+                    raise ValueError('scenario fail is not backed by any failing required step that can produce fail')
                 failing_scenario = True
             if not failing_top_level and not failing_scenario:
                 raise ValueError('fail outcome is not backed by any scenario or step reporting its own fail')

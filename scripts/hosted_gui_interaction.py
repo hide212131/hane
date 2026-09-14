@@ -916,7 +916,11 @@ def boundary_edit_check(swift_helper, screenshot_path, pid, fixture_path, baseli
     detail["landing_classification"] = "at_canonical"
     ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
     if not ok:
-        return "fail", f"undo に失敗した: {err}", detail
+        return "blocked", (
+            f"境界クリック挿入後の undo に失敗した(timeout、integrity mismatch、AppleScript の"
+            f"実行失敗などの helper/実行環境側要因の可能性があり、undo の製品挙動を観測できて"
+            f"いないため製品 fail と区別して procedure blocked とする): {err}"
+        ), detail
     matched, actual = wait_for_fixture_bytes(fixture_path, baseline.encode("utf-8"), poll_timeout)
     detail.update(expected_after_undo=baseline, actual_after_undo=_decode(actual))
     if not matched:
