@@ -228,6 +228,12 @@ pub struct MarkdownParse {
     /// prefixes cannot be associated with an owner by comparing source starts.
     /// Kept before range merging so nested, adjacent prefixes retain ownership.
     pub quote_markers: Vec<(SourceRange, NodeId)>,
+    /// List item bullet/number markers paired with their owning list item
+    /// node. An indented item's own source range starts before its marker
+    /// (at the indentation, not the bullet), so ownership cannot be recovered
+    /// by comparing source starts either; kept explicit for the same reason
+    /// as `quote_markers`.
+    pub list_item_markers: Vec<(SourceRange, NodeId)>,
     /// Padding removed from inline code after container prefixes and line
     /// endings are interpreted. Derived against the parser's code content.
     pub code_padding: Vec<SourceRange>,
@@ -682,6 +688,7 @@ fn code_padding(
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
     quote_markers: Vec<(SourceRange, NodeId)>,
+    list_item_markers: Vec<(SourceRange, NodeId)>,
 }
 
 /// Derives marker source ranges by lexing only inside the source ranges that
@@ -691,6 +698,7 @@ struct DerivedMarkers {
 fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
     let mut quote_owners = Vec::new();
+    let mut list_item_owners = Vec::new();
     for (id, block) in tree.blocks() {
         let relative = block.source_range.start.0.saturating_sub(range.start.0);
         let tail = source.get(relative..).unwrap_or_default();
@@ -746,10 +754,12 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                         item.find(". ").map_or(0, |end| end + 2)
                     };
                 if marker_len > 0 {
-                    markers.push(SourceRange::new(
+                    let marker = SourceRange::new(
                         block.source_range.start.0 + prefix,
                         block.source_range.start.0 + prefix + marker_len,
-                    ));
+                    );
+                    markers.push(marker);
+                    list_item_owners.push((marker, id));
                 }
             }
             NodeKind::CodeBlock => {
@@ -834,6 +844,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
     DerivedMarkers {
         markers: merged,
         quote_markers: quote_owners,
+        list_item_markers: list_item_owners,
     }
 }
 
@@ -983,6 +994,7 @@ pub fn parse_document(
         tree,
         markers: markers.markers,
         quote_markers: markers.quote_markers,
+        list_item_markers: markers.list_item_markers,
         code_padding,
     }
 }

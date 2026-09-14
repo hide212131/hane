@@ -4080,9 +4080,11 @@ fn source_offset_for_visual_position(
 /// land on the visible content the marker actually belongs to: just before it
 /// for a closing marker (content it closes sits to the left), just after it
 /// for an opening marker (content it opens sits to the right). `MarkerEdge`
-/// carries that distinction from the parse tree; a hidden marker with no
-/// meaningful side (e.g. a quote/list prefix at the start of a line, which has
-/// no competing visible content on its left) keeps the closing-side default.
+/// carries that distinction from the parse tree, including for a quote/list
+/// prefix, whose owning container node always resolves it as opening even
+/// though the node's own source range can start before the marker (at the
+/// container's indentation). A marker with no resolvable edge at all (not
+/// expected for markers this crate derives) keeps the closing-side default.
 fn collapsed_boundary_bias(block: &VisualLine, visual_offset: usize) -> Bias {
     let edge = block.source_map.segments.iter().find_map(|segment| {
         let at_point = segment.visual_range.start.0 == visual_offset
@@ -4275,6 +4277,36 @@ mod tests {
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, line, visual_offset),
             SourceOffset(text.find("**bold").unwrap() + 2)
+        );
+    }
+
+    // Codex review on PR #144: an indented list item's bullet marker collapses
+    // to zero visual width the same as any other hidden marker, but its
+    // owning `ListItem` node's source range starts at the line's indentation
+    // rather than at the bullet itself — so the naive start/end alignment
+    // `marker_edge` otherwise uses to classify a delimiter never matches, and
+    // the marker fell back to the closing-side default. That misclassified
+    // the marker as closing content to its *left* (the indentation) instead
+    // of opening the list item to its right, so a click at the start of the
+    // visible text landed before the bullet instead of after it.
+    #[test]
+    fn hidden_list_marker_boundary_lands_after_the_marker_even_when_indented() {
+        let text = "  - item\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  item");
+        let visual_offset = line.visual_text.find("item").unwrap();
+        // "  - item" hides the bullet `- ` (source offsets 2..4); canonical is
+        // source offset 4, just after the marker and before "item", not
+        // offset 2, just before the marker in the leading indentation.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            SourceOffset(text.find("- item").unwrap() + 2)
         );
     }
 

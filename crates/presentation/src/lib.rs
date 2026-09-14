@@ -1061,11 +1061,21 @@ fn marker_is_disclosed(
 /// does. Returns `None` when the marker does not align with either edge of
 /// any delimiter-owning node (not expected for markers this crate derives,
 /// but not a display-breaking condition either).
+///
+/// A quote or list item's own prefix marker is always an opening edge — the
+/// content it introduces sits to its right — even though its owning node's
+/// `source_range` starts before the marker at the container's indentation,
+/// which would otherwise make the `start == marker.start` check below miss
+/// it entirely for an indented item.
 fn marker_edge(
-    marker: SourceRange,
+    planned: &ProjectedMarker,
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
 ) -> Option<MarkerEdge> {
+    if planned.quote_owner.is_some() || planned.list_owner.is_some() {
+        return Some(MarkerEdge::Opening);
+    }
+    let marker = planned.range;
     nodes.intersecting(marker).into_iter().find_map(|id| {
         let span = parsed.tree.node(*id)?;
         if !has_delimiter_markers(span.kind) {
@@ -1250,7 +1260,7 @@ fn present_markdown_from_parse(
             } else {
                 Visibility::HiddenMarkup
             },
-            marker_edge(marker, parsed, &shared.projection.nodes),
+            marker_edge(planned, parsed, &shared.projection.nodes),
         );
         source_cursor = marker.end.0;
     }
@@ -1575,6 +1585,7 @@ impl<T> SourceIndex<T> {
 struct ProjectedMarker {
     range: SourceRange,
     quote_owner: Option<NodeId>,
+    list_owner: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1590,6 +1601,11 @@ impl ProjectionIndex {
             .iter()
             .map(|(range, owner)| ((range.start, range.end), *owner))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let list_owners = parsed
+            .list_item_markers
+            .iter()
+            .map(|(range, owner)| ((range.start, range.end), *owner))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut markers = parsed
             .markers
             .iter()
@@ -1597,6 +1613,7 @@ impl ProjectionIndex {
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
+                list_owner: list_owners.get(&(range.start, range.end)).copied(),
             })
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
