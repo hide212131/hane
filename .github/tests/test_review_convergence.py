@@ -161,9 +161,10 @@ class OutdatedReviewCountTests(unittest.TestCase):
 
 class ConvergenceSignalsTests(unittest.TestCase):
     def test_assembles_all_signals_with_a_current_decision(self):
-        commits = [{'sha': 'a' * 40}, {'sha': SHA}]
+        prior_sha = 'b' * 40
+        commits = [{'sha': prior_sha}, {'sha': SHA}]
         statuses_by_sha = {
-            'a' * 40: [status(1, 'hane/codex-review', 'failure', f"Codex findings for {'a' * 12}")],
+            prior_sha: [status(1, 'hane/codex-review', 'failure', f'Codex findings for {prior_sha[:12]}')],
             SHA: [status(2, 'hane/codex-review', 'failure', f'Codex findings for {SHORT}')],
         }
         current_decision = decision(cluster('c1', 'blocker', ['f1']), cluster('c2', 'follow_up', ['f2']))
