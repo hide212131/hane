@@ -17,7 +17,12 @@ class Tests(unittest.TestCase):
             "vendor/gpui/src/lib.rs",
             "Cargo.toml",
             "Cargo.lock",
+            "rust-toolchain",
             "rust-toolchain.toml",
+            ".cargo/config",
+            ".cargo/config.toml",
+            ".clippy.toml",
+            "clippy.toml",
             "assets/app-icon.ico",
             "assets/icons/work-folder/file.svg",
             ".github/workflows/ci.yml",
@@ -48,6 +53,7 @@ class Tests(unittest.TestCase):
         self.assertFalse(path_filter.requires_rust_ci("crates-old/example.rs"))
         self.assertFalse(path_filter.requires_rust_ci("vendor-notes/readme.txt"))
         self.assertFalse(path_filter.requires_rust_ci("assets.md"))
+        self.assertFalse(path_filter.requires_rust_ci(".cargo-notes/config.toml"))
 
     def test_any_rust_input_in_mixed_changes_runs_ci(self):
         self.assertTrue(
@@ -74,6 +80,15 @@ class Tests(unittest.TestCase):
             check=True,
         )
         self.assertEqual(run.stdout, b"false\n")
+
+        run = subprocess.run(
+            command,
+            input=b"README.md\0.cargo/config.toml\0",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        self.assertEqual(run.stdout, b"true\n")
 
         run = subprocess.run(
             command,
