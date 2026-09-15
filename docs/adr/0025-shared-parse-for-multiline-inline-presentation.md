@@ -157,11 +157,11 @@ PR #102 および後続実装では、少なくとも次を固定する。
 
 PR #102 の残件は、個別 review comment に対する局所 workaround として処理せず、本 ADR の不変条件へ収束させる。
 
-修正開始前に対象 exact head の non-outdated / unresolved substantive review threads を全件 snapshot し、root-cause cluster を把握する。独立した finding を1回のClaude invocationへ無造作に混ぜず、原則1 finding / 1 repair invocation とするが、各修正は本 ADR の共通設計を壊さないことを条件とする。
+修正開始前に対象 exact head の non-outdated / unresolved substantive review threads を全件確認し、root-cause cluster を把握する。同じ root-cause cluster に属する blocker は一回の fix にまとめる。独立した root cause は同じ fix に混ぜず、別の action として扱う。worker は修正後の次工程を決めない。
 
-各修正後は新しい exact head で review thread snapshot を取り直し、outdated 化した指摘、新規 finding、残存 finding を再分類する。
+各修正後は新しい exact head で review threads を取り直し、outdated 化した指摘、新規 finding、残存 finding を再分類する。
 
-review 状態の canonical snapshot と Claude fix worker / merge gate の不一致は Issue #110 で別途恒久修正する。
+AADW v1 で Issue #110 が対象としていた canonical snapshot / Claude fix worker / merge gate の同期契約は、現行 AADW v2 の進行判断には使わない。current GitHub facts と `docs/aadw-command-policy.md` を正本として Commander が判断する。
 
 ## 結果
 

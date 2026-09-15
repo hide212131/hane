@@ -1,39 +1,37 @@
 ---
-name: 設計 Issue（Work → Claude Code）
-about: ChatGPT / Work で整理した要求・設計を Claude Code の実装に引き渡すための Issue テンプレート
+name: 設計・実装 Issue（AADW v2）
+about: 要求・設計判断・制約・受け入れ条件を整理し、AADW v2 で実装できる状態にするための Issue テンプレート
 title: ""
 labels: ""
 assignees: ""
 ---
 
 <!--
-このテンプレートは、要求整理・詳細設計を担当する Work（ChatGPT）が Issue を作成し、
-実装担当の Claude Code へ引き渡すための構成です。
-六つの主要項目（背景・解決したい問題・要求・設計上の決定・制約・受け入れ条件）に加えて、
-実装裁量の範囲と設計完了 handoff を記述する項目を含みます。
-詳細は docs/agentic-development-workflow.md の「Work（ChatGPT）」節、ADR-0023・ADR-0026 を参照してください。
-このテンプレートに沿わない既存 Issue でも、既存の /implement 手順はそのまま利用できます。
+Hane の現行運用は docs/agentic-development-workflow-v2.md と docs/aadw-command-policy.md を正とします。
+この Issue 自体は AADW の機械的な state を持ちません。ChatGPT Commander が GitHub 上の current facts と本文を読み、必要な次の一つの action を判断します。
 -->
 
 ## 背景
 
-<!-- なぜこの Issue が必要か。確認した基準（対象 commit、関連する既存文書）があれば書く。 -->
+<!-- なぜこの Issue が必要か。関連する既存文書、Issue、PR があれば書く。 -->
 
 ## 解決したい問題
 
-<!-- 現状のどこに問題があるか。 -->
+<!-- 現状のどこに問題があるか。観測した事実と推測を分ける。 -->
 
 ## 要求
 
-<!-- 満たすべき要求を列挙する。 -->
+<!-- 満たすべき要求を書く。 -->
 
 ## 設計上の決定
 
-<!-- 決定済みの設計とその根拠を書く。未決事項がある場合は区別して明記する。 -->
-
 ### 決定済み
 
+<!-- 実装が守るべき設計判断と、その根拠を書く。 -->
+
 ### 未決事項
+
+<!-- 不明点がなければ「なし」。実装を阻む unknown は解消するまで pass 扱いしない。 -->
 
 ## 制約
 
@@ -41,22 +39,23 @@ assignees: ""
 
 ## 受け入れ条件
 
-- [ ] （満たしたかを検証できる受け入れ条件を記入）
+- [ ] （満たしたかを GitHub 上の evidence で確認できる条件を書く）
 
 ## 実装時の判断
 
 <!--
-上記の要求・決定・制約を守る範囲で、具体的な変更ファイル・関数・実装手順は
-Claude Code が既存コードと関連文書を確認したうえで最終判断する旨を明記する。
+要求・決定・制約を守る範囲で、具体的な変更ファイル、関数構成、実装手順は実装担当が既存コードを読んで判断する。
+独立した root cause を一つの修正へ混ぜない。
 -->
 
-## 設計引き渡し
+## 引き渡し情報
 
-<!-- 要求・範囲・設計判断と根拠・制約・検証可能な受け入れ条件が揃い、実装を阻む未決事項がなければ設計完了とする。残る場合は設計中に留める。
-設計完了 handoff の書式。書き方の例は docs/agentic-development-workflow.md の「Work（ChatGPT）」節を参照。 -->
+<!--
+実装を阻む未決事項がないこと、必要な成果物・制約・受け入れ条件が本文に揃っていることを確認する。
+特定の起動コマンドや AADW 独自 state は前提にしない。
+-->
 
-設計状態: 設計中 / 設計完了（実装未起動）
-成果物・制約・受け入れ条件: 本文参照
 実装を阻む未決事項: なし / <内容>
-実装担当: Claude Code。レビュー: Codex。進行判断: GitHub Copilot。
-起動状況: 未起動 / 依頼投稿済み（コメント URL） / Claude 実装開始（Actions run URL） / PR 作成済み（PR URL）
+製品コードを変更する場合の実装担当: Claude Code
+docs / metadata のみの場合: Commander が current facts と Commander Policy から既存の action を選ぶ
+GUI validation の要否: Commander が変更内容と受け入れ条件から判断

@@ -1,12 +1,12 @@
 # `scripts/gui_validate.py` — 起動・撮影・終了の最小検証コマンド
 
-[Local GUI validation 設計](local-gui-validation.md) の段階 1（「6. 検証コマンドの責務」「7. GitHub との受け渡し」）の最初の実装として、信頼するローカル checkout から Hane を起動し、対象ウィンドウを撮影して、終了処理までの証拠を残す。既存の [`scripts/capture.sh`](../scripts/capture.sh) と [`scripts/window_id.swift`](../scripts/window_id.swift) を出発点にしており、両スクリプトの既存の動作（`測定` `docs/refactor-*` からの利用を含む）は変更していない。
+[Local GUI validation 設計](local-gui-validation.md) の「実行手段」で位置づける最小コマンドとして、信頼するローカル checkout から Hane を起動し、対象ウィンドウを撮影して、終了処理までの証拠を残す。既存の [`scripts/capture.sh`](../scripts/capture.sh) と [`scripts/window_id.swift`](../scripts/window_id.swift) を出発点にしており、両スクリプトの既存の動作（`測定` `docs/refactor-*` からの利用を含む）は変更していない。
 
 この文書はこのコマンド固有の運用手順（実行方法・結果形式・終了コード・制約）を記す。設計判断そのものは [ADR-0024](adr/0024-local-gui-validation.md) と設計書を正本とする。
 
 ## この文書の位置づけ
 
-**このコマンドの追加・成功実行は、段階 1 が実機で実証済みであることを意味しない。** 実行方法と結果形式を定義するものであり、対象 Mac での実行結果は別途記録する。このコマンド自身の単体テスト（後述）は実画面・実ビルドなしで状態遷移を検証するものであり、Mac 上での実証の代わりにはならない。
+**このコマンドの追加・成功実行は、Hane の GUI acceptance criteria 全体が実機で実証済みであることを意味しない。** 実行方法と結果形式を定義するものであり、対象 Mac での実行結果は別途記録する。このコマンド自身の単体テスト（後述）は実画面・実ビルドなしで runner 内部の結果分類とデータ契約を検証するものであり、Mac 上での実証の代わりにはならない。
 
 ## 何を確認し、何を確認しないか
 
@@ -81,7 +81,9 @@ target/gui-validate/<request-id>/<generation>/
 
 ### `pass` / `fail` / `blocked` の決め方
 
-設計書「7. GitHub との受け渡し」の表と同じ優先順位を実装している。実施した工程の結果に `fail` が一つでもあれば全体は `fail`、`fail` がなく `blocked` が一つでもあれば全体は `blocked`、すべて `pass` なら全体も `pass`。後片付け（`cleanup`）が失敗した場合も同じ表に従うため、他の工程がすべて成功していても全体は `blocked` になる。後片付けの失敗を成功として扱わないためである。
+以下はこの CLI 固有の結果分類であり、AADW の persistent state や最終判断ではない。実施した工程の結果に `fail` が一つでもあれば全体は `fail`、`fail` がなく `blocked` が一つでもあれば全体は `blocked`、すべて `pass` なら全体も `pass`。後片付け（`cleanup`）が失敗した場合も同じ優先順位に従うため、他の工程がすべて成功していても全体は `blocked` になる。後片付けの失敗を成功として扱わないためである。
+
+Commander は `overall_result` をそのまま AADW の verdict にせず、target SHA、個別工程、artifact、current facts と [AADW Commander Policy](aadw-command-policy.md) を合わせて意味を判断する。
 
 工程ごとの分類方針:
 
@@ -121,7 +123,7 @@ target/gui-validate/<request-id>/<generation>/
 python3 -m unittest discover -s scripts/tests
 ```
 
-このテストの成功は状態遷移とデータ契約の検証であり、対象 Mac 上での起動・撮影・終了の実証を意味しない。実機での実証は別途、対象 Mac 上で本コマンドを実行し、生成された `result.json` と画像を確認して記録する。
+このテストの成功は CLI 内部の結果分類とデータ契約の検証であり、対象 Mac 上での起動・撮影・終了の実証を意味しない。実機での実証は別途、対象 Mac 上で本コマンドを実行し、生成された `result.json` と画像を確認して記録する。
 
 実行用ディレクトリは未作成または空の場所を指定する。過去の証拠や既存文書がある場所は設定エラーとし、上書きしない。checkout内ではGitで無視される場所（既定は `target/` 配下）に限る。非無視パスは空でも設定エラーとなる。checkout外の専用ディレクトリも指定できる。これにより、保持した証拠が次回のclean確認を妨げない。
 
