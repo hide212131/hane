@@ -4,7 +4,7 @@
 
 この文書は、AADW v2 において ChatGPT が司令塔として判断するときのルールを定める。
 
-AADW v2 の判断は、原則として次の2つだけを入力とする。
+判断入力は原則として次の2つだけとする。
 
 1. この Commander Policy。
 2. GitHub から取得した current facts / evidence。
@@ -19,9 +19,7 @@ current facts / evidence
    next one action
 ```
 
-current facts の取得方法は固定しすぎない。初期 v2 では ChatGPT が GitHub connector の少数の read 操作を固定手順で使う。実運用で重複や高コストが確認された場合だけ `aadw_status(PR)` のような read-only collector へ抽出してよい。
-
-GitHub Actions、worker、collector は、この Policy に書かれた意味判断を代行しない。
+current facts の取得方法や worker の起動方法は固定しすぎない。まず既存の GitHub / Codex / Claude / GUI 機能を使い、重複や複雑さが実運用で確認された場合だけ専用 wrapper / collector を追加する。
 
 ---
 
@@ -59,13 +57,21 @@ current Issue の目的と acceptance criteria を満たすことを優先する
 
 current evidence に基づき、次に必要な一つの action を選ぶ。
 
+### 2.6 existing tools first
+
+AADW 専用 command / workflow / wrapper / Gate を前提にしない。
+
+既存機能で十分ならそのまま使う。
+
+同じ操作や確認が繰り返し問題になると確認された場合だけ、最小の専用部品へ抽出する。
+
 ---
 
 ## 3. Current state の確認
 
-利用者から `PR #123 を続けて` のように依頼された場合、まず GitHub から current state の事実を固定手順で取得する。
+利用者から `PR #123 を続けて` のように依頼された場合、まず GitHub から current state の事実を取得する。
 
-初期 v2 では原則として次程度を見る。
+原則として次程度を見る。
 
 - PR metadata / current head SHA。
 - current head の CI / checks。
@@ -82,8 +88,6 @@ current evidence に基づき、次に必要な一つの action を選ぶ。
 
 無関係な evidence を広く取得しない。
 
-current-state discovery が実運用で重いと確認された場合は、その重複部分だけを read-only collector へ抽出してよい。
-
 ---
 
 ## 4. CI
@@ -92,7 +96,7 @@ current-state discovery が実運用で重いと確認された場合は、そ�
 
 CI が current exact head に対して成功している場合、CI を blocker としない。
 
-次に必要な検証が何かを current evidence から判断する。
+次に必要な検証を current evidence から判断する。
 
 ### CI failure
 
@@ -143,7 +147,7 @@ blocker がある場合、同じ root-cause cluster のものは一回の fix �
 
 独立した root cause は必要に応じて別 fix とする。
 
-fix instruction には、少なくとも次を含める。
+fix instruction には少なくとも次を含める。
 
 - target PR。
 - target exact head SHA。
@@ -208,11 +212,18 @@ current PR の目的を直接妨げない改善は follow-up に分離できる�
 
 ChatGPT の意味判断だけでは merge しない。
 
-current Issue の目的と acceptance criteria を満たし、必要な review / GUI 判断を終えたと判断したら `aadw_gate(PR, expected_head)` を実行する。
+current Issue の目的と acceptance criteria を満たし、必要な review / GUI 判断を終えたら、merge 直前に GitHub 上の客観条件を再確認する。
 
-Gate が失敗した場合は merge しない。
+最低限確認する。
 
-Gate は客観条件だけを確認し、意味判断を行わない。
+- current head SHA が判断対象の expected head と一致する。
+- required CI checks が success。
+- 必要と判断した GUI validation がある場合、その結果が受け入れ可能である。
+- GitHub が PR を mergeable と報告している。
+
+merge は expected head SHA を指定して行う。
+
+専用 Gate は必須ではない。この確認が実運用で繰り返し複雑になると確認された場合だけ、客観条件だけを確認する小さな Gate へ抽出してよい。
 
 ---
 
@@ -238,10 +249,12 @@ run review
 run fix
 run GUI validation
 rerun failed infrastructure step
-run gate
+merge after objective safety checks
 stop and ask for human decision
 ```
 
-判断理由は、current facts とこの Policy に基づいて説明できること。
+実行にはまず既存機能を使う。
+
+判断理由は current facts とこの Policy に基づいて説明できること。
 
 Policy に無い複雑な例外を新しい workflow state として作るより、必要なら Policy 自体を更新する。
