@@ -18,6 +18,7 @@ class Tests(unittest.TestCase):
             "Cargo.toml",
             "Cargo.lock",
             "rust-toolchain.toml",
+            "assets/app-icon.ico",
             "assets/icons/work-folder/file.svg",
             ".github/workflows/ci.yml",
             ".github/scripts/rust_ci_path_filter.py",
@@ -36,6 +37,8 @@ class Tests(unittest.TestCase):
             ".github/scripts/aadw_observer.py",
             ".github/tests/test_aadw_observer.py",
             ".github/workflows/aadw-notifications.yml",
+            "assets/app-icon.svg",
+            "assets/phase4-feather.svg",
         ]
         for path in paths:
             with self.subTest(path=path):
