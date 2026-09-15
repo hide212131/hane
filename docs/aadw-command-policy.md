@@ -7,7 +7,7 @@
 AADW v2 の判断は、原則として次の2つだけを入力とする。
 
 1. この Commander Policy。
-2. `aadw_status(PR)` と、必要に応じて追加取得した current evidence。
+2. GitHub から取得した current facts / evidence。
 
 ```text
 Commander Policy
@@ -19,7 +19,9 @@ current facts / evidence
    next one action
 ```
 
-GitHub Actions、worker、status collector は、この Policy に書かれた意味判断を代行しない。
+current facts の取得方法は固定しすぎない。初期 v2 では ChatGPT が GitHub connector の少数の read 操作を固定手順で使う。実運用で重複や高コストが確認された場合だけ `aadw_status(PR)` のような read-only collector へ抽出してよい。
+
+GitHub Actions、worker、collector は、この Policy に書かれた意味判断を代行しない。
 
 ---
 
@@ -61,9 +63,16 @@ current evidence に基づき、次に必要な一つの action を選ぶ。
 
 ## 3. Current state の確認
 
-利用者から `PR #123 を続けて` のように依頼された場合、まず `aadw_status(PR)` を取得する。
+利用者から `PR #123 を続けて` のように依頼された場合、まず GitHub から current state の事実を固定手順で取得する。
 
-status summary だけで判断できない場合に限り、必要な evidence を追加取得する。
+初期 v2 では原則として次程度を見る。
+
+- PR metadata / current head SHA。
+- current head の CI / checks。
+- current review / unresolved review threads。
+- relevant workflow runs / GUI evidence の有無。
+
+これだけで判断できない場合に限り、必要な evidence を追加取得する。
 
 例:
 
@@ -72,6 +81,8 @@ status summary だけで判断できない場合に限り、必要な evidence �
 - CI failure なら failed check / job / log。
 
 無関係な evidence を広く取得しない。
+
+current-state discovery が実運用で重いと確認された場合は、その重複部分だけを read-only collector へ抽出してよい。
 
 ---
 
@@ -148,7 +159,7 @@ fix instruction には、少なくとも次を含める。
 
 Claude が push して head が変わったら、旧 head の evidence は current 判断に使わない。
 
-新 head に対して `aadw_status(PR)` から再確認する。
+新 head に対して current-state discovery から再確認する。
 
 同じ root cause が修正後も繰り返す場合、細かい patch を無制限に続けず、設計見直し、scope 分割、追加 evidence の取得などを判断する。
 
@@ -207,7 +218,7 @@ Gate は客観条件だけを確認し、意味判断を行わない。
 
 ## 10. Provider / infrastructure failure
 
-Claude、Codex、GUI runner、status workflow などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
+Claude、Codex、GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
 
 必要な evidence が得られなければ停止する。
 
