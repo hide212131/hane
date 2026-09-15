@@ -56,5 +56,6 @@ Hane の現行運用は docs/agentic-development-workflow-v2.md と docs/aadw-co
 -->
 
 実装を阻む未決事項: なし / <内容>
-実装担当の想定: Claude Code / <別の既存手段>
+製品コードを変更する場合の実装担当: Claude Code
+docs / metadata のみの場合: Commander が current facts と Commander Policy から既存の action を選ぶ
 GUI validation の要否: Commander が変更内容と受け入れ条件から判断
