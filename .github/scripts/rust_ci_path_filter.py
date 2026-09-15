@@ -6,12 +6,13 @@ import sys
 from collections.abc import Iterable
 
 RUST_CI_PREFIXES = (
-    "assets/",
+    "assets/icons/work-folder/",
     "crates/",
     "vendor/",
 )
 
 RUST_CI_PATHS = {
+    "assets/app-icon.ico",
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain.toml",
