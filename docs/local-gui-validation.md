@@ -14,11 +14,13 @@ GUI validation は focused scenario を基本とする。毎回 full regression 
 
 GUI validator は次を行う。
 
-- 対象 head、検証シナリオ、検証した base / merge context を evidence から確認できるようにする。
+- 対象 head と検証シナリオを明示する。base-sensitive な scenario を検証する場合は、実際に検証した base / merge context も evidence から確認できるようにする。
 - 実アプリを操作し、観測した結果と必要な artifact を残す。
 - 保存内容、状態変化、画面上の結果など、そのシナリオで確認すべき事実を確認する。
 - product code を変更しない。
 - 検証後の修正、再レビュー、merge など次の action を決めない。
+
+base の変更が scenario に影響しないと扱うかどうかは GUI worker が決めない。ChatGPT Commander が current facts と scenario の性質から判断し、その根拠を GitHub 上の Issue / PR など自然な場所に残す。
 
 `pass` / `fail` / `blocked` のような runner 側の結果がある場合も、それ自体を AADW の persistent state や最終判断にしない。ChatGPT が current facts と Commander Policy に基づき、product regression、acceptance blocker、validation infrastructure problem、pre-existing independent issue、unknown を区別する。
 
