@@ -31,9 +31,8 @@
 | [ADR-0020](0020-block-virtualization.md) | ブロック単位の仮想化と描画 |
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
-| [ADR-0023](0023-ai-agent-development-workflow.md) | AI agent 開発の実装・レビュー・進行判断の分離 |
 | [ADR-0024](0024-local-gui-validation.md) | ローカル GUI 検証を Computer Use の承認から切り離し、非公開リポジトリで実行を制御する（実装前） |
-| [ADR-0026](0026-work-design-handoff.md) | Work（ChatGPT）を上流の planner/designer とし、Claude Code への明示的な handoff を定義する（ADR-0023 を補足） |
+| [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | AADW v2 を ChatGPT Commander + GitHub facts で運用する |
 
 ## Superseded / amended
 
@@ -44,6 +43,8 @@
 | [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md) | [ADR-0020](0020-block-virtualization.md)、[ADR-0021](0021-layout-lines-and-visual-coordinates.md)、[ADR-0022](0022-layout-cache-invalidation.md) |
 | [ADR-0008](0008-markdown-parsing-strategy.md) | [ADR-0018](0018-block-index.md)、[architecture](../architecture.md) |
 | [ADR-0009](0009-performance-harness.md) | [architecture](../architecture.md)、[baseline](../baseline/README.md) |
+| [ADR-0023](0023-ai-agent-development-workflow.md) | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) |
+| [ADR-0026](0026-work-design-handoff.md) | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) |
 
 ## History
 
