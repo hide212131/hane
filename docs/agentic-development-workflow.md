@@ -11,4 +11,4 @@
 - [AADW Commander Policy](aadw-command-policy.md)
 - [ADR-0027](adr/0027-aadw-v2-chatgpt-commander.md)
 
-v1 の全文が必要な場合は、v2 正本化直前の commit `2ef70feda07958bbdf87b6d62c70147f4ce9ccfd` にある [この文書の履歴版](https://github.com/hide212131/hane/blob/2ef70feda07958bbdf87b6d62c70147f4ce9ccfd/docs/agentic-development-workflow.md) を参照する。
+v1 の全文は [`docs/history/aadw-v1/agentic-development-workflow.md`](history/aadw-v1/agentic-development-workflow.md) に保存する。履歴資料内の相対リンクは v1 当時の配置を前提としているため、必要に応じて同じ履歴 snapshot または Git history を参照する。

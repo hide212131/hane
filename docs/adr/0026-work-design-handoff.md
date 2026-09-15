@@ -12,4 +12,4 @@ Superseded — [ADR-0027](0027-aadw-v2-chatgpt-commander.md) により置換。
 
 現行の設計は [AADW v2 設計書](../agentic-development-workflow-v2.md) と [AADW Commander Policy](../aadw-command-policy.md) を参照する。
 
-元の全文は v2 正本化直前の commit `2ef70feda07958bbdf87b6d62c70147f4ce9ccfd` にある [履歴版](https://github.com/hide212131/hane/blob/2ef70feda07958bbdf87b6d62c70147f4ce9ccfd/docs/adr/0026-work-design-handoff.md) に保存されている。
+元の全文は [`docs/history/aadw-v1/adr/0026-work-design-handoff.md`](../history/aadw-v1/adr/0026-work-design-handoff.md) に保存する。
