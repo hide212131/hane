@@ -31,7 +31,7 @@
 | [ADR-0020](0020-block-virtualization.md) | ブロック単位の仮想化と描画 |
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
-| [ADR-0024](0024-local-gui-validation.md) | GUI 検証の hosted macOS 優先と trust boundary（AADW orchestration は ADR-0027 で改訂） |
+| [ADR-0024](0024-local-gui-validation.md) | GUI 検証を独立した観測手段とし、現行入口はローカル CLI とする trust boundary（AADW orchestration は ADR-0027 で改訂） |
 | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | AADW v2 を ChatGPT Commander + GitHub facts で運用する |
 
 ## Superseded / amended
