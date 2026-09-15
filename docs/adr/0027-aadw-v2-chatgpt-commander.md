@@ -12,6 +12,7 @@
 
 - Parent Issue #154
 - Issue #155
+- Issue #160
 - PR #150: AADW v1 の workflow 停止
 - PR #151: AADW v2 設計書と Commander Policy の追加
 - ADR-0023: superseded
@@ -22,6 +23,8 @@
 AADW v1 は、Claude、Codex、GitHub Copilot、GUI validation を GitHub Actions の状態遷移で接続し、独自 status、receipt、routing、reconcile、retry を持つ構成へ拡大した。その結果、GitHub 自身が既に持つ状態と AADW 独自状態の同期、過去 head と current head の区別、再実行や回復経路の整合を保つための仕組みが増えた。
 
 PR #150 で v1 の workflow を停止し、PR #151 で `docs/agentic-development-workflow-v2.md` と `docs/aadw-command-policy.md` を追加した。v2 では v1 の状態機械を引き継がず、GitHub 上の current facts をそのまま正本として使う。
+
+Phase 3 の実運用では、PR head が同じでも target branch が進むと PR diff、CI、review、GUI validation、merge result の前提が変わり得ることを確認した。このため、PR evidence の freshness は head SHA だけでなく current target branch / base context も含めて判断する。
 
 ## 決定
 
@@ -38,9 +41,9 @@ Commander の入力は原則として次の2つだけとする。
 1. default branch 上の `docs/aadw-command-policy.md`。
 2. GitHub から取得した current facts / evidence。
 
-Pull Request、current head SHA、Issue の受入条件、CI checks、workflow runs、reviews、review threads、commits、必要な GUI evidence、mergeability は GitHub 上の情報を正本とする。同じ事実を Snapshot comment、current-state file、独自 DB、コピー status、generic receipt へ複製しない。
+Pull Request、current head SHA、current target branch / base context、Issue の受入条件、CI checks、workflow runs、reviews、review threads、commits、必要な GUI evidence、mergeability は GitHub 上の情報を正本とする。同じ事実を Snapshot comment、current-state file、独自 DB、コピー status、generic receipt へ複製しない。
 
-判断には current exact head に結び付く evidence だけを使う。head が変わったら旧 head の evidence は履歴として扱い、必要な検証を取り直す。
+PR の判断には current head と current target branch / base context に結び付く evidence だけを使う。head が変われば旧 head の evidence は履歴として扱う。head が同じでも target branch が進み evidence の前提が変わった場合は、旧 CI / review / GUI evidence を無条件に current とみなさず、必要な検証を current context で取り直す。この context を AADW 独自の persistent state として保存しない。
 
 ChatGPT は一度に次の一つの action だけを選ぶ。Codex、Claude、GUI Validator、CI、GitHub merge は AADW の stage ではなく、その時点で必要なら使う既存の action 候補とする。worker は自分の処理後に次工程を決めない。
 
@@ -50,21 +53,21 @@ ChatGPT は一度に次の一つの action だけを選ぶ。Codex、Claude、GU
 - Commander Policy は trusted な default branch 上の文書を正本とする。
 - Claude Code だけが trusted same-repository PR branch の製品コードを変更する。
 - Codex と GUI Validator は製品コードを変更しない。
-- repository mutation を伴う処理は実行直前に対象 head の一致を確認する。
-- merge 直前には expected head、required CI、必要な validation、GitHub mergeability を客観的に再確認する。
+- repository mutation を伴う処理は実行直前に対象 head の一致を確認する。これは concurrent product branch mutation を防ぐ guard であり、PR evidence の base freshness の代わりにはならない。
+- merge 直前には expected head、current target branch / base context、required CI、必要な validation、GitHub mergeability を客観的に再確認する。
 
 ## 専用部品の扱い
 
 初期 v2 では Commander Policy 以外の AADW 専用 component を必須にしない。
 
-複数 PR の実運用で、同じ GitHub read の重複、exact-head filtering の高コスト、handoff の誤り、merge 確認の複雑さなどが繰り返し確認された場合だけ、read-only collector、薄い wrapper、merge safety checker などの最小部品を検討する。
+複数 PR の実運用で、同じ GitHub read の重複、current-context filtering の高コスト、handoff の誤り、merge 確認の複雑さなどが繰り返し確認された場合だけ、read-only collector、薄い wrapper、merge safety checker などの最小部品を検討する。
 
 追加部品は persistent state を複製せず、Commander Policy の意味判断を実装しない。
 
 ## 結果
 
 - GitHub が自然に持つ情報と AADW 独自状態の同期が不要になる。
-- current state を exact head ごとに直接観測できる。
+- current state を head と current base context の組み合わせから直接観測できる。
 - 複雑な意味判断を ChatGPT に残し、worker と workflow の責務を小さくできる。
 - provider / infrastructure failure を product failure と分離して扱える。
 - 実測されていない問題のために collector / wrapper / retry state machine を先に作らない。
