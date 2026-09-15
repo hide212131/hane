@@ -120,9 +120,10 @@ Commander Policy の正本は `docs/aadw-command-policy.md` とする。
 current state の正本として、GitHub が自然に持つ情報をそのまま使う。
 
 - Pull Request と current head SHA。
+- current target branch とその head / base context。
 - Issue と acceptance criteria。
 - CI Check。
-- GitHub Actions run / job / conclusion。
+- GitHub Actions run / job / conclusion と、取得できる場合はその run が対象にした PR base SHA。
 - Pull Request Review。
 - Review Thread。
 - Commit。
@@ -144,17 +145,18 @@ ChatGPT は最初から repository 全体を探索しない。
 原則として最初に見るのは次程度とする。
 
 1. PR metadata と current head SHA。
-2. current head の CI / checks。
-3. current review / unresolved review threads。
-4. relevant workflow runs / GUI evidence の有無。
+2. current target branch head / base context。
+3. current context の CI / checks。
+4. current review / unresolved review threads。
+5. relevant workflow runs / GUI evidence の有無。
 
 これだけで判断できない場合に限り、必要な evidence を追加取得する。
 
 例:
 
-- review 判断なら Issue、current diff、current unresolved threads。
-- CI failure なら failed job と relevant log。
-- GUI failure なら scenario、observed result、artifact、必要なら trusted baseline。
+- review 判断なら Issue、current diff、current unresolved threads、review 後に target branch が進んでいないか。
+- CI failure なら failed job、relevant log、run が対象にした PR base SHA。
+- GUI failure なら scenario、observed result、artifact、必要なら trusted baseline、対象 head / base context。
 
 無関係な evidence は広く取得しない。
 
@@ -163,7 +165,7 @@ ChatGPT は最初から repository 全体を探索しない。
 実運用で次のような問題が繰り返し確認された場合だけ、current-state discovery の重複部分を read-only collector へ抽出してよい。
 
 - 毎回同じ GitHub API を多数呼ぶ。
-- exact-head filtering が繰り返される。
+- current context の filtering が繰り返される。
 - discovery が遅い。
 - 手順の揺れが誤判断を生む。
 
@@ -171,17 +173,21 @@ ChatGPT は最初から repository 全体を探索しない。
 
 ---
 
-## 7. exact-head only
+## 7. current PR context: head + base
 
-current head SHA を一つの世代として扱う。
+product branch の mutation 世代は current head SHA で扱う。
 
-current head が `A` なら、現在判断に使えるのは `A` に関係する evidence だけである。
+current head が `A` のとき、`A` 以外の head に対する CI / Review / GUI evidence は current 判断に使わない。Claude が修正して `B` になったら、`A` の evidence は履歴になる。
 
-Claude が修正して `B` になったら、`A` の CI / Review / GUI evidence は履歴になる。
+ただし PR の evidence freshness は head SHA だけでは決まらない。head が `A` のままでも target branch が進めば、PR diff、merge result、CI、review、GUI scenario の前提が変わり得る。
 
-古い head の情報を組み合わせて current state を推測しない。
+したがって CI / Review / GUI / merge の evidence は、current head に加えて current target branch / base context と整合しているかを確認する。evidence がどの base context に対するものか確認できない、または current base と異なる場合は、同じ head だからという理由だけで current 扱いしない。必要なら current base context で取り直す。
 
-repository mutation を行う処理は、実行直前に current head が対象 SHA と一致することを確認する。
+PR metadata の base SHA が常に target branch の現在の head を表すとは仮定しない。必要なら target branch 自体を読み、current base を確認する。
+
+この head + base context を AADW 独自の persistent generation として保存しない。GitHub 上の事実から、その時点だけ導出する。
+
+repository mutation を行う処理は別の競合防止責務として、実行開始時と push 直前に current head が対象 SHA と一致することを確認する。
 
 ---
 
@@ -191,7 +197,8 @@ ChatGPT の判断ルールの正本は `docs/aadw-command-policy.md` とする�
 
 Policy は少なくとも次を定める。
 
-- current exact head only。
+- current PR context（head + base）の freshness。
+- repository mutation の exact-head guard。
 - evidence first。
 - fail closed。
 - Issue purpose / acceptance criteria を優先する。
@@ -199,6 +206,7 @@ Policy は少なくとも次を定める。
 - blocker / follow-up / unknown の考え方。
 - fix scope の決め方。
 - fix 後は新 head として再確認する。
+- base が進んだ場合の evidence 再評価。
 - GUI failure の扱い。
 - provider / infrastructure failure を product failure と混同しないこと。
 - 一度に次の一つの action だけを選ぶこと。
@@ -216,7 +224,9 @@ ChatGPT が current facts と Commander Policy から選ぶ **action の候補**
 
 ### Review
 
-必要なら既存の Codex review 手段で current exact head をレビューする。
+必要なら既存の Codex review 手段で current PR head をレビューする。
+
+head が同じでも review 後に target branch が進み、review の base context が current か確認できない場合は、必要に応じて current base context でレビューを取り直す。
 
 Review の正本は GitHub Review / Review Thread とする。
 
@@ -234,6 +244,8 @@ Issue の acceptance criteria と変更内容から必要だと ChatGPT が判�
 
 focused scenario を基本とする。
 
+GUI evidence は対象 head と、その scenario に影響する base context を対応付ける。head が同じでも base の product code が変われば、必要に応じて validation を取り直す。
+
 GUI worker は観測事実だけを残し、`fail` / `blocked` の意味判断は ChatGPT が行う。
 
 ### Merge
@@ -245,11 +257,12 @@ merge 直前に GitHub 上の客観条件を再確認する。
 最低限確認する。
 
 - current head SHA が判断対象の expected head と一致する。
-- required CI checks が success。
-- 必要と判断した GUI validation がある場合、その結果が受け入れ可能である。
+- current target branch / base context が、採用する CI / review / GUI evidence の前提と整合している。
+- required CI checks が current context で success。
+- 必要と判断した GUI validation がある場合、その結果が current context で受け入れ可能である。
 - GitHub が PR を mergeable と報告している。
 
-merge は expected head SHA を指定して行う。
+merge は expected head SHA を指定して行う。expected head は concurrent product branch mutation を防ぐ guard であり、base freshness の代わりにはならない。
 
 専用 Gate は初期必須ではない。この確認が実運用で繰り返し複雑になる場合だけ、小さな客観チェックへ抽出する。
 
@@ -277,7 +290,7 @@ cluster は意味判断として次のいずれかに分類する。
 
 ## 11. fail closed
 
-事実を取得できない、current head と結び付けられない、evidence が不足する場合は推測しない。
+事実を取得できない、evidence を current head / base context と結び付けられない、または evidence が不足する場合は推測しない。
 
 ChatGPT は Commander Policy に従い、不明な状態を pass として扱わない。
 
@@ -361,9 +374,10 @@ ChatGPT 主導が十分安定してから検討する。
 - Commander の入力が `Commander Policy + current facts / evidence` に整理されている。
 - 判断ルールが `docs/aadw-command-policy.md` に一元化されている。
 - GitHub 上の既存情報を正本として使う。
-- exact-head 以外の evidence を current evidence として使わない。
+- current head / base context と整合しない evidence を current evidence として使わない。
+- repository mutation は expected head guard で concurrent change を上書きしない。
 - worker が勝手に次 action を決めない。
-- merge 時に expected head と客観的安全条件を確認する。
+- merge 時に expected head、current base context、客観的安全条件を確認する。
 - 不要な AADW 専用コンポーネントを作らない。
 
 ---
