@@ -68,9 +68,17 @@ GitHub Actions は司令塔ではない。ChatGPT に指示された単一の処
                          ChatGPT
                      唯一の司令塔
                            │
-                    aadw status PR
+                aadw_status(PR) を呼ぶ
                            │
-                 短い事実一覧を取得
+                           ▼
+                  Status GitHub Action
+                  read-only collector
+                           │
+                 status.txt artifact
+                           │
+                           ▼
+                         ChatGPT
+               短い事実一覧を読む
                            │
                必要な証拠だけ追加取得
                            │
@@ -100,7 +108,11 @@ AADW の中心ループは次である。
 ```text
 ChatGPT
   ↓
-aadw status <PR>
+aadw_status(PR)
+  ↓
+GitHub Actions が status collector を実行
+  ↓
+status.txt artifact を ChatGPT が取得
   ↓
 必要な evidence だけ読む
   ↓
@@ -112,6 +124,8 @@ worker が GitHub に結果を残す
   ↓
 利用者が ChatGPT に戻す
 ```
+
+`aadw_status(PR)` は ChatGPT から見た一つの論理操作である。ChatGPT が Hane repository のローカル shell で `./scripts/aadw` を直接実行することを前提にしない。
 
 ---
 
@@ -149,26 +163,43 @@ GitHub に自然な正本が存在しない情報だけ、最小限の artifact 
 
 ### 5.1 目的
 
-ChatGPT が current state を知るたびに GitHub 上を探索し回らなくてよいよう、read-only の一発コマンドを用意する。
+ChatGPT が current state を知るたびに GitHub 上を探索し回らなくてよいよう、**status 取得専用の read-only GitHub Actions workflow** を用意する。
 
-概念コマンド:
+ChatGPT から見た論理操作は次とする。
 
-```bash
-./scripts/aadw status 123
+```text
+aadw_status(PR)
 ```
 
-Status Collector は current state の正本ではない。
+その実体は次である。
 
-GitHub 上の正本をその場で読み、current exact head に関係する事実を短く表示して終了する。
+```text
+ChatGPT
+  ↓ status workflow を起動
+GitHub Actions
+  ↓ PR番号を入力として collector を実行
+GitHub 上の正本を read-only で取得
+  ↓
+短い status.txt を artifact として保存
+  ↓
+ChatGPT が artifact を取得
+```
 
-### 5.2 行うこと
+status workflow は `workflow_dispatch` 等の明示的な起動を使う。ChatGPT 側には、workflow の起動から対象 run の特定、完了確認、`status.txt` artifact の取得までを一つの操作として扱える薄い tool / connector を用意する。
+
+この tool は AADW の判断を行わない。単に status workflow を起動して結果を返す transport adapter である。
+
+現在の ChatGPT GitHub connector に workflow dispatch 操作が公開されていない場合、この薄い tool / connector の提供は Phase 1 の実装要件とする。
+
+### 5.2 Status workflow が行うこと
 
 Status Collector が行うのは次だけである。
 
 1. PR の current head SHA を取得する。
-2. GitHub 上の関連情報を取得する。
+2. GitHub 上の関連情報を read-only で取得する。
 3. current head に関係する情報だけを残す。
-4. 必要な値だけを短く表示する。
+4. 必要な値だけを短い自然言語で `status.txt` に出力する。
+5. 収集開始時と終了時の current head を比較し、途中で head が変わった場合は結果を無効として明示する。
 
 つまり、
 
@@ -191,6 +222,8 @@ Status Collector は次を行わない。
 - GUI が必要かの意味判断。
 - merge してよいかの判断。
 - persistent snapshot の作成。
+- PR comment の作成・更新。
+- product branch の変更。
 
 ### 5.4 出力
 
@@ -218,6 +251,8 @@ Next: Claude should fix the findings.
 
 ChatGPT が上記の事実を読んで、次に何を見るか・何をするか判断する。
 
+`status.txt` は status workflow の実行結果であり、current state の正本ではない。次回は再度 workflow を実行して GitHub の正本から最新情報を取得する。
+
 ### 5.5 JSON の扱い
 
 Collector 内部で JSON や構造体を使うことは問題ない。
@@ -231,10 +266,10 @@ GitHub API
   ↓
 必要な値だけ選択
   ↓
-短い自然言語
+短い自然言語 status.txt
 ```
 
-テストしやすさのための一時的な内部構造は許容するが、それを persistent state や外部 contract にしない。
+テストしやすさのための一時的な内部構造は許容するが、それを persistent state や Commander 向け外部 contract にしない。
 
 ---
 
@@ -246,9 +281,11 @@ GitHub API
 PR #123 を続けて
 ```
 
-ChatGPT はまず `aadw status 123` を実行する。
+ChatGPT はまず `aadw_status(123)` を一度呼ぶ。
 
-そこで current state を把握し、必要な証拠だけ追加取得する。
+tool / connector は内部で status workflow を起動し、完了した run の `status.txt` を返す。
+
+ChatGPT はその短い出力から current state を把握し、必要な証拠だけ追加取得する。
 
 例えば review threads が3件あると分かった場合、追加取得するのは主に次だけでよい。
 
@@ -261,7 +298,9 @@ GUI logs や無関係な CI logs は読まない。
 
 逆に GUI failure がある場合は GUI evidence だけを詳しく読む。
 
-**ChatGPT は、status summary を入口にして必要な証拠へ drill-down する。**
+**ChatGPT は `aadw_status(PR)` を current-state discovery の固定入口にし、そこから必要な証拠だけへ drill-down する。**
+
+status workflow 自体に詳細 evidence を大量に詰め込まない。
 
 ---
 
@@ -274,6 +313,25 @@ current head が `A` なら、現在判断に使えるのは `A` に関係する
 Claude が修正して `B` になったら、`A` の CI / Review / GUI evidence は履歴になる。
 
 Status Collector も current head を最初に取得し、古い head の結果を current summary に混ぜない。
+
+さらに collector 終了時に current head を再取得する。
+
+```text
+start: HEAD = A
+collect facts
+end:   HEAD = A
+```
+
+一致した場合だけ `status.txt` を有効な収集結果として扱う。
+
+途中で `A → B` に変わった場合は、推測して補正せず次のように返す。
+
+```text
+STATUS INVALID
+HEAD changed during collection: A -> B
+```
+
+ChatGPT は新しい status workflow を実行し直す。
 
 古い head の情報を組み合わせて current state を推測する処理は作らない。
 
@@ -292,7 +350,11 @@ GitHub に結果が残る
   ↓
 利用者: 「PR #123 を続けて」
   ↓
-ChatGPT: aadw status 123
+ChatGPT: aadw_status(123)
+  ↓
+Status GitHub Action
+  ↓
+status.txt
   ↓
 必要な証拠だけ追加取得
   ↓
@@ -397,7 +459,7 @@ before push: current head == target SHA
 
 不一致なら push しない。
 
-push 後は新 head なので、再び `aadw status` から判断をやり直す。
+push 後は新 head なので、再び `aadw_status(PR)` から判断をやり直す。
 
 ---
 
@@ -485,6 +547,8 @@ GitHub に必要な証拠の置き場所がない
 
 状態を二重管理しないことを優先する。
 
+`status.txt` artifact は status workflow の一時的な実行結果であり、これらの persistent AADW state の代替ではない。
+
 ---
 
 ## 16. fail closed
@@ -496,6 +560,8 @@ Status Collector は、分からない事実を埋めず、例えば次のよう
 ```text
 GUI validation: unknown
 ```
+
+head が収集中に変化した場合も結果を無効化する。
 
 ChatGPT も不明な状態を pass として扱わない。
 
@@ -525,6 +591,8 @@ ChatGPT、worker、Gate はそれぞれ責務を越えない。
 - Codex と GUI Validator は product code を変更しない。
 - Gate は意味判断をしない。
 - Status Collector は repository mutation をしない。
+- status workflow は read-only permissions を原則とする。
+- ChatGPT から status workflow を起動する transport adapter は、指定 workflow の dispatch と対象 artifact 取得以外の権限を持たせない。
 
 fork PR への自動修正は初期 v2 の対象外とする。
 
@@ -534,17 +602,19 @@ fork PR への自動修正は初期 v2 の対象外とする。
 
 初期 v2 は大きな workflow を作らず、単純な道具を用意する。
 
-概念的には次程度とする。
+ChatGPT から見た論理操作は概念的に次程度とする。
 
 ```text
-aadw status <PR>
-aadw review <PR>
-aadw fix <PR> <instruction>
-aadw gui <PR> <scenario>
-aadw gate <PR> <expected-head>
+aadw_status(PR)
+aadw_review(PR)
+aadw_fix(PR, instruction)
+aadw_gui(PR, scenario)
+aadw_gate(PR, expected_head)
 ```
 
-各コマンドは、
+実装上、これらが GitHub Actions workflow を起動する場合でも、ChatGPT 側からは一つの操作として扱える薄い tool / connector を用意する。
+
+各操作は、
 
 ```text
 一入力
@@ -554,39 +624,45 @@ aadw gate <PR> <expected-head>
 
 を原則とする。
 
-コマンド同士を内部で自動連鎖させない。
+操作同士を内部で自動連鎖させない。
 
 ---
 
 ## 20. 実装順序
 
-### Phase 1: `aadw status`
+### Phase 1: `aadw_status(PR)`
 
 最初に作る。
 
-- current head を取得。
-- PR / Issue / CI / Review / Thread / Actions / GUI evidence の必要な事実を取得。
-- current head に filter。
-- 短い自然言語で表示。
-- persistent state を一切作らない。
+- read-only status workflow を追加する。
+- PR 番号を入力として受け取る。
+- current head を取得する。
+- PR / Issue / CI / Review / Thread / Actions / GUI evidence の必要な事実を取得する。
+- current head に filter する。
+- 開始時と終了時の head 一致を確認する。
+- 短い自然言語 `status.txt` を artifact として出力する。
+- persistent state を作らない。
+- ChatGPT から workflow dispatch → run 特定 → artifact 取得までを一操作で行える薄い tool / connector を用意する。
 
-### Phase 2: `aadw review`
+Phase 1 の完成条件は、利用者が `PR #123 を続けて` と依頼したとき、ChatGPT が GitHub 上を手作業で横断探索せず `aadw_status(123)` 一回で短い status を取得できることである。
+
+### Phase 2: `aadw_review(PR)`
 
 current exact head への Codex review 起動だけを実装する。
 
 ### Phase 3: ChatGPT Commander Loop
 
-`PR #xxx を続けて` → `aadw status` → 必要 evidence → 判断、の運用を成立させる。
+`PR #xxx を続けて` → `aadw_status(PR)` → 必要 evidence → 判断、の運用を成立させる。
 
-### Phase 4: `aadw fix`
+### Phase 4: `aadw_fix(PR, instruction)`
 
 ChatGPT の修正指示を Claude に渡す単純 worker を実装する。
 
-### Phase 5: `aadw gui`
+### Phase 5: `aadw_gui(PR, scenario)`
 
 focused GUI scenario の実行と証拠保存だけを実装する。
 
-### Phase 6: `aadw gate`
+### Phase 6: `aadw_gate(PR, expected_head)`
 
 客観的な merge safety check だけを実装する。
 
@@ -607,8 +683,10 @@ Copilot を追加しても既存 worker や新しい state machine を作り直�
 初期 v2 は次を満たせば完成とする。
 
 - ChatGPT が唯一の司令塔として全体を統括できる。
-- `aadw status <PR>` 一発で current state の事実を短く把握できる。
+- `aadw_status(PR)` 一回で status GitHub Action を起動し、current state の短い事実一覧を取得できる。
+- ChatGPT が Hane repository のローカル shell を直接操作することを前提にしない。
 - ChatGPT が詳細 evidence を必要なものだけ追加取得できる。
+- status workflow は read-only で、意味判断や persistent current state を持たない。
 - 各 worker は一つの仕事だけを行う。
 - worker が勝手に次 worker を起動しない。
 - GitHub 上の既存情報を正本として使い、同じ意味の AADW state を複製しない。
@@ -628,10 +706,15 @@ AADW v2 は、大きな自動状態機械ではない。
 
 ```text
 GitHub = 事実の正本
-Tools  = 事実の取得・単純な実行
+GitHub Actions = 単純な実行場所
+Thin tools/connectors = ChatGPT と Actions の接続
 ChatGPT = 複雑な判断
 Gate = 最後の客観的安全装置
 ```
+
+`aadw_status(PR)` のポイントは、状態を新しく保存することではない。
+
+**ChatGPT が必要な瞬間に GitHub Actions へ収集を依頼し、その時点の正本から作った短い実行結果だけを受け取ること**である。
 
 新機能を追加するときは、必ず次を確認する。
 
