@@ -402,7 +402,7 @@ Claude への指示には次を含める。
 - root-cause clusters。
 - current Issue の目的。
 - fix scope。
--触らない独立問題。
+- 触らない独立問題。
 - 必要な test。
 
 Claude は開始時に current head を確認する。
