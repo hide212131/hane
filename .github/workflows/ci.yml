@@ -7,10 +7,45 @@ permissions:
   contents: read
 
 jobs:
+  rust_ci_changes:
+    name: Determine whether Rust CI is required
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.filter.outputs.required }}
+    steps:
+      - name: Check out Pull Request
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test Rust CI path filter
+        run: python3 .github/tests/test_rust_ci_path_filter.py
+
+      - name: Detect Rust CI inputs
+        id: filter
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          required="$(
+            git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" \
+              | python3 .github/scripts/rust_ci_path_filter.py --null
+          )"
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+
   test_macos:
     name: cargo test / clippy (macos-latest)
+    needs: rust_ci_changes
+    if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
     runs-on: macos-latest
     steps:
+      - name: Fail when Rust CI path detection failed
+        if: ${{ needs.rust_ci_changes.result != 'success' }}
+        run: exit 1
+
       - name: Check out Pull Request
         uses: actions/checkout@v6
         with:
@@ -30,8 +65,14 @@ jobs:
 
   test_windows:
     name: cargo test / clippy (windows-latest)
+    needs: rust_ci_changes
+    if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
     runs-on: windows-latest
     steps:
+      - name: Fail when Rust CI path detection failed
+        if: ${{ needs.rust_ci_changes.result != 'success' }}
+        run: exit 1
+
       - name: Check out Pull Request
         uses: actions/checkout@v6
         with:
