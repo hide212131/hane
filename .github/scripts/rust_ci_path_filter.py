@@ -6,15 +6,19 @@ import sys
 from collections.abc import Iterable
 
 RUST_CI_PREFIXES = (
+    ".cargo/",
     "assets/icons/work-folder/",
     "crates/",
     "vendor/",
 )
 
 RUST_CI_PATHS = {
+    ".clippy.toml",
     "assets/app-icon.ico",
     "Cargo.lock",
     "Cargo.toml",
+    "clippy.toml",
+    "rust-toolchain",
     "rust-toolchain.toml",
     ".github/scripts/rust_ci_path_filter.py",
     ".github/tests/test_rust_ci_path_filter.py",
