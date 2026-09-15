@@ -2,7 +2,7 @@
 
 ## 位置づけ
 
-GUI validation は AADW v2 の stage や judge ではない。ChatGPT Commander が Issue の acceptance criteria と変更内容から必要だと判断した場合に使う、既存の観測手段である。
+GUI validation は AADW v2 の stage や judge ではない。ChatGPT Commander が Issue の acceptance criteria と変更内容から必要だと判断した場合に使う観測手段である。
 
 全体の判断ルールは [AADW Commander Policy](aadw-command-policy.md)、採用理由と trust boundary は [ADR-0024](adr/0024-local-gui-validation.md) を参照する。
 
@@ -22,17 +22,23 @@ GUI validator は次を行う。
 
 `pass` / `fail` / `blocked` のような runner 側の結果がある場合も、それ自体を AADW の persistent state や最終判断にしない。ChatGPT が current facts と Commander Policy に基づき、product regression、acceptance blocker、validation infrastructure problem、pre-existing independent issue、unknown を区別する。
 
-## 実行手段
+## 現在使える実行手段
 
-Computer Use を必須条件にしない。既存の GitHub-hosted macOS と Hane 専用の検証部品を優先し、hosted では確認できない操作だけを必要に応じてローカル Mac で補う。
+Computer Use を必須条件にしない。
 
-ローカルの起動・撮影・終了を行う最小コマンドは `scripts/gui_validate.py` である。使い方、結果 JSON、終了コードは [CLI 操作説明](local-gui-validate-cli.md) を参照する。このコマンドは launch → ready → window → screenshot → teardown の経路を確認するもので、すべての GUI acceptance criteria を自動で検証するものではない。
+現在 repository に残っている明示的な GUI validation の実行入口は、ローカル Mac で起動・撮影・終了を行う `scripts/gui_validate.py` である。使い方、結果 JSON、終了コードは [CLI 操作説明](local-gui-validate-cli.md) を参照する。このコマンドは launch → ready → window → screenshot → teardown の経路を確認するもので、すべての GUI acceptance criteria を自動で検証するものではない。
 
-hosted / local のどちらでも、検証対象のコードを実行する環境へ不要な書き込み認証情報を渡さない。same-repository の trusted な対象を基本とし、未確認の外部 PR を個人用 Mac で無条件実行しない。
+AADW v1 では GitHub-hosted macOS を使う workflow も存在し、build / launch / window discovery / capture / cleanup の経路を検証していた。しかし PR #150 でその workflow は停止・削除されており、現行 v2 には手動 dispatch できる hosted GUI validation の入口はない。そのため、hosted runner を現在使える手段として扱わない。
+
+将来、複数 PR の実運用でローカル実行だけでは繰り返し evidence を取得できないことが確認された場合は、hosted entrypoint の再導入を独立した改善として検討できる。先回りして v1 の orchestration を復活させない。
+
+現在使える手段で acceptance に必要な GUI evidence を取得できない場合は、その不足を product failure と推測しない。一方で必要な evidence が `unknown` のまま merge 方向へ進めない。
+
+ローカルで検証する場合も、検証対象のコードを実行する環境へ不要な書き込み認証情報を渡さない。same-repository の trusted な対象を基本とし、未確認の外部 PR を個人用 Mac で無条件実行しない。
 
 ## Evidence
 
-GitHub が自然に持つ workflow run / artifact / PR 情報をそのまま使う。AADW 専用の snapshot state や generic receipt へ複製しない。
+GitHub が自然に持つ workflow run / artifact / PR 情報がある場合はそのまま使い、AADW 専用の snapshot state や generic receipt へ複製しない。
 
 GitHub に自然な置き場所がない画像などだけ、必要最小限の artifact として保存する。evidence には対象 head SHA、シナリオ、観測結果、artifact の対応が分かる情報を残す。
 
