@@ -234,7 +234,7 @@ jobs:
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
-              .github/*|AGENTS.md|CLAUDE.md|CLAUDE.local.md|.claude/*|.claude.json|.mcp.json|.gitmodules|.ripgreprc|.husky/*)
+              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Claude worker attempted to modify trusted authority or workflow path: $path"
                 exit 1
                 ;;
