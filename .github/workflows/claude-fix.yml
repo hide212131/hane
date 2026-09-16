@@ -177,7 +177,8 @@ jobs:
           claude_args: |
             --add-dir pr-head
             --model claude-sonnet-5
-            --max-turns 60
+            --max-turns 160
+            --tools "Read,Edit,Write,Glob,Grep"
             --allowedTools "Read,Edit,Write,Glob,Grep"
 
       - name: Build untrusted worker patch from a fresh expected-head checkout
