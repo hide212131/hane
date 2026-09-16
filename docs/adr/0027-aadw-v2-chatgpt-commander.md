@@ -24,7 +24,7 @@ AADW v1 は、Claude、Codex、GitHub Copilot、GUI validation を GitHub Action
 
 PR #150 で v1 の workflow を停止し、PR #151 で `docs/agentic-development-workflow-v2.md` と `docs/aadw-command-policy.md` を追加した。v2 では v1 の状態機械を引き継がず、GitHub 上の current facts をそのまま正本として使う。
 
-Phase 3 の実運用では、PR head が同じでも target branch が進むと PR diff、CI、review、GUI validation、merge result の前提が変わり得ることを確認した。このため、PR evidence の freshness は head SHA だけでなく current target branch / base context も含めて判断する。
+Phase 3 の実運用では、PR head が同じでも target branch が進むと PR diff、CI、review、GUI validation、merge result の前提が変わり得ることを確認した。このため、base の変更が evidence の主張に影響する場合は、head SHA だけでなく current target branch / base context も freshness の判断に含める。
 
 ## 決定
 
@@ -43,7 +43,9 @@ Commander の入力は原則として次の2つだけとする。
 
 Pull Request、current head SHA、current target branch / base context、Issue の受入条件、CI checks、workflow runs、reviews、review threads、commits、必要な GUI evidence、mergeability は GitHub 上の情報を正本とする。同じ事実を Snapshot comment、current-state file、独自 DB、コピー status、generic receipt へ複製しない。
 
-PR の判断には current head と current target branch / base context に結び付く evidence だけを使う。head が変われば旧 head の evidence は履歴として扱う。head が同じでも target branch が進み evidence の前提が変わった場合は、旧 CI / review / GUI evidence を無条件に current とみなさず、必要な検証を current context で取り直す。この context を AADW 独自の persistent state として保存しない。
+PR evidence は current head に結び付くものだけを使う。head が変われば旧 head の evidence は履歴として扱う。head が同じでも target branch が進み、base の変更が CI / review / GUI などの evidence の主張に影響する場合は、旧 evidence を無条件に current とみなさず、必要な検証を current context で取り直す。
+
+一方、base の変更が evidence の主張に影響しないと Commander が current facts と check / scenario の性質から判断できる場合は、head に結び付く evidence を利用できる。その根拠は GitHub 上に残し、この判断を worker に移さない。この context を AADW 独自の persistent state として保存しない。
 
 ChatGPT は一度に次の一つの action だけを選ぶ。Codex、Claude、GUI Validator、CI、GitHub merge は AADW の stage ではなく、その時点で必要なら使う既存の action 候補とする。worker は自分の処理後に次工程を決めない。
 
@@ -54,7 +56,7 @@ ChatGPT は一度に次の一つの action だけを選ぶ。Codex、Claude、GU
 - Claude Code だけが trusted same-repository PR branch の製品コードを変更する。
 - Codex と GUI Validator は製品コードを変更しない。
 - repository mutation を伴う処理は実行直前に対象 head の一致を確認する。これは concurrent product branch mutation を防ぐ guard であり、PR evidence の base freshness の代わりにはならない。
-- merge 直前には expected head、current target branch / base context、required CI、必要な validation、GitHub mergeability を客観的に再確認する。
+- merge 直前には expected head、current target branch / base context、required CI、必要な validation、GitHub mergeability を客観的に再確認する。base context は、採用する evidence の主張に影響する範囲で freshness を確認する。
 
 ## 専用部品の扱い
 
@@ -67,7 +69,8 @@ ChatGPT は一度に次の一つの action だけを選ぶ。Codex、Claude、GU
 ## 結果
 
 - GitHub が自然に持つ情報と AADW 独自状態の同期が不要になる。
-- current state を head と current base context の組み合わせから直接観測できる。
+- current state を current head と、必要な evidence について current base context から直接観測できる。
+- base-independent な evidence まで機械的に無効化せず、Commander が主張の性質から判断できる。
 - 複雑な意味判断を ChatGPT に残し、worker と workflow の責務を小さくできる。
 - provider / infrastructure failure を product failure と分離して扱える。
 - 実測されていない問題のために collector / wrapper / retry state machine を先に作らない。
