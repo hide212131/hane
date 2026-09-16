@@ -239,7 +239,7 @@ jobs:
                 exit 1
                 ;;
             esac
-          done < <(git -C final-head diff --cached --name-only -z)
+          done < <(git -C final-head diff --cached --no-renames --name-only -z)
 
           if [[ "$changed" != 'true' ]]; then
             echo '::error::Worker patch has no staged repository change.'
