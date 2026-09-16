@@ -6735,28 +6735,44 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Measure the real shaped width of "bold" so the window can be
-        // narrowed to exactly where the real `WindowShaper` wraps the line,
-        // instead of a hand-picked pixel value that only happens to work for
-        // one font.
-        let (visual_text_len, bold_width) = cx.update(|window, app| {
+        // Measure the real shaped widths of both rows this line must wrap
+        // into, so the window can be narrowed to exactly where the real
+        // `WindowShaper` wraps it, instead of a hand-picked pixel value that
+        // only happens to work for one font. `bold_width` is how wide "bold"
+        // renders as its own row; `suffix_width` is how wide the trailing
+        // " more" (with its leading space, since the closing `**` collapsed
+        // there) renders as the next row. The viewport must fit whichever of
+        // the two is wider, but must stay narrower than the whole line, or
+        // "bold more" would fit on a single row and never wrap at all.
+        let (visual_text_len, bold_width, suffix_width, full_width) = cx.update(|window, app| {
             view.read_with(app, |editor_view, _| {
                 let visual = editor_view.rendered_line(0).expect("line rendered");
                 assert_eq!(visual.visual_text, "bold more");
                 let shaper = WindowShaper::new(window);
-                let whole = 0..visual.visual_text.len();
+                let len = visual.visual_text.len();
+                let whole = 0..len;
+                let suffix = "bold".len()..len;
                 (
-                    visual.visual_text.len(),
-                    shaper.x_for_offset(&visual, whole, "bold".len()),
+                    len,
+                    shaper.x_for_offset(&visual, whole.clone(), "bold".len()),
+                    shaper.x_for_offset(&visual, suffix, len),
+                    shaper.x_for_offset(&visual, whole, len),
                 )
             })
         });
+        assert!(
+            bold_width + suffix_width > full_width,
+            "the two rows' widths must overlap the whole line's width for a \
+             viewport that fits the wider row to still be narrower than the \
+             whole line, or this test cannot force a wrap at the collapsed \
+             marker"
+        );
         let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
-        // Just wide enough for "bold" alone: the only wrap opportunity in
-        // "bold more" is the space before "more", so this forces the real
-        // layout to break there, at the same visual offset the closing `**`
-        // collapsed to.
-        let viewport_width = bold_width + 2.0 + 2.0 * padding;
+        // Wide enough for the wider of the two rows, but narrower than the
+        // whole line: the only wrap opportunity in "bold more" is the space
+        // before "more", so this forces the real layout to break there, at
+        // the same visual offset the closing `**` collapsed to.
+        let viewport_width = bold_width.max(suffix_width) + 2.0 + 2.0 * padding;
         cx.simulate_resize(gpui::size(px(viewport_width), px(760.0)));
         cx.run_until_parked();
 
