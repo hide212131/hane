@@ -6779,32 +6779,63 @@ mod tests {
                     })
                 });
             let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
-            // Wide enough for the wider of the two rows, but narrower than
-            // the real shaped width of the whole line: the only wrap
-            // opportunity in "bold more" is the space before "more", so this
-            // forces the real layout to break there, at the same visual
-            // offset the closing `**` collapsed to.
-            let viewport_width = bold_width.max(suffix_width) + 2.0 + 2.0 * padding;
+            // The only wrap opportunity in "bold more" is the space before
+            // "more", but OS/font shaping differs on whether that space
+            // stays on the row above (boundary 5) or starts the next row
+            // (boundary 4, the same visual offset the closing `**`
+            // collapsed to). A single computed width is not portable across
+            // platforms, so search a bounded range of viewport widths —
+            // from just wide enough to fit the wider row up to just short
+            // of the whole line's shaped width — for one that makes the
+            // real `WindowShaper` wrap exactly at boundary 4, instead of
+            // trusting one formula or a platform-specific magic pixel
+            // value.
+            let min_width = bold_width.max(suffix_width) + 2.0 + 2.0 * padding;
             assert!(
-                viewport_width < full_width,
-                "the viewport built to fit the wider row must still be \
-                 narrower than the whole line's actual shaped width, or the \
-                 real WindowShaper cannot be forced to wrap this line at all"
+                min_width < full_width,
+                "the narrowest viewport built to fit the wider row must \
+                 still be narrower than the whole line's actual shaped \
+                 width, or the real WindowShaper cannot be forced to wrap \
+                 this line at all"
             );
-            cx.simulate_resize(gpui::size(px(viewport_width), px(760.0)));
-            cx.run_until_parked();
+            const MAX_CANDIDATES: usize = 64;
+            let step = ((full_width - min_width) / MAX_CANDIDATES as f32).max(0.5);
 
-            // Confirm, from the actual painted fragments, that the real
-            // layout wrapped exactly at the collapsed closing marker rather
-            // than trusting the viewport math above alone.
-            let upper_row = row_fragment(&view, cx, 0, 0);
-            let next_row = row_fragment(&view, cx, 0, 1);
-            assert_eq!(
-                (upper_row, next_row),
-                (0.."bold".len(), "bold".len()..visual_text_len),
-                "the real WindowShaper must wrap this line exactly at the \
-                 collapsed closing marker for this test to exercise the bug"
-            );
+            let mut attempts = Vec::new();
+            let mut viewport_width = None;
+            let mut width = min_width;
+            while width < full_width && attempts.len() < MAX_CANDIDATES {
+                cx.simulate_resize(gpui::size(px(width), px(760.0)));
+                cx.run_until_parked();
+
+                // Read the actual painted fragments rather than trusting
+                // the viewport math alone: only a width that really wraps
+                // here counts as a match.
+                let upper_row = row_fragment(&view, cx, 0, 0);
+                let next_row = row_fragment(&view, cx, 0, 1);
+                let wrapped_at_marker = (upper_row.clone(), next_row.clone())
+                    == (0.."bold".len(), "bold".len()..visual_text_len);
+                attempts.push((width, upper_row, next_row));
+                if wrapped_at_marker {
+                    viewport_width = Some(width);
+                    break;
+                }
+                width += step;
+            }
+
+            // Fail with the widths and fragments actually tried instead of
+            // silently accepting a different, unintended wrap boundary.
+            viewport_width.unwrap_or_else(|| {
+                panic!(
+                    "no viewport width in [{min_width}, {full_width}) made \
+                     the real WindowShaper wrap \"bold more\" exactly at the \
+                     collapsed closing marker (visual offset {}); widths \
+                     and resulting (upper_row, next_row) fragments tried: \
+                     {:?}",
+                    "bold".len(),
+                    attempts
+                )
+            });
 
             (view, cx)
         }
