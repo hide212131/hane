@@ -99,6 +99,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - name: Check Claude OAuth secret
         shell: bash
@@ -129,6 +130,28 @@ jobs:
       - name: Remove target checkout Git metadata from worker reach
         shell: bash
         run: rm -rf pr-head/.git
+
+      - name: Revalidate exact target head before Claude execution
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+          EXPECTED_HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr_json")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
+          head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          current_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
+
+          if [[ "$state" != 'open' || "$head_repo" != "$REPOSITORY" || "$head_ref" != "$EXPECTED_HEAD_REF" || "$current_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Target Pull Request changed before Claude execution. expected_ref=${EXPECTED_HEAD_REF} expected_sha=${EXPECTED_SHA} current_state=${state} current_repo=${head_repo:-unknown} current_ref=${head_ref:-unknown} current_sha=${current_sha:-unknown}."
+            exit 1
+          fi
 
       - name: Run credential-less focused product fix with Claude Code
         uses: anthropics/claude-code-base-action@beta
