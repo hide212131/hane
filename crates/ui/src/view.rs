@@ -6717,98 +6717,130 @@ mod tests {
     // until the real `WindowShaper` wraps "bold more" exactly where the
     // hidden closing marker collapsed, then simulates an actual mouse click
     // on each real painted row.
+    //
+    // The upper-row and next-row clicks each get their own freshly opened
+    // view (`open_wrapped_view_for_click`) instead of sharing one view: a
+    // mouse-down on the upper row moves the caret onto the bold span, which
+    // un-hides its markers and reflows the line, so reusing the same view for
+    // the second click would silently assert against a different layout than
+    // the one just verified. Each view is independently driven to, and
+    // confirmed against, the real wrapped layout before its single click.
     #[gpui::test]
     fn soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row_through_real_layout(
         cx: &mut gpui::TestAppContext,
     ) {
         let text = "**bold** more";
-        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
-        assert!(root.is_none());
 
-        // Move the caret off the bold construct so its markers hide, the same
-        // setup the pure-function tests above use.
-        view.update(cx, |view, cx| {
-            view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(text.len())))
-                .unwrap();
-            view.after_input(cx);
-        });
-        cx.run_until_parked();
+        // Opens a fresh `EditorView`, moves the caret off the bold construct
+        // so its markers hide, and narrows the window until the real
+        // `WindowShaper` wraps "bold more" exactly where the hidden closing
+        // marker collapsed. Confirms that real wrap against the actual
+        // painted fragments before returning, so callers can trust the
+        // layout they are about to click into.
+        fn open_wrapped_view_for_click<'a>(
+            cx: &'a mut gpui::TestAppContext,
+            text: &str,
+        ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+            let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+            assert!(root.is_none());
 
-        // Measure the real shaped widths of both rows this line must wrap
-        // into, so the window can be narrowed to exactly where the real
-        // `WindowShaper` wraps it, instead of a hand-picked pixel value that
-        // only happens to work for one font. `bold_width` is how wide "bold"
-        // renders as its own row; `suffix_width` is how wide the trailing
-        // " more" (with its leading space, since the closing `**` collapsed
-        // there) renders as the next row. The viewport must fit whichever of
-        // the two is wider, but must stay narrower than the whole line, or
-        // "bold more" would fit on a single row and never wrap at all.
-        let (visual_text_len, bold_width, suffix_width, full_width) = cx.update(|window, app| {
-            view.read_with(app, |editor_view, _| {
-                let visual = editor_view.rendered_line(0).expect("line rendered");
-                assert_eq!(visual.visual_text, "bold more");
-                let shaper = WindowShaper::new(window);
-                let len = visual.visual_text.len();
-                let whole = 0..len;
-                let suffix = "bold".len()..len;
-                (
-                    len,
-                    shaper.x_for_offset(&visual, whole.clone(), "bold".len()),
-                    shaper.x_for_offset(&visual, suffix, len),
-                    shaper.x_for_offset(&visual, whole, len),
-                )
-            })
-        });
-        assert!(
-            bold_width + suffix_width > full_width,
-            "the two rows' widths must overlap the whole line's width for a \
-             viewport that fits the wider row to still be narrower than the \
-             whole line, or this test cannot force a wrap at the collapsed \
-             marker"
-        );
-        let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
-        // Wide enough for the wider of the two rows, but narrower than the
-        // whole line: the only wrap opportunity in "bold more" is the space
-        // before "more", so this forces the real layout to break there, at
-        // the same visual offset the closing `**` collapsed to.
-        let viewport_width = bold_width.max(suffix_width) + 2.0 + 2.0 * padding;
-        cx.simulate_resize(gpui::size(px(viewport_width), px(760.0)));
-        cx.run_until_parked();
+            // Move the caret off the bold construct so its markers hide, the
+            // same setup the pure-function tests above use.
+            view.update(cx, |view, cx| {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(text.len())))
+                    .unwrap();
+                view.after_input(cx);
+            });
+            cx.run_until_parked();
 
-        let upper_row = row_fragment(&view, cx, 0, 0);
-        let next_row = row_fragment(&view, cx, 0, 1);
-        assert_eq!(
-            (upper_row, next_row),
-            (0.."bold".len(), "bold".len()..visual_text_len),
-            "the real WindowShaper must wrap this line exactly at the collapsed \
-             closing marker for this test to exercise the bug"
-        );
+            // Measure the real shaped widths of both rows this line must
+            // wrap into, so the window can be narrowed to exactly where the
+            // real `WindowShaper` wraps it, instead of a hand-picked pixel
+            // value that only happens to work for one font. `bold_width` is
+            // how wide "bold" renders as its own row; `suffix_width` is how
+            // wide the trailing " more" (with its leading space, since the
+            // closing `**` collapsed there) renders as the next row.
+            let (visual_text_len, bold_width, suffix_width, full_width) =
+                cx.update(|window, app| {
+                    view.read_with(app, |editor_view, _| {
+                        let visual = editor_view.rendered_line(0).expect("line rendered");
+                        assert_eq!(visual.visual_text, "bold more");
+                        let shaper = WindowShaper::new(window);
+                        let len = visual.visual_text.len();
+                        let whole = 0..len;
+                        let suffix = "bold".len()..len;
+                        (
+                            len,
+                            shaper.x_for_offset(&visual, whole.clone(), "bold".len()),
+                            shaper.x_for_offset(&visual, suffix, len),
+                            shaper.x_for_offset(&visual, whole, len),
+                        )
+                    })
+                });
+            let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
+            // Wide enough for the wider of the two rows, but narrower than
+            // the real shaped width of the whole line: the only wrap
+            // opportunity in "bold more" is the space before "more", so this
+            // forces the real layout to break there, at the same visual
+            // offset the closing `**` collapsed to.
+            let viewport_width = bold_width.max(suffix_width) + 2.0 + 2.0 * padding;
+            assert!(
+                viewport_width < full_width,
+                "the viewport built to fit the wider row must still be \
+                 narrower than the whole line's actual shaped width, or the \
+                 real WindowShaper cannot be forced to wrap this line at all"
+            );
+            cx.simulate_resize(gpui::size(px(viewport_width), px(760.0)));
+            cx.run_until_parked();
+
+            // Confirm, from the actual painted fragments, that the real
+            // layout wrapped exactly at the collapsed closing marker rather
+            // than trusting the viewport math above alone.
+            let upper_row = row_fragment(&view, cx, 0, 0);
+            let next_row = row_fragment(&view, cx, 0, 1);
+            assert_eq!(
+                (upper_row, next_row),
+                (0.."bold".len(), "bold".len()..visual_text_len),
+                "the real WindowShaper must wrap this line exactly at the \
+                 collapsed closing marker for this test to exercise the bug"
+            );
+
+            (view, cx)
+        }
 
         // The upper row's own trailing edge: a real click there must land
         // just before the collapsed closing marker, on the content it
         // closes.
-        let (click_point, _) = row_click(&view, cx, "row-0-0", 0, 0, "bold".len());
-        cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
-        view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.editor().selection(),
-                Selection::caret(SourceOffset(6))
-            );
-        });
+        {
+            let (view, cx) = open_wrapped_view_for_click(cx, text);
+            let (click_point, _) = row_click(&view, cx, "row-0-0", 0, 0, "bold".len());
+            cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().selection(),
+                    Selection::caret(SourceOffset(6))
+                );
+            });
+        }
 
         // The next row's own leading edge: a real click there must land just
         // after the same collapsed marker, on the content it opens, not back
-        // on the row above.
-        let (click_point, _) = row_click(&view, cx, "row-0-1", 0, 1, "bold".len());
-        cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
-        view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.editor().selection(),
-                Selection::caret(SourceOffset(8))
-            );
-        });
+        // on the row above. This uses its own fresh view (see
+        // `open_wrapped_view_for_click`) so the upper-row click above never
+        // touches the layout this assertion depends on.
+        {
+            let (view, cx) = open_wrapped_view_for_click(cx, text);
+            let (click_point, _) = row_click(&view, cx, "row-0-1", 0, 1, "bold".len());
+            cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.editor().selection(),
+                    Selection::caret(SourceOffset(8))
+                );
+            });
+        }
     }
 }
