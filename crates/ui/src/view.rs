@@ -6706,4 +6706,93 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+
+    // Codex review on PR #144: `soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row`
+    // above hand-crafts its `upper_row`/`next_row` fragments and calls
+    // `source_offset_for_visual_position` directly, so it never proves that
+    // real layout actually produces a row boundary at the collapsed marker's
+    // own visual position, or that a real click reaches that fix through
+    // `offset_at_row_x`. This drives the real `EditorView` render tree the
+    // same way the sibling GPUI mouse tests above do: it narrows the window
+    // until the real `WindowShaper` wraps "bold more" exactly where the
+    // hidden closing marker collapsed, then simulates an actual mouse click
+    // on each real painted row.
+    #[gpui::test]
+    fn soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row_through_real_layout(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "**bold** more";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        // Move the caret off the bold construct so its markers hide, the same
+        // setup the pure-function tests above use.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(text.len())))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        // Measure the real shaped width of "bold" so the window can be
+        // narrowed to exactly where the real `WindowShaper` wraps the line,
+        // instead of a hand-picked pixel value that only happens to work for
+        // one font.
+        let (visual_text_len, bold_width) = cx.update(|window, app| {
+            view.read_with(app, |editor_view, _| {
+                let visual = editor_view.rendered_line(0).expect("line rendered");
+                assert_eq!(visual.visual_text, "bold more");
+                let shaper = WindowShaper::new(window);
+                let whole = 0..visual.visual_text.len();
+                (
+                    visual.visual_text.len(),
+                    shaper.x_for_offset(&visual, whole, "bold".len()),
+                )
+            })
+        });
+        let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
+        // Just wide enough for "bold" alone: the only wrap opportunity in
+        // "bold more" is the space before "more", so this forces the real
+        // layout to break there, at the same visual offset the closing `**`
+        // collapsed to.
+        let viewport_width = bold_width + 2.0 + 2.0 * padding;
+        cx.simulate_resize(gpui::size(px(viewport_width), px(760.0)));
+        cx.run_until_parked();
+
+        let upper_row = row_fragment(&view, cx, 0, 0);
+        let next_row = row_fragment(&view, cx, 0, 1);
+        assert_eq!(
+            (upper_row, next_row),
+            (0.."bold".len(), "bold".len()..visual_text_len),
+            "the real WindowShaper must wrap this line exactly at the collapsed \
+             closing marker for this test to exercise the bug"
+        );
+
+        // The upper row's own trailing edge: a real click there must land
+        // just before the collapsed closing marker, on the content it
+        // closes.
+        let (click_point, _) = row_click(&view, cx, "row-0-0", 0, 0, "bold".len());
+        cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(6))
+            );
+        });
+
+        // The next row's own leading edge: a real click there must land just
+        // after the same collapsed marker, on the content it opens, not back
+        // on the row above.
+        let (click_point, _) = row_click(&view, cx, "row-0-1", 0, 1, "bold".len());
+        cx.simulate_mouse_down(click_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(click_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(8))
+            );
+        });
+    }
 }
