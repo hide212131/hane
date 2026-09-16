@@ -125,9 +125,11 @@ stop and ask for human decision
 
 ### 4.1 CI
 
-CI が current PR head に対して成功し、その run の base context が current target branch と整合している場合、CI を blocker としない。
+CI evidence は current PR head に対応していることを必須とする。
 
-同じ head の成功 run でも、run が対象にした base が current target branch より古い場合は current CI とみなさない。GitHub が run の pull request base SHA などを持つ場合はそれを使って確認する。base context を確認できない場合は、必要なら current base で CI を取り直す。
+その CI の主張が target branch / merge context に影響される場合は、run の base context が current target branch と整合していることも確認する。同じ head の成功 run でも、base-sensitive な CI が古い base を対象にした場合は current CI とみなさない。GitHub が run の pull request base SHA などを持つ場合はそれを使い、必要なら current base で CI を取り直す。
+
+一方、変更内容と check の性質から base の変更がその CI の主張に影響しないと Commander が判断できる場合は、head に結び付く成功 evidence を利用できる。その根拠を GitHub 上に残す。
 
 CI が失敗している場合、そのまま merge 方向へ進めない。
 
@@ -137,9 +139,11 @@ infrastructure failure など product code の問題と判断できない場合�
 
 ### 4.2 Review
 
-current PR context の unresolved findings を一度に確認する。
+current PR head の unresolved findings を一度に確認する。
 
-review が current head を対象にしていても、その後 target branch が進み PR diff / merge context が変わった場合は、過去 review を無条件に current とみなさない。review が対象にした base context を証明できない場合は fail closed とし、必要なら current base で review を取り直す。
+review の主張が PR diff / merge context に影響される場合は、review 後に target branch が進んでいないかを確認する。base が変わり、review が対象にした context を current と証明できない場合は無条件に再利用せず、必要なら current base context で review を取り直す。
+
+一方、特定の head-local な指摘など、base の変更が review の主張に影響しないと Commander が current facts から判断できる場合は、その review evidence を利用できる。その根拠を GitHub 上に残す。
 
 review comment 1件を fix 1回に対応させない。
 
@@ -208,10 +212,12 @@ current Issue の目的と acceptance criteria を満たし、必要な review /
 最低限確認する。
 
 - current head SHA が判断対象の expected head と一致する。
-- current target branch / base context が、base-sensitive な CI / review / GUI evidence の前提と整合している。
+- current target branch / base context が、採用する base-sensitive な CI / review / GUI evidence の前提と整合している。
 - required CI checks が current context で success。
 - 必要と判断した GUI validation がある場合、その結果が current context で受け入れ可能である。
 - GitHub が PR を mergeable と報告している。
+
+base-independent と判断した evidence は、Commander がその根拠を GitHub 上に残していることを確認する。
 
 merge は expected head SHA を指定して行う。expected head は concurrent product branch mutation を防ぐための guard であり、base freshness の代わりにはならない。
 
