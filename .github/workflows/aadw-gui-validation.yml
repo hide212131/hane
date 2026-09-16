@@ -48,8 +48,6 @@ jobs:
       TARGET_HEAD_SHA: ${{ inputs.target_head_sha }}
       EXECUTION_CONTEXT: ${{ inputs.execution_context }}
       REQUESTED_PROCEDURE: ${{ inputs.procedure }}
-      RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
-      ARTIFACT_DIR: ${{ runner.temp }}/hane-gui-artifact
 
     steps:
       - name: Check out trusted procedure
@@ -243,6 +241,7 @@ jobs:
           BASE_REF: ${{ steps.preflight.outputs.base_ref }}
           BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
           CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
+          RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
         run: |
           set -euo pipefail
           mkdir -p "$RUN_DIR"
@@ -289,6 +288,9 @@ jobs:
       - name: Stage public evidence
         if: always()
         shell: bash
+        env:
+          RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+          ARTIFACT_DIR: ${{ runner.temp }}/hane-gui-artifact
         run: |
           set -euo pipefail
           python3 -I control/.github/scripts/stage_gui_evidence.py
