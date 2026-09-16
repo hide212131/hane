@@ -41,16 +41,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: Build ${{ matrix.artifact_name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            artifact_name: hane-macos-arm64
-          - runner: macos-15-intel
-            artifact_name: hane-macos-x64
-    runs-on: ${{ matrix.runner }}
+    name: Build hane-macos-arm64
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
 
@@ -67,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          staging="staging/${{ matrix.artifact_name }}"
+          staging="staging/hane-macos-arm64"
           mkdir -p "$staging"
           cp target/release/hane "$staging/hane"
           chmod +x "$staging/hane"
@@ -75,13 +67,13 @@ jobs:
           if [ -f LICENSE ]; then
             cp LICENSE "$staging/LICENSE"
           fi
-          ditto -c -k --sequesterRsrc --keepParent "$staging" "${{ matrix.artifact_name }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$staging" "hane-macos-arm64.zip"
 
       - name: Upload portable build artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}.zip
+          name: hane-macos-arm64
+          path: hane-macos-arm64.zip
           if-no-files-found: error
 
   release:
@@ -105,12 +97,6 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: hane-macos-arm64
-          path: release-assets
-
-      - name: Download macOS Intel build artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: hane-macos-x64
           path: release-assets
 
       - name: Publish GitHub Release assets
