@@ -129,17 +129,17 @@ jobs:
             exit 1
           fi
 
-          git_dir="$(git rev-parse --git-dir)"
-          printf '%s\n' "$EXPECTED_SHA" > "${git_dir}/aadw-expected-sha"
-          printf '%s\n' "$EXPECTED_HEAD_REF" > "${git_dir}/aadw-head-ref"
+          git_common_dir="$(git rev-parse --git-common-dir)"
+          printf '%s\n' "$EXPECTED_SHA" > "${git_common_dir}/aadw-expected-sha"
+          printf '%s\n' "$EXPECTED_HEAD_REF" > "${git_common_dir}/aadw-head-ref"
 
-          cat > "${git_dir}/hooks/pre-push" <<'HOOK'
+          cat > "${git_common_dir}/hooks/pre-push" <<'HOOK'
           #!/usr/bin/env bash
           set -euo pipefail
 
-          git_dir="$(git rev-parse --git-dir)"
-          expected_sha="$(cat "${git_dir}/aadw-expected-sha")"
-          expected_head_ref="$(cat "${git_dir}/aadw-head-ref")"
+          git_common_dir="$(git rev-parse --git-common-dir)"
+          expected_sha="$(cat "${git_common_dir}/aadw-expected-sha")"
+          expected_head_ref="$(cat "${git_common_dir}/aadw-head-ref")"
           expected_remote_ref="refs/heads/${expected_head_ref}"
           seen_expected_ref=false
 
@@ -160,7 +160,7 @@ jobs:
             exit 1
           fi
           HOOK
-          chmod +x "${git_dir}/hooks/pre-push"
+          chmod +x "${git_common_dir}/hooks/pre-push"
 
       - name: Run focused product fix with Claude Code
         uses: anthropics/claude-code-action@v1
