@@ -20,6 +20,21 @@
 
 **撮影に成功したことは、描画内容・入力・保存を含む包括的な GUI 検証の合格を意味しない。** 結果 JSON の `scope_note` に同じ注記を機械可読な形でも残す。入力・保存内容の検査、日本語入力、スクロール、AI による画像確認は別の Issue で扱う。
 
+### PR の base context について
+
+この CLI は要求された commit を独立した一時 checkout に固定して実行する。現在の `result.json` が証明する target は **その commit SHA の snapshot** であり、PR の current target branch SHA や GitHub が作る synthetic merge SHA ではない。
+
+したがって、head が同じでも target branch の product code が進み、GUI scenario がその変更に影響され得る場合、この CLI の `pass` だけでは current PR context の acceptance evidence として十分ではない。
+
+base-sensitive な acceptance にこの CLI の結果を使えるのは、少なくとも次のいずれかを Commander が GitHub facts から確認できる場合に限る。
+
+- 検証対象 head 自体が current base を取り込んでいる。
+- scenario が base の変更に影響されないことを具体的な evidence から判断できる。
+
+current head + current base の merge context 自体を検証する必要がある場合、この CLI は現状その context を構築・記録しないため単独では使えない。その場合は必要な runner で base / merge SHA を evidence に残す。現行 v2 の hosted entrypoint は Issue #162 で独立して扱う。
+
+`result.json` に実際には検証していない base SHA を外部から metadata として付け足しても、merge-context を検証した証拠にはならない。必要な context を確認できない場合は `unknown` として fail closed にする。
+
 ## 実行方法
 
 ```sh
@@ -73,7 +88,7 @@ target/gui-validate/<request-id>/<generation>/
 
 - `overall_result`: `pass` / `fail` / `blocked`
 - `overall_reason`: 各工程の失敗理由を結合した短い説明
-- `target`: 要求 SHA・実際の SHA・一致可否・作業コピーの汚染有無
+- `target`: 要求 SHA・実際の SHA・一致可否・作業コピーの汚染有無。これは検証した head snapshot を表し、PR base / merge context を表さない
 - `build`: profile・feature flags・`rustc`/`cargo` バージョン・バイナリパスと SHA-256
 - `steps`: `preflight` → `build` → `launch` → `window_discovery` → `capture` → `cleanup` の各工程の `pass` / `fail` / `blocked` / `skipped` と理由
 - `evidence`: ログ・画像・状態ディレクトリ・固定文書への参照
@@ -83,7 +98,7 @@ target/gui-validate/<request-id>/<generation>/
 
 以下はこの CLI 固有の結果分類であり、AADW の persistent state や最終判断ではない。実施した工程の結果に `fail` が一つでもあれば全体は `fail`、`fail` がなく `blocked` が一つでもあれば全体は `blocked`、すべて `pass` なら全体も `pass`。後片付け（`cleanup`）が失敗した場合も同じ優先順位に従うため、他の工程がすべて成功していても全体は `blocked` になる。後片付けの失敗を成功として扱わないためである。
 
-Commander は `overall_result` をそのまま AADW の verdict にせず、target SHA、個別工程、artifact、current facts と [AADW Commander Policy](aadw-command-policy.md) を合わせて意味を判断する。
+Commander は `overall_result` をそのまま AADW の verdict にせず、target SHA、個別工程、artifact、current head / base context、current facts と [AADW Commander Policy](aadw-command-policy.md) を合わせて意味を判断する。base-sensitive な scenario でこの CLI が base / merge context を証明できない場合、`overall_result: pass` を acceptance の pass に読み替えない。
 
 工程ごとの分類方針:
 

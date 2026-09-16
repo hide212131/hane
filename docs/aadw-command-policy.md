@@ -31,13 +31,21 @@ current facts の取得方法や action の実行方法は固定しすぎない�
 
 ## 2. 基本原則
 
-### 2.1 current exact head only
+### 2.1 current PR context only
 
-判断には current PR head に対応する evidence だけを使う。
+PR の evidence を current と扱うときは、current PR head を確認し、その evidence の claim が target branch / base context に影響され得る場合は current base context も確認する。
 
-古い head の CI、review、GUI evidence、worker result は current state の判断材料にしない。
+head が変われば、旧 head の CI、review、GUI evidence、worker result は current state の判断材料にしない。
 
-head が変わったら新しい世代として扱い、必要な検証を取り直す。
+一方、head が同じでも target branch が進めば PR diff、merge result、CI、review、base-sensitive な GUI scenario の前提が変わり得る。そのような evidence について、どの base context に対するものか確認できない、または current base と異なる場合は、推測で current 扱いしない。必要なら current base context で検証を取り直す。
+
+base の変更が evidence の claim に影響しないと Commander が current facts と scenario / check の性質から判断できる場合は、head に結び付く evidence を利用できる。その判断は worker に委ねず、根拠を GitHub 上に残す。
+
+PR metadata に含まれる base SHA が常に target branch の現在の head を表すとは仮定しない。base-sensitive な判断では必要なら target branch 自体を読み、current base を確認する。
+
+この context を AADW 独自の generation ID、snapshot、status、DB として保存しない。その時点の GitHub facts から必要な瞬間だけ判断する。
+
+repository mutation の競合防止は別の責務である。product branch を変更する worker は、引き続き開始時と push 直前に current PR head が対象 SHA と一致することを確認する。
 
 ### 2.2 evidence first
 
@@ -80,7 +88,8 @@ AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 原則として次程度を見る。
 
 - PR metadata / current head SHA。
-- current head の CI / checks。
+- current target branch head / base context。
+- current context の CI / checks。
 - current review / unresolved review threads。
 - relevant workflow runs / GUI evidence の有無。
 
@@ -88,11 +97,11 @@ AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 
 例:
 
-- review 判断なら Issue、current diff、current review、current unresolved review threads。
-- GUI 判断なら scenario、observed result、artifact、baseline。
-- CI failure なら failed check / job / log。
+- review 判断なら Issue、current diff、current review、current unresolved review threads、review 後に base が進んでいないか。
+- GUI 判断なら scenario、observed result、artifact、baseline、対象 head / base context。
+- CI failure なら failed check / job / log と workflow run が対象にした PR base SHA。
 
-無関係な evidence を広く取得しない。
+無関係な evidence は広く取得しない。
 
 ---
 
@@ -116,7 +125,11 @@ stop and ask for human decision
 
 ### 4.1 CI
 
-CI が current exact head に対して成功している場合、CI を blocker としない。
+CI evidence は current PR head に対応していることを必須とする。
+
+その CI の主張が target branch / merge context に影響される場合は、run の base context が current target branch と整合していることも確認する。同じ head の成功 run でも、base-sensitive な CI が古い base を対象にした場合は current CI とみなさない。GitHub が run の pull request base SHA などを持つ場合はそれを使い、必要なら current base で CI を取り直す。
+
+一方、変更内容と check の性質から base の変更がその CI の主張に影響しないと Commander が判断できる場合は、head に結び付く成功 evidence を利用できる。その根拠を GitHub 上に残す。
 
 CI が失敗している場合、そのまま merge 方向へ進めない。
 
@@ -126,7 +139,11 @@ infrastructure failure など product code の問題と判断できない場合�
 
 ### 4.2 Review
 
-current exact head の unresolved findings を一度に確認する。
+current PR head の unresolved findings を一度に確認する。
+
+review の主張が PR diff / merge context に影響される場合は、review 後に target branch が進んでいないかを確認する。base が変わり、review が対象にした context を current と証明できない場合は無条件に再利用せず、必要なら current base context で review を取り直す。
+
+一方、特定の head-local な指摘など、base の変更が review の主張に影響しないと Commander が current facts から判断できる場合は、その review evidence を利用できる。その根拠を GitHub 上に残す。
 
 review comment 1件を fix 1回に対応させない。
 
@@ -158,6 +175,8 @@ GUI validation を行うかどうかは current Issue の acceptance criteria �
 不要な full regression を毎回要求しない。
 
 focused scenario を優先する。
+
+GUI evidence は対象 head に加えて、その scenario の結果に current base / merge context が影響する場合は、その context と対応していることを確認する。head が同じでも base の product code が scenario に影響する形で変わった場合、旧 GUI evidence を無条件に current とみなさない。base-independent と判断できる場合は、その根拠を GitHub 上に残して head-only evidence を利用できる。
 
 GUI result が `fail` / `blocked` の場合は evidence を読み、少なくとも次を区別する。
 
@@ -193,11 +212,14 @@ current Issue の目的と acceptance criteria を満たし、必要な review /
 最低限確認する。
 
 - current head SHA が判断対象の expected head と一致する。
-- required CI checks が success。
-- 必要と判断した GUI validation がある場合、その結果が受け入れ可能である。
+- current target branch / base context が、採用する base-sensitive な CI / review / GUI evidence の前提と整合している。
+- required CI checks が current context で success。
+- 必要と判断した GUI validation がある場合、その結果が current context で受け入れ可能である。
 - GitHub が PR を mergeable と報告している。
 
-merge は expected head SHA を指定して行う。
+base-independent と判断した evidence は、Commander がその根拠を GitHub 上に残していることを確認する。
+
+merge は expected head SHA を指定して行う。expected head は concurrent product branch mutation を防ぐための guard であり、base freshness の代わりにはならない。
 
 専用 Gate は必須ではない。確認が実運用で繰り返し複雑になる場合だけ、客観条件だけを確認する小さな Gate へ抽出してよい。
 
@@ -215,13 +237,15 @@ repository mutation を伴う action は、実行直前に current head が対�
 
 Claude が push して head が変わったら、旧 head の evidence は current 判断に使わない。
 
+target branch が動いて evidence の base context が変わった場合も、head が同じだからという理由だけで base-sensitive な旧 CI / review / GUI evidence を current 扱いしない。
+
 ---
 
 ## 6. Observe again
 
 action の結果が GitHub に残ったら、過去の判断をそのまま継続せず、current facts を読み直す。
 
-新しい head なら新しい世代として扱う。
+新しい head なら新しい product branch 世代として扱う。head が同じでも target branch が進んだ場合は、base-sensitive な evidence の context を再評価する。
 
 同じ root cause が修正後も繰り返す場合、細かい patch を無制限に続けず、設計見直し、scope 分割、追加 evidence の取得などを判断する。
 
