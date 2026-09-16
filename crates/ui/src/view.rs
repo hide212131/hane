@@ -2134,12 +2134,13 @@ impl EditorView {
     ) -> Option<SourceOffset> {
         let visual = self.rendered_line(line)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment, x);
+        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment.clone(), x);
         Some(source_offset_for_visual_position(
             self.editor(),
             line,
             &visual,
             visual_offset,
+            Some(&fragment),
         ))
     }
 
@@ -4050,17 +4051,25 @@ impl EditorView {
     }
 }
 
+/// `fragment` is the clicked row's own stretch of `block`'s visual text (see
+/// `EditorView::offset_at_row_x`), when the caller is resolving a click on a
+/// specific rendered row rather than a bare visual offset. It lets
+/// `collapsed_boundary_bias` tell which side of a soft-wrapped, zero-width
+/// collapsed boundary the click actually landed on; `None` (as from the
+/// non-row test helpers below) leaves that disambiguation off, matching the
+/// unwrapped, whole-line behavior.
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
     block: &VisualLine,
     visual_offset: usize,
+    fragment: Option<&Range<usize>>,
 ) -> SourceOffset {
     block
         .source_map
         .visual_to_source(
             VisualOffset(visual_offset),
-            collapsed_boundary_bias(block, visual_offset),
+            collapsed_boundary_bias(block, visual_offset, fragment),
         )
         .map(|candidate| candidate.source_offset)
         .or_else(|| {
@@ -4092,7 +4101,36 @@ fn source_offset_for_visual_position(
 /// point would arbitrarily favor the closing side; instead an opening edge
 /// anywhere at the point wins, since a click there is visually at the start
 /// of the following visible content, not the end of the preceding content.
-fn collapsed_boundary_bias(block: &VisualLine, visual_offset: usize) -> Bias {
+///
+/// A soft-wrapped row boundary can land on exactly the same collapsed point:
+/// the row that ends there and the row that starts there both render text
+/// whose shared visual offset is this marker's position. `marker_edge` alone
+/// cannot tell those two rows apart — it only knows the marker's own
+/// direction, not which side of it the click actually hit — so a click at the
+/// start of the row that begins the boundary always resolved to the
+/// upper-row (closing-marker) side even when the click was on the next row's
+/// own visible text. `fragment`, the clicked row's own stretch of `block`'s
+/// visual text, resolves that: a click exactly at the row's leading edge (and
+/// not at the very start of the line, which is not a wrap boundary) belongs
+/// to the content that row opens with; a click exactly at the row's trailing
+/// edge (and not at the very end of the line, which owns the caret itself as
+/// a hard-wrapped row's own trailing position) belongs to the content that
+/// row closes with. This is checked before the marker-edge fallback because
+/// it reflects where the click physically landed, which the marker's own
+/// direction cannot.
+fn collapsed_boundary_bias(
+    block: &VisualLine,
+    visual_offset: usize,
+    fragment: Option<&Range<usize>>,
+) -> Bias {
+    if let Some(fragment) = fragment {
+        if fragment.start == visual_offset && visual_offset > 0 {
+            return Bias::After;
+        }
+        if fragment.end == visual_offset && visual_offset < block.visual_text.len() {
+            return Bias::Before;
+        }
+    }
     let mut edges = block.source_map.segments.iter().filter_map(|segment| {
         let at_point = segment.visual_range.start.0 == visual_offset
             && segment.visual_range.end.0 == visual_offset;
@@ -4167,27 +4205,27 @@ mod tests {
 
         let first = &lines[0];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, first, 2),
+            source_offset_for_visual_position(&editor, 0, first, 2, None),
             SourceOffset(2)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, first, first.visual_text.len()),
+            source_offset_for_visual_position(&editor, 0, first, first.visual_text.len(), None),
             SourceOffset(6)
         );
 
         let empty = &lines[1];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 1, empty, 0),
+            source_offset_for_visual_position(&editor, 1, empty, 0, None),
             SourceOffset(7)
         );
 
         let bold = &lines[2];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, bold, 0),
+            source_offset_for_visual_position(&editor, 2, bold, 0, None),
             SourceOffset(10)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len()),
+            source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len(), None),
             SourceOffset(14)
         );
     }
@@ -4219,8 +4257,50 @@ mod tests {
         // (source offset 6, just before the marker), not the start of " more"
         // (source offset 8, just after it).
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, "bold".len()),
+            source_offset_for_visual_position(&editor, 0, line, "bold".len(), None),
             SourceOffset(6)
+        );
+    }
+
+    // Root cause behind the current PR #144 blocker: `offset_at_row_x` knew
+    // which row (fragment) a click landed on, but discarded it before calling
+    // `source_offset_for_visual_position`, so a soft-wrap boundary that shares
+    // a visual offset with a hidden closing marker always resolved to the
+    // marker's own edge (`Bias::Before`) regardless of which row was clicked.
+    // A click at the very start of the row that begins after the wrap must
+    // land in that row's own visible content, not back before the marker on
+    // the row above. This fixes both sides of the same collapsed boundary as
+    // `hidden_closing_marker_boundary_lands_before_the_marker_not_after_it`
+    // above, which pins the no-wrap (whole-line fragment) case.
+    #[test]
+    fn soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row() {
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "bold more");
+        let boundary = "bold".len();
+
+        // The upper row: it ends exactly at the collapsed closing marker, so
+        // a click at its own trailing edge stays on the content it closes,
+        // just before the marker (source offset 6).
+        let upper_row = 0..boundary;
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, boundary, Some(&upper_row)),
+            SourceOffset(6)
+        );
+
+        // The next row: it starts exactly at the same collapsed point, so a
+        // click at its own leading edge lands on the content it opens, just
+        // after the marker (source offset 8), not back on the row above.
+        let next_row = boundary..line.visual_text.len();
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, boundary, Some(&next_row)),
+            SourceOffset(8)
         );
     }
 
@@ -4240,7 +4320,7 @@ mod tests {
         // offset 12, just before the marker), not the start of " end" (source
         // offset 13, just after it).
         assert_eq!(
-            source_offset_for_visual_position(&editor, 1, second, "de".len()),
+            source_offset_for_visual_position(&editor, 1, second, "de".len(), None),
             SourceOffset(12)
         );
     }
@@ -4263,7 +4343,7 @@ mod tests {
         // start of "code" (source offset 13, just after the marker), not the
         // end of "this inline " (source offset 12, just before it).
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, "this inline ".len()),
+            source_offset_for_visual_position(&editor, 0, line, "this inline ".len(), None),
             SourceOffset(13)
         );
     }
@@ -4283,7 +4363,7 @@ mod tests {
         // "**bold**" starts at source offset 13; the opening `**` ends at 15,
         // right where "bold" begins in the source.
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("**bold").unwrap() + 2)
         );
     }
@@ -4313,7 +4393,7 @@ mod tests {
         // source offset 4, just after the marker and before "item", not
         // offset 2, just before the marker in the leading indentation.
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("- item").unwrap() + 2)
         );
     }
@@ -4339,7 +4419,7 @@ mod tests {
         // "![alt](x)" starts at source offset 2; the opening `![` ends at 4,
         // right where "alt" begins in the source.
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("alt").unwrap())
         );
     }
@@ -4367,7 +4447,7 @@ mod tests {
         // is source offset 5, just after the marker and before "title", not
         // offset 2, just before the marker in the leading indentation.
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("title").unwrap())
         );
     }
@@ -4396,7 +4476,7 @@ mod tests {
         // canonical is source offset 7, the start of "b", not offset 2, the
         // end of "a".
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, line, visual_offset),
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find('b').unwrap())
         );
     }
@@ -6343,13 +6423,14 @@ mod tests {
                 let shaper = WindowShaper::new(window);
                 let x = f32::from(bounds.origin.x)
                     + editor_view.theme.line_horizontal_padding
-                    + shaper.x_for_offset(&visual, fragment, visual_offset);
+                    + shaper.x_for_offset(&visual, fragment.clone(), visual_offset);
                 let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
                     &visual,
                     visual_offset,
+                    Some(&fragment),
                 );
                 (point(px(x), px(y)), expected)
             })
