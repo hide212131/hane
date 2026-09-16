@@ -85,11 +85,28 @@ pub enum BoundarySide {
     Trailing,
 }
 
+/// Which end of a delimited construct (e.g. `**bold**`, `` `code` ``) a
+/// [`Visibility::HiddenMarkup`] segment's marker sits at. A collapsed
+/// zero-visual-width marker shares its visual position with the visible
+/// content on one side and unrelated content on the other; only the parse
+/// tree that produced the marker knows which side is which, so this is
+/// resolved once here rather than guessed from position at click time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkerEdge {
+    Opening,
+    Closing,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MappingSegment {
     pub source_range: SourceRange,
     pub visual_range: VisualRange,
     pub visibility: Visibility,
+    /// `Some` only for a [`Visibility::HiddenMarkup`] segment whose marker
+    /// opens or closes a delimited construct (bold, italic, inline code,
+    /// links); `None` for plain visible text and for markup with no
+    /// meaningful side (e.g. a quote/list prefix, a table pipe).
+    pub marker_edge: Option<MarkerEdge>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -855,6 +872,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
                 source_range: range,
                 visual_range: VisualRange::new(0, source.len()),
                 visibility: Visibility::Visible,
+                marker_edge: None,
             }],
         },
         estimated_height: 24.0,
@@ -1037,6 +1055,58 @@ fn marker_is_disclosed(
     })
 }
 
+/// Resolves whether `marker` is the opening or closing delimiter of the
+/// smallest enclosing construct that owns it, by checking whether the
+/// marker's own range starts or ends exactly where that construct's node
+/// does. Returns `None` when the marker does not align with either edge of
+/// any delimiter-owning node (not expected for markers this crate derives,
+/// but not a display-breaking condition either).
+///
+/// A quote or list item's own prefix marker is always an opening edge — the
+/// content it introduces sits to its right — even though its owning node's
+/// `source_range` starts before the marker at the container's indentation,
+/// which would otherwise make the `start == marker.start` check below miss
+/// it entirely for an indented item.
+///
+/// An ATX heading is not in [`has_delimiter_markers`] (its markers are
+/// derived block-side, not from a delimiter pair the inline scanner walks),
+/// so it is classified separately here rather than being folded into that
+/// set.
+fn marker_edge(
+    planned: &ProjectedMarker,
+    parsed: &MarkdownParse,
+    nodes: &SourceIndex<NodeId>,
+) -> Option<MarkerEdge> {
+    if planned.quote_owner.is_some() || planned.list_owner.is_some() {
+        return Some(MarkerEdge::Opening);
+    }
+    let marker = planned.range;
+    nodes.intersecting(marker).into_iter().find_map(|id| {
+        let span = parsed.tree.node(*id)?;
+        let is_heading = matches!(span.kind, NodeKind::Heading(_));
+        if !has_delimiter_markers(span.kind) && !is_heading {
+            return None;
+        }
+        if span.source_range.start == marker.start {
+            Some(MarkerEdge::Opening)
+        } else if is_heading {
+            // A heading's own source range can include the block's trailing
+            // newline, which the derived closing marker's end excludes, so the
+            // end-alignment check below never matches; a marker positioned
+            // after all of the heading's content is its closing sequence.
+            span.children
+                .last()
+                .and_then(|child_id| parsed.tree.node(*child_id))
+                .is_none_or(|child| child.source_range.end <= marker.start)
+                .then_some(MarkerEdge::Closing)
+        } else if span.source_range.end == marker.end {
+            Some(MarkerEdge::Closing)
+        } else {
+            None
+        }
+    })
+}
+
 /// Returns true when `segments` tile `range` contiguously, so every source byte
 /// of the block belongs to exactly one mapping segment (empty synthesized
 /// segments are ignored). Enforces the "source is never lost" display contract:
@@ -1063,6 +1133,7 @@ fn append_segment(
     block_range: SourceRange,
     source_range: SourceRange,
     visibility: Visibility,
+    marker_edge: Option<MarkerEdge>,
 ) {
     let visual_start = visual.len();
     if visibility != Visibility::HiddenMarkup {
@@ -1075,6 +1146,7 @@ fn append_segment(
         source_range,
         visual_range: VisualRange::new(visual_start, visual.len()),
         visibility,
+        marker_edge,
     });
 }
 
@@ -1189,6 +1261,7 @@ fn present_markdown_from_parse(
                 range,
                 SourceRange::new(source_cursor, marker.start.0),
                 Visibility::Visible,
+                None,
             );
         }
         let expanded = marker_is_disclosed(planned, parsed, &shared.projection.nodes, disclosure);
@@ -1203,6 +1276,7 @@ fn present_markdown_from_parse(
             } else {
                 Visibility::HiddenMarkup
             },
+            marker_edge(planned, parsed, &shared.projection.nodes),
         );
         source_cursor = marker.end.0;
     }
@@ -1214,6 +1288,7 @@ fn present_markdown_from_parse(
             range,
             SourceRange::new(source_cursor, range.end.0),
             Visibility::Visible,
+            None,
         );
     }
     if segments.is_empty() {
@@ -1221,6 +1296,7 @@ fn present_markdown_from_parse(
             source_range: range,
             visual_range: VisualRange::new(0, visual.len()),
             visibility: Visibility::Visible,
+            marker_edge: None,
         });
     }
     // Contract guard: if marker derivation for an unsupported construct left the
@@ -1525,6 +1601,7 @@ impl<T> SourceIndex<T> {
 struct ProjectedMarker {
     range: SourceRange,
     quote_owner: Option<NodeId>,
+    list_owner: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1540,6 +1617,11 @@ impl ProjectionIndex {
             .iter()
             .map(|(range, owner)| ((range.start, range.end), *owner))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let list_owners = parsed
+            .list_item_markers
+            .iter()
+            .map(|(range, owner)| ((range.start, range.end), *owner))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut markers = parsed
             .markers
             .iter()
@@ -1547,6 +1629,7 @@ impl ProjectionIndex {
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
+                list_owner: list_owners.get(&(range.start, range.end)).copied(),
             })
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
@@ -1816,6 +1899,7 @@ fn present_image(
             source_range: SourceRange::new(base, base + image.prefix_end - 2),
             visual_range: VisualRange::new(0, image.prefix_end - 2),
             visibility: Visibility::Visible,
+            marker_edge: None,
         });
     }
     let visual_prefix = image.prefix_end.saturating_sub(2);
@@ -1823,17 +1907,20 @@ fn present_image(
         source_range: SourceRange::new(base + visual_prefix, base + image.prefix_end),
         visual_range: VisualRange::new(visual_prefix, visual_prefix),
         visibility: Visibility::HiddenMarkup,
+        marker_edge: Some(MarkerEdge::Opening),
     });
     segments.push(MappingSegment {
         source_range: SourceRange::new(base + image.alt_start, base + image.alt_end),
         visual_range: VisualRange::new(visual_prefix, visual_prefix + image.alt.len()),
         visibility: Visibility::Visible,
+        marker_edge: None,
     });
     let visual_end = visual_prefix + image.alt.len();
     segments.push(MappingSegment {
         source_range: SourceRange::new(base + image.suffix_start, base + image.suffix_end),
         visual_range: VisualRange::new(visual_end, visual_end),
         visibility: Visibility::HiddenMarkup,
+        marker_edge: Some(MarkerEdge::Closing),
     });
     if image.suffix_end < source.len() {
         segments.push(MappingSegment {
@@ -1843,6 +1930,7 @@ fn present_image(
                 visual_end + source.len() - image.suffix_end,
             ),
             visibility: Visibility::Visible,
+            marker_edge: None,
         });
     }
     VisualLine {
@@ -1888,6 +1976,7 @@ fn present_table_line(
                     source_range: range,
                     visual_range: VisualRange::new(0, 0),
                     visibility: Visibility::HiddenMarkup,
+                    marker_edge: None,
                 }],
             },
             estimated_height: estimated_height(BlockKind::TableDelimiter, line_height),
@@ -1912,6 +2001,7 @@ fn present_table_line(
                 range,
                 SourceRange::new(base + cursor, base + index),
                 Visibility::Visible,
+                None,
             );
         }
         let at = visual.len();
@@ -1919,6 +2009,7 @@ fn present_table_line(
             source_range: SourceRange::new(base + index, base + index + marker.len()),
             visual_range: VisualRange::new(at, at),
             visibility: Visibility::HiddenMarkup,
+            marker_edge: None,
         });
         if index > 0 && index + 1 < content_end {
             visual.push('│');
@@ -1926,6 +2017,7 @@ fn present_table_line(
                 source_range: SourceRange::empty(base + index + 1),
                 visual_range: VisualRange::new(at, visual.len()),
                 visibility: Visibility::Synthesized,
+                marker_edge: None,
             });
         }
         cursor = index + marker.len();
@@ -1938,6 +2030,7 @@ fn present_table_line(
             range,
             SourceRange::new(base + cursor, range.end.0),
             Visibility::Visible,
+            None,
         );
     }
     let visual_len = visual.len();

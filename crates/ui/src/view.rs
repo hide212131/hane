@@ -43,9 +43,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, VisualLine,
-    VisualOffset, block_heights, block_is_joinable, block_line_span, layout_block,
-    parse_joined_span, trailing_blank_lines,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    VisualBlock, VisualLine, VisualOffset, block_heights, block_is_joinable, block_line_span,
+    layout_block, parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
@@ -2134,12 +2134,13 @@ impl EditorView {
     ) -> Option<SourceOffset> {
         let visual = self.rendered_line(line)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment, x);
+        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment.clone(), x);
         Some(source_offset_for_visual_position(
             self.editor(),
             line,
             &visual,
             visual_offset,
+            Some(&fragment),
         ))
     }
 
@@ -4050,15 +4051,26 @@ impl EditorView {
     }
 }
 
+/// `fragment` is the clicked row's own stretch of `block`'s visual text (see
+/// `EditorView::offset_at_row_x`), when the caller is resolving a click on a
+/// specific rendered row rather than a bare visual offset. It lets
+/// `collapsed_boundary_bias` tell which side of a soft-wrapped, zero-width
+/// collapsed boundary the click actually landed on; `None` (as from the
+/// non-row test helpers below) leaves that disambiguation off, matching the
+/// unwrapped, whole-line behavior.
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
     block: &VisualLine,
     visual_offset: usize,
+    fragment: Option<&Range<usize>>,
 ) -> SourceOffset {
     block
         .source_map
-        .visual_to_source(VisualOffset(visual_offset), Bias::After)
+        .visual_to_source(
+            VisualOffset(visual_offset),
+            collapsed_boundary_bias(block, visual_offset, fragment),
+        )
         .map(|candidate| candidate.source_offset)
         .or_else(|| {
             editor
@@ -4068,6 +4080,69 @@ fn source_offset_for_visual_position(
                 .map(|range| range.start)
         })
         .unwrap_or(block.source_range.start)
+}
+
+/// A hidden marker (e.g. the trailing `**` of bold text, or the opening `` ` ``
+/// of a code span) collapses to zero visual width, so its own visual position
+/// is indistinguishable from the visible text on whichever side is unrelated
+/// content. Per the collapsed-boundary contract (ADR-0004), a click there must
+/// land on the visible content the marker actually belongs to: just before it
+/// for a closing marker (content it closes sits to the left), just after it
+/// for an opening marker (content it opens sits to the right). `MarkerEdge`
+/// carries that distinction from the parse tree, including for a quote/list
+/// prefix, whose owning container node always resolves it as opening even
+/// though the node's own source range can start before the marker (at the
+/// container's indentation). A marker with no resolvable edge at all (not
+/// expected for markers this crate derives) keeps the closing-side default.
+///
+/// Two adjacent constructs with no visible gap (e.g. `[a](x)[b](y)`) collapse
+/// a closing marker and the next construct's opening marker onto the very
+/// same point. Picking whichever of them happens to appear first at that
+/// point would arbitrarily favor the closing side; instead an opening edge
+/// anywhere at the point wins, since a click there is visually at the start
+/// of the following visible content, not the end of the preceding content.
+///
+/// A soft-wrapped row boundary can land on exactly the same collapsed point:
+/// the row that ends there and the row that starts there both render text
+/// whose shared visual offset is this marker's position. `marker_edge` alone
+/// cannot tell those two rows apart — it only knows the marker's own
+/// direction, not which side of it the click actually hit — so a click at the
+/// start of the row that begins the boundary always resolved to the
+/// upper-row (closing-marker) side even when the click was on the next row's
+/// own visible text. `fragment`, the clicked row's own stretch of `block`'s
+/// visual text, resolves that: a click exactly at the row's leading edge (and
+/// not at the very start of the line, which is not a wrap boundary) belongs
+/// to the content that row opens with; a click exactly at the row's trailing
+/// edge (and not at the very end of the line, which owns the caret itself as
+/// a hard-wrapped row's own trailing position) belongs to the content that
+/// row closes with. This is checked before the marker-edge fallback because
+/// it reflects where the click physically landed, which the marker's own
+/// direction cannot.
+fn collapsed_boundary_bias(
+    block: &VisualLine,
+    visual_offset: usize,
+    fragment: Option<&Range<usize>>,
+) -> Bias {
+    if let Some(fragment) = fragment {
+        if fragment.start == visual_offset && visual_offset > 0 {
+            return Bias::After;
+        }
+        if fragment.end == visual_offset && visual_offset < block.visual_text.len() {
+            return Bias::Before;
+        }
+    }
+    let mut edges = block.source_map.segments.iter().filter_map(|segment| {
+        let at_point = segment.visual_range.start.0 == visual_offset
+            && segment.visual_range.end.0 == visual_offset;
+        (at_point && segment.visibility == Visibility::HiddenMarkup)
+            .then_some(segment.marker_edge)
+            .flatten()
+    });
+    if edges.any(|edge| edge == MarkerEdge::Opening) {
+        Bias::After
+    } else {
+        Bias::Before
+    }
 }
 
 #[cfg(test)]
@@ -4130,28 +4205,279 @@ mod tests {
 
         let first = &lines[0];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, first, 2),
+            source_offset_for_visual_position(&editor, 0, first, 2, None),
             SourceOffset(2)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 0, first, first.visual_text.len()),
+            source_offset_for_visual_position(&editor, 0, first, first.visual_text.len(), None),
             SourceOffset(6)
         );
 
         let empty = &lines[1];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 1, empty, 0),
+            source_offset_for_visual_position(&editor, 1, empty, 0, None),
             SourceOffset(7)
         );
 
         let bold = &lines[2];
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, bold, 0),
+            source_offset_for_visual_position(&editor, 2, bold, 0, None),
             SourceOffset(10)
         );
         assert_eq!(
-            source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len()),
+            source_offset_for_visual_position(&editor, 2, bold, bold.visual_text.len(), None),
             SourceOffset(14)
+        );
+    }
+
+    // Issue #143: a hidden closing marker collapses to zero visual width, so
+    // when visible text immediately follows it on the same line, the marker's
+    // own visual position is indistinguishable from that following text's
+    // start. The canonical position for a click there must stay on the
+    // content the marker closes (just before the marker), not jump past it
+    // into unrelated following content.
+    #[test]
+    fn hidden_closing_marker_boundary_lands_before_the_marker_not_after_it() {
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        // The default caret sits at source offset 0, which is also where the
+        // bold construct's own opening marker starts: `range_touches` treats
+        // a caret exactly at a construct's start as touching it, which would
+        // disclose (un-hide) the markers this test needs hidden. Move the
+        // caret past the construct first, as the other cases below already do.
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "bold more");
+        // The shared boundary between "bold" and " more" sits right where the
+        // closing `**` collapsed to nothing: canonical is the end of "bold"
+        // (source offset 6, just before the marker), not the start of " more"
+        // (source offset 8, just after it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, "bold".len(), None),
+            SourceOffset(6)
+        );
+    }
+
+    // Root cause behind the current PR #144 blocker: `offset_at_row_x` knew
+    // which row (fragment) a click landed on, but discarded it before calling
+    // `source_offset_for_visual_position`, so a soft-wrap boundary that shares
+    // a visual offset with a hidden closing marker always resolved to the
+    // marker's own edge (`Bias::Before`) regardless of which row was clicked.
+    // A click at the very start of the row that begins after the wrap must
+    // land in that row's own visible content, not back before the marker on
+    // the row above. This fixes both sides of the same collapsed boundary as
+    // `hidden_closing_marker_boundary_lands_before_the_marker_not_after_it`
+    // above, which pins the no-wrap (whole-line fragment) case.
+    #[test]
+    fn soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row() {
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "bold more");
+        let boundary = "bold".len();
+
+        // The upper row: it ends exactly at the collapsed closing marker, so
+        // a click at its own trailing edge stays on the content it closes,
+        // just before the marker (source offset 6).
+        let upper_row = 0..boundary;
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, boundary, Some(&upper_row)),
+            SourceOffset(6)
+        );
+
+        // The next row: it starts exactly at the same collapsed point, so a
+        // click at its own leading edge lands on the content it opens, just
+        // after the marker (source offset 8), not back on the row above.
+        let next_row = boundary..line.visual_text.len();
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, boundary, Some(&next_row)),
+            SourceOffset(8)
+        );
+    }
+
+    #[test]
+    fn hidden_closing_marker_boundary_lands_before_the_marker_across_a_joined_multiline_span() {
+        // CommonMark resolves a backtick-delimited code span across a soft
+        // line break, so the closing marker for `co` on the first physical
+        // line lands on the second: `present_block` joins both lines' shared
+        // parse the same way it would for a multiline bold or emphasis run.
+        let editor = Editor::new("start `co\nde` end");
+        let lines = presented_lines(&editor);
+
+        let second = &lines[1];
+        assert_eq!(second.visual_text, "de end");
+        // The shared boundary between "de" and " end" sits where the closing
+        // backtick collapsed to nothing: canonical is the end of "de" (source
+        // offset 12, just before the marker), not the start of " end" (source
+        // offset 13, just after it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 1, second, "de".len(), None),
+            SourceOffset(12)
+        );
+    }
+
+    // Codex review on PR #144: a hidden *opening* marker (e.g. the leading
+    // backtick of a code span) shares its collapsed visual position with the
+    // end of whatever unrelated text precedes it, the mirror image of the
+    // closing-marker case above. The canonical position for a click there
+    // must land just after the marker, inside the content it opens, not just
+    // before it in the unrelated preceding text.
+    #[test]
+    fn hidden_opening_marker_boundary_lands_after_the_marker_not_before_it() {
+        let editor = Editor::new("this inline `code`");
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "this inline code");
+        // The shared boundary between "this inline " and "code" sits right
+        // where the opening backtick collapsed to nothing: canonical is the
+        // start of "code" (source offset 13, just after the marker), not the
+        // end of "this inline " (source offset 12, just before it).
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, "this inline ".len(), None),
+            SourceOffset(13)
+        );
+    }
+
+    // Mirrors the hosted GUI validator's `quote_open` probe
+    // (`scripts/hosted_gui_interaction.py`): an opening marker nested inside a
+    // blockquote container must resolve the same way a top-level one does.
+    #[test]
+    fn hidden_opening_marker_boundary_inside_a_quote_lands_after_the_marker() {
+        let text = "> quote with **bold**";
+        let editor = Editor::new(text);
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "> quote with bold");
+        let visual_offset = line.visual_text.find("bold").unwrap();
+        // "**bold**" starts at source offset 13; the opening `**` ends at 15,
+        // right where "bold" begins in the source.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
+            SourceOffset(text.find("**bold").unwrap() + 2)
+        );
+    }
+
+    // Codex review on PR #144: an indented list item's bullet marker collapses
+    // to zero visual width the same as any other hidden marker, but its
+    // owning `ListItem` node's source range starts at the line's indentation
+    // rather than at the bullet itself — so the naive start/end alignment
+    // `marker_edge` otherwise uses to classify a delimiter never matches, and
+    // the marker fell back to the closing-side default. That misclassified
+    // the marker as closing content to its *left* (the indentation) instead
+    // of opening the list item to its right, so a click at the start of the
+    // visible text landed before the bullet instead of after it.
+    #[test]
+    fn hidden_list_marker_boundary_lands_after_the_marker_even_when_indented() {
+        let text = "  - item\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  item");
+        let visual_offset = line.visual_text.find("item").unwrap();
+        // "  - item" hides the bullet `- ` (source offsets 2..4); canonical is
+        // source offset 4, just after the marker and before "item", not
+        // offset 2, just before the marker in the leading indentation.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
+            SourceOffset(text.find("- item").unwrap() + 2)
+        );
+    }
+
+    // Codex review on PR #144: a standalone image with leading indentation
+    // (`  ![alt](x)`) collapses the indentation's end, the hidden `![`, and
+    // the start of the visible alt text to the same visual offset. Without a
+    // marker edge the boundary defaulted to closing-side, landing a click
+    // just before `![` in the indentation instead of just after it at the
+    // start of the alt text.
+    #[test]
+    fn hidden_image_opening_marker_boundary_lands_after_the_marker() {
+        let text = "  ![alt](x)\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  alt");
+        let visual_offset = line.visual_text.find("alt").unwrap();
+        // "![alt](x)" starts at source offset 2; the opening `![` ends at 4,
+        // right where "alt" begins in the source.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
+            SourceOffset(text.find("alt").unwrap())
+        );
+    }
+
+    // Codex review on PR #144: an indented ATX heading (`  ## title`) collapses
+    // the indentation's end and the start of the visible title to the same
+    // visual offset, the same shape as the indented list/image cases above.
+    // `Heading` was not in `has_delimiter_markers`, so `marker_edge` never
+    // classified its opening marker and the boundary fell back to the
+    // closing-side default, landing a click just before `## ` in the
+    // indentation instead of just after it at the start of the title.
+    #[test]
+    fn hidden_heading_marker_boundary_lands_after_the_marker_even_when_indented() {
+        let text = "  ## title\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "  title");
+        let visual_offset = line.visual_text.find("title").unwrap();
+        // "  ## title" hides the marker `## ` (source offsets 2..5); canonical
+        // is source offset 5, just after the marker and before "title", not
+        // offset 2, just before the marker in the leading indentation.
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
+            SourceOffset(text.find("title").unwrap())
+        );
+    }
+
+    // Codex review on PR #144: two adjacent links with no visible gap between
+    // them (`[a](x)[b](y)`) collapse the first link's closing marker and the
+    // second link's opening marker onto the exact same visual point.
+    // `find_map` picked whichever segment happened to be first in source
+    // order at that point — the first link's closing marker — so a click at
+    // the start of "b" landed at the end of "a" instead, and subsequent input
+    // edited the first link rather than the second.
+    #[test]
+    fn adjacent_links_boundary_lands_after_the_second_links_opening_marker() {
+        let text = "[a](x)[b](y)\nnext line";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let lines = presented_lines(&editor);
+
+        let line = &lines[0];
+        assert_eq!(line.visual_text, "ab");
+        let visual_offset = line.visual_text.find('b').unwrap();
+        // The boundary between "a" and "b" sits where the first link's
+        // closing marker and the second link's opening marker both collapse:
+        // canonical is source offset 7, the start of "b", not offset 2, the
+        // end of "a".
+        assert_eq!(
+            source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
+            SourceOffset(text.find('b').unwrap())
         );
     }
 
@@ -6097,13 +6423,14 @@ mod tests {
                 let shaper = WindowShaper::new(window);
                 let x = f32::from(bounds.origin.x)
                     + editor_view.theme.line_horizontal_padding
-                    + shaper.x_for_offset(&visual, fragment, visual_offset);
+                    + shaper.x_for_offset(&visual, fragment.clone(), visual_offset);
                 let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
                     &visual,
                     visual_offset,
+                    Some(&fragment),
                 );
                 (point(px(x), px(y)), expected)
             })
@@ -6379,4 +6706,5 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+
 }
