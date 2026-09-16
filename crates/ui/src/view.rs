@@ -3968,17 +3968,19 @@ fn work_folder_root_display_name(root: &Path) -> String {
 /// The sidebar's file-row label: the file name unchanged, unless it embeds
 /// a recognized date (`YYYY-MM-DD` or `YYYYMMDD`), in which case that date
 /// renders as its own small badge (`本日`, `17日(木)`, `10/3(土)`,
-/// `2025/10/3(金)`, …) instead of raw digits, while the surrounding text
-/// stays exactly what the file system reports — the real file name, path,
-/// and work-folder sort key never change.
+/// `2025/10/3(金)`, …) instead of raw digits, always placed at the front of
+/// the row regardless of where the date sat in the original name, followed
+/// by the rest of the name joined back into one natural, readable string —
+/// while the surrounding text stays exactly what the file system reports —
+/// the real file name, path, and work-folder sort key never change.
 fn file_name_label(file_name: &str, today: CalendarDate, theme: &Theme) -> gpui::Div {
     let row = div().flex().flex_row().items_center().gap_1();
     let Some(badge) = split_file_name_for_badge(file_name) else {
         return row.child(file_name.to_owned());
     };
-    row.when(!badge.before.is_empty(), |row| row.child(badge.before))
-        .child(date_badge_chip(badge.date, today, theme))
-        .when(!badge.after.is_empty(), |row| row.child(badge.after))
+    let remainder = badge.remainder();
+    row.child(date_badge_chip(badge.date, today, theme))
+        .when(!remainder.is_empty(), |row| row.child(remainder))
 }
 
 /// A small rounded chip for one badge-worthy date, styled like the header's

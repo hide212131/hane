@@ -189,6 +189,23 @@ pub struct FileNameDateBadge {
     pub after: String,
 }
 
+impl FileNameDateBadge {
+    /// `before` and `after` joined into the single line of text the sidebar
+    /// shows next to the badge, once the badge itself has been moved to the
+    /// front of the row: concatenated directly when one side is empty or
+    /// `after` is a bare extension (starts with `.`, as it does whenever the
+    /// date sat directly before the file name's extension), and separated by
+    /// one space otherwise so two former name segments don't run together.
+    #[must_use]
+    pub fn remainder(&self) -> String {
+        if self.before.is_empty() || self.after.is_empty() || self.after.starts_with('.') {
+            format!("{}{}", self.before, self.after)
+        } else {
+            format!("{} {}", self.before, self.after)
+        }
+    }
+}
+
 const BADGE_SEPARATORS: [char; 3] = ['_', '-', ' '];
 
 /// `None` when `file_name` has no valid embedded date to badge; the caller
@@ -370,6 +387,26 @@ mod tests {
         let badge = split_file_name_for_badge("XYZ__--2026-09-17--__.md").unwrap();
         assert_eq!(badge.before, "XYZ");
         assert_eq!(badge.after, ".md");
+    }
+
+    #[test]
+    fn the_remainder_joins_a_trailing_extension_directly_without_a_space() {
+        let hyphenated = split_file_name_for_badge("XYZ_2026-09-17.md").unwrap();
+        assert_eq!(hyphenated.remainder(), "XYZ.md");
+        let compact = split_file_name_for_badge("XYZ_20260917.md").unwrap();
+        assert_eq!(compact.remainder(), "XYZ.md");
+    }
+
+    #[test]
+    fn the_remainder_joins_a_middle_date_split_with_a_single_space() {
+        let badge = split_file_name_for_badge("Weekly_2026-09-17_Notes.md").unwrap();
+        assert_eq!(badge.remainder(), "Weekly Notes.md");
+    }
+
+    #[test]
+    fn the_remainder_of_a_leading_date_is_just_the_rest_of_the_name() {
+        let badge = split_file_name_for_badge("2026-09-17_ABC.md").unwrap();
+        assert_eq!(badge.remainder(), "ABC.md");
     }
 
     #[test]
