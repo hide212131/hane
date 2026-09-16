@@ -1,12 +1,12 @@
 //! Date badges for work-folder sidebar file names (issue #174).
 //!
-//! Finds a calendar date embedded in a Markdown file name (`YYYY-MM-DD` or
-//! `YYYYMMDD`, anywhere in the name) without ever touching the real file
-//! name, path, or work-folder sort key: those stay exactly what the
-//! filesystem reports. What the sidebar renders is a display-only
-//! decomposition of the name into the text before the date, the date
-//! itself, and the text after, plus the short label the badge shows for
-//! that date relative to "today".
+//! Finds a calendar date embedded in a Markdown file name (`YYYY-M-D` with a
+//! 1- or 2-digit month and day, or the compact `YYYYMMDD`, anywhere in the
+//! name) without ever touching the real file name, path, or work-folder sort
+//! key: those stay exactly what the filesystem reports. What the sidebar
+//! renders is a display-only decomposition of the name into the text before
+//! the date, the date itself, and the text after, plus the short label the
+//! badge shows for that date relative to "today".
 //!
 //! Everything here except [`local_today`] is pure and takes "today" as an
 //! explicit argument, so the calendar rules stay unit-testable without
@@ -144,23 +144,52 @@ fn match_compact(bytes: &[u8], start: usize) -> Option<DateMatch> {
     Some(DateMatch { date, start, end })
 }
 
-/// Matches `YYYY-MM-DD` starting at `start`.
+/// Matches a 1- or 2-digit field starting at `start`, preferring the 2-digit
+/// reading whenever both digits are present and `terminator_ok` accepts the
+/// byte right after them. This is unambiguous for the caller's grammar
+/// (month or day followed by a fixed non-digit boundary): whichever length
+/// leaves `terminator_ok` satisfied is the only one that can, since the
+/// other length would leave a digit sitting where the terminator check
+/// expects a non-digit.
+fn match_one_or_two_digit_field(
+    bytes: &[u8],
+    start: usize,
+    terminator_ok: impl Fn(Option<u8>) -> bool,
+) -> Option<(i32, usize)> {
+    let two_end = start + 2;
+    if let Some(segment) = bytes.get(start..two_end) {
+        if segment.iter().all(u8::is_ascii_digit) && terminator_ok(bytes.get(two_end).copied()) {
+            return Some((parse_digits(bytes, start..two_end)?, two_end));
+        }
+    }
+    let one_end = start + 1;
+    let byte = *bytes.get(start)?;
+    if byte.is_ascii_digit() && terminator_ok(bytes.get(one_end).copied()) {
+        return Some((i32::from(byte - b'0'), one_end));
+    }
+    None
+}
+
+/// Matches `YYYY-M-D` starting at `start`, where the month and day each
+/// accept one or two digits (`YYYY-MM-DD`, `YYYY-M-DD`, `YYYY-MM-D`, or
+/// `YYYY-M-D`). The year stays a fixed 4 digits.
 fn match_hyphenated(bytes: &[u8], start: usize) -> Option<DateMatch> {
-    let end = start.checked_add(10)?;
-    let segment = bytes.get(start..end)?;
-    let digits_ok = segment[0..4].iter().all(u8::is_ascii_digit)
-        && segment[5..7].iter().all(u8::is_ascii_digit)
-        && segment[8..10].iter().all(u8::is_ascii_digit);
-    if !digits_ok
-        || segment[4] != b'-'
-        || segment[7] != b'-'
-        || !has_digit_run_boundary(bytes, start, end)
-    {
+    let year_end = start.checked_add(4)?;
+    let year_segment = bytes.get(start..year_end)?;
+    if !year_segment.iter().all(u8::is_ascii_digit) || digit_at(bytes, start.wrapping_sub(1)) {
         return None;
     }
-    let year = parse_digits(bytes, start..start + 4)?;
-    let month = parse_digits(bytes, start + 5..start + 7)?;
-    let day = parse_digits(bytes, start + 8..start + 10)?;
+    if bytes.get(year_end).copied() != Some(b'-') {
+        return None;
+    }
+    let month_start = year_end + 1;
+    let (month, month_end) =
+        match_one_or_two_digit_field(bytes, month_start, |byte| byte == Some(b'-'))?;
+    let day_start = month_end + 1;
+    let (day, end) = match_one_or_two_digit_field(bytes, day_start, |byte| {
+        byte.is_none_or(|b| !b.is_ascii_digit())
+    })?;
+    let year = parse_digits(bytes, start..year_end)?;
     let date = CalendarDate::new(year, u32::try_from(month).ok()?, u32::try_from(day).ok()?)?;
     Some(DateMatch { date, start, end })
 }
@@ -327,6 +356,79 @@ mod tests {
         assert_eq!(badge.before, "");
         assert_eq!(badge.date, CalendarDate::new(2026, 9, 17).unwrap());
         assert_eq!(badge.after, "ABC.md");
+    }
+
+    #[test]
+    fn a_hyphenated_date_with_single_digit_month_and_day_is_found() {
+        let badge = split_file_name_for_badge("2026-9-1_ABC.md").unwrap();
+        assert_eq!(badge.before, "");
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+        assert_eq!(badge.after, "ABC.md");
+    }
+
+    #[test]
+    fn a_hyphenated_date_with_single_digit_month_and_two_digit_day_is_found() {
+        let badge = split_file_name_for_badge("2026-9-01_ABC.md").unwrap();
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+    }
+
+    #[test]
+    fn a_hyphenated_date_with_two_digit_month_and_single_digit_day_is_found() {
+        let badge = split_file_name_for_badge("2026-09-1_ABC.md").unwrap();
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+    }
+
+    #[test]
+    fn a_hyphenated_date_with_two_digit_month_and_day_is_found() {
+        let badge = split_file_name_for_badge("2026-09-01_ABC.md").unwrap();
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+    }
+
+    #[test]
+    fn a_single_digit_hyphenated_date_at_the_end_of_the_name_is_found() {
+        let badge = split_file_name_for_badge("XYZ_2026-9-1.md").unwrap();
+        assert_eq!(badge.before, "XYZ");
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+        assert_eq!(badge.after, ".md");
+    }
+
+    #[test]
+    fn a_single_digit_hyphenated_date_in_the_middle_of_the_name_is_found() {
+        let badge = split_file_name_for_badge("Weekly_2026-9-1_Notes.md").unwrap();
+        assert_eq!(badge.before, "Weekly");
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 1).unwrap());
+        assert_eq!(badge.after, "Notes.md");
+    }
+
+    #[test]
+    fn a_calendar_invalid_single_digit_hyphenated_date_is_not_recognized() {
+        assert!(split_file_name_for_badge("XYZ_2026-2-30_ABC.md").is_none());
+    }
+
+    #[test]
+    fn a_two_digit_day_is_not_truncated_into_a_one_digit_prefix() {
+        // A naive length-first match could stop at `2026-9-1` and leave a
+        // stray trailing `1` as part of the badge's `after` text instead of
+        // consuming the whole `11` as the day.
+        let badge = split_file_name_for_badge("2026-9-11_ABC.md").unwrap();
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 11).unwrap());
+        assert_eq!(badge.after, "ABC.md");
+    }
+
+    #[test]
+    fn a_two_digit_day_prefix_that_would_be_calendar_invalid_alone_is_still_read_in_full() {
+        // `2026-9-3` alone is valid, but the full two-digit run `30` here
+        // must be read as the day, not truncated to the valid-looking `3`.
+        let badge = split_file_name_for_badge("2026-9-30_ABC.md").unwrap();
+        assert_eq!(badge.date, CalendarDate::new(2026, 9, 30).unwrap());
+        assert_eq!(badge.after, "ABC.md");
+    }
+
+    #[test]
+    fn a_longer_month_digit_run_is_not_truncated_into_a_shorter_field() {
+        // `999` after the year can't be read as a 1- or 2-digit month
+        // because neither leaves a `-` immediately after it.
+        assert!(split_file_name_for_badge("2026-999-01_ABC.md").is_none());
     }
 
     #[test]
