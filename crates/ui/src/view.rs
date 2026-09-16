@@ -3832,6 +3832,7 @@ impl EditorView {
                                         entry.file_name(),
                                         today,
                                         &self.theme,
+                                        DateBadgePosition::Right,
                                     )),
                             )
                             .on_click(cx.listener(move |view, _, _, cx| {
@@ -3965,22 +3966,53 @@ fn work_folder_root_display_name(root: &Path) -> String {
     )
 }
 
+/// Where the date badge renders relative to the rest of a file-row label's
+/// text. Both sides render through the same [`file_name_label`] call; only
+/// `Right` is wired to the one current call site today, with `Left` kept
+/// selectable for a future settings screen that lets the user choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DateBadgePosition {
+    /// Reserved for a future settings toggle; exercised today by
+    /// [`badge_renders_before_remainder`]'s unit tests.
+    #[allow(dead_code)]
+    Left,
+    Right,
+}
+
+/// Whether the date badge should render before the remainder text for a
+/// given [`DateBadgePosition`]: pure so both orderings are unit-testable
+/// without a GPUI context.
+fn badge_renders_before_remainder(position: DateBadgePosition) -> bool {
+    matches!(position, DateBadgePosition::Left)
+}
+
 /// The sidebar's file-row label: the file name unchanged, unless it embeds
 /// a recognized date (`YYYY-MM-DD` or `YYYYMMDD`), in which case that date
 /// renders as its own small badge (`本日`, `17日(木)`, `10/3(土)`,
-/// `2025/10/3(金)`, …) instead of raw digits, always placed at the front of
-/// the row regardless of where the date sat in the original name, followed
-/// by the rest of the name joined back into one natural, readable string —
-/// while the surrounding text stays exactly what the file system reports —
-/// the real file name, path, and work-folder sort key never change.
-fn file_name_label(file_name: &str, today: CalendarDate, theme: &Theme) -> gpui::Div {
+/// `2025/10/3(金)`, …) instead of raw digits, positioned per
+/// `badge_position` relative to the rest of the name joined back into one
+/// natural, readable string — while the surrounding text stays exactly what
+/// the file system reports — the real file name, path, and work-folder sort
+/// key never change.
+fn file_name_label(
+    file_name: &str,
+    today: CalendarDate,
+    theme: &Theme,
+    badge_position: DateBadgePosition,
+) -> gpui::Div {
     let row = div().flex().flex_row().items_center().gap_1();
     let Some(badge) = split_file_name_for_badge(file_name) else {
         return row.child(file_name.to_owned());
     };
     let remainder = badge.remainder();
-    row.child(date_badge_chip(badge.date, today, theme))
-        .when(!remainder.is_empty(), |row| row.child(remainder))
+    let chip = date_badge_chip(badge.date, today, theme);
+    if badge_renders_before_remainder(badge_position) {
+        row.child(chip)
+            .when(!remainder.is_empty(), |row| row.child(remainder))
+    } else {
+        row.when(!remainder.is_empty(), |row| row.child(remainder))
+            .child(chip)
+    }
 }
 
 /// A small rounded chip for one badge-worthy date, styled like the header's
@@ -4208,6 +4240,12 @@ mod tests {
         assert!(!entry.is_valid(639.0, 11, Revision(3)));
         assert!(!entry.is_valid(640.0, 12, Revision(3)));
         assert!(!entry.is_valid(640.0, 11, Revision(4)));
+    }
+
+    #[test]
+    fn the_date_badge_renders_before_the_remainder_only_on_the_left() {
+        assert!(badge_renders_before_remainder(DateBadgePosition::Left));
+        assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
     }
 
     #[test]
