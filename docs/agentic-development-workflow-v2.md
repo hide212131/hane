@@ -173,19 +173,21 @@ ChatGPT は最初から repository 全体を探索しない。
 
 ---
 
-## 7. current PR context: head + base
+## 7. current PR context: head + 必要な base context
 
 product branch の mutation 世代は current head SHA で扱う。
 
 current head が `A` のとき、`A` 以外の head に対する CI / Review / GUI evidence は current 判断に使わない。Claude が修正して `B` になったら、`A` の evidence は履歴になる。
 
-ただし PR の evidence freshness は head SHA だけでは決まらない。head が `A` のままでも target branch が進めば、PR diff、merge result、CI、review、GUI scenario の前提が変わり得る。
+ただし PR の evidence freshness は常に head SHA だけで決まるわけではない。head が `A` のままでも target branch が進めば、PR diff、merge result、base-sensitive な CI、review、GUI scenario の前提が変わり得る。
 
-したがって CI / Review / GUI / merge の evidence は、current head に加えて current target branch / base context と整合しているかを確認する。evidence がどの base context に対するものか確認できない、または current base と異なる場合は、同じ head だからという理由だけで current 扱いしない。必要なら current base context で取り直す。
+その evidence の主張が target branch / merge context に影響される場合は、current head に加えて current target branch / base context と整合しているかを確認する。evidence がどの base context に対するものか確認できない、または current base と異なる場合は、同じ head だからという理由だけで current 扱いしない。必要なら current base context で取り直す。
 
-PR metadata の base SHA が常に target branch の現在の head を表すとは仮定しない。必要なら target branch 自体を読み、current base を確認する。
+一方、base の変更が evidence の主張に影響しないと Commander が current facts と check / scenario の性質から判断できる場合は、head に結び付く evidence を利用できる。その判断は worker に委ねず、根拠を GitHub 上に残す。
 
-この head + base context を AADW 独自の persistent generation として保存しない。GitHub 上の事実から、その時点だけ導出する。
+PR metadata の base SHA が常に target branch の現在の head を表すとは仮定しない。base-sensitive な判断では必要なら target branch 自体を読み、current base を確認する。
+
+この head / base context を AADW 独自の persistent generation として保存しない。GitHub 上の事実から、その時点だけ導出する。
 
 repository mutation を行う処理は別の競合防止責務として、実行開始時と push 直前に current head が対象 SHA と一致することを確認する。
 
@@ -197,7 +199,8 @@ ChatGPT の判断ルールの正本は `docs/aadw-command-policy.md` とする�
 
 Policy は少なくとも次を定める。
 
-- current PR context（head + base）の freshness。
+- current head と、base-sensitive な evidence に必要な current base context の freshness。
+- base-independent evidence の扱いを Commander が判断すること。
 - repository mutation の exact-head guard。
 - evidence first。
 - fail closed。
@@ -226,7 +229,7 @@ ChatGPT が current facts と Commander Policy から選ぶ **action の候補**
 
 必要なら既存の Codex review 手段で current PR head をレビューする。
 
-head が同じでも review 後に target branch が進み、review の base context が current か確認できない場合は、必要に応じて current base context でレビューを取り直す。
+review の主張が PR diff / merge context に影響する場合は、head が同じでも review 後に target branch が進んだかを確認し、必要に応じて current base context でレビューを取り直す。base の変更が review の主張に影響しないと Commander が判断できる場合は、その根拠を GitHub 上に残して head に結び付く review evidence を利用できる。
 
 Review の正本は GitHub Review / Review Thread とする。
 
@@ -244,7 +247,7 @@ Issue の acceptance criteria と変更内容から必要だと ChatGPT が判�
 
 focused scenario を基本とする。
 
-GUI evidence は対象 head と、その scenario に影響する base context を対応付ける。head が同じでも base の product code が変われば、必要に応じて validation を取り直す。
+GUI evidence は対象 head と、その scenario に base / merge context が影響する場合は実際に検証した context を対応付ける。head が同じでも base の product code が scenario に影響する形で変われば、必要に応じて validation を取り直す。base-independent と判断できる場合は、その根拠を GitHub 上に残して head-only evidence を利用できる。
 
 GUI worker は観測事実だけを残し、`fail` / `blocked` の意味判断は ChatGPT が行う。
 
@@ -257,10 +260,12 @@ merge 直前に GitHub 上の客観条件を再確認する。
 最低限確認する。
 
 - current head SHA が判断対象の expected head と一致する。
-- current target branch / base context が、採用する CI / review / GUI evidence の前提と整合している。
+- current target branch / base context が、採用する base-sensitive な CI / review / GUI evidence の前提と整合している。
 - required CI checks が current context で success。
 - 必要と判断した GUI validation がある場合、その結果が current context で受け入れ可能である。
 - GitHub が PR を mergeable と報告している。
+
+base-independent と判断した evidence は、その根拠が GitHub 上に残っていることを確認する。
 
 merge は expected head SHA を指定して行う。expected head は concurrent product branch mutation を防ぐ guard であり、base freshness の代わりにはならない。
 
@@ -290,7 +295,7 @@ cluster は意味判断として次のいずれかに分類する。
 
 ## 11. fail closed
 
-事実を取得できない、evidence を current head / base context と結び付けられない、または evidence が不足する場合は推測しない。
+事実を取得できない、evidence を current head と、その主張に必要な context に結び付けられない、または evidence が不足する場合は推測しない。
 
 ChatGPT は Commander Policy に従い、不明な状態を pass として扱わない。
 
@@ -374,10 +379,11 @@ ChatGPT 主導が十分安定してから検討する。
 - Commander の入力が `Commander Policy + current facts / evidence` に整理されている。
 - 判断ルールが `docs/aadw-command-policy.md` に一元化されている。
 - GitHub 上の既存情報を正本として使う。
-- current head / base context と整合しない evidence を current evidence として使わない。
+- current head と、その主張に必要な base / merge context に整合しない evidence を current evidence として使わない。
+- base-independent evidence は Commander が根拠を残して利用できる。
 - repository mutation は expected head guard で concurrent change を上書きしない。
 - worker が勝手に次 action を決めない。
-- merge 時に expected head、current base context、客観的安全条件を確認する。
+- merge 時に expected head、必要な current base context、客観的安全条件を確認する。
 - 不要な AADW 専用コンポーネントを作らない。
 
 ---
