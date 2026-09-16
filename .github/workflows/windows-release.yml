@@ -1,0 +1,129 @@
+name: Release builds
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build hane-windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked -p hane
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $staging = "staging/hane-windows-x64"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item target/release/hane.exe "$staging/hane.exe"
+          Copy-Item README.md "$staging/README.md"
+          Copy-Item LICENSE "$staging/LICENSE" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$staging/*" -DestinationPath "hane-windows-x64.zip" -Force
+
+      - name: Upload portable build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: hane-windows-x64
+          path: hane-windows-x64.zip
+          if-no-files-found: error
+
+  build-macos:
+    name: Build ${{ matrix.artifact_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            artifact_name: hane-macos-arm64
+          - runner: macos-15-intel
+            artifact_name: hane-macos-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked -p hane
+
+      - name: Package portable zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="staging/${{ matrix.artifact_name }}"
+          mkdir -p "$staging"
+          cp target/release/hane "$staging/hane"
+          chmod +x "$staging/hane"
+          cp README.md "$staging/README.md"
+          if [ -f LICENSE ]; then
+            cp LICENSE "$staging/LICENSE"
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$staging" "${{ matrix.artifact_name }}.zip"
+
+      - name: Upload portable build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: hane-windows-x64
+          path: release-assets
+
+      - name: Download macOS Apple Silicon build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: hane-macos-arm64
+          path: release-assets
+
+      - name: Download macOS Intel build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: hane-macos-x64
+          path: release-assets
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/*.zip \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/*.zip \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
