@@ -48,11 +48,12 @@ use hane_presentation::{
     layout_block, parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
-    DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService, LoadedFile,
-    OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner, RecentFiles,
-    RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket, SavedFile,
-    SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction, WorkFolder,
-    WorkFolderNode, WorkFolderScanner, decide_title_sync, extract_h1_title, run_save_job,
+    CalendarDate, DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService,
+    LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
+    RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket,
+    SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction,
+    WorkFolder, WorkFolderNode, WorkFolderScanner, decide_title_sync, extract_h1_title,
+    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
     unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
@@ -3794,6 +3795,7 @@ impl EditorView {
         let mut rows = Vec::new();
         flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
         let tree_row_count = rows.len();
+        let today = local_today();
         let tree = rows
             .into_iter()
             .enumerate()
@@ -3826,7 +3828,11 @@ impl EditorView {
                                         None,
                                         self.theme.sidebar_foreground,
                                     ))
-                                    .child(entry.file_name().to_owned()),
+                                    .child(file_name_label(
+                                        entry.file_name(),
+                                        today,
+                                        &self.theme,
+                                    )),
                             )
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.open_work_folder_entry(&path, cx);
@@ -3957,6 +3963,36 @@ fn work_folder_root_display_name(root: &Path) -> String {
         || root.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// The sidebar's file-row label: the file name unchanged, unless it embeds
+/// a recognized date (`YYYY-MM-DD` or `YYYYMMDD`), in which case that date
+/// renders as its own small badge (`本日`, `17日(木)`, `10/3(土)`,
+/// `2025/10/3(金)`, …) instead of raw digits, while the surrounding text
+/// stays exactly what the file system reports — the real file name, path,
+/// and work-folder sort key never change.
+fn file_name_label(file_name: &str, today: CalendarDate, theme: &Theme) -> gpui::Div {
+    let row = div().flex().flex_row().items_center().gap_1();
+    let Some(badge) = split_file_name_for_badge(file_name) else {
+        return row.child(file_name.to_owned());
+    };
+    row.when(!badge.before.is_empty(), |row| row.child(badge.before))
+        .child(date_badge_chip(badge.date, today, theme))
+        .when(!badge.after.is_empty(), |row| row.child(badge.after))
+}
+
+/// A small rounded chip for one badge-worthy date, styled like the header's
+/// recent-file chips (`self.theme.code_background`) so it reads as a
+/// decoration rather than more filename text.
+fn date_badge_chip(date: CalendarDate, today: CalendarDate, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(4.0))
+        .rounded_sm()
+        .bg(rgb(theme.code_background))
+        .text_color(rgb(theme.quote_foreground))
+        .text_size(px(10.0))
+        .child(format_relative_date_label(date, today))
 }
 
 /// A short label for an unnamed note in the sidebar: its first non-blank
