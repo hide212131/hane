@@ -72,6 +72,63 @@ def compile_helper(source: Path, directory: Path) -> tuple[Path, str]:
 
 
 REQUIRED_PREPROCESSING_KEYS = {"method", "scale_factor", "source_size", "processed_size"}
+EXPECTED_PREPROCESSING_METHOD = "uniform_upscale"
+# Must match `ocrUpscaleFactor` in hosted_date_badge_gui.swift (procedure v4).
+EXPECTED_PREPROCESSING_SCALE_FACTOR = 4
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_pixel_size(value: object, label: str) -> tuple[int, int]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"vision helper preprocessing {label} is not an object")
+    width = value.get("width")
+    height = value.get("height")
+    if not _is_positive_int(width) or not _is_positive_int(height):
+        raise RuntimeError(
+            f"vision helper preprocessing {label} has a non-positive-integer width/height: {value!r}"
+        )
+    return width, height
+
+
+def validate_preprocessing_evidence(preprocessing: dict) -> None:
+    """Fail-closed validation of the OCR preprocessing evidence's authoritative values.
+
+    `REQUIRED_PREPROCESSING_KEYS` only proves the four keys exist; a helper
+    build could still report a disabled/no-op preprocessing pass (e.g.
+    `method: "none"`, `scale_factor: 1`) or self-inconsistent sizes and pass
+    that check. Requiring the exact procedure v4 contract (uniform upscale by
+    the current Swift helper's fixed integer factor, with processed size
+    exactly `source * scale_factor`) keeps this fail-closed against a silent
+    regression to raw-resolution OCR (Issue #190), not just a
+    structurally-shaped-but-meaningless report. Unknown extra fields are
+    still allowed for forward compatibility.
+    """
+    if preprocessing.get("method") != EXPECTED_PREPROCESSING_METHOD:
+        raise RuntimeError(
+            f"vision helper preprocessing method is not {EXPECTED_PREPROCESSING_METHOD!r}: "
+            f"{preprocessing.get('method')!r}"
+        )
+    scale_factor = preprocessing.get("scale_factor")
+    if (
+        not isinstance(scale_factor, int)
+        or isinstance(scale_factor, bool)
+        or scale_factor != EXPECTED_PREPROCESSING_SCALE_FACTOR
+    ):
+        raise RuntimeError(
+            f"vision helper preprocessing scale_factor is not {EXPECTED_PREPROCESSING_SCALE_FACTOR!r}: "
+            f"{scale_factor!r}"
+        )
+    source_width, source_height = _validate_pixel_size(preprocessing.get("source_size"), "source_size")
+    processed_width, processed_height = _validate_pixel_size(preprocessing.get("processed_size"), "processed_size")
+    if processed_width != source_width * scale_factor or processed_height != source_height * scale_factor:
+        raise RuntimeError(
+            "vision helper preprocessing processed_size is not source_size * scale_factor: "
+            f"source={preprocessing.get('source_size')!r} processed={preprocessing.get('processed_size')!r} "
+            f"scale_factor={scale_factor!r}"
+        )
 
 
 def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -> tuple[list[dict], dict]:
@@ -107,6 +164,7 @@ def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -
         raise RuntimeError("vision helper did not return a matches list")
     if not isinstance(preprocessing, dict) or not REQUIRED_PREPROCESSING_KEYS.issubset(preprocessing):
         raise RuntimeError("vision helper did not return OCR preprocessing evidence")
+    validate_preprocessing_evidence(preprocessing)
     return matches, preprocessing
 
 
