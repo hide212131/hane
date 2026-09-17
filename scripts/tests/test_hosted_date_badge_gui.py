@@ -51,6 +51,28 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertFalse(mod.recognized_line_matches_expected(separator_left, "Alpha.md"))
         self.assertFalse(mod.recognized_line_matches_expected(badge_joined, "Alpha.md"))
 
+    def test_long_name_uses_full_recognized_line_geometry(self):
+        prefix_match = {
+            "matched_text": "This Is",
+            "recognized_line": "This Is An Extremely Long…",
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+            "line_bounding_box": {"minX": 0.10, "maxX": 0.60, "minY": 0.49, "maxY": 0.53},
+        }
+        geometry = mod.display_geometry_match(prefix_match, use_full_line=True)
+        self.assertEqual(geometry["bounding_box"], prefix_match["line_bounding_box"])
+        badge_over_later_text = {
+            "bounding_box": {"minX": 0.55, "maxX": 0.65, "minY": 0.50, "maxY": 0.52}
+        }
+        self.assertFalse(mod.badge_is_strictly_right(geometry, badge_over_later_text))
+        self.assertTrue(
+            mod.badge_is_strictly_right(
+                geometry,
+                {"bounding_box": {"minX": 0.60, "maxX": 0.68, "minY": 0.50, "maxY": 0.52}},
+            )
+        )
+        with self.assertRaises(ValueError):
+            mod.display_geometry_match({"bounding_box": prefix_match["bounding_box"]}, use_full_line=True)
+
     def test_badge_must_not_overlap_display_name(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
         touching = {"bounding_box": {"minX": 0.20, "maxX": 0.25, "minY": 0.50, "maxY": 0.52}}
