@@ -274,22 +274,26 @@ pub fn format_relative_date_label(date: CalendarDate, today: CalendarDate) -> St
     }
 }
 
-/// Today's calendar date in the terminal's local timezone. The one boundary
+/// Today's calendar date in the machine's local timezone. The one boundary
 /// in this module that reads the system clock; every other function takes
 /// "today" as a plain argument so the display rules stay deterministic and
 /// testable.
 ///
-/// Uses the platform's own local-time conversion on Unix (macOS and Linux,
-/// Hane's shipped and CI-tested targets); other platforms fall back to the
-/// UTC calendar date, which only disagrees with the true local date for
-/// callers far enough from UTC to be near a day boundary.
+/// Uses the platform's own local-time conversion on Unix (macOS and Linux)
+/// and on Windows, Hane's shipped and CI-tested targets; other platforms
+/// fall back to the UTC calendar date, which only disagrees with the true
+/// local date for callers far enough from UTC to be near a day boundary.
 #[must_use]
 pub fn local_today() -> CalendarDate {
     #[cfg(unix)]
     {
         unix_local_today().unwrap_or_else(utc_today)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_local_today().unwrap_or_else(utc_today)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         utc_today()
     }
@@ -312,6 +316,46 @@ fn unix_local_today() -> Option<CalendarDate> {
             u32::try_from(tm.tm_mday).ok()?,
         )
     }
+}
+
+/// The subset of the Win32 `SYSTEMTIME` struct fields `GetLocalTime` fills
+/// in; layout must match `<minwinbase.h>` exactly since this is passed by
+/// pointer straight to `kernel32.dll`.
+#[cfg(windows)]
+#[repr(C)]
+struct SystemTime {
+    w_year: u16,
+    w_month: u16,
+    _w_day_of_week: u16,
+    w_day: u16,
+    _w_hour: u16,
+    _w_minute: u16,
+    _w_second: u16,
+    _w_milliseconds: u16,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetLocalTime"]
+    fn get_local_time(lp_system_time: *mut SystemTime);
+}
+
+#[cfg(windows)]
+fn windows_local_today() -> Option<CalendarDate> {
+    // SAFETY: `st` is a plain-old-data struct matching `SYSTEMTIME`'s
+    // layout, and `GetLocalTime` always fully initializes every field
+    // through the valid pointer we pass to it; it has no failure return.
+    let st = unsafe {
+        let mut st: SystemTime = std::mem::zeroed();
+        get_local_time(&mut st);
+        st
+    };
+    CalendarDate::new(
+        i32::from(st.w_year),
+        u32::from(st.w_month),
+        u32::from(st.w_day),
+    )
 }
 
 fn utc_today() -> CalendarDate {
