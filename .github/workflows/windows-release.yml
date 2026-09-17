@@ -17,8 +17,6 @@ jobs:
   prepare:
     name: Prepare release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
     steps:
@@ -47,15 +45,10 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
-              echo "Tag already exists: $release_tag" >&2
-              exit 1
-            fi
-
-            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$release_tag" \
-              -f sha="$GITHUB_SHA" >/dev/null
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+            echo "Tag already exists: $release_tag" >&2
+            exit 1
           fi
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
@@ -163,8 +156,17 @@ jobs:
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" release-assets/*.zip \
-              --generate-notes \
-              --title "$RELEASE_TAG" \
+            create_args=(
+              "$RELEASE_TAG"
+              release-assets/*.zip
+              --generate-notes
+              --title "$RELEASE_TAG"
               --repo "$GITHUB_REPOSITORY"
+            )
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              create_args+=(--target "$GITHUB_SHA")
+            fi
+
+            gh release create "${create_args[@]}"
           fi
