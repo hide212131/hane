@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/2"
+PROCEDURE_VERSION = "hosted-date-badge/3"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
     "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
@@ -98,6 +98,38 @@ def center_y(match: dict) -> float:
 def center_x(match: dict) -> float:
     box = match["bounding_box"]
     return (float(box["minX"]) + float(box["maxX"])) / 2.0
+
+
+def group_candidates_by_observation(candidates: list[dict]) -> dict[int, list[dict]]:
+    """Group Vision matches by the OCR observation (sidebar text line) they came from.
+
+    `helper_find_all` can now return more than one match per observation: one
+    per bounded Vision candidate (`candidate_rank`) whose own text happens to
+    satisfy the search pattern. Grouping by `observation_index` recovers which
+    matches describe the same physical line versus genuinely different rows.
+    """
+    groups: dict[int, list[dict]] = {}
+    for candidate in candidates:
+        groups.setdefault(candidate["observation_index"], []).append(candidate)
+    for group in groups.values():
+        group.sort(key=lambda item: item["candidate_rank"])
+    return groups
+
+
+def best_matches(candidates: list[dict]) -> list[dict]:
+    """Reduce to Vision's most-confident (lowest `candidate_rank`) match per observation.
+
+    Vision's own top-1 candidate for an observation can misread a glyph
+    (Issue #187), in which case top-1 simply never appears here because its
+    text does not satisfy the search pattern at all -- only a lower-ranked
+    alternate's own text does. Picking the lowest available rank per
+    observation recovers that alternate without ever preferring a
+    less-confident alternate over a top-ranked one that is already present:
+    if the most confident available match for an observation still fails a
+    downstream exact/geometry check, this function does not search further
+    alternates to find one that would conveniently pass (fail-closed).
+    """
+    return [group[0] for group in group_candidates_by_observation(candidates).values()]
 
 
 def nearest_same_row(text_match: dict, badge_matches: list[dict]) -> dict | None:
@@ -401,20 +433,33 @@ def main() -> int:
                                 date_cache: dict[str, list[dict]] = {}
                                 for case in cases:
                                     try:
-                                        texts = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
-                                        badges_raw = badge_cache.setdefault(
+                                        # `best_matches` reduces Vision's bounded per-candidate
+                                        # matches (Issue #187: top-1 alone can misread a tiny
+                                        # sidebar glyph) to the single most-confident match per
+                                        # OCR observation. The `_all` lists are kept only as
+                                        # read-only evidence for fail-closed diagnostics below.
+                                        texts_all = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
+                                        texts = best_matches(texts_all)
+                                        badges_all = badge_cache.setdefault(
                                             case["badge_label"],
                                             helper_find_all(
                                                 helper, helper_digest, screenshot, re.escape(case["badge_label"])
                                             ),
                                         )
+                                        badges_raw = best_matches(badges_all)
                                         token_pattern = date_token_pattern(case["date_token"])
-                                        date_matches = date_cache.setdefault(
+                                        date_matches_all = date_cache.setdefault(
                                             case["date_token"],
                                             helper_find_all(helper, helper_digest, screenshot, token_pattern),
                                         )
+                                        date_matches = best_matches(date_matches_all)
                                         if not texts:
-                                            scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名を screenshot OCR で確認できない"))
+                                            scenario_steps.append(step(
+                                                case["name"],
+                                                "fail",
+                                                "省略後の表示ファイル名を screenshot OCR で確認できない",
+                                                text_candidates=texts_all,
+                                            ))
                                             continue
                                         text_match = texts[0]
                                         full_line = text_match.get("recognized_line", "")
@@ -440,6 +485,8 @@ def main() -> int:
                                                     expected_display=expected_display,
                                                     recognized_line=full_line,
                                                     text_match=text_match,
+                                                    text_candidates=texts_all,
+                                                    badge_candidates=badges_all,
                                                     screenshot=str(screenshot),
                                                 ))
                                                 continue
@@ -465,6 +512,7 @@ def main() -> int:
                                                 text_match=text_match,
                                                 display_geometry=display_match["bounding_box"],
                                                 date_on_row=date_on_row,
+                                                date_candidates=date_matches_all,
                                                 screenshot=str(screenshot),
                                             ))
                                             continue
@@ -475,7 +523,12 @@ def main() -> int:
                                         )
                                         badge_match = nearest_same_row(display_match, badge_candidates)
                                         if badge_match is None:
-                                            scenario_steps.append(step(case["name"], "fail", "同じ sidebar row の日付バッジを確認できない"))
+                                            scenario_steps.append(step(
+                                                case["name"],
+                                                "fail",
+                                                "同じ sidebar row の日付バッジを確認できない",
+                                                badge_candidates=badges_all,
+                                            ))
                                             continue
                                         right_side = badge_is_strictly_right(display_match, badge_match)
                                         scenario_steps.append(step(
@@ -486,9 +539,12 @@ def main() -> int:
                                             expected_badge=case["badge_label"],
                                             date_token=case["date_token"],
                                             text_match=text_match,
+                                            text_candidates=texts_all,
                                             display_geometry=display_match["bounding_box"],
                                             badge_match=badge_match,
+                                            badge_candidates=badges_all,
                                             date_matches=date_matches,
+                                            date_candidates=date_matches_all,
                                             screenshot=str(screenshot),
                                         ))
                                     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
