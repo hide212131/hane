@@ -33,6 +33,18 @@ const FIXTURES: &[MarkdownFixture] = &[
         visual_lines: &["foo", "baz"],
     },
     MarkdownFixture {
+        name: "tab before a soft break stays textual content",
+        // CommonMark defines `space` as U+0020 and treats tab separately. The
+        // §6.8 rule removes spaces around a soft break, not arbitrary ASCII
+        // whitespace, so a trailing tab must not be projected away as padding.
+        source: "foo\t\nbaz",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::SoftBreak]],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        style_runs: &[NO_STYLES, NO_STYLES],
+        visual_lines: &["foo\t", "baz"],
+    },
+    MarkdownFixture {
         name: "hard break trailing spaces and leading whitespace with CRLF",
         source: "foo  \r\n     baz",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::HardBreak]],
