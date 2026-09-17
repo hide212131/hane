@@ -166,31 +166,36 @@ def joined_composition_ends_with_badge(full_line: str, expected_badge: str) -> b
     return normalized_ocr_text(full_line).endswith(normalized_ocr_text(expected_badge))
 
 
-def display_geometry_match(match: dict, *, use_full_line: bool, joined_badge: dict | None = None) -> dict:
+def display_geometry_match(match: dict, *, use_full_line: bool, joined_row: bool = False) -> dict:
     """Return geometry representing the whole visible filename when needed.
 
     Normal short cases use an anchored regex whose match is already the whole
     display name (badge, if any, is excluded by the caller's lookahead
     pattern, so no clipping is needed even when the row is joined). The
     long-name case intentionally cannot know the exact truncation point, so
-    its prefix match is only an identity locator; the right-side/non-overlap
-    oracle must use Vision's full recognized-line box. When that long-name
-    row is joined with its badge into one recognized_line, the full line box
-    would include the badge itself, which would let the badge trivially
-    "pass" the non-overlap check regardless of its true position. Clip the
-    box to end where the joined badge begins so the oracle still covers the
-    entire visible filename but excludes the badge.
+    a split-row prefix match is only an identity locator; the right-side/
+    non-overlap oracle there must use Vision's full recognized-line box.
+
+    When Vision instead joins that long-name row with its badge into one
+    recognized_line, the full line box would span the badge itself. Clipping
+    that box to the badge *under verification*'s own minX made the
+    non-overlap oracle an unfalsifiable tautology: the badge always
+    satisfies `badge.minX >= clipped_maxX` because the clip endpoint *is*
+    that same badge's minX, regardless of whether it truly overlaps visible
+    filename text (Issue #185 follow-up false-PASS). The long-name
+    text_pattern is greedy over the visible filename words plus an optional
+    trailing ellipsis, so on a joined row its own regex match box already
+    covers the whole visible filename independently of the badge. Use that
+    match box unmodified instead of deriving filename geometry from the
+    badge under verification.
     """
-    if not use_full_line:
+    if not use_full_line or joined_row:
         return match
     line_box = match.get("line_bounding_box")
     required = {"minX", "maxX", "minY", "maxY"}
     if not isinstance(line_box, dict) or not required.issubset(line_box):
         raise ValueError("Vision evidence is missing the full recognized-line bounding box")
-    box = dict(line_box)
-    if joined_badge is not None:
-        box["maxX"] = min(float(box["maxX"]), float(joined_badge["bounding_box"]["minX"]))
-    return {**match, "bounding_box": box}
+    return {**match, "bounding_box": dict(line_box)}
 
 
 def badge_is_strictly_right(text_match: dict, badge_match: dict) -> bool:
@@ -306,12 +311,16 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
                 "This_Is_An_Extremely_Long_Sidebar_Filename_Designed_To_Force_"
                 f"Truncation_{today_token}.md"
             ),
-            # This prefix only identifies the intended OCR observation. Its
-            # full `recognized_line` bbox (clipped before an embedded badge
-            # when Vision joins the row into one line), not this regex match
-            # bbox, is used for row matching and the strict right-side/
-            # non-overlap check.
-            "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+",
+            # For a split row (filename alone on its own recognized_line),
+            # this prefix only identifies the intended OCR observation and
+            # the full `recognized_line` bbox is used for the strict
+            # right-side/non-overlap check. For a row Vision joins with the
+            # badge into one recognized_line, this regex match itself --
+            # greedy over the visible filename words plus an optional
+            # trailing ellipsis -- is used as independent filename geometry
+            # instead, so the check never derives filename geometry from the
+            # very badge being verified (Issue #185 follow-up false-PASS).
+            "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+(?:\s*(?:…|\.\.\.))?",
             "expected_display": None,
             "date_token": today_token,
             "badge_label": "本日",
@@ -442,7 +451,7 @@ def main() -> int:
                                         display_match = display_geometry_match(
                                             text_match,
                                             use_full_line=expected_display is None,
-                                            joined_badge=joined_candidate if is_joined_row else None,
+                                            joined_row=is_joined_row,
                                         )
                                         date_on_row = nearest_same_row(display_match, date_matches)
                                         date_in_line = re.search(token_pattern, full_line) is not None

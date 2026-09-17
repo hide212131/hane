@@ -121,35 +121,52 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mod.display_geometry_match({"bounding_box": prefix_match["bounding_box"]}, use_full_line=True)
 
-    def test_long_name_joined_clips_badge_out_of_display_geometry(self):
+    def test_long_name_joined_uses_independent_match_geometry_not_badge_position(self):
         # Vision joined the truncated filename and badge into one
-        # recognized_line. The unclipped full-line box would span the badge
-        # too (making the non-overlap oracle unsatisfiable), while the bare
-        # prefix-match box ignores later visible filename text; the geometry
-        # must cover exactly the visible filename up to where the badge
-        # begins.
+        # recognized_line. Deriving filename geometry by clipping to the
+        # badge under verification's own position made the right-side check
+        # an unfalsifiable tautology (Issue #185 follow-up false-PASS): the
+        # badge always satisfies `badge.minX >= clipped_maxX` because the
+        # clip endpoint *is* that same badge's minX, regardless of its true
+        # overlap. The regex match itself is independent of the badge and
+        # must be used unmodified.
         prefix_match = {
-            "matched_text": "This Is",
+            "matched_text": "This Is An Extremely Long…",
             "recognized_line": "This Is An Extremely Long…本日",
-            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+            "bounding_box": {"minX": 0.10, "maxX": 0.50, "minY": 0.50, "maxY": 0.52},
             "line_bounding_box": {"minX": 0.10, "maxX": 0.65, "minY": 0.49, "maxY": 0.53},
         }
-        joined_badge = {"bounding_box": {"minX": 0.60, "maxX": 0.65, "minY": 0.50, "maxY": 0.52}}
-        geometry = mod.display_geometry_match(prefix_match, use_full_line=True, joined_badge=joined_badge)
-        self.assertEqual(
-            geometry["bounding_box"],
-            {"minX": 0.10, "maxX": 0.60, "minY": 0.49, "maxY": 0.53},
+        geometry = mod.display_geometry_match(prefix_match, use_full_line=True, joined_row=True)
+        self.assertEqual(geometry["bounding_box"], prefix_match["bounding_box"])
+
+        # Regression 1: filename match maxX=0.50, actual joined badge
+        # minX=0.55 (to the right, no overlap) -> pass.
+        actual_badge_right = {"bounding_box": {"minX": 0.55, "maxX": 0.65, "minY": 0.50, "maxY": 0.52}}
+        self.assertTrue(mod.badge_is_strictly_right(geometry, actual_badge_right))
+
+        # Regression 2: filename match maxX=0.58 overlaps the actual joined
+        # badge minX=0.55 -> fail. This is the very badge under
+        # verification, not a different candidate; before the fix, clipping
+        # the filename geometry to this badge's own minX made this
+        # unconditionally pass regardless of the overlap.
+        overlapping_match = {
+            **prefix_match,
+            "bounding_box": {"minX": 0.10, "maxX": 0.58, "minY": 0.50, "maxY": 0.52},
+        }
+        overlapping_geometry = mod.display_geometry_match(overlapping_match, use_full_line=True, joined_row=True)
+        same_joined_badge = {"bounding_box": {"minX": 0.55, "maxX": 0.65, "minY": 0.50, "maxY": 0.52}}
+        self.assertFalse(mod.badge_is_strictly_right(overlapping_geometry, same_joined_badge))
+
+    def test_long_name_text_pattern_covers_trailing_ellipsis_but_not_badge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=dt.date(2026, 9, 17))
+        pattern = next(
+            case["text_pattern"] for case in cases if case["name"] == "long_name_keeps_badge_visible"
         )
-        # The true joined badge sits right at the clipped edge, so it passes.
-        self.assertTrue(mod.badge_is_strictly_right(geometry, joined_badge))
-        # A candidate that actually overlaps later visible filename text
-        # (well before the true badge) must still fail against the clipped
-        # geometry...
-        overlapping_candidate = {"bounding_box": {"minX": 0.30, "maxX": 0.40, "minY": 0.50, "maxY": 0.52}}
-        self.assertFalse(mod.badge_is_strictly_right(geometry, overlapping_candidate))
-        # ...even though the bare prefix-match box alone would have wrongly
-        # let it "pass" (the Issue #185 false-PASS risk this clipping avoids).
-        self.assertTrue(mod.badge_is_strictly_right(prefix_match, overlapping_candidate))
+        match = re.search(pattern, "This Is An Extremely Long Sidebar Filename…本日")
+        self.assertIsNotNone(match)
+        self.assertTrue(match.group(0).endswith("…"))
+        self.assertNotIn("本日", match.group(0))
 
     def test_badge_must_not_overlap_display_name(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
