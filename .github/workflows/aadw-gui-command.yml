@@ -169,7 +169,7 @@ jobs:
             --arg target_head_sha "$TARGET_HEAD_SHA" \
             --arg request_base_sha "$REQUEST_BASE_SHA" \
             --arg execution_context "$EXECUTION_CONTEXT" \
-            --arg procedure "$PROCEDURE" \
+            --arg request_procedure "$PROCEDURE" \
             --arg request_comment_id "$REQUEST_COMMENT_ID" \
             '{
               ref: $ref,
@@ -178,7 +178,7 @@ jobs:
                 target_head_sha: $target_head_sha,
                 request_base_sha: $request_base_sha,
                 execution_context: $execution_context,
-                procedure: $procedure,
+                request_procedure: $request_procedure,
                 request_comment_id: $request_comment_id
               }
             }' \
