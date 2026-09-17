@@ -1,0 +1,250 @@
+name: AADW GUI Command
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: aadw-gui-command-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  route:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/gui-validate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+      pull-requests: read
+    env:
+      REPOSITORY: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+      COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+      COMMENT_BODY: ${{ github.event.comment.body }}
+
+    steps:
+      - name: Check out trusted command policy
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Parse exact GUI command
+        id: command
+        shell: bash
+        run: |
+          set -euo pipefail
+          execution_context="$(printf '%s' "$COMMENT_BODY" | python3 control/.github/scripts/aadw_gui_command.py parse)"
+          if [[ -z "$execution_context" ]]; then
+            echo 'recognized=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'recognized=true' >> "$GITHUB_OUTPUT"
+          echo "execution_context=$execution_context" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve and authorize current Pull Request request
+        id: request
+        if: steps.command.outputs.recognized == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_CONTEXT: ${{ steps.command.outputs.execution_context }}
+        run: |
+          set -euo pipefail
+
+          permission="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${REPOSITORY}/collaborators/${COMMENT_ACTOR}/permission" \
+              --jq '.permission' 2>/dev/null || true
+          )"
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
+          if [[ -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request base ref.'
+            exit 1
+          fi
+          base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve current target branch SHA.'
+            exit 1
+          fi
+
+          procedure="$(
+            python3 control/.github/scripts/aadw_gui_command.py \
+              procedure control/scripts/hosted_gui_interaction.py
+          )"
+          request_json="$(
+            printf '%s' "$pr_json" \
+              | python3 control/.github/scripts/aadw_gui_command.py request \
+                  --repository "$REPOSITORY" \
+                  --pr-number "$PR_NUMBER" \
+                  --actor "$COMMENT_ACTOR" \
+                  --permission "$permission" \
+                  --base-sha "$base_sha" \
+                  --execution-context "$EXECUTION_CONTEXT" \
+                  --procedure "$procedure" \
+                  --comment-id "$COMMENT_ID"
+          )"
+
+          while IFS='=' read -r key value; do
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done < <(
+            jq -r '
+              to_entries[]
+              | select(.key == "pr_number"
+                    or .key == "target_head_sha"
+                    or .key == "request_base_sha"
+                    or .key == "execution_context"
+                    or .key == "procedure"
+                    or .key == "request_comment_id"
+                    or .key == "request_identity"
+                    or .key == "run_name")
+              | "\(.key)=\(.value)"
+            ' <<< "$request_json"
+          )
+
+      - name: Check for equivalent GUI validation
+        id: duplicate
+        if: steps.command.outputs.recognized == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NAME: ${{ steps.request.outputs.run_name }}
+        run: |
+          set -euo pipefail
+
+          runs_json="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/runs?event=workflow_dispatch&per_page=100"
+          )"
+          duplicate_json="$(
+            printf '%s' "$runs_json" \
+              | python3 control/.github/scripts/aadw_gui_command.py duplicate \
+                  --run-name "$RUN_NAME"
+          )"
+
+          if [[ "$duplicate_json" == 'null' ]]; then
+            echo 'found=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo 'found=true' >> "$GITHUB_OUTPUT"
+          echo "run_id=$(jq -r '.id' <<< "$duplicate_json")" >> "$GITHUB_OUTPUT"
+          echo "run_url=$(jq -r '.html_url' <<< "$duplicate_json")" >> "$GITHUB_OUTPUT"
+          echo "run_status=$(jq -r '.status' <<< "$duplicate_json")" >> "$GITHUB_OUTPUT"
+          echo "run_conclusion=$(jq -r '.conclusion // ""' <<< "$duplicate_json")" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch trusted Hosted GUI Validation
+        id: dispatched
+        if: >-
+          steps.command.outputs.recognized == 'true' &&
+          steps.duplicate.outputs.found == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_HEAD_SHA: ${{ steps.request.outputs.target_head_sha }}
+          REQUEST_BASE_SHA: ${{ steps.request.outputs.request_base_sha }}
+          EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
+          PROCEDURE: ${{ steps.request.outputs.procedure }}
+          REQUEST_COMMENT_ID: ${{ steps.request.outputs.request_comment_id }}
+        run: |
+          set -euo pipefail
+          dispatch_json="$(
+            jq -n \
+              --arg ref "$DEFAULT_BRANCH" \
+              --arg pr_number "$PR_NUMBER" \
+              --arg target_head_sha "$TARGET_HEAD_SHA" \
+              --arg request_base_sha "$REQUEST_BASE_SHA" \
+              --arg execution_context "$EXECUTION_CONTEXT" \
+              --arg request_procedure "$PROCEDURE" \
+              --arg request_comment_id "$REQUEST_COMMENT_ID" \
+              '{
+                ref: $ref,
+                inputs: {
+                  pr_number: $pr_number,
+                  target_head_sha: $target_head_sha,
+                  request_base_sha: $request_base_sha,
+                  execution_context: $execution_context,
+                  request_procedure: $request_procedure,
+                  request_comment_id: $request_comment_id
+                },
+                return_run_details: true
+              }' \
+              | gh api \
+                  --method POST \
+                  -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2026-03-10' \
+                  "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/dispatches" \
+                  --input -
+          )"
+
+          run_id="$(jq -r '.workflow_run_id // empty' <<< "$dispatch_json")"
+          run_url="$(jq -r '.html_url // empty' <<< "$dispatch_json")"
+          if ! [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || [[ -z "$run_url" ]]; then
+            echo '::error::Workflow dispatch succeeded without usable run details.'
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
+
+      - name: Report accepted request on Pull Request
+        if: steps.command.outputs.recognized == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_HEAD_SHA: ${{ steps.request.outputs.target_head_sha }}
+          REQUEST_BASE_SHA: ${{ steps.request.outputs.request_base_sha }}
+          EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
+          PROCEDURE: ${{ steps.request.outputs.procedure }}
+          DUPLICATE: ${{ steps.duplicate.outputs.found }}
+          DUPLICATE_RUN_URL: ${{ steps.duplicate.outputs.run_url }}
+          DUPLICATE_RUN_STATUS: ${{ steps.duplicate.outputs.run_status }}
+          DISPATCHED_RUN_URL: ${{ steps.dispatched.outputs.run_url }}
+        run: |
+          set -euo pipefail
+
+          short_head="${TARGET_HEAD_SHA:0:12}"
+          short_base="${REQUEST_BASE_SHA:0:12}"
+          if [[ "$DUPLICATE" == 'true' ]]; then
+            run_url="$DUPLICATE_RUN_URL"
+            if [[ "$DUPLICATE_RUN_STATUS" == 'completed' ]]; then
+              summary="同じ PR context の GUI validation はすでに成功済みです。"
+            else
+              summary="同じ PR context の GUI validation はすでに queued / in progress です。"
+            fi
+          else
+            run_url="$DISPATCHED_RUN_URL"
+            summary="GUI validation を開始しました。"
+          fi
+
+          body="$(cat <<EOF
+          ${summary}
+
+          - PR: #${PR_NUMBER}
+          - head: \`${short_head}\`
+          - base: \`${short_base}\`
+          - context: \`${EXECUTION_CONTEXT}\`
+          - procedure: \`${PROCEDURE}\`
+          - run: ${run_url}
+
+          このコメントは通知用です。merge 判断に使う evidence は workflow run / artifact と current PR context を確認します。
+          EOF
+          )"
+          gh api \
+            --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$body"
