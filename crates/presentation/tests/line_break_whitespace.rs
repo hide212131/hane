@@ -75,10 +75,12 @@ const FIXTURES: &[MarkdownFixture] = &[
     MarkdownFixture {
         name: "hard break inside a list keeps existing continuation indentation",
         source: "- foo  \n  baz",
+        // Tight list items omit the Paragraph node: pulldown-cmark suppresses
+        // Start/End(Paragraph) for a tight item's `TightParagraph`, so HardBreak
+        // sits directly under ListItem, matching every other tight-list fixture.
         tree_paths: &[&[
             NodeKind::List { ordered: false },
             NodeKind::ListItem { task: None },
-            NodeKind::Paragraph,
             NodeKind::HardBreak,
         ]],
         markers: &["- ", "  "],
