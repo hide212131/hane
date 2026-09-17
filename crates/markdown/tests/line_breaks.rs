@@ -88,6 +88,56 @@ fn hard_break_needs_two_or_more_trailing_spaces_or_a_backslash() {
     }
 }
 
+/// CommonMark 0.31.2 §6.7 defines the space-type hard break as two or more
+/// U+0020 SPACE immediately before the line ending. Tab is not `space`, so
+/// it must never count toward a hard break nor be hidden by one's marker —
+/// it stays ordinary, addressable source content either way.
+#[test]
+fn hard_break_ignores_tabs_when_counting_trailing_spaces() {
+    for (source, expect_hard, expect_marker) in [
+        ("foo\t\t\nbar", false, None),
+        ("foo \t\nbar", false, None),
+        ("foo\t \nbar", false, None),
+        ("foo\t  \nbar", true, Some("  ")),
+    ] {
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let has_hard = parsed
+            .tree
+            .iter()
+            .any(|(_, node)| node.kind == NodeKind::HardBreak);
+        assert_eq!(has_hard, expect_hard, "source: {source:?}");
+
+        let marker_text = parsed
+            .markers
+            .iter()
+            .map(|marker| &source[marker.start.0..marker.end.0])
+            .collect::<Vec<_>>();
+        match expect_marker {
+            Some(text) => assert_eq!(marker_text, vec![text], "source: {source:?}"),
+            None => assert!(
+                marker_text.is_empty(),
+                "source: {source:?}: {marker_text:?}"
+            ),
+        }
+
+        let tab_ix = source.find('\t').unwrap();
+        assert!(
+            parsed
+                .markers
+                .iter()
+                .all(|marker| !(marker.start.0..marker.end.0).contains(&tab_ix)),
+            "a tab must never be hidden by a marker, source: {source:?}"
+        );
+        assert!(
+            parsed
+                .line_break_padding
+                .iter()
+                .all(|padding| !(padding.start.0..padding.end.0).contains(&tab_ix)),
+            "a tab must never be hidden by line-break padding, source: {source:?}"
+        );
+    }
+}
+
 /// A hard break's syntax is only ever derived from an `Event::HardBreak` the
 /// parser itself emitted, so it can never appear where CommonMark forbids a
 /// break: inside a code span, inside an HTML tag's own markup, or at the very

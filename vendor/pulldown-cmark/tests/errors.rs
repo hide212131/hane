@@ -1,6 +1,34 @@
 use pulldown_cmark::{Event, Options, Parser};
 
 #[test]
+fn hard_break_needs_two_trailing_spaces_not_tabs() {
+    // CommonMark 0.31.2 section 6.7: the space-type hard break requires two
+    // or more U+0020 SPACE immediately before the line ending. Tab is not
+    // `space`, so it must never count toward a hard break, nor be hidden
+    // inside one; it stays ordinary text.
+    for (source, expect_hard, expect_text) in [
+        ("foo\t\t\nbar", false, "foo\t\t"),
+        ("foo \t\nbar", false, "foo \t"),
+        ("foo\t \nbar", false, "foo\t"),
+        ("foo\t  \nbar", true, "foo\t"),
+    ] {
+        let events = Parser::new(source).collect::<Vec<_>>();
+        let has_hard = events.iter().any(|event| *event == Event::HardBreak);
+        let has_soft = events.iter().any(|event| *event == Event::SoftBreak);
+        assert_eq!(has_hard, expect_hard, "{source:?}: {events:?}");
+        assert_eq!(has_soft, !expect_hard, "{source:?}: {events:?}");
+        let text = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Text(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text, expect_text, "{source:?}: {events:?}");
+    }
+}
+
+#[test]
 fn code_span_line_endings_normalize_once_and_preserve_source_offsets() {
     // CommonMark 0.31.2 sections 2.1 and 6.1: CRLF is one line ending,
     // and each line ending becomes one space before optional edge trimming.

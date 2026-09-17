@@ -845,10 +845,13 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         }
                     }
 
-                    let trailing_whitespace =
-                        scan_rev_while(&bytes[..ix], is_ascii_whitespace_no_nl);
-                    if trailing_whitespace >= 2 {
-                        i -= trailing_whitespace;
+                    // CommonMark 0.31.2 §6.7 defines the space-type hard
+                    // break as two or more U+0020 SPACE immediately before
+                    // the line ending; tab/VT/FF are not `space` and must
+                    // not count toward it or be swallowed into its marker.
+                    let trailing_spaces = scan_rev_while(&bytes[..ix], |b| b == b' ');
+                    if trailing_spaces >= 2 {
+                        i -= trailing_spaces;
                         self.tree.append_text(begin_text, i, backslash_escaped);
                         backslash_escaped = false;
                         return LoopInstruction::BreakAtWith(
@@ -861,8 +864,12 @@ impl<'a, 'b> FirstPass<'a, 'b> {
                         );
                     }
 
+                    // Not a hard break: fold away at most the single
+                    // trailing space CommonMark's soft-break rule absorbs.
+                    // Any other trailing whitespace (including tabs) is
+                    // ordinary text and must stay in the appended range.
                     self.tree
-                        .append_text(begin_text, ix - trailing_whitespace, backslash_escaped);
+                        .append_text(begin_text, ix - trailing_spaces, backslash_escaped);
                     backslash_escaped = false;
 
                     LoopInstruction::BreakAtWith(
