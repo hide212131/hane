@@ -54,8 +54,13 @@ pub enum NodeKind {
     Heading(u8),
     CodeBlock,
     Quote,
+    /// `start` is `Some(n)` for an ordered list starting at `n` — `0`,
+    /// non-1 starts, and values written with leading zeros all parse
+    /// losslessly to their numeric value — and `None` for a bullet list.
+    /// The exact marker bytes, leading zeros included, live in
+    /// [`MarkdownParse::list_item_markers`]'s source ranges, not here.
     List {
-        ordered: bool,
+        start: Option<u64>,
     },
     /// `task` is `Some(checked)` for a GFM task-list item and `None` otherwise.
     ListItem {
@@ -223,6 +228,22 @@ impl MarkdownTree {
                     .is_some_and(|node| matches!(node.kind, NodeKind::List { .. }))
             })
             .count()
+    }
+
+    /// For a `ListItem`, its owning `List` node and its zero-based position
+    /// among that list's direct item children (`0` for the first item). `None`
+    /// when `id` is not a `ListItem` — every `ListItem` is a direct child of
+    /// exactly one `List`, so callers needing a display ordinal derive it from
+    /// this position and the owner's `NodeKind::List::start` rather than
+    /// scanning source lines or a viewport.
+    pub fn list_item_ordinal(&self, id: NodeId) -> Option<(NodeId, usize)> {
+        let node = self.node(id)?;
+        if !matches!(node.kind, NodeKind::ListItem { .. }) {
+            return None;
+        }
+        let owner = node.parent?;
+        let ordinal = self.children(owner).iter().position(|child| *child == id)?;
+        Some((owner, ordinal))
     }
 }
 
@@ -464,7 +485,11 @@ impl PrefixCursor {
         Some(start..self.byte)
     }
 
-    fn list_item(&mut self, line: &[u8]) -> Option<usize> {
+    /// `line`-relative byte range of the marker symbol (bullet char, or
+    /// digits plus their `.`/`)` terminator) parsed by [`Self::list_item`],
+    /// together with the column width of the whole prefix a continuation
+    /// line on the same item must match.
+    fn list_item(&mut self, line: &[u8]) -> Option<ListItemPrefix> {
         let start_column = self.column;
         self.indent(line, 3);
         if self.pending_spaces != 0 {
@@ -486,6 +511,7 @@ impl PrefixCursor {
             _ => return None,
         }
         self.column += self.byte - marker;
+        let symbol = marker..self.byte;
         // An empty opening line has one implicit padding column, including
         // when the marker touches EOL or has several trailing spaces/tabs.
         // This matches the parser's empty-list-item continuation indentation.
@@ -493,7 +519,10 @@ impl PrefixCursor {
             .iter()
             .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
         {
-            return Some(self.column - start_column + 1);
+            return Some(ListItemPrefix {
+                symbol,
+                width: self.column - start_column + 1,
+            });
         }
         let after_marker = *self;
         let padding = self.indent(line, 5);
@@ -506,8 +535,16 @@ impl PrefixCursor {
             *self = after_marker;
             self.space(line);
         }
-        Some(self.column - start_column)
+        Some(ListItemPrefix {
+            symbol,
+            width: self.column - start_column,
+        })
     }
+}
+
+struct ListItemPrefix {
+    symbol: std::ops::Range<usize>,
+    width: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -587,7 +624,7 @@ fn ancestor_containers(
                 let line_start = markdown_line_start(source, start);
                 let line = markdown_lines(&source[line_start..]).next().unwrap_or("");
                 let mut cursor = consume_containers(&containers, line_start, line.as_bytes())?;
-                let indent = cursor.list_item(line.as_bytes())?;
+                let indent = cursor.list_item(line.as_bytes())?.width;
                 containers.push(PrefixContainer::ListItem { start, indent });
             }
             _ => {}
@@ -847,20 +884,24 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                 }
             }
             NodeKind::ListItem { .. } => {
-                let prefix = tail
-                    .find(|character: char| !character.is_ascii_whitespace())
-                    .unwrap_or(0);
-                let item = &tail[prefix..];
-                let marker_len =
-                    if item.starts_with("- ") || item.starts_with("* ") || item.starts_with("+ ") {
-                        2
-                    } else {
-                        item.find(". ").map_or(0, |end| end + 2)
-                    };
-                if marker_len > 0 {
+                // The marker (bullet, or digits plus `.`/`)`) appears only on
+                // the item's own opening physical line; unlike a quote's
+                // per-line prefix, no ancestor container prefix precedes it
+                // here, since the item's own source range already starts at
+                // that line's indentation.
+                let line = markdown_lines(tail).next().unwrap_or("");
+                if let Some(prefix) = PrefixCursor::default().list_item(line.as_bytes()) {
+                    // Exactly one separator byte (space or tab) is markup,
+                    // matching the one CommonMark requires; an item whose
+                    // marker touches the line ending has none. Any further
+                    // padding is ordinary indentation, not marker syntax.
+                    let mut end = prefix.symbol.end;
+                    if matches!(line.as_bytes().get(end), Some(b' ' | b'\t')) {
+                        end += 1;
+                    }
                     let marker = SourceRange::new(
-                        block.source_range.start.0 + prefix,
-                        block.source_range.start.0 + prefix + marker_len,
+                        block.source_range.start.0 + prefix.symbol.start,
+                        block.source_range.start.0 + end,
                     );
                     markers.push(marker);
                     list_item_owners.push((marker, id));
@@ -994,9 +1035,7 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
         Tag::Heading { level, .. } => NodeKind::Heading(heading_level(*level)),
         Tag::CodeBlock(_) => NodeKind::CodeBlock,
         Tag::BlockQuote(_) => NodeKind::Quote,
-        Tag::List(start) => NodeKind::List {
-            ordered: start.is_some(),
-        },
+        Tag::List(start) => NodeKind::List { start: *start },
         Tag::Item => NodeKind::ListItem { task: None },
         Tag::Table(_) => NodeKind::Table,
         Tag::TableHead => NodeKind::TableHead,
@@ -1505,10 +1544,24 @@ mod tests {
                         .blocks()
                         .find(|(_, node)| node.kind == NodeKind::Quote)
                         .expect("the parser recognizes the nested quote");
+                    let item_id = quote.parent.unwrap();
                     assert!(matches!(
-                        parsed.tree.node(quote.parent.unwrap()).unwrap().kind,
+                        parsed.tree.node(item_id).unwrap().kind,
                         NodeKind::ListItem { .. }
                     ));
+                    // The item's own marker is unaffected by its opening line
+                    // being empty: exactly one separator byte is markup when
+                    // one exists in the source, none when the marker touches
+                    // the line ending directly.
+                    let separator = usize::from(!padding.is_empty());
+                    let expected_item_marker =
+                        SourceRange::new(base, base + marker.len() + separator);
+                    assert_eq!(
+                        parsed.list_item_markers,
+                        vec![(expected_item_marker, item_id)],
+                        "source: {source:?}"
+                    );
+                    assert!(parsed.markers.contains(&expected_item_marker));
                     let expected: Vec<_> = source
                         .match_indices('>')
                         .map(|(at, _)| SourceRange::new(base + at, base + at + 2))
@@ -1528,6 +1581,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ordered_list_start_value_is_preserved_losslessly() {
+        for (source, expected) in [
+            ("- item\n", None),
+            ("* item\n", None),
+            ("+ item\n", None),
+            ("1. item\n", Some(1)),
+            ("0. item\n", Some(0)),
+            ("5) item\n", Some(5)),
+            // Leading zeros round-trip to their numeric value here; the
+            // original digits are preserved separately in the marker's own
+            // source range, not in this parsed value.
+            ("007. item\n", Some(7)),
+            ("123456789. item\n", Some(123_456_789)),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let (_, list) = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| matches!(node.kind, NodeKind::List { .. }))
+                .unwrap_or_else(|| panic!("no list parsed for {source:?}"));
+            assert_eq!(
+                list.kind,
+                NodeKind::List { start: expected },
+                "source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_digit_ordered_marker_exceeds_commonmarks_limit_and_is_not_a_list() {
+        let source = "1234567890. item\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert!(
+            !parsed
+                .tree
+                .blocks()
+                .any(|(_, node)| matches!(node.kind, NodeKind::List { .. })),
+            "a 10-digit start exceeds CommonMark's ordered-list marker limit"
+        );
+    }
+
+    #[test]
+    fn four_space_indent_is_an_indented_code_block_not_a_list_item() {
+        let source = "    - item\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert!(
+            parsed
+                .tree
+                .blocks()
+                .any(|(_, node)| node.kind == NodeKind::CodeBlock)
+        );
+        assert!(
+            !parsed
+                .tree
+                .blocks()
+                .any(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+        );
+    }
+
+    #[test]
+    fn list_item_markers_cover_bullet_and_ordered_delimiters_exactly() {
+        for (source, expected) in [
+            ("- item\n", (0, 2)),
+            ("* item\n", (0, 2)),
+            ("+ item\n", (0, 2)),
+            // A tab is as valid a separator as a single space.
+            ("-\titem\n", (0, 2)),
+            // An empty item whose marker touches the line ending has no
+            // separator byte to include.
+            ("-\n", (0, 1)),
+            ("-\r\n", (0, 1)),
+            // Trailing whitespace on an otherwise-empty opening line still
+            // contributes exactly one separator byte, the same as content.
+            ("-   \n", (0, 2)),
+            ("1. item\n", (0, 3)),
+            ("1) item\n", (0, 3)),
+            ("0. item\n", (0, 3)),
+            // Leading zeros are part of the marker's source bytes, not
+            // reconstructed from the parsed start value.
+            ("003) item\n", (0, 5)),
+            // 0-3 leading spaces are part of the marker range at this
+            // nesting level.
+            ("  - item\n", (2, 4)),
+            ("   - item\n", (3, 5)),
+            // 5+ spaces after the marker still contribute only one
+            // separator byte; the rest is the item's own indentation.
+            ("-     item\n", (0, 2)),
+            // Nine digits is CommonMark's maximum ordered-marker width.
+            ("123456789. item\n", (0, 11)),
+        ] {
+            let base = 37;
+            let parsed = parse_document(
+                Revision(1),
+                SourceRange::new(base, base + source.len()),
+                source,
+            );
+            let (item_id, _) = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .unwrap_or_else(|| panic!("no list item parsed for {source:?}"));
+            let expected = SourceRange::new(base + expected.0, base + expected.1);
+            assert_eq!(
+                parsed.list_item_markers,
+                vec![(expected, item_id)],
+                "source: {source:?}"
+            );
+            assert!(parsed.markers.contains(&expected), "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn list_item_ordinal_reports_owner_and_sibling_position() {
+        let source = "- a\n- b\n  - nested a\n  - nested b\n- c\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (outer_list, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::List { .. }))
+            .expect("outer list");
+        let outer_items = parsed.tree.children(outer_list).to_vec();
+        assert_eq!(outer_items.len(), 3);
+        for (position, item) in outer_items.iter().enumerate() {
+            assert_eq!(
+                parsed.tree.list_item_ordinal(*item),
+                Some((outer_list, position))
+            );
+        }
+        // The nested list's items are siblings of each other, not of the
+        // outer list's items, even though they share a document.
+        let nested_list = parsed
+            .tree
+            .children(outer_items[1])
+            .iter()
+            .copied()
+            .find(|id| matches!(parsed.tree.node(*id).unwrap().kind, NodeKind::List { .. }))
+            .expect("nested list under the second outer item");
+        let nested_items = parsed.tree.children(nested_list).to_vec();
+        assert_eq!(nested_items.len(), 2);
+        for (position, item) in nested_items.iter().enumerate() {
+            assert_eq!(
+                parsed.tree.list_item_ordinal(*item),
+                Some((nested_list, position))
+            );
+        }
+        assert_eq!(parsed.tree.list_item_ordinal(outer_list), None);
     }
 
     #[test]

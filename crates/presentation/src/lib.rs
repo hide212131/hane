@@ -2993,7 +2993,7 @@ mod tests {
                 kind: if source.starts_with('>') {
                     NodeKind::Quote
                 } else {
-                    NodeKind::List { ordered: false }
+                    NodeKind::List { start: None }
                 },
                 source_range: SourceRange::new(50, offset),
                 revision: Revision(1),

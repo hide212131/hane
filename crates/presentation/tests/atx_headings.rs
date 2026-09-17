@@ -91,7 +91,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
             tree_paths: &[
                 &[NodeKind::Quote, NodeKind::Heading(2)],
                 &[
-                    NodeKind::List { ordered: false },
+                    NodeKind::List { start: None },
                     NodeKind::ListItem { task: None },
                     NodeKind::Heading(3),
                 ],

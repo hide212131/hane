@@ -28,12 +28,12 @@ const FIXTURES: &[MarkdownFixture] = &[
         source: "- [ ] todo\n- [x] done",
         tree_paths: &[
             &[
-                NodeKind::List { ordered: false },
+                NodeKind::List { start: None },
                 NodeKind::ListItem { task: Some(false) },
                 NodeKind::TaskMarker(false),
             ],
             &[
-                NodeKind::List { ordered: false },
+                NodeKind::List { start: None },
                 NodeKind::ListItem { task: Some(true) },
                 NodeKind::TaskMarker(true),
             ],
@@ -49,9 +49,9 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "nested list",
         source: "- outer\n  - inner **bold**",
         tree_paths: &[&[
-            NodeKind::List { ordered: false },
+            NodeKind::List { start: None },
             NodeKind::ListItem { task: None },
-            NodeKind::List { ordered: false },
+            NodeKind::List { start: None },
             NodeKind::ListItem { task: None },
             NodeKind::Strong,
         ]],
@@ -205,7 +205,7 @@ const FIXTURES: &[MarkdownFixture] = &[
         // way a top-level paragraph does; the bullet stays a per-line marker.
         source: "- **bold\n  across**",
         tree_paths: &[&[
-            NodeKind::List { ordered: false },
+            NodeKind::List { start: None },
             NodeKind::ListItem { task: None },
             NodeKind::Strong,
         ]],
