@@ -26,23 +26,49 @@ base の変更が scenario に影響しないと扱うかどうかは GUI worker
 
 ## 現在使える実行手段
 
-Computer Use を必須条件にしない。
+Computer Use を必須条件にしない。現在は GitHub-hosted macOS の Hosted GUI Validation と、ローカル Mac の CLI を用途に応じて使える。
 
-現在 repository に残っている明示的な GUI validation の実行入口は、ローカル Mac で起動・撮影・終了を行う `scripts/gui_validate.py` である。使い方、結果 JSON、終了コードは [CLI 操作説明](local-gui-validate-cli.md) を参照する。このコマンドは launch → ready → window → screenshot → teardown の経路を確認するもので、すべての GUI acceptance criteria を自動で検証するものではない。
+### Hosted GUI Validation
+
+通常は対象 Pull Request の Conversation に、次のどちらかを単独のコメントとして投稿する。
+
+```text
+/gui-validate head
+```
+
+```text
+/gui-validate merge
+```
+
+`head` は exact current PR head を検証する。`merge` は current target branch と current PR head から GitHub が作る current PR merge ref を検証する。文章中にコマンド文字列を書いた場合や、引数がない・未知の引数を付けた場合は起動しない。
+
+comment router は trusted default branch の workflow / script だけを使い、コメントイベントから PR 番号を取得する。GitHub API から current PR metadata を取得し、コメント投稿者が `write` / `maintain` / `admin` のいずれかであること、PR が open かつ non-draft であること、same-repository PR であることを確認する。head SHA と current target branch SHA は人に入力させず、その時点の GitHub facts から解決する。
+
+procedure version は trusted default branch の `scripts/hosted_gui_interaction.py` にある `PROCEDURE_VERSION` を読み、人に転記させない。現在の総合 procedure は `hosted-gui-interaction/7` である。
+
+router が作る依頼は PR、exact head、router が観測した current base、execution context、procedure に結び付ける。同じ context の queued / in-progress / success run がすでにある場合は重複起動を抑止する。base SHA も識別に含めるため、head が同じまま target branch が進んだ場合に、古い base の成功 run を current evidence として自動再利用しない。
+
+Hosted GUI Validation 側でも router の値をそのまま信用しない。実行時に元コメント、投稿者権限、PR の open/non-draft、same-repository、exact head、current base、trusted procedure を再取得・再検証する。router の依頼後に head または base が動いた場合は fail closed とし、新しい context へ暗黙に置き換えない。`merge` では current PR merge ref が2 parent の merge commit であり、第1 parent が検証時の current base、第2 parent が requested exact head であることも確認する。
+
+受理した依頼は Pull Request Conversation に head / base / execution context / procedure / workflow run URL を通知する。この通知コメント自体は trust evidence ではない。workflow run、artifact、current PR facts を evidence として使う。
+
+障害時の fallback として Actions の `AADW Hosted GUI Validation` から manual `workflow_dispatch` も残す。manual fallback でも trusted actor、open/non-draft、same-repository、exact-head、current-base、merge-ref parent、procedure の検証は省略しない。
+
+Hosted run の artifact には `aadw-context.json` と validator が生成した公開可能な screenshot / structured observation / log を保存する。`aadw-context.json` から requested head、requested/observed base、execution context / SHA、trusted control SHA、procedure、workflow run を対応付けられる。
+
+### ローカル CLI
+
+ローカル Mac では `scripts/gui_validate.py` で launch → ready → window → screenshot → teardown を確認できる。使い方、結果 JSON、終了コードは [CLI 操作説明](local-gui-validate-cli.md) を参照する。このコマンドが確認する範囲を超える acceptance criteria は、別の focused scenario と evidence が必要である。
 
 このローカル CLI は指定された commit の snapshot を独立 checkout して検証し、現在の result schema は target head SHA を記録するが、PR の current base SHA や synthetic merge SHA は記録・構築しない。そのため、**base の product code が scenario に影響する PR context を、この CLI の head-only result だけで証明することはできない**。
 
 base-sensitive な GUI acceptance では、次のいずれかを満たす evidence が必要である。
 
 - 検証対象 head 自体が current base を取り込んでおり、そのことを GitHub facts で確認できる。
-- current head + current base から作った merge context を実際に検証し、その base / merge SHA を evidence に残せる runner を使う。
+- current head + current base から作った merge context を実際に検証し、その base / merge SHA を evidence に残せる Hosted GUI Validation を使う。
 - scenario が base の変更に影響されないと Commander が具体的な evidence から判断できる。
 
 これらを確認できない場合、ローカル CLI が `pass` でも base-sensitive acceptance は `unknown` のままとし、merge 方向へ進めない。CLI の result schema に実際には検証していない base SHA を単なる metadata として追加し、merge-context 検証済みと見せることもしない。
-
-AADW v1 では GitHub-hosted macOS を使う workflow も存在し、build / launch / window discovery / capture / cleanup の経路を検証していた。しかし PR #150 でその workflow は停止・削除されており、現行 v2 には手動 dispatch できる hosted GUI validation の入口はない。そのため、hosted runner を現在使える手段として扱わない。
-
-Phase 3 の実運用で hosted entrypoint の必要性が確認されたため、再導入は Issue #162 で独立して扱う。v1 の orchestration や judge を復活させず、current head / base context と focused scenario を明示できる観測入口だけを検討する。
 
 現在使える手段で acceptance に必要な GUI evidence を取得できない場合は、その不足を product failure と推測しない。一方で必要な evidence が `unknown` のまま merge 方向へ進めない。
 
@@ -61,5 +87,7 @@ GitHub に自然な置き場所がない画像などだけ、必要最小限の 
 ## v1 からの変更
 
 AADW v1 では GUI requirement、GUI validation、Copilot judge、merge gate を workflow の状態遷移として接続していた。v2 ではその orchestration を使わず、GUI validation を必要なときだけ選ぶ独立した観測 action とする。
+
+Hosted GUI Validation も v1 の state machine を復活させるものではない。comment router は authorization と current request construction、GUI workflow は execution-time validation と観測に限定する。結果から fix / review / merge を自動連鎖させない。
 
 v1 の全文は [`docs/history/aadw-v1/local-gui-validation.md`](history/aadw-v1/local-gui-validation.md) に保存する。
