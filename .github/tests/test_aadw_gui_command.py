@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +14,8 @@ command = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(command)
 
 SHA = "a" * 40
+BASE = "b" * 40
+OTHER_BASE = "c" * 40
 
 
 def pull_request(**overrides):
@@ -89,6 +90,7 @@ class BuildRequestTests(unittest.TestCase):
             "actor": "trusted-user",
             "permission": "write",
             "pr": pull_request(),
+            "base_sha": BASE,
             "execution_context": "merge",
             "procedure": "hosted-gui-interaction/7",
             "comment_id": 456,
@@ -100,17 +102,18 @@ class BuildRequestTests(unittest.TestCase):
         request = self.build()
         self.assertEqual(request["pr_number"], "123")
         self.assertEqual(request["target_head_sha"], SHA)
+        self.assertEqual(request["request_base_sha"], BASE)
         self.assertEqual(request["execution_context"], "merge")
         self.assertEqual(request["procedure"], "hosted-gui-interaction/7")
         self.assertEqual(request["request_comment_id"], "456")
         self.assertEqual(request["request_actor"], "trusted-user")
         self.assertEqual(
             request["request_identity"],
-            f"pr=123;head={SHA};context=merge;procedure=hosted-gui-interaction/7",
+            f"pr=123;head={SHA};base={BASE};context=merge;procedure=hosted-gui-interaction/7",
         )
         self.assertEqual(
             request["run_name"],
-            f"AADW GUI PR #123 @ {SHA} merge hosted-gui-interaction/7",
+            f"AADW GUI PR #123 @ {SHA} base {BASE} merge hosted-gui-interaction/7",
         )
 
     def test_accepts_write_maintain_and_admin_only(self):
@@ -134,11 +137,14 @@ class BuildRequestTests(unittest.TestCase):
         with self.assertRaises(command.RequestError):
             self.build(pr=pr)
 
-    def test_rejects_invalid_current_head_or_refs(self):
+    def test_rejects_invalid_current_head_base_or_refs(self):
         pr = pull_request()
         pr["head"]["sha"] = "A" * 40
         with self.assertRaises(command.RequestError):
             self.build(pr=pr)
+
+        with self.assertRaises(command.RequestError):
+            self.build(base_sha="B" * 40)
 
         pr = pull_request()
         pr["head"]["ref"] = ""
@@ -154,9 +160,15 @@ class BuildRequestTests(unittest.TestCase):
         with self.assertRaises(command.RequestError):
             self.build(execution_context="latest")
 
+    def test_base_change_creates_a_distinct_request_identity(self):
+        first = self.build(base_sha=BASE)
+        second = self.build(base_sha=OTHER_BASE)
+        self.assertNotEqual(first["request_identity"], second["request_identity"])
+        self.assertNotEqual(first["run_name"], second["run_name"])
+
 
 class DuplicateTests(unittest.TestCase):
-    RUN_NAME = f"AADW GUI PR #123 @ {SHA} merge hosted-gui-interaction/7"
+    RUN_NAME = f"AADW GUI PR #123 @ {SHA} base {BASE} merge hosted-gui-interaction/7"
 
     def test_queued_or_in_progress_run_is_duplicate(self):
         for status in ("queued", "in_progress", "pending"):
@@ -173,7 +185,8 @@ class DuplicateTests(unittest.TestCase):
         self.assertIsNone(command.find_duplicate([run], self.RUN_NAME))
 
     def test_different_request_identity_is_not_duplicate(self):
-        run = {"id": 10, "display_title": self.RUN_NAME + "-different", "status": "queued", "conclusion": None}
+        different = f"AADW GUI PR #123 @ {SHA} base {OTHER_BASE} merge hosted-gui-interaction/7"
+        run = {"id": 10, "display_title": different, "status": "success", "conclusion": "success"}
         self.assertIsNone(command.find_duplicate([run], self.RUN_NAME))
 
     def test_older_success_still_prevents_duplicate_after_failed_retry(self):
