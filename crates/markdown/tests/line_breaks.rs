@@ -151,6 +151,49 @@ fn line_break_padding_hides_insignificant_spaces_around_breaks_only() {
     }
 }
 
+/// A lazy continuation line omits some (or all) ancestor container prefixes,
+/// but pulldown-cmark still folds it into the same paragraph as a SoftBreak,
+/// so the leading whitespace it drops from semantic content is exactly as
+/// insignificant as an ordinary continuation's — even though `markers` has
+/// nothing to hide there (`quote_markers_follow_list_ancestors_without_hiding_literal_greater_than`
+/// covers the marker side of the same lazy lines).
+#[test]
+fn line_break_padding_hides_insignificant_spaces_on_lazy_continuation_lines() {
+    for (source, expected) in [
+        // Quote lazy continuation: line 2 has no `>` at all.
+        ("> foo\n  bar", vec![(6, 8)]),
+        // List lazy continuation: line 2 is indented less than the marker
+        // requires ("- " is 2 columns), so it lazily continues the paragraph.
+        ("- foo\n bar", vec![(6, 7)]),
+        ("- foo\nbar", vec![]),
+        // Nested quotes: line 2 keeps only the outer `>`, line 3 keeps none.
+        ("> > foo\n> bar\nbaz", vec![]),
+    ] {
+        let base = 37;
+        let parsed = parse_document(
+            Revision(1),
+            SourceRange::new(base, base + source.len()),
+            source,
+        );
+        let mut actual = parsed.line_break_padding.clone();
+        actual.sort_by_key(|range| range.start);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(start, end)| SourceRange::new(base + start, base + end))
+            .collect();
+        assert_eq!(actual, expected, "source: {source:?}");
+        for padding in &parsed.line_break_padding {
+            assert!(
+                parsed
+                    .markers
+                    .iter()
+                    .all(|marker| !padding.intersects(*marker)),
+                "line-break padding must not overlap derived markers: {padding:?}"
+            );
+        }
+    }
+}
+
 /// CommonMark resolves emphasis across a hard break the same way it does
 /// across a soft break: the delimiter pair spans both physical lines.
 #[test]

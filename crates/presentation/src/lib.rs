@@ -2794,6 +2794,66 @@ mod tests {
     }
 
     #[test]
+    fn line_break_padding_hides_lazy_continuation_indentation_from_rendered_presentation() {
+        // Lazy continuation lines drop some (quote) or all (list, under-indented)
+        // ancestor container prefixes, but pulldown-cmark still folds them into
+        // the same paragraph as an ordinary soft break, so their leading
+        // whitespace must disappear from inactive visual text the same way — all
+        // while every source byte, including the hidden padding, stays mapped.
+        for (first_line, second_line, hidden_marker, hidden_padding) in [
+            ("> foo\n", "  bar", (0, 2), (6, 8)),
+            ("- foo\n", " bar", (0, 2), (6, 7)),
+        ] {
+            let base = 12;
+            let first_range = SourceRange::new(base, base + first_line.len());
+            let second_range =
+                SourceRange::new(first_range.end.0, first_range.end.0 + second_line.len());
+            let lines = [
+                BlockLine {
+                    line: 0,
+                    range: first_range,
+                    text: first_line,
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: 1,
+                    range: second_range,
+                    text: second_line,
+                    disclosure: None,
+                },
+            ];
+            let joined = parse_joined_block(&lines, Revision(1));
+            let mut out = Vec::new();
+            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            assert_eq!(
+                out[0].visual_text, "foo",
+                "source: {first_line:?}{second_line:?}"
+            );
+            assert_eq!(
+                out[1].visual_text, "bar",
+                "source: {first_line:?}{second_line:?}"
+            );
+            for (line, range) in [(&lines[0], first_range), (&lines[1], second_range)] {
+                assert!(
+                    segments_tile_range(range, &out[line.line].source_map.segments),
+                    "source bytes must stay fully mapped for line {}: {first_line:?}{second_line:?}",
+                    line.line
+                );
+            }
+            for &(start, end) in &[hidden_marker, hidden_padding] {
+                let hidden_range = SourceRange::new(base + start, base + end);
+                assert!(
+                    out.iter().any(|line| line.source_map.segments.iter().any(
+                        |segment| segment.source_range == hidden_range
+                            && segment.visibility == Visibility::HiddenMarkup
+                    )),
+                    "expected {hidden_range:?} hidden but addressable for {first_line:?}{second_line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shared_heading_kinds_follow_each_physical_lines_source_range() {
         for (source, expected) in [
             (

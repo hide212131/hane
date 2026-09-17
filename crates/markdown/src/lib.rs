@@ -752,9 +752,31 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
             .get(line_start..)
             .and_then(|rest| markdown_lines(rest).next())
             .unwrap_or("");
-        let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes()) else {
-            continue;
-        };
+        // Lazy continuation may carry only some ancestor prefixes, or none:
+        // stop at the first container this line does not actually have, the
+        // same way `code_padding` does for code spans. The parser already
+        // decided this line is part of the same inline content (that is why
+        // it produced this SoftBreak/HardBreak at all), so whatever leading
+        // whitespace remains past the prefixes this line really has is still
+        // insignificant, regardless of how many ancestor levels went missing.
+        let mut cursor = PrefixCursor::default();
+        for container in &containers {
+            let before = cursor;
+            let matched = match *container {
+                PrefixContainer::Quote => cursor.quote(line.as_bytes()).is_some(),
+                PrefixContainer::ListItem { start, indent } => {
+                    if (line_start..line_start + line.len()).contains(&start) {
+                        cursor.list_item(line.as_bytes()).is_some()
+                    } else {
+                        cursor.indent(line.as_bytes(), indent) == indent
+                    }
+                }
+            };
+            if !matched {
+                cursor = before;
+                break;
+            }
+        }
         let before = cursor.byte;
         cursor.indent(line.as_bytes(), line.len());
         if cursor.byte > before {
