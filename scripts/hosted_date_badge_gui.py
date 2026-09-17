@@ -31,6 +31,10 @@ SCOPE_NOTE = (
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
+# Sidebar rows are about 24 px apart in the default 760 px-tall hosted window,
+# or ~0.032 in Vision-normalized coordinates. Keep this below half a row so a
+# same-label badge on an adjacent row can never satisfy the same-row match.
+SAME_ROW_CENTER_Y_TOLERANCE = 0.014
 
 
 def load_gui_validate(control_dir: Path):
@@ -100,7 +104,11 @@ def nearest_same_row(text_match: dict, badge_matches: list[dict]) -> dict | None
     if not badge_matches:
         return None
     candidate = min(badge_matches, key=lambda item: abs(center_y(item) - center_y(text_match)))
-    return candidate if abs(center_y(candidate) - center_y(text_match)) <= 0.035 else None
+    return (
+        candidate
+        if abs(center_y(candidate) - center_y(text_match)) <= SAME_ROW_CENTER_Y_TOLERANCE
+        else None
+    )
 
 
 def japanese_weekday(value: dt.date) -> str:
