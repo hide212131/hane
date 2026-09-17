@@ -1,0 +1,27 @@
+name: PR178 Exact Head Fmt Validation
+
+on:
+  push:
+    branches:
+      - tmp-pr178-sync-check
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact PR head
+        uses: actions/checkout@v6
+        with:
+          ref: 21b8cff13c2912cf7c17270552011f51417de035
+          persist-credentials: false
+      - name: Verify exact head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "21b8cff13c2912cf7c17270552011f51417de035"
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
