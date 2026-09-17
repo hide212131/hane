@@ -70,6 +70,17 @@ jobs:
               --jq '.permission' 2>/dev/null || true
           )"
           pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
+          if [[ -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request base ref.'
+            exit 1
+          fi
+          base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve current target branch SHA.'
+            exit 1
+          fi
+
           procedure="$(
             python3 control/.github/scripts/aadw_gui_command.py \
               procedure control/scripts/hosted_gui_interaction.py
@@ -81,6 +92,7 @@ jobs:
                   --pr-number "$PR_NUMBER" \
                   --actor "$COMMENT_ACTOR" \
                   --permission "$permission" \
+                  --base-sha "$base_sha" \
                   --execution-context "$EXECUTION_CONTEXT" \
                   --procedure "$procedure" \
                   --comment-id "$COMMENT_ID"
@@ -93,6 +105,7 @@ jobs:
               to_entries[]
               | select(.key == "pr_number"
                     or .key == "target_head_sha"
+                    or .key == "request_base_sha"
                     or .key == "execution_context"
                     or .key == "procedure"
                     or .key == "request_comment_id"
@@ -144,6 +157,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_HEAD_SHA: ${{ steps.request.outputs.target_head_sha }}
+          REQUEST_BASE_SHA: ${{ steps.request.outputs.request_base_sha }}
           EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
           PROCEDURE: ${{ steps.request.outputs.procedure }}
           REQUEST_COMMENT_ID: ${{ steps.request.outputs.request_comment_id }}
@@ -153,6 +167,7 @@ jobs:
             --arg ref "$DEFAULT_BRANCH" \
             --arg pr_number "$PR_NUMBER" \
             --arg target_head_sha "$TARGET_HEAD_SHA" \
+            --arg request_base_sha "$REQUEST_BASE_SHA" \
             --arg execution_context "$EXECUTION_CONTEXT" \
             --arg procedure "$PROCEDURE" \
             --arg request_comment_id "$REQUEST_COMMENT_ID" \
@@ -161,6 +176,7 @@ jobs:
               inputs: {
                 pr_number: $pr_number,
                 target_head_sha: $target_head_sha,
+                request_base_sha: $request_base_sha,
                 execution_context: $execution_context,
                 procedure: $procedure,
                 request_comment_id: $request_comment_id
@@ -218,23 +234,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_HEAD_SHA: ${{ steps.request.outputs.target_head_sha }}
+          REQUEST_BASE_SHA: ${{ steps.request.outputs.request_base_sha }}
           EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
           PROCEDURE: ${{ steps.request.outputs.procedure }}
           DUPLICATE: ${{ steps.duplicate.outputs.found }}
           DUPLICATE_RUN_URL: ${{ steps.duplicate.outputs.run_url }}
           DUPLICATE_RUN_STATUS: ${{ steps.duplicate.outputs.run_status }}
-          DUPLICATE_RUN_CONCLUSION: ${{ steps.duplicate.outputs.run_conclusion }}
           DISPATCHED_RUN_URL: ${{ steps.dispatched.outputs.run_url }}
         run: |
           set -euo pipefail
 
           short_head="${TARGET_HEAD_SHA:0:12}"
+          short_base="${REQUEST_BASE_SHA:0:12}"
           if [[ "$DUPLICATE" == 'true' ]]; then
             run_url="$DUPLICATE_RUN_URL"
             if [[ "$DUPLICATE_RUN_STATUS" == 'completed' ]]; then
-              summary="同じ GUI validation はすでに成功済みです。"
+              summary="同じ PR context の GUI validation はすでに成功済みです。"
             else
-              summary="同じ GUI validation はすでに queued / in progress です。"
+              summary="同じ PR context の GUI validation はすでに queued / in progress です。"
             fi
           else
             run_url="$DISPATCHED_RUN_URL"
@@ -246,6 +263,7 @@ jobs:
 
           - PR: #${PR_NUMBER}
           - head: \`${short_head}\`
+          - base: \`${short_base}\`
           - context: \`${EXECUTION_CONTEXT}\`
           - procedure: \`${PROCEDURE}\`
           - run: ${run_url}
