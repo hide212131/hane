@@ -29,7 +29,7 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
-    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
+    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task,
     Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
@@ -75,6 +75,13 @@ const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
 const SIDEBAR_PADDING: f32 = 8.0;
 const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
+/// How often `_date_badge_refresh_task` re-observes the local calendar date
+/// for the sidebar's file-name badges. Short enough that a window left open
+/// across local midnight shows `本日` moving on within about a minute of the
+/// real boundary, long enough to stay well clear of "high-frequency polling":
+/// each tick is a cheap local-time read, not a redraw unless the date
+/// actually changed.
+const DATE_BADGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -275,6 +282,16 @@ pub struct EditorView {
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
     editor_scrollbar_drag: Option<ScrollbarDrag>,
+    /// The local calendar date the sidebar's file-name badges last used for
+    /// "today" (see `refresh_sidebar_date_badge_today`). The render path
+    /// itself always reads a fresh `local_today()`; this is only kept so the
+    /// periodic refresh can tell a real date-boundary crossing apart from a
+    /// same-day recheck and skip the `cx.notify()` when nothing changed.
+    sidebar_date_badge_today: CalendarDate,
+    /// Keeps `refresh_sidebar_date_badge_today`'s periodic recheck alive for
+    /// the life of the view; dropping it (which happens when the view
+    /// itself drops) cancels the task, so no polling outlives the view.
+    _date_badge_refresh_task: Task<()>,
     /// Folder paths reserved by a `new_work_folder_folder` call whose
     /// `create_dir` is still in flight. `work_folder`'s tree is not updated
     /// until that background write completes, so a name picked from the
@@ -605,6 +622,21 @@ impl EditorView {
             view.flush_pending_drafts();
             std::future::ready(())
         });
+        // Re-observes the local date on a timer so the sidebar's `本日`
+        // badge moves on even when the window sits open, focused, and
+        // untouched across local midnight; `view.update` failing (the view
+        // has been dropped) ends the loop instead of polling forever.
+        let date_badge_refresh_task = cx.spawn(async move |view, cx| {
+            loop {
+                gpui::Timer::after(DATE_BADGE_REFRESH_INTERVAL).await;
+                if view
+                    .update(cx, |view, cx| view.refresh_sidebar_date_badge_today(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             sessions,
             files,
@@ -622,6 +654,8 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
+            sidebar_date_badge_today: local_today(),
+            _date_badge_refresh_task: date_badge_refresh_task,
             pending_new_folders: HashSet::new(),
             _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
@@ -3678,6 +3712,34 @@ fn flatten_work_folder_tree<'a>(
 }
 
 impl EditorView {
+    /// Re-observes the local calendar date for the sidebar's file-name
+    /// badges and redraws the view when it has moved on. Driven by
+    /// `_date_badge_refresh_task` so a window left open, focused, and
+    /// untouched across local midnight still shows `本日` move to the new
+    /// day, rather than only refreshing on the next unrelated redraw.
+    fn refresh_sidebar_date_badge_today(&mut self, cx: &mut Context<Self>) {
+        self.apply_sidebar_date_badge_today(local_today(), cx);
+    }
+
+    /// The state update `refresh_sidebar_date_badge_today` drives, split out
+    /// so the "did today actually change" decision is unit-testable without
+    /// depending on the system clock or a real timer. Returns whether
+    /// `today` differed from what the sidebar last used; `cx.notify()` only
+    /// fires in that case, so a recheck that lands on the same day is a
+    /// no-op redraw-wise.
+    fn apply_sidebar_date_badge_today(
+        &mut self,
+        today: CalendarDate,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.sidebar_date_badge_today == today {
+            return false;
+        }
+        self.sidebar_date_badge_today = today;
+        cx.notify();
+        true
+    }
+
     /// The folder/file tree for the sidebar, when this window was opened onto
     /// a work folder. File and folder rows reserve the same disclosure slot,
     /// so their file/folder icons line up and a folder does not shift when its
@@ -4259,6 +4321,49 @@ mod tests {
     fn the_date_badge_renders_before_the_remainder_only_on_the_left() {
         assert!(badge_renders_before_remainder(DateBadgePosition::Left));
         assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
+    }
+
+    // Regression coverage for the sidebar's `本日` badge going stale across a
+    // local-midnight boundary while the window stays open: `gpui::Timer` is
+    // wall-clock in this codebase's tests (see
+    // `draft_save_survives_switching_sessions_within_the_debounce_window`),
+    // so waiting out `DATE_BADGE_REFRESH_INTERVAL` for real is not practical
+    // here. This instead drives the exact state-update the periodic task
+    // calls on every tick, which is what actually decides whether the
+    // sidebar redraws.
+    #[gpui::test]
+    fn apply_sidebar_date_badge_today_notifies_only_when_the_date_actually_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+        let initial = view.update(cx, |view, _cx| view.sidebar_date_badge_today);
+        let other_day = CalendarDate::new(1, 1, 1).unwrap();
+        assert_ne!(initial, other_day);
+
+        // Rechecking the same day the sidebar already knows about must not
+        // report a change: nothing new to redraw.
+        let changed =
+            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(initial, cx));
+        assert!(!changed);
+        assert_eq!(
+            view.update(cx, |view, _cx| view.sidebar_date_badge_today),
+            initial
+        );
+
+        // A genuine date-boundary crossing updates the cached date and
+        // reports that the sidebar has something new to show.
+        let changed =
+            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        assert!(changed);
+        assert_eq!(
+            view.update(cx, |view, _cx| view.sidebar_date_badge_today),
+            other_day
+        );
+
+        // Rechecking again on the new day is once more a no-op.
+        let changed_again =
+            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        assert!(!changed_again);
     }
 
     #[test]
