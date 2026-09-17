@@ -1,5 +1,5 @@
 name: AADW Hosted GUI Validation
-run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} base ${{ inputs.request_base_sha }} ${{ inputs.execution_context }} ${{ inputs.procedure }}
+run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} base ${{ inputs.request_base_sha }} ${{ inputs.execution_context }} ${{ inputs.request_procedure }}
 
 on:
   workflow_dispatch:
@@ -25,13 +25,11 @@ on:
           - head
           - merge
         default: head
-      procedure:
-        description: Trusted GUI procedure identifier
-        required: true
-        type: choice
-        options:
-          - hosted-gui-interaction/7
-        default: hosted-gui-interaction/7
+      request_procedure:
+        description: Internal router-observed procedure; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
       request_comment_id:
         description: Internal PR comment request id; leave blank for manual fallback
         required: false
@@ -60,7 +58,7 @@ jobs:
       TARGET_HEAD_SHA: ${{ inputs.target_head_sha }}
       REQUEST_BASE_SHA: ${{ inputs.request_base_sha }}
       EXECUTION_CONTEXT: ${{ inputs.execution_context }}
-      REQUESTED_PROCEDURE: ${{ inputs.procedure }}
+      REQUESTED_PROCEDURE: ${{ inputs.request_procedure }}
       REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
 
     steps:
@@ -96,8 +94,8 @@ jobs:
             echo '::error::request_base_sha must be a lowercase full 40-hex SHA when provided.'
             exit 1
           fi
-          if [[ -z "$REQUESTED_PROCEDURE" || "$REQUESTED_PROCEDURE" == *$'\n'* || "$REQUESTED_PROCEDURE" == *$'\r'* ]]; then
-            echo '::error::procedure must be a non-empty single-line value.'
+          if [[ "$REQUESTED_PROCEDURE" == *$'\n'* || "$REQUESTED_PROCEDURE" == *$'\r'* ]]; then
+            echo '::error::request_procedure must be a single-line value when provided.'
             exit 1
           fi
           case "$EXECUTION_CONTEXT" in
@@ -114,8 +112,8 @@ jobs:
               echo '::error::request_comment_id must be a positive integer when provided.'
               exit 1
             fi
-            if [[ -z "$REQUEST_BASE_SHA" ]]; then
-              echo '::error::Routed requests must include the router-observed base SHA.'
+            if [[ -z "$REQUEST_BASE_SHA" || -z "$REQUESTED_PROCEDURE" ]]; then
+              echo '::error::Routed requests must include router-observed base and procedure values.'
               exit 1
             fi
 
@@ -201,7 +199,7 @@ jobs:
             python3 control/.github/scripts/aadw_gui_command.py \
               procedure control/scripts/hosted_gui_interaction.py
           )"
-          if [[ "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
+          if [[ -n "$REQUESTED_PROCEDURE" && "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
             echo "::error::Requested procedure does not match trusted control. requested=${REQUESTED_PROCEDURE} actual=${actual_procedure}"
             exit 1
           fi
@@ -219,6 +217,7 @@ jobs:
             echo "control_sha=$control_sha"
             echo "checkout_ref=$checkout_ref"
             echo "request_actor=$request_actor"
+            echo "procedure=$actual_procedure"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out requested execution tree
@@ -287,6 +286,7 @@ jobs:
           BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
           CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
           REQUEST_ACTOR: ${{ steps.preflight.outputs.request_actor }}
+          EFFECTIVE_PROCEDURE: ${{ steps.preflight.outputs.procedure }}
           RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
         run: |
           set -euo pipefail
@@ -302,7 +302,7 @@ jobs:
             --arg execution_context "$EXECUTION_CONTEXT" \
             --arg execution_sha "$EXECUTION_SHA" \
             --arg control_sha "$CONTROL_SHA" \
-            --arg procedure "$REQUESTED_PROCEDURE" \
+            --arg procedure "$EFFECTIVE_PROCEDURE" \
             --arg actor "$REQUEST_ACTOR" \
             --arg request_comment_id "$REQUEST_COMMENT_ID" \
             --arg run_id "$GITHUB_RUN_ID" \
