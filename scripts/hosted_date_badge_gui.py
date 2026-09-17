@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/1"
+PROCEDURE_VERSION = "hosted-date-badge/2"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
     "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
@@ -130,15 +130,66 @@ def exact_label_matches(candidates: list[dict], expected: str) -> list[dict]:
     return [candidate for candidate in candidates if recognized_line_matches_expected(candidate, expected)]
 
 
-def display_geometry_match(match: dict, *, use_full_line: bool) -> dict:
+def joined_row_candidate(full_line: str, badge_candidates: list[dict]) -> dict | None:
+    """Find a badge observation that is literally the same OCR line as `full_line`.
+
+    Vision sometimes joins a sidebar filename and its badge into a single
+    `recognized_line` (e.g. `Alpha.md 本日`) instead of two observations. Such
+    a badge candidate's own `recognized_line` equals the row's full line, not
+    just the badge label, so it cannot be found by `exact_label_matches`.
+    """
+    normalized_full = normalized_ocr_text(full_line)
+    return next(
+        (
+            candidate
+            for candidate in badge_candidates
+            if normalized_ocr_text(candidate.get("recognized_line", "")) == normalized_full
+        ),
+        None,
+    )
+
+
+def joined_composition_is_exact(full_line: str, expected_display: str, expected_badge: str) -> bool:
+    """Fail-closed check that a joined row is exactly `expected display + badge`.
+
+    Only a single optional space (or no separator, for OCR spacing loss) is
+    tolerated between the two parts. Any extra prefix/suffix, or a different
+    badge label such as a longer date that merely contains the expected badge
+    as a substring (e.g. `2026/1/2(金)` vs expected `1/2(金)`), is rejected.
+    """
+    normalized = normalized_ocr_text(full_line)
+    display = normalized_ocr_text(expected_display)
+    return normalized in (f"{display} {expected_badge}", f"{display}{expected_badge}")
+
+
+def joined_composition_ends_with_badge(full_line: str, expected_badge: str) -> bool:
+    return normalized_ocr_text(full_line).endswith(normalized_ocr_text(expected_badge))
+
+
+def display_geometry_match(match: dict, *, use_full_line: bool, joined_row: bool = False) -> dict:
     """Return geometry representing the whole visible filename when needed.
 
     Normal short cases use an anchored regex whose match is already the whole
-    display name. The long-name case intentionally cannot know the exact
-    truncation point, so its prefix match is only an identity locator; the
-    right-side/non-overlap oracle must use Vision's full recognized-line box.
+    display name (badge, if any, is excluded by the caller's lookahead
+    pattern, so no clipping is needed even when the row is joined). The
+    long-name case intentionally cannot know the exact truncation point, so
+    a split-row prefix match is only an identity locator; the right-side/
+    non-overlap oracle there must use Vision's full recognized-line box.
+
+    When Vision instead joins that long-name row with its badge into one
+    recognized_line, the full line box would span the badge itself. Clipping
+    that box to the badge *under verification*'s own minX made the
+    non-overlap oracle an unfalsifiable tautology: the badge always
+    satisfies `badge.minX >= clipped_maxX` because the clip endpoint *is*
+    that same badge's minX, regardless of whether it truly overlaps visible
+    filename text (Issue #185 follow-up false-PASS). The long-name
+    text_pattern is greedy over the visible filename words plus an optional
+    trailing ellipsis, so on a joined row its own regex match box already
+    covers the whole visible filename independently of the badge. Use that
+    match box unmodified instead of deriving filename geometry from the
+    badge under verification.
     """
-    if not use_full_line:
+    if not use_full_line or joined_row:
         return match
     line_box = match.get("line_bounding_box")
     required = {"minX", "maxX", "minY", "maxY"}
@@ -225,7 +276,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_at_start",
             "filename": f"{today_token}_Alpha.md",
-            "text_pattern": r"^\s*Alpha\.md\s*$",
+            "text_pattern": r"^\s*Alpha\.md",
             "expected_display": "Alpha.md",
             "date_token": today_token,
             "badge_label": "本日",
@@ -233,7 +284,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_in_middle",
             "filename": f"Bravo_{date_in_middle_token}_Note.md",
-            "text_pattern": r"^\s*Bravo\s+Note\.md\s*$",
+            "text_pattern": r"^\s*Bravo\s+Note\.md",
             "expected_display": "Bravo Note.md",
             "date_token": date_in_middle_token,
             "badge_label": relative_label(date_in_middle, today),
@@ -241,7 +292,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_at_end",
             "filename": f"Charlie_{date_at_end_token}.md",
-            "text_pattern": r"^\s*Charlie\.md\s*$",
+            "text_pattern": r"^\s*Charlie\.md",
             "expected_display": "Charlie.md",
             "date_token": date_at_end_token,
             "badge_label": relative_label(date_at_end, today),
@@ -249,7 +300,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "one_digit_month_day",
             "filename": f"{one_digit_token}_Delta.md",
-            "text_pattern": r"^\s*Delta\.md\s*$",
+            "text_pattern": r"^\s*Delta\.md",
             "expected_display": "Delta.md",
             "date_token": one_digit_token,
             "badge_label": relative_label(one_digit, today),
@@ -260,10 +311,16 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
                 "This_Is_An_Extremely_Long_Sidebar_Filename_Designed_To_Force_"
                 f"Truncation_{today_token}.md"
             ),
-            # This prefix only identifies the intended OCR observation. Its
-            # full `recognized_line` bbox, not this regex match bbox, is used
-            # for row matching and the strict right-side/non-overlap check.
-            "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+",
+            # For a split row (filename alone on its own recognized_line),
+            # this prefix only identifies the intended OCR observation and
+            # the full `recognized_line` bbox is used for the strict
+            # right-side/non-overlap check. For a row Vision joins with the
+            # badge into one recognized_line, this regex match itself --
+            # greedy over the visible filename words plus an optional
+            # trailing ellipsis -- is used as independent filename geometry
+            # instead, so the check never derives filename geometry from the
+            # very badge being verified (Issue #185 follow-up false-PASS).
+            "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+(?:\s*(?:…|\.\.\.))?",
             "expected_display": None,
             "date_token": today_token,
             "badge_label": "本日",
@@ -345,13 +402,10 @@ def main() -> int:
                                 for case in cases:
                                     try:
                                         texts = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
-                                        badges = badge_cache.setdefault(
+                                        badges_raw = badge_cache.setdefault(
                                             case["badge_label"],
-                                            exact_label_matches(
-                                                helper_find_all(
-                                                    helper, helper_digest, screenshot, re.escape(case["badge_label"])
-                                                ),
-                                                case["badge_label"],
+                                            helper_find_all(
+                                                helper, helper_digest, screenshot, re.escape(case["badge_label"])
                                             ),
                                         )
                                         token_pattern = date_token_pattern(case["date_token"])
@@ -363,25 +417,44 @@ def main() -> int:
                                             scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名を screenshot OCR で確認できない"))
                                             continue
                                         text_match = texts[0]
+                                        full_line = text_match.get("recognized_line", "")
                                         expected_display = case.get("expected_display")
-                                        if expected_display is not None and not recognized_line_matches_expected(text_match, expected_display):
-                                            scenario_steps.append(step(
-                                                case["name"],
-                                                "fail",
-                                                "sidebar の表示名全体が期待値と一致しない",
-                                                filename=case["filename"],
-                                                expected_display=expected_display,
-                                                recognized_line=text_match.get("recognized_line", ""),
-                                                text_match=text_match,
-                                                screenshot=str(screenshot),
-                                            ))
-                                            continue
+
+                                        # Vision may keep the filename and badge as separate
+                                        # observations (split row) or join them into one
+                                        # `recognized_line` such as `Alpha.md 本日` (joined
+                                        # row). `joined_candidate` is the badge observation
+                                        # that is literally that same OCR line, if any.
+                                        joined_candidate = joined_row_candidate(full_line, badges_raw)
+                                        if expected_display is not None:
+                                            is_split_row = recognized_line_matches_expected(text_match, expected_display)
+                                            is_joined_row = joined_candidate is not None and joined_composition_is_exact(
+                                                full_line, expected_display, case["badge_label"]
+                                            )
+                                            if not is_split_row and not is_joined_row:
+                                                scenario_steps.append(step(
+                                                    case["name"],
+                                                    "fail",
+                                                    "sidebar の表示名全体が期待値と一致しない",
+                                                    filename=case["filename"],
+                                                    expected_display=expected_display,
+                                                    recognized_line=full_line,
+                                                    text_match=text_match,
+                                                    screenshot=str(screenshot),
+                                                ))
+                                                continue
+                                        else:
+                                            is_joined_row = joined_candidate is not None and joined_composition_ends_with_badge(
+                                                full_line, case["badge_label"]
+                                            )
+
                                         display_match = display_geometry_match(
                                             text_match,
                                             use_full_line=expected_display is None,
+                                            joined_row=is_joined_row,
                                         )
                                         date_on_row = nearest_same_row(display_match, date_matches)
-                                        date_in_line = re.search(token_pattern, text_match.get("recognized_line", "")) is not None
+                                        date_in_line = re.search(token_pattern, full_line) is not None
                                         if date_on_row is not None or date_in_line:
                                             scenario_steps.append(step(
                                                 case["name"],
@@ -395,7 +468,12 @@ def main() -> int:
                                                 screenshot=str(screenshot),
                                             ))
                                             continue
-                                        badge_match = nearest_same_row(display_match, badges)
+                                        badge_candidates = (
+                                            [joined_candidate]
+                                            if is_joined_row
+                                            else exact_label_matches(badges_raw, case["badge_label"])
+                                        )
+                                        badge_match = nearest_same_row(display_match, badge_candidates)
                                         if badge_match is None:
                                             scenario_steps.append(step(case["name"], "fail", "同じ sidebar row の日付バッジを確認できない"))
                                             continue
@@ -467,7 +545,7 @@ def main() -> int:
             "overall_reason": reason,
         }
         label = {"pass": "PASS", "fail": "FAIL", "blocked": "BLOCKED"}.get(overall, "BLOCKED")
-        result["summary"] = f"[{label}] hosted-date-badge/1 — {reason}"
+        result["summary"] = f"[{label}] {PROCEDURE_VERSION} — {reason}"
         result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         (run_dir / "summary.md").write_text(result["summary"] + "\n", encoding="utf-8")
         print(result["summary"])
@@ -486,7 +564,7 @@ def main() -> int:
             "scenarios": [],
         }
         result_path.write_text(json.dumps(fallback, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(f"[BLOCKED] hosted-date-badge/1 — {exc}")
+        print(f"[BLOCKED] {PROCEDURE_VERSION} — {exc}")
         return EXIT_NONPASS
     finally:
         env.release_execution()
