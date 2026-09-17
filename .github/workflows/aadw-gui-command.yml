@@ -45,13 +45,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          execution_context="$(printf '%s' "$COMMENT_BODY" | python3 control/.github/scripts/aadw_gui_command.py parse)"
-          if [[ -z "$execution_context" ]]; then
+          route_json="$(printf '%s' "$COMMENT_BODY" | python3 control/.github/scripts/aadw_gui_command.py route)"
+          if [[ -z "$route_json" ]]; then
             echo 'recognized=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           echo 'recognized=true' >> "$GITHUB_OUTPUT"
-          echo "execution_context=$execution_context" >> "$GITHUB_OUTPUT"
+          for key in validation_kind execution_context workflow_file procedure_path; do
+            value="$(jq -r --arg key "$key" '.[$key] // empty' <<< "$route_json")"
+            if [[ -z "$value" ]]; then
+              echo "::error::Trusted command route is missing ${key}."
+              exit 1
+            fi
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Resolve and authorize current Pull Request request
         id: request
@@ -60,6 +68,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXECUTION_CONTEXT: ${{ steps.command.outputs.execution_context }}
+          PROCEDURE_PATH: ${{ steps.command.outputs.procedure_path }}
         run: |
           set -euo pipefail
 
@@ -83,7 +92,7 @@ jobs:
 
           procedure="$(
             python3 control/.github/scripts/aadw_gui_command.py \
-              procedure control/scripts/hosted_gui_interaction.py
+              procedure "control/${PROCEDURE_PATH}"
           )"
           request_json="$(
             printf '%s' "$pr_json" \
@@ -122,13 +131,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_NAME: ${{ steps.request.outputs.run_name }}
+          WORKFLOW_FILE: ${{ steps.command.outputs.workflow_file }}
         run: |
           set -euo pipefail
 
           runs_json="$(
             gh api \
               -H 'Accept: application/vnd.github+json' \
-              "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/runs?event=workflow_dispatch&per_page=100"
+              "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=100"
           )"
           duplicate_json="$(
             printf '%s' "$runs_json" \
@@ -160,6 +170,7 @@ jobs:
           EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
           PROCEDURE: ${{ steps.request.outputs.procedure }}
           REQUEST_COMMENT_ID: ${{ steps.request.outputs.request_comment_id }}
+          WORKFLOW_FILE: ${{ steps.command.outputs.workflow_file }}
         run: |
           set -euo pipefail
           dispatch_json="$(
@@ -187,7 +198,7 @@ jobs:
                   --method POST \
                   -H 'Accept: application/vnd.github+json' \
                   -H 'X-GitHub-Api-Version: 2026-03-10' \
-                  "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/dispatches" \
+                  "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
                   --input -
           )"
 
@@ -209,6 +220,7 @@ jobs:
           REQUEST_BASE_SHA: ${{ steps.request.outputs.request_base_sha }}
           EXECUTION_CONTEXT: ${{ steps.request.outputs.execution_context }}
           PROCEDURE: ${{ steps.request.outputs.procedure }}
+          VALIDATION_KIND: ${{ steps.command.outputs.validation_kind }}
           DUPLICATE: ${{ steps.duplicate.outputs.found }}
           DUPLICATE_RUN_URL: ${{ steps.duplicate.outputs.run_url }}
           DUPLICATE_RUN_STATUS: ${{ steps.duplicate.outputs.run_status }}
@@ -236,6 +248,7 @@ jobs:
           - PR: #${PR_NUMBER}
           - head: \`${short_head}\`
           - base: \`${short_base}\`
+          - validation kind: \`${VALIDATION_KIND}\`
           - context: \`${EXECUTION_CONTEXT}\`
           - procedure: \`${PROCEDURE}\`
           - run: ${run_url}

@@ -1,4 +1,5 @@
 name: AADW Focused Date Badge GUI Validation
+run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} base ${{ inputs.request_base_sha }} ${{ inputs.execution_context }} ${{ inputs.request_procedure }}
 
 on:
   workflow_dispatch:
@@ -11,6 +12,11 @@ on:
         description: Exact current Pull Request head SHA (40 hex)
         required: true
         type: string
+      request_base_sha:
+        description: Internal router-observed base SHA; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
       execution_context:
         description: Validate the exact head, or GitHub's current base+head merge context
         required: true
@@ -19,6 +25,16 @@ on:
           - head
           - merge
         default: merge
+      request_procedure:
+        description: Internal router-observed procedure; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
+      request_comment_id:
+        description: Internal PR comment request id; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: aadw-date-badge-gui-pr-${{ inputs.pr_number }}
@@ -33,14 +49,17 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      issues: read
       pull-requests: read
     env:
       REPOSITORY: ${{ github.repository }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       PR_NUMBER: ${{ inputs.pr_number }}
       TARGET_HEAD_SHA: ${{ inputs.target_head_sha }}
+      REQUEST_BASE_SHA: ${{ inputs.request_base_sha }}
       EXECUTION_CONTEXT: ${{ inputs.execution_context }}
-      REQUESTED_PROCEDURE: hosted-date-badge/1
+      REQUESTED_PROCEDURE: ${{ inputs.request_procedure }}
+      REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
 
     steps:
       - name: Check out trusted procedure
@@ -56,7 +75,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
 
@@ -72,6 +90,14 @@ jobs:
             echo '::error::target_head_sha must be a lowercase full 40-hex SHA.'
             exit 1
           fi
+          if [[ -n "$REQUEST_BASE_SHA" ]] && ! [[ "$REQUEST_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::request_base_sha must be a lowercase full 40-hex SHA when provided.'
+            exit 1
+          fi
+          if [[ "$REQUESTED_PROCEDURE" == *$'\n'* || "$REQUESTED_PROCEDURE" == *$'\r'* ]]; then
+            echo '::error::request_procedure must be a single-line value when provided.'
+            exit 1
+          fi
           case "$EXECUTION_CONTEXT" in
             head|merge) ;;
             *)
@@ -80,16 +106,60 @@ jobs:
               ;;
           esac
 
+          request_actor="$GITHUB_ACTOR"
+          if [[ -n "$REQUEST_COMMENT_ID" ]]; then
+            if ! [[ "$REQUEST_COMMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo '::error::request_comment_id must be a positive integer when provided.'
+              exit 1
+            fi
+            if [[ -z "$REQUEST_BASE_SHA" || -z "$REQUESTED_PROCEDURE" ]]; then
+              echo '::error::Routed requests must include router-observed base and procedure values.'
+              exit 1
+            fi
+
+            comment_json="$(gh api "repos/${REPOSITORY}/issues/comments/${REQUEST_COMMENT_ID}")"
+            comment_pr_number="$(jq -r '.issue_url | split("/")[-1] // ""' <<< "$comment_json")"
+            request_actor="$(jq -r '.user.login // ""' <<< "$comment_json")"
+            comment_body="$(jq -r '.body // ""' <<< "$comment_json")"
+            route_json="$(
+              printf '%s' "$comment_body" \
+                | python3 control/.github/scripts/aadw_gui_command.py route
+            )"
+            if [[ -z "$route_json" ]]; then
+              echo '::error::Routed comment is not a recognized trusted GUI command.'
+              exit 1
+            fi
+            comment_kind="$(jq -r '.validation_kind // ""' <<< "$route_json")"
+            comment_context="$(jq -r '.execution_context // ""' <<< "$route_json")"
+
+            if [[ "$comment_pr_number" != "$PR_NUMBER" ]]; then
+              echo "::error::Routed comment does not belong to target PR. comment_pr=${comment_pr_number:-unknown} target_pr=${PR_NUMBER}"
+              exit 1
+            fi
+            if [[ -z "$request_actor" ]]; then
+              echo '::error::Could not resolve routed comment actor.'
+              exit 1
+            fi
+            if [[ "$comment_kind" != 'date-badge' ]]; then
+              echo "::error::Routed comment selected a different validation kind: ${comment_kind:-invalid}."
+              exit 1
+            fi
+            if [[ "$comment_context" != "$EXECUTION_CONTEXT" ]]; then
+              echo "::error::Routed comment command no longer matches the requested execution context. comment=${comment_context:-invalid} requested=${EXECUTION_CONTEXT}"
+              exit 1
+            fi
+          fi
+
           permission="$(
             gh api \
               -H 'Accept: application/vnd.github+json' \
-              "repos/${REPOSITORY}/collaborators/${ACTOR}/permission" \
+              "repos/${REPOSITORY}/collaborators/${request_actor}/permission" \
               --jq '.permission' 2>/dev/null || true
           )"
           case "$permission" in
             admin|maintain|write) ;;
             *)
-              echo "::error::Dispatch actor is not trusted: ${ACTOR} (${permission:-none})."
+              echo "::error::Request actor is not trusted: ${request_actor} (${permission:-none})."
               exit 1
               ;;
           esac
@@ -124,6 +194,10 @@ jobs:
             echo '::error::Could not resolve current target branch SHA.'
             exit 1
           fi
+          if [[ -n "$REQUEST_BASE_SHA" && "$base_sha" != "$REQUEST_BASE_SHA" ]]; then
+            echo "::error::Target base moved after request. expected=${REQUEST_BASE_SHA} current=${base_sha}."
+            exit 1
+          fi
 
           control_sha="$(git -C control rev-parse HEAD)"
           if [[ "$control_sha" != "$GITHUB_WORKFLOW_SHA" ]]; then
@@ -132,24 +206,11 @@ jobs:
           fi
 
           actual_procedure="$(
-            python3 - <<'PY'
-          import ast
-          from pathlib import Path
-
-          tree = ast.parse(Path('control/scripts/hosted_date_badge_gui.py').read_text())
-          value = None
-          for node in tree.body:
-              if isinstance(node, ast.Assign):
-                  for target in node.targets:
-                      if isinstance(target, ast.Name) and target.id == 'PROCEDURE_VERSION':
-                          value = ast.literal_eval(node.value)
-          if not isinstance(value, str):
-              raise SystemExit('PROCEDURE_VERSION not found')
-          print(value)
-          PY
+            python3 control/.github/scripts/aadw_gui_command.py \
+              procedure control/scripts/hosted_date_badge_gui.py
           )"
-          if [[ "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
-            echo "::error::Trusted procedure mismatch. requested=${REQUESTED_PROCEDURE} actual=${actual_procedure}"
+          if [[ -n "$REQUESTED_PROCEDURE" && "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
+            echo "::error::Requested procedure does not match trusted control. requested=${REQUESTED_PROCEDURE} actual=${actual_procedure}"
             exit 1
           fi
 
@@ -165,6 +226,8 @@ jobs:
             echo "base_sha=$base_sha"
             echo "control_sha=$control_sha"
             echo "checkout_ref=$checkout_ref"
+            echo "request_actor=$request_actor"
+            echo "procedure=$actual_procedure"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out requested execution tree
@@ -213,11 +276,12 @@ jobs:
           current_pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
           current_state="$(jq -r '.state' <<< "$current_pr_json")"
           current_draft="$(jq -r '.draft' <<< "$current_pr_json")"
+          current_head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$current_pr_json")"
           current_head="$(jq -r '.head.sha // ""' <<< "$current_pr_json")"
           current_base_ref="$(jq -r '.base.ref // ""' <<< "$current_pr_json")"
           current_base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${current_base_ref}" | awk 'NR == 1 {print $1}')"
-          if [[ "$current_state" != 'open' || "$current_draft" != 'false' || "$current_head" != "$TARGET_HEAD_SHA" || "$current_base_ref" != "$EXPECTED_BASE_REF" || "$current_base_sha" != "$CURRENT_BASE_SHA" ]]; then
-            echo "::error::PR context changed before GUI execution. state=${current_state} draft=${current_draft} head=${current_head} base_ref=${current_base_ref} base_sha=${current_base_sha}"
+          if [[ "$current_state" != 'open' || "$current_draft" != 'false' || "$current_head_repo" != "$REPOSITORY" || "$current_head" != "$TARGET_HEAD_SHA" || "$current_base_ref" != "$EXPECTED_BASE_REF" || "$current_base_sha" != "$CURRENT_BASE_SHA" ]]; then
+            echo "::error::PR context changed before GUI execution. state=${current_state} draft=${current_draft} head_repo=${current_head_repo:-unknown} head=${current_head} base_ref=${current_base_ref} base_sha=${current_base_sha}"
             exit 1
           fi
 
@@ -231,6 +295,8 @@ jobs:
           BASE_REF: ${{ steps.preflight.outputs.base_ref }}
           BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
           CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
+          REQUEST_ACTOR: ${{ steps.preflight.outputs.request_actor }}
+          EFFECTIVE_PROCEDURE: ${{ steps.preflight.outputs.procedure }}
           RUN_DIR: ${{ runner.temp }}/hane-date-badge-gui
         run: |
           set -euo pipefail
@@ -239,14 +305,16 @@ jobs:
             --arg repository "$REPOSITORY" \
             --argjson pr_number "$PR_NUMBER" \
             --arg requested_head_sha "$TARGET_HEAD_SHA" \
+            --arg requested_base_sha "$REQUEST_BASE_SHA" \
             --arg head_ref "$HEAD_REF" \
             --arg base_ref "$BASE_REF" \
             --arg observed_base_sha "$BASE_SHA" \
             --arg execution_context "$EXECUTION_CONTEXT" \
             --arg execution_sha "$EXECUTION_SHA" \
             --arg control_sha "$CONTROL_SHA" \
-            --arg procedure "$REQUESTED_PROCEDURE" \
-            --arg actor "$GITHUB_ACTOR" \
+            --arg procedure "$EFFECTIVE_PROCEDURE" \
+            --arg actor "$REQUEST_ACTOR" \
+            --arg request_comment_id "$REQUEST_COMMENT_ID" \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             '{
@@ -254,6 +322,7 @@ jobs:
               repository: $repository,
               pr_number: $pr_number,
               requested_head_sha: $requested_head_sha,
+              requested_base_sha: ($requested_base_sha | if length == 0 then null else . end),
               head_ref: $head_ref,
               base_ref: $base_ref,
               observed_base_sha: $observed_base_sha,
@@ -262,6 +331,7 @@ jobs:
               control_sha: $control_sha,
               procedure: $procedure,
               dispatched_by: $actor,
+              request_comment_id: ($request_comment_id | if length == 0 then null else tonumber end),
               workflow_run_id: $run_id,
               workflow_run_attempt: $run_attempt
             }' > "$RUN_DIR/aadw-context.json"
