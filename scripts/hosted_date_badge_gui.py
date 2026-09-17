@@ -276,7 +276,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_at_start",
             "filename": f"{today_token}_Alpha.md",
-            "text_pattern": r"^\s*Alpha\.md(?=\s|$)",
+            "text_pattern": r"^\s*Alpha\.md",
             "expected_display": "Alpha.md",
             "date_token": today_token,
             "badge_label": "本日",
@@ -284,7 +284,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_in_middle",
             "filename": f"Bravo_{date_in_middle_token}_Note.md",
-            "text_pattern": r"^\s*Bravo\s+Note\.md(?=\s|$)",
+            "text_pattern": r"^\s*Bravo\s+Note\.md",
             "expected_display": "Bravo Note.md",
             "date_token": date_in_middle_token,
             "badge_label": relative_label(date_in_middle, today),
@@ -292,7 +292,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "date_at_end",
             "filename": f"Charlie_{date_at_end_token}.md",
-            "text_pattern": r"^\s*Charlie\.md(?=\s|$)",
+            "text_pattern": r"^\s*Charlie\.md",
             "expected_display": "Charlie.md",
             "date_token": date_at_end_token,
             "badge_label": relative_label(date_at_end, today),
@@ -300,7 +300,7 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
         {
             "name": "one_digit_month_day",
             "filename": f"{one_digit_token}_Delta.md",
-            "text_pattern": r"^\s*Delta\.md(?=\s|$)",
+            "text_pattern": r"^\s*Delta\.md",
             "expected_display": "Delta.md",
             "date_token": one_digit_token,
             "badge_label": relative_label(one_digit, today),

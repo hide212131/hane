@@ -19,6 +19,14 @@
       "accepted": true
     },
     {
+      "name": "short_joined_no_space",
+      "expected_display": "Alpha.md",
+      "expected_badge": "本日",
+      "text_recognized_line": "Alpha.md本日",
+      "badge_recognized_line": "Alpha.md本日",
+      "accepted": true
+    },
+    {
       "name": "longer_badge_must_not_match",
       "expected_display": "Delta.md",
       "expected_badge": "1/2(金)",
@@ -27,11 +35,27 @@
       "accepted": false
     },
     {
+      "name": "longer_badge_no_space_must_not_match",
+      "expected_display": "Delta.md",
+      "expected_badge": "1/2(金)",
+      "text_recognized_line": "Delta.md2026/1/2(金)",
+      "badge_recognized_line": "Delta.md2026/1/2(金)",
+      "accepted": false
+    },
+    {
       "name": "extra_suffix_must_not_match",
       "expected_display": "Alpha.md",
       "expected_badge": "本日",
       "text_recognized_line": "Alpha.md 本日 extra",
       "badge_recognized_line": "Alpha.md 本日 extra",
+      "accepted": false
+    },
+    {
+      "name": "extra_suffix_no_space_must_not_match",
+      "expected_display": "Alpha.md",
+      "expected_badge": "本日",
+      "text_recognized_line": "Alpha.md本日 extra",
+      "badge_recognized_line": "Alpha.md本日 extra",
       "accepted": false
     }
   ]

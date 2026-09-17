@@ -99,6 +99,43 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 )
                 self.assertEqual(is_split or is_joined, case["accepted"])
 
+    def test_short_name_text_pattern_finds_row_before_composition_decides(self):
+        # Issue #185 follow-up: the fixture-only test above never exercises
+        # the actual `text_pattern` regex used by `helper_find_all` to locate
+        # the OCR candidate in the first place. A too-strict pattern (e.g.
+        # requiring `.md` to be followed by whitespace/end) silently drops
+        # the candidate before the whole-line composition check ever runs,
+        # so `Alpha.md本日` (OCR lost the separating space) would never reach
+        # `joined_composition_is_exact` at all. This test runs the real
+        # `text_pattern` from `make_fixtures` together with the real
+        # composition functions against full OCR-recognized lines.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=dt.date(2026, 9, 17))
+        pattern_by_display = {
+            case["expected_display"]: case["text_pattern"]
+            for case in cases
+            if case["expected_display"] is not None
+        }
+
+        def resolve(display: str, badge: str, full_line: str) -> bool:
+            pattern = pattern_by_display[display]
+            if re.search(pattern, full_line) is None:
+                return False
+            badge_candidates = [{"recognized_line": full_line}] if badge in full_line else []
+            is_split = mod.recognized_line_matches_expected({"recognized_line": full_line}, display)
+            joined_candidate = mod.joined_row_candidate(full_line, badge_candidates)
+            is_joined = joined_candidate is not None and mod.joined_composition_is_exact(
+                full_line, display, badge
+            )
+            return is_split or is_joined
+
+        self.assertTrue(resolve("Alpha.md", "本日", "Alpha.md 本日"))
+        self.assertTrue(resolve("Alpha.md", "本日", "Alpha.md本日"))
+        self.assertFalse(resolve("Alpha.md", "本日", "Alpha.md extra"))
+        self.assertFalse(resolve("Alpha.md", "本日", "Alpha.md本日 extra"))
+        self.assertFalse(resolve("Delta.md", "1/2(金)", "Delta.md2026/1/2(金)"))
+        self.assertFalse(resolve("Alpha.md", "本日", "_Alpha.md 本日"))
+
     def test_long_name_split_uses_full_recognized_line_geometry(self):
         prefix_match = {
             "matched_text": "This Is",
@@ -194,10 +231,13 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             self.assertTrue(all(case["date_token"] in case["filename"] for case in cases))
             regular_cases = [case for case in cases if case["expected_display"] is not None]
             self.assertTrue(all(case["text_pattern"].startswith("^\\s*") for case in regular_cases))
-            # The pattern must stop at a word boundary (whitespace or line end)
-            # rather than requiring `\s*$`, so it still matches when Vision
-            # joins the filename and badge into one recognized_line.
-            self.assertTrue(all(case["text_pattern"].endswith("(?=\\s|$)") for case in regular_cases))
+            # The pattern only anchors the display-name prefix and has no
+            # trailing boundary, so it still matches when Vision joins the
+            # filename and badge into one recognized_line with no separating
+            # space (e.g. `Alpha.md本日`, Issue #185 follow-up). Rejecting
+            # any extra suffix/badge mismatch is the job of the whole-line
+            # exact/joined composition checks downstream, not this pattern.
+            self.assertFalse(any(case["text_pattern"].endswith("$") for case in regular_cases))
             self.assertEqual(before, sorted(case["filename"] for case in cases))
             self.assertTrue(all((Path(tmp) / "work-folder" / name).is_file() for name in before))
 
