@@ -1028,24 +1028,18 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
-    // A list item's own bullet/number marker discloses when the caret,
-    // selection or IME touches the item's own directly-owned content — its
-    // opening line and any of its own paragraphs — but not a nested list one
-    // of its children owns. Only one marker ever exists on an item's own
-    // opening line (see `derive_markers`), so without this exclusion, editing
-    // deep inside a nested item's content would also touch every enclosing
-    // ancestor's `source_range` (which spans the nested content too) and
-    // spuriously disclose ancestors' markers the caret never came near.
+    // A list item's own bullet/number marker discloses whenever the caret,
+    // selection or IME touches any of the item's own source range — its
+    // opening line, its own paragraphs, and any nested child list or item it
+    // contains. A nested item's `source_range` sits inside every enclosing
+    // ancestor's own `source_range`, so entering nested content discloses the
+    // whole ancestor chain down to the item actually touched, while a sibling
+    // item — whose `source_range` never overlaps — stays hidden.
     if let Some(owner) = marker.list_owner {
-        return parsed.tree.node(owner).is_some_and(|item| {
-            range_touches(item.source_range, disclosure)
-                && !parsed.tree.children(owner).iter().any(|child| {
-                    parsed.tree.node(*child).is_some_and(|child_node| {
-                        matches!(child_node.kind, NodeKind::List { .. })
-                            && range_touches(child_node.source_range, disclosure)
-                    })
-                })
-        });
+        return parsed
+            .tree
+            .node(owner)
+            .is_some_and(|item| range_touches(item.source_range, disclosure));
     }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
@@ -3113,6 +3107,89 @@ mod tests {
             Some(SourceRange::empty(start + 4)),
         );
         assert_eq!(visual.visual_text, "> outer\n> nested");
+    }
+
+    #[test]
+    fn list_marker_discloses_for_every_ancestor_whose_source_range_the_caret_enters() {
+        // A nested/mixed fixture (#126): an outer item whose own directly-owned
+        // content is interrupted by a nested child list with its own second
+        // paragraph, followed by the outer item's own second paragraph, then
+        // an unrelated top-level sibling.
+        let source =
+            "- outer\n\n  - inner\n\n    second\n\n  outer second\n\n- sibling";
+        let start = 50;
+        let range = SourceRange::new(start, start + source.len());
+        let outer_line = 0;
+        let inner_line = 2;
+        let sibling_line = 8;
+        let line = |visual_text: &str, index: usize| -> String {
+            visual_text.split('\n').nth(index).unwrap().to_string()
+        };
+        let present = |disclosure: Option<SourceRange>| {
+            present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, disclosure)
+        };
+
+        // Nothing disclosed: both markers collapse to their synthesized bullet.
+        let collapsed = present(None);
+        assert_eq!(line(&collapsed.visual_text, outer_line), "\u{2022} outer");
+        assert_eq!(line(&collapsed.visual_text, inner_line), "  \u{2022} inner");
+        assert_eq!(line(&collapsed.visual_text, sibling_line), "\u{2022} sibling");
+
+        // A caret inside the nested child's own first line discloses both the
+        // nested item's own marker and its ancestor's, since the caret's
+        // source range intersects both owners' source ranges.
+        let at_inner = start + source.find("inner").unwrap();
+        let inner_caret = present(Some(SourceRange::empty(at_inner)));
+        assert_eq!(line(&inner_caret.visual_text, outer_line), "- outer");
+        assert_eq!(line(&inner_caret.visual_text, inner_line), "  - inner");
+        assert_eq!(
+            line(&inner_caret.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A selection inside the nested child's own second paragraph — not on
+        // the marker's own line — still discloses the nested item's marker and
+        // every ancestor whose source range contains that paragraph.
+        let second_start = start + source.find("second").unwrap();
+        let second_selection = present(Some(SourceRange::new(
+            second_start,
+            second_start + "second".len(),
+        )));
+        assert_eq!(line(&second_selection.visual_text, outer_line), "- outer");
+        assert_eq!(line(&second_selection.visual_text, inner_line), "  - inner");
+        assert_eq!(
+            line(&second_selection.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A caret back in the outer item's own paragraph, past the nested
+        // child, discloses only the outer marker: the caret's source range no
+        // longer intersects the nested item's own source range.
+        let at_outer_second = start + source.find("outer second").unwrap();
+        let outer_second_caret = present(Some(SourceRange::empty(at_outer_second)));
+        assert_eq!(line(&outer_second_caret.visual_text, outer_line), "- outer");
+        assert_eq!(
+            line(&outer_second_caret.visual_text, inner_line),
+            "  \u{2022} inner"
+        );
+        assert_eq!(
+            line(&outer_second_caret.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A caret in the unrelated sibling item discloses only its own
+        // marker, never the outer or nested ancestors of a different subtree.
+        let at_sibling = start + source.find("sibling").unwrap();
+        let sibling_caret = present(Some(SourceRange::empty(at_sibling)));
+        assert_eq!(
+            line(&sibling_caret.visual_text, outer_line),
+            "\u{2022} outer"
+        );
+        assert_eq!(
+            line(&sibling_caret.visual_text, inner_line),
+            "  \u{2022} inner"
+        );
+        assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
     }
 
     #[test]
