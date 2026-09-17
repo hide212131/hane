@@ -40,6 +40,10 @@ class ParseCommandTests(unittest.TestCase):
     def test_accepts_exact_merge_command(self):
         self.assertEqual(command.parse_command("/gui-validate merge"), "merge")
 
+    def test_legacy_parser_does_not_accept_focused_command(self):
+        self.assertIsNone(command.parse_command("/gui-validate date-badge head"))
+        self.assertIsNone(command.parse_command("/gui-validate date-badge merge"))
+
     def test_accepts_outer_whitespace_but_not_embedded_prose(self):
         self.assertEqual(command.parse_command(" \r\n/gui-validate merge\r\n "), "merge")
         self.assertIsNone(command.parse_command("このPRは /gui-validate merge した方がよい"))
@@ -56,6 +60,54 @@ class ParseCommandTests(unittest.TestCase):
         for body in invalid:
             with self.subTest(body=body):
                 self.assertIsNone(command.parse_command(body))
+
+
+class ParseRouteTests(unittest.TestCase):
+    def test_routes_existing_comprehensive_commands_unchanged(self):
+        self.assertEqual(
+            command.parse_route("/gui-validate head"),
+            {
+                "validation_kind": "comprehensive",
+                "execution_context": "head",
+                "workflow_file": "aadw-gui-validation.yml",
+                "procedure_path": "scripts/hosted_gui_interaction.py",
+            },
+        )
+        self.assertEqual(
+            command.parse_route("/gui-validate merge"),
+            {
+                "validation_kind": "comprehensive",
+                "execution_context": "merge",
+                "workflow_file": "aadw-gui-validation.yml",
+                "procedure_path": "scripts/hosted_gui_interaction.py",
+            },
+        )
+
+    def test_routes_date_badge_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate date-badge {context}"),
+                    {
+                        "validation_kind": "date-badge",
+                        "execution_context": context,
+                        "workflow_file": "aadw-date-badge-gui-validation.yml",
+                        "procedure_path": "scripts/hosted_date_badge_gui.py",
+                    },
+                )
+
+    def test_rejects_prose_extra_args_and_unknown_validation_kind(self):
+        invalid = (
+            "/gui-validate date-badge",
+            "/gui-validate date-badge merge extra",
+            "/gui-validate unknown merge",
+            "このPRは /gui-validate date-badge merge してください",
+            "/gui-validate date-badge\nmerge",
+            "/gui-validate comprehensive merge",
+        )
+        for body in invalid:
+            with self.subTest(body=body):
+                self.assertIsNone(command.parse_route(body))
 
 
 class TrustedProcedureTests(unittest.TestCase):
@@ -166,6 +218,12 @@ class BuildRequestTests(unittest.TestCase):
         self.assertNotEqual(first["request_identity"], second["request_identity"])
         self.assertNotEqual(first["run_name"], second["run_name"])
 
+    def test_procedure_change_creates_a_distinct_request_identity(self):
+        comprehensive = self.build(procedure="hosted-gui-interaction/7")
+        focused = self.build(procedure="hosted-date-badge/1")
+        self.assertNotEqual(comprehensive["request_identity"], focused["request_identity"])
+        self.assertNotEqual(comprehensive["run_name"], focused["run_name"])
+
 
 class DuplicateTests(unittest.TestCase):
     RUN_NAME = f"AADW GUI PR #123 @ {SHA} base {BASE} merge hosted-gui-interaction/7"
@@ -187,6 +245,11 @@ class DuplicateTests(unittest.TestCase):
     def test_different_request_identity_is_not_duplicate(self):
         different = f"AADW GUI PR #123 @ {SHA} base {OTHER_BASE} merge hosted-gui-interaction/7"
         run = {"id": 10, "display_title": different, "status": "completed", "conclusion": "success"}
+        self.assertIsNone(command.find_duplicate([run], self.RUN_NAME))
+
+    def test_different_procedure_is_not_duplicate(self):
+        focused = f"AADW GUI PR #123 @ {SHA} base {BASE} merge hosted-date-badge/1"
+        run = {"id": 10, "display_title": focused, "status": "completed", "conclusion": "success"}
         self.assertIsNone(command.find_duplicate([run], self.RUN_NAME))
 
     def test_older_success_still_prevents_duplicate_after_failed_retry(self):

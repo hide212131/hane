@@ -15,23 +15,73 @@ import re
 import sys
 from typing import Any
 
+# Keep the original comprehensive command grammar unchanged. The legacy
+# `parse` CLI intentionally recognizes only this form so the comprehensive
+# workflow cannot accept a focused command if it is ever mis-dispatched.
 COMMAND_RE = re.compile(r"/gui-validate[ \t]+(head|merge)")
+DATE_BADGE_COMMAND_RE = re.compile(r"/gui-validate[ \t]+date-badge[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
 RUN_NAME_PREFIX = "AADW GUI"
+
+# A comment chooses only a small named validation kind and execution context.
+# Workflow/script paths remain trusted default-branch data and are never read
+# from comment arguments.
+TRUSTED_ROUTES = {
+    "comprehensive": {
+        "workflow_file": "aadw-gui-validation.yml",
+        "procedure_path": "scripts/hosted_gui_interaction.py",
+    },
+    "date-badge": {
+        "workflow_file": "aadw-date-badge-gui-validation.yml",
+        "procedure_path": "scripts/hosted_date_badge_gui.py",
+    },
+}
 
 
 class RequestError(ValueError):
     """A routed request is not safe to dispatch."""
 
 
-def parse_command(body: str) -> str | None:
-    """Return the requested execution context only for an exact command comment."""
+def _normalized_command(body: str) -> str | None:
     if not isinstance(body, str):
         return None
-    normalized = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return body.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def parse_command(body: str) -> str | None:
+    """Return context only for the original comprehensive exact command."""
+    normalized = _normalized_command(body)
+    if normalized is None:
+        return None
     match = COMMAND_RE.fullmatch(normalized)
     return match.group(1) if match else None
+
+
+def parse_route(body: str) -> dict[str, str] | None:
+    """Resolve an exact GUI command to one of the fixed trusted routes."""
+    normalized = _normalized_command(body)
+    if normalized is None:
+        return None
+
+    comprehensive = COMMAND_RE.fullmatch(normalized)
+    if comprehensive:
+        validation_kind = "comprehensive"
+        execution_context = comprehensive.group(1)
+    else:
+        date_badge = DATE_BADGE_COMMAND_RE.fullmatch(normalized)
+        if not date_badge:
+            return None
+        validation_kind = "date-badge"
+        execution_context = date_badge.group(1)
+
+    route = TRUSTED_ROUTES[validation_kind]
+    return {
+        "validation_kind": validation_kind,
+        "execution_context": execution_context,
+        "workflow_file": route["workflow_file"],
+        "procedure_path": route["procedure_path"],
+    }
 
 
 def trusted_procedure(path: str | Path) -> str:
@@ -185,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("parse")
+    sub.add_parser("route")
 
     procedure_parser = sub.add_parser("procedure")
     procedure_parser.add_argument("path")
@@ -208,6 +259,11 @@ def main(argv: list[str] | None = None) -> int:
             result = parse_command(sys.stdin.read())
             if result is not None:
                 print(result)
+            return 0
+        if args.command == "route":
+            result = parse_route(sys.stdin.read())
+            if result is not None:
+                print(json.dumps(result, separators=(",", ":"), sort_keys=True))
             return 0
         if args.command == "procedure":
             print(trusted_procedure(args.path))
