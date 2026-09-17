@@ -48,7 +48,7 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeId, NodeKind,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
@@ -1120,14 +1120,26 @@ fn marker_edge(
 /// The synthesized replacement text for an inactive list item's own hidden
 /// bullet/number marker: `"• "` for an unordered item, or `"{n}. "` for an
 /// ordered item, where `n` is the owning list's `start` plus the item's
-/// zero-based sibling position (`MarkdownTree::list_item_ordinal`) — never
-/// the item's own source digits, which [`NodeKind::List`] documents as
-/// possibly `0`, non-sequential, or leading-zero-padded. The synthesized
-/// delimiter is always `.`, independent of the source's own `.`/`)`; only
-/// disclosing the marker (see [`marker_is_disclosed`]) shows those source
-/// bytes, unchanged, as editable [`Visibility::ExpandedMarkup`].
-fn list_item_label(parsed: &MarkdownParse, item: NodeId) -> Option<String> {
-    let (owner, ordinal) = parsed.tree.list_item_ordinal(item)?;
+/// zero-based sibling position — never the item's own source digits, which
+/// [`NodeKind::List`] documents as possibly `0`, non-sequential, or
+/// leading-zero-padded. The synthesized delimiter is always `.`, independent
+/// of the source's own `.`/`)`; only disclosing the marker (see
+/// [`marker_is_disclosed`]) shows those source bytes, unchanged, as editable
+/// [`Visibility::ExpandedMarkup`].
+///
+/// `ordinals` is [`ProjectionIndex::list_item_ordinals`], the whole tree's
+/// owner/position table built once per parse: looking `item` up here is
+/// `O(1)`, unlike `MarkdownTree::list_item_ordinal`'s preceding-sibling scan,
+/// which this function must not call per visible line — a large list's
+/// viewport projects one line at a time (see
+/// [`present_markdown_from_parse`]), and a scan there would cost proportional
+/// to each visible item's position rather than the visible range.
+fn list_item_label(
+    parsed: &MarkdownParse,
+    ordinals: &[Option<(NodeId, usize)>],
+    item: NodeId,
+) -> Option<String> {
+    let (owner, ordinal) = (*ordinals.get(item.0)?)?;
     match parsed.tree.node(owner)?.kind {
         NodeKind::List { start: None } => Some("\u{2022} ".to_owned()),
         NodeKind::List { start: Some(start) } => {
@@ -1316,7 +1328,7 @@ fn present_markdown_from_parse(
         // together.
         if !expanded
             && let Some(owner) = planned.list_owner
-            && let Some(label) = list_item_label(parsed, owner)
+            && let Some(label) = list_item_label(parsed, &shared.projection.list_item_ordinals, owner)
         {
             let visual_start = visual.len();
             visual.push_str(&label);
@@ -1657,6 +1669,30 @@ struct ProjectedMarker {
 struct ProjectionIndex {
     markers: Vec<ProjectedMarker>,
     nodes: SourceIndex<NodeId>,
+    /// Owner list and zero-based sibling position for every list item in
+    /// the parse, indexed by [`NodeId::0`]. Built once here — a single pass
+    /// over each list's own children — so [`list_item_label`] looks a
+    /// visible item's ordinal up in `O(1)` instead of every visible line
+    /// re-deriving it with [`MarkdownTree::list_item_ordinal`]'s
+    /// preceding-sibling scan.
+    list_item_ordinals: Vec<Option<(NodeId, usize)>>,
+}
+
+/// [`ProjectionIndex::list_item_ordinals`]'s builder: every `List` node's
+/// children, in the document order [`MarkdownTree::children`] already keeps
+/// them in, get positions `0, 1, 2, ...`. Each list item is visited exactly
+/// once across the whole tree, so this is `O(node count)` total regardless
+/// of how many lines a later viewport projects from it.
+fn list_item_ordinals(tree: &MarkdownTree) -> Vec<Option<(NodeId, usize)>> {
+    let mut ordinals = vec![None; tree.len()];
+    for (id, node) in tree.iter() {
+        if matches!(node.kind, NodeKind::List { .. }) {
+            for (position, child) in tree.children(id).iter().enumerate() {
+                ordinals[child.0] = Some((id, position));
+            }
+        }
+    }
+    ordinals
 }
 
 impl ProjectionIndex {
@@ -1691,7 +1727,12 @@ impl ProjectionIndex {
                 .map(|(id, node)| (node.source_range, id))
                 .collect(),
         );
-        Self { markers, nodes }
+        let list_item_ordinals = list_item_ordinals(&parsed.tree);
+        Self {
+            markers,
+            nodes,
+            list_item_ordinals,
+        }
     }
 }
 
@@ -3190,6 +3231,128 @@ mod tests {
             "  \u{2022} inner"
         );
         assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
+    }
+
+    #[test]
+    fn ordered_list_labels_use_owner_start_plus_sibling_position() {
+        for (source, expected_labels) in [
+            // Loose/irregular source digits never leak into the synthesized
+            // label; only the first item's marker sets the owner's `start`,
+            // and later items number sequentially from it regardless of
+            // their own written digits.
+            ("3. a\n1. b\n1. c", vec!["3. a", "4. b", "5. c"]),
+            // `0` is a valid ordered-list start.
+            ("0. a\n0. b", vec!["0. a", "1. b"]),
+        ] {
+            let start = 40;
+            let range = SourceRange::new(start, start + source.len());
+            let presented =
+                present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+            let lines: Vec<_> = presented.visual_text.split('\n').collect();
+            assert_eq!(lines, expected_labels, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn nested_lists_number_independently_of_their_ancestors_and_siblings() {
+        // A mixed fixture: an ordered outer list whose first item contains a
+        // nested bullet list, followed by the outer list's second item. The
+        // nested items are siblings of each other only, and the outer
+        // second item's ordinal must not count the nested items at all.
+        let source = "3. outer-a\n   - nested-a\n   - nested-b\n1. outer-b";
+        let start = 40;
+        let range = SourceRange::new(start, start + source.len());
+        let presented = present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+        let lines: Vec<_> = presented.visual_text.split('\n').collect();
+        assert_eq!(
+            lines,
+            vec![
+                "3. outer-a",
+                "   \u{2022} nested-a",
+                "   \u{2022} nested-b",
+                "4. outer-b",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_item_label_returns_none_when_the_ordinal_table_omits_the_item() {
+        // `list_item_label` must read only the precomputed ordinal table, not
+        // fall back to `MarkdownTree::list_item_ordinal`'s preceding-sibling
+        // scan when an entry is missing — a fallback here would mask a
+        // construction gap and silently reintroduce a per-line sibling walk.
+        let source = "1. a\n2. b\n3. c\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        let populated = list_item_ordinals(&parsed.tree);
+        assert_eq!(list_item_label(&parsed, &populated, item), Some("1. ".to_owned()));
+        let empty = vec![None; parsed.tree.len()];
+        assert_eq!(list_item_label(&parsed, &empty, item), None);
+    }
+
+    #[test]
+    fn large_ordered_list_viewport_labels_reuse_one_shared_parse_at_middle_and_tail() {
+        // 100,000 flat items in one ordered list. If a visible item's label
+        // still re-derived its ordinal via `MarkdownTree::list_item_ordinal`
+        // per line (a scan of every preceding sibling), presenting only the
+        // handful of lines drawn from the middle and the tail below would
+        // still be correct but would cost proportional to each item's
+        // position rather than to the lines actually presented; this test
+        // fixes correctness at that position, and
+        // `list_item_label_returns_none_when_the_ordinal_table_omits_the_item`
+        // fixes structurally that no such fallback scan exists at all.
+        const ITEMS: usize = 100_000;
+        let start_value = 3u64;
+        let source = (0..ITEMS)
+            .map(|i| format!("{start_value}. item {i}\n"))
+            .collect::<String>();
+        let mut cursor = 40;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(cursor, cursor + text.len());
+                cursor = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(9));
+        let shared = SharedParse {
+            parsed: &joined.parsed,
+            projection: &joined.projection,
+        };
+        let middle = ITEMS / 2;
+        for &index in &[middle - 2, middle - 1, middle, ITEMS - 3, ITEMS - 2, ITEMS - 1] {
+            let line = &lines[index];
+            let presented = present_markdown_from_parse(
+                line.line as u64,
+                Revision(9),
+                line.range,
+                line.text,
+                26.0,
+                None,
+                &shared,
+            );
+            assert_eq!(
+                presented.visual_text,
+                format!("{}. item {index}\n", start_value + index as u64),
+                "item {index}"
+            );
+            assert!(segments_tile_range(line.range, &presented.source_map.segments));
+            assert!(
+                presented.source_map.segments.capacity() <= 5,
+                "mapping storage must depend on this line's own markers, not item {index}'s position"
+            );
+        }
     }
 
     #[test]
