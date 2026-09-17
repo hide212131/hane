@@ -780,7 +780,10 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
         let before = cursor.byte;
         cursor.indent(line.as_bytes(), line.len());
         if cursor.byte > before {
-            padding.push(absolute_range(range.start.0 + line_start, before..cursor.byte));
+            padding.push(absolute_range(
+                range.start.0 + line_start,
+                before..cursor.byte,
+            ));
         }
     }
     padding
@@ -931,7 +934,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             markers.push(SourceRange::new(end - marker_len, end));
         }
     }
-    for (_, span) in tree.iter().filter(|(_, node)| node.kind == NodeKind::HardBreak) {
+    for (_, span) in tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::HardBreak)
+    {
         let start = span.source_range.start.0;
         let end = span.source_range.end.0;
         if start < range.start.0 || end > range.end.0 || start >= end {

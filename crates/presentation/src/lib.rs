@@ -2689,7 +2689,15 @@ mod tests {
                 "a following line makes this a hard break: {first_line:?}"
             );
             let mut out = Vec::new();
-            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            present_joined_run(
+                &lines,
+                Revision(1),
+                26.0,
+                &(0..2),
+                Some(&joined),
+                None,
+                &mut out,
+            );
             // The break syntax ("  " or "\") hides as markup; the terminator
             // is trimmed like any other trailing line ending, not turned into
             // a literal control character or a synthesized space.
@@ -2727,7 +2735,15 @@ mod tests {
             "an ordinary bare-CR line ending is a soft break"
         );
         let mut out = Vec::new();
-        present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+        present_joined_run(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..2),
+            Some(&joined),
+            None,
+            &mut out,
+        );
         assert_eq!(out[0].visual_text, "a");
         assert_eq!(out[1].visual_text, "b");
         assert!(
@@ -2771,7 +2787,15 @@ mod tests {
             ];
             let joined = parse_joined_block(&lines, Revision(1));
             let mut out = Vec::new();
-            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            present_joined_run(
+                &lines,
+                Revision(1),
+                26.0,
+                &(0..2),
+                Some(&joined),
+                None,
+                &mut out,
+            );
             assert_eq!(
                 out[0].visual_text, expected_first,
                 "source: {first_line:?}{second_line:?}"
@@ -2826,7 +2850,15 @@ mod tests {
             ];
             let joined = parse_joined_block(&lines, Revision(1));
             let mut out = Vec::new();
-            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            present_joined_run(
+                &lines,
+                Revision(1),
+                26.0,
+                &(0..2),
+                Some(&joined),
+                None,
+                &mut out,
+            );
             assert_eq!(
                 out[0].visual_text, "foo",
                 "source: {first_line:?}{second_line:?}"

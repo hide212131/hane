@@ -15,9 +15,7 @@ fn hard_break_syntax_is_derived_without_consuming_the_line_ending() {
         let marker_text = parsed
             .markers
             .iter()
-            .map(|marker| {
-                &source[marker.start.0 - base..marker.end.0 - base]
-            })
+            .map(|marker| &source[marker.start.0 - base..marker.end.0 - base])
             .collect::<Vec<_>>();
 
         assert_eq!(marker_text, ["  ", "\\"], "newline={newline:?}");
@@ -68,7 +66,10 @@ fn blank_lines_split_paragraphs_and_ordinary_line_endings_stay_soft_breaks() {
             .any(|(_, node)| node.kind == NodeKind::HardBreak),
         "an ordinary line ending is never a hard break"
     );
-    assert!(joined.markers.is_empty(), "a soft break has no markup to hide");
+    assert!(
+        joined.markers.is_empty(),
+        "a soft break has no markup to hide"
+    );
 }
 
 #[test]
