@@ -191,9 +191,22 @@ fn block_context(
     } else {
         render.clone()
     };
+    // Clipped to the block's own source range, not just its enclosing
+    // `RopeBuffer` line: `RopeBuffer` treats a lone `\r` as ordinary text
+    // (ADR-0003), so a bare-CR paragraph break can put two Markdown blocks'
+    // worth of bytes inside one physical line. Without this clip, both blocks
+    // would read and present the same full line's text, duplicating content
+    // that in fact belongs to a sibling block.
+    let block_range = block.source_range;
     let ranges = context
         .clone()
-        .map(|line| document.line_range(LineId(line)).ok())
+        .map(|line| {
+            let line_range = document.line_range(LineId(line)).ok()?;
+            Some(SourceRange::new(
+                line_range.start.0.max(block_range.start.0),
+                line_range.end.0.min(block_range.end.0),
+            ))
+        })
         .collect::<Option<Vec<_>>>()?;
     let texts = ranges
         .iter()
@@ -574,6 +587,24 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_cr_paragraph_boundary_does_not_duplicate_content_across_blocks() {
+        // `RopeBuffer` treats a lone `\r` as ordinary text (ADR-0003), so
+        // "a\r\rb" is one physical line to the editor even though CommonMark
+        // reads the blank line the `\r\r` makes as splitting it into two
+        // paragraphs. Each indexed block must present only its own bytes,
+        // not the whole shared physical line (which would duplicate the
+        // sibling block's content).
+        let editor = Editor::new("a\r\rb");
+        let index = BlockIndex::from_buffer(editor.document());
+        assert_eq!(index.len(), 2, "a bare-CR blank line splits the paragraph");
+        let texts = presented_lines(&editor)
+            .iter()
+            .map(|line| line.visual_text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
     fn shared_line_boundary_belongs_only_to_the_following_line() {
         let first = SourceRange::new(0, 4);
         let second = SourceRange::new(4, 8);
@@ -876,6 +907,7 @@ mod tests {
         let joined = hane_presentation::parse_joined_span(
             document,
             span.start..content_end,
+            block.source_range,
             document.revision(),
         )
         .expect("the whole span parses");

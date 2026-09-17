@@ -1150,6 +1150,55 @@ fn append_segment(
     });
 }
 
+/// Collapses a soft or hard break's line-ending byte into a single space when
+/// it falls strictly inside `range` instead of at its end.
+///
+/// `RopeBuffer` treats a lone `\r` as an ordinary character rather than a line
+/// terminator (ADR-0003), so a bare-CR line ending never starts a new
+/// `BlockLine`: the whole break, and any content after it, can land in the
+/// middle of one physical line's text instead of at the end, where
+/// `present_block`/`present_joined_run` already trim a trailing line ending
+/// from view. Left as a raw byte here, it would show as a literal control
+/// character in the middle of an otherwise ordinary run of text.
+///
+/// A `SoftBreak`/`HardBreak` node can only ever end with `\n` or `\r\n` when it
+/// coincides with `range`'s own end, because both are full `RopeBuffer` line
+/// terminators; every node this walks past that filter ends in a bare `\r`.
+/// Such a node can also never form inside a code span or inline HTML (see
+/// `hard_break_never_forms_inside_code_spans_html_tags_or_at_block_end`), so
+/// every byte this touches is genuine prose whitespace. Collapsing it to the
+/// single space CommonMark already permits a line break to render as keeps
+/// the run on its one visual row without inventing a new `LineWrap` case for
+/// it — that row-splitting responsibility stays out of scope here (see
+/// ADR-0025 on `LineWrap::Soft` and #34's soft-wrap).
+fn collapse_embedded_breaks(
+    visual: &mut String,
+    segments: &[MappingSegment],
+    parsed: &MarkdownParse,
+    range: SourceRange,
+) {
+    for (_, node) in parsed.tree.iter() {
+        if !matches!(node.kind, NodeKind::SoftBreak | NodeKind::HardBreak) {
+            continue;
+        }
+        let end = node.source_range.end;
+        if end.0 <= range.start.0 || end.0 >= range.end.0 {
+            continue;
+        }
+        let cr = SourceOffset(end.0 - 1);
+        let Some(segment) = segments
+            .iter()
+            .find(|segment| segment.source_range.start <= cr && cr < segment.source_range.end)
+        else {
+            continue;
+        };
+        let visual_pos = segment.visual_range.start.0 + (cr.0 - segment.source_range.start.0);
+        if visual.as_bytes().get(visual_pos) == Some(&b'\r') {
+            visual.replace_range(visual_pos..visual_pos + 1, " ");
+        }
+    }
+}
+
 /// Builds a native Markdown block with progressive disclosure. Markdown source
 /// remains authoritative; only marker ranges outside `disclosure` collapse.
 pub fn present_markdown_with_disclosure(
@@ -1305,6 +1354,7 @@ fn present_markdown_from_parse(
     if !segments_tile_range(range, &segments) {
         return present_raw_source(line_id, revision, range, source, line_height);
     }
+    collapse_embedded_breaks(&mut visual, &segments, parsed, range);
     let source_map = SourceMap { segments };
     // A style run's node may also span lines that are not this one; clipping to
     // `range` (as already done here) and letting `source_to_visual` fail outside
@@ -1691,9 +1741,16 @@ pub fn parse_joined_block(lines: &[BlockLine<'_>], revision: Revision) -> Joined
 /// cost scales with the block's size, which for a joinable block has no
 /// upper bound. `content` excludes the block's trailing blank run, matching
 /// what [`present_block`] itself treats as the construct's own lines.
+///
+/// The read is clipped to `block_source_range`. `content` names whole
+/// `RopeBuffer` lines, but a lone `\r` is ordinary text to `RopeBuffer`
+/// (ADR-0003), so a bare-CR paragraph break can leave a sibling block's bytes
+/// inside the same physical line; without the clip this would join and parse
+/// that sibling's text as if it were this block's own.
 pub fn parse_joined_span(
     document: &RopeBuffer,
     content: Range<usize>,
+    block_source_range: SourceRange,
     revision: Revision,
 ) -> Option<JoinedParse> {
     if content.is_empty() {
@@ -1707,7 +1764,13 @@ pub fn parse_joined_span(
         .line_range(hane_document::LineId(content.end - 1))
         .ok()?
         .end;
-    let joined_range = SourceRange::new(start.0, end.0);
+    let joined_range = SourceRange::new(
+        start.0.max(block_source_range.start.0),
+        end.0.min(block_source_range.end.0),
+    );
+    if joined_range.is_empty() {
+        return None;
+    }
     let joined_source = document.text(joined_range).ok()?;
     let parsed = parse_document(revision, joined_range, &joined_source);
     let projection = ProjectionIndex::new(&parsed);
@@ -2636,6 +2699,59 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn a_bare_cr_hard_break_collapses_to_a_space_without_leaking_a_control_character() {
+        // `RopeBuffer` treats a lone `\r` as ordinary text (ADR-0003), so this
+        // whole hard break sits inside what is, to the editor, one physical
+        // line. The break syntax still hides as markup; the line ending
+        // itself must not show up as a literal control character.
+        for source in ["a  \rb", "a\\\rb"] {
+            let range = SourceRange::new(5, 5 + source.len());
+            let block =
+                present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+            assert_eq!(block.visual_text, "a b", "source: {source:?}");
+            assert!(
+                block
+                    .source_map
+                    .segments
+                    .iter()
+                    .any(|segment| segment.visibility == Visibility::HiddenMarkup),
+                "the break syntax still hides as markup: {source:?}"
+            );
+            assert!(
+                segments_tile_range(range, &block.source_map.segments),
+                "every source byte still belongs to a segment: {source:?}"
+            );
+            let saved: String = block
+                .source_map
+                .segments
+                .iter()
+                .filter(|segment| !segment.source_range.is_empty())
+                .map(|segment| {
+                    &source[segment.source_range.start.0 - range.start.0
+                        ..segment.source_range.end.0 - range.start.0]
+                })
+                .collect();
+            assert_eq!(saved, source, "no source byte is lost: {source:?}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_bare_cr_soft_break_also_collapses_without_a_marker() {
+        let source = "a\rb";
+        let range = SourceRange::new(5, 5 + source.len());
+        let block = present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+        assert_eq!(block.visual_text, "a b");
+        assert!(
+            block
+                .source_map
+                .segments
+                .iter()
+                .all(|segment| segment.visibility == Visibility::Visible),
+            "an ordinary line ending has no markup to hide"
+        );
     }
 
     #[test]
