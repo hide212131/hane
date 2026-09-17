@@ -599,10 +599,7 @@ mod tests {
             .iter()
             .map(|line| line.visual_text.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            texts,
-            vec!["a".to_string(), String::new(), "b".to_string()]
-        );
+        assert_eq!(texts, vec!["a".to_string(), String::new(), "b".to_string()]);
     }
 
     #[test]

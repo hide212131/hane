@@ -150,7 +150,11 @@ fn count_line_endings(slice: &str) -> usize {
             }
             b'\r' => {
                 count += 1;
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
             }
             _ => i += 1,
         }

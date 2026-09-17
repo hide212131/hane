@@ -2783,10 +2783,12 @@ mod tests {
             for &(start, end) in hidden {
                 let hidden_range = SourceRange::new(base + start, base + end);
                 assert!(
-                    out.iter().any(|line| line.source_map.segments.iter().any(
-                        |segment| segment.source_range == hidden_range
-                            && segment.visibility == Visibility::HiddenMarkup
-                    )),
+                    out.iter().any(|line| {
+                        line.source_map.segments.iter().any(|segment| {
+                            segment.source_range == hidden_range
+                                && segment.visibility == Visibility::HiddenMarkup
+                        })
+                    }),
                     "expected {hidden_range:?} hidden but addressable for {first_line:?}{second_line:?}"
                 );
             }
@@ -2843,10 +2845,12 @@ mod tests {
             for &(start, end) in &[hidden_marker, hidden_padding] {
                 let hidden_range = SourceRange::new(base + start, base + end);
                 assert!(
-                    out.iter().any(|line| line.source_map.segments.iter().any(
-                        |segment| segment.source_range == hidden_range
-                            && segment.visibility == Visibility::HiddenMarkup
-                    )),
+                    out.iter().any(|line| {
+                        line.source_map.segments.iter().any(|segment| {
+                            segment.source_range == hidden_range
+                                && segment.visibility == Visibility::HiddenMarkup
+                        })
+                    }),
                     "expected {hidden_range:?} hidden but addressable for {first_line:?}{second_line:?}"
                 );
             }

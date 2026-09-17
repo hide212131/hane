@@ -82,7 +82,11 @@ fn line_boundaries(text: &str) -> Vec<Vec<usize>> {
             }
             b'\r' => {
                 let content_end = i;
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 lines.push(grapheme_boundaries(text, start, content_end));
                 start = i;
             }
