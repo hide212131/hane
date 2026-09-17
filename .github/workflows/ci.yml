@@ -22,6 +22,9 @@ jobs:
       - name: Test Rust CI path filter
         run: python3 .github/tests/test_rust_ci_path_filter.py
 
+      - name: Test AADW GUI command policy
+        run: python3 .github/tests/test_aadw_gui_command.py
+
       - name: Detect Rust CI inputs
         id: filter
         shell: bash
