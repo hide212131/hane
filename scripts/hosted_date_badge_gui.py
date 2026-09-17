@@ -137,7 +137,7 @@ def relative_label(value: dt.date, today: dt.date) -> str:
         return f"{value.day}日({weekday})"
     if value.year == today.year:
         return f"{value.month}/{value.day}({weekday})"
-    return f"{value.year}/{value.day}({weekday})" if False else f"{value.year}/{value.month}/{value.day}({weekday})"
+    return f"{value.year}/{value.month}/{value.day}({weekday})"
 
 
 def date_token_pattern(token: str) -> str:
