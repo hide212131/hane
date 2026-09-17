@@ -38,11 +38,12 @@ const FIXTURES: &[MarkdownFixture] = &[
                 NodeKind::TaskMarker(true),
             ],
         ],
-        // The checkbox itself is content, not markup: no presenter hides it yet,
-        // so it stays visible and only the bullet collapses.
+        // The checkbox itself is content, not markup: no presenter hides it
+        // yet, so it stays visible; the bullet collapses and is replaced by a
+        // synthesized `•` the same as any other unordered item's marker.
         markers: &["- ", "- "],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
-        visual_lines: &["[ ] todo", "[x] done"],
+        visual_lines: &["\u{2022} [ ] todo", "\u{2022} [x] done"],
         style_runs: &[&[], &[]],
     },
     MarkdownFixture {
@@ -57,8 +58,97 @@ const FIXTURES: &[MarkdownFixture] = &[
         ]],
         markers: &["- ", "- ", "**", "**"],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
-        visual_lines: &["outer", "  inner bold"],
-        style_runs: &[&[], &[style(Bold, 8, 12)]],
+        // Each item's own synthesized `•` sits after that item's own leading
+        // indentation, ahead of its content; the nested item's indentation is
+        // ordinary visible text, unrelated to the synthesized marker.
+        visual_lines: &["\u{2022} outer", "  \u{2022} inner bold"],
+        // "\u{2022} " is 4 UTF-8 bytes ("•" is 3 bytes, plus the space); style
+        // runs are visual byte offsets, so the nested line's 2-byte
+        // indentation is followed by a 4-byte synthesized marker before
+        // "inner bold" begins at byte 6.
+        style_runs: &[&[], &[style(Bold, 12, 16)]],
+    },
+    MarkdownFixture {
+        name: "ordered list display ignores its own non-sequential source digits",
+        // CommonMark only requires later items to share the first item's
+        // delimiter kind, not an increasing value; the owning list's `start`
+        // (from the first item alone) plus each item's sibling position is
+        // what the display number comes from, never the item's own written
+        // digits.
+        source: "3. 甲\n1. 乙\n9. 丙",
+        tree_paths: &[&[
+            NodeKind::List { start: Some(3) },
+            NodeKind::ListItem { task: None },
+        ]],
+        markers: &["3. ", "1. ", "9. "],
+        block_kinds: &[
+            BlockKind::ListItem,
+            BlockKind::ListItem,
+            BlockKind::ListItem,
+        ],
+        visual_lines: &["3. 甲", "4. 乙", "5. 丙"],
+        style_runs: &[&[], &[], &[]],
+    },
+    MarkdownFixture {
+        name: "ordered list display normalizes a leading zero and a `)` delimiter",
+        // Leading zeros and the `)` delimiter are source bytes only
+        // (`NodeKind::List::start` parses them losslessly to their numeric
+        // value); the synthesized display is always `{n}. `.
+        source: "003) three\n004) four",
+        tree_paths: &[&[
+            NodeKind::List { start: Some(3) },
+            NodeKind::ListItem { task: None },
+        ]],
+        markers: &["003) ", "004) "],
+        block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
+        visual_lines: &["3. three", "4. four"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
+        name: "ordered list display rolls from a single digit to two digits",
+        source: "9. a\n1. b",
+        tree_paths: &[&[
+            NodeKind::List { start: Some(9) },
+            NodeKind::ListItem { task: None },
+        ]],
+        markers: &["9. ", "1. "],
+        block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
+        visual_lines: &["9. a", "10. b"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
+        name: "empty bullet item still gets a synthesized marker",
+        // An item whose opening line ends right after the marker has no
+        // separator byte in its source (see the marker-derivation tests in
+        // `hane_markdown`), but the synthesized bullet is independent of
+        // that width.
+        source: "-\n- next",
+        tree_paths: &[&[
+            NodeKind::List { start: None },
+            NodeKind::ListItem { task: None },
+        ]],
+        markers: &["-", "- "],
+        block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
+        visual_lines: &["\u{2022} ", "\u{2022} next"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
+        name: "ordered list inside a quote keeps the quote prefix and the list marker separate",
+        source: "> 1. 甲\n> 2. 乙",
+        tree_paths: &[&[
+            NodeKind::Quote,
+            NodeKind::List { start: Some(1) },
+            NodeKind::ListItem { task: None },
+        ]],
+        // Every quoted physical line carries its own `> ` prefix (owned by
+        // the quote), separate from that line's own list marker (owned by
+        // its `ListItem`); the two owners are never conflated.
+        markers: &["> ", "1. ", "> ", "2. "],
+        // The quote is the outer top-level construct, so it — not the
+        // nested list — is the indexed block kind for both lines.
+        block_kinds: &[BlockKind::Quote, BlockKind::Quote],
+        visual_lines: &["1. 甲", "2. 乙"],
+        style_runs: &[&[], &[]],
     },
     MarkdownFixture {
         name: "multi-line quote",
@@ -211,8 +301,12 @@ const FIXTURES: &[MarkdownFixture] = &[
         ]],
         markers: &["- ", "**", "**"],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
-        visual_lines: &["bold", "  across"],
-        style_runs: &[&[style(Bold, 0, 5)], &[style(Bold, 0, 8)]],
+        // Only the item's own opening line gets a synthesized `•`; the
+        // continuation line's indentation is ordinary visible text.
+        visual_lines: &["\u{2022} bold", "  across"],
+        // "\u{2022} " is 4 UTF-8 bytes, shifting line 0's Bold run from its
+        // former [0, 5) by 4 bytes.
+        style_runs: &[&[style(Bold, 4, 9)], &[style(Bold, 0, 8)]],
     },
     MarkdownFixture {
         name: "strong emphasis spanning a soft line break inside a quote",

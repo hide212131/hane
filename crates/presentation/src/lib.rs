@@ -1028,6 +1028,25 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
+    // A list item's own bullet/number marker discloses when the caret,
+    // selection or IME touches the item's own directly-owned content — its
+    // opening line and any of its own paragraphs — but not a nested list one
+    // of its children owns. Only one marker ever exists on an item's own
+    // opening line (see `derive_markers`), so without this exclusion, editing
+    // deep inside a nested item's content would also touch every enclosing
+    // ancestor's `source_range` (which spans the nested content too) and
+    // spuriously disclose ancestors' markers the caret never came near.
+    if let Some(owner) = marker.list_owner {
+        return parsed.tree.node(owner).is_some_and(|item| {
+            range_touches(item.source_range, disclosure)
+                && !parsed.tree.children(owner).iter().any(|child| {
+                    parsed.tree.node(*child).is_some_and(|child_node| {
+                        matches!(child_node.kind, NodeKind::List { .. })
+                            && range_touches(child_node.source_range, disclosure)
+                    })
+                })
+        });
+    }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
         return true;
@@ -1036,10 +1055,7 @@ fn marker_is_disclosed(
         let span = parsed.tree.node(*id).expect("indexed node");
         let owns_marker = if has_delimiter_markers(span.kind) {
             span.source_range.start <= marker.start && marker.end <= span.source_range.end
-        } else if matches!(
-            span.kind,
-            NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
-        ) {
+        } else if matches!(span.kind, NodeKind::Heading(_) | NodeKind::CodeBlock) {
             (marker.start == span.source_range.start
                 || (matches!(span.kind, NodeKind::Heading(_))
                     && span
@@ -1105,6 +1121,26 @@ fn marker_edge(
             None
         }
     })
+}
+
+/// The synthesized replacement text for an inactive list item's own hidden
+/// bullet/number marker: `"• "` for an unordered item, or `"{n}. "` for an
+/// ordered item, where `n` is the owning list's `start` plus the item's
+/// zero-based sibling position (`MarkdownTree::list_item_ordinal`) — never
+/// the item's own source digits, which [`NodeKind::List`] documents as
+/// possibly `0`, non-sequential, or leading-zero-padded. The synthesized
+/// delimiter is always `.`, independent of the source's own `.`/`)`; only
+/// disclosing the marker (see [`marker_is_disclosed`]) shows those source
+/// bytes, unchanged, as editable [`Visibility::ExpandedMarkup`].
+fn list_item_label(parsed: &MarkdownParse, item: NodeId) -> Option<String> {
+    let (owner, ordinal) = parsed.tree.list_item_ordinal(item)?;
+    match parsed.tree.node(owner)?.kind {
+        NodeKind::List { start: None } => Some("\u{2022} ".to_owned()),
+        NodeKind::List { start: Some(start) } => {
+            Some(format!("{}. ", start.saturating_add(ordinal as u64)))
+        }
+        _ => None,
+    }
 }
 
 /// Returns true when `segments` tile `range` contiguously, so every source byte
@@ -1278,6 +1314,25 @@ fn present_markdown_from_parse(
             },
             marker_edge(planned, parsed, &shared.projection.nodes),
         );
+        // An inactive list item marker is replaced by one synthesized
+        // bullet/number, anchored at the hidden marker's own start rather
+        // than carrying an independent fake source position (see
+        // `list_item_label`). Disclosing the marker (`expanded` above) shows
+        // its real source bytes directly instead, so the two never render
+        // together.
+        if !expanded
+            && let Some(owner) = planned.list_owner
+            && let Some(label) = list_item_label(parsed, owner)
+        {
+            let visual_start = visual.len();
+            visual.push_str(&label);
+            segments.push(MappingSegment {
+                source_range: SourceRange::empty(marker.start.0),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                visibility: Visibility::Synthesized,
+                marker_edge: None,
+            });
+        }
         source_cursor = marker.end.0;
     }
     if source_cursor < range.end.0 {

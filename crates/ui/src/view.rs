@@ -4389,11 +4389,12 @@ mod tests {
         let lines = presented_lines(&editor);
 
         let line = &lines[0];
-        assert_eq!(line.visual_text, "  item");
+        assert_eq!(line.visual_text, "  \u{2022} item");
         let visual_offset = line.visual_text.find("item").unwrap();
-        // "  - item" hides the bullet `- ` (source offsets 2..4); canonical is
-        // source offset 4, just after the marker and before "item", not
-        // offset 2, just before the marker in the leading indentation.
+        // "  - item" hides the bullet `- ` (source offsets 2..4) and replaces
+        // it with a synthesized `•`; canonical is source offset 4, just after
+        // the marker and before "item", not offset 2, just before the marker
+        // in the leading indentation.
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("- item").unwrap() + 2)
