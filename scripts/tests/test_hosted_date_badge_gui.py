@@ -127,6 +127,84 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             )
         )
 
+    def test_main_loop_recovers_correct_whole_line_when_top1_misreads_weekday(self):
+        # Issue #188: the isolated-function test above (and the pre-fix
+        # implementation) independently picked `best_matches` for the
+        # filename search (top-1, wrong weekday) and for the badge search
+        # (the correct lower-ranked alternate) without ever checking they
+        # describe the *same* bounded alternate. That combined a wrong-rank
+        # filename hypothesis with a different-rank badge hypothesis, so the
+        # actually-correct sidebar row (run #35281283306) was rejected as a
+        # false-FAIL. This test reproduces the same-observation, multi-rank
+        # shape the real `helper_find_all` output has and exercises the
+        # actual main-loop decision sequence end to end.
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures" / "date_badge_vision_alternative_candidates.json"
+        )
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        case = next(c for c in payload["cases"] if c["name"] == "weekday_top1_misread")
+        expected_display = case["expected_display"]
+        expected_badge = case["expected_badge"]
+        correct_line = f"{expected_display} {expected_badge}"
+        self.assertEqual(case["observed_top1_line"], "Charlie.md 2025/9/2(X)")
+
+        top1_wrong_weekday = {
+            "observation_index": 4,
+            "candidate_rank": 0,
+            "confidence": 0.9,
+            "recognized_line": case["observed_top1_line"],
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+        }
+        alternate_correct_line = {
+            "observation_index": 4,
+            "candidate_rank": 2,
+            "confidence": 0.35,
+            "recognized_line": correct_line,
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+        }
+        # `helper_find_all` reports a separate bounding box per search: this
+        # is the same (observation, rank) as `alternate_correct_line`, but
+        # the box for where the badge label itself sits on the line.
+        alternate_correct_line_badge_box = {
+            "observation_index": 4,
+            "candidate_rank": 2,
+            "confidence": 0.35,
+            "recognized_line": correct_line,
+            "bounding_box": {"minX": 0.25, "maxX": 0.45, "minY": 0.50, "maxY": 0.52},
+        }
+        texts_all = [top1_wrong_weekday, alternate_correct_line]
+        badges_all = [alternate_correct_line_badge_box]
+
+        # Old behavior (Issue #188 bug): `best_matches` alone always fixes
+        # rank 0 because it already satisfies the filename-only pattern.
+        (naive_text_match,) = mod.best_matches(texts_all)
+        self.assertEqual(naive_text_match["candidate_rank"], 0)
+        self.assertFalse(mod.recognized_line_matches_expected(naive_text_match, expected_display))
+
+        # Fixed behavior: search every bounded alternate for the observation
+        # against the exact whole-line predicates, per search, before
+        # picking a row kind.
+        split_matches = mod.best_matches_satisfying(
+            texts_all, lambda candidate: mod.recognized_line_matches_expected(candidate, expected_display)
+        )
+        self.assertEqual(split_matches, [])
+        joined_line_matches = mod.best_matches_satisfying(
+            texts_all,
+            lambda candidate: mod.joined_composition_is_exact(
+                candidate.get("recognized_line", ""), expected_display, expected_badge
+            ),
+        )
+        self.assertEqual(len(joined_line_matches), 1)
+        joined_line_candidate = joined_line_matches[0]
+        self.assertEqual(joined_line_candidate["candidate_rank"], 2)
+
+        full_line = joined_line_candidate.get("recognized_line", "")
+        joined_candidate = mod.joined_row_candidate(full_line, badges_all)
+        self.assertIs(joined_candidate, alternate_correct_line_badge_box)
+
+        display_match = mod.display_geometry_match(joined_line_candidate, use_full_line=False, joined_row=True)
+        self.assertTrue(mod.badge_is_strictly_right(display_match, joined_candidate))
+
     def test_vision_alternative_candidate_fixture_recovers_missing_top1_filename_match(self):
         fixture_path = (
             Path(__file__).resolve().parent / "fixtures" / "date_badge_vision_alternative_candidates.json"

@@ -132,6 +132,30 @@ def best_matches(candidates: list[dict]) -> list[dict]:
     return [group[0] for group in group_candidates_by_observation(candidates).values()]
 
 
+def best_matches_satisfying(candidates: list[dict], predicate) -> list[dict]:
+    """Reduce to the most-confident candidate per observation whose own line satisfies `predicate`.
+
+    Unlike `best_matches`, this does not first fix the most-confident match
+    to a looser search pattern (e.g. a filename prefix) and then test it
+    against a stricter whole-line predicate. A less-confident bounded
+    alternate can be the only one whose own `recognized_line` satisfies
+    `predicate` exactly, while a more-confident alternate for the same
+    observation only matched the looser pattern by misreading a different
+    part of that same line -- e.g. the filename prefix reads correctly but
+    the weekday glyph does not (Issue #188). Testing every bounded alternate
+    against `predicate` before ranking keeps the observation's OCR
+    hypothesis self-consistent, and, mirroring `best_matches`, never prefers
+    a less-confident alternate once a more-confident one already satisfies
+    `predicate` (fail-closed).
+    """
+    result = []
+    for group in group_candidates_by_observation(candidates).values():
+        match = next((candidate for candidate in group if predicate(candidate)), None)
+        if match is not None:
+            result.append(match)
+    return result
+
+
 def nearest_same_row(text_match: dict, badge_matches: list[dict]) -> dict | None:
     if not badge_matches:
         return None
@@ -158,6 +182,13 @@ def exact_label_matches(candidates: list[dict], expected: str) -> list[dict]:
     observation like `2026/1/2(金)` can be returned for an expected label of
     `1/2(金)`. Only a full recognized-line match proves the badge itself, not
     a longer line that merely contains the label as a substring.
+
+    Callers should pass every bounded alternate for the search (not a
+    per-observation reduction like `best_matches`), so an exact-matching
+    lower-confidence alternate is never discarded in favor of a
+    higher-confidence alternate for the same observation that only matched
+    the looser search pattern (Issue #188). `nearest_same_row` still performs
+    the row disambiguation afterwards.
     """
     return [candidate for candidate in candidates if recognized_line_matches_expected(candidate, expected)]
 
@@ -169,6 +200,13 @@ def joined_row_candidate(full_line: str, badge_candidates: list[dict]) -> dict |
     `recognized_line` (e.g. `Alpha.md 本日`) instead of two observations. Such
     a badge candidate's own `recognized_line` equals the row's full line, not
     just the badge label, so it cannot be found by `exact_label_matches`.
+
+    Callers should pass every bounded alternate for the badge search (not a
+    per-observation reduction like `best_matches`), so the alternate whose
+    own line truly equals `full_line` is never missed in favor of a
+    higher-confidence alternate for the same observation that matched the
+    badge-label search pattern without being the same whole line (Issue
+    #188).
     """
     normalized_full = normalized_ocr_text(full_line)
     return next(
@@ -436,8 +474,14 @@ def main() -> int:
                                         # `best_matches` reduces Vision's bounded per-candidate
                                         # matches (Issue #187: top-1 alone can misread a tiny
                                         # sidebar glyph) to the single most-confident match per
-                                        # OCR observation. The `_all` lists are kept only as
-                                        # read-only evidence for fail-closed diagnostics below.
+                                        # OCR observation. The `_all` lists are kept as read-only
+                                        # evidence for fail-closed diagnostics, and are also
+                                        # re-searched directly below (via
+                                        # `best_matches_satisfying`) whenever a stricter
+                                        # whole-line predicate must consider every bounded
+                                        # alternate rather than only the one alternate
+                                        # `best_matches` picked for a looser pattern search
+                                        # (Issue #188).
                                         texts_all = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
                                         texts = best_matches(texts_all)
                                         badges_all = badge_cache.setdefault(
@@ -446,7 +490,6 @@ def main() -> int:
                                                 helper, helper_digest, screenshot, re.escape(case["badge_label"])
                                             ),
                                         )
-                                        badges_raw = best_matches(badges_all)
                                         token_pattern = date_token_pattern(case["date_token"])
                                         date_matches_all = date_cache.setdefault(
                                             case["date_token"],
@@ -468,14 +511,35 @@ def main() -> int:
                                         # Vision may keep the filename and badge as separate
                                         # observations (split row) or join them into one
                                         # `recognized_line` such as `Alpha.md 本日` (joined
-                                        # row). `joined_candidate` is the badge observation
-                                        # that is literally that same OCR line, if any.
-                                        joined_candidate = joined_row_candidate(full_line, badges_raw)
+                                        # row). Which bounded alternate is the correct whole-line
+                                        # reading of that row is decided per predicate directly
+                                        # against each candidate's own `recognized_line`, never
+                                        # by mixing `text_match`'s own (possibly wrong-rank) line
+                                        # with a candidate an independent badge search happened
+                                        # to pick. `text_match`/`full_line` are only replaced by
+                                        # the specific alternate that itself satisfies the
+                                        # accepted row kind.
                                         if expected_display is not None:
-                                            is_split_row = recognized_line_matches_expected(text_match, expected_display)
-                                            is_joined_row = joined_candidate is not None and joined_composition_is_exact(
-                                                full_line, expected_display, case["badge_label"]
+                                            split_matches = best_matches_satisfying(
+                                                texts_all,
+                                                lambda candidate: recognized_line_matches_expected(candidate, expected_display),
                                             )
+                                            split_candidate = split_matches[0] if split_matches else None
+                                            joined_line_matches = best_matches_satisfying(
+                                                texts_all,
+                                                lambda candidate: joined_composition_is_exact(
+                                                    candidate.get("recognized_line", ""), expected_display, case["badge_label"]
+                                                ),
+                                            )
+                                            joined_line_candidate = joined_line_matches[0] if joined_line_matches else None
+                                            if split_candidate is not None:
+                                                is_split_row, is_joined_row = True, False
+                                                text_match = split_candidate
+                                            elif joined_line_candidate is not None:
+                                                is_split_row, is_joined_row = False, True
+                                                text_match = joined_line_candidate
+                                            else:
+                                                is_split_row = is_joined_row = False
                                             if not is_split_row and not is_joined_row:
                                                 scenario_steps.append(step(
                                                     case["name"],
@@ -491,9 +555,25 @@ def main() -> int:
                                                 ))
                                                 continue
                                         else:
-                                            is_joined_row = joined_candidate is not None and joined_composition_ends_with_badge(
-                                                full_line, case["badge_label"]
+                                            joined_line_matches = best_matches_satisfying(
+                                                texts_all,
+                                                lambda candidate: joined_composition_ends_with_badge(
+                                                    candidate.get("recognized_line", ""), case["badge_label"]
+                                                ),
                                             )
+                                            joined_line_candidate = joined_line_matches[0] if joined_line_matches else None
+                                            is_joined_row = joined_line_candidate is not None
+                                            if is_joined_row:
+                                                text_match = joined_line_candidate
+                                        full_line = text_match.get("recognized_line", "")
+
+                                        # `joined_candidate` is the badge observation whose own
+                                        # OCR line is literally that same accepted row, searched
+                                        # across every bounded alternate in `badges_all` (not a
+                                        # pre-reduced rank-0-first subset) so the badge substring
+                                        # geometry comes from the same OCR hypothesis as
+                                        # `text_match`, used only for its bounding box.
+                                        joined_candidate = joined_row_candidate(full_line, badges_all) if is_joined_row else None
 
                                         display_match = display_geometry_match(
                                             text_match,
@@ -517,9 +597,9 @@ def main() -> int:
                                             ))
                                             continue
                                         badge_candidates = (
-                                            [joined_candidate]
+                                            ([joined_candidate] if joined_candidate is not None else [])
                                             if is_joined_row
-                                            else exact_label_matches(badges_raw, case["badge_label"])
+                                            else exact_label_matches(badges_all, case["badge_label"])
                                         )
                                         badge_match = nearest_same_row(display_match, badge_candidates)
                                         if badge_match is None:
