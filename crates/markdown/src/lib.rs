@@ -248,6 +248,13 @@ pub struct MarkdownParse {
     /// Padding removed from inline code after container prefixes and line
     /// endings are interpreted. Derived against the parser's code content.
     pub code_padding: Vec<SourceRange>,
+    /// Spaces/tabs a soft or hard line break makes insignificant: the single
+    /// trailing space CommonMark folds into a soft break, and the leading
+    /// indentation of the physical line either break kind continues onto.
+    /// Not markup — a soft break in particular carries none, see
+    /// [`NodeKind::SoftBreak`] — so kept separate from `markers` the same way
+    /// `code_padding` is, while still hidden from rendered presentation.
+    pub line_break_padding: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,6 +703,64 @@ fn code_padding(
     padding
 }
 
+/// Spaces/tabs a soft or hard line break makes insignificant, so presentation
+/// can hide them like other derived padding while keeping their source bytes
+/// addressable. Two distinct sources, per the CommonMark line-break rules:
+///
+/// - The single trailing space/tab CommonMark folds into a soft break (two or
+///   more would have made it a hard break instead). pulldown-cmark's own
+///   `Text` item ends before this byte and its `SoftBreak` item starts at the
+///   line ending itself, so — unlike a hard break's own syntax, which is a
+///   real `HardBreak` item covering it — this one byte is not part of any
+///   parsed item's range at all; it is recovered here directly from `source`.
+/// - The leading indentation of the physical line either break kind
+///   continues onto: CommonMark drops any amount of it when forming a
+///   paragraph's inline content, independent of the break that precedes it.
+fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
+    let mut padding = Vec::new();
+    for (id, span) in tree
+        .iter()
+        .filter(|(_, node)| matches!(node.kind, NodeKind::SoftBreak | NodeKind::HardBreak))
+    {
+        let end = span.source_range.end.0.saturating_sub(range.start.0);
+        if end > source.len() {
+            continue;
+        }
+        if span.kind == NodeKind::SoftBreak {
+            let break_start = span.source_range.start.0;
+            if break_start > range.start.0
+                && let Some(byte) = source
+                    .as_bytes()
+                    .get(break_start - range.start.0 - 1)
+                    .copied()
+                && matches!(byte, b'\t' | 0x0b | 0x0c | b' ')
+            {
+                padding.push(SourceRange::new(break_start - 1, break_start));
+            }
+        }
+        let Some(containers) = ancestor_containers(tree, id, range, source) else {
+            continue;
+        };
+        // `end` is the byte right after the line ending this break owns (see
+        // the `HardBreak` marker derivation above), i.e. the start of the
+        // physical line it continues onto.
+        let line_start = end;
+        let line = source
+            .get(line_start..)
+            .and_then(|rest| markdown_lines(rest).next())
+            .unwrap_or("");
+        let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes()) else {
+            continue;
+        };
+        let before = cursor.byte;
+        cursor.indent(line.as_bytes(), line.len());
+        if cursor.byte > before {
+            padding.push(absolute_range(range.start.0 + line_start, before..cursor.byte));
+        }
+    }
+    padding
+}
+
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
     quote_markers: Vec<(SourceRange, NodeId)>,
@@ -1018,6 +1083,7 @@ pub fn parse_document(
     let (tree, codes) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
+    let line_break_padding = line_break_padding(&tree, source_range, source);
     MarkdownParse {
         revision,
         source_range,
@@ -1026,6 +1092,7 @@ pub fn parse_document(
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
         code_padding,
+        line_break_padding,
     }
 }
 

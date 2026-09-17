@@ -111,6 +111,46 @@ fn hard_break_never_forms_inside_code_spans_html_tags_or_at_block_end() {
     }
 }
 
+/// CommonMark drops the leading indentation of the physical line a break
+/// continues onto (regardless of break kind), and the single trailing
+/// space/tab a soft break folds away, so neither should remain as visible
+/// whitespace in rendered presentation. Both stay real source bytes —
+/// addressable and disclosable — via `line_break_padding`, not `markers`,
+/// since a soft break itself carries no markup (see `NodeKind::SoftBreak`).
+#[test]
+fn line_break_padding_hides_insignificant_spaces_around_breaks_only() {
+    for (source, expected) in [
+        ("foo  \n     bar", vec![(6, 11)]),
+        ("foo\\\n     bar", vec![(5, 10)]),
+        ("foo \n baz", vec![(3, 4), (5, 6)]),
+        // No padding to hide when neither side has insignificant whitespace.
+        ("foo\nbar", vec![]),
+    ] {
+        let base = 37;
+        let parsed = parse_document(
+            Revision(1),
+            SourceRange::new(base, base + source.len()),
+            source,
+        );
+        let mut actual = parsed.line_break_padding.clone();
+        actual.sort_by_key(|range| range.start);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(start, end)| SourceRange::new(base + start, base + end))
+            .collect();
+        assert_eq!(actual, expected, "source: {source:?}");
+        for padding in &parsed.line_break_padding {
+            assert!(
+                parsed
+                    .markers
+                    .iter()
+                    .all(|marker| !padding.intersects(*marker)),
+                "line-break padding must not overlap derived markers: {padding:?}"
+            );
+        }
+    }
+}
+
 /// CommonMark resolves emphasis across a hard break the same way it does
 /// across a soft break: the delimiter pair spans both physical lines.
 #[test]
