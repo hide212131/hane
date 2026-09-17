@@ -2036,7 +2036,9 @@ impl EditorView {
             cx.spawn(async move |view, cx| {
                 let parse = cx
                     .background_executor()
-                    .spawn(async move { parse_joined_span(&snapshot, content, revision) })
+                    .spawn(async move {
+                        parse_joined_span(&snapshot, content, source_range, revision)
+                    })
                     .await;
                 let _ = view.update(cx, |view, cx| {
                     // Release capacity even for an old document. Dropping a
@@ -4787,6 +4789,7 @@ mod tests {
             let parse = parse_joined_span(
                 view.editor().document(),
                 span,
+                indexed.source_range,
                 view.editor().document().revision(),
             )
             .unwrap();
@@ -5170,8 +5173,13 @@ mod tests {
         let document = editor.document();
         let span = block_line_span(document, &second).expect("block spans lines");
         let content_end = span.end - trailing_blank_lines(document, &span);
-        let joined = parse_joined_span(document, span.start..content_end, document.revision())
-            .expect("the whole span parses");
+        let joined = parse_joined_span(
+            document,
+            span.start..content_end,
+            second.source_range,
+            document.revision(),
+        )
+        .expect("the whole span parses");
 
         // Aimed at the 3rd column: inside "bold" once the opening `**` hides
         // as a marker, but still inside the literal `**` when it does not —

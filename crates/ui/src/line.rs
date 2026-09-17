@@ -191,9 +191,20 @@ fn block_context(
     } else {
         render.clone()
     };
+    // Clipped to the block's own source range as a defensive bound: a
+    // `RopeBuffer` line and a block both tile the document on the same
+    // canonical line endings, so in the ordinary case a line's range already
+    // sits inside its owning block's range and this clip changes nothing.
+    let block_range = block.source_range;
     let ranges = context
         .clone()
-        .map(|line| document.line_range(LineId(line)).ok())
+        .map(|line| {
+            let line_range = document.line_range(LineId(line)).ok()?;
+            Some(SourceRange::new(
+                line_range.start.0.max(block_range.start.0),
+                line_range.end.0.min(block_range.end.0),
+            ))
+        })
         .collect::<Option<Vec<_>>>()?;
     let texts = ranges
         .iter()
@@ -574,6 +585,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_cr_paragraph_boundary_renders_its_own_blank_line_like_lf() {
+        // `RopeBuffer` and `BlockIndex` split physical lines on a bare CR the
+        // same way they do on `\n`: "a\r\rb" is three physical lines ("a\r",
+        // the blank "\r", and "b"), the first two tiling into the paragraph
+        // "a" and the third into the paragraph "b" — the same shape
+        // "a\n\nb" already has. Neither block ever presents the sibling
+        // block's bytes.
+        let editor = Editor::new("a\r\rb");
+        let index = BlockIndex::from_buffer(editor.document());
+        assert_eq!(index.len(), 2, "a bare-CR blank line splits the paragraph");
+        let texts = presented_lines(&editor)
+            .iter()
+            .map(|line| line.visual_text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
+    }
+
+    #[test]
     fn shared_line_boundary_belongs_only_to_the_following_line() {
         let first = SourceRange::new(0, 4);
         let second = SourceRange::new(4, 8);
@@ -876,6 +908,7 @@ mod tests {
         let joined = hane_presentation::parse_joined_span(
             document,
             span.start..content_end,
+            block.source_range,
             document.revision(),
         )
         .expect("the whole span parses");

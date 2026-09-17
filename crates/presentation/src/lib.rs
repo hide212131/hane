@@ -1626,6 +1626,7 @@ impl ProjectionIndex {
             .markers
             .iter()
             .chain(&parsed.code_padding)
+            .chain(&parsed.line_break_padding)
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
@@ -1691,9 +1692,14 @@ pub fn parse_joined_block(lines: &[BlockLine<'_>], revision: Revision) -> Joined
 /// cost scales with the block's size, which for a joinable block has no
 /// upper bound. `content` excludes the block's trailing blank run, matching
 /// what [`present_block`] itself treats as the construct's own lines.
+///
+/// The read is clipped to `block_source_range` as a defensive bound: `content`
+/// names whole `RopeBuffer` lines, which tile the document the same way
+/// blocks do, so in the ordinary case the clip changes nothing.
 pub fn parse_joined_span(
     document: &RopeBuffer,
     content: Range<usize>,
+    block_source_range: SourceRange,
     revision: Revision,
 ) -> Option<JoinedParse> {
     if content.is_empty() {
@@ -1707,7 +1713,13 @@ pub fn parse_joined_span(
         .line_range(hane_document::LineId(content.end - 1))
         .ok()?
         .end;
-    let joined_range = SourceRange::new(start.0, end.0);
+    let joined_range = SourceRange::new(
+        start.0.max(block_source_range.start.0),
+        end.0.min(block_source_range.end.0),
+    );
+    if joined_range.is_empty() {
+        return None;
+    }
     let joined_source = document.text(joined_range).ok()?;
     let parsed = parse_document(revision, joined_range, &joined_source);
     let projection = ProjectionIndex::new(&parsed);
@@ -2636,6 +2648,209 @@ mod tests {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range == SourceRange::new(32, 33)
         }));
+    }
+
+    #[test]
+    fn a_bare_cr_hard_break_hides_its_syntax_without_touching_the_line_ending() {
+        // `RopeBuffer` and `BlockIndex` now split physical lines on a bare CR
+        // exactly like `\n`/`\r\n`, so `line.rs` never hands a range spanning
+        // two physical lines to the per-line presenter: a hard break's syntax
+        // and its terminator both sit at the very end of their own line's
+        // range, same as an LF-based hard break's. A hard break only forms
+        // with a following line to break to (see
+        // `hard_break_never_forms_inside_code_spans_html_tags_or_at_block_end`),
+        // so this goes through the real two-line joined pipeline.
+        for (first_line, second_line) in [("a  \r", "b"), ("a\\\r", "b")] {
+            let base = 5;
+            let first_range = SourceRange::new(base, base + first_line.len());
+            let second_range =
+                SourceRange::new(first_range.end.0, first_range.end.0 + second_line.len());
+            let lines = [
+                BlockLine {
+                    line: 0,
+                    range: first_range,
+                    text: first_line,
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: 1,
+                    range: second_range,
+                    text: second_line,
+                    disclosure: None,
+                },
+            ];
+            let joined = parse_joined_block(&lines, Revision(1));
+            assert!(
+                joined
+                    .parsed
+                    .tree
+                    .iter()
+                    .any(|(_, node)| node.kind == NodeKind::HardBreak),
+                "a following line makes this a hard break: {first_line:?}"
+            );
+            let mut out = Vec::new();
+            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            // The break syntax ("  " or "\") hides as markup; the terminator
+            // is trimmed like any other trailing line ending, not turned into
+            // a literal control character or a synthesized space.
+            assert_eq!(out[0].visual_text, "a", "source: {first_line:?}");
+            assert_eq!(out[1].visual_text, "b");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_bare_cr_soft_break_keeps_each_physical_line_its_own_visible_text() {
+        let base = 5;
+        let first_range = SourceRange::new(base, base + 2);
+        let second_range = SourceRange::new(first_range.end.0, first_range.end.0 + 1);
+        let lines = [
+            BlockLine {
+                line: 0,
+                range: first_range,
+                text: "a\r",
+                disclosure: None,
+            },
+            BlockLine {
+                line: 1,
+                range: second_range,
+                text: "b",
+                disclosure: None,
+            },
+        ];
+        let joined = parse_joined_block(&lines, Revision(1));
+        assert!(
+            joined
+                .parsed
+                .tree
+                .iter()
+                .any(|(_, node)| node.kind == NodeKind::SoftBreak),
+            "an ordinary bare-CR line ending is a soft break"
+        );
+        let mut out = Vec::new();
+        present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+        assert_eq!(out[0].visual_text, "a");
+        assert_eq!(out[1].visual_text, "b");
+        assert!(
+            out[0]
+                .source_map
+                .segments
+                .iter()
+                .all(|segment| segment.visibility == Visibility::Visible),
+            "an ordinary line ending has no markup to hide"
+        );
+    }
+
+    #[test]
+    fn line_break_padding_hides_insignificant_spaces_from_rendered_presentation() {
+        // CommonMark drops leading indentation of the line a break continues
+        // onto, and the single trailing space/tab a soft break folds away
+        // (spec §6.6/§6.7); neither should remain as extra visible whitespace,
+        // but both stay addressable source bytes disclosed like other markup.
+        for (first_line, second_line, expected_first, expected_second, hidden) in [
+            ("foo  \n", "     bar", "foo", "bar", &[(6, 11)][..]),
+            ("foo\\\n", "     bar", "foo", "bar", &[(5, 10)][..]),
+            ("foo \n", " baz", "foo", "baz", &[(3, 4), (5, 6)][..]),
+        ] {
+            let base = 12;
+            let first_range = SourceRange::new(base, base + first_line.len());
+            let second_range =
+                SourceRange::new(first_range.end.0, first_range.end.0 + second_line.len());
+            let lines = [
+                BlockLine {
+                    line: 0,
+                    range: first_range,
+                    text: first_line,
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: 1,
+                    range: second_range,
+                    text: second_line,
+                    disclosure: None,
+                },
+            ];
+            let joined = parse_joined_block(&lines, Revision(1));
+            let mut out = Vec::new();
+            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            assert_eq!(
+                out[0].visual_text, expected_first,
+                "source: {first_line:?}{second_line:?}"
+            );
+            assert_eq!(
+                out[1].visual_text, expected_second,
+                "source: {first_line:?}{second_line:?}"
+            );
+            for &(start, end) in hidden {
+                let hidden_range = SourceRange::new(base + start, base + end);
+                assert!(
+                    out.iter().any(|line| line.source_map.segments.iter().any(
+                        |segment| segment.source_range == hidden_range
+                            && segment.visibility == Visibility::HiddenMarkup
+                    )),
+                    "expected {hidden_range:?} hidden but addressable for {first_line:?}{second_line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn line_break_padding_hides_lazy_continuation_indentation_from_rendered_presentation() {
+        // Lazy continuation lines drop some (quote) or all (list, under-indented)
+        // ancestor container prefixes, but pulldown-cmark still folds them into
+        // the same paragraph as an ordinary soft break, so their leading
+        // whitespace must disappear from inactive visual text the same way — all
+        // while every source byte, including the hidden padding, stays mapped.
+        for (first_line, second_line, hidden_marker, hidden_padding) in [
+            ("> foo\n", "  bar", (0, 2), (6, 8)),
+            ("- foo\n", " bar", (0, 2), (6, 7)),
+        ] {
+            let base = 12;
+            let first_range = SourceRange::new(base, base + first_line.len());
+            let second_range =
+                SourceRange::new(first_range.end.0, first_range.end.0 + second_line.len());
+            let lines = [
+                BlockLine {
+                    line: 0,
+                    range: first_range,
+                    text: first_line,
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: 1,
+                    range: second_range,
+                    text: second_line,
+                    disclosure: None,
+                },
+            ];
+            let joined = parse_joined_block(&lines, Revision(1));
+            let mut out = Vec::new();
+            present_joined_run(&lines, Revision(1), 26.0, &(0..2), Some(&joined), None, &mut out);
+            assert_eq!(
+                out[0].visual_text, "foo",
+                "source: {first_line:?}{second_line:?}"
+            );
+            assert_eq!(
+                out[1].visual_text, "bar",
+                "source: {first_line:?}{second_line:?}"
+            );
+            for (line, range) in [(&lines[0], first_range), (&lines[1], second_range)] {
+                assert!(
+                    segments_tile_range(range, &out[line.line].source_map.segments),
+                    "source bytes must stay fully mapped for line {}: {first_line:?}{second_line:?}",
+                    line.line
+                );
+            }
+            for &(start, end) in &[hidden_marker, hidden_padding] {
+                let hidden_range = SourceRange::new(base + start, base + end);
+                assert!(
+                    out.iter().any(|line| line.source_map.segments.iter().any(
+                        |segment| segment.source_range == hidden_range
+                            && segment.visibility == Visibility::HiddenMarkup
+                    )),
+                    "expected {hidden_range:?} hidden but addressable for {first_line:?}{second_line:?}"
+                );
+            }
+        }
     }
 
     #[test]
