@@ -119,6 +119,17 @@ def recognized_line_matches_expected(match: dict, expected: str) -> bool:
     return normalized_ocr_text(match.get("recognized_line", "")) == normalized_ocr_text(expected)
 
 
+def exact_label_matches(candidates: list[dict], expected: str) -> list[dict]:
+    """Keep only candidates whose whole OCR line equals expected, fail-closed.
+
+    `helper_find_all` locates candidates by substring search, so a badge
+    observation like `2026/1/2(金)` can be returned for an expected label of
+    `1/2(金)`. Only a full recognized-line match proves the badge itself, not
+    a longer line that merely contains the label as a substring.
+    """
+    return [candidate for candidate in candidates if recognized_line_matches_expected(candidate, expected)]
+
+
 def display_geometry_match(match: dict, *, use_full_line: bool) -> dict:
     """Return geometry representing the whole visible filename when needed.
 
@@ -318,7 +329,12 @@ def main() -> int:
                                         texts = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
                                         badges = badge_cache.setdefault(
                                             case["badge_label"],
-                                            helper_find_all(helper, helper_digest, screenshot, re.escape(case["badge_label"])),
+                                            exact_label_matches(
+                                                helper_find_all(
+                                                    helper, helper_digest, screenshot, re.escape(case["badge_label"])
+                                                ),
+                                                case["badge_label"],
+                                            ),
                                         )
                                         token_pattern = date_token_pattern(case["date_token"])
                                         date_matches = date_cache.setdefault(

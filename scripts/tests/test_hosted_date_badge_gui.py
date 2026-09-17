@@ -51,6 +51,15 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertFalse(mod.recognized_line_matches_expected(separator_left, "Alpha.md"))
         self.assertFalse(mod.recognized_line_matches_expected(badge_joined, "Alpha.md"))
 
+    def test_exact_label_matches_rejects_longer_recognized_line(self):
+        expected = "1/2(金)"
+        exact = {"recognized_line": "1/2(金)"}
+        longer_prefix = {"recognized_line": "2026/1/2(金)"}
+        suffix = {"recognized_line": "1/2(金)本日"}
+        prefix = {"recognized_line": "本日1/2(金)"}
+        filtered = mod.exact_label_matches([longer_prefix, suffix, prefix, exact], expected)
+        self.assertEqual(filtered, [exact])
+
     def test_long_name_uses_full_recognized_line_geometry(self):
         prefix_match = {
             "matched_text": "This Is",
