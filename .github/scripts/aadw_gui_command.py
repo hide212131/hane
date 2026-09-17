@@ -54,16 +54,38 @@ def trusted_procedure(path: str | Path) -> str:
     return values[0]
 
 
-def request_identity(pr_number: int, head_sha: str, execution_context: str, procedure: str) -> str:
-    """Canonical identity used to suppress equivalent hosted GUI requests."""
+def _require_sha(value: str, name: str) -> str:
+    if not isinstance(value, str) or SHA_RE.fullmatch(value) is None:
+        raise RequestError(f"{name} is not a lowercase full 40-hex SHA")
+    return value
+
+
+def request_identity(
+    pr_number: int,
+    head_sha: str,
+    base_sha: str,
+    execution_context: str,
+    procedure: str,
+) -> str:
+    """Canonical request identity, including the observed current base context."""
     return (
-        f"pr={pr_number};head={head_sha};context={execution_context};procedure={procedure}"
+        f"pr={pr_number};head={head_sha};base={base_sha};"
+        f"context={execution_context};procedure={procedure}"
     )
 
 
-def run_name(pr_number: int, head_sha: str, execution_context: str, procedure: str) -> str:
-    """Workflow run title containing the full request identity without lossy SHA truncation."""
-    return f"{RUN_NAME_PREFIX} PR #{pr_number} @ {head_sha} {execution_context} {procedure}"
+def run_name(
+    pr_number: int,
+    head_sha: str,
+    base_sha: str,
+    execution_context: str,
+    procedure: str,
+) -> str:
+    """Workflow run title containing the complete routed request identity."""
+    return (
+        f"{RUN_NAME_PREFIX} PR #{pr_number} @ {head_sha} base {base_sha} "
+        f"{execution_context} {procedure}"
+    )
 
 
 def build_request(
@@ -73,6 +95,7 @@ def build_request(
     actor: str,
     permission: str,
     pr: dict[str, Any],
+    base_sha: str,
     execution_context: str,
     procedure: str,
     comment_id: int,
@@ -108,9 +131,8 @@ def build_request(
             f"only same-repository Pull Requests may be dispatched: {head_repo_name or 'unknown'}"
         )
 
-    head_sha = head.get("sha", "")
-    if not isinstance(head_sha, str) or SHA_RE.fullmatch(head_sha) is None:
-        raise RequestError("current Pull Request head SHA is not a lowercase full 40-hex SHA")
+    head_sha = _require_sha(head.get("sha", ""), "current Pull Request head SHA")
+    current_base_sha = _require_sha(base_sha, "current target branch SHA")
     if not isinstance(head.get("ref"), str) or not head["ref"]:
         raise RequestError("could not resolve Pull Request head ref")
     if not isinstance(base.get("ref"), str) or not base["ref"]:
@@ -119,12 +141,17 @@ def build_request(
     return {
         "pr_number": str(pr_number),
         "target_head_sha": head_sha,
+        "request_base_sha": current_base_sha,
         "execution_context": execution_context,
         "procedure": procedure,
         "request_comment_id": str(comment_id),
         "request_actor": actor,
-        "request_identity": request_identity(pr_number, head_sha, execution_context, procedure),
-        "run_name": run_name(pr_number, head_sha, execution_context, procedure),
+        "request_identity": request_identity(
+            pr_number, head_sha, current_base_sha, execution_context, procedure
+        ),
+        "run_name": run_name(
+            pr_number, head_sha, current_base_sha, execution_context, procedure
+        ),
     }
 
 
@@ -167,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     request_parser.add_argument("--pr-number", required=True, type=int)
     request_parser.add_argument("--actor", required=True)
     request_parser.add_argument("--permission", required=True)
+    request_parser.add_argument("--base-sha", required=True)
     request_parser.add_argument("--execution-context", required=True)
     request_parser.add_argument("--procedure", required=True)
     request_parser.add_argument("--comment-id", required=True, type=int)
@@ -191,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                 actor=args.actor,
                 permission=args.permission,
                 pr=_read_json_stdin(),
+                base_sha=args.base_sha,
                 execution_context=args.execution_context,
                 procedure=args.procedure,
                 comment_id=args.comment_id,
