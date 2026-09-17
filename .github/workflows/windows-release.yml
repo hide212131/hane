@@ -3,13 +3,66 @@ name: Release builds
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (例: v0.8.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: Resolve and validate release tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "Manual releases must be run from the main branch." >&2
+              exit 1
+            fi
+            release_tag="$INPUT_VERSION"
+          else
+            release_tag="$GITHUB_REF_NAME"
+          fi
+
+          if ! [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release version: $release_tag" >&2
+            echo "Expected format: v0.8.0" >&2
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+              echo "Tag already exists: $release_tag" >&2
+              exit 1
+            fi
+
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$release_tag" \
+              -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
   build-windows:
     name: Build hane-windows-x64
+    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +95,7 @@ jobs:
 
   build-macos:
     name: Build hane-macos-arm64
+    needs: prepare
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
@@ -78,8 +132,8 @@ jobs:
 
   release:
     name: Publish release assets
-    if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - prepare
       - build-windows
       - build-macos
     runs-on: ubuntu-latest
@@ -102,14 +156,15 @@ jobs:
       - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/*.zip \
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/*.zip \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" release-assets/*.zip \
+            gh release create "$RELEASE_TAG" release-assets/*.zip \
               --generate-notes \
-              --title "$GITHUB_REF_NAME" \
+              --title "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY"
           fi
