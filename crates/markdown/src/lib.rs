@@ -79,7 +79,17 @@ pub enum NodeKind {
     InlineHtml,
     FootnoteReference,
     TaskMarker(bool),
-    Break,
+    /// A CommonMark soft line break: an ordinary source line ending inside a
+    /// paragraph's inline content. Purely a source-level join point, not
+    /// markup and not the viewport's own wrap concept (`LineWrap::Soft` in
+    /// `hane_presentation`, which is display-width wrapping and unrelated).
+    SoftBreak,
+    /// A CommonMark hard line break: two or more trailing spaces, or a
+    /// trailing backslash, before a line ending inside a paragraph's inline
+    /// content. Unlike [`Self::SoftBreak`], the syntax bytes preceding the
+    /// line ending are markup and can be hidden/disclosed like other
+    /// delimiters.
+    HardBreak,
     /// A construct with no modeled kind. Retains its source range so callers can
     /// still account for the bytes.
     Unsupported,
@@ -120,7 +130,8 @@ impl NodeKind {
                 | Self::InlineHtml
                 | Self::FootnoteReference
                 | Self::TaskMarker(_)
-                | Self::Break
+                | Self::SoftBreak
+                | Self::HardBreak
         )
     }
 }
@@ -830,6 +841,22 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             markers.push(SourceRange::new(end - marker_len, end));
         }
     }
+    for (_, span) in tree.iter().filter(|(_, node)| node.kind == NodeKind::HardBreak) {
+        let start = span.source_range.start.0;
+        let end = span.source_range.end.0;
+        if start < range.start.0 || end > range.end.0 || start >= end {
+            continue;
+        }
+        // pulldown-cmark's hard-break range covers the break syntax (trailing
+        // spaces or a backslash) plus the physical line ending it precedes.
+        // Only the syntax is markup; the line-ending bytes stay ordinary
+        // source so they remain addressable/preserved rather than hidden.
+        let text = &source[start - range.start.0..end - range.start.0];
+        let marker_len = text.trim_end_matches(['\r', '\n']).len();
+        if marker_len > 0 {
+            markers.push(SourceRange::new(start, start + marker_len));
+        }
+    }
     markers.sort_by_key(|marker| (marker.start, marker.end));
     let mut merged: Vec<SourceRange> = Vec::with_capacity(markers.len());
     for marker in markers {
@@ -962,8 +989,11 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
             Event::FootnoteReference(_) => {
                 push(&mut nodes, &open, NodeKind::FootnoteReference, range);
             }
-            Event::SoftBreak | Event::HardBreak => {
-                push(&mut nodes, &open, NodeKind::Break, range);
+            Event::SoftBreak => {
+                push(&mut nodes, &open, NodeKind::SoftBreak, range);
+            }
+            Event::HardBreak => {
+                push(&mut nodes, &open, NodeKind::HardBreak, range);
             }
             Event::Rule => {
                 push(&mut nodes, &open, NodeKind::Rule, range);

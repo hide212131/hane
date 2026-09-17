@@ -227,6 +227,41 @@ const FIXTURES: &[MarkdownFixture] = &[
         style_runs: &[&[style(Bold, 0, 5)], &[style(Bold, 0, 6)]],
     },
     MarkdownFixture {
+        name: "soft line break is an ordinary source join, not markup",
+        // An unadorned line ending inside a paragraph is CommonMark's soft
+        // break: a join point in one run of inline content, not a construct
+        // with its own markup to hide (contrast the hard-break fixtures
+        // below, which do hide syntax bytes).
+        source: "line one\nline two",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::SoftBreak]],
+        markers: &[],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        visual_lines: &["line one", "line two"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
+        name: "hard line break from two trailing spaces",
+        // Two or more trailing spaces before a line ending force a hard
+        // break. The spaces are markup and collapse; the line ending itself
+        // stays an ordinary source join, matching the soft-break fixture
+        // above except for the hidden marker.
+        source: "line one  \nline two",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::HardBreak]],
+        markers: &["  "],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        visual_lines: &["line one", "line two"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
+        name: "hard line break from a trailing backslash",
+        source: "line one\\\nline two",
+        tree_paths: &[&[NodeKind::Paragraph, NodeKind::HardBreak]],
+        markers: &["\\"],
+        block_kinds: &[BlockKind::Paragraph, BlockKind::Paragraph],
+        visual_lines: &["line one", "line two"],
+        style_runs: &[&[], &[]],
+    },
+    MarkdownFixture {
         name: "nested strong and emphasis",
         // Not a single numbered CommonMark example; kept as the evidence that
         // Strong and Emphasis compose — the inner Emphasis style unions into
