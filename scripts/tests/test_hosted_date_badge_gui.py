@@ -18,7 +18,7 @@ spec.loader.exec_module(mod)
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/2")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/3")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -35,6 +35,191 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertIsNone(re.search(pattern, "2026/9/1"))
         with self.assertRaises(ValueError):
             mod.date_token_pattern("20260901")
+
+    def test_group_candidates_by_observation_sorts_by_rank(self):
+        rank1 = {"observation_index": 0, "candidate_rank": 1, "confidence": 0.4}
+        rank0 = {"observation_index": 0, "candidate_rank": 0, "confidence": 0.9}
+        other_row = {"observation_index": 1, "candidate_rank": 0, "confidence": 0.8}
+        groups = mod.group_candidates_by_observation([rank1, rank0, other_row])
+        self.assertEqual(groups[0], [rank0, rank1])
+        self.assertEqual(groups[1], [other_row])
+
+    def test_best_matches_prefers_lowest_rank_per_observation(self):
+        rank0 = {"observation_index": 0, "candidate_rank": 0, "confidence": 0.9, "recognized_line": "a"}
+        rank1 = {"observation_index": 0, "candidate_rank": 1, "confidence": 0.4, "recognized_line": "a"}
+        self.assertEqual(mod.best_matches([rank1, rank0]), [rank0])
+
+    def test_best_matches_recovers_alternate_when_top_rank_never_matched(self):
+        # Issue #187: `helper_find_all` only emits an entry for a candidate
+        # whose own text satisfies the search pattern, so a misread top-1
+        # (rank 0) that breaks the match simply never appears here at all --
+        # only a lower-ranked alternate (rank 1+) whose text is correct does.
+        alt = {
+            "observation_index": 3,
+            "candidate_rank": 1,
+            "confidence": 0.55,
+            "recognized_line": "2025/9/2(火)",
+            "bounding_box": {"minX": 0.1, "maxX": 0.3, "minY": 0.5, "maxY": 0.52},
+        }
+        self.assertEqual(mod.best_matches([alt]), [alt])
+
+    def test_best_matches_does_not_search_past_a_present_top_rank_for_a_passing_alternate(self):
+        # Fail-closed (Issue #187 requirement): if the most-confident
+        # available match for an observation is present but would fail a
+        # downstream exact check, `best_matches` must not skip it in favor of
+        # a less-confident alternate that would conveniently pass.
+        present_but_wrong = {
+            "observation_index": 5,
+            "candidate_rank": 0,
+            "confidence": 0.6,
+            "recognized_line": "2025/9/2(火)X",
+        }
+        would_pass_alternate = {
+            "observation_index": 5,
+            "candidate_rank": 1,
+            "confidence": 0.2,
+            "recognized_line": "2025/9/2(火)",
+        }
+        selected = mod.best_matches([present_but_wrong, would_pass_alternate])
+        self.assertEqual(selected, [present_but_wrong])
+        self.assertFalse(mod.recognized_line_matches_expected(selected[0], "2025/9/2(火)"))
+
+    def test_best_matches_keeps_rank_confidence_and_geometry_evidence(self):
+        candidate = {
+            "observation_index": 2,
+            "candidate_rank": 1,
+            "confidence": 0.42,
+            "recognized_line": "1/2(金)",
+            "bounding_box": {"minX": 0.2, "maxX": 0.3, "minY": 0.1, "maxY": 0.12},
+        }
+        (selected,) = mod.best_matches([candidate])
+        self.assertEqual(selected["candidate_rank"], 1)
+        self.assertEqual(selected["confidence"], 0.42)
+        self.assertEqual(selected["recognized_line"], "1/2(金)")
+        self.assertIs(selected["bounding_box"], candidate["bounding_box"])
+
+    def test_vision_alternative_candidate_fixture_recovers_weekday_misread(self):
+        # Connects the real PR #175 focused GUI run #35281283306 regression
+        # shape (Issue #187) to the fix: Vision's top-1 misread the weekday
+        # kanji as "X", so no top-1 entry for this observation ever satisfies
+        # a search for the correct badge text; only a bounded lower-ranked
+        # alternate does.
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures" / "date_badge_vision_alternative_candidates.json"
+        )
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        case = next(c for c in payload["cases"] if c["name"] == "weekday_top1_misread")
+        self.assertNotIn(case["expected_badge"], case["observed_top1_line"])
+
+        alternate = {
+            "observation_index": 0,
+            "candidate_rank": 1,
+            "confidence": 0.5,
+            "recognized_line": f"{case['expected_display']} {case['expected_badge']}",
+            "bounding_box": {"minX": 0.3, "maxX": 0.5, "minY": 0.2, "maxY": 0.22},
+        }
+        badges_raw = mod.best_matches([alternate])
+        joined_candidate = mod.joined_row_candidate(alternate["recognized_line"], badges_raw)
+        self.assertIsNotNone(joined_candidate)
+        self.assertTrue(
+            mod.joined_composition_is_exact(
+                alternate["recognized_line"], case["expected_display"], case["expected_badge"]
+            )
+        )
+
+    def test_main_loop_recovers_correct_whole_line_when_top1_misreads_weekday(self):
+        # Issue #188: the isolated-function test above (and the pre-fix
+        # implementation) independently picked `best_matches` for the
+        # filename search (top-1, wrong weekday) and for the badge search
+        # (the correct lower-ranked alternate) without ever checking they
+        # describe the *same* bounded alternate. That combined a wrong-rank
+        # filename hypothesis with a different-rank badge hypothesis, so the
+        # actually-correct sidebar row (run #35281283306) was rejected as a
+        # false-FAIL. This test reproduces the same-observation, multi-rank
+        # shape the real `helper_find_all` output has and exercises the
+        # actual main-loop decision sequence end to end.
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures" / "date_badge_vision_alternative_candidates.json"
+        )
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        case = next(c for c in payload["cases"] if c["name"] == "weekday_top1_misread")
+        expected_display = case["expected_display"]
+        expected_badge = case["expected_badge"]
+        correct_line = f"{expected_display} {expected_badge}"
+        self.assertEqual(case["observed_top1_line"], "Charlie.md 2025/9/2(X)")
+
+        top1_wrong_weekday = {
+            "observation_index": 4,
+            "candidate_rank": 0,
+            "confidence": 0.9,
+            "recognized_line": case["observed_top1_line"],
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+        }
+        alternate_correct_line = {
+            "observation_index": 4,
+            "candidate_rank": 2,
+            "confidence": 0.35,
+            "recognized_line": correct_line,
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+        }
+        # `helper_find_all` reports a separate bounding box per search: this
+        # is the same (observation, rank) as `alternate_correct_line`, but
+        # the box for where the badge label itself sits on the line.
+        alternate_correct_line_badge_box = {
+            "observation_index": 4,
+            "candidate_rank": 2,
+            "confidence": 0.35,
+            "recognized_line": correct_line,
+            "bounding_box": {"minX": 0.25, "maxX": 0.45, "minY": 0.50, "maxY": 0.52},
+        }
+        texts_all = [top1_wrong_weekday, alternate_correct_line]
+        badges_all = [alternate_correct_line_badge_box]
+
+        # Old behavior (Issue #188 bug): `best_matches` alone always fixes
+        # rank 0 because it already satisfies the filename-only pattern.
+        (naive_text_match,) = mod.best_matches(texts_all)
+        self.assertEqual(naive_text_match["candidate_rank"], 0)
+        self.assertFalse(mod.recognized_line_matches_expected(naive_text_match, expected_display))
+
+        # Fixed behavior: search every bounded alternate for the observation
+        # against the exact whole-line predicates, per search, before
+        # picking a row kind.
+        split_matches = mod.best_matches_satisfying(
+            texts_all, lambda candidate: mod.recognized_line_matches_expected(candidate, expected_display)
+        )
+        self.assertEqual(split_matches, [])
+        joined_line_matches = mod.best_matches_satisfying(
+            texts_all,
+            lambda candidate: mod.joined_composition_is_exact(
+                candidate.get("recognized_line", ""), expected_display, expected_badge
+            ),
+        )
+        self.assertEqual(len(joined_line_matches), 1)
+        joined_line_candidate = joined_line_matches[0]
+        self.assertEqual(joined_line_candidate["candidate_rank"], 2)
+
+        full_line = joined_line_candidate.get("recognized_line", "")
+        joined_candidate = mod.joined_row_candidate(full_line, badges_all)
+        self.assertIs(joined_candidate, alternate_correct_line_badge_box)
+
+        display_match = mod.display_geometry_match(joined_line_candidate, use_full_line=False, joined_row=True)
+        self.assertTrue(mod.badge_is_strictly_right(display_match, joined_candidate))
+
+    def test_vision_alternative_candidate_fixture_recovers_missing_top1_filename_match(self):
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures" / "date_badge_vision_alternative_candidates.json"
+        )
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        case = next(c for c in payload["cases"] if c["name"] == "filename_top1_not_found")
+        alternate_text = {
+            "observation_index": 1,
+            "candidate_rank": 2,
+            "confidence": 0.3,
+            "recognized_line": case["expected_display"],
+            "bounding_box": {"minX": 0.05, "maxX": 0.15, "minY": 0.3, "maxY": 0.32},
+        }
+        (text_match,) = mod.best_matches([alternate_text])
+        self.assertTrue(mod.recognized_line_matches_expected(text_match, case["expected_display"]))
 
     def test_nearest_same_row_rejects_adjacent_row_badge(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}

@@ -1,0 +1,17 @@
+{
+  "source_run": 35281283306,
+  "purpose": "Issue #187 regression shapes: Vision top-1 OCR can misrecognize tiny sidebar text even when the rendered GUI is correct. Future validator logic must consider bounded alternative candidates without weakening exact downstream checks.",
+  "cases": [
+    {
+      "name": "weekday_top1_misread",
+      "expected_display": "Charlie.md",
+      "expected_badge": "2025/9/2(火)",
+      "observed_top1_line": "Charlie.md 2025/9/2(X)"
+    },
+    {
+      "name": "filename_top1_not_found",
+      "expected_display": "Alpha.md",
+      "expected_badge": "本日"
+    }
+  ]
+}
