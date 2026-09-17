@@ -126,6 +126,14 @@ def relative_label(value: dt.date, today: dt.date) -> str:
     return f"{value.year}/{value.month}/{value.day}({weekday})"
 
 
+def date_token_pattern(token: str) -> str:
+    """OCR-tolerant pattern for a hyphenated filename date token."""
+    parts = token.split("-")
+    if len(parts) != 3 or not all(part.isascii() and part.isdecimal() for part in parts):
+        raise ValueError(f"invalid hyphenated date token: {token!r}")
+    return r"\s*-\s*".join(re.escape(part) for part in parts)
+
+
 def make_config(module, target_dir: Path, run_dir: Path, fixture: Path, expected_sha: str, request_id: str):
     state_dir = run_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -152,29 +160,34 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
     today = dt.date.today()
     today_token = today.strftime("%Y-%m-%d")
     one_digit = dt.date(today.year, 1, 2)
+    one_digit_token = f"{one_digit.year}-1-2"
     cases = [
         {
             "name": "date_at_start",
             "filename": f"{today_token}_Alpha.md",
             "text_pattern": r"Alpha\.md",
+            "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "date_in_middle",
             "filename": f"Bravo_{today_token}_Note.md",
             "text_pattern": r"Bravo\s+Note\.md",
+            "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "date_at_end",
             "filename": f"Charlie_{today_token}.md",
             "text_pattern": r"Charlie\.md",
+            "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "one_digit_month_day",
-            "filename": f"{one_digit.year}-1-2_Delta.md",
+            "filename": f"{one_digit_token}_Delta.md",
             "text_pattern": r"Delta\.md",
+            "date_token": one_digit_token,
             "badge_label": relative_label(one_digit, today),
         },
         {
@@ -183,7 +196,10 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
                 "This_Is_An_Extremely_Long_Sidebar_Filename_Designed_To_Force_"
                 f"Truncation_{today_token}.md"
             ),
-            "text_pattern": r"This",
+            # Greedily cover all visible filename words so the right-side check
+            # is against the visible truncated name, not merely its first word.
+            "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+",
+            "date_token": today_token,
             "badge_label": "本日",
         },
     ]
@@ -259,6 +275,7 @@ def main() -> int:
                             if capture["result"] == "pass":
                                 screenshot = config.image_path
                                 badge_cache: dict[str, list[dict]] = {}
+                                date_cache: dict[str, list[dict]] = {}
                                 for case in cases:
                                     try:
                                         texts = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
@@ -266,10 +283,29 @@ def main() -> int:
                                             case["badge_label"],
                                             helper_find_all(helper, helper_digest, screenshot, re.escape(case["badge_label"])),
                                         )
+                                        token_pattern = date_token_pattern(case["date_token"])
+                                        date_matches = date_cache.setdefault(
+                                            case["date_token"],
+                                            helper_find_all(helper, helper_digest, screenshot, token_pattern),
+                                        )
                                         if not texts:
-                                            scenario_steps.append(step(case["name"], "fail", "ファイル名本文を screenshot OCR で確認できない"))
+                                            scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名全体を screenshot OCR で確認できない"))
                                             continue
                                         text_match = texts[0]
+                                        date_on_row = nearest_same_row(text_match, date_matches)
+                                        date_in_line = re.search(token_pattern, text_match.get("recognized_line", "")) is not None
+                                        if date_on_row is not None or date_in_line:
+                                            scenario_steps.append(step(
+                                                case["name"],
+                                                "fail",
+                                                "元ファイル名の日付 token が sidebar の表示名から除去されていない",
+                                                filename=case["filename"],
+                                                date_token=case["date_token"],
+                                                text_match=text_match,
+                                                date_on_row=date_on_row,
+                                                screenshot=str(screenshot),
+                                            ))
+                                            continue
                                         badge_match = nearest_same_row(text_match, badges)
                                         if badge_match is None:
                                             scenario_steps.append(step(case["name"], "fail", "同じ sidebar row の日付バッジを確認できない"))
@@ -280,11 +316,13 @@ def main() -> int:
                                         scenario_steps.append(step(
                                             case["name"],
                                             "pass" if right_side else "fail",
-                                            None if right_side else "日付バッジがファイル名本文の右側にない",
+                                            None if right_side else "日付バッジが省略後の表示ファイル名全体の右側にない",
                                             filename=case["filename"],
                                             expected_badge=case["badge_label"],
+                                            date_token=case["date_token"],
                                             text_match=text_match,
                                             badge_match=badge_match,
+                                            date_matches=date_matches,
                                             screenshot=str(screenshot),
                                         ))
                                     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
