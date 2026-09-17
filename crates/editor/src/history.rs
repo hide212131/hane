@@ -4,6 +4,13 @@ use std::time::{Duration, Instant};
 
 const GROUP_TIMEOUT: Duration = Duration::from_millis(750);
 
+/// Matches RopeBuffer's source line endings (see its `line_mirror` docs):
+/// LF, CRLF and a bare CR all end a line. A CRLF's `\r` is always followed by
+/// `\n`, so checking either byte alone is enough to catch the pair too.
+fn is_line_ending(c: char) -> bool {
+    c == '\n' || c == '\r'
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EditKind {
     Insert,
@@ -56,8 +63,8 @@ impl HistoryEntry {
                 if self.deleted.is_empty()
                     && next.deleted.is_empty()
                     && next.start == self.start + self.inserted.len()
-                    && !self.inserted.ends_with('\n')
-                    && !next.inserted.contains('\n') =>
+                    && !self.inserted.ends_with(is_line_ending)
+                    && !next.inserted.contains(is_line_ending) =>
             {
                 self.inserted.push_str(&next.inserted);
             }

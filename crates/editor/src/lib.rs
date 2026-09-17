@@ -525,4 +525,38 @@ mod tests {
         e.dispatch(EditorCommand::Undo).unwrap();
         assert_eq!(e.document().full_text(), "ab");
     }
+
+    #[test]
+    fn bare_cr_is_its_own_undo_transaction_like_lf() {
+        let mut e = Editor::new("ab");
+        e.set_selection(Selection::caret(SourceOffset(1))).unwrap();
+        e.dispatch(EditorCommand::Insert("x")).unwrap();
+        e.dispatch(EditorCommand::Insert("\r")).unwrap();
+        e.dispatch(EditorCommand::Insert("y")).unwrap();
+        assert_eq!(e.document().full_text(), "ax\ryb");
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ax\rb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "axb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ab");
+    }
+
+    #[test]
+    fn crlf_inserted_as_one_string_is_its_own_undo_transaction() {
+        let mut e = Editor::new("ab");
+        e.set_selection(Selection::caret(SourceOffset(1))).unwrap();
+        e.dispatch(EditorCommand::Insert("x")).unwrap();
+        e.dispatch(EditorCommand::Insert("\r\n")).unwrap();
+        e.dispatch(EditorCommand::Insert("y")).unwrap();
+        assert_eq!(e.document().full_text(), "ax\r\nyb");
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ax\r\nb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "axb");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "ab");
+    }
 }
