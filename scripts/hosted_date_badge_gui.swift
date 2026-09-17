@@ -11,6 +11,15 @@ func fail(_ message: String) -> Never {
     exit(2)
 }
 
+func rectDictionary(_ rect: CGRect) -> [String: Double] {
+    [
+        "minX": Double(rect.minX),
+        "maxX": Double(rect.maxX),
+        "minY": Double(rect.minY),
+        "maxY": Double(rect.maxY),
+    ]
+}
+
 func findAllText(_ path: String, _ pattern: String) {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
@@ -34,15 +43,17 @@ func findAllText(_ path: String, _ pattern: String) {
                   let box = try? candidate.boundingBox(for: range)
             else { continue }
             let rect = box.boundingBox
+            // observation.boundingBox covers the whole recognized text line,
+            // whereas `rect` covers only the regex match. The focused date-
+            // badge validator needs both: exact filename cases use the match
+            // box, and the intentionally truncated long-name case uses the
+            // whole line so a badge overlapping later visible text/ellipsis
+            // cannot be accepted merely because an early prefix matched.
             output.append([
                 "matched_text": String(text[range]),
                 "recognized_line": text,
-                "bounding_box": [
-                    "minX": Double(rect.minX),
-                    "maxX": Double(rect.maxX),
-                    "minY": Double(rect.minY),
-                    "maxY": Double(rect.maxY),
-                ],
+                "bounding_box": rectDictionary(rect),
+                "line_bounding_box": rectDictionary(observation.boundingBox),
             ])
         }
     }
