@@ -1,5 +1,5 @@
 name: AADW Hosted GUI Validation
-run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} ${{ inputs.execution_context }} ${{ inputs.procedure }}
+run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} base ${{ inputs.request_base_sha }} ${{ inputs.execution_context }} ${{ inputs.procedure }}
 
 on:
   workflow_dispatch:
@@ -12,6 +12,11 @@ on:
         description: Exact current Pull Request head SHA (40 hex)
         required: true
         type: string
+      request_base_sha:
+        description: Internal router-observed base SHA; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
       execution_context:
         description: Validate the exact head, or GitHub's current base+head merge context
         required: true
@@ -53,6 +58,7 @@ jobs:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       PR_NUMBER: ${{ inputs.pr_number }}
       TARGET_HEAD_SHA: ${{ inputs.target_head_sha }}
+      REQUEST_BASE_SHA: ${{ inputs.request_base_sha }}
       EXECUTION_CONTEXT: ${{ inputs.execution_context }}
       REQUESTED_PROCEDURE: ${{ inputs.procedure }}
       REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
@@ -86,6 +92,10 @@ jobs:
             echo '::error::target_head_sha must be a lowercase full 40-hex SHA.'
             exit 1
           fi
+          if [[ -n "$REQUEST_BASE_SHA" ]] && ! [[ "$REQUEST_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::request_base_sha must be a lowercase full 40-hex SHA when provided.'
+            exit 1
+          fi
           if [[ -z "$REQUESTED_PROCEDURE" || "$REQUESTED_PROCEDURE" == *$'\n'* || "$REQUESTED_PROCEDURE" == *$'\r'* ]]; then
             echo '::error::procedure must be a non-empty single-line value.'
             exit 1
@@ -102,6 +112,10 @@ jobs:
           if [[ -n "$REQUEST_COMMENT_ID" ]]; then
             if ! [[ "$REQUEST_COMMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
               echo '::error::request_comment_id must be a positive integer when provided.'
+              exit 1
+            fi
+            if [[ -z "$REQUEST_BASE_SHA" ]]; then
+              echo '::error::Routed requests must include the router-observed base SHA.'
               exit 1
             fi
 
@@ -170,6 +184,10 @@ jobs:
           base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
           if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo '::error::Could not resolve current target branch SHA.'
+            exit 1
+          fi
+          if [[ -n "$REQUEST_BASE_SHA" && "$base_sha" != "$REQUEST_BASE_SHA" ]]; then
+            echo "::error::Target base moved after request. expected=${REQUEST_BASE_SHA} current=${base_sha}."
             exit 1
           fi
 
@@ -277,6 +295,7 @@ jobs:
             --arg repository "$REPOSITORY" \
             --argjson pr_number "$PR_NUMBER" \
             --arg requested_head_sha "$TARGET_HEAD_SHA" \
+            --arg requested_base_sha "$REQUEST_BASE_SHA" \
             --arg head_ref "$HEAD_REF" \
             --arg base_ref "$BASE_REF" \
             --arg observed_base_sha "$BASE_SHA" \
@@ -293,6 +312,7 @@ jobs:
               repository: $repository,
               pr_number: $pr_number,
               requested_head_sha: $requested_head_sha,
+              requested_base_sha: ($requested_base_sha | if length == 0 then null else . end),
               head_ref: $head_ref,
               base_ref: $base_ref,
               observed_base_sha: $observed_base_sha,
