@@ -157,10 +157,11 @@ fn match_one_or_two_digit_field(
     terminator_ok: impl Fn(Option<u8>) -> bool,
 ) -> Option<(i32, usize)> {
     let two_end = start + 2;
-    if let Some(segment) = bytes.get(start..two_end) {
-        if segment.iter().all(u8::is_ascii_digit) && terminator_ok(bytes.get(two_end).copied()) {
-            return Some((parse_digits(bytes, start..two_end)?, two_end));
-        }
+    if let Some(segment) = bytes.get(start..two_end)
+        && segment.iter().all(u8::is_ascii_digit)
+        && terminator_ok(bytes.get(two_end).copied())
+    {
+        return Some((parse_digits(bytes, start..two_end)?, two_end));
     }
     let one_end = start + 1;
     let byte = *bytes.get(start)?;
