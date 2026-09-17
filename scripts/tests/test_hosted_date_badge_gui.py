@@ -43,6 +43,23 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertIsNone(mod.nearest_same_row(text, [adjacent_row]))
         self.assertLess(mod.SAME_ROW_CENTER_Y_TOLERANCE, 0.016)
 
+    def test_recognized_line_must_be_the_complete_display_name(self):
+        exact = {"recognized_line": " Alpha.md "}
+        separator_left = {"recognized_line": "_Alpha.md"}
+        badge_joined = {"recognized_line": "Alpha.md 本日"}
+        self.assertTrue(mod.recognized_line_matches_expected(exact, "Alpha.md"))
+        self.assertFalse(mod.recognized_line_matches_expected(separator_left, "Alpha.md"))
+        self.assertFalse(mod.recognized_line_matches_expected(badge_joined, "Alpha.md"))
+
+    def test_badge_must_not_overlap_display_name(self):
+        text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
+        touching = {"bounding_box": {"minX": 0.20, "maxX": 0.25, "minY": 0.50, "maxY": 0.52}}
+        separated = {"bounding_box": {"minX": 0.201, "maxX": 0.25, "minY": 0.50, "maxY": 0.52}}
+        overlapping = {"bounding_box": {"minX": 0.199, "maxX": 0.25, "minY": 0.50, "maxY": 0.52}}
+        self.assertTrue(mod.badge_is_strictly_right(text, touching))
+        self.assertTrue(mod.badge_is_strictly_right(text, separated))
+        self.assertFalse(mod.badge_is_strictly_right(text, overlapping))
+
     def test_fixture_names_cover_required_shapes(self):
         with tempfile.TemporaryDirectory() as tmp:
             before, cases = mod.make_fixtures(Path(tmp) / "work-folder")
@@ -58,6 +75,9 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 },
             )
             self.assertTrue(all(case["date_token"] in case["filename"] for case in cases))
+            regular_cases = [case for case in cases if case["expected_display"] is not None]
+            self.assertTrue(all(case["text_pattern"].startswith("^\\s*") for case in regular_cases))
+            self.assertTrue(all(case["text_pattern"].endswith("\\s*$") for case in regular_cases))
             self.assertEqual(before, sorted(case["filename"] for case in cases))
             self.assertTrue(all((Path(tmp) / "work-folder" / name).is_file() for name in before))
 
