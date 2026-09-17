@@ -2034,12 +2034,12 @@ impl EditorView {
             self.joined_parse_jobs.insert(id, job);
             self.joined_parse_jobs_running += 1;
             cx.spawn(async move |view, cx| {
-                let parse = cx
-                    .background_executor()
-                    .spawn(async move {
-                        parse_joined_span(&snapshot, content, source_range, revision)
-                    })
-                    .await;
+                let parse =
+                    cx.background_executor()
+                        .spawn(async move {
+                            parse_joined_span(&snapshot, content, source_range, revision)
+                        })
+                        .await;
                 let _ = view.update(cx, |view, cx| {
                     // Release capacity even for an old document. Dropping a
                     // Task cannot interrupt synchronous parse already polling;
