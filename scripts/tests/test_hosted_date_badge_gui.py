@@ -1,5 +1,6 @@
 import datetime as dt
 import importlib.util
+import json
 import re
 import sys
 import tempfile
@@ -17,7 +18,7 @@ spec.loader.exec_module(mod)
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/1")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/2")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -60,7 +61,45 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         filtered = mod.exact_label_matches([longer_prefix, suffix, prefix, exact], expected)
         self.assertEqual(filtered, [exact])
 
-    def test_long_name_uses_full_recognized_line_geometry(self):
+    def test_joined_row_candidate_finds_badge_on_the_same_recognized_line(self):
+        same_line = {"recognized_line": "Alpha.md 本日", "bounding_box": {}}
+        other_line = {"recognized_line": "本日", "bounding_box": {}}
+        self.assertIs(mod.joined_row_candidate("Alpha.md 本日", [other_line, same_line]), same_line)
+        self.assertIsNone(mod.joined_row_candidate("Alpha.md", [other_line]))
+
+    def test_joined_composition_is_exact_accepts_only_display_plus_badge(self):
+        self.assertTrue(mod.joined_composition_is_exact("Alpha.md 本日", "Alpha.md", "本日"))
+        # OCR sometimes loses the separating space; still an exact composition.
+        self.assertTrue(mod.joined_composition_is_exact("Alpha.md本日", "Alpha.md", "本日"))
+        # A longer badge that merely contains the expected badge as a
+        # substring must not be accepted (Issue #185 regression).
+        self.assertFalse(mod.joined_composition_is_exact("Delta.md 2026/1/2(金)", "Delta.md", "1/2(金)"))
+        self.assertFalse(mod.joined_composition_is_exact("Alpha.md 本日 extra", "Alpha.md", "本日"))
+        self.assertFalse(mod.joined_composition_is_exact("prefix Alpha.md 本日", "Alpha.md", "本日"))
+
+    def test_joined_composition_ends_with_badge(self):
+        self.assertTrue(mod.joined_composition_ends_with_badge("This Is Long…本日", "本日"))
+        self.assertFalse(mod.joined_composition_ends_with_badge("本日 This Is Long…", "本日"))
+        self.assertFalse(mod.joined_composition_ends_with_badge("This Is Long…本日 extra", "本日"))
+
+    def test_joined_ocr_fixture_matches_expected_acceptance(self):
+        # Regression input shapes captured from PR #175 focused GUI run
+        # #35250368931 (Issue #185): Vision may split the filename/badge into
+        # separate observations or join them into one recognized_line.
+        fixture_path = Path(__file__).resolve().parent / "fixtures" / "date_badge_joined_ocr_cases.json"
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in payload["cases"]:
+            with self.subTest(case=case["name"]):
+                text_match = {"recognized_line": case["text_recognized_line"]}
+                badge_match = {"recognized_line": case["badge_recognized_line"]}
+                is_split = mod.recognized_line_matches_expected(text_match, case["expected_display"])
+                joined_candidate = mod.joined_row_candidate(case["text_recognized_line"], [badge_match])
+                is_joined = joined_candidate is not None and mod.joined_composition_is_exact(
+                    case["text_recognized_line"], case["expected_display"], case["expected_badge"]
+                )
+                self.assertEqual(is_split or is_joined, case["accepted"])
+
+    def test_long_name_split_uses_full_recognized_line_geometry(self):
         prefix_match = {
             "matched_text": "This Is",
             "recognized_line": "This Is An Extremely Long…",
@@ -81,6 +120,36 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             mod.display_geometry_match({"bounding_box": prefix_match["bounding_box"]}, use_full_line=True)
+
+    def test_long_name_joined_clips_badge_out_of_display_geometry(self):
+        # Vision joined the truncated filename and badge into one
+        # recognized_line. The unclipped full-line box would span the badge
+        # too (making the non-overlap oracle unsatisfiable), while the bare
+        # prefix-match box ignores later visible filename text; the geometry
+        # must cover exactly the visible filename up to where the badge
+        # begins.
+        prefix_match = {
+            "matched_text": "This Is",
+            "recognized_line": "This Is An Extremely Long…本日",
+            "bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52},
+            "line_bounding_box": {"minX": 0.10, "maxX": 0.65, "minY": 0.49, "maxY": 0.53},
+        }
+        joined_badge = {"bounding_box": {"minX": 0.60, "maxX": 0.65, "minY": 0.50, "maxY": 0.52}}
+        geometry = mod.display_geometry_match(prefix_match, use_full_line=True, joined_badge=joined_badge)
+        self.assertEqual(
+            geometry["bounding_box"],
+            {"minX": 0.10, "maxX": 0.60, "minY": 0.49, "maxY": 0.53},
+        )
+        # The true joined badge sits right at the clipped edge, so it passes.
+        self.assertTrue(mod.badge_is_strictly_right(geometry, joined_badge))
+        # A candidate that actually overlaps later visible filename text
+        # (well before the true badge) must still fail against the clipped
+        # geometry...
+        overlapping_candidate = {"bounding_box": {"minX": 0.30, "maxX": 0.40, "minY": 0.50, "maxY": 0.52}}
+        self.assertFalse(mod.badge_is_strictly_right(geometry, overlapping_candidate))
+        # ...even though the bare prefix-match box alone would have wrongly
+        # let it "pass" (the Issue #185 false-PASS risk this clipping avoids).
+        self.assertTrue(mod.badge_is_strictly_right(prefix_match, overlapping_candidate))
 
     def test_badge_must_not_overlap_display_name(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
@@ -108,7 +177,10 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             self.assertTrue(all(case["date_token"] in case["filename"] for case in cases))
             regular_cases = [case for case in cases if case["expected_display"] is not None]
             self.assertTrue(all(case["text_pattern"].startswith("^\\s*") for case in regular_cases))
-            self.assertTrue(all(case["text_pattern"].endswith("\\s*$") for case in regular_cases))
+            # The pattern must stop at a word boundary (whitespace or line end)
+            # rather than requiring `\s*$`, so it still matches when Vision
+            # joins the filename and badge into one recognized_line.
+            self.assertTrue(all(case["text_pattern"].endswith("(?=\\s|$)") for case in regular_cases))
             self.assertEqual(before, sorted(case["filename"] for case in cases))
             self.assertTrue(all((Path(tmp) / "work-folder" / name).is_file() for name in before))
 
