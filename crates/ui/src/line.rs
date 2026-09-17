@@ -191,12 +191,10 @@ fn block_context(
     } else {
         render.clone()
     };
-    // Clipped to the block's own source range, not just its enclosing
-    // `RopeBuffer` line: `RopeBuffer` treats a lone `\r` as ordinary text
-    // (ADR-0003), so a bare-CR paragraph break can put two Markdown blocks'
-    // worth of bytes inside one physical line. Without this clip, both blocks
-    // would read and present the same full line's text, duplicating content
-    // that in fact belongs to a sibling block.
+    // Clipped to the block's own source range as a defensive bound: a
+    // `RopeBuffer` line and a block both tile the document on the same
+    // canonical line endings, so in the ordinary case a line's range already
+    // sits inside its owning block's range and this clip changes nothing.
     let block_range = block.source_range;
     let ranges = context
         .clone()
@@ -587,13 +585,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_cr_paragraph_boundary_does_not_duplicate_content_across_blocks() {
-        // `RopeBuffer` treats a lone `\r` as ordinary text (ADR-0003), so
-        // "a\r\rb" is one physical line to the editor even though CommonMark
-        // reads the blank line the `\r\r` makes as splitting it into two
-        // paragraphs. Each indexed block must present only its own bytes,
-        // not the whole shared physical line (which would duplicate the
-        // sibling block's content).
+    fn a_bare_cr_paragraph_boundary_renders_its_own_blank_line_like_lf() {
+        // `RopeBuffer` and `BlockIndex` split physical lines on a bare CR the
+        // same way they do on `\n`: "a\r\rb" is three physical lines ("a\r",
+        // the blank "\r", and "b"), the first two tiling into the paragraph
+        // "a" and the third into the paragraph "b" — the same shape
+        // "a\n\nb" already has. Neither block ever presents the sibling
+        // block's bytes.
         let editor = Editor::new("a\r\rb");
         let index = BlockIndex::from_buffer(editor.document());
         assert_eq!(index.len(), 2, "a bare-CR blank line splits the paragraph");
@@ -601,7 +599,10 @@ mod tests {
             .iter()
             .map(|line| line.visual_text.clone())
             .collect::<Vec<_>>();
-        assert_eq!(texts, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
     }
 
     #[test]

@@ -207,3 +207,34 @@ fn block_line_counts_tile_the_document_through_edits() {
     index.update(&buffer, &deltas);
     check(&index, &buffer, "after joining the blocks back");
 }
+
+/// CommonMark treats a bare `\r` exactly like `\n` for both blank-line block
+/// splitting and physical line counting; the block index and `RopeBuffer` must
+/// agree on that, not just on `\n`-separated documents.
+#[test]
+fn bare_cr_splits_blocks_and_counts_lines_like_lf() {
+    let source = "a\r\rb\r\nc\r\nd\ne";
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::build(buffer.revision(), source);
+
+    // `a` and `b\r\nc\r\nd\ne` are two paragraphs, separated by the blank line a
+    // bare `\r\r` creates. The blank line's two lines ("a\r" and the empty
+    // "\r" line) tile into the block above, as blank lines always do.
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.block(0).unwrap().source_range, SourceRange::new(0, 3));
+    assert_eq!(index.block(0).unwrap().line_count, 2);
+    assert_eq!(
+        index.block(1).unwrap().source_range,
+        SourceRange::new(3, source.len())
+    );
+    // "b\r\n", "c\r\n", "d\n", "e" — four physical lines in the second block.
+    assert_eq!(index.block(1).unwrap().line_count, 4);
+
+    for block in index.blocks() {
+        let first = buffer.line_for_offset(block.source_range.start).unwrap();
+        let last = buffer
+            .line_for_offset(SourceOffset(block.source_range.end.0 - 1))
+            .unwrap();
+        assert_eq!(block.line_count, last.0 + 1 - first.0);
+    }
+}

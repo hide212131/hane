@@ -492,6 +492,24 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_treat_a_bare_cr_as_a_line_boundary_like_lf_and_crlf() {
+        let mut e = Editor::new("first\r日本語\rlast");
+        e.set_selection(Selection::caret(SourceOffset(12))).unwrap();
+        e.dispatch(EditorCommand::MoveToLineStart { extend: false })
+            .unwrap();
+        assert_eq!(e.selection(), Selection::caret(SourceOffset(6)));
+        e.dispatch(EditorCommand::MoveToLineEnd { extend: true })
+            .unwrap();
+        assert_eq!(
+            e.selection(),
+            Selection {
+                anchor: SourceOffset(6),
+                active: SourceOffset(15)
+            }
+        );
+    }
+
+    #[test]
     fn newline_replaces_selection_and_is_its_own_undo_transaction() {
         let mut e = Editor::new("ab");
         e.set_selection(Selection::caret(SourceOffset(1))).unwrap();

@@ -71,11 +71,12 @@ pub struct IndexedBlock {
     pub confidence: Confidence,
     /// Physical source lines the block covers.
     ///
-    /// Counted as the newlines in the block's bytes, plus one when the block does
-    /// not end in a newline. Defined that way the counts are additive under
-    /// concatenation, so merging blocks needs no re-count — and the empty last
-    /// line of a document that ends in a newline belongs to no block, which is
-    /// what `hane_presentation::block_heights` accounts for.
+    /// Counted as the CommonMark 0.31.2 source line endings (`\n`, `\r\n` or a
+    /// bare `\r`) in the block's bytes, plus one when the block does not end in
+    /// one. Defined that way the counts are additive under concatenation, so
+    /// merging blocks needs no re-count — and the empty last line of a document
+    /// that ends in a line ending belongs to no block, which is what
+    /// `hane_presentation::block_heights` accounts for.
     pub line_count: usize,
 }
 
@@ -132,6 +133,31 @@ pub struct BlockIndexUpdate {
 /// One tiled block: its kind, its byte length, and the physical lines it covers.
 pub(crate) type TiledBlock = (NodeKind, usize, usize);
 
+/// Counts CommonMark 0.31.2 source line endings in `slice`: `\n`, `\r\n` and a
+/// bare `\r` each count once. A block boundary always falls at the start of a
+/// line, so a slice that ends in a bare `\r` can never have that `\r`'s
+/// partner `\n` sitting in the next block's slice — treating `slice` as
+/// self-contained is safe.
+fn count_line_endings(slice: &str) -> usize {
+    let bytes = slice.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                count += 1;
+                i += 1;
+            }
+            b'\r' => {
+                count += 1;
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            }
+            _ => i += 1,
+        }
+    }
+    count
+}
+
 /// Tiles one parsed slice into block spans covering `range` exactly: each
 /// top-level block runs from its own start to the next block's start, the first
 /// starts at `range.start`, and the last ends at `range.end`. Returns no block
@@ -167,8 +193,9 @@ pub(crate) fn tiled_blocks(
                 .map_or(range.end.0, |(_, next)| *next)
                 .max(start);
             let slice = &source[start - range.start.0..end - range.start.0];
-            let newlines = slice.bytes().filter(|byte| *byte == b'\n').count();
-            let lines = newlines + usize::from(!slice.ends_with('\n'));
+            let endings = count_line_endings(slice);
+            let ends_with_line_ending = slice.ends_with(['\n', '\r']);
+            let lines = endings + usize::from(!ends_with_line_ending);
             (*kind, end - start, lines)
         })
         .collect()

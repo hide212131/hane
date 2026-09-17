@@ -68,8 +68,15 @@ VisualPosition
 - `SourceRange` は byte range であり、char range でも grapheme range でもない。
 - 空 range は挿入位置として有効である。
 - 改行は buffer 内の実バイト列を保持し、内部正規化しない。
-- 行分割では `\n` を改行境界とし、`\r\n` は2 byte の列として保持しつつ1つの改行として扱う。
-- 孤立した `\r` は通常文字として扱う。
+- 行分割は CommonMark 0.31.2 の source line ending 定義に従い、`\n`・`\r\n`・孤立した `\r` をそれぞれ1つの行境界として扱う。`\r\n` は2 byte の列のまま1つの改行として扱う。
+
+`TextBuffer` の line query (`line_count`、offset→line、line+column→offset、`line_range`、`line_content_range`) はこの3種の line ending すべてで同じ意味を返す。Markdown parser（pulldown-cmark 経由）はこの3種をもともと source line ending として扱っており、editor 側の line 概念を parser 側の block/line 分割と一致させるための決定である。
+
+保存 bytes は正規化しない。`RopeBuffer` の実装は Ropey の line index が `\n` のみを改行とみなす制約（`unicode_lines` を無効化した設定、100 MB 級文書での性能測定のため）に対し、`rope` と byte/char 位置が1:1で対応する内部専用の mirror rope を保持し、孤立した `\r` をその mirror 上でのみ `\n` に置き換えて Ropey の line index を再利用する。mirror は通常 edit のたびに、その edit の範囲と直前1文字分の再分類だけを更新し、文書全体を再走査しない。保存・読み取り・`text()`/`slice()` は常に実バイトを保持する `rope` 側から行い、mirror の内容が外部に漏れることはない。
+
+### 2026-08-24 時点の決定との違い
+
+当初は「孤立した `\r` は通常文字として扱う」としていたが、これは Ropey の line index の制約をそのまま editor の仕様に持ち込んだものであり、CommonMark の source line ending 定義とも、pulldown-cmark が実際に解釈する block/line 分割とも矛盾していた。この不一致は caret・selection・IME・SourceMap・保存再読込の広い範囲で bare CR 付近の表示・カーソル位置のずれとして表面化したため、上記の通り改めた。
 
 `slice`、`text`、`edit`、`line_for_offset`、`offset_for_line_col`、`anchor` は、境界外 offset または UTF-8 文字境界外 offset を受け取った場合に panic せず `BufferError` を返す。
 
