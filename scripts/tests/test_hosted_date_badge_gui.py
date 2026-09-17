@@ -1,11 +1,14 @@
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "hosted_date_badge_gui.py"
@@ -18,7 +21,7 @@ spec.loader.exec_module(mod)
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/3")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/4")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -35,6 +38,243 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertIsNone(re.search(pattern, "2026/9/1"))
         with self.assertRaises(ValueError):
             mod.date_token_pattern("20260901")
+
+    def test_helper_find_all_parses_matches_and_preprocessing_evidence(self):
+        # Issue #190: `hosted_date_badge_gui.swift` now uniformly upscales
+        # the whole screenshot before OCR and reports that as evidence
+        # alongside the matches, instead of returning a bare match list.
+        payload = json.dumps({
+            "matches": [{
+                "observation_index": 0,
+                "candidate_rank": 0,
+                "confidence": 0.9,
+                "recognized_line": "Alpha.md",
+                "bounding_box": {"minX": 0.0, "maxX": 0.1, "minY": 0.0, "maxY": 0.02},
+            }],
+            "preprocessing": {
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 3840, "height": 2720},
+            },
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ):
+                matches, preprocessing = mod.helper_find_all(
+                    helper, digest, Path(directory) / "shot.png", "Alpha"
+                )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(preprocessing["method"], "uniform_upscale")
+        self.assertEqual(preprocessing["scale_factor"], 4)
+        self.assertEqual(preprocessing["source_size"], {"width": 960, "height": 680})
+        self.assertEqual(preprocessing["processed_size"], {"width": 3840, "height": 2720})
+
+    def test_helper_find_all_rejects_bare_match_list_without_preprocessing_evidence(self):
+        # Fail-closed: the pre-#190 helper contract (a bare JSON list) must
+        # not be silently accepted as if preprocessing evidence were absent
+        # but valid -- a helper that regressed to raw-resolution OCR should
+        # surface as an error here, not a quiet pass.
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "[]", ""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
+
+    def test_helper_find_all_rejects_incomplete_preprocessing_evidence(self):
+        payload = json.dumps({"matches": [], "preprocessing": {"method": "uniform_upscale"}})
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
+
+    def test_validate_preprocessing_evidence_accepts_valid_evidence(self):
+        # Should not raise, and unknown extra fields are forward-compatible.
+        mod.validate_preprocessing_evidence({
+            "method": "uniform_upscale",
+            "scale_factor": 4,
+            "source_size": {"width": 960, "height": 680},
+            "processed_size": {"width": 3840, "height": 2720},
+            "future_field": "ignored",
+        })
+
+    def test_validate_preprocessing_evidence_rejects_disabled_method(self):
+        # Issue #191 P1: a helper that stopped preprocessing must not be
+        # silently accepted just because the four required keys exist.
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "none",
+                "scale_factor": 4,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 960, "height": 680},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_no_op_scale_factor(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 1,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 960, "height": 680},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_wrong_scale_factor(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 2,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 1920, "height": 1360},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_bool_scale_factor(self):
+        # `bool` is an `int` subclass in Python; must not be misread as 1/0.
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": True,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 960, "height": 680},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_non_dict_sizes(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": [960, 680],
+                "processed_size": {"width": 3840, "height": 2720},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_zero_or_negative_size(self):
+        for width in (0, -960):
+            with self.subTest(width=width):
+                with self.assertRaises(RuntimeError):
+                    mod.validate_preprocessing_evidence({
+                        "method": "uniform_upscale",
+                        "scale_factor": 4,
+                        "source_size": {"width": width, "height": 680},
+                        "processed_size": {"width": width * 4, "height": 2720},
+                    })
+
+    def test_validate_preprocessing_evidence_rejects_non_integer_size(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": {"width": 960.5, "height": 680},
+                "processed_size": {"width": 3842.0, "height": 2720},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_bool_size(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": {"width": True, "height": 680},
+                "processed_size": {"width": 4, "height": 2720},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_string_size(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": {"width": "960", "height": 680},
+                "processed_size": {"width": 3840, "height": 2720},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_source_processed_mismatch(self):
+        # Correct method/scale_factor but processed_size does not actually
+        # reflect source_size * scale_factor.
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                "method": "uniform_upscale",
+                "scale_factor": 4,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 3840, "height": 2721},
+            })
+
+    def test_helper_find_all_rejects_inconsistent_preprocessing_evidence(self):
+        # End-to-end: `helper_find_all` itself must reject a structurally
+        # complete but semantically invalid preprocessing report, not just
+        # the standalone `validate_preprocessing_evidence` helper.
+        payload = json.dumps({
+            "matches": [],
+            "preprocessing": {
+                "method": "none",
+                "scale_factor": 1,
+                "source_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 960, "height": 680},
+            },
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
+
+    def test_ocr_preprocessing_is_a_uniform_whole_image_upscale(self):
+        # Structural evidence (mirrors the existing `hosted_gui_interaction`
+        # helper-source assertions) that the OCR input transform is a plain
+        # full-frame integer upscale: both dimensions scaled by the same
+        # factor, drawn with no crop/offset, and that Vision actually
+        # analyzes the upscaled in-memory image (not the raw screenshot
+        # file) so the resolution fix is really applied.
+        swift_source = SCRIPT.with_name("hosted_date_badge_gui.swift").read_text()
+        self.assertIn("let ocrUpscaleFactor = 4", swift_source)
+        self.assertIn("image.width * factor", swift_source)
+        self.assertIn("image.height * factor", swift_source)
+        self.assertRegex(
+            swift_source, r"CGRect\(x:\s*0,\s*y:\s*0,\s*width:\s*width,\s*height:\s*height\)"
+        )
+        self.assertIn("VNImageRequestHandler(cgImage: processedImage", swift_source)
+        self.assertIn('"method": "uniform_upscale"', swift_source)
+        self.assertIn('"scale_factor": ocrUpscaleFactor', swift_source)
+        self.assertIn('"source_size"', swift_source)
+        self.assertIn('"processed_size"', swift_source)
+
+    def test_uniform_whole_image_scale_preserves_normalized_coordinates(self):
+        # Pure geometry proof behind the fix (Issue #190): Vision's own
+        # boundingBox is normalized to whichever image it analyzed
+        # (x/width, y/height, ...). Scaling *every* pixel-space coordinate
+        # and *both* image dimensions by the same positive integer factor,
+        # with no crop/offset, leaves that normalized fraction unchanged
+        # regardless of the factor -- independent of Vision/Swift, and
+        # independent of which factor is chosen.
+        def normalized(pixel_rect, image_size):
+            x, y, w, h = pixel_rect
+            width, height = image_size
+            return (x / width, y / height, w / width, h / height)
+
+        source_size = (960, 680)
+        pixel_rect = (120.0, 340.0, 40.0, 18.0)
+        baseline = normalized(pixel_rect, source_size)
+        for factor in (1, 2, 3, 4, 8):
+            scaled_size = (source_size[0] * factor, source_size[1] * factor)
+            scaled_rect = tuple(value * factor for value in pixel_rect)
+            self.assertEqual(normalized(scaled_rect, scaled_size), baseline)
 
     def test_group_candidates_by_observation_sorts_by_rank(self):
         rank1 = {"observation_index": 0, "candidate_rank": 1, "confidence": 0.4}
