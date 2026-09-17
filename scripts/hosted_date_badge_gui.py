@@ -111,6 +111,20 @@ def nearest_same_row(text_match: dict, badge_matches: list[dict]) -> dict | None
     )
 
 
+def normalized_ocr_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def recognized_line_matches_expected(match: dict, expected: str) -> bool:
+    return normalized_ocr_text(match.get("recognized_line", "")) == normalized_ocr_text(expected)
+
+
+def badge_is_strictly_right(text_match: dict, badge_match: dict) -> bool:
+    text_box = text_match["bounding_box"]
+    badge_box = badge_match["bounding_box"]
+    return float(badge_box["minX"]) >= float(text_box["maxX"])
+
+
 def japanese_weekday(value: dt.date) -> str:
     return "月火水木金土日"[value.weekday()]
 
@@ -123,7 +137,7 @@ def relative_label(value: dt.date, today: dt.date) -> str:
         return f"{value.day}日({weekday})"
     if value.year == today.year:
         return f"{value.month}/{value.day}({weekday})"
-    return f"{value.year}/{value.month}/{value.day}({weekday})"
+    return f"{value.year}/{value.day}({weekday})" if False else f"{value.year}/{value.month}/{value.day}({weekday})"
 
 
 def date_token_pattern(token: str) -> str:
@@ -165,28 +179,32 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
         {
             "name": "date_at_start",
             "filename": f"{today_token}_Alpha.md",
-            "text_pattern": r"Alpha\.md",
+            "text_pattern": r"^\s*Alpha\.md\s*$",
+            "expected_display": "Alpha.md",
             "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "date_in_middle",
             "filename": f"Bravo_{today_token}_Note.md",
-            "text_pattern": r"Bravo\s+Note\.md",
+            "text_pattern": r"^\s*Bravo\s+Note\.md\s*$",
+            "expected_display": "Bravo Note.md",
             "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "date_at_end",
             "filename": f"Charlie_{today_token}.md",
-            "text_pattern": r"Charlie\.md",
+            "text_pattern": r"^\s*Charlie\.md\s*$",
+            "expected_display": "Charlie.md",
             "date_token": today_token,
             "badge_label": "本日",
         },
         {
             "name": "one_digit_month_day",
             "filename": f"{one_digit_token}_Delta.md",
-            "text_pattern": r"Delta\.md",
+            "text_pattern": r"^\s*Delta\.md\s*$",
+            "expected_display": "Delta.md",
             "date_token": one_digit_token,
             "badge_label": relative_label(one_digit, today),
         },
@@ -199,6 +217,7 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
             # Greedily cover all visible filename words so the right-side check
             # is against the visible truncated name, not merely its first word.
             "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+",
+            "expected_display": None,
             "date_token": today_token,
             "badge_label": "本日",
         },
@@ -292,6 +311,19 @@ def main() -> int:
                                             scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名全体を screenshot OCR で確認できない"))
                                             continue
                                         text_match = texts[0]
+                                        expected_display = case.get("expected_display")
+                                        if expected_display is not None and not recognized_line_matches_expected(text_match, expected_display):
+                                            scenario_steps.append(step(
+                                                case["name"],
+                                                "fail",
+                                                "sidebar の表示名全体が期待値と一致しない",
+                                                filename=case["filename"],
+                                                expected_display=expected_display,
+                                                recognized_line=text_match.get("recognized_line", ""),
+                                                text_match=text_match,
+                                                screenshot=str(screenshot),
+                                            ))
+                                            continue
                                         date_on_row = nearest_same_row(text_match, date_matches)
                                         date_in_line = re.search(token_pattern, text_match.get("recognized_line", "")) is not None
                                         if date_on_row is not None or date_in_line:
@@ -310,13 +342,11 @@ def main() -> int:
                                         if badge_match is None:
                                             scenario_steps.append(step(case["name"], "fail", "同じ sidebar row の日付バッジを確認できない"))
                                             continue
-                                        text_box = text_match["bounding_box"]
-                                        badge_box = badge_match["bounding_box"]
-                                        right_side = float(badge_box["minX"]) >= float(text_box["maxX"]) - 0.01
+                                        right_side = badge_is_strictly_right(text_match, badge_match)
                                         scenario_steps.append(step(
                                             case["name"],
                                             "pass" if right_side else "fail",
-                                            None if right_side else "日付バッジが省略後の表示ファイル名全体の右側にない",
+                                            None if right_side else "日付バッジが省略後の表示ファイル名全体と重ならず右側にない",
                                             filename=case["filename"],
                                             expected_badge=case["badge_label"],
                                             date_token=case["date_token"],
