@@ -112,6 +112,31 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             self.assertEqual(before, sorted(case["filename"] for case in cases))
             self.assertTrue(all((Path(tmp) / "work-folder" / name).is_file() for name in before))
 
+    def test_make_fixtures_exercises_all_relative_label_shapes_for_fixed_today(self):
+        # Fixed `today` makes this deterministic instead of depending on which
+        # calendar day the real GUI run happens to execute on.
+        today = dt.date(2026, 9, 17)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=today)
+        labels = {case["name"]: case["badge_label"] for case in cases}
+        self.assertEqual(labels["date_at_start"], "本日")
+        self.assertEqual(labels["long_name_keeps_badge_visible"], "本日")
+
+        shapes = set()
+        for label in labels.values():
+            if label == "本日":
+                shapes.add("today")
+            elif re.fullmatch(r"\d+日\(.\)", label):
+                shapes.add("same_year_same_month")
+            elif re.fullmatch(r"\d+/\d+\(.\)", label):
+                shapes.add("same_year_other_month")
+            elif re.fullmatch(r"\d+/\d+/\d+\(.\)", label):
+                shapes.add("other_year")
+        self.assertEqual(
+            shapes,
+            {"today", "same_year_same_month", "same_year_other_month", "other_year"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

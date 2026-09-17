@@ -197,12 +197,30 @@ def make_config(module, target_dir: Path, run_dir: Path, fixture: Path, expected
     )
 
 
-def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
+def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[str], list[dict]]:
+    """Build sidebar fixtures whose badges cover all four `relative_label` shapes.
+
+    Each non-`本日` fixture date is derived from `today` so that, regardless
+    of which real day the hosted GUI run executes on, the five fixtures still
+    exercise 本日 / same-month-different-day / same-year-different-month /
+    previous-year once each.
+    """
     folder.mkdir(parents=True, exist_ok=False)
-    today = dt.date.today()
+    if today is None:
+        today = dt.date.today()
     today_token = today.strftime("%Y-%m-%d")
-    one_digit = dt.date(today.year, 1, 2)
-    one_digit_token = f"{one_digit.year}-1-2"
+
+    middle_day = 1 if today.day != 1 else 2
+    date_in_middle = dt.date(today.year, today.month, middle_day)
+    date_in_middle_token = date_in_middle.strftime("%Y-%m-%d")
+
+    one_digit_month = 1 if today.month != 1 else 2
+    one_digit = dt.date(today.year, one_digit_month, 2)
+    one_digit_token = f"{one_digit.year}-{one_digit.month}-{one_digit.day}"
+
+    date_at_end = dt.date(today.year - 1, today.month, 2)
+    date_at_end_token = date_at_end.strftime("%Y-%m-%d")
+
     cases = [
         {
             "name": "date_at_start",
@@ -214,19 +232,19 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
         },
         {
             "name": "date_in_middle",
-            "filename": f"Bravo_{today_token}_Note.md",
+            "filename": f"Bravo_{date_in_middle_token}_Note.md",
             "text_pattern": r"^\s*Bravo\s+Note\.md\s*$",
             "expected_display": "Bravo Note.md",
-            "date_token": today_token,
-            "badge_label": "本日",
+            "date_token": date_in_middle_token,
+            "badge_label": relative_label(date_in_middle, today),
         },
         {
             "name": "date_at_end",
-            "filename": f"Charlie_{today_token}.md",
+            "filename": f"Charlie_{date_at_end_token}.md",
             "text_pattern": r"^\s*Charlie\.md\s*$",
             "expected_display": "Charlie.md",
-            "date_token": today_token,
-            "badge_label": "本日",
+            "date_token": date_at_end_token,
+            "badge_label": relative_label(date_at_end, today),
         },
         {
             "name": "one_digit_month_day",
