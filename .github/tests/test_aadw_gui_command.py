@@ -186,7 +186,7 @@ class DuplicateTests(unittest.TestCase):
 
     def test_different_request_identity_is_not_duplicate(self):
         different = f"AADW GUI PR #123 @ {SHA} base {OTHER_BASE} merge hosted-gui-interaction/7"
-        run = {"id": 10, "display_title": different, "status": "success", "conclusion": "success"}
+        run = {"id": 10, "display_title": different, "status": "completed", "conclusion": "success"}
         self.assertIsNone(command.find_duplicate([run], self.RUN_NAME))
 
     def test_older_success_still_prevents_duplicate_after_failed_retry(self):
