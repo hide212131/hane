@@ -230,19 +230,15 @@ jobs:
             summary="GUI validation を開始しました。"
           fi
 
-          body="$(cat <<EOF
-          ${summary}
-
-          - PR: #${PR_NUMBER}
-          - head: \`${short_head}\`
-          - base: \`${short_base}\`
-          - context: \`${EXECUTION_CONTEXT}\`
-          - procedure: \`${PROCEDURE}\`
-          - run: ${run_url}
-
-          このコメントは通知用です。merge 判断に使う evidence は workflow run / artifact と current PR context を確認します。
-          EOF
-          )"
+          printf -v body '%s\n\n- PR: #%s\n- head: `%s`\n- base: `%s`\n- context: `%s`\n- procedure: `%s`\n- run: %s\n\n%s\n' \
+            "$summary" \
+            "$PR_NUMBER" \
+            "$short_head" \
+            "$short_base" \
+            "$EXECUTION_CONTEXT" \
+            "$PROCEDURE" \
+            "$run_url" \
+            'このコメントは通知用です。merge 判断に使う evidence は workflow run / artifact と current PR context を確認します。'
           gh api \
             --method POST \
             -H 'Accept: application/vnd.github+json' \
