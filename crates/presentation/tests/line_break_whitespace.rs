@@ -5,6 +5,7 @@
 //! boundary, disclosure, and exact saved source bytes. Viewport-width wrapping
 //! is deliberately outside this file's scope.
 
+#[allow(dead_code)]
 mod support;
 
 use hane_markdown::NodeKind;
@@ -72,8 +73,8 @@ const FIXTURES: &[MarkdownFixture] = &[
         visual_lines: &["foo", "baz"],
     },
     MarkdownFixture {
-        name: "hard break whitespace inside a list keeps existing list indentation",
-        source: "- foo  \n   baz",
+        name: "hard break inside a list keeps existing continuation indentation",
+        source: "- foo  \n  baz",
         tree_paths: &[&[
             NodeKind::List { ordered: false },
             NodeKind::ListItem { task: None },
@@ -83,9 +84,9 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["- ", "  "],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
         style_runs: &[NO_STYLES, NO_STYLES],
-        // The two spaces required by the list continuation remain the existing
-        // list presentation indentation; only the extra CommonMark break-adjacent
-        // space is parser-discarded padding.
+        // The two spaces required by the list continuation belong to the
+        // existing list presentation; break-adjacent whitespace behavior is
+        // covered independently above and inside the quote fixture.
         visual_lines: &["foo", "  baz"],
     },
     MarkdownFixture {
