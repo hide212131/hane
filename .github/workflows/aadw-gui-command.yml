@@ -130,14 +130,12 @@ jobs:
               -H 'Accept: application/vnd.github+json' \
               "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/runs?event=workflow_dispatch&per_page=100"
           )"
-          before_run_id="$(jq '[.workflow_runs[].id] | max // 0' <<< "$runs_json")"
           duplicate_json="$(
             printf '%s' "$runs_json" \
               | python3 control/.github/scripts/aadw_gui_command.py duplicate \
                   --run-name "$RUN_NAME"
           )"
 
-          echo "before_run_id=$before_run_id" >> "$GITHUB_OUTPUT"
           if [[ "$duplicate_json" == 'null' ]]; then
             echo 'found=false' >> "$GITHUB_OUTPUT"
             exit 0
@@ -150,6 +148,7 @@ jobs:
           echo "run_conclusion=$(jq -r '.conclusion // ""' <<< "$duplicate_json")" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch trusted Hosted GUI Validation
+        id: dispatched
         if: >-
           steps.command.outputs.recognized == 'true' &&
           steps.duplicate.outputs.found == 'false'
@@ -163,70 +162,43 @@ jobs:
           REQUEST_COMMENT_ID: ${{ steps.request.outputs.request_comment_id }}
         run: |
           set -euo pipefail
-          jq -n \
-            --arg ref "$DEFAULT_BRANCH" \
-            --arg pr_number "$PR_NUMBER" \
-            --arg target_head_sha "$TARGET_HEAD_SHA" \
-            --arg request_base_sha "$REQUEST_BASE_SHA" \
-            --arg execution_context "$EXECUTION_CONTEXT" \
-            --arg request_procedure "$PROCEDURE" \
-            --arg request_comment_id "$REQUEST_COMMENT_ID" \
-            '{
-              ref: $ref,
-              inputs: {
-                pr_number: $pr_number,
-                target_head_sha: $target_head_sha,
-                request_base_sha: $request_base_sha,
-                execution_context: $execution_context,
-                request_procedure: $request_procedure,
-                request_comment_id: $request_comment_id
-              }
-            }' \
-            | gh api \
-                --method POST \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/dispatches" \
-                --input -
+          dispatch_json="$(
+            jq -n \
+              --arg ref "$DEFAULT_BRANCH" \
+              --arg pr_number "$PR_NUMBER" \
+              --arg target_head_sha "$TARGET_HEAD_SHA" \
+              --arg request_base_sha "$REQUEST_BASE_SHA" \
+              --arg execution_context "$EXECUTION_CONTEXT" \
+              --arg request_procedure "$PROCEDURE" \
+              --arg request_comment_id "$REQUEST_COMMENT_ID" \
+              '{
+                ref: $ref,
+                inputs: {
+                  pr_number: $pr_number,
+                  target_head_sha: $target_head_sha,
+                  request_base_sha: $request_base_sha,
+                  execution_context: $execution_context,
+                  request_procedure: $request_procedure,
+                  request_comment_id: $request_comment_id
+                },
+                return_run_details: true
+              }' \
+              | gh api \
+                  --method POST \
+                  -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2026-03-10' \
+                  "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/dispatches" \
+                  --input -
+          )"
 
-      - name: Resolve dispatched workflow run
-        id: dispatched
-        if: >-
-          steps.command.outputs.recognized == 'true' &&
-          steps.duplicate.outputs.found == 'false'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_NAME: ${{ steps.request.outputs.run_name }}
-          BEFORE_RUN_ID: ${{ steps.duplicate.outputs.before_run_id }}
-        run: |
-          set -euo pipefail
-
-          for attempt in {1..20}; do
-            runs_json="$(
-              gh api \
-                -H 'Accept: application/vnd.github+json' \
-                "repos/${REPOSITORY}/actions/workflows/aadw-gui-validation.yml/runs?event=workflow_dispatch&per_page=50"
-            )"
-            run_json="$(
-              jq -c \
-                --arg run_name "$RUN_NAME" \
-                --argjson before "$BEFORE_RUN_ID" \
-                '[.workflow_runs[]
-                  | select(.display_title == $run_name and .id > $before)]
-                 | sort_by(.id)
-                 | last // empty' \
-                <<< "$runs_json"
-            )"
-            if [[ -n "$run_json" ]]; then
-              echo "run_id=$(jq -r '.id' <<< "$run_json")" >> "$GITHUB_OUTPUT"
-              echo "run_url=$(jq -r '.html_url' <<< "$run_json")" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo '::error::Hosted GUI Validation was dispatched but its workflow run could not be resolved.'
-          exit 1
+          run_id="$(jq -r '.workflow_run_id // empty' <<< "$dispatch_json")"
+          run_url="$(jq -r '.html_url // empty' <<< "$dispatch_json")"
+          if ! [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || [[ -z "$run_url" ]]; then
+            echo '::error::Workflow dispatch succeeded without usable run details.'
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
 
       - name: Report accepted request on Pull Request
         if: steps.command.outputs.recognized == 'true'
