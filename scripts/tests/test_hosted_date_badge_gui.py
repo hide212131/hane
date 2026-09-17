@@ -26,12 +26,13 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(mod.relative_label(dt.date(2026, 10, 3), today), "10/3(土)")
         self.assertEqual(mod.relative_label(dt.date(2025, 10, 3), today), "2025/10/3(金)")
 
-    def test_nearest_same_row_rejects_far_badge(self):
+    def test_nearest_same_row_rejects_adjacent_row_badge(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
-        near = {"bounding_box": {"minX": 0.25, "maxX": 0.30, "minY": 0.49, "maxY": 0.51}}
-        far = {"bounding_box": {"minX": 0.25, "maxX": 0.30, "minY": 0.20, "maxY": 0.22}}
-        self.assertIs(mod.nearest_same_row(text, [far, near]), near)
-        self.assertIsNone(mod.nearest_same_row(text, [far]))
+        same_row = {"bounding_box": {"minX": 0.25, "maxX": 0.30, "minY": 0.495, "maxY": 0.515}}
+        adjacent_row = {"bounding_box": {"minX": 0.25, "maxX": 0.30, "minY": 0.469, "maxY": 0.489}}
+        self.assertIs(mod.nearest_same_row(text, [adjacent_row, same_row]), same_row)
+        self.assertIsNone(mod.nearest_same_row(text, [adjacent_row]))
+        self.assertLess(mod.SAME_ROW_CENTER_Y_TOLERANCE, 0.016)
 
     def test_fixture_names_cover_required_shapes(self):
         with tempfile.TemporaryDirectory() as tmp:
