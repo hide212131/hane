@@ -119,6 +119,23 @@ def recognized_line_matches_expected(match: dict, expected: str) -> bool:
     return normalized_ocr_text(match.get("recognized_line", "")) == normalized_ocr_text(expected)
 
 
+def display_geometry_match(match: dict, *, use_full_line: bool) -> dict:
+    """Return geometry representing the whole visible filename when needed.
+
+    Normal short cases use an anchored regex whose match is already the whole
+    display name. The long-name case intentionally cannot know the exact
+    truncation point, so its prefix match is only an identity locator; the
+    right-side/non-overlap oracle must use Vision's full recognized-line box.
+    """
+    if not use_full_line:
+        return match
+    line_box = match.get("line_bounding_box")
+    required = {"minX", "maxX", "minY", "maxY"}
+    if not isinstance(line_box, dict) or not required.issubset(line_box):
+        raise ValueError("Vision evidence is missing the full recognized-line bounding box")
+    return {**match, "bounding_box": dict(line_box)}
+
+
 def badge_is_strictly_right(text_match: dict, badge_match: dict) -> bool:
     text_box = text_match["bounding_box"]
     badge_box = badge_match["bounding_box"]
@@ -214,8 +231,9 @@ def make_fixtures(folder: Path) -> tuple[list[str], list[dict]]:
                 "This_Is_An_Extremely_Long_Sidebar_Filename_Designed_To_Force_"
                 f"Truncation_{today_token}.md"
             ),
-            # Greedily cover all visible filename words so the right-side check
-            # is against the visible truncated name, not merely its first word.
+            # This prefix only identifies the intended OCR observation. Its
+            # full `recognized_line` bbox, not this regex match bbox, is used
+            # for row matching and the strict right-side/non-overlap check.
             "text_pattern": r"This(?:[_ ]?[A-Za-z]+)+",
             "expected_display": None,
             "date_token": today_token,
@@ -308,7 +326,7 @@ def main() -> int:
                                             helper_find_all(helper, helper_digest, screenshot, token_pattern),
                                         )
                                         if not texts:
-                                            scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名全体を screenshot OCR で確認できない"))
+                                            scenario_steps.append(step(case["name"], "fail", "省略後の表示ファイル名を screenshot OCR で確認できない"))
                                             continue
                                         text_match = texts[0]
                                         expected_display = case.get("expected_display")
@@ -324,7 +342,11 @@ def main() -> int:
                                                 screenshot=str(screenshot),
                                             ))
                                             continue
-                                        date_on_row = nearest_same_row(text_match, date_matches)
+                                        display_match = display_geometry_match(
+                                            text_match,
+                                            use_full_line=expected_display is None,
+                                        )
+                                        date_on_row = nearest_same_row(display_match, date_matches)
                                         date_in_line = re.search(token_pattern, text_match.get("recognized_line", "")) is not None
                                         if date_on_row is not None or date_in_line:
                                             scenario_steps.append(step(
@@ -334,15 +356,16 @@ def main() -> int:
                                                 filename=case["filename"],
                                                 date_token=case["date_token"],
                                                 text_match=text_match,
+                                                display_geometry=display_match["bounding_box"],
                                                 date_on_row=date_on_row,
                                                 screenshot=str(screenshot),
                                             ))
                                             continue
-                                        badge_match = nearest_same_row(text_match, badges)
+                                        badge_match = nearest_same_row(display_match, badges)
                                         if badge_match is None:
                                             scenario_steps.append(step(case["name"], "fail", "同じ sidebar row の日付バッジを確認できない"))
                                             continue
-                                        right_side = badge_is_strictly_right(text_match, badge_match)
+                                        right_side = badge_is_strictly_right(display_match, badge_match)
                                         scenario_steps.append(step(
                                             case["name"],
                                             "pass" if right_side else "fail",
@@ -351,6 +374,7 @@ def main() -> int:
                                             expected_badge=case["badge_label"],
                                             date_token=case["date_token"],
                                             text_match=text_match,
+                                            display_geometry=display_match["bounding_box"],
                                             badge_match=badge_match,
                                             date_matches=date_matches,
                                             screenshot=str(screenshot),
