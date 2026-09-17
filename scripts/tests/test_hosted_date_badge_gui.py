@@ -118,12 +118,22 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         today = dt.date(2026, 9, 17)
         with tempfile.TemporaryDirectory() as tmp:
             _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=today)
-        labels = {case["name"]: case["badge_label"] for case in cases}
-        self.assertEqual(labels["date_at_start"], "本日")
-        self.assertEqual(labels["long_name_keeps_badge_visible"], "本日")
+        by_name = {case["name"]: case for case in cases}
 
+        self.assertEqual(by_name["date_at_start"]["date_token"], "2026-09-17")
+        self.assertEqual(by_name["date_at_start"]["badge_label"], "本日")
+        self.assertEqual(by_name["date_in_middle"]["date_token"], "2026-09-01")
+        self.assertEqual(by_name["date_in_middle"]["badge_label"], "1日(火)")
+        self.assertEqual(by_name["one_digit_month_day"]["date_token"], "2026-1-2")
+        self.assertEqual(by_name["one_digit_month_day"]["badge_label"], "1/2(金)")
+        self.assertEqual(by_name["date_at_end"]["date_token"], "2025-09-02")
+        self.assertEqual(by_name["date_at_end"]["badge_label"], "2025/9/2(火)")
+        self.assertEqual(by_name["long_name_keeps_badge_visible"]["date_token"], "2026-09-17")
+        self.assertEqual(by_name["long_name_keeps_badge_visible"]["badge_label"], "本日")
+
+        labels = [case["badge_label"] for case in cases]
         shapes = set()
-        for label in labels.values():
+        for label in labels:
             if label == "本日":
                 shapes.add("today")
             elif re.fullmatch(r"\d+日\(.\)", label):
