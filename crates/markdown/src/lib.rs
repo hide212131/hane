@@ -703,16 +703,19 @@ fn code_padding(
     padding
 }
 
-/// Spaces/tabs a soft or hard line break makes insignificant, so presentation
-/// can hide them like other derived padding while keeping their source bytes
+/// Bytes a soft or hard line break makes insignificant, so presentation can
+/// hide them like other derived padding while keeping their source bytes
 /// addressable. Two distinct sources, per the CommonMark line-break rules:
 ///
-/// - The single trailing space/tab CommonMark folds into a soft break (two or
-///   more would have made it a hard break instead). pulldown-cmark's own
-///   `Text` item ends before this byte and its `SoftBreak` item starts at the
-///   line ending itself, so — unlike a hard break's own syntax, which is a
-///   real `HardBreak` item covering it — this one byte is not part of any
-///   parsed item's range at all; it is recovered here directly from `source`.
+/// - The single trailing U+0020 space CommonMark folds into a soft break (two
+///   or more would have made it a hard break instead; CommonMark §6.8 defines
+///   `space` as U+0020 specifically, so a trailing tab/VT/FF is not part of
+///   this rule and stays visible/addressable textual content instead).
+///   pulldown-cmark's own `Text` item ends before this byte and its
+///   `SoftBreak` item starts at the line ending itself, so — unlike a hard
+///   break's own syntax, which is a real `HardBreak` item covering it — this
+///   one byte is not part of any parsed item's range at all; it is recovered
+///   here directly from `source`.
 /// - The leading indentation of the physical line either break kind
 ///   continues onto: CommonMark drops any amount of it when forming a
 ///   paragraph's inline content, independent of the break that precedes it.
@@ -733,7 +736,7 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
                     .as_bytes()
                     .get(break_start - range.start.0 - 1)
                     .copied()
-                && matches!(byte, b'\t' | 0x0b | 0x0c | b' ')
+                && byte == b' '
             {
                 padding.push(SourceRange::new(break_start - 1, break_start));
             }
