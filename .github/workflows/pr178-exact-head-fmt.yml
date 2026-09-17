@@ -16,12 +16,12 @@ jobs:
       - name: Check out exact PR head
         uses: actions/checkout@v6
         with:
-          ref: 7b2bd7ce45166d79a53f11365e52e761c642f7c3
+          ref: 55673ca5f584b05990f2656a948f156f5e5be36d
           persist-credentials: false
       - name: Verify exact head
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "7b2bd7ce45166d79a53f11365e52e761c642f7c3"
+          test "$(git rev-parse HEAD)" = "55673ca5f584b05990f2656a948f156f5e5be36d"
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
