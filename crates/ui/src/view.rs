@@ -4000,18 +4000,31 @@ fn file_name_label(
     theme: &Theme,
     badge_position: DateBadgePosition,
 ) -> gpui::Div {
-    let row = div().flex().flex_row().items_center().gap_1();
+    // Lets this label shrink below its content width inside the sidebar's
+    // fixed-width row instead of pushing the (flex_none) date badge past the
+    // visible edge; `min_w` defaults to the content size otherwise.
+    let row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .min_w(px(0.0));
     let Some(badge) = split_file_name_for_badge(file_name) else {
         return row.child(file_name.to_owned());
     };
     let remainder = badge.remainder();
     let chip = date_badge_chip(badge.date, today, theme);
+    let remainder_child = (!remainder.is_empty()).then(|| {
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .truncate()
+            .child(remainder)
+    });
     if badge_renders_before_remainder(badge_position) {
-        row.child(chip)
-            .when(!remainder.is_empty(), |row| row.child(remainder))
+        row.child(chip).children(remainder_child)
     } else {
-        row.when(!remainder.is_empty(), |row| row.child(remainder))
-            .child(chip)
+        row.children(remainder_child).child(chip)
     }
 }
 
