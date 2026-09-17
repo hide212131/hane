@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/3"
+PROCEDURE_VERSION = "hosted-date-badge/4"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
     "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
@@ -71,7 +71,21 @@ def compile_helper(source: Path, directory: Path) -> tuple[Path, str]:
     return binary, hashlib.sha256(binary.read_bytes()).hexdigest()
 
 
-def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -> list[dict]:
+REQUIRED_PREPROCESSING_KEYS = {"method", "scale_factor", "source_size", "processed_size"}
+
+
+def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -> tuple[list[dict], dict]:
+    """Run the trusted Vision helper and return `(matches, preprocessing_evidence)`.
+
+    `hosted_date_badge_gui.swift` uniformly upscales the whole screenshot
+    before OCR (Issue #190: tiny sidebar glyphs, e.g. a weekday kanji, can be
+    missing from every bounded Vision candidate at the raw screenshot
+    resolution -- not just top-1) and reports what it did (method, scale
+    factor, source/processed pixel size) alongside the matches. Requiring
+    that evidence here, rather than only trusting it implicitly, keeps this
+    fail-closed: a helper build that silently stopped preprocessing would
+    fail this parse instead of quietly falling back to raw-resolution OCR.
+    """
     if hashlib.sha256(helper.read_bytes()).hexdigest() != digest:
         raise RuntimeError("trusted vision helper integrity mismatch before execution")
     proc = subprocess.run(
@@ -85,9 +99,15 @@ def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"vision helper exited {proc.returncode}")
     value = json.loads(proc.stdout)
-    if not isinstance(value, list):
-        raise RuntimeError("vision helper did not return a list")
-    return value
+    if not isinstance(value, dict):
+        raise RuntimeError("vision helper did not return a JSON object")
+    matches = value.get("matches")
+    preprocessing = value.get("preprocessing")
+    if not isinstance(matches, list):
+        raise RuntimeError("vision helper did not return a matches list")
+    if not isinstance(preprocessing, dict) or not REQUIRED_PREPROCESSING_KEYS.issubset(preprocessing):
+        raise RuntimeError("vision helper did not return OCR preprocessing evidence")
+    return matches, preprocessing
 
 
 def center_y(match: dict) -> float:
@@ -426,6 +446,7 @@ def main() -> int:
     scenario_steps: list[dict] = []
     target_info: dict = {}
     build_info: dict = {}
+    ocr_preprocessing: dict = {}
     process = None
     started_at = env.clock.now_iso()
     helper_tmp = tempfile.TemporaryDirectory(prefix="hane-date-badge-helper-")
@@ -467,8 +488,8 @@ def main() -> int:
                             scenario_steps.append(capture)
                             if capture["result"] == "pass":
                                 screenshot = config.image_path
-                                badge_cache: dict[str, list[dict]] = {}
-                                date_cache: dict[str, list[dict]] = {}
+                                badge_cache: dict[str, tuple[list[dict], dict]] = {}
+                                date_cache: dict[str, tuple[list[dict], dict]] = {}
                                 for case in cases:
                                     try:
                                         # `best_matches` reduces Vision's bounded per-candidate
@@ -482,16 +503,18 @@ def main() -> int:
                                         # alternate rather than only the one alternate
                                         # `best_matches` picked for a looser pattern search
                                         # (Issue #188).
-                                        texts_all = helper_find_all(helper, helper_digest, screenshot, case["text_pattern"])
+                                        texts_all, ocr_preprocessing = helper_find_all(
+                                            helper, helper_digest, screenshot, case["text_pattern"]
+                                        )
                                         texts = best_matches(texts_all)
-                                        badges_all = badge_cache.setdefault(
+                                        badges_all, _ = badge_cache.setdefault(
                                             case["badge_label"],
                                             helper_find_all(
                                                 helper, helper_digest, screenshot, re.escape(case["badge_label"])
                                             ),
                                         )
                                         token_pattern = date_token_pattern(case["date_token"])
-                                        date_matches_all = date_cache.setdefault(
+                                        date_matches_all, _ = date_cache.setdefault(
                                             case["date_token"],
                                             helper_find_all(helper, helper_digest, screenshot, token_pattern),
                                         )
@@ -670,6 +693,7 @@ def main() -> int:
                 "machine": platform.machine(),
             },
             "build": build_info,
+            "ocr_preprocessing": ocr_preprocessing,
             "top_level_steps": top_steps,
             "scenarios": [{
                 "name": "sidebar_date_badges",
