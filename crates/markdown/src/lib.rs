@@ -79,7 +79,17 @@ pub enum NodeKind {
     InlineHtml,
     FootnoteReference,
     TaskMarker(bool),
-    Break,
+    /// A CommonMark soft line break: an ordinary source line ending inside a
+    /// paragraph's inline content. Purely a source-level join point, not
+    /// markup and not the viewport's own wrap concept (`LineWrap::Soft` in
+    /// `hane_presentation`, which is display-width wrapping and unrelated).
+    SoftBreak,
+    /// A CommonMark hard line break: two or more trailing spaces, or a
+    /// trailing backslash, before a line ending inside a paragraph's inline
+    /// content. Unlike [`Self::SoftBreak`], the syntax bytes preceding the
+    /// line ending are markup and can be hidden/disclosed like other
+    /// delimiters.
+    HardBreak,
     /// A construct with no modeled kind. Retains its source range so callers can
     /// still account for the bytes.
     Unsupported,
@@ -120,7 +130,8 @@ impl NodeKind {
                 | Self::InlineHtml
                 | Self::FootnoteReference
                 | Self::TaskMarker(_)
-                | Self::Break
+                | Self::SoftBreak
+                | Self::HardBreak
         )
     }
 }
@@ -237,6 +248,13 @@ pub struct MarkdownParse {
     /// Padding removed from inline code after container prefixes and line
     /// endings are interpreted. Derived against the parser's code content.
     pub code_padding: Vec<SourceRange>,
+    /// Spaces/tabs a soft or hard line break makes insignificant: the single
+    /// trailing space CommonMark folds into a soft break, and the leading
+    /// indentation of the physical line either break kind continues onto.
+    /// Not markup — a soft break in particular carries none, see
+    /// [`NodeKind::SoftBreak`] — so kept separate from `markers` the same way
+    /// `code_padding` is, while still hidden from rendered presentation.
+    pub line_break_padding: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,6 +703,92 @@ fn code_padding(
     padding
 }
 
+/// Bytes a soft or hard line break makes insignificant, so presentation can
+/// hide them like other derived padding while keeping their source bytes
+/// addressable. Two distinct sources, per the CommonMark line-break rules:
+///
+/// - The single trailing U+0020 space CommonMark folds into a soft break (two
+///   or more would have made it a hard break instead; CommonMark §6.8 defines
+///   `space` as U+0020 specifically, so a trailing tab/VT/FF is not part of
+///   this rule and stays visible/addressable textual content instead).
+///   pulldown-cmark's own `Text` item ends before this byte and its
+///   `SoftBreak` item starts at the line ending itself, so — unlike a hard
+///   break's own syntax, which is a real `HardBreak` item covering it — this
+///   one byte is not part of any parsed item's range at all; it is recovered
+///   here directly from `source`.
+/// - The leading indentation of the physical line either break kind
+///   continues onto: CommonMark drops any amount of it when forming a
+///   paragraph's inline content, independent of the break that precedes it.
+fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> Vec<SourceRange> {
+    let mut padding = Vec::new();
+    for (id, span) in tree
+        .iter()
+        .filter(|(_, node)| matches!(node.kind, NodeKind::SoftBreak | NodeKind::HardBreak))
+    {
+        let end = span.source_range.end.0.saturating_sub(range.start.0);
+        if end > source.len() {
+            continue;
+        }
+        if span.kind == NodeKind::SoftBreak {
+            let break_start = span.source_range.start.0;
+            if break_start > range.start.0
+                && let Some(byte) = source
+                    .as_bytes()
+                    .get(break_start - range.start.0 - 1)
+                    .copied()
+                && byte == b' '
+            {
+                padding.push(SourceRange::new(break_start - 1, break_start));
+            }
+        }
+        let Some(containers) = ancestor_containers(tree, id, range, source) else {
+            continue;
+        };
+        // `end` is the byte right after the line ending this break owns (see
+        // the `HardBreak` marker derivation above), i.e. the start of the
+        // physical line it continues onto.
+        let line_start = end;
+        let line = source
+            .get(line_start..)
+            .and_then(|rest| markdown_lines(rest).next())
+            .unwrap_or("");
+        // Lazy continuation may carry only some ancestor prefixes, or none:
+        // stop at the first container this line does not actually have, the
+        // same way `code_padding` does for code spans. The parser already
+        // decided this line is part of the same inline content (that is why
+        // it produced this SoftBreak/HardBreak at all), so whatever leading
+        // whitespace remains past the prefixes this line really has is still
+        // insignificant, regardless of how many ancestor levels went missing.
+        let mut cursor = PrefixCursor::default();
+        for container in &containers {
+            let before = cursor;
+            let matched = match *container {
+                PrefixContainer::Quote => cursor.quote(line.as_bytes()).is_some(),
+                PrefixContainer::ListItem { start, indent } => {
+                    if (line_start..line_start + line.len()).contains(&start) {
+                        cursor.list_item(line.as_bytes()).is_some()
+                    } else {
+                        cursor.indent(line.as_bytes(), indent) == indent
+                    }
+                }
+            };
+            if !matched {
+                cursor = before;
+                break;
+            }
+        }
+        let before = cursor.byte;
+        cursor.indent(line.as_bytes(), line.len());
+        if cursor.byte > before {
+            padding.push(absolute_range(
+                range.start.0 + line_start,
+                before..cursor.byte,
+            ));
+        }
+    }
+    padding
+}
+
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
     quote_markers: Vec<(SourceRange, NodeId)>,
@@ -830,6 +934,25 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             markers.push(SourceRange::new(end - marker_len, end));
         }
     }
+    for (_, span) in tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::HardBreak)
+    {
+        let start = span.source_range.start.0;
+        let end = span.source_range.end.0;
+        if start < range.start.0 || end > range.end.0 || start >= end {
+            continue;
+        }
+        // pulldown-cmark's hard-break range covers the break syntax (trailing
+        // spaces or a backslash) plus the physical line ending it precedes.
+        // Only the syntax is markup; the line-ending bytes stay ordinary
+        // source so they remain addressable/preserved rather than hidden.
+        let text = &source[start - range.start.0..end - range.start.0];
+        let marker_len = text.trim_end_matches(['\r', '\n']).len();
+        if marker_len > 0 {
+            markers.push(SourceRange::new(start, start + marker_len));
+        }
+    }
     markers.sort_by_key(|marker| (marker.start, marker.end));
     let mut merged: Vec<SourceRange> = Vec::with_capacity(markers.len());
     for marker in markers {
@@ -962,8 +1085,11 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
             Event::FootnoteReference(_) => {
                 push(&mut nodes, &open, NodeKind::FootnoteReference, range);
             }
-            Event::SoftBreak | Event::HardBreak => {
-                push(&mut nodes, &open, NodeKind::Break, range);
+            Event::SoftBreak => {
+                push(&mut nodes, &open, NodeKind::SoftBreak, range);
+            }
+            Event::HardBreak => {
+                push(&mut nodes, &open, NodeKind::HardBreak, range);
             }
             Event::Rule => {
                 push(&mut nodes, &open, NodeKind::Rule, range);
@@ -988,6 +1114,7 @@ pub fn parse_document(
     let (tree, codes) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
+    let line_break_padding = line_break_padding(&tree, source_range, source);
     MarkdownParse {
         revision,
         source_range,
@@ -996,6 +1123,7 @@ pub fn parse_document(
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
         code_padding,
+        line_break_padding,
     }
 }
 

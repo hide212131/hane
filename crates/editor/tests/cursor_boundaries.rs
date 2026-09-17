@@ -65,17 +65,33 @@ fn grapheme_boundaries(text: &str, start: usize, end: usize) -> Vec<usize> {
     boundaries
 }
 
+/// Splits `text` the way `RopeBuffer` does: CommonMark 0.31.2 source line
+/// endings (`\n`, `\r\n`, and a bare `\r`) each end one physical line. A
+/// Unicode line/paragraph separator like U+2028 is ordinary text, not a break.
 fn line_boundaries(text: &str) -> Vec<Vec<usize>> {
+    let bytes = text.as_bytes();
     let mut lines = Vec::new();
     let mut start = 0;
-    for (newline, _) in text.match_indices('\n') {
-        let content_end = if text[start..newline].ends_with('\r') {
-            newline - 1
-        } else {
-            newline
-        };
-        lines.push(grapheme_boundaries(text, start, content_end));
-        start = newline + 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(grapheme_boundaries(text, start, i));
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                let content_end = i;
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                lines.push(grapheme_boundaries(text, start, content_end));
+                start = i;
+            }
+            _ => i += 1,
+        }
     }
     lines.push(grapheme_boundaries(text, start, text.len()));
     lines
@@ -118,6 +134,18 @@ fn horizontal_arrows_at_line_and_document_boundaries() {
             "abc|\r\ndef",
             Arrow::Right,
             "abc\r\n|def",
+        ),
+        (
+            "left at bare CR line start",
+            "abc\r|def",
+            Arrow::Left,
+            "abc|\rdef",
+        ),
+        (
+            "right at bare CR line end",
+            "abc|\rdef",
+            Arrow::Right,
+            "abc\r|def",
         ),
         (
             "left after an empty line",
