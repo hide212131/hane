@@ -1,5 +1,6 @@
 import datetime as dt
 import importlib.util
+import re
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,14 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(mod.relative_label(dt.date(2026, 10, 3), today), "10/3(土)")
         self.assertEqual(mod.relative_label(dt.date(2025, 10, 3), today), "2025/10/3(金)")
 
+    def test_date_token_pattern_tolerates_ocr_spacing(self):
+        pattern = mod.date_token_pattern("2026-9-1")
+        self.assertIsNotNone(re.search(pattern, "2026-9-1"))
+        self.assertIsNotNone(re.search(pattern, "2026 - 9 - 1"))
+        self.assertIsNone(re.search(pattern, "2026/9/1"))
+        with self.assertRaises(ValueError):
+            mod.date_token_pattern("20260901")
+
     def test_nearest_same_row_rejects_adjacent_row_badge(self):
         text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
         same_row = {"bounding_box": {"minX": 0.25, "maxX": 0.30, "minY": 0.495, "maxY": 0.515}}
@@ -48,6 +57,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                     "long_name_keeps_badge_visible",
                 },
             )
+            self.assertTrue(all(case["date_token"] in case["filename"] for case in cases))
             self.assertEqual(before, sorted(case["filename"] for case in cases))
             self.assertTrue(all((Path(tmp) / "work-folder" / name).is_file() for name in before))
 
