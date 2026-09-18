@@ -266,6 +266,17 @@ pub struct MarkdownParse {
     /// by comparing source starts either; kept explicit for the same reason
     /// as `quote_markers`.
     pub list_item_markers: Vec<(SourceRange, NodeId)>,
+    /// A list item's own structural indentation on every physical line its
+    /// content occupies past the marker's own opening line, paired with the
+    /// owning item and the column width (not necessarily its byte length, as
+    /// a tab can consume fewer bytes than columns) an inactive presentation
+    /// should synthesize in its place. Separate from `list_item_markers`
+    /// (which covers only the opening line's own bullet/number) and from
+    /// `quote_markers` (a different container's own per-line prefix). A
+    /// physical line several nested items all continue onto gets one range
+    /// per owner, each covering only that item's own share of the
+    /// indentation, the same way nested quote prefixes are split.
+    pub list_structural_prefixes: Vec<(SourceRange, NodeId, usize)>,
     /// Padding removed from inline code after container prefixes and line
     /// endings are interpreted. Derived against the parser's code content.
     pub code_padding: Vec<SourceRange>,
@@ -1012,6 +1023,73 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
     }
 }
 
+/// Recovers a list item's own structural indentation on every physical line
+/// its content occupies beyond the marker's own opening line: source-
+/// addressable so an inactive presentation can hide exactly the bytes the
+/// parser required for the item to keep owning that line, and disclose the
+/// original bytes (spaces, tabs) once the item itself is active.
+///
+/// Mirrors [`quote_markers`]'s per-owner tiling for nested containers: each
+/// item is scanned independently, consuming its own ancestors first via
+/// [`ancestor_containers`]/[`consume_containers`] and attributing only the
+/// remainder — its own registered indent width — to itself, so a physical
+/// line several nested items all continue onto ends up with one prefix range
+/// per owner rather than one range that conflates them. A line whose
+/// required indentation is not fully present (a lazy paragraph continuation,
+/// or a blank line) is left alone: [`line_break_padding`] already hides that
+/// shortfall — and any genuinely superfluous indentation past what every
+/// level requires, since its own consumption only starts after every
+/// container it can match has already consumed its own required width — as
+/// one undivided run, because CommonMark discards it without regard to which
+/// container needed which part of it.
+fn list_structural_prefixes(
+    tree: &MarkdownTree,
+    range: SourceRange,
+    source: &str,
+) -> Vec<(SourceRange, NodeId, usize)> {
+    let mut prefixes = Vec::new();
+    for (id, block) in tree.blocks() {
+        if !matches!(block.kind, NodeKind::ListItem { .. }) {
+            continue;
+        }
+        let Some(containers) = ancestor_containers(tree, id, range, source) else {
+            continue;
+        };
+        let start = block.source_range.start.0 - range.start.0;
+        let end = block.source_range.end.0 - range.start.0;
+        let opening_line_start = markdown_line_start(source, start);
+        let opening_line = markdown_lines(&source[opening_line_start..])
+            .next()
+            .unwrap_or("");
+        let Some(mut opening_cursor) =
+            consume_containers(&containers, opening_line_start, opening_line.as_bytes())
+        else {
+            continue;
+        };
+        let Some(prefix) = opening_cursor.list_item(opening_line.as_bytes()) else {
+            continue;
+        };
+        let indent = prefix.width;
+
+        let mut line_start = opening_line_start + opening_line.len();
+        for line in markdown_lines(&source[line_start..end]) {
+            if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
+            {
+                let before = cursor.byte;
+                if cursor.indent(line.as_bytes(), indent) == indent && cursor.byte > before {
+                    prefixes.push((
+                        absolute_range(range.start.0 + line_start, before..cursor.byte),
+                        id,
+                        indent,
+                    ));
+                }
+            }
+            line_start += line.len();
+        }
+    }
+    prefixes
+}
+
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -1154,6 +1232,7 @@ pub fn parse_document(
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
+    let list_structural_prefixes = list_structural_prefixes(&tree, source_range, source);
     MarkdownParse {
         revision,
         source_range,
@@ -1161,6 +1240,7 @@ pub fn parse_document(
         markers: markers.markers,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
+        list_structural_prefixes,
         code_padding,
         line_break_padding,
     }
@@ -1745,6 +1825,224 @@ mod tests {
                 local.block_at(at).map(|block| block.kind),
                 formal.block_at(at).map(|block| block.kind),
                 "line {line} resolves to the same block kind"
+            );
+        }
+    }
+
+    /// Every derived structural-prefix range must slice to whitespace only:
+    /// it is markup-like padding, never a byte of actual content.
+    fn assert_structural_prefixes_are_whitespace(
+        source: &str,
+        prefixes: &[(SourceRange, NodeId, usize)],
+    ) {
+        for (range, _, _) in prefixes {
+            let slice = &source[range.start.0..range.end.0];
+            assert!(
+                slice.bytes().all(|byte| matches!(byte, b' ' | b'\t')),
+                "prefix {range:?} is not whitespace in {source:?}: {slice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_structural_prefixes_are_empty_for_a_lazy_paragraph_continuation() {
+        // A paragraph continuation line may drop container indentation
+        // entirely (CommonMark's lazy continuation); `line_break_padding`
+        // already hides that shortfall as one undivided run, so this owned,
+        // per-item mechanism must not also claim part of it.
+        let source = "- foo\n bar\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert_eq!(parsed.list_structural_prefixes, Vec::new());
+    }
+
+    #[test]
+    fn list_structural_prefixes_are_empty_for_an_empty_item() {
+        let source = "-\n\n- next\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert_eq!(parsed.list_structural_prefixes, Vec::new());
+    }
+
+    #[test]
+    fn list_structural_prefixes_cover_a_loose_items_second_and_third_paragraph() {
+        let source = "- first\n\n  second\n\n  third\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        assert_eq!(
+            parsed.list_structural_prefixes,
+            vec![
+                (SourceRange::new(9, 11), item, 2),
+                (SourceRange::new(19, 21), item, 2),
+            ]
+        );
+        assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
+    }
+
+    #[test]
+    fn list_structural_prefixes_split_ownership_for_a_nested_child_then_parent_paragraph() {
+        // A nested/mixed fixture (#126): an outer item whose own directly-owned
+        // content is interrupted by a nested child list with its own second
+        // paragraph, followed by the outer item's own second paragraph.
+        let source = "- outer\n\n  - inner\n\n    second\n\n  outer second\n\n- sibling";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let lists = parsed
+            .tree
+            .blocks()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::List { .. }))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        let outer_list = lists[0];
+        let outer = parsed.tree.children(outer_list)[0];
+        let nested_list = *parsed
+            .tree
+            .children(outer)
+            .iter()
+            .find(|id| matches!(parsed.tree.node(**id).unwrap().kind, NodeKind::List { .. }))
+            .expect("nested list under the outer item");
+        let inner = parsed.tree.children(nested_list)[0];
+
+        // The outer item owns its own share of every line its content
+        // continues onto, including the nested list's own opening line and
+        // its own later paragraph, but not the nested item's own inner share
+        // of "second"'s indentation.
+        assert!(parsed.list_structural_prefixes.contains(&(
+            SourceRange::new(9, 11),
+            outer,
+            2
+        )));
+        assert!(parsed.list_structural_prefixes.contains(&(
+            SourceRange::new(20, 22),
+            outer,
+            2
+        )));
+        assert!(parsed.list_structural_prefixes.contains(&(
+            SourceRange::new(32, 34),
+            outer,
+            2
+        )));
+        // The nested item owns only the remainder of "second"'s indentation,
+        // past the outer item's own share of the same physical line.
+        assert!(parsed.list_structural_prefixes.contains(&(
+            SourceRange::new(22, 24),
+            inner,
+            2
+        )));
+        assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
+    }
+
+    #[test]
+    fn list_structural_prefixes_account_for_leading_spaces_and_marker_padding() {
+        for (source, expected_width, continuation) in [
+            // 0-3 leading spaces before the marker are part of the required
+            // continuation width at this nesting level.
+            ("  - item\n    continued\n", 4, (9, 13)),
+            // 5+ spaces after the marker are one separator column, not a
+            // wider required continuation indent.
+            ("-     item\n  more\n", 2, (11, 13)),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let (item, _) = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .expect("a list item");
+            assert_eq!(
+                parsed.list_structural_prefixes,
+                vec![(
+                    SourceRange::new(continuation.0, continuation.1),
+                    item,
+                    expected_width
+                )],
+                "source: {source:?}"
+            );
+            assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
+        }
+    }
+
+    #[test]
+    fn list_structural_prefixes_use_column_width_across_a_tab_and_a_two_digit_marker() {
+        // A two-digit ordered marker ("10. ") is four columns wide; a single
+        // leading tab on the continuation line reaches that width in one
+        // byte, so the derived prefix's byte length and its column width
+        // (what an inactive presentation synthesizes) legitimately differ.
+        let source = "10. item\n\tcontinued\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        assert_eq!(
+            parsed.list_structural_prefixes,
+            vec![(SourceRange::new(9, 10), item, 4)]
+        );
+    }
+
+    #[test]
+    fn list_structural_prefixes_are_owned_separately_from_the_quote_prefix_sharing_a_line() {
+        let source = "> - item\n>   continued\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        assert_eq!(
+            parsed.list_structural_prefixes,
+            vec![(SourceRange::new(11, 13), item, 2)]
+        );
+        // Immediately preceded by, and never overlapping, the quote's own
+        // per-line prefix on the same continuation line.
+        assert!(
+            parsed
+                .quote_markers
+                .iter()
+                .any(|(range, _)| *range == SourceRange::new(9, 11))
+        );
+    }
+
+    #[test]
+    fn list_structural_prefixes_cover_every_line_of_an_items_heading_and_fenced_code() {
+        // Only the container indentation is markup; the fence delimiters and
+        // code content stay literal (recovered separately by `derive_markers`
+        // and left untouched here).
+        let source = "- # Heading\n\n  ```\n  code\n  ```\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        assert_eq!(
+            parsed.list_structural_prefixes,
+            vec![
+                (SourceRange::new(13, 15), item, 2),
+                (SourceRange::new(19, 21), item, 2),
+                (SourceRange::new(26, 28), item, 2),
+            ]
+        );
+        assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
+    }
+
+    #[test]
+    fn list_structural_prefixes_follow_commonmark_line_endings_with_raw_offsets() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let template = "- first\n\n  second\n";
+            let source = template.replace('\n', newline);
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), &source);
+            let (item, _) = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .expect("a list item");
+            let prefix_start = source.find("  second").expect("second paragraph");
+            assert_eq!(
+                parsed.list_structural_prefixes,
+                vec![(SourceRange::new(prefix_start, prefix_start + 2), item, 2)],
+                "newline: {newline:?}"
             );
         }
     }

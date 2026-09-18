@@ -86,10 +86,12 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["- ", "  "],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
         style_runs: &[NO_STYLES, NO_STYLES],
-        // The two spaces required by the list continuation belong to the
-        // existing list presentation; break-adjacent whitespace behavior is
-        // covered independently above and inside the quote fixture. The
-        // item's own opening line also carries its synthesized `•`.
+        // The two spaces required by the list continuation are the item's
+        // own structural prefix, synthesized back to the same two spaces;
+        // break-adjacent whitespace behavior (the `"  "` marker above, from
+        // the hard break's own trailing spaces on line one) is covered
+        // independently above and inside the quote fixture. The item's own
+        // opening line also carries its synthesized `•`.
         visual_lines: &["\u{2022} foo", "  baz"],
     },
     MarkdownFixture {

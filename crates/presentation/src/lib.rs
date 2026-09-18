@@ -1041,6 +1041,16 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|item| range_touches(item.source_range, disclosure));
     }
+    // A list item's own structural continuation indentation follows the same
+    // ownership rule as its opening marker above: it discloses whenever the
+    // caret, selection or IME touches any of the owning item's own source
+    // range, not just the physical line the indentation itself sits on.
+    if let Some((owner, _)) = marker.list_prefix {
+        return parsed
+            .tree
+            .node(owner)
+            .is_some_and(|item| range_touches(item.source_range, disclosure));
+    }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
         return true;
@@ -1087,7 +1097,8 @@ fn marker_edge(
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
 ) -> Option<MarkerEdge> {
-    if planned.quote_owner.is_some() || planned.list_owner.is_some() {
+    if planned.quote_owner.is_some() || planned.list_owner.is_some() || planned.list_prefix.is_some()
+    {
         return Some(MarkerEdge::Opening);
     }
     let marker = planned.range;
@@ -1332,6 +1343,23 @@ fn present_markdown_from_parse(
         {
             let visual_start = visual.len();
             visual.push_str(&label);
+            segments.push(MappingSegment {
+                source_range: SourceRange::empty(marker.start.0),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                visibility: Visibility::Synthesized,
+                marker_edge: None,
+            });
+        }
+        // An inactive list item's own structural continuation indentation is
+        // replaced by that many synthesized spaces — normalizing any tab's
+        // column width to plain spaces — anchored the same way the bullet
+        // synthesis above is; disclosing it (`expanded`) shows the real
+        // source bytes (spaces or tabs) directly instead.
+        if !expanded
+            && let Some((_, columns)) = planned.list_prefix
+        {
+            let visual_start = visual.len();
+            visual.push_str(&" ".repeat(columns));
             segments.push(MappingSegment {
                 source_range: SourceRange::empty(marker.start.0),
                 visual_range: VisualRange::new(visual_start, visual.len()),
@@ -1663,6 +1691,13 @@ struct ProjectedMarker {
     range: SourceRange,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
+    /// `Some((owner, columns))` for a list item's own structural continuation
+    /// indentation (`MarkdownParse::list_structural_prefixes`): the owning
+    /// item, and the column width an inactive presentation synthesizes in
+    /// its place. Distinct from `list_owner`, which is the item's own
+    /// opening bullet/number and gets a synthesized label instead of
+    /// synthesized spaces.
+    list_prefix: Option<(NodeId, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1707,15 +1742,22 @@ impl ProjectionIndex {
             .iter()
             .map(|(range, owner)| ((range.start, range.end), *owner))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let list_prefixes = parsed
+            .list_structural_prefixes
+            .iter()
+            .map(|(range, owner, columns)| ((range.start, range.end), (*owner, *columns)))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut markers = parsed
             .markers
             .iter()
             .chain(&parsed.code_padding)
             .chain(&parsed.line_break_padding)
+            .chain(parsed.list_structural_prefixes.iter().map(|(range, _, _)| range))
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
+                list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
             })
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
@@ -3231,6 +3273,31 @@ mod tests {
             "  \u{2022} inner"
         );
         assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
+    }
+
+    #[test]
+    fn list_structural_prefix_synthesizes_columns_and_discloses_the_owning_items_raw_bytes() {
+        // A two-digit ordered marker ("10. ") is four columns wide; the
+        // continuation line reaches that width with a single leading tab, so
+        // the inactive synthesized replacement (four plain spaces) and the
+        // disclosed original byte (one tab character) are visibly different,
+        // unlike the common all-spaces case.
+        let source = "10. item\n\tcontinued\n";
+        let start = 40;
+        let range = SourceRange::new(start, start + source.len());
+        let line = |visual_text: &str, index: usize| -> String {
+            visual_text.split('\n').nth(index).unwrap().to_string()
+        };
+        let present = |disclosure: Option<SourceRange>| {
+            present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, disclosure)
+        };
+
+        let collapsed = present(None);
+        assert_eq!(line(&collapsed.visual_text, 1), "    continued");
+
+        let at_continued = start + source.find("continued").unwrap();
+        let disclosed = present(Some(SourceRange::empty(at_continued)));
+        assert_eq!(line(&disclosed.visual_text, 1), "\tcontinued");
     }
 
     #[test]
