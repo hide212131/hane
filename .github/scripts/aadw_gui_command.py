@@ -41,6 +41,10 @@ TRUSTED_ROUTES = {
         "workflow_file": "aadw-gui-validation.yml",
         "procedure_path": "scripts/hosted_normal_list_gui.py",
     },
+    "sidebar-chrome": {
+        "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
+        "procedure_path": "scripts/hosted_sidebar_chrome_gui.py",
+    },
 }
 
 
@@ -80,10 +84,15 @@ def parse_route(body: str) -> dict[str, str] | None:
             execution_context = date_badge.group(1)
         else:
             normal_list = NORMAL_LIST_COMMAND_RE.fullmatch(normalized)
-            if not normal_list:
-                return None
-            validation_kind = "normal-list"
-            execution_context = normal_list.group(1)
+            if normal_list:
+                validation_kind = "normal-list"
+                execution_context = normal_list.group(1)
+            else:
+                sidebar_chrome = SIDEBAR_CHROME_COMMAND_RE.fullmatch(normalized)
+                if not sidebar_chrome:
+                    return None
+                validation_kind = "sidebar-chrome"
+                execution_context = sidebar_chrome.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {
