@@ -40,6 +40,18 @@ Computer Use を必須条件にしない。現在は GitHub-hosted macOS の Hos
 /gui-validate merge
 ```
 
+Issue #126 の通常リスト表示だけを確認する場合は、専用のコマンドを使う。
+
+```text
+/gui-validate normal-list head
+```
+
+```text
+/gui-validate normal-list merge
+```
+
+このコマンドは `scripts/hosted_normal_list_gui.py` の信頼済み手順へ振り分けられる。総合の GUI 検証結果や日付表示専用の検証結果を代用するものではない。
+
 `head` は exact current PR head を検証する。`merge` は current target branch と current PR head から GitHub が作る current PR merge ref を検証する。文章中にコマンド文字列を書いた場合や、引数がない・未知の引数を付けた場合は起動しない。
 
 comment router は trusted default branch の workflow / script だけを使い、コメントイベントから PR 番号を取得する。GitHub API から current PR metadata を取得し、コメント投稿者が `write` / `maintain` / `admin` のいずれかであること、PR が open かつ non-draft であること、same-repository PR であることを確認する。head SHA と current target branch SHA は人に入力させず、その時点の GitHub facts から解決する。

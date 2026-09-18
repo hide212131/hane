@@ -107,6 +107,7 @@ jobs:
           esac
 
           request_actor="$GITHUB_ACTOR"
+          comment_procedure_path=""
           if [[ -n "$REQUEST_COMMENT_ID" ]]; then
             if ! [[ "$REQUEST_COMMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
               echo '::error::request_comment_id must be a positive integer when provided.'
@@ -121,10 +122,18 @@ jobs:
             comment_pr_number="$(jq -r '.issue_url | split("/")[-1] // ""' <<< "$comment_json")"
             request_actor="$(jq -r '.user.login // ""' <<< "$comment_json")"
             comment_body="$(jq -r '.body // ""' <<< "$comment_json")"
-            comment_context="$(
+            route_json="$(
               printf '%s' "$comment_body" \
-                | python3 control/.github/scripts/aadw_gui_command.py parse
+                | python3 control/.github/scripts/aadw_gui_command.py route
             )"
+
+            if [[ -z "$route_json" ]]; then
+              echo '::error::Routed comment is not a recognized trusted GUI command.'
+              exit 1
+            fi
+            comment_kind="$(jq -r '.validation_kind // ""' <<< "$route_json")"
+            comment_context="$(jq -r '.execution_context // ""' <<< "$route_json")"
+            comment_procedure_path="$(jq -r '.procedure_path // ""' <<< "$route_json")"
 
             if [[ "$comment_pr_number" != "$PR_NUMBER" ]]; then
               echo "::error::Routed comment does not belong to target PR. comment_pr=${comment_pr_number:-unknown} target_pr=${PR_NUMBER}"
@@ -132,6 +141,10 @@ jobs:
             fi
             if [[ -z "$request_actor" ]]; then
               echo '::error::Could not resolve routed comment actor.'
+              exit 1
+            fi
+            if [[ "$comment_kind" != 'comprehensive' && "$comment_kind" != 'normal-list' ]]; then
+              echo "::error::Routed comment selected an unsupported validation kind for this workflow: ${comment_kind:-invalid}."
               exit 1
             fi
             if [[ "$comment_context" != "$EXECUTION_CONTEXT" ]]; then
@@ -195,9 +208,33 @@ jobs:
             exit 1
           fi
 
+          case "$REQUESTED_PROCEDURE" in
+            '')
+              procedure_path='scripts/hosted_gui_interaction.py'
+              validation_kind='comprehensive'
+              ;;
+            'hosted-gui-interaction/7')
+              procedure_path='scripts/hosted_gui_interaction.py'
+              validation_kind='comprehensive'
+              ;;
+            'hosted-normal-list/1')
+              procedure_path='scripts/hosted_normal_list_gui.py'
+              validation_kind='normal-list'
+              ;;
+            *)
+              echo "::error::Unsupported trusted procedure: ${REQUESTED_PROCEDURE}"
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$comment_procedure_path" && "$comment_procedure_path" != "$procedure_path" ]]; then
+            echo "::error::Routed comment procedure does not match the requested procedure path. comment=${comment_procedure_path} requested=${procedure_path}"
+            exit 1
+          fi
+
           actual_procedure="$(
             python3 control/.github/scripts/aadw_gui_command.py \
-              procedure control/scripts/hosted_gui_interaction.py
+              procedure "control/${procedure_path}"
           )"
           if [[ -n "$REQUESTED_PROCEDURE" && "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
             echo "::error::Requested procedure does not match trusted control. requested=${REQUESTED_PROCEDURE} actual=${actual_procedure}"
@@ -218,6 +255,8 @@ jobs:
             echo "checkout_ref=$checkout_ref"
             echo "request_actor=$request_actor"
             echo "procedure=$actual_procedure"
+            echo "procedure_path=$procedure_path"
+            echo "validation_kind=$validation_kind"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out requested execution tree
@@ -287,6 +326,8 @@ jobs:
           CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
           REQUEST_ACTOR: ${{ steps.preflight.outputs.request_actor }}
           EFFECTIVE_PROCEDURE: ${{ steps.preflight.outputs.procedure }}
+          PROCEDURE_PATH: ${{ steps.preflight.outputs.procedure_path }}
+          VALIDATION_KIND: ${{ steps.preflight.outputs.validation_kind }}
           RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
         run: |
           set -euo pipefail
@@ -303,6 +344,8 @@ jobs:
             --arg execution_sha "$EXECUTION_SHA" \
             --arg control_sha "$CONTROL_SHA" \
             --arg procedure "$EFFECTIVE_PROCEDURE" \
+            --arg procedure_path "$PROCEDURE_PATH" \
+            --arg validation_kind "$VALIDATION_KIND" \
             --arg actor "$REQUEST_ACTOR" \
             --arg request_comment_id "$REQUEST_COMMENT_ID" \
             --arg run_id "$GITHUB_RUN_ID" \
@@ -320,6 +363,8 @@ jobs:
               execution_sha: $execution_sha,
               control_sha: $control_sha,
               procedure: $procedure,
+              procedure_path: $procedure_path,
+              validation_kind: $validation_kind,
               dispatched_by: $actor,
               request_comment_id: ($request_comment_id | if length == 0 then null else tonumber end),
               workflow_run_id: $run_id,
@@ -328,12 +373,36 @@ jobs:
 
       - name: Validate Hane using the trusted procedure
         env:
-          HANE_GUI_INTERACTION_TARGET_DIR: ${{ github.workspace }}/hane
-          HANE_GUI_INTERACTION_CONTROL_DIR: ${{ github.workspace }}/control
-          HANE_GUI_INTERACTION_EXPECTED_SHA: ${{ steps.execution.outputs.execution_sha }}
-          HANE_GUI_INTERACTION_RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
-          HANE_GUI_INTERACTION_REQUEST_ID: aadw-gui-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3 control/scripts/hosted_gui_interaction.py
+          TARGET_DIR: ${{ github.workspace }}/hane
+          CONTROL_DIR: ${{ github.workspace }}/control
+          EXPECTED_SHA: ${{ steps.execution.outputs.execution_sha }}
+          PROCEDURE_PATH: ${{ steps.preflight.outputs.procedure_path }}
+          RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+          REQUEST_ID: aadw-gui-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          case "$PROCEDURE_PATH" in
+            scripts/hosted_gui_interaction.py)
+              HANE_GUI_INTERACTION_TARGET_DIR="$TARGET_DIR" \
+              HANE_GUI_INTERACTION_CONTROL_DIR="$CONTROL_DIR" \
+              HANE_GUI_INTERACTION_EXPECTED_SHA="$EXPECTED_SHA" \
+              HANE_GUI_INTERACTION_RUN_DIR="$RUN_DIR" \
+              HANE_GUI_INTERACTION_REQUEST_ID="$REQUEST_ID" \
+              python3 "$CONTROL_DIR/$PROCEDURE_PATH"
+              ;;
+            scripts/hosted_normal_list_gui.py)
+              HANE_NORMAL_LIST_GUI_TARGET_DIR="$TARGET_DIR" \
+              HANE_NORMAL_LIST_GUI_CONTROL_DIR="$CONTROL_DIR" \
+              HANE_NORMAL_LIST_GUI_EXPECTED_SHA="$EXPECTED_SHA" \
+              HANE_NORMAL_LIST_GUI_RUN_DIR="$RUN_DIR" \
+              HANE_NORMAL_LIST_GUI_REQUEST_ID="$REQUEST_ID" \
+              python3 "$CONTROL_DIR/$PROCEDURE_PATH"
+              ;;
+            *)
+              echo "::error::Unsupported trusted procedure path: ${PROCEDURE_PATH}"
+              exit 1
+              ;;
+          esac
 
       - name: Stage public evidence
         if: always()
