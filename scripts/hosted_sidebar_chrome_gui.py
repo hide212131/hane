@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import subprocess
@@ -358,8 +359,13 @@ def main() -> int:
         "started_at": started_at,
         "finished_at": env.clock.now_iso(),
         "target": target_info,
-        "control": {"sha": os.environ.get("HANE_SIDEBAR_CHROME_GUI_CONTROL_SHA", "")},
-        "runner": module.runner_metadata(),
+        "control": {"sha": env.git_head(control_dir)},
+        "runner": {
+            "os": os.environ.get("RUNNER_OS", ""),
+            "arch": os.environ.get("RUNNER_ARCH", ""),
+            "macos_version": platform.mac_ver()[0],
+            "machine": platform.machine(),
+        },
         "build": build_info,
         "top_level_steps": top_steps,
         "scenarios": scenarios,
@@ -368,6 +374,7 @@ def main() -> int:
         "summary": f"[{overall.upper()}] {PROCEDURE_VERSION}" + (f" — {overall_reason}" if overall_reason else ""),
     }
     result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (run_dir / "summary.md").write_text(result["summary"] + "\n", encoding="utf-8")
     print(result["summary"])
     return 0 if overall == "pass" else 1
 
