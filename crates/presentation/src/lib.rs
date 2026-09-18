@@ -226,16 +226,43 @@ impl SourceMap {
         }
     }
 
+    /// Hidden and synthesized segments can sit back-to-back with no visible
+    /// content between them (e.g. a list marker's synthesized bullet
+    /// immediately followed by a nested ATX heading's hidden marker). A
+    /// single source→visual→source round trip only walks to the next such
+    /// boundary rather than settling on an editable position (ADR-0004), so
+    /// `next` can differ from `current` and itself still not be a fixed
+    /// point. Repeating the round trip walks the whole chain; each affinity
+    /// only ever advances toward candidates sorted later (`After`) or
+    /// earlier (`Before`) for that same affinity, so the source offset it
+    /// produces is monotonic and bounded, and it stabilizes in at most
+    /// `segments.len()` steps.
     pub fn normalize_source(&self, source: SourceOffset, affinity: Bias) -> Option<SourceOffset> {
-        let visual = self.source_to_visual(source, affinity)?.visual_offset;
-        self.visual_to_source(visual, affinity)
-            .map(|candidate| candidate.source_offset)
+        let mut current = source;
+        for _ in 0..=self.segments.len() {
+            let visual = self.source_to_visual(current, affinity)?.visual_offset;
+            let next = self.visual_to_source(visual, affinity)?.source_offset;
+            if next == current {
+                return Some(current);
+            }
+            current = next;
+        }
+        Some(current)
     }
 
+    /// Mirrors [`Self::normalize_source`]'s chained-boundary walk in the
+    /// visual direction.
     pub fn normalize_visual(&self, visual: VisualOffset, affinity: Bias) -> Option<VisualOffset> {
-        let source = self.visual_to_source(visual, affinity)?.source_offset;
-        self.source_to_visual(source, affinity)
-            .map(|candidate| candidate.visual_offset)
+        let mut current = visual;
+        for _ in 0..=self.segments.len() {
+            let source = self.visual_to_source(current, affinity)?.source_offset;
+            let next = self.source_to_visual(source, affinity)?.visual_offset;
+            if next == current {
+                return Some(current);
+            }
+            current = next;
+        }
+        Some(current)
     }
 }
 
