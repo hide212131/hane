@@ -43,6 +43,8 @@ class ParseCommandTests(unittest.TestCase):
     def test_legacy_parser_does_not_accept_focused_command(self):
         self.assertIsNone(command.parse_command("/gui-validate date-badge head"))
         self.assertIsNone(command.parse_command("/gui-validate date-badge merge"))
+        self.assertIsNone(command.parse_command("/gui-validate sidebar-chrome head"))
+        self.assertIsNone(command.parse_command("/gui-validate sidebar-chrome merge"))
 
     def test_accepts_outer_whitespace_but_not_embedded_prose(self):
         self.assertEqual(command.parse_command(" \r\n/gui-validate merge\r\n "), "merge")
@@ -109,6 +111,19 @@ class ParseRouteTests(unittest.TestCase):
                     },
                 )
 
+    def test_routes_sidebar_chrome_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate sidebar-chrome {context}"),
+                    {
+                        "validation_kind": "sidebar-chrome",
+                        "execution_context": context,
+                        "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
+                        "procedure_path": "scripts/hosted_sidebar_chrome_gui.py",
+                    },
+                )
+
     def test_rejects_prose_extra_args_and_unknown_validation_kind(self):
         invalid = (
             "/gui-validate date-badge",
@@ -118,6 +133,10 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate date-badge\nmerge",
             "/gui-validate normal-list",
             "/gui-validate normal-list merge extra",
+            "/gui-validate sidebar-chrome",
+            "/gui-validate sidebar-chrome merge extra",
+            "このPRは /gui-validate sidebar-chrome merge してください",
+            "/gui-validate sidebar-chrome\nmerge",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
