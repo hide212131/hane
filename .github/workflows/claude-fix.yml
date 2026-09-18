@@ -183,6 +183,15 @@ jobs:
             --tools "Read,Edit,Write,Glob,Grep"
             --allowedTools "Read,Edit,Write,Glob,Grep"
 
+      - name: Check out trusted diagnostic source after Claude failure
+        if: steps.claude.outcome == 'failure'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-diagnostic
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Diagnose Claude execution failure
         if: steps.claude.outcome == 'failure'
         shell: bash
@@ -196,7 +205,7 @@ jobs:
             candidate="$RUNNER_TEMP/claude-execution-output.json"
           fi
 
-          python .github/scripts/classify_claude_failure.py "$candidate"
+          python trusted-diagnostic/.github/scripts/classify_claude_failure.py "$candidate"
 
           # The classifier only adds safe diagnostics. Preserve the original
           # Claude failure so no downstream patch/finalizer step can run.
