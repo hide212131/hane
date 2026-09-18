@@ -48,8 +48,8 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, MarkdownTree, NodeId, NodeKind,
-    has_delimiter_markers, is_table_delimiter, parse_document,
+    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownNode, MarkdownParse, MarkdownTree,
+    NodeId, NodeKind, has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -1160,6 +1160,36 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     }
 }
 
+/// Resolves an empty disclosure at a list-item boundary to the item that
+/// starts there. Markdown list-item ranges are allowed to meet exactly at the
+/// following item's start, so the generic inclusive caret check would
+/// disclose both sibling markers and make the preceding row change width too.
+/// Keep the inclusive end for an item's ordinary terminal caret unless that
+/// same offset is also the start of a sibling.
+fn list_item_range_touches(
+    tree: &MarkdownTree,
+    item_id: NodeId,
+    item: &MarkdownNode,
+    disclosure: SourceRange,
+) -> bool {
+    if !range_touches(item.source_range, disclosure) {
+        return false;
+    }
+    if !disclosure.is_empty() || disclosure.start != item.source_range.end {
+        return true;
+    }
+    let Some(list_id) = item.parent else {
+        return true;
+    };
+    !tree.children(list_id).iter().any(|sibling_id| {
+        *sibling_id != item_id
+            && tree.node(*sibling_id).is_some_and(|sibling| {
+                matches!(sibling.kind, NodeKind::ListItem { .. })
+                    && sibling.source_range.start == disclosure.start
+            })
+    })
+}
+
 fn marker_is_disclosed(
     marker: &ProjectedMarker,
     parsed: &MarkdownParse,
@@ -1187,7 +1217,7 @@ fn marker_is_disclosed(
         return parsed
             .tree
             .node(owner)
-            .is_some_and(|item| range_touches(item.source_range, disclosure));
+            .is_some_and(|item| list_item_range_touches(&parsed.tree, owner, item, disclosure));
     }
     // A list item's own structural continuation indentation follows the same
     // ownership rule as its opening marker above: it discloses whenever the
@@ -1197,7 +1227,7 @@ fn marker_is_disclosed(
         return parsed
             .tree
             .node(owner)
-            .is_some_and(|item| range_touches(item.source_range, disclosure));
+            .is_some_and(|item| list_item_range_touches(&parsed.tree, owner, item, disclosure));
     }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
@@ -3771,6 +3801,24 @@ mod tests {
             "\u{2022} inner"
         );
         assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
+    }
+
+    #[test]
+    fn list_item_boundary_discloses_only_the_item_that_starts_there() {
+        let source = "- first\n- second";
+        let range = SourceRange::new(0, source.len());
+        let second_start = source.find("- second").expect("second list item");
+        let presented = present_markdown_with_disclosure(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(second_start)),
+        );
+        let lines = presented.visual_text.split('\n').collect::<Vec<_>>();
+
+        assert_eq!(lines, &["• first", "- second"]);
     }
 
     #[test]
