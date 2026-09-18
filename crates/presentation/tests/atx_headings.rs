@@ -102,7 +102,7 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::Paragraph,
                 BlockKind::Heading(3),
             ],
-            visual_lines: &["quote", "", "item"],
+            visual_lines: &["quote", "", "• item"],
             style_runs: &[&[], &[], &[]],
         },
         MarkdownFixture {
