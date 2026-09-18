@@ -4944,6 +4944,8 @@ mod tests {
                 .iter()
                 .any(|run| run.kind == StyleKind::CodeBlock)
         );
+        assert_eq!(line.style_runs.len(), 1);
+        assert_eq!(line.style_runs[0].kind, StyleKind::CodeBlock);
     }
 
     #[test]

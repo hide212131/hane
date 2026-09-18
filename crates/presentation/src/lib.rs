@@ -1705,7 +1705,8 @@ fn present_markdown_from_parse(
         .iter()
         .filter_map(|id| parsed.tree.node(**id))
         .filter(|node| {
-            !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
+            formal_code_block != Some(true)
+                && !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
         })
         .filter(|node| has_delimiter_markers(node.kind))
         .filter_map(|span| {
