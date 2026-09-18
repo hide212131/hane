@@ -4880,6 +4880,38 @@ mod tests {
     }
 
     #[test]
+    fn a_late_list_continuation_keeps_formal_owner_and_structural_indent() {
+        let mut source = String::from("1. opening\n");
+        for _ in 0..5_000 {
+            source.push_str("   continued\n");
+        }
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+
+        // The opening marker is outside the synchronous viewport parse. The
+        // formal projection must still identify this row as the first item and
+        // hide its structural three-column continuation prefix.
+        let late_line = 4_500;
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(late_line..late_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late continuation presents");
+        let line = &late.lines[0];
+        assert_eq!(line.visual_text, "continued");
+        let list = line.list.as_ref().expect("formal list row metadata");
+        assert_eq!(list.owner.ordinal, 0);
+        assert_eq!(list.owner.depth, 1);
+        assert_eq!(list.structural_prefixes.len(), 1);
+        assert_eq!(list.structural_prefixes[0].columns, 3);
+    }
+
+    #[test]
     fn one_block_covers_every_physical_line_of_its_construct() {
         let source = "# title\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\ntail\n";
         let editor = Editor::new(source);

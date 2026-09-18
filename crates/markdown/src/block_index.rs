@@ -24,7 +24,8 @@
 
 use crate::block_store::BlockStore;
 use crate::{
-    ListProjection, ListProjectionItem, MarkdownParse, MarkdownTree, NodeKind, parse_document,
+    ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
+    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
@@ -164,10 +165,71 @@ fn count_line_endings(slice: &str) -> usize {
     count
 }
 
+fn list_projection_label(start: Option<u64>, ordinal: usize) -> String {
+    match start {
+        None => "\u{2022} ".to_owned(),
+        Some(start) => format!("{}. ", start.saturating_add(ordinal as u64)),
+    }
+}
+
+fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
+    let mut ranges = Vec::new();
+    let mut start = range.start.0;
+    while start < range.end.0 {
+        let tail = &source[start..range.end.0];
+        let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
+            offset
+                + if tail.as_bytes()[offset] == b'\r'
+                    && tail.as_bytes().get(offset + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                }
+        });
+        let next = (start + end).min(range.end.0);
+        if next <= start {
+            break;
+        }
+        ranges.push(SourceRange::new(start, next));
+        start = next;
+    }
+    ranges
+}
+
+fn build_list_rows(
+    block_range: SourceRange,
+    source: &str,
+    items: &[ListProjectionItem],
+) -> Vec<ListProjectionRow> {
+    let mut rows = Vec::new();
+    let mut active = Vec::new();
+    let mut next_item = 0;
+    for source_range in source_line_ranges(block_range, source) {
+        while next_item < items.len() && items[next_item].item_range.start < source_range.end {
+            active.push(next_item);
+            next_item += 1;
+        }
+        active.retain(|index| items[*index].item_range.end > source_range.start);
+        if let Some(item_index) = active
+            .iter()
+            .copied()
+            .max_by_key(|index| items[*index].depth)
+        {
+            rows.push(ListProjectionRow {
+                source_range,
+                item_index,
+            });
+        }
+    }
+    rows
+}
+
 fn build_list_projections(
     parsed: &MarkdownParse,
     blocks: &[TiledBlock],
     range: SourceRange,
+    source: &str,
 ) -> Vec<Option<ListProjection>> {
     let block_ranges = blocks
         .iter()
@@ -177,12 +239,46 @@ fn build_list_projections(
             Some(block)
         })
         .collect::<Vec<_>>();
+    let mut ordinals = vec![None; parsed.tree.len()];
+    let mut lists = Vec::new();
+    for (list_id, node) in parsed.tree.iter() {
+        let NodeKind::List { start } = node.kind else {
+            continue;
+        };
+        let marker_labels = parsed
+            .tree
+            .children(list_id)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| list_projection_label(start, ordinal))
+            .collect::<Vec<_>>();
+        let mut max_marker_label = String::new();
+        let mut max_marker_columns = 0;
+        for label in &marker_labels {
+            let columns = label.chars().count();
+            if columns > max_marker_columns {
+                max_marker_columns = columns;
+                max_marker_label.clone_from(label);
+            }
+        }
+        lists.push(ListProjectionList {
+            source_range: node.source_range,
+            start,
+            item_count: marker_labels.len(),
+            max_marker_label,
+            max_marker_columns,
+            marker_labels: marker_labels.into(),
+        });
+        for (ordinal, child) in parsed.tree.children(list_id).iter().enumerate() {
+            ordinals[child.0] = Some((list_id, ordinal));
+        }
+    }
     let mut items = vec![Vec::new(); blocks.len()];
     for (marker_range, item_id) in &parsed.list_item_markers {
         let Some(item) = parsed.tree.node(*item_id) else {
             continue;
         };
-        let Some((list_id, ordinal)) = parsed.tree.list_item_ordinal(*item_id) else {
+        let Some((list_id, ordinal)) = ordinals.get(item_id.0).and_then(|entry| *entry) else {
             continue;
         };
         let Some(NodeKind::List { start }) = parsed.tree.node(list_id).map(|node| node.kind) else {
@@ -206,9 +302,50 @@ fn build_list_projections(
             item_count: parsed.tree.children(list_id).len(),
         });
     }
-    items
-        .into_iter()
-        .map(|items| (!items.is_empty()).then_some(ListProjection { items }))
+    let mut prefixes = vec![Vec::new(); blocks.len()];
+    for (source_range, item_id, columns) in &parsed.list_structural_prefixes {
+        let Some(item) = parsed.tree.node(*item_id) else {
+            continue;
+        };
+        let Some(block) = block_ranges
+            .iter()
+            .position(|block| block.start <= source_range.start && source_range.start < block.end)
+        else {
+            continue;
+        };
+        prefixes[block].push(ListProjectionPrefix {
+            source_range: *source_range,
+            item_range: item.source_range,
+            columns: *columns,
+        });
+    }
+    for block_items in &mut items {
+        block_items.sort_by_key(|item| (item.item_range.start, item.item_range.end));
+    }
+    for block_prefixes in &mut prefixes {
+        block_prefixes.sort_by_key(|prefix| (prefix.source_range.start, prefix.source_range.end));
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(block, _)| {
+            (!items[block].is_empty()).then(|| {
+                let block_range = block_ranges[block];
+                let block_items = std::mem::take(&mut items[block]);
+                let block_prefixes = std::mem::take(&mut prefixes[block]);
+                let block_lists = lists
+                    .iter()
+                    .filter(|list| {
+                        block_items
+                            .iter()
+                            .any(|item| item.list_range == list.source_range)
+                    })
+                    .cloned()
+                    .collect();
+                let rows = build_list_rows(block_range, source, &block_items);
+                ListProjection::new(block_items, block_prefixes, block_lists, rows)
+            })
+        })
         .collect()
 }
 
@@ -276,7 +413,7 @@ impl BlockIndex {
         let range = SourceRange::new(0, source.len());
         let parsed = parse_document(revision, range, source);
         let blocks = tiled_blocks(&parsed.tree, range, source);
-        let list_projections = build_list_projections(&parsed, &blocks, range);
+        let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
             |(index, (kind, length, lines))| {

@@ -38,6 +38,7 @@ pub use block_index::{
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use std::sync::Arc;
 
 /// Markdown *syntax* kind, as written in the source.
 ///
@@ -298,6 +299,9 @@ pub struct MarkdownParse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListProjection {
     pub items: Vec<ListProjectionItem>,
+    pub prefixes: Vec<ListProjectionPrefix>,
+    pub lists: Vec<ListProjectionList>,
+    rows: Vec<ListProjectionRow>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,6 +313,91 @@ pub struct ListProjectionItem {
     pub ordinal: usize,
     pub depth: usize,
     pub item_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListProjectionPrefix {
+    pub source_range: SourceRange,
+    pub item_range: SourceRange,
+    pub columns: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListProjectionList {
+    pub source_range: SourceRange,
+    pub start: Option<u64>,
+    pub item_count: usize,
+    pub max_marker_label: String,
+    pub max_marker_columns: usize,
+    pub marker_labels: Arc<[String]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListProjectionRow {
+    pub source_range: SourceRange,
+    item_index: usize,
+}
+
+impl ListProjection {
+    pub(crate) fn new(
+        items: Vec<ListProjectionItem>,
+        prefixes: Vec<ListProjectionPrefix>,
+        lists: Vec<ListProjectionList>,
+        rows: Vec<ListProjectionRow>,
+    ) -> Self {
+        Self {
+            items,
+            prefixes,
+            lists,
+            rows,
+        }
+    }
+
+    pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
+        let index = self
+            .items
+            .binary_search_by_key(&(marker_range.start, marker_range.end), |item| {
+                (item.marker_range.start, item.marker_range.end)
+            })
+            .ok()?;
+        self.items.get(index)
+    }
+
+    /// Finds the deepest formal list item owning a physical source line. The
+    /// row index is built with the formal parse, so a viewport parse does not
+    /// have to scan every item in a large list to recover its owner.
+    pub fn item_for_range(&self, range: SourceRange) -> Option<&ListProjectionItem> {
+        let index = self
+            .rows
+            .partition_point(|row| row.source_range.end <= range.start);
+        let row = self.rows.get(index)?;
+        if !row.source_range.intersects(range) {
+            return None;
+        }
+        self.items.get(row.item_index)
+    }
+
+    pub fn list(&self, source_range: SourceRange) -> Option<&ListProjectionList> {
+        let index = self
+            .lists
+            .binary_search_by_key(&(source_range.start, source_range.end), |list| {
+                (list.source_range.start, list.source_range.end)
+            })
+            .ok()?;
+        self.lists.get(index)
+    }
+
+    pub fn prefixes_in(&self, range: SourceRange) -> impl Iterator<Item = &ListProjectionPrefix> {
+        let start = self
+            .prefixes
+            .partition_point(|prefix| prefix.source_range.end <= range.start);
+        let end = self
+            .prefixes
+            .partition_point(|prefix| prefix.source_range.start < range.end);
+        self.prefixes[start..end]
+            .iter()
+            .filter(move |prefix| prefix.source_range.intersects(range))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

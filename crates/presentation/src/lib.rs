@@ -49,8 +49,8 @@ use hane_document::{
 };
 use hane_markdown::{
     BlockId, BlockIndex, Confidence, IndexedBlock, ListProjection, ListProjectionItem,
-    MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, has_delimiter_markers,
-    is_table_delimiter, parse_document,
+    ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
+    has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -1242,6 +1242,9 @@ fn marker_is_disclosed(
     // ownership rule as its opening marker above: it discloses whenever the
     // caret, selection or IME touches any of the owning item's own source
     // range, not just the physical line the indentation itself sits on.
+    if let Some(prefix) = marker.global_list_prefix {
+        return range_touches(prefix.item_range, disclosure);
+    }
     if let Some((owner, _)) = marker.list_prefix {
         return parsed
             .tree
@@ -1297,6 +1300,7 @@ fn marker_edge(
     if planned.quote_owner.is_some()
         || planned.list_owner.is_some()
         || planned.list_prefix.is_some()
+        || planned.global_list_prefix.is_some()
     {
         return Some(MarkerEdge::Opening);
     }
@@ -1534,7 +1538,27 @@ fn present_markdown_from_parse(
     let plan = &shared.projection.markers;
     let start = plan.partition_point(|marker| marker.range.start < range.start);
     let end = plan.partition_point(|marker| marker.range.start < range.end);
-    let markers_on_line = &plan[start..end];
+    let mut projected_markers = plan[start..end].to_vec();
+    if let Some(global) = shared.list_projection {
+        for prefix in global.prefixes_in(range) {
+            if let Some(marker) = projected_markers
+                .iter_mut()
+                .find(|marker| marker.range == prefix.source_range)
+            {
+                marker.global_list_prefix = Some(*prefix);
+            } else {
+                projected_markers.push(ProjectedMarker {
+                    range: prefix.source_range,
+                    quote_owner: None,
+                    list_owner: None,
+                    list_prefix: None,
+                    global_list_prefix: Some(*prefix),
+                });
+            }
+        }
+        projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+    }
+    let markers_on_line = projected_markers.as_slice();
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
     for planned in markers_on_line {
@@ -1939,6 +1963,9 @@ struct ProjectedMarker {
     /// Distinct from `list_owner`, which is the item's own opening
     /// bullet/number and gets a synthesized label.
     list_prefix: Option<(NodeId, usize)>,
+    /// A structural prefix recovered from the formal block projection when
+    /// the viewport parse has no local `ListItem` owner for this line.
+    global_list_prefix: Option<ListProjectionPrefix>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1970,50 +1997,26 @@ fn projected_item_for_marker(
     projection: Option<&ListProjection>,
     marker_range: SourceRange,
 ) -> Option<&ListProjectionItem> {
-    let projection = projection?;
-    let index = projection
-        .items
-        .binary_search_by_key(&(marker_range.start, marker_range.end), |item| {
-            (item.marker_range.start, item.marker_range.end)
-        })
-        .ok()?;
-    projection.items.get(index)
+    projection?.item_for_marker(marker_range)
 }
 
 fn projected_item_for_range(
     projection: Option<&ListProjection>,
     range: SourceRange,
 ) -> Option<&ListProjectionItem> {
-    projection?
-        .items
-        .iter()
-        .filter(|item| {
-            item.item_range.intersects(range)
-                || (range.is_empty()
-                    && item.item_range.start <= range.start
-                    && range.start <= item.item_range.end)
-        })
-        .max_by_key(|item| (item.depth, std::cmp::Reverse(item.item_range.len_bytes())))
+    projection?.item_for_range(range)
 }
 
-fn projected_list_alignment(item: &ListProjectionItem) -> ListAlignment {
-    let marker_labels = (0..item.item_count)
-        .map(|ordinal| list_label(item.start, ordinal))
-        .collect::<Vec<_>>();
-    let mut max_marker_label = String::new();
-    let mut max_marker_columns = 0;
-    for label in &marker_labels {
-        let columns = label.chars().count();
-        if columns > max_marker_columns {
-            max_marker_columns = columns;
-            max_marker_label.clone_from(label);
-        }
-    }
-    ListAlignment {
-        max_marker_label,
-        max_marker_columns,
-        marker_labels: marker_labels.into(),
-    }
+fn projected_list_alignment(
+    projection: &ListProjection,
+    item: &ListProjectionItem,
+) -> Option<ListAlignment> {
+    let list = projection.list(item.list_range)?;
+    Some(ListAlignment {
+        max_marker_label: list.max_marker_label.clone(),
+        max_marker_columns: list.max_marker_columns,
+        marker_labels: list.marker_labels.clone(),
+    })
 }
 
 fn list_alignments(tree: &MarkdownTree) -> Vec<Option<ListAlignment>> {
@@ -2211,6 +2214,7 @@ impl ProjectionIndex {
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
+                global_list_prefix: None,
             })
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
@@ -2347,16 +2351,29 @@ fn list_row_metadata(
         .intersecting(range)
         .into_iter()
         .copied()
-        .max_by_key(|id| parsed.tree.list_depth(*id))?;
-    let item_projection = projection.list_item_projections.get(item.0)?.as_ref()?;
-    let opening = markers_on_line.iter().find(|planned| {
-        planned.list_owner == Some(item)
-            && planned.range.start >= range.start
-            && planned.range.start < range.end
+        .max_by_key(|id| parsed.tree.list_depth(*id));
+    let item_projection = item.and_then(|item| {
+        projection
+            .list_item_projections
+            .get(item.0)
+            .and_then(Option::as_ref)
+    });
+    let projected = projected_item_for_range(list_projection, range);
+    if item_projection.is_none() && projected.is_none() {
+        return None;
+    }
+    let opening = item.and_then(|item| {
+        markers_on_line.iter().find(|planned| {
+            planned.list_owner == Some(item)
+                && planned.range.start >= range.start
+                && planned.range.start < range.end
+        })
     });
     let role = if opening.is_some() {
         ListRowRole::Opening
-    } else if let Some(region) = list_row_paragraph(item_projection, range) {
+    } else if let Some(item_projection) = item_projection
+        && let Some(region) = list_row_paragraph(item_projection, range)
+    {
         if region.after_nested_list {
             ListRowRole::ParentParagraphAfterNestedList {
                 ordinal: region.ordinal,
@@ -2384,17 +2401,28 @@ fn list_row_metadata(
     let structural_prefixes = markers_on_line
         .iter()
         .filter_map(|planned| {
-            let (owner, columns) = planned.list_prefix?;
+            if let Some((owner, columns)) = planned.list_prefix {
+                return Some(ListStructuralPrefixMetadata {
+                    item_id: ListItemId(owner.0 as u64),
+                    source_range: planned.range,
+                    columns,
+                });
+            }
+            let prefix = planned.global_list_prefix?;
             Some(ListStructuralPrefixMetadata {
-                item_id: ListItemId(owner.0 as u64),
-                source_range: planned.range,
-                columns,
+                item_id: ListItemId(prefix.item_range.start.0 as u64),
+                source_range: prefix.source_range,
+                columns: prefix.columns,
             })
         })
         .collect::<Vec<_>>();
     let body_visual_start = markers_on_line
         .iter()
-        .filter(|planned| planned.list_owner.is_some() || planned.list_prefix.is_some())
+        .filter(|planned| {
+            planned.list_owner.is_some()
+                || planned.list_prefix.is_some()
+                || planned.global_list_prefix.is_some()
+        })
         .flat_map(|planned| {
             source_map.segments.iter().filter_map(|segment| {
                 let same_source = segment.source_range == planned.range;
@@ -2406,19 +2434,31 @@ fn list_row_metadata(
         })
         .max()
         .unwrap_or(VisualOffset(0));
-    let owner = projected_item_for_range(list_projection, range).map_or_else(
-        || item_projection.owner.clone(),
-        |projected| {
-            let mut owner = item_projection.owner.clone();
-            owner.list_id = ListId(projected.list_range.start.0 as u64);
-            owner.item_id = ListItemId(projected.item_range.start.0 as u64);
-            owner.start = projected.start;
-            owner.ordinal = projected.ordinal;
-            owner.depth = projected.depth;
-            owner.alignment = projected_list_alignment(projected);
-            owner
-        },
-    );
+    let owner = if let Some(projected) = projected {
+        let list_projection = list_projection?;
+        let alignment = projected_list_alignment(list_projection, projected)?;
+        let mut owner = item_projection.map_or_else(
+            || ListOwnerMetadata {
+                list_id: ListId(projected.list_range.start.0 as u64),
+                item_id: ListItemId(projected.item_range.start.0 as u64),
+                marker_kind: list_marker_kind(projected.start),
+                start: projected.start,
+                ordinal: projected.ordinal,
+                depth: projected.depth,
+                alignment: alignment.clone(),
+            },
+            |item_projection| item_projection.owner.clone(),
+        );
+        owner.list_id = ListId(projected.list_range.start.0 as u64);
+        owner.item_id = ListItemId(projected.item_range.start.0 as u64);
+        owner.start = projected.start;
+        owner.ordinal = projected.ordinal;
+        owner.depth = projected.depth;
+        owner.alignment = alignment;
+        owner
+    } else {
+        item_projection?.owner.clone()
+    };
     Some(ListRowMetadata {
         owner,
         role,
