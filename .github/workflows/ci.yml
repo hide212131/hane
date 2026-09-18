@@ -29,6 +29,9 @@ jobs:
       - name: Test AADW GUI command policy
         run: python3 .github/tests/test_aadw_gui_command.py
 
+      - name: Test focused sidebar GUI policy
+        run: python3 .github/tests/test_sidebar_gui.py
+
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
