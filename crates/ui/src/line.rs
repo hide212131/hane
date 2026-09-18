@@ -383,15 +383,10 @@ pub(crate) fn row_element(
         &line.style_runs,
         row.body_visual_start,
     );
+    let marker_body_gap_segment = marker_body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
-    for segment in &segments {
-        if row.marker_body_gap > 0.0
-            && row.body_visual_start.is_some_and(|body| {
-                body > row.line_visual_range.start
-                    && body <= row.line_visual_range.end
-                    && segment.visual_range.start >= body
-            })
-        {
+    for (segment_index, segment) in segments.iter().enumerate() {
+        if marker_body_gap_segment == Some(segment_index) {
             elements.push(
                 div()
                     .flex_none()
@@ -522,6 +517,19 @@ fn line_segments(
             visual_range: range.clone(),
         })
         .collect()
+}
+
+fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
+    let body = row.body_visual_start?;
+    (row.marker_body_gap > 0.0
+        && body > row.line_visual_range.start
+        && body <= row.line_visual_range.end)
+        .then(|| {
+            segments
+                .iter()
+                .position(|segment| segment.visual_range.start >= body)
+        })
+        .flatten()
 }
 
 fn cursor_overlay(theme: Theme) -> Div {
@@ -741,6 +749,30 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn list_marker_body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
+        let mut row = row();
+        row.line_visual_range = 0..12;
+        row.body_visual_start = Some(3);
+        row.marker_body_gap = 8.0;
+        let segments = line_segments(
+            0..12,
+            None,
+            Some(5..9),
+            Some(7..11),
+            &[],
+            row.body_visual_start,
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..3, 3..5, 5..7, 7..9, 9..11, 11..12]
+        );
+        assert_eq!(marker_body_gap_segment(&row, &segments), Some(1));
     }
 
     #[test]
