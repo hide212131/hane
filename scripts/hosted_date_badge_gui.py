@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -141,6 +142,7 @@ def _validate_roi(value: object) -> dict:
         if (
             not isinstance(actual, (int, float))
             or isinstance(actual, bool)
+            or not math.isfinite(float(actual))
             or abs(float(actual) - expected) > ROI_FRACTION_TOLERANCE
         ):
             raise RuntimeError(

@@ -230,6 +230,47 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                         "roi": {**mod.EXPECTED_ROI, key: mod.EXPECTED_ROI[key] + 0.1},
                     })
 
+    def test_validate_preprocessing_evidence_rejects_roi_non_finite_fraction(self):
+        # `json.loads` accepts `NaN`/`Infinity`/`-Infinity` as Python floats,
+        # and a naive `abs(actual - expected) > tolerance` comparison never
+        # trips for `NaN` (every comparison against `NaN` is `False`), so a
+        # non-finite roi fraction must be rejected explicitly rather than
+        # slipping through as a "close enough" match.
+        for key in ("x_fraction", "y_fraction_from_top", "width_fraction", "height_fraction"):
+            for non_finite in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(key=key, non_finite=non_finite):
+                    with self.assertRaises(RuntimeError):
+                        mod._validate_roi({**mod.EXPECTED_ROI, key: non_finite})
+                    with self.assertRaises(RuntimeError):
+                        mod.validate_preprocessing_evidence({
+                            **VALID_PREPROCESSING_EVIDENCE,
+                            "roi": {**mod.EXPECTED_ROI, key: non_finite},
+                        })
+
+    def test_validate_preprocessing_evidence_rejects_roi_non_finite_fraction_from_json(self):
+        # End-to-end: the trusted vision helper's JSON stdout is parsed with
+        # `json.loads`, which accepts the non-standard `NaN`/`Infinity`
+        # literals; confirm that path is rejected too, not just direct float
+        # values constructed in Python.
+        payload = (
+            '{"matches": [], "preprocessing": {"method": "roi_crop_uniform_upscale", '
+            '"scale_factor": 4, "source_size": {"width": 960, "height": 680}, '
+            '"roi": {"origin": "top_left_y_down", "x_fraction": 0.0, '
+            '"y_fraction_from_top": 0.05, "width_fraction": NaN, "height_fraction": 0.35}, '
+            '"crop_size": {"width": 288, "height": 238}, '
+            '"processed_size": {"width": 1152, "height": 952}}}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
+
     def test_validate_preprocessing_evidence_rejects_crop_size_not_matching_roi(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
