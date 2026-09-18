@@ -427,6 +427,14 @@ pub(crate) fn row_element(
             );
         }
     }
+    if marker_body_gap_segment == Some(segments.len()) {
+        elements.push(
+            div()
+                .flex_none()
+                .w(px(row.marker_body_gap))
+                .into_any_element(),
+        );
+    }
     if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
         elements.push(cursor_overlay(theme).into_any_element());
     }
@@ -528,6 +536,7 @@ fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option
             segments
                 .iter()
                 .position(|segment| segment.visual_range.start >= body)
+                .or_else(|| (body == row.line_visual_range.end).then_some(segments.len()))
         })
         .flatten()
 }
@@ -772,6 +781,26 @@ mod tests {
             vec![0..3, 3..5, 5..7, 7..9, 9..11, 11..12]
         );
         assert_eq!(marker_body_gap_segment(&row, &segments), Some(1));
+    }
+
+    #[test]
+    fn list_marker_body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
+        let mut row = row(0..4, LineWrap::Hard);
+        row.body_visual_start = Some(4);
+        row.marker_body_gap = 8.0;
+        let segments = line_segments(0..4, None, None, None, &[], row.body_visual_start);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..4]
+        );
+        assert_eq!(
+            marker_body_gap_segment(&row, &segments),
+            Some(segments.len())
+        );
     }
 
     #[test]

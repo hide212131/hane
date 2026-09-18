@@ -498,7 +498,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                         .marker_x_origin
                         .unwrap_or(line_geometry.body_x_origin)
                 } else {
-                    line_geometry.body_x_origin - line_geometry.structural_prefix_width
+                    line_geometry.body_x_origin - line_geometry.expanded_prefix_width
                 },
                 body_x_origin: line_geometry.body_x_origin,
                 effective_width: line_geometry.effective_width,
@@ -524,7 +524,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 struct LineGeometry {
     marker_x_origin: Option<f32>,
     body_x_origin: f32,
-    structural_prefix_width: f32,
+    expanded_prefix_width: f32,
     effective_width: f32,
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
@@ -560,7 +560,7 @@ fn line_geometry(
         return LineGeometry {
             marker_x_origin: None,
             body_x_origin: 0.0,
-            structural_prefix_width: 0.0,
+            expanded_prefix_width: 0.0,
             effective_width: width.max(0.0),
             body_visual_start: None,
             marker_visual_range: None,
@@ -579,29 +579,32 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let structural_prefix_width = list
-        .structural_prefixes
+    let body_visual_start = list.body_visual_start.0;
+    let marker_visual_range = list.marker.as_ref().map(|marker| marker.visual_range);
+    let expanded_prefix_width = line
+        .source_map
+        .segments
         .iter()
-        .filter_map(|prefix| {
-            line.source_map.segments.iter().find_map(|segment| {
-                (segment.source_range == prefix.source_range
-                    && segment.visibility == crate::Visibility::ExpandedMarkup)
-                    .then(|| {
-                        shaper.x_for_offset(
-                            line,
-                            segment.visual_range.start.0..segment.visual_range.end.0,
-                            segment.visual_range.end.0,
-                        )
-                    })
-            })
+        .filter(|segment| {
+            segment.visibility == crate::Visibility::ExpandedMarkup
+                && segment.visual_range.start.0 < body_visual_start
+                && segment.visual_range.end.0 <= body_visual_start
+                && marker_visual_range.as_ref() != Some(&segment.visual_range)
+        })
+        .map(|segment| {
+            shaper.x_for_offset(
+                line,
+                segment.visual_range.start.0..segment.visual_range.end.0,
+                segment.visual_range.end.0,
+            )
         })
         .sum::<f32>();
     let body_x =
-        marker_x + structural_prefix_width + aggregate_marker_width.max(disclosed_marker_width);
+        marker_x + expanded_prefix_width + aggregate_marker_width.max(disclosed_marker_width);
     LineGeometry {
         marker_x_origin: list.marker.as_ref().map(|_| marker_x),
         body_x_origin: body_x,
-        structural_prefix_width,
+        expanded_prefix_width,
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
         body_visual_start: Some(list.body_visual_start.0),
         marker_visual_range: list
@@ -631,7 +634,7 @@ fn fragment_boundaries(
     }
     let first_x_origin = geometry
         .marker_x_origin
-        .unwrap_or(geometry.body_x_origin - geometry.structural_prefix_width);
+        .unwrap_or(geometry.body_x_origin - geometry.expanded_prefix_width);
     let first_width = (width - first_x_origin).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);

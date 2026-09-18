@@ -355,6 +355,32 @@ fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
 }
 
 #[test]
+fn disclosed_quote_prefix_width_is_included_in_list_body_geometry() {
+    let source = "> 1. item\n";
+    let cursor = source.find("item").expect("item in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the quoted list row is laid out");
+
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 40.0);
+    assert_eq!(
+        layout
+            .point_for_source(&block, SourceOffset(cursor), &shaper())
+            .expect("item has a point")
+            .x,
+        40.0
+    );
+}
+
+#[test]
 fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
     let source = "- outer\n\n  - inner\n";
     let block = present(source, None)
