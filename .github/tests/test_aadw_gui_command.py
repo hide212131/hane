@@ -114,15 +114,24 @@ class ParseRouteTests(unittest.TestCase):
     def test_routes_sidebar_chrome_focused_commands(self):
         for context in ("head", "merge"):
             with self.subTest(context=context):
+                expected = {
+                    "validation_kind": "sidebar-chrome",
+                    "execution_context": context,
+                    "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
+                    "procedure_path": "scripts/hosted_sidebar_chrome_gui.py",
+                }
                 self.assertEqual(
                     command.parse_route(f"/gui-validate sidebar-chrome {context}"),
-                    {
-                        "validation_kind": "sidebar-chrome",
-                        "execution_context": context,
-                        "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
-                        "procedure_path": "scripts/hosted_sidebar_chrome_gui.py",
-                    },
+                    expected,
                 )
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate\tsidebar-chrome\t{context}"),
+                    expected,
+                )
+
+    def test_sidebar_chrome_route_rejects_non_whitespace_separators(self):
+        self.assertIsNone(command.parse_route("/gui-validatettsidebar-chromethead"))
+        self.assertIsNone(command.parse_route(r"/gui-validate\sidebar-chrome\head"))
 
     def test_rejects_prose_extra_args_and_unknown_validation_kind(self):
         invalid = (
