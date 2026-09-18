@@ -336,6 +336,7 @@ pub struct ListProjectionList {
 pub struct ListProjectionRow {
     pub source_range: SourceRange,
     item_index: usize,
+    is_code_block: bool,
 }
 
 impl ListProjection {
@@ -367,14 +368,16 @@ impl ListProjection {
     /// row index is built with the formal parse, so a viewport parse does not
     /// have to scan every item in a large list to recover its owner.
     pub fn item_for_range(&self, range: SourceRange) -> Option<&ListProjectionItem> {
-        let index = self
-            .rows
-            .partition_point(|row| row.source_range.end <= range.start);
-        let row = self.rows.get(index)?;
-        if !row.source_range.intersects(range) {
-            return None;
-        }
+        let row = self.row_for_range(range)?;
         self.items.get(row.item_index)
+    }
+
+    /// Reports whether the formal parse presents the physical list row as code.
+    /// A bounded viewport parse can mistake a four-column list continuation for
+    /// an indented code block; callers use this bit only to restore the formal
+    /// display kind while preserving genuine code nested in the list.
+    pub fn is_code_block_for_range(&self, range: SourceRange) -> Option<bool> {
+        Some(self.row_for_range(range)?.is_code_block)
     }
 
     pub fn list(&self, source_range: SourceRange) -> Option<&ListProjectionList> {
@@ -397,6 +400,14 @@ impl ListProjection {
         self.prefixes[start..end]
             .iter()
             .filter(move |prefix| prefix.source_range.intersects(range))
+    }
+
+    fn row_for_range(&self, range: SourceRange) -> Option<&ListProjectionRow> {
+        let index = self
+            .rows
+            .partition_point(|row| row.source_range.end <= range.start);
+        let row = self.rows.get(index)?;
+        row.source_range.intersects(range).then_some(row)
     }
 }
 

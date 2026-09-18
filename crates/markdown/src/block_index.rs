@@ -201,6 +201,7 @@ fn build_list_rows(
     block_range: SourceRange,
     source: &str,
     items: &[ListProjectionItem],
+    code_blocks: &[SourceRange],
 ) -> Vec<ListProjectionRow> {
     let mut rows = Vec::new();
     let mut active = Vec::new();
@@ -216,9 +217,13 @@ fn build_list_rows(
             .copied()
             .max_by_key(|index| items[*index].depth)
         {
+            let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
             rows.push(ListProjectionRow {
                 source_range,
                 item_index,
+                is_code_block: code_blocks
+                    .get(code_block)
+                    .is_some_and(|code| code.intersects(source_range)),
             });
         }
     }
@@ -241,6 +246,14 @@ fn build_list_projections(
         .collect::<Vec<_>>();
     let mut ordinals = vec![None; parsed.tree.len()];
     let mut lists = Vec::new();
+    let mut code_blocks = parsed
+        .tree
+        .iter()
+        .filter_map(|(_, node)| {
+            matches!(node.kind, NodeKind::CodeBlock).then_some(node.source_range)
+        })
+        .collect::<Vec<_>>();
+    code_blocks.sort_by_key(|range| (range.start, range.end));
     for (list_id, node) in parsed.tree.iter() {
         let NodeKind::List { start } = node.kind else {
             continue;
@@ -342,7 +355,7 @@ fn build_list_projections(
                     })
                     .cloned()
                     .collect();
-                let rows = build_list_rows(block_range, source, &block_items);
+                let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
                 ListProjection::new(block_items, block_prefixes, block_lists, rows)
             })
         })

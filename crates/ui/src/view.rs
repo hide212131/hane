@@ -4881,9 +4881,9 @@ mod tests {
 
     #[test]
     fn a_late_list_continuation_keeps_formal_owner_and_structural_indent() {
-        let mut source = String::from("1. opening\n");
+        let mut source = String::from("10. opening\n");
         for _ in 0..5_000 {
-            source.push_str("   continued\n");
+            source.push_str("    continued\n");
         }
         let editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
@@ -4892,7 +4892,7 @@ mod tests {
 
         // The opening marker is outside the synchronous viewport parse. The
         // formal projection must still identify this row as the first item and
-        // hide its structural three-column continuation prefix.
+        // hide its structural four-column continuation prefix.
         let late_line = 4_500;
         let late = presented_block_with_list_projection(
             &editor,
@@ -4908,7 +4908,8 @@ mod tests {
         assert_eq!(list.owner.ordinal, 0);
         assert_eq!(list.owner.depth, 1);
         assert_eq!(list.structural_prefixes.len(), 1);
-        assert_eq!(list.structural_prefixes[0].columns, 3);
+        assert_eq!(list.structural_prefixes[0].columns, 4);
+        assert!(line.style_runs.is_empty(), "continuation is not code");
     }
 
     #[test]

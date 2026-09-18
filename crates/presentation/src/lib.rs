@@ -1512,6 +1512,9 @@ fn present_markdown_from_parse(
         return block;
     }
     let parsed = shared.parsed;
+    let formal_code_block = shared
+        .list_projection
+        .and_then(|projection| projection.is_code_block_for_range(range));
     // An ATX heading nested in an existing quote/list still carries its
     // heading level. Only nodes intersecting this physical line contribute:
     // the shared tree also contains other headings and trailing blank lines.
@@ -1525,13 +1528,16 @@ fn present_markdown_from_parse(
             .filter_map(|id| parsed.tree.node(**id))
             .filter(|node| node.kind.is_block())
     };
-    let kind = blocks()
+    let mut kind = blocks()
         .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             _ => None,
         })
         .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
         .unwrap_or_default();
+    if formal_code_block == Some(false) && kind == BlockKind::CodeBlock {
+        kind = BlockKind::ListItem;
+    }
     let mut visual = String::with_capacity(source.len());
     // The ordered plan belongs to the semantic snapshot. Binary search avoids
     // copying or walking off-screen markers for each physical line.
@@ -1656,6 +1662,9 @@ fn present_markdown_from_parse(
     let mut style_runs = nodes
         .iter()
         .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| {
+            !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
+        })
         .filter(|node| has_delimiter_markers(node.kind))
         .filter_map(|span| {
             let style = syntax_display(span.kind).inline_style?;
