@@ -220,6 +220,75 @@ fn multi_line_constructs_lay_out_one_row_per_source_line_when_they_fit() {
 }
 
 #[test]
+fn list_body_columns_are_shared_by_inactive_ordered_labels() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line < 2)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.marker_x_origin == Some(0.0)));
+    assert!(rows.iter().all(|row| row.body_x_origin == 32.0));
+    assert_eq!(rows[0].effective_width, 128.0);
+
+    let foo = SourceOffset(source.find("foo").expect("foo in source"));
+    let bar = SourceOffset(source.find("bar").expect("bar in source"));
+    let foo_point = layout
+        .point_for_source(&block, foo, &shaper())
+        .expect("foo has a point");
+    let bar_point = layout
+        .point_for_source(&block, bar, &shaper())
+        .expect("bar has a point");
+    assert_eq!(foo_point.x, bar_point.x);
+    assert_eq!(foo_point.x, 32.0);
+}
+
+#[test]
+fn list_continuations_and_wrapped_fragments_start_at_the_body_column() {
+    let source = "- first\n  continuation\n\n- one two three four five six\n";
+    let list = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&list, WIDTH, &shaper());
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the continuation row is laid out");
+    assert_eq!(continuation.text_x_origin, 16.0);
+    assert_eq!(continuation.body_x_origin, 16.0);
+
+    let wrapped = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 3)
+        .collect::<Vec<_>>();
+    assert!(wrapped.len() > 1, "the final item wraps");
+    assert_eq!(wrapped[0].text_x_origin, 0.0);
+    assert!(wrapped[1..].iter().all(|row| row.text_x_origin == 16.0));
+    assert!(wrapped.iter().all(|row| row.effective_width == 64.0));
+}
+
+#[test]
+fn deeply_nested_or_narrow_lists_keep_a_positive_effective_width() {
+    let source = "999999999. value\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 1.0, &shaper());
+    assert!(!layout.lines.is_empty());
+    assert!(layout.lines.iter().all(|row| row.effective_width >= 1.0));
+}
+
+#[test]
 fn vertical_movement_follows_rows_and_keeps_the_preferred_x() {
     let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
     let shaper = shaper();

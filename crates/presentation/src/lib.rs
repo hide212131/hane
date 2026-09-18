@@ -41,7 +41,7 @@ pub mod testing;
 
 pub use layout::{
     BlockLayout, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove, layout_block,
-    line_visual_start,
+    line_visual_start, LIST_DEPTH_INDENT,
 };
 
 use hane_document::{
@@ -1491,23 +1491,12 @@ fn present_markdown_from_parse(
                 marker_edge: None,
             });
         }
-        // An inactive list item's own structural continuation indentation is
-        // replaced by that many synthesized spaces — normalizing any tab's
-        // column width to plain spaces — anchored the same way the bullet
-        // synthesis above is; disclosing it (`expanded`) shows the real
-        // source bytes (spaces or tabs) directly instead.
-        if !expanded
-            && let Some((_, columns)) = planned.list_prefix
-        {
-            let visual_start = visual.len();
-            visual.push_str(&" ".repeat(columns));
-            segments.push(MappingSegment {
-                source_range: SourceRange::empty(marker.start.0),
-                visual_range: VisualRange::new(visual_start, visual.len()),
-                visibility: Visibility::Synthesized,
-                marker_edge: None,
-            });
-        }
+        // An inactive list item's structural continuation indentation has no
+        // visual representation. Layout owns the semantic body column; adding
+        // spaces here would make source indentation part of the text being
+        // shaped and would make caret/hit-test geometry disagree with it.
+        // Disclosing the item still shows the original source spaces or tabs
+        // through this marker's ExpandedMarkup segment.
         source_cursor = marker.end.0;
     }
     if source_cursor < range.end.0 {
@@ -1844,10 +1833,9 @@ struct ProjectedMarker {
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
     /// indentation (`MarkdownParse::list_structural_prefixes`): the owning
-    /// item, and the column width an inactive presentation synthesizes in
-    /// its place. Distinct from `list_owner`, which is the item's own
-    /// opening bullet/number and gets a synthesized label instead of
-    /// synthesized spaces.
+    /// item and the semantic column width the layout uses for its body.
+    /// Distinct from `list_owner`, which is the item's own opening
+    /// bullet/number and gets a synthesized label.
     list_prefix: Option<(NodeId, usize)>,
 }
 
@@ -3592,7 +3580,7 @@ mod tests {
             // The list item's opening line carries the synthesized bullet
             // marker even while inactive (#126 contract), unlike the quote
             // fixtures above whose `>` markup is real source text instead.
-            ("- `\n  x\n  `", vec!["• ", "  x", "  "]),
+            ("- `\n  x\n  `", vec!["• ", "x", ""]),
         ] {
             let mut offset = 50;
             let lines: Vec<_> = source
@@ -3705,7 +3693,7 @@ mod tests {
         // Nothing disclosed: both markers collapse to their synthesized bullet.
         let collapsed = present(None);
         assert_eq!(line(&collapsed.visual_text, outer_line), "\u{2022} outer");
-        assert_eq!(line(&collapsed.visual_text, inner_line), "  \u{2022} inner");
+        assert_eq!(line(&collapsed.visual_text, inner_line), "\u{2022} inner");
         assert_eq!(line(&collapsed.visual_text, sibling_line), "\u{2022} sibling");
 
         // A caret inside the nested child's own first line discloses both the
@@ -3760,7 +3748,7 @@ mod tests {
         );
         assert_eq!(
             line(&sibling_caret.visual_text, inner_line),
-            "  \u{2022} inner"
+            "\u{2022} inner"
         );
         assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
     }
@@ -3783,7 +3771,7 @@ mod tests {
         };
 
         let collapsed = present(None);
-        assert_eq!(line(&collapsed.visual_text, 1), "    continued");
+        assert_eq!(line(&collapsed.visual_text, 1), "continued");
 
         let at_continued = start + source.find("continued").unwrap();
         let disclosed = present(Some(SourceRange::empty(at_continued)));
@@ -3825,8 +3813,8 @@ mod tests {
             lines,
             vec![
                 "3. outer-a",
-                "   \u{2022} nested-a",
-                "   \u{2022} nested-b",
+                "\u{2022} nested-a",
+                "\u{2022} nested-b",
                 "4. outer-b",
             ]
         );

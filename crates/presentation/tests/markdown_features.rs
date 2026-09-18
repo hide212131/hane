@@ -58,18 +58,13 @@ const FIXTURES: &[MarkdownFixture] = &[
         ]],
         markers: &["- ", "- ", "**", "**"],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
-        // Each item's own synthesized `•` sits after that item's own leading
-        // indentation, ahead of its content. The outer item's own structural
-        // continuation indentation carries the nested list's opening line —
-        // synthesized as the same two spaces, not the outer item's own
-        // literal source bytes — separately from the nested item's own
-        // synthesized marker.
-        visual_lines: &["\u{2022} outer", "  \u{2022} inner bold"],
-        // "\u{2022} " is 4 UTF-8 bytes ("•" is 3 bytes, plus the space); style
-        // runs are visual byte offsets, so the nested line's 2-byte
-        // indentation is followed by a 4-byte synthesized marker before
-        // "inner bold" begins at byte 6.
-        style_runs: &[&[], &[style(Bold, 12, 16)]],
+        // Structural indentation is layout geometry, not fake visual text;
+        // only the nested item's synthesized marker remains in the
+        // presentation string.
+        visual_lines: &["\u{2022} outer", "\u{2022} inner bold"],
+        // "\u{2022} " is 4 UTF-8 bytes ("•" is 3 bytes, plus the space), so
+        // the bold run begins after the marker and "inner ".
+        style_runs: &[&[], &[style(Bold, 10, 14)]],
     },
     MarkdownFixture {
         name: "ordered list display ignores its own non-sequential source digits",
@@ -305,12 +300,12 @@ const FIXTURES: &[MarkdownFixture] = &[
         markers: &["- ", "**", "**"],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
         // Only the item's own opening line gets a synthesized `•`; the
-        // continuation line's required indentation is the item's own
-        // structural prefix, synthesized back to the same two spaces.
-        visual_lines: &["\u{2022} bold", "  across"],
+        // continuation line's required indentation is supplied by layout
+        // geometry rather than synthesized spaces.
+        visual_lines: &["\u{2022} bold", "across"],
         // "\u{2022} " is 4 UTF-8 bytes, shifting line 0's Bold run from its
         // former [0, 5) by 4 bytes.
-        style_runs: &[&[style(Bold, 4, 9)], &[style(Bold, 0, 8)]],
+        style_runs: &[&[style(Bold, 4, 9)], &[style(Bold, 0, 6)]],
     },
     MarkdownFixture {
         name: "strong emphasis spanning a soft line break inside a quote",

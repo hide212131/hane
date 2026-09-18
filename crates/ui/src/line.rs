@@ -640,6 +640,12 @@ mod tests {
             source_range: SourceRange::new(0, 0),
             y: 0.0,
             height: 26.0,
+            text_x_origin: 0.0,
+            body_x_origin: 0.0,
+            effective_width: 80.0,
+            marker_x_origin: None,
+            body_visual_start: None,
+            marker_visual_range: None,
         }
     }
 

@@ -270,7 +270,7 @@ pub struct MarkdownParse {
     /// content occupies past the marker's own opening line, paired with the
     /// owning item and the column width (not necessarily its byte length, as
     /// a tab can consume fewer bytes than columns) an inactive presentation
-    /// should synthesize in its place. Separate from `list_item_markers`
+    /// should account for in layout. Separate from `list_item_markers`
     /// (which covers only the opening line's own bullet/number) and from
     /// `quote_markers` (a different container's own per-line prefix). A
     /// physical line several nested items all continue onto gets one range

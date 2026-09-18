@@ -17,10 +17,17 @@
 //! with a fixed advance width, which is what makes the coordinate contract
 //! verifiable without a window.
 
-use crate::{VisualBlock, VisualLine, VisualOffset, VisualRange};
+use crate::{ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::BlockId;
+use std::collections::HashMap;
 use std::ops::Range;
+
+/// Horizontal distance between semantic list depths. This is presentation
+/// geometry, not a claim about how many source spaces a Markdown parser
+/// consumed.
+pub const LIST_DEPTH_INDENT: f32 = 24.0;
+const MIN_EFFECTIVE_WRAP_WIDTH: f32 = 1.0;
 
 /// How a row ends.
 ///
@@ -59,11 +66,72 @@ pub struct LayoutLine {
     /// Top of the row, relative to the first presented row of the block.
     pub y: f32,
     pub height: f32,
+    /// x of the text drawn at the start of this fragment, in the block's text
+    /// column. The first fragment of an opening list row starts at its marker;
+    /// every hanging fragment starts at the item's body column.
+    pub text_x_origin: f32,
+    /// x at which the owning list item's body starts, in the block's text
+    /// column. Opening markers may be narrower than this column because the
+    /// whole list aligns to its aggregate inactive label width.
+    pub body_x_origin: f32,
+    /// Width passed to the shaper for this row. It is always positive for a
+    /// positive block width, even when a deeply nested list leaves no usable
+    /// room; this keeps a narrow viewport finite and deterministic.
+    pub effective_width: f32,
+    /// Semantic marker position, when this is a list row. Kept separately from
+    /// `text_x_origin` so painting can place a marker and body without making
+    /// source text carry structural indentation.
+    pub marker_x_origin: Option<f32>,
+    /// The visual offset at which the item body starts on this line. Hidden
+    /// source prefixes have zero visual width, so this may be zero.
+    pub body_visual_start: Option<usize>,
+    /// The visual range of the marker displayed on this line, if any.
+    pub marker_visual_range: Option<Range<usize>>,
 }
 
 impl LayoutLine {
     pub fn bottom(&self) -> f32 {
         self.y + self.height
+    }
+
+    fn x_for_visual(&self, line: &VisualLine, visual: usize, shaper: &dyn LineShaper) -> f32 {
+        let visual = visual.clamp(self.line_visual_range.start, self.line_visual_range.end);
+        if let Some(body) = self.body_visual_start
+            && body <= self.line_visual_range.end
+            && visual >= body
+        {
+            let body_fragment_start = body.max(self.line_visual_range.start);
+            return self.body_x_origin
+                + shaper.x_for_offset(
+                    line,
+                    body_fragment_start..self.line_visual_range.end,
+                    visual,
+                );
+        }
+        self.text_x_origin + shaper.x_for_offset(line, self.line_visual_range.clone(), visual)
+    }
+
+    fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
+        if let Some(body) = self.body_visual_start
+            && body <= self.line_visual_range.end
+        {
+            let body_fragment_start = body.max(self.line_visual_range.start);
+            if body_fragment_start < self.line_visual_range.end && x >= self.body_x_origin {
+                return shaper
+                    .offset_for_x(
+                        line,
+                        body_fragment_start..self.line_visual_range.end,
+                        x - self.body_x_origin,
+                    )
+                    .clamp(body_fragment_start, self.line_visual_range.end);
+            }
+            if body_fragment_start > self.line_visual_range.start && x >= self.body_x_origin {
+                return body_fragment_start;
+            }
+        }
+        shaper
+            .offset_for_x(line, self.line_visual_range.clone(), x - self.text_x_origin)
+            .clamp(self.line_visual_range.start, self.line_visual_range.end)
     }
 
     /// True when `offset` is inside this row, or at its end and the row is the
@@ -94,13 +162,18 @@ pub trait LineShaper {
     fn x_for_offset(&self, line: &VisualLine, fragment: Range<usize>, offset: usize) -> f32;
     /// The offset in `fragment` closest to `x`, measured from its left edge.
     fn offset_for_x(&self, line: &VisualLine, fragment: Range<usize>, x: f32) -> usize;
+    /// Width of arbitrary presentation text in the line's block font. Layout
+    /// uses this for an inactive marker label when the widest item is outside
+    /// the currently presented viewport.
+    fn width_for_text(&self, line: &VisualLine, text: &str) -> f32;
 }
 
 /// Where a source offset sits inside a laid-out block.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutPoint {
     pub row: usize,
-    /// Distance from the left edge of the text column.
+    /// Absolute x inside the block's text column, including semantic list
+    /// marker/body indentation.
     pub x: f32,
     /// Top of the row, relative to the top of the block.
     pub y: f32,
@@ -216,7 +289,7 @@ impl BlockLayout {
             .clamp(row.line_visual_range.start, row.line_visual_range.end);
         Some(LayoutPoint {
             row: row_index,
-            x: shaper.x_for_offset(line, row.line_visual_range.clone(), visual),
+            x: row.x_for_visual(line, visual, shaper),
             y: self.leading_space + row.y,
             height: row.height,
         })
@@ -244,9 +317,7 @@ impl BlockLayout {
     ) -> Option<SourceOffset> {
         let row = self.lines.get(row_index)?;
         let line = block.lines.get(row.line)?;
-        let visual = shaper
-            .offset_for_x(line, row.line_visual_range.clone(), x)
-            .clamp(row.line_visual_range.start, row.line_visual_range.end);
+        let visual = row.visual_for_x(line, x, shaper);
         Some(
             line.source_map
                 .visual_to_source(VisualOffset(visual), Bias::After)
@@ -348,12 +419,18 @@ pub fn line_visual_start(block: &VisualBlock, index: usize) -> usize {
 /// break falls, how tall a row is, where a row sits — is decided here so it is
 /// the same with any font.
 pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
+    let marker_widths = list_marker_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
         let block_start = line_visual_start(block, index);
         let height = line.height();
-        let boundaries = fragment_boundaries(line, width, shaper);
+        let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+        let boundaries = if width <= 0.0 {
+            vec![0, line.visual_text.len()]
+        } else {
+            fragment_boundaries(line, line_geometry.effective_width, shaper)
+        };
         for (fragment, pair) in boundaries.windows(2).enumerate() {
             let (start, end) = (pair[0], pair[1]);
             let last = end == line.visual_text.len();
@@ -380,6 +457,18 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 },
                 y,
                 height,
+                text_x_origin: if line_geometry.marker_x_origin.is_some() && fragment == 0 {
+                    line_geometry
+                        .marker_x_origin
+                        .unwrap_or(line_geometry.body_x_origin)
+                } else {
+                    line_geometry.body_x_origin
+                },
+                body_x_origin: line_geometry.body_x_origin,
+                effective_width: line_geometry.effective_width,
+                marker_x_origin: line_geometry.marker_x_origin,
+                body_visual_start: line_geometry.body_visual_start,
+                marker_visual_range: line_geometry.marker_visual_range.clone(),
             });
             y += height;
         }
@@ -391,6 +480,74 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
         lines,
         leading_space: block.leading_space(),
         trailing_space: block.trailing_space(),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LineGeometry {
+    marker_x_origin: Option<f32>,
+    body_x_origin: f32,
+    effective_width: f32,
+    body_visual_start: Option<usize>,
+    marker_visual_range: Option<Range<usize>>,
+}
+
+fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
+    let mut widths: HashMap<ListId, f32> = HashMap::new();
+    for line in &block.lines {
+        let Some(list) = &line.list else {
+            continue;
+        };
+        let width = shaper.width_for_text(line, &list.owner.alignment.max_marker_label);
+        widths
+            .entry(list.owner.list_id)
+            .and_modify(|current| *current = current.max(width))
+            .or_insert(width);
+    }
+    widths
+}
+
+fn list_depth_x(depth: usize) -> f32 {
+    depth.saturating_sub(1) as f32 * LIST_DEPTH_INDENT
+}
+
+fn line_geometry(
+    line: &VisualLine,
+    width: f32,
+    shaper: &dyn LineShaper,
+    marker_widths: &HashMap<ListId, f32>,
+) -> LineGeometry {
+    let Some(list) = &line.list else {
+        return LineGeometry {
+            marker_x_origin: None,
+            body_x_origin: 0.0,
+            effective_width: width.max(0.0),
+            body_visual_start: None,
+            marker_visual_range: None,
+        };
+    };
+    let marker_x = list_depth_x(list.owner.depth);
+    let aggregate_marker_width = marker_widths
+        .get(&list.owner.list_id)
+        .copied()
+        .unwrap_or_else(|| shaper.width_for_text(line, &list.owner.alignment.max_marker_label));
+    let disclosed_marker_width = list.marker.as_ref().map_or(0.0, |marker| {
+        shaper.x_for_offset(
+            line,
+            marker.visual_range.start.0..marker.visual_range.end.0,
+            marker.visual_range.end.0,
+        )
+    });
+    let body_x = marker_x + aggregate_marker_width.max(disclosed_marker_width);
+    LineGeometry {
+        marker_x_origin: list.marker.as_ref().map(|_| marker_x),
+        body_x_origin: body_x,
+        effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
+        body_visual_start: Some(list.body_visual_start.0),
+        marker_visual_range: list
+            .marker
+            .as_ref()
+            .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
     }
 }
 

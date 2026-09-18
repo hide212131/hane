@@ -83,4 +83,8 @@ impl LineShaper for FixedAdvanceShaper {
                 .nth(column)
                 .map_or(text.len(), |(offset, _)| offset)
     }
+
+    fn width_for_text(&self, line: &VisualLine, text: &str) -> f32 {
+        text.chars().count() as f32 * self.advance_for(line)
+    }
 }
