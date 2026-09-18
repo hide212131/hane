@@ -289,6 +289,28 @@ pub struct MarkdownParse {
     pub line_break_padding: Vec<SourceRange>,
 }
 
+/// Document-wide list information retained by a formal [`BlockIndex`] so a
+/// viewport-only presentation can keep the same numbering and nesting while
+/// the block's full Markdown parse is still being prepared in the background.
+///
+/// This is deliberately a render-neutral projection: it contains source
+/// ranges and list positions, not display labels or layout coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListProjection {
+    pub items: Vec<ListProjectionItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListProjectionItem {
+    pub item_range: SourceRange,
+    pub marker_range: SourceRange,
+    pub list_range: SourceRange,
+    pub start: Option<u64>,
+    pub ordinal: usize,
+    pub depth: usize,
+    pub item_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FenceDelimiter {
     marker: u8,

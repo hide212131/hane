@@ -20,9 +20,11 @@ use crate::capture::InputCapture;
 use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
+#[cfg(test)]
+use crate::line::presented_block;
 use crate::line::{
     BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
-    presented_block, row_element,
+    presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -39,7 +41,7 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    local_block_index,
+    ListProjection, local_block_index,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
@@ -2337,11 +2339,15 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
             cached.revision == revision && cached.source_range == indexed.source_range
         });
-        let visual = presented_block(
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
+        let visual = presented_block_with_list_projection(
             self.editor(),
             &indexed,
             &window,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
@@ -2370,6 +2376,9 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
             cached.revision == revision && cached.source_range == indexed.source_range
         });
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
         target_in_neighbor(
             self.editor(),
             &indexed,
@@ -2379,6 +2388,7 @@ impl EditorView {
             self.content_width,
             shaper,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )
     }
 
@@ -2773,11 +2783,15 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&block.id).filter(|cached| {
             cached.revision == revision && cached.source_range == block.source_range
         });
-        let presented = presented_block(
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(block));
+        let presented = presented_block_with_list_projection(
             self.sessions.active().editor(),
             block,
             visible,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
@@ -2903,8 +2917,10 @@ fn target_in_neighbor(
     width: f32,
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
 ) -> Option<SourceOffset> {
-    let visual = presented_block(editor, indexed, &window, joined)?;
+    let visual =
+        presented_block_with_list_projection(editor, indexed, &window, joined, list_projection)?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -2938,7 +2954,9 @@ fn neighbor_row_target(
     joined: Option<&JoinedParse>,
 ) -> Option<SourceOffset> {
     let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
-    target_in_neighbor(editor, &indexed, window, down, x, width, shaper, joined)
+    target_in_neighbor(
+        editor, &indexed, window, down, x, width, shaper, joined, None,
+    )
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -4393,9 +4411,15 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX), None)
-                    .expect("block presents")
-                    .lines
+                presented_block_with_list_projection(
+                    editor,
+                    &block,
+                    &(0..usize::MAX),
+                    None,
+                    index.list_projection(&block),
+                )
+                .expect("block presents")
+                .lines
             })
             .collect()
     }
@@ -4816,6 +4840,43 @@ mod tests {
         assert_eq!(visual.leading_space(), 40_000.0 * 26.0);
         assert!(visual.covers(&(40_010..40_040)));
         assert!(!visual.covers(&(39_000..39_050)));
+    }
+
+    #[test]
+    fn a_large_list_viewport_keeps_formal_numbering_and_nesting() {
+        let mut source = String::from("1. outer\n   1. nested\n1. second\n");
+        for _ in 3..5_000 {
+            source.push_str("1. item\n");
+        }
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+
+        // The nested item is rendered from a one-line viewport parse. Its
+        // parent list is outside that parse, so the formal depth must come
+        // from the projection retained by BlockIndex.
+        let nested =
+            presented_block_with_list_projection(&editor, &block, &(1..2), None, Some(projection))
+                .expect("nested item presents");
+        assert_eq!(nested.lines[0].visual_text, "1. nested");
+        assert_eq!(nested.lines[0].list.as_ref().unwrap().owner.depth, 2);
+
+        // The late item is past the synchronous 4,096-line join budget. Its
+        // source marker is still `1.`, but the inactive presentation must use
+        // the direct-child ordinal from the whole list rather than restarting
+        // at `1.` in the viewport.
+        let late_line = 3_000;
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(late_line..late_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late item presents");
+        assert_eq!(late.lines[0].visual_text, "3000. item");
+        assert_eq!(late.lines[0].list.as_ref().unwrap().owner.ordinal, 2_999);
     }
 
     #[test]

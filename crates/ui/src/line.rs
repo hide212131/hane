@@ -15,11 +15,12 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::IndexedBlock;
+use hane_markdown::{IndexedBlock, ListProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
     InlineDisplay, JoinedParse, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset,
-    block_is_joinable, block_line_span, expected_disclosures, present_block, trailing_blank_lines,
+    block_is_joinable, block_line_span, expected_disclosures, present_block_with_list_projection,
+    trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -105,18 +106,29 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
 /// (see [`JoinedParse`]); it is what lets a block that exceeds either sync
 /// budget still resolve a marker pair arbitrarily far apart without this
 /// function reading the whole span itself on every call.
+#[cfg(test)]
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
+    presented_block_with_list_projection(editor, block, visible, joined, None)
+}
+
+pub(crate) fn presented_block_with_list_projection(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
     let ctx = block_context(editor, block, &span, &render, joined)?;
     let lines = block_lines(editor, &ctx);
-    Some(present_block(
+    Some(present_block_with_list_projection(
         block,
         document.revision(),
         &BlockWindow {
@@ -128,6 +140,7 @@ pub(crate) fn presented_block(
             block_disclosure: ctx.block_disclosure,
         },
         DEFAULT_LINE_HEIGHT,
+        list_projection,
     ))
 }
 

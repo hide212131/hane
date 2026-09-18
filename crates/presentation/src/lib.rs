@@ -48,8 +48,9 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownNode, MarkdownParse, MarkdownTree,
-    NodeId, NodeKind, has_delimiter_markers, is_table_delimiter, parse_document,
+    BlockId, BlockIndex, Confidence, IndexedBlock, ListProjection, ListProjectionItem,
+    MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, has_delimiter_markers,
+    is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -949,18 +950,35 @@ pub fn present_block(
     window: &BlockWindow<'_>,
     line_height: f32,
 ) -> VisualBlock {
+    present_block_with_list_projection(block, revision, window, line_height, None)
+}
+
+/// Presents a block with document-wide list context from a formal block index.
+///
+/// A block larger than the synchronous join budget is intentionally parsed only
+/// for the visible lines. The compact projection lets those lines retain the
+/// formal list's numbering, depth, and marker-column width until a whole-block
+/// [`JoinedParse`] becomes available.
+pub fn present_block_with_list_projection(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+    list_projection: Option<&ListProjection>,
+) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
         if run_uses_shared_parse(run.len(), window.joined) {
-            present_joined_run(
+            present_joined_run_with_list_projection(
                 &window.lines[run.clone()],
                 revision,
                 line_height,
                 &window.render,
                 window.joined,
                 window.block_disclosure,
+                list_projection,
                 &mut lines,
             );
             continue;
@@ -974,7 +992,7 @@ pub fn present_block(
         } else {
             LineContext::Normal
         };
-        let mut presented = present_polished_line(
+        let mut presented = present_polished_line_with_list_projection(
             line.line as u64,
             revision,
             line.range,
@@ -982,6 +1000,7 @@ pub fn present_block(
             line_height,
             line.disclosure,
             line_context,
+            list_projection,
         );
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
@@ -1325,11 +1344,29 @@ fn marker_edge(
 /// viewport projects one line at a time (see
 /// [`present_markdown_from_parse`]), and a scan there would cost proportional
 /// to each visible item's position rather than the visible range.
+#[cfg(test)]
 fn list_item_label(
     parsed: &MarkdownParse,
     ordinals: &[Option<(NodeId, usize)>],
     item: NodeId,
 ) -> Option<String> {
+    let (owner, ordinal) = (*ordinals.get(item.0)?)?;
+    match parsed.tree.node(owner)?.kind {
+        NodeKind::List { start } => Some(list_label(start, ordinal)),
+        _ => None,
+    }
+}
+
+fn list_item_label_with_projection(
+    parsed: &MarkdownParse,
+    ordinals: &[Option<(NodeId, usize)>],
+    item: NodeId,
+    list_projection: Option<&ListProjection>,
+    marker_range: SourceRange,
+) -> Option<String> {
+    if let Some(projected) = projected_item_for_marker(list_projection, marker_range) {
+        return Some(list_label(projected.start, projected.ordinal));
+    }
     let (owner, ordinal) = (*ordinals.get(item.0)?)?;
     match parsed.tree.node(owner)?.kind {
         NodeKind::List { start } => Some(list_label(start, ordinal)),
@@ -1390,6 +1427,26 @@ pub fn present_markdown_with_disclosure(
     line_height: f32,
     disclosure: Option<SourceRange>,
 ) -> VisualLine {
+    present_markdown_with_list_projection(
+        line_id,
+        revision,
+        range,
+        source,
+        line_height,
+        disclosure,
+        None,
+    )
+}
+
+fn present_markdown_with_list_projection(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
+) -> VisualLine {
     if source.is_empty() {
         let mut block = present_plain(line_id, revision, range, source);
         block.estimated_height = line_height;
@@ -1407,6 +1464,7 @@ pub fn present_markdown_with_disclosure(
         &SharedParse {
             parsed: &parsed,
             projection: &projection,
+            list_projection,
         },
     )
 }
@@ -1416,6 +1474,7 @@ pub fn present_markdown_with_disclosure(
 struct SharedParse<'a> {
     parsed: &'a MarkdownParse,
     projection: &'a ProjectionIndex,
+    list_projection: Option<&'a ListProjection>,
 }
 
 /// Presents one physical line from an already-parsed tree instead of parsing
@@ -1516,8 +1575,13 @@ fn present_markdown_from_parse(
         // together.
         if !expanded
             && let Some(owner) = planned.list_owner
-            && let Some(label) =
-                list_item_label(parsed, &shared.projection.list_item_ordinals, owner)
+            && let Some(label) = list_item_label_with_projection(
+                parsed,
+                &shared.projection.list_item_ordinals,
+                owner,
+                shared.list_projection,
+                planned.range,
+            )
         {
             let visual_start = visual.len();
             visual.push_str(&label);
@@ -1596,6 +1660,7 @@ fn present_markdown_from_parse(
         &visual,
         &source_map,
         disclosure,
+        shared.list_projection,
     );
     VisualLine {
         line_id,
@@ -1898,6 +1963,56 @@ fn list_label(start: Option<u64>, ordinal: usize) -> String {
     match start {
         None => "\u{2022} ".to_owned(),
         Some(start) => format!("{}. ", start.saturating_add(ordinal as u64)),
+    }
+}
+
+fn projected_item_for_marker(
+    projection: Option<&ListProjection>,
+    marker_range: SourceRange,
+) -> Option<&ListProjectionItem> {
+    let projection = projection?;
+    let index = projection
+        .items
+        .binary_search_by_key(&(marker_range.start, marker_range.end), |item| {
+            (item.marker_range.start, item.marker_range.end)
+        })
+        .ok()?;
+    projection.items.get(index)
+}
+
+fn projected_item_for_range(
+    projection: Option<&ListProjection>,
+    range: SourceRange,
+) -> Option<&ListProjectionItem> {
+    projection?
+        .items
+        .iter()
+        .filter(|item| {
+            item.item_range.intersects(range)
+                || (range.is_empty()
+                    && item.item_range.start <= range.start
+                    && range.start <= item.item_range.end)
+        })
+        .max_by_key(|item| (item.depth, std::cmp::Reverse(item.item_range.len_bytes())))
+}
+
+fn projected_list_alignment(item: &ListProjectionItem) -> ListAlignment {
+    let marker_labels = (0..item.item_count)
+        .map(|ordinal| list_label(item.start, ordinal))
+        .collect::<Vec<_>>();
+    let mut max_marker_label = String::new();
+    let mut max_marker_columns = 0;
+    for label in &marker_labels {
+        let columns = label.chars().count();
+        if columns > max_marker_columns {
+            max_marker_columns = columns;
+            max_marker_label.clone_from(label);
+        }
+    }
+    ListAlignment {
+        max_marker_label,
+        max_marker_columns,
+        marker_labels: marker_labels.into(),
     }
 }
 
@@ -2213,6 +2328,10 @@ fn list_row_paragraph(
         })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "list row projection keeps source, visual and disclosure inputs together"
+)]
 fn list_row_metadata(
     parsed: &MarkdownParse,
     projection: &ProjectionIndex,
@@ -2221,6 +2340,7 @@ fn list_row_metadata(
     visual: &str,
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
 ) -> Option<ListRowMetadata> {
     let item = projection
         .list_items
@@ -2286,8 +2406,21 @@ fn list_row_metadata(
         })
         .max()
         .unwrap_or(VisualOffset(0));
+    let owner = projected_item_for_range(list_projection, range).map_or_else(
+        || item_projection.owner.clone(),
+        |projected| {
+            let mut owner = item_projection.owner.clone();
+            owner.list_id = ListId(projected.list_range.start.0 as u64);
+            owner.item_id = ListItemId(projected.item_range.start.0 as u64);
+            owner.start = projected.start;
+            owner.ordinal = projected.ordinal;
+            owner.depth = projected.depth;
+            owner.alignment = projected_list_alignment(projected);
+            owner
+        },
+    );
     Some(ListRowMetadata {
-        owner: item_projection.owner.clone(),
+        owner,
         role,
         marker,
         structural_prefixes,
@@ -2391,6 +2524,7 @@ pub fn parse_joined_span(
 /// rejoining and reparsing `lines`; only `lines` themselves still have to be
 /// this run's own, since each is presented against its own physical range
 /// regardless of which parse supplied it.
+#[cfg(test)]
 fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
@@ -2398,6 +2532,32 @@ fn present_joined_run(
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
     block_disclosure: Option<SourceRange>,
+    out: &mut Vec<VisualLine>,
+) {
+    present_joined_run_with_list_projection(
+        lines,
+        revision,
+        line_height,
+        render,
+        joined,
+        block_disclosure,
+        None,
+        out,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "joined presentation keeps the render window and parse context together"
+)]
+fn present_joined_run_with_list_projection(
+    lines: &[BlockLine<'_>],
+    revision: Revision,
+    line_height: f32,
+    render: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    block_disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
     out: &mut Vec<VisualLine>,
 ) {
     let computed;
@@ -2411,6 +2571,7 @@ fn present_joined_run(
     let shared = SharedParse {
         parsed: &joined.parsed,
         projection: &joined.projection,
+        list_projection,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
     // construct whose markers live on different physical lines; `marker_is_disclosed`
@@ -2469,6 +2630,32 @@ pub fn present_polished_line(
     disclosure: Option<SourceRange>,
     context: LineContext,
 ) -> VisualLine {
+    present_polished_line_with_list_projection(
+        line_id,
+        revision,
+        range,
+        source,
+        line_height,
+        disclosure,
+        context,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "line presentation keeps the existing public dispatch inputs plus list context"
+)]
+fn present_polished_line_with_list_projection(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    context: LineContext,
+    list_projection: Option<&ListProjection>,
+) -> VisualLine {
     // A fenced-code line has no disclosable inline markup; its content is literal,
     // so it stays a code block regardless of cursor position and wins over image
     // and table recognition that would otherwise mis-read the literal text.
@@ -2481,7 +2668,15 @@ pub fn present_polished_line(
     {
         present_table_line(line_id, revision, range, source, line_height)
     } else {
-        present_markdown_with_disclosure(line_id, revision, range, source, line_height, disclosure)
+        present_markdown_with_list_projection(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+            list_projection,
+        )
     };
     block.context = context;
     block
@@ -3020,6 +3215,7 @@ mod tests {
         let shared = SharedParse {
             parsed: &joined.parsed,
             projection: &joined.projection,
+            list_projection: None,
         };
         // The caret is off-screen inside the strong span. Prefix ownership and
         // both distant delimiters still use the same complete snapshot.
@@ -4211,6 +4407,7 @@ mod tests {
         let shared = SharedParse {
             parsed: &joined.parsed,
             projection: &joined.projection,
+            list_projection: None,
         };
         let middle = ITEMS / 2;
         for &index in &[
