@@ -20,7 +20,7 @@
 use crate::{ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::BlockId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// Horizontal distance between semantic list depths. This is presentation
@@ -549,17 +549,14 @@ struct LineGeometry {
 
 fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
     let mut widths: HashMap<ListId, f32> = HashMap::new();
-    let mut measured_scales: HashMap<ListId, u32> = HashMap::new();
+    let mut measured_scales: HashSet<(ListId, u32)> = HashSet::new();
     for line in &block.lines {
         let Some(list) = &line.list else {
             continue;
         };
         let list_id = list.owner.list_id;
         let scale = line.display().font_scale.to_bits();
-        if measured_scales
-            .get(&list_id)
-            .is_some_and(|measured| *measured == scale)
-        {
+        if !measured_scales.insert((list_id, scale)) {
             continue;
         }
         let width = list
@@ -578,7 +575,6 @@ fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<L
             .entry(list_id)
             .and_modify(|current| *current = current.max(width))
             .or_insert(width);
-        measured_scales.insert(list_id, scale);
     }
     widths
 }

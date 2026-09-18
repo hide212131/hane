@@ -33,6 +33,7 @@ fn shaper() -> FixedAdvanceShaper {
 struct CountingShaper {
     inner: FixedAdvanceShaper,
     wrap_calls: Cell<usize>,
+    width_calls: Cell<usize>,
 }
 
 impl CountingShaper {
@@ -40,6 +41,7 @@ impl CountingShaper {
         Self {
             inner: FixedAdvanceShaper::new(advance),
             wrap_calls: Cell::new(0),
+            width_calls: Cell::new(0),
         }
     }
 }
@@ -74,6 +76,7 @@ impl LineShaper for CountingShaper {
     }
 
     fn width_for_text(&self, line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        self.width_calls.set(self.width_calls.get() + 1);
         self.inner.width_for_text(line, text)
     }
 }
@@ -456,6 +459,42 @@ fn list_body_columns_use_the_widest_actual_marker_label() {
             48.0
         );
     }
+}
+
+#[test]
+fn list_marker_widths_cache_each_font_scale_once() {
+    let source = "- # heading one\n- body two\n- # heading three\n- body four\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the mixed-style list block is presented");
+    let scales = block
+        .lines
+        .iter()
+        .filter_map(|line| {
+            line.list
+                .as_ref()
+                .map(|_| line.display().font_scale.to_bits())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scales.len(), 4);
+    assert_eq!(scales[0], scales[2]);
+    assert_eq!(scales[1], scales[3]);
+    assert_ne!(scales[0], scales[1]);
+
+    let marker_labels = block
+        .lines
+        .first()
+        .and_then(|line| line.list.as_ref())
+        .expect("the first list row has metadata")
+        .owner
+        .alignment
+        .marker_labels
+        .len();
+    let shaper = CountingShaper::new(8.0);
+    let _layout = layout_block(&block, 240.0, &shaper);
+
+    assert_eq!(shaper.width_calls.get(), marker_labels * 2);
 }
 
 #[test]
