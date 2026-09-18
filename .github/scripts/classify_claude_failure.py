@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,11 +48,32 @@ def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
 
 
+def _safe_number(value: Any, *, integer: bool) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(float(value)) or value < 0:
+        return None
+    if integer:
+        if not isinstance(value, int) or value > 1_000_000:
+            return None
+        return value
+    if value > 1_000_000_000:
+        return None
+    return value
+
+
+def _rate_limit_rejected(event: dict[str, Any]) -> bool:
+    if event.get("type") != "rate_limit_event":
+        return False
+    info = event.get("rate_limit_info")
+    return isinstance(info, dict) and info.get("status") == "rejected"
+
+
 def classify_events(events: list[dict[str, Any]]) -> str:
     text = _error_result_text(events)
     result = _last_error_result(events)
 
-    if any(event.get("type") == "rate_limit_event" for event in events) or _has_any(
+    if any(_rate_limit_rejected(event) for event in events) or _has_any(
         text,
         (
             "usage limit",
@@ -144,8 +166,10 @@ def diagnostic(payload: Any) -> dict[str, Any]:
 
     return {
         "category": category,
-        "num_turns": result.get("num_turns"),
-        "total_cost_usd": result.get("total_cost_usd"),
+        "num_turns": _safe_number(result.get("num_turns"), integer=True),
+        "total_cost_usd": _safe_number(
+            result.get("total_cost_usd"), integer=False
+        ),
         "model_usage": usage_state,
     }
 
