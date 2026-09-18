@@ -1592,6 +1592,14 @@ fn present_markdown_from_parse(
         }
         projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
     }
+    if formal_code_block == Some(true) {
+        projected_markers.retain(|marker| {
+            marker.quote_owner.is_some()
+                || marker.list_owner.is_some()
+                || marker.list_prefix.is_some()
+                || marker.global_list_prefix.is_some()
+        });
+    }
     let markers_on_line = projected_markers.as_slice();
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;

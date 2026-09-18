@@ -4918,12 +4918,12 @@ mod tests {
         for _ in 0..5_000 {
             source.push_str("  continued\n");
         }
-        source.push_str("\n  ```\n  code\n  ```\n");
+        source.push_str("\n  ```\n  **literal**\n  ```\n");
         let editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one list block");
         let projection = index.list_projection(&block).expect("list projection");
-        let code_line = source[..source.find("  code").expect("code row")]
+        let code_line = source[..source.find("  **literal**").expect("code row")]
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
@@ -4937,6 +4937,7 @@ mod tests {
         )
         .expect("late code row presents");
         let line = &code.lines[0];
+        assert_eq!(line.visual_text, "**literal**");
         assert_eq!(line.kind, BlockKind::CodeBlock);
         assert!(
             line.style_runs
