@@ -30,7 +30,7 @@ use gpui::{
     App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
     Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
-    Window, div, point, prelude::FluentBuilder, px, rgb,
+    Task, Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
