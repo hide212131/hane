@@ -90,14 +90,13 @@ impl WindowShaper {
 }
 
 impl LineShaper for WindowShaper {
-    fn wrap_boundaries(&self, line: &VisualLine, width: f32) -> Vec<usize> {
-        let whole = 0..line.visual_text.len();
-        if whole.is_empty() {
+    fn wrap_boundaries(&self, line: &VisualLine, fragment: Range<usize>, width: f32) -> Vec<usize> {
+        if fragment.is_empty() {
             return Vec::new();
         }
-        let runs = self.runs(line, &whole);
+        let runs = self.runs(line, &fragment);
         let Ok(wrapped) = self.text_system.shape_text(
-            line.visual_text.clone().into(),
+            line.visual_text[fragment.clone()].to_owned().into(),
             px(block_font_size(line)),
             &runs,
             Some(px(width)),
@@ -114,7 +113,9 @@ impl LineShaper for WindowShaper {
                     .iter()
                     .filter_map(|boundary| {
                         let run = line.unwrapped_layout.runs.get(boundary.run_ix)?;
-                        run.glyphs.get(boundary.glyph_ix).map(|glyph| glyph.index)
+                        run.glyphs
+                            .get(boundary.glyph_ix)
+                            .map(|glyph| fragment.start + glyph.index)
                     })
                     .collect()
             })

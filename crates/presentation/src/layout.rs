@@ -74,9 +74,10 @@ pub struct LayoutLine {
     /// column. Opening markers may be narrower than this column because the
     /// whole list aligns to its aggregate inactive label width.
     pub body_x_origin: f32,
-    /// Width passed to the shaper for this row. It is always positive for a
-    /// positive block width, even when a deeply nested list leaves no usable
-    /// room; this keeps a narrow viewport finite and deterministic.
+    /// Width passed to the shaper for body-column fragments. The first
+    /// fragment of an opening list row receives the wider marker-inclusive
+    /// budget; this value remains the positive body budget used by later
+    /// fragments, even when a deeply nested list leaves no usable room.
     pub effective_width: f32,
     /// Semantic marker position, when this is a list row. Kept separately from
     /// `text_x_origin` so painting can place a marker and body without making
@@ -159,9 +160,10 @@ impl LayoutLine {
 /// byte offsets into that same text, never into the fragment, so callers never
 /// have to rebase them.
 pub trait LineShaper {
-    /// Byte offsets of `line.visual_text` where it has to break to fit `width`,
-    /// ascending, excluding 0 and the text length.
-    fn wrap_boundaries(&self, line: &VisualLine, width: f32) -> Vec<usize>;
+    /// Byte offsets of `line.visual_text[fragment]` where it has to break to
+    /// fit `width`, returned as absolute offsets into `line.visual_text` and
+    /// excluding the fragment's start and end.
+    fn wrap_boundaries(&self, line: &VisualLine, fragment: Range<usize>, width: f32) -> Vec<usize>;
     /// x of `offset`, measured from the left edge of `fragment`.
     fn x_for_offset(&self, line: &VisualLine, fragment: Range<usize>, offset: usize) -> f32;
     /// The offset in `fragment` closest to `x`, measured from its left edge.
@@ -310,6 +312,19 @@ impl BlockLayout {
         self.source_at_x(block, self.row_at_y(y)?, x, shaper)
     }
 
+    /// The line-local visual offset under `x` on one row.
+    pub fn visual_at_x(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<VisualOffset> {
+        let row = self.lines.get(row_index)?;
+        let line = block.lines.get(row.line)?;
+        Some(VisualOffset(row.visual_for_x(line, x, shaper)))
+    }
+
     /// The source offset at `x` on one row. Vertical movement is this applied to
     /// the row above or below, which is why it is separate from the point form.
     pub fn source_at_x(
@@ -319,12 +334,29 @@ impl BlockLayout {
         x: f32,
         shaper: &dyn LineShaper,
     ) -> Option<SourceOffset> {
+        self.source_at_x_with_bias(block, row_index, x, shaper, Bias::After)
+    }
+
+    /// The source offset at `x`, using the caller's boundary affinity.
+    ///
+    /// Most geometry queries use [`Bias::After`]. Mouse clicks are different:
+    /// a collapsed inline marker can share one visual point with content on
+    /// either side, so the UI can preserve the affinity of the row edge that
+    /// was actually clicked.
+    pub fn source_at_x_with_bias(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        shaper: &dyn LineShaper,
+        affinity: Bias,
+    ) -> Option<SourceOffset> {
         let row = self.lines.get(row_index)?;
         let line = block.lines.get(row.line)?;
-        let visual = row.visual_for_x(line, x, shaper);
+        let visual = self.visual_at_x(block, row_index, x, shaper)?.0;
         Some(
             line.source_map
-                .visual_to_source(VisualOffset(visual), Bias::After)
+                .visual_to_source(VisualOffset(visual), affinity)
                 .map_or(row.source_range.start, |candidate| candidate.source_offset),
         )
     }
@@ -433,7 +465,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
         let boundaries = if width <= 0.0 {
             vec![0, line.visual_text.len()]
         } else {
-            fragment_boundaries(line, line_geometry.effective_width, shaper)
+            fragment_boundaries(line, &line_geometry, width, shaper)
         };
         for (fragment, pair) in boundaries.windows(2).enumerate() {
             let (start, end) = (pair[0], pair[1]);
@@ -466,7 +498,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                         .marker_x_origin
                         .unwrap_or(line_geometry.body_x_origin)
                 } else {
-                    line_geometry.body_x_origin
+                    line_geometry.body_x_origin - line_geometry.structural_prefix_width
                 },
                 body_x_origin: line_geometry.body_x_origin,
                 effective_width: line_geometry.effective_width,
@@ -492,6 +524,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 struct LineGeometry {
     marker_x_origin: Option<f32>,
     body_x_origin: f32,
+    structural_prefix_width: f32,
     effective_width: f32,
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
@@ -527,6 +560,7 @@ fn line_geometry(
         return LineGeometry {
             marker_x_origin: None,
             body_x_origin: 0.0,
+            structural_prefix_width: 0.0,
             effective_width: width.max(0.0),
             body_visual_start: None,
             marker_visual_range: None,
@@ -545,10 +579,29 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let body_x = marker_x + aggregate_marker_width.max(disclosed_marker_width);
+    let structural_prefix_width = list
+        .structural_prefixes
+        .iter()
+        .filter_map(|prefix| {
+            line.source_map.segments.iter().find_map(|segment| {
+                (segment.source_range == prefix.source_range
+                    && segment.visibility == crate::Visibility::ExpandedMarkup)
+                    .then(|| {
+                        shaper.x_for_offset(
+                            line,
+                            segment.visual_range.start.0..segment.visual_range.end.0,
+                            segment.visual_range.end.0,
+                        )
+                    })
+            })
+        })
+        .sum::<f32>();
+    let body_x =
+        marker_x + structural_prefix_width + aggregate_marker_width.max(disclosed_marker_width);
     LineGeometry {
         marker_x_origin: list.marker.as_ref().map(|_| marker_x),
         body_x_origin: body_x,
+        structural_prefix_width,
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
         body_visual_start: Some(list.body_visual_start.0),
         marker_visual_range: list
@@ -564,23 +617,42 @@ fn line_geometry(
 /// Fragment boundaries of one line, including 0 and the text length, so
 /// `windows(2)` yields the fragments. A line with nothing to wrap is one
 /// fragment, which is the case for every line until it outgrows the column.
-fn fragment_boundaries(line: &VisualLine, width: f32, shaper: &dyn LineShaper) -> Vec<usize> {
+fn fragment_boundaries(
+    line: &VisualLine,
+    geometry: &LineGeometry,
+    width: f32,
+    shaper: &dyn LineShaper,
+) -> Vec<usize> {
     let len = line.visual_text.len();
     // An image row is drawn as a picture, not as text: it has one row whatever
     // its alt text measures.
     if width <= 0.0 || line.image.is_some() {
         return vec![0, len];
     }
+    let first_x_origin = geometry
+        .marker_x_origin
+        .unwrap_or(geometry.body_x_origin - geometry.structural_prefix_width);
+    let first_width = (width - first_x_origin).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);
-    boundaries.extend(
-        shaper
-            .wrap_boundaries(line, width)
+    let mut start = 0;
+    while start < len {
+        let row_width = geometry
+            .body_visual_start
+            .filter(|body| start >= *body)
+            .map_or(first_width, |_| geometry.effective_width);
+        let Some(next) = shaper
+            .wrap_boundaries(line, start..len, row_width)
             .into_iter()
-            .filter(|offset| {
-                *offset > 0 && *offset < len && line.visual_text.is_char_boundary(*offset)
-            }),
-    );
+            .find(|offset| {
+                *offset > start && *offset < len && line.visual_text.is_char_boundary(*offset)
+            })
+        else {
+            break;
+        };
+        boundaries.push(next);
+        start = next;
+    }
     // Rows are built from consecutive pairs, so out-of-order or repeated
     // boundaries from a shaper would slice text backwards rather than fail a
     // check somewhere later.

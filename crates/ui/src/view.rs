@@ -32,10 +32,9 @@ use gpui::{
     Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task,
     Window, div, point, prelude::FluentBuilder, px, rgb,
 };
-#[cfg(test)]
-use hane_document::Bias;
 use hane_document::{
-    BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
+    Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
+    TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
@@ -43,12 +42,13 @@ use hane_markdown::{
     local_block_index,
 };
 use hane_metrics::FrameMetrics;
-use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, block_heights,
-    block_is_joinable, block_line_span, layout_block, parse_joined_span, trailing_blank_lines,
-};
 #[cfg(test)]
-use hane_presentation::{MarkerEdge, Visibility, VisualLine, VisualOffset};
+use hane_presentation::VisualOffset;
+use hane_presentation::{
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    VisualBlock, VisualLine, block_heights, block_is_joinable, block_line_span, layout_block,
+    parse_joined_span, trailing_blank_lines,
+};
 use hane_session::{
     CalendarDate, DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService,
     LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
@@ -2181,7 +2181,10 @@ impl EditorView {
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
         let shaper = WindowShaper::new(window);
-        layout.source_at_x(visual, row_index, x, &shaper)
+        let visual_offset = layout.visual_at_x(visual, row_index, x, &shaper)?;
+        let line = visual.lines.get(visual_line)?;
+        let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
+        layout.source_at_x_with_bias(visual, row_index, x, &shaper, bias)
     }
 
     fn on_row_mouse_down(
@@ -4265,7 +4268,6 @@ fn source_offset_for_visual_position(
 /// row closes with. This is checked before the marker-edge fallback because
 /// it reflects where the click physically landed, which the marker's own
 /// direction cannot.
-#[cfg(test)]
 fn collapsed_boundary_bias(
     block: &VisualLine,
     visual_offset: usize,
@@ -4501,6 +4503,38 @@ mod tests {
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, line, boundary, Some(&next_row)),
             SourceOffset(8)
+        );
+    }
+
+    #[test]
+    fn layout_click_mapping_preserves_collapsed_marker_affinity() {
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (block, layout) = laid_out(&editor, &index, 0, &shaper);
+        let line = &block.lines[0];
+        let boundary = "bold".len();
+        let x = boundary as f32 * 8.0;
+
+        assert_eq!(
+            layout.source_at_x_with_bias(&block, 0, x, &shaper, Bias::Before),
+            Some(SourceOffset(6))
+        );
+        assert_eq!(
+            layout.source_at_x_with_bias(&block, 0, x, &shaper, Bias::After),
+            Some(SourceOffset(8))
+        );
+        assert_eq!(
+            collapsed_boundary_bias(line, boundary, Some(&(0..boundary))),
+            Bias::Before
+        );
+        assert_eq!(
+            collapsed_boundary_bias(line, boundary, Some(&(boundary..line.visual_text.len()))),
+            Bias::After
         );
     }
 

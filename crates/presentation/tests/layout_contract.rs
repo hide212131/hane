@@ -283,6 +283,78 @@ fn list_continuations_and_wrapped_fragments_start_at_the_body_column() {
 }
 
 #[test]
+fn opening_list_wrap_counts_the_marker_only_in_the_first_row_budget() {
+    let source = "- one two three four five six\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, WIDTH, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+    assert!(rows.len() > 1, "the item must wrap");
+
+    let line = &block.lines[0];
+    let body_start = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let first_body_text = line.visual_text[body_start..]
+        .find("three")
+        .map(|offset| body_start + offset)
+        .expect("the first body row reaches the word after the marker budget");
+    assert_eq!(rows[0].line_visual_range.end, first_body_text);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[0].body_x_origin, 16.0);
+}
+
+#[test]
+fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
+    let source = "  - item\n    continued\n";
+    let cursor = source.find("continued").expect("continuation in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+    assert_eq!(opening.text_x_origin, 0.0);
+    assert_eq!(opening.body_x_origin, 32.0);
+
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("continuation row is laid out");
+    assert_eq!(continuation.text_x_origin, 16.0);
+    assert_eq!(continuation.body_x_origin, 48.0);
+
+    let item = SourceOffset(source.find("item").expect("item in source"));
+    let continued = SourceOffset(source.find("continued").expect("continued in source"));
+    assert_eq!(
+        layout.point_for_source(&block, item, &shaper()).unwrap().x,
+        32.0
+    );
+    assert_eq!(
+        layout
+            .point_for_source(&block, continued, &shaper())
+            .unwrap()
+            .x,
+        48.0
+    );
+}
+
+#[test]
 fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
     let source = "- outer\n\n  - inner\n";
     let block = present(source, None)
