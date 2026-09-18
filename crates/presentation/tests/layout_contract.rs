@@ -527,6 +527,58 @@ fn a_long_marker_stays_intact_before_the_body_when_the_column_is_narrow() {
 }
 
 #[test]
+fn disclosed_list_prefix_is_subtracted_only_on_the_first_wrap_fragment() {
+    let source = "  - one two three four five six seven eight\n";
+    let cursor = source.find("one").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 64.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() > 1, "the disclosed list line must wrap");
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert!(
+        rows[1..]
+            .iter()
+            .all(|row| row.text_x_origin == row.body_x_origin)
+    );
+}
+
+#[test]
+fn disclosed_empty_long_marker_stays_in_one_opening_row() {
+    let source = "999999999.\n";
+    let block = present(source, Some(0))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    assert_eq!(body, line.visual_text.len());
+
+    let layout = layout_block(&block, 40.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].line_visual_range, 0..line.visual_text.len());
+    assert_eq!(rows[0].wrap, LineWrap::Hard);
+}
+
+#[test]
 fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
     let source = "  - item\n    continued\n";
     let cursor = source.find("continued").expect("continuation in source");

@@ -509,12 +509,12 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 },
                 y,
                 height,
-                text_x_origin: if line_geometry.marker_x_origin.is_some() && fragment == 0 {
-                    line_geometry
-                        .marker_x_origin
-                        .unwrap_or(line_geometry.body_x_origin)
+                text_x_origin: if fragment == 0 {
+                    line_geometry.marker_x_origin.unwrap_or(
+                        line_geometry.body_x_origin - line_geometry.expanded_prefix_width,
+                    )
                 } else {
-                    line_geometry.body_x_origin - line_geometry.expanded_prefix_width
+                    line_geometry.body_x_origin
                 },
                 body_x_origin: line_geometry.body_x_origin,
                 effective_width: line_geometry.effective_width,
@@ -693,31 +693,35 @@ fn fragment_boundaries(
     // Opening list rows are the one exception: the first row has a marker
     // budget, while rows starting at the body use the hanging budget. At most
     // one shaping pass is needed for each of those two width regions.
-    let body_boundary = geometry
-        .body_visual_start
-        .filter(|body| *body > 0 && *body < len);
+    let body_boundary = geometry.body_visual_start.filter(|body| *body > 0);
     if let Some(body) = body_boundary {
-        let marker_overflows_first_row =
-            geometry.marker_visual_range.as_ref().is_some_and(|marker| {
-                shaper.x_for_offset(line, marker.clone(), marker.end) + geometry.marker_body_gap
-                    > first_width
-            });
-        if marker_overflows_first_row {
-            // A marker is one indivisible synthesized/source projection. If
-            // its aligned column cannot fit in the opening-row budget, let it
-            // overflow to the body boundary instead of wrapping the marker
-            // itself into fragments that would be painted at the body origin.
-            boundaries.push(body);
-            boundaries.extend(valid_boundaries(body, geometry.effective_width));
-        } else {
-            let first_boundaries = valid_boundaries(0, first_width);
-            if let Some(split) = first_boundaries.iter().find(|offset| **offset >= body) {
-                boundaries.push(*split);
-                boundaries.extend(valid_boundaries(*split, geometry.effective_width));
+        let body = body.min(len);
+        if body < len {
+            let marker_overflows_first_row =
+                geometry.marker_visual_range.as_ref().is_some_and(|marker| {
+                    shaper.x_for_offset(line, marker.clone(), marker.end) + geometry.marker_body_gap
+                        > first_width
+                });
+            if marker_overflows_first_row {
+                // A marker is one indivisible synthesized/source projection. If
+                // its aligned column cannot fit in the opening-row budget, let it
+                // overflow to the body boundary instead of wrapping the marker
+                // itself into fragments that would be painted at the body origin.
+                boundaries.push(body);
+                boundaries.extend(valid_boundaries(body, geometry.effective_width));
             } else {
-                boundaries.extend(first_boundaries);
+                let first_boundaries = valid_boundaries(0, first_width);
+                if let Some(split) = first_boundaries.iter().find(|offset| **offset >= body) {
+                    boundaries.push(*split);
+                    boundaries.extend(valid_boundaries(*split, geometry.effective_width));
+                } else {
+                    boundaries.extend(first_boundaries);
+                }
             }
         }
+        // An empty item still owns one opening row. There is no body row to
+        // hang from, so the final `len` boundary below must be the only
+        // boundary after zero; otherwise it would create an empty fragment.
     } else {
         let row_width = geometry
             .body_visual_start
