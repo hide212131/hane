@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -23,7 +24,7 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/4"
+PROCEDURE_VERSION = "hosted-date-badge/5"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
     "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
@@ -71,10 +72,36 @@ def compile_helper(source: Path, directory: Path) -> tuple[Path, str]:
     return binary, hashlib.sha256(binary.read_bytes()).hexdigest()
 
 
-REQUIRED_PREPROCESSING_KEYS = {"method", "scale_factor", "source_size", "processed_size"}
-EXPECTED_PREPROCESSING_METHOD = "uniform_upscale"
-# Must match `ocrUpscaleFactor` in hosted_date_badge_gui.swift (procedure v4).
+REQUIRED_PREPROCESSING_KEYS = {"method", "scale_factor", "source_size", "roi", "crop_size", "processed_size"}
+EXPECTED_PREPROCESSING_METHOD = "roi_crop_uniform_upscale"
+# Must match `ocrUpscaleFactor` in hosted_date_badge_gui.swift (procedure v5).
 EXPECTED_PREPROCESSING_SCALE_FACTOR = 4
+# Trusted sidebar ROI, top-left origin / y-down, fraction of the raw
+# screenshot. Must match `SidebarROI` in hosted_date_badge_gui.swift.
+#
+# Issue #190: feeding Vision the whole window diluted a tiny sidebar glyph's
+# share of the analyzed frame so much that no bounded candidate at any rank
+# recovered it, and PR #175 run #35286639940 showed a uniform 4x full-frame
+# upscale (procedure v4) is a no-op on that share -- it still returned zero
+# filename/badge candidates. Cropping to just the sidebar's x-extent (at full
+# window height) before upscaling multiplies the glyph's share of the
+# analyzed frame instead. These values are fixed constants, not read from the
+# target product code at runtime, so the validator's pass/fail behavior
+# cannot be steered by changes to the app under test. `width_fraction` is
+# chosen from PR #175 run #35286639940 raw-screenshot facts (960x681): the
+# sidebar divider sits at ~222px (~0.231 of width), with margin beyond that
+# observed fact.
+EXPECTED_ROI = {
+    "origin": "top_left_y_down",
+    "x_fraction": 0.0,
+    "y_fraction_from_top": 0.0,
+    "width_fraction": 0.30,
+    "height_fraction": 1.0,
+}
+ROI_FRACTION_TOLERANCE = 1e-9
+# Pixel rounding slack between `source_size * roi fraction` and the reported
+# `crop_size` (the Swift helper rounds the crop rect to whole pixels).
+ROI_CROP_SIZE_TOLERANCE_PIXELS = 1
 
 
 def _is_positive_int(value: object) -> bool:
@@ -93,18 +120,85 @@ def _validate_pixel_size(value: object, label: str) -> tuple[int, int]:
     return width, height
 
 
+def _validate_roi(value: object) -> dict:
+    """Fail-closed validation that `roi` is exactly the trusted sidebar ROI contract.
+
+    A helper build that widened, shrank, or dropped the ROI crop (e.g. back
+    to the full window) must not be silently accepted just because a
+    structurally-shaped `roi` object is present. Comparing every field
+    against `EXPECTED_ROI` -- not merely checking it is a well-formed
+    rectangle -- keeps this fail-closed the same way the fixed
+    `EXPECTED_PREPROCESSING_SCALE_FACTOR` check already does for the upscale
+    factor.
+    """
+    if not isinstance(value, dict):
+        raise RuntimeError(f"vision helper preprocessing roi is not an object: {value!r}")
+    if value.get("origin") != EXPECTED_ROI["origin"]:
+        raise RuntimeError(
+            f"vision helper preprocessing roi origin is not {EXPECTED_ROI['origin']!r}: {value.get('origin')!r}"
+        )
+    for key in ("x_fraction", "y_fraction_from_top", "width_fraction", "height_fraction"):
+        actual = value.get(key)
+        expected = EXPECTED_ROI[key]
+        if (
+            not isinstance(actual, (int, float))
+            or isinstance(actual, bool)
+            or not math.isfinite(float(actual))
+            or abs(float(actual) - expected) > ROI_FRACTION_TOLERANCE
+        ):
+            raise RuntimeError(
+                f"vision helper preprocessing roi.{key} does not match the trusted sidebar ROI "
+                f"contract: {actual!r} != {expected!r}"
+            )
+    return value
+
+
+def _validate_crop_size(value: object, source_width: int, source_height: int, roi: dict) -> tuple[int, int]:
+    """Fail-closed validation that `crop_size` really reflects an ROI crop of `source_size`.
+
+    Beyond structural positive-integer checks, this proves the crop is
+    consistent with the trusted `roi` fractions (within the Swift helper's
+    whole-pixel rounding) and strictly smaller than the source in at least
+    one dimension, so a helper that reported the trusted `roi` values but
+    never actually shrank the analyzed frame (a full-frame no-op crop) cannot
+    pass. The trusted ROI itself may keep one dimension at full size (e.g.
+    the sidebar crop's full window height), so this does not require both
+    dimensions to shrink.
+    """
+    crop_width, crop_height = _validate_pixel_size(value, "crop_size")
+    expected_width = source_width * roi["width_fraction"]
+    expected_height = source_height * roi["height_fraction"]
+    if abs(crop_width - expected_width) > ROI_CROP_SIZE_TOLERANCE_PIXELS:
+        raise RuntimeError(
+            "vision helper preprocessing crop_size width is not source_size.width * roi.width_fraction: "
+            f"crop_width={crop_width!r} source_width={source_width!r} width_fraction={roi['width_fraction']!r}"
+        )
+    if abs(crop_height - expected_height) > ROI_CROP_SIZE_TOLERANCE_PIXELS:
+        raise RuntimeError(
+            "vision helper preprocessing crop_size height is not source_size.height * roi.height_fraction: "
+            f"crop_height={crop_height!r} source_height={source_height!r} height_fraction={roi['height_fraction']!r}"
+        )
+    if crop_width >= source_width and crop_height >= source_height:
+        raise RuntimeError(
+            "vision helper preprocessing crop_size is not smaller than source_size in any dimension: "
+            f"crop_size={value!r} source=({source_width!r}, {source_height!r})"
+        )
+    return crop_width, crop_height
+
+
 def validate_preprocessing_evidence(preprocessing: dict) -> None:
     """Fail-closed validation of the OCR preprocessing evidence's authoritative values.
 
-    `REQUIRED_PREPROCESSING_KEYS` only proves the four keys exist; a helper
-    build could still report a disabled/no-op preprocessing pass (e.g.
-    `method: "none"`, `scale_factor: 1`) or self-inconsistent sizes and pass
-    that check. Requiring the exact procedure v4 contract (uniform upscale by
-    the current Swift helper's fixed integer factor, with processed size
-    exactly `source * scale_factor`) keeps this fail-closed against a silent
-    regression to raw-resolution OCR (Issue #190), not just a
-    structurally-shaped-but-meaningless report. Unknown extra fields are
-    still allowed for forward compatibility.
+    `REQUIRED_PREPROCESSING_KEYS` only proves the keys exist; a helper build
+    could still report a disabled/no-op preprocessing pass (e.g.
+    `method: "none"`, `scale_factor: 1`, or an `roi` covering the whole
+    frame) or self-inconsistent sizes and pass that check. Requiring the
+    exact procedure v5 contract (ROI crop to the trusted sidebar region, then
+    uniform upscale by the current Swift helper's fixed integer factor, with
+    `processed_size` exactly `crop_size * scale_factor`) keeps this
+    fail-closed against a silent regression to raw-resolution or full-frame
+    OCR (Issue #190), not just a structurally-shaped-but-meaningless report.
+    Unknown extra fields are still allowed for forward compatibility.
     """
     if preprocessing.get("method") != EXPECTED_PREPROCESSING_METHOD:
         raise RuntimeError(
@@ -122,11 +216,13 @@ def validate_preprocessing_evidence(preprocessing: dict) -> None:
             f"{scale_factor!r}"
         )
     source_width, source_height = _validate_pixel_size(preprocessing.get("source_size"), "source_size")
+    roi = _validate_roi(preprocessing.get("roi"))
+    crop_width, crop_height = _validate_crop_size(preprocessing.get("crop_size"), source_width, source_height, roi)
     processed_width, processed_height = _validate_pixel_size(preprocessing.get("processed_size"), "processed_size")
-    if processed_width != source_width * scale_factor or processed_height != source_height * scale_factor:
+    if processed_width != crop_width * scale_factor or processed_height != crop_height * scale_factor:
         raise RuntimeError(
-            "vision helper preprocessing processed_size is not source_size * scale_factor: "
-            f"source={preprocessing.get('source_size')!r} processed={preprocessing.get('processed_size')!r} "
+            "vision helper preprocessing processed_size is not crop_size * scale_factor: "
+            f"crop_size={preprocessing.get('crop_size')!r} processed={preprocessing.get('processed_size')!r} "
             f"scale_factor={scale_factor!r}"
         )
 
@@ -134,14 +230,19 @@ def validate_preprocessing_evidence(preprocessing: dict) -> None:
 def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -> tuple[list[dict], dict]:
     """Run the trusted Vision helper and return `(matches, preprocessing_evidence)`.
 
-    `hosted_date_badge_gui.swift` uniformly upscales the whole screenshot
-    before OCR (Issue #190: tiny sidebar glyphs, e.g. a weekday kanji, can be
-    missing from every bounded Vision candidate at the raw screenshot
-    resolution -- not just top-1) and reports what it did (method, scale
-    factor, source/processed pixel size) alongside the matches. Requiring
-    that evidence here, rather than only trusting it implicitly, keeps this
-    fail-closed: a helper build that silently stopped preprocessing would
-    fail this parse instead of quietly falling back to raw-resolution OCR.
+    `hosted_date_badge_gui.swift` crops the screenshot to the trusted sidebar
+    ROI and uniformly upscales that crop before OCR (Issue #190: tiny sidebar
+    glyphs, e.g. a weekday kanji, can be missing from every bounded Vision
+    candidate at the raw screenshot resolution, or even after a uniform
+    full-frame upscale, since that leaves each glyph's share of the analyzed
+    frame unchanged -- not just top-1), then reprojects every returned box
+    back into the raw screenshot's own normalized coordinates and reports
+    what it did (method, ROI contract, scale factor, source/crop/processed
+    pixel size) alongside the matches. Requiring that evidence here, rather
+    than only trusting it implicitly, keeps this fail-closed: a helper build
+    that silently stopped preprocessing, or widened the ROI back to the full
+    frame, would fail this parse instead of quietly falling back to a
+    dilution regression.
     """
     if hashlib.sha256(helper.read_bytes()).hexdigest() != digest:
         raise RuntimeError("trusted vision helper integrity mismatch before execution")
