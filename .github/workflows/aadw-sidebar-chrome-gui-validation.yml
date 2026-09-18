@@ -1,0 +1,369 @@
+name: AADW Focused Sidebar Chrome GUI Validation
+run-name: AADW GUI PR #${{ inputs.pr_number }} @ ${{ inputs.target_head_sha }} base ${{ inputs.request_base_sha }} ${{ inputs.execution_context }} ${{ inputs.request_procedure }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull Request number to validate
+        required: true
+        type: string
+      target_head_sha:
+        description: Exact current Pull Request head SHA (40 hex)
+        required: true
+        type: string
+      request_base_sha:
+        description: Internal router-observed base SHA; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
+      execution_context:
+        description: Validate the exact head, or GitHub's current base+head merge context
+        required: true
+        type: choice
+        options:
+          - head
+          - merge
+        default: merge
+      request_procedure:
+        description: Internal router-observed procedure; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
+      request_comment_id:
+        description: Internal PR comment request id; leave blank for manual fallback
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: aadw-sidebar-chrome-gui-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    env:
+      REPOSITORY: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      TARGET_HEAD_SHA: ${{ inputs.target_head_sha }}
+      REQUEST_BASE_SHA: ${{ inputs.request_base_sha }}
+      EXECUTION_CONTEXT: ${{ inputs.execution_context }}
+      REQUESTED_PROCEDURE: ${{ inputs.request_procedure }}
+      REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
+
+    steps:
+      - name: Check out trusted procedure
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate trusted request and current PR context
+        id: preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+            echo "::error::This trusted entrypoint must be dispatched from the default branch. ref=${GITHUB_REF} default=${DEFAULT_BRANCH}"
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::pr_number must be a positive integer.'
+            exit 1
+          fi
+          if ! [[ "$TARGET_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::target_head_sha must be a lowercase full 40-hex SHA.'
+            exit 1
+          fi
+          if [[ -n "$REQUEST_BASE_SHA" ]] && ! [[ "$REQUEST_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::request_base_sha must be a lowercase full 40-hex SHA when provided.'
+            exit 1
+          fi
+          if [[ "$REQUESTED_PROCEDURE" == *$'\n'* || "$REQUESTED_PROCEDURE" == *$'\r'* ]]; then
+            echo '::error::request_procedure must be a single-line value when provided.'
+            exit 1
+          fi
+          case "$EXECUTION_CONTEXT" in
+            head|merge) ;;
+            *)
+              echo "::error::Unsupported execution context: $EXECUTION_CONTEXT"
+              exit 1
+              ;;
+          esac
+
+          request_actor="$GITHUB_ACTOR"
+          if [[ -n "$REQUEST_COMMENT_ID" ]]; then
+            if ! [[ "$REQUEST_COMMENT_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo '::error::request_comment_id must be a positive integer when provided.'
+              exit 1
+            fi
+            if [[ -z "$REQUEST_BASE_SHA" || -z "$REQUESTED_PROCEDURE" ]]; then
+              echo '::error::Routed requests must include router-observed base and procedure values.'
+              exit 1
+            fi
+
+            comment_json="$(gh api "repos/${REPOSITORY}/issues/comments/${REQUEST_COMMENT_ID}")"
+            comment_pr_number="$(jq -r '.issue_url | split("/")[-1] // ""' <<< "$comment_json")"
+            request_actor="$(jq -r '.user.login // ""' <<< "$comment_json")"
+            comment_body="$(jq -r '.body // ""' <<< "$comment_json")"
+            route_json="$(
+              printf '%s' "$comment_body" \
+                | python3 control/.github/scripts/aadw_gui_command.py route
+            )"
+            if [[ -z "$route_json" ]]; then
+              echo '::error::Routed comment is not a recognized trusted GUI command.'
+              exit 1
+            fi
+            comment_kind="$(jq -r '.validation_kind // ""' <<< "$route_json")"
+            comment_context="$(jq -r '.execution_context // ""' <<< "$route_json")"
+
+            if [[ "$comment_pr_number" != "$PR_NUMBER" ]]; then
+              echo "::error::Routed comment does not belong to target PR. comment_pr=${comment_pr_number:-unknown} target_pr=${PR_NUMBER}"
+              exit 1
+            fi
+            if [[ -z "$request_actor" ]]; then
+              echo '::error::Could not resolve routed comment actor.'
+              exit 1
+            fi
+            if [[ "$comment_kind" != 'sidebar-chrome' ]]; then
+              echo "::error::Routed comment selected a different validation kind: ${comment_kind:-invalid}."
+              exit 1
+            fi
+            if [[ "$comment_context" != "$EXECUTION_CONTEXT" ]]; then
+              echo "::error::Routed comment command no longer matches the requested execution context. comment=${comment_context:-invalid} requested=${EXECUTION_CONTEXT}"
+              exit 1
+            fi
+          fi
+
+          permission="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/${REPOSITORY}/collaborators/${request_actor}/permission" \
+              --jq '.permission' 2>/dev/null || true
+          )"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *)
+              echo "::error::Request actor is not trusted: ${request_actor} (${permission:-none})."
+              exit 1
+              ;;
+          esac
+
+          pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r '.state' <<< "$pr_json")"
+          draft="$(jq -r '.draft' <<< "$pr_json")"
+          head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
+          head_ref="$(jq -r '.head.ref // ""' <<< "$pr_json")"
+          current_head_sha="$(jq -r '.head.sha // ""' <<< "$pr_json")"
+          base_ref="$(jq -r '.base.ref // ""' <<< "$pr_json")"
+
+          if [[ "$state" != 'open' || "$draft" != 'false' ]]; then
+            echo "::error::Target Pull Request must be open and non-draft. state=${state} draft=${draft}"
+            exit 1
+          fi
+          if [[ "$head_repo" != "$REPOSITORY" ]]; then
+            echo "::error::Only trusted same-repository Pull Requests may be executed: ${head_repo:-unknown}."
+            exit 1
+          fi
+          if [[ "$current_head_sha" != "$TARGET_HEAD_SHA" ]]; then
+            echo "::error::Target head moved. expected=${TARGET_HEAD_SHA} current=${current_head_sha}."
+            exit 1
+          fi
+          if [[ -z "$head_ref" || -z "$base_ref" ]]; then
+            echo '::error::Could not resolve Pull Request refs.'
+            exit 1
+          fi
+
+          base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${base_ref}" | awk 'NR == 1 {print $1}')"
+          if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve current target branch SHA.'
+            exit 1
+          fi
+          if [[ -n "$REQUEST_BASE_SHA" && "$base_sha" != "$REQUEST_BASE_SHA" ]]; then
+            echo "::error::Target base moved after request. expected=${REQUEST_BASE_SHA} current=${base_sha}."
+            exit 1
+          fi
+
+          control_sha="$(git -C control rev-parse HEAD)"
+          if [[ "$control_sha" != "$GITHUB_WORKFLOW_SHA" ]]; then
+            echo "::error::Trusted procedure checkout does not match workflow SHA. workflow=${GITHUB_WORKFLOW_SHA} control=${control_sha}"
+            exit 1
+          fi
+
+          actual_procedure="$(
+            python3 control/.github/scripts/aadw_gui_command.py \
+              procedure control/scripts/hosted_sidebar_chrome_gui.py
+          )"
+          if [[ -n "$REQUESTED_PROCEDURE" && "$actual_procedure" != "$REQUESTED_PROCEDURE" ]]; then
+            echo "::error::Requested procedure does not match trusted control. requested=${REQUESTED_PROCEDURE} actual=${actual_procedure}"
+            exit 1
+          fi
+
+          if [[ "$EXECUTION_CONTEXT" == 'head' ]]; then
+            checkout_ref="$TARGET_HEAD_SHA"
+          else
+            checkout_ref="refs/pull/${PR_NUMBER}/merge"
+          fi
+
+          {
+            echo "head_ref=$head_ref"
+            echo "base_ref=$base_ref"
+            echo "base_sha=$base_sha"
+            echo "control_sha=$control_sha"
+            echo "checkout_ref=$checkout_ref"
+            echo "request_actor=$request_actor"
+            echo "procedure=$actual_procedure"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out requested execution tree
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.preflight.outputs.checkout_ref }}
+          path: hane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact execution tree
+        id: execution
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
+          EXPECTED_BASE_REF: ${{ steps.preflight.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+
+          execution_sha="$(git -C hane rev-parse HEAD)"
+          if ! [[ "$execution_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Could not resolve execution SHA.'
+            exit 1
+          fi
+
+          if [[ "$EXECUTION_CONTEXT" == 'head' ]]; then
+            if [[ "$execution_sha" != "$TARGET_HEAD_SHA" ]]; then
+              echo "::error::Head checkout mismatch. expected=${TARGET_HEAD_SHA} actual=${execution_sha}"
+              exit 1
+            fi
+          else
+            parent_count="$(git -C hane rev-list --parents -n 1 HEAD | awk '{print NF-1}')"
+            if [[ "$parent_count" != '2' ]]; then
+              echo "::error::PR merge ref is not a two-parent merge commit: ${execution_sha}"
+              exit 1
+            fi
+            first_parent="$(git -C hane rev-parse HEAD^1)"
+            second_parent="$(git -C hane rev-parse HEAD^2)"
+            if [[ "$first_parent" != "$CURRENT_BASE_SHA" || "$second_parent" != "$TARGET_HEAD_SHA" ]]; then
+              echo "::error::PR merge ref is stale. expected_base=${CURRENT_BASE_SHA} actual_base=${first_parent} expected_head=${TARGET_HEAD_SHA} actual_head=${second_parent}"
+              exit 1
+            fi
+          fi
+
+          current_pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          current_state="$(jq -r '.state' <<< "$current_pr_json")"
+          current_draft="$(jq -r '.draft' <<< "$current_pr_json")"
+          current_head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$current_pr_json")"
+          current_head="$(jq -r '.head.sha // ""' <<< "$current_pr_json")"
+          current_base_ref="$(jq -r '.base.ref // ""' <<< "$current_pr_json")"
+          current_base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${current_base_ref}" | awk 'NR == 1 {print $1}')"
+          if [[ "$current_state" != 'open' || "$current_draft" != 'false' || "$current_head_repo" != "$REPOSITORY" || "$current_head" != "$TARGET_HEAD_SHA" || "$current_base_ref" != "$EXPECTED_BASE_REF" || "$current_base_sha" != "$CURRENT_BASE_SHA" ]]; then
+            echo "::error::PR context changed before GUI execution. state=${current_state} draft=${current_draft} head_repo=${current_head_repo:-unknown} head=${current_head} base_ref=${current_base_ref} base_sha=${current_base_sha}"
+            exit 1
+          fi
+
+          echo "execution_sha=$execution_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Record request context
+        shell: bash
+        env:
+          EXECUTION_SHA: ${{ steps.execution.outputs.execution_sha }}
+          HEAD_REF: ${{ steps.preflight.outputs.head_ref }}
+          BASE_REF: ${{ steps.preflight.outputs.base_ref }}
+          BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
+          CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
+          REQUEST_ACTOR: ${{ steps.preflight.outputs.request_actor }}
+          EFFECTIVE_PROCEDURE: ${{ steps.preflight.outputs.procedure }}
+          RUN_DIR: ${{ runner.temp }}/hane-sidebar-chrome-gui
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_DIR"
+          jq -n \
+            --arg repository "$REPOSITORY" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg requested_head_sha "$TARGET_HEAD_SHA" \
+            --arg requested_base_sha "$REQUEST_BASE_SHA" \
+            --arg head_ref "$HEAD_REF" \
+            --arg base_ref "$BASE_REF" \
+            --arg observed_base_sha "$BASE_SHA" \
+            --arg execution_context "$EXECUTION_CONTEXT" \
+            --arg execution_sha "$EXECUTION_SHA" \
+            --arg control_sha "$CONTROL_SHA" \
+            --arg procedure "$EFFECTIVE_PROCEDURE" \
+            --arg actor "$REQUEST_ACTOR" \
+            --arg request_comment_id "$REQUEST_COMMENT_ID" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{
+              schema_version: 1,
+              repository: $repository,
+              pr_number: $pr_number,
+              requested_head_sha: $requested_head_sha,
+              requested_base_sha: ($requested_base_sha | if length == 0 then null else . end),
+              head_ref: $head_ref,
+              base_ref: $base_ref,
+              observed_base_sha: $observed_base_sha,
+              execution_context: $execution_context,
+              execution_sha: $execution_sha,
+              control_sha: $control_sha,
+              procedure: $procedure,
+              dispatched_by: $actor,
+              request_comment_id: ($request_comment_id | if length == 0 then null else tonumber end),
+              workflow_run_id: $run_id,
+              workflow_run_attempt: $run_attempt
+            }' > "$RUN_DIR/aadw-context.json"
+
+      - name: Validate sidebar date badges using trusted focused procedure
+        env:
+          HANE_SIDEBAR_CHROME_GUI_TARGET_DIR: ${{ github.workspace }}/hane
+          HANE_SIDEBAR_CHROME_GUI_CONTROL_DIR: ${{ github.workspace }}/control
+          HANE_SIDEBAR_CHROME_GUI_EXPECTED_SHA: ${{ steps.execution.outputs.execution_sha }}
+          HANE_SIDEBAR_CHROME_GUI_RUN_DIR: ${{ runner.temp }}/hane-sidebar-chrome-gui
+          HANE_SIDEBAR_CHROME_GUI_REQUEST_ID: aadw-sidebar-chrome-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 control/scripts/hosted_sidebar_chrome_gui.py
+
+      - name: Stage public evidence
+        if: always()
+        shell: bash
+        env:
+          RUN_DIR: ${{ runner.temp }}/hane-sidebar-chrome-gui
+          ARTIFACT_DIR: ${{ runner.temp }}/hane-sidebar-chrome-gui-artifact
+        run: |
+          set -euo pipefail
+          python3 -I control/.github/scripts/stage_sidebar_chrome_gui_evidence.py
+          mkdir -p "$ARTIFACT_DIR"
+          if [[ -f "$RUN_DIR/aadw-context.json" ]]; then
+            cp "$RUN_DIR/aadw-context.json" "$ARTIFACT_DIR/aadw-context.json"
+          fi
+
+      - name: Upload focused GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aadw-sidebar-chrome-gui-evidence-pr-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hane-sidebar-chrome-gui-artifact
+          if-no-files-found: error
+          retention-days: 14
