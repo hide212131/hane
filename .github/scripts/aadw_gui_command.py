@@ -21,7 +21,7 @@ from typing import Any
 COMMAND_RE = re.compile(r"/gui-validate[ \t]+(head|merge)")
 DATE_BADGE_COMMAND_RE = re.compile(r"/gui-validate[ \t]+date-badge[ \t]+(head|merge)")
 NORMAL_LIST_COMMAND_RE = re.compile(r"/gui-validate[ \t]+normal-list[ \t]+(head|merge)")
-SIDEBAR_CHROME_COMMAND_RE = re.compile(r"/gui-validate[ \\t]+sidebar-chrome[ \\t]+(head|merge)")
+SIDEBAR_CHROME_COMMAND_RE = re.compile(r"/gui-validate[ \t]+sidebar-chrome[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
 RUN_NAME_PREFIX = "AADW GUI"
