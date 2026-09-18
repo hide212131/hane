@@ -38,6 +38,25 @@ class ClaudeFailureClassifierTests(unittest.TestCase):
         )
         self.assertNotIn("secret-reset-message-do-not-print", summary)
 
+    def test_allowed_rate_limit_event_does_not_override_real_failure(self):
+        payload = [
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "allowed_warning"},
+            },
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "num_turns": 160,
+                "total_cost_usd": 1.0,
+                "modelUsage": {"claude": {}},
+            },
+        ]
+        self.assertEqual(
+            classifier.classify_events(payload), classifier.CATEGORY_MAX_TURNS
+        )
+
     def test_authentication_is_classified_from_error_result_only(self):
         payload = [
             {
@@ -123,6 +142,24 @@ class ClaudeFailureClassifierTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("category=diagnostic_unavailable", text)
         self.assertIn("execution_file=missing", text)
+
+    def test_untrusted_numeric_fields_are_normalized_before_logging(self):
+        payload = [
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "num_turns": "secret\n::error::forged",
+                "total_cost_usd": "another-secret",
+                "modelUsage": {},
+            }
+        ]
+        info = classifier.diagnostic(payload)
+        self.assertIsNone(info["num_turns"])
+        self.assertIsNone(info["total_cost_usd"])
+        summary = classifier.format_summary(info, execution_file="present")
+        self.assertNotIn("secret", summary)
+        self.assertNotIn("::error::", summary)
 
     def test_json_file_diagnostic_never_echoes_error_text(self):
         payload = [
