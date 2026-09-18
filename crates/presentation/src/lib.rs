@@ -2958,9 +2958,12 @@ mod tests {
         // the same paragraph as an ordinary soft break, so their leading
         // whitespace must disappear from inactive visual text the same way — all
         // while every source byte, including the hidden padding, stays mapped.
-        for (first_line, second_line, hidden_marker, hidden_padding) in [
-            ("> foo\n", "  bar", (0, 2), (6, 8)),
-            ("- foo\n", " bar", (0, 2), (6, 7)),
+        // The list fixture's opening line carries the synthesized bullet
+        // marker even while inactive (#126 contract); the quote fixture has
+        // no such marker since `>` markup is hidden rather than synthesized.
+        for (first_line, second_line, hidden_marker, hidden_padding, expected_first) in [
+            ("> foo\n", "  bar", (0, 2), (6, 8), "foo"),
+            ("- foo\n", " bar", (0, 2), (6, 7), "• foo"),
         ] {
             let base = 12;
             let first_range = SourceRange::new(base, base + first_line.len());
@@ -2992,7 +2995,7 @@ mod tests {
                 &mut out,
             );
             assert_eq!(
-                out[0].visual_text, "foo",
+                out[0].visual_text, expected_first,
                 "source: {first_line:?}{second_line:?}"
             );
             assert_eq!(
@@ -3102,7 +3105,10 @@ mod tests {
             ("> > `\n> > x\n> > `", vec!["", "x", ""]),
             ("> ` \n>  `", vec![" ", " "]),
             ("> ` x\n> y `", vec!["x", "y"]),
-            ("- `\n  x\n  `", vec!["", "  x", "  "]),
+            // The list item's opening line carries the synthesized bullet
+            // marker even while inactive (#126 contract), unlike the quote
+            // fixtures above whose `>` markup is real source text instead.
+            ("- `\n  x\n  `", vec!["• ", "  x", "  "]),
         ] {
             let mut offset = 50;
             let lines: Vec<_> = source
