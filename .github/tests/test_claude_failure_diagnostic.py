@@ -57,6 +57,45 @@ class ClaudeFailureClassifierTests(unittest.TestCase):
             classifier.classify_events(payload), classifier.CATEGORY_MAX_TURNS
         )
 
+    def test_sdk_errors_are_classified_without_echoing_raw_text(self):
+        payload = [
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": [
+                    "API Error: HTTP 401 unauthorized oauth token secret-value"
+                ],
+                "num_turns": 1,
+                "total_cost_usd": 0,
+                "modelUsage": {},
+            }
+        ]
+        self.assertEqual(
+            classifier.classify_events(payload), classifier.CATEGORY_AUTH
+        )
+        summary = classifier.format_summary(
+            classifier.diagnostic(payload), execution_file="present"
+        )
+        self.assertNotIn("secret-value", summary)
+
+    def test_sdk_provider_error_in_errors_is_classified(self):
+        payload = [
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["API Error: service unavailable"],
+                "num_turns": 2,
+                "total_cost_usd": 0.1,
+                "modelUsage": {"claude": {}},
+            }
+        ]
+        self.assertEqual(
+            classifier.classify_events(payload),
+            classifier.CATEGORY_MODEL_PROVIDER,
+        )
+
     def test_authentication_is_classified_from_error_result_only(self):
         payload = [
             {
@@ -119,6 +158,24 @@ class ClaudeFailureClassifierTests(unittest.TestCase):
         self.assertEqual(
             classifier.classify_events(payload), classifier.CATEGORY_ZERO_COST
         )
+
+    def test_invalid_raw_metrics_do_not_trigger_zero_cost_classification(self):
+        for turns, cost in ((True, False), (-1, 0), (1, -1)):
+            payload = [
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "num_turns": turns,
+                    "total_cost_usd": cost,
+                    "modelUsage": {},
+                }
+            ]
+            with self.subTest(turns=turns, cost=cost):
+                self.assertEqual(
+                    classifier.classify_events(payload),
+                    classifier.CATEGORY_UNKNOWN,
+                )
 
     def test_unknown_failure_stays_unknown(self):
         payload = [
