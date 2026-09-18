@@ -158,7 +158,15 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
             WORKFLOW,
         )
         self.assertIn(
-            "python .github/scripts/classify_claude_failure.py",
+            "ref: ${{ github.workflow_sha }}",
+            WORKFLOW,
+        )
+        self.assertIn(
+            "path: trusted-diagnostic",
+            WORKFLOW,
+        )
+        self.assertIn(
+            "python trusted-diagnostic/.github/scripts/classify_claude_failure.py",
             WORKFLOW,
         )
         self.assertIn(
@@ -169,6 +177,15 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
             "      - name: Diagnose Claude execution failure\n", 1
         )[1].split("\n      - name: Build untrusted worker patch", 1)[0]
         self.assertIn("exit 1", diagnostic_block)
+
+    def test_diagnostic_classifier_is_reacquired_after_claude(self):
+        claude_index = WORKFLOW.index("id: claude")
+        checkout_index = WORKFLOW.index(
+            "Check out trusted diagnostic source after Claude failure"
+        )
+        diagnose_index = WORKFLOW.index("Diagnose Claude execution failure")
+        self.assertLess(claude_index, checkout_index)
+        self.assertLess(checkout_index, diagnose_index)
 
     def test_full_output_is_not_enabled(self):
         self.assertNotIn("show_full_output: true", WORKFLOW)
