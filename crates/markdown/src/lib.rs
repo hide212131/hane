@@ -1066,9 +1066,22 @@ fn list_structural_prefixes(
         else {
             continue;
         };
+        let before_own_prefix = opening_cursor.byte;
+        let mut indent_cursor = opening_cursor;
+        let own_prefix_columns = indent_cursor.indent(opening_line.as_bytes(), 3);
         let Some(prefix) = opening_cursor.list_item(opening_line.as_bytes()) else {
             continue;
         };
+        if own_prefix_columns > 0 {
+            prefixes.push((
+                absolute_range(
+                    range.start.0 + opening_line_start,
+                    before_own_prefix..prefix.symbol.start,
+                ),
+                id,
+                own_prefix_columns,
+            ));
+        }
         let indent = prefix.width;
 
         let mut line_start = opening_line_start + opening_line.len();
@@ -1936,8 +1949,8 @@ mod tests {
     #[test]
     fn list_structural_prefixes_account_for_leading_spaces_and_marker_padding() {
         for (source, expected_width, continuation) in [
-            // 0-3 leading spaces before the marker are part of the required
-            // continuation width at this nesting level.
+            // 0-3 leading spaces before the opening marker are owned by the
+            // item too; the continuation width remains the full parsed prefix.
             ("  - item\n    continued\n", 4, (9, 13)),
             // 5+ spaces after the marker are one separator column, not a
             // wider required continuation indent.
@@ -1949,13 +1962,24 @@ mod tests {
                 .blocks()
                 .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
                 .expect("a list item");
-            assert_eq!(
-                parsed.list_structural_prefixes,
+            let expected = if source.starts_with("  -") {
+                vec![
+                    (SourceRange::new(0, 2), item, 2),
+                    (
+                        SourceRange::new(continuation.0, continuation.1),
+                        item,
+                        expected_width,
+                    ),
+                ]
+            } else {
                 vec![(
                     SourceRange::new(continuation.0, continuation.1),
                     item,
-                    expected_width
-                )],
+                    expected_width,
+                )]
+            };
+            assert_eq!(
+                parsed.list_structural_prefixes, expected,
                 "source: {source:?}"
             );
             assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);

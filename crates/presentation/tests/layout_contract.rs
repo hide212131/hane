@@ -277,6 +277,40 @@ fn list_continuations_and_wrapped_fragments_start_at_the_body_column() {
 }
 
 #[test]
+fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
+    let source = "- outer\n\n  - inner\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        })
+        .expect("the nested list block is presented");
+    let inner_line = block
+        .lines
+        .iter()
+        .position(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        .expect("the nested row is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == inner_line)
+        .expect("the nested row is laid out");
+    assert_eq!(row.marker_x_origin, Some(24.0));
+    assert_eq!(row.text_x_origin, 24.0);
+    assert_eq!(row.body_x_origin, 40.0);
+
+    let inner = SourceOffset(source.find("inner").expect("inner in source"));
+    let point = layout
+        .point_for_source(&block, inner, &shaper())
+        .expect("inner has a point");
+    assert_eq!(point.x, 40.0);
+}
+
+#[test]
 fn deeply_nested_or_narrow_lists_keep_a_positive_effective_width() {
     let source = "999999999. value\n";
     let block = present(source, None)
