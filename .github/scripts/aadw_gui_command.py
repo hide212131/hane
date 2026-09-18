@@ -36,6 +36,10 @@ TRUSTED_ROUTES = {
         "workflow_file": "aadw-date-badge-gui-validation.yml",
         "procedure_path": "scripts/hosted_date_badge_gui.py",
     },
+    "sidebar-chrome": {
+        "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
+        "procedure_path": "scripts/hosted_sidebar_chrome_gui.py",
+    },
 }
 
 
@@ -70,10 +74,15 @@ def parse_route(body: str) -> dict[str, str] | None:
         execution_context = comprehensive.group(1)
     else:
         date_badge = DATE_BADGE_COMMAND_RE.fullmatch(normalized)
-        if not date_badge:
-            return None
-        validation_kind = "date-badge"
-        execution_context = date_badge.group(1)
+        if date_badge:
+            validation_kind = "date-badge"
+            execution_context = date_badge.group(1)
+        else:
+            sidebar_chrome = SIDEBAR_CHROME_COMMAND_RE.fullmatch(normalized)
+            if not sidebar_chrome:
+                return None
+            validation_kind = "sidebar-chrome"
+            execution_context = sidebar_chrome.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {
