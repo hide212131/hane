@@ -1024,10 +1024,11 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
 }
 
 /// Recovers a list item's own structural indentation on every physical line
-/// its content occupies beyond the marker's own opening line: source-
-/// addressable so an inactive presentation can hide exactly the bytes the
-/// parser required for the item to keep owning that line, and disclose the
-/// original bytes (spaces, tabs) once the item itself is active.
+/// its content occupies, including parser-accepted padding between an opening
+/// marker and its body: source-addressable so an inactive presentation can
+/// hide exactly the bytes the parser required for the item to keep owning that
+/// line, and disclose the original bytes (spaces, tabs) once the item itself
+/// is active.
 ///
 /// Mirrors [`quote_markers`]'s per-owner tiling for nested containers: each
 /// item is scanned independently, consuming its own ancestors first via
@@ -1069,6 +1070,7 @@ fn list_structural_prefixes(
         let before_own_prefix = opening_cursor.byte;
         let mut indent_cursor = opening_cursor;
         let own_prefix_columns = indent_cursor.indent(opening_line.as_bytes(), 3);
+        let marker_start_cursor = opening_cursor;
         let Some(prefix) = opening_cursor.list_item(opening_line.as_bytes()) else {
             continue;
         };
@@ -1081,6 +1083,43 @@ fn list_structural_prefixes(
                 id,
                 own_prefix_columns,
             ));
+        }
+        // The marker projection hides exactly one separator byte so that it
+        // can preserve the source mapping of the written marker. CommonMark
+        // still treats the remaining 1-3 columns of padding as structural
+        // when there are at most four columns after the marker. Claim those
+        // bytes separately so an inactive row renders one synthesized label
+        // followed immediately by its body. For the 5+ case `list_item`
+        // resets to one separator column, intentionally leaving the excess
+        // spaces visible as content indentation.
+        let marker_end = prefix.symbol.end
+            + usize::from(matches!(
+                opening_line.as_bytes().get(prefix.symbol.end),
+                Some(b' ' | b'\t')
+            ));
+        if opening_cursor.byte > marker_end {
+            let mut marker_end_cursor = marker_start_cursor;
+            marker_end_cursor.indent(opening_line.as_bytes(), 3);
+            marker_end_cursor.byte += prefix.symbol.len();
+            marker_end_cursor.column += prefix.symbol.len();
+            if marker_end_cursor.space(opening_line.as_bytes()) {
+                while marker_end_cursor.pending_spaces > 0 {
+                    marker_end_cursor.space(opening_line.as_bytes());
+                }
+            }
+            let columns = opening_cursor
+                .column
+                .saturating_sub(marker_end_cursor.column);
+            if columns > 0 {
+                prefixes.push((
+                    absolute_range(
+                        range.start.0 + opening_line_start,
+                        marker_end..opening_cursor.byte,
+                    ),
+                    id,
+                    columns,
+                ));
+            }
         }
         let indent = prefix.width;
 
@@ -1983,6 +2022,33 @@ mod tests {
             );
             assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
         }
+    }
+
+    #[test]
+    fn list_structural_prefixes_cover_opening_marker_padding_up_to_the_body() {
+        for (source, expected_range, expected_columns) in [
+            ("-   item\n", SourceRange::new(2, 4), 2),
+            ("1.    item\n", SourceRange::new(3, 6), 3),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let (item, _) = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .expect("a list item");
+            assert_eq!(
+                parsed.list_structural_prefixes,
+                vec![(expected_range, item, expected_columns)],
+                "source: {source:?}"
+            );
+            assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
+        }
+
+        // Five or more spaces are parser content indentation after the one
+        // separator column, so the excess must remain visible.
+        let source = "-     item\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert!(parsed.list_structural_prefixes.is_empty());
     }
 
     #[test]

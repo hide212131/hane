@@ -3816,6 +3816,28 @@ mod tests {
     }
 
     #[test]
+    fn opening_list_marker_padding_is_hidden_but_disclosed_with_the_item() {
+        for (source, expected) in [("-   item\n", "• item\n"), ("1.    item\n", "1. item\n")] {
+            let start = 40;
+            let range = SourceRange::new(start, start + source.len());
+            let collapsed =
+                present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+            assert_eq!(collapsed.visual_text, expected, "source: {source:?}");
+
+            let item = start + source.find("item").expect("item in source");
+            let disclosed = present_markdown_with_disclosure(
+                0,
+                Revision(1),
+                range,
+                source,
+                26.0,
+                Some(SourceRange::empty(item)),
+            );
+            assert_eq!(disclosed.visual_text, source, "source: {source:?}");
+        }
+    }
+
+    #[test]
     fn ordered_list_labels_use_owner_start_plus_sibling_position() {
         for (source, expected_labels) in [
             // Loose/irregular source digits never leak into the synthesized
