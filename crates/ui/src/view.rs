@@ -4575,7 +4575,11 @@ mod tests {
     // visible text landed before the bullet instead of after it.
     #[test]
     fn hidden_list_marker_boundary_lands_after_the_marker_even_when_indented() {
-        let text = "  - item\nnext line";
+        // A blank line closes the list before "next line", so the caret at
+        // document end sits in an unrelated trailing paragraph rather than
+        // (per CommonMark lazy continuation) inside the list item's own
+        // source range, keeping the marker hidden for this boundary check.
+        let text = "  - item\n\nnext line";
         let mut editor = Editor::new(text);
         editor
             .set_selection(Selection::caret(SourceOffset(text.len())))
