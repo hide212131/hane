@@ -549,15 +549,36 @@ struct LineGeometry {
 
 fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
     let mut widths: HashMap<ListId, f32> = HashMap::new();
+    let mut measured_scales: HashMap<ListId, u32> = HashMap::new();
     for line in &block.lines {
         let Some(list) = &line.list else {
             continue;
         };
-        let width = shaper.width_for_text(line, &list.owner.alignment.max_marker_label);
+        let list_id = list.owner.list_id;
+        let scale = line.display().font_scale.to_bits();
+        if measured_scales
+            .get(&list_id)
+            .is_some_and(|measured| *measured == scale)
+        {
+            continue;
+        }
+        let width = list
+            .owner
+            .alignment
+            .marker_labels
+            .iter()
+            .map(|label| shaper.width_for_text(line, label))
+            .fold(0.0, f32::max);
+        let width = if width > 0.0 {
+            width
+        } else {
+            shaper.width_for_text(line, &list.owner.alignment.max_marker_label)
+        };
         widths
-            .entry(list.owner.list_id)
+            .entry(list_id)
             .and_modify(|current| *current = current.max(width))
             .or_insert(width);
+        measured_scales.insert(list_id, scale);
     }
     widths
 }
@@ -676,15 +697,26 @@ fn fragment_boundaries(
         .body_visual_start
         .filter(|body| *body > 0 && *body < len);
     if let Some(body) = body_boundary {
-        let first_boundaries = valid_boundaries(0, first_width);
-        if let Some(split) = first_boundaries.iter().position(|offset| *offset >= body) {
-            boundaries.extend(first_boundaries[..=split].iter().copied());
-            let start = first_boundaries[split];
-            if start < len {
-                boundaries.extend(valid_boundaries(start, geometry.effective_width));
-            }
+        let marker_overflows_first_row =
+            geometry.marker_visual_range.as_ref().is_some_and(|marker| {
+                shaper.x_for_offset(line, marker.clone(), marker.end) + geometry.marker_body_gap
+                    > first_width
+            });
+        if marker_overflows_first_row {
+            // A marker is one indivisible synthesized/source projection. If
+            // its aligned column cannot fit in the opening-row budget, let it
+            // overflow to the body boundary instead of wrapping the marker
+            // itself into fragments that would be painted at the body origin.
+            boundaries.push(body);
+            boundaries.extend(valid_boundaries(body, geometry.effective_width));
         } else {
-            boundaries.extend(first_boundaries);
+            let first_boundaries = valid_boundaries(0, first_width);
+            if let Some(split) = first_boundaries.iter().find(|offset| **offset >= body) {
+                boundaries.push(*split);
+                boundaries.extend(valid_boundaries(*split, geometry.effective_width));
+            } else {
+                boundaries.extend(first_boundaries);
+            }
         }
     } else {
         let row_width = geometry

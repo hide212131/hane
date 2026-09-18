@@ -78,6 +78,55 @@ impl LineShaper for CountingShaper {
     }
 }
 
+struct VariableLabelShaper {
+    inner: FixedAdvanceShaper,
+}
+
+impl VariableLabelShaper {
+    fn new(advance: f32) -> Self {
+        Self {
+            inner: FixedAdvanceShaper::new(advance),
+        }
+    }
+}
+
+impl LineShaper for VariableLabelShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        self.inner.wrap_boundaries(line, fragment, width)
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        self.inner.x_for_offset(line, fragment, offset)
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        self.inner.offset_for_x(line, fragment, x)
+    }
+
+    fn width_for_text(&self, line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        if text == "12. " {
+            48.0
+        } else {
+            self.inner.width_for_text(line, text)
+        }
+    }
+}
+
 /// Presents a whole document into blocks the way `EditorView` does: block
 /// boundaries from the index, then one `present_block` call per block with all
 /// of its lines.
@@ -306,6 +355,35 @@ fn list_body_columns_are_shared_by_inactive_ordered_labels() {
 }
 
 #[test]
+fn list_body_columns_use_the_widest_actual_marker_label() {
+    let source = "10. first\n11. second\n12. third\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let shaper = VariableLabelShaper::new(8.0);
+    let layout = layout_block(&block, 160.0, &shaper);
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line < 3)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.body_x_origin == 48.0));
+    for word in ["first", "second", "third"] {
+        let source_offset = SourceOffset(source.find(word).expect("list item body"));
+        assert_eq!(
+            layout
+                .point_for_source(&block, source_offset, &shaper)
+                .expect("body has a point")
+                .x,
+            48.0
+        );
+    }
+}
+
+#[test]
 fn list_marker_body_gap_clicks_clamp_to_the_body_boundary() {
     let source = "9. foo\n1. bar\n";
     let block = present(source, None)
@@ -419,6 +497,33 @@ fn opening_list_wrap_counts_the_marker_only_in_the_first_row_budget() {
     assert_eq!(rows[0].line_visual_range.end, first_body_text);
     assert_eq!(rows[0].text_x_origin, 0.0);
     assert_eq!(rows[0].body_x_origin, 16.0);
+}
+
+#[test]
+fn a_long_marker_stays_intact_before_the_body_when_the_column_is_narrow() {
+    let source = "999999999. value\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 40.0, &shaper());
+    let body = block.lines[0]
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() >= 2, "the body must continue on a later row");
+    assert_eq!(rows[0].line_visual_range, 0..body);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[1].line_visual_range.start, body);
+    assert_eq!(rows[1].text_x_origin, rows[1].body_x_origin);
 }
 
 #[test]

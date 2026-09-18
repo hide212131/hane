@@ -52,6 +52,7 @@ use hane_markdown::{
     has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct VisualOffset(pub usize);
@@ -456,11 +457,14 @@ pub enum ListRowRole {
 
 /// Aggregate marker information for one semantic list. The width is measured
 /// from the inactive display labels (`3. `, `10. `, `• `), never from source
-/// digits such as `003)`.
+/// digits such as `003)`. `marker_labels` retains every direct-child label so
+/// layout can measure actual font widths instead of assuming that equal digit
+/// counts have equal advances.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListAlignment {
     pub max_marker_label: String,
     pub max_marker_columns: usize,
+    pub marker_labels: Arc<[String]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1873,19 +1877,25 @@ fn list_alignments(tree: &MarkdownTree) -> Vec<Option<ListAlignment>> {
         let NodeKind::List { start } = node.kind else {
             continue;
         };
+        let marker_labels = tree
+            .children(id)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| list_label(start, ordinal))
+            .collect::<Vec<_>>();
         let mut max_marker_label = String::new();
         let mut max_marker_columns = 0;
-        for (ordinal, _) in tree.children(id).iter().enumerate() {
-            let label = list_label(start, ordinal);
+        for label in &marker_labels {
             let columns = label.chars().count();
             if columns > max_marker_columns {
                 max_marker_columns = columns;
-                max_marker_label = label;
+                max_marker_label.clone_from(label);
             }
         }
         alignments[id.0] = Some(ListAlignment {
             max_marker_label,
             max_marker_columns,
+            marker_labels: marker_labels.into(),
         });
     }
     alignments
