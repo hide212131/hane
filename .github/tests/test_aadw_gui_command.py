@@ -96,6 +96,19 @@ class ParseRouteTests(unittest.TestCase):
                     },
                 )
 
+    def test_routes_sidebar_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate sidebar {context}"),
+                    {
+                        "validation_kind": "sidebar",
+                        "execution_context": context,
+                        "workflow_file": "aadw-gui-validation.yml",
+                        "procedure_path": "scripts/hosted_sidebar_gui.py",
+                    },
+                )
+
     def test_routes_normal_list_focused_commands(self):
         for context in ("head", "merge"):
             with self.subTest(context=context):
@@ -118,6 +131,8 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate date-badge\nmerge",
             "/gui-validate normal-list",
             "/gui-validate normal-list merge extra",
+            "/gui-validate sidebar",
+            "/gui-validate sidebar merge extra",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
