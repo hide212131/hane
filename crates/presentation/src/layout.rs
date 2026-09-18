@@ -87,6 +87,10 @@ pub struct LayoutLine {
     pub body_visual_start: Option<usize>,
     /// The visual range of the marker displayed on this line, if any.
     pub marker_visual_range: Option<Range<usize>>,
+    /// Geometry-only gap between the displayed marker and the aligned body
+    /// column. It is zero for continuation rows and for a marker already as
+    /// wide as the list's aggregate label.
+    pub marker_body_gap: f32,
 }
 
 impl LayoutLine {
@@ -469,6 +473,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 marker_x_origin: line_geometry.marker_x_origin,
                 body_visual_start: line_geometry.body_visual_start,
                 marker_visual_range: line_geometry.marker_visual_range.clone(),
+                marker_body_gap: line_geometry.marker_body_gap,
             });
             y += height;
         }
@@ -490,6 +495,7 @@ struct LineGeometry {
     effective_width: f32,
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
+    marker_body_gap: f32,
 }
 
 fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
@@ -524,6 +530,7 @@ fn line_geometry(
             effective_width: width.max(0.0),
             body_visual_start: None,
             marker_visual_range: None,
+            marker_body_gap: 0.0,
         };
     };
     let marker_x = list_depth_x(list.owner.depth);
@@ -548,6 +555,9 @@ fn line_geometry(
             .marker
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
+        marker_body_gap: list.marker.as_ref().map_or(0.0, |_| {
+            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
+        }),
     }
 }
 

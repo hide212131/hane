@@ -235,6 +235,12 @@ fn list_body_columns_are_shared_by_inactive_ordered_labels() {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.marker_x_origin == Some(0.0)));
     assert!(rows.iter().all(|row| row.body_x_origin == 32.0));
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.marker_body_gap)
+            .collect::<Vec<_>>(),
+        vec![8.0, 0.0]
+    );
     assert_eq!(rows[0].effective_width, 128.0);
 
     let foo = SourceOffset(source.find("foo").expect("foo in source"));

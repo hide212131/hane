@@ -32,9 +32,10 @@ use gpui::{
     Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
     Task, Window, div, point, prelude::FluentBuilder, px, rgb,
 };
+#[cfg(test)]
+use hane_document::Bias;
 use hane_document::{
-    Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
-    TextBuffer,
+    BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
@@ -43,10 +44,11 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
-    VisualBlock, VisualLine, VisualOffset, block_heights, block_is_joinable, block_line_span,
-    layout_block, parse_joined_span, trailing_blank_lines,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, VerticalMove, VisualBlock, block_heights,
+    block_is_joinable, block_line_span, layout_block, parse_joined_span, trailing_blank_lines,
 };
+#[cfg(test)]
+use hane_presentation::{MarkerEdge, Visibility, VisualLine, VisualOffset};
 use hane_session::{
     CalendarDate, DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService,
     LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
@@ -2154,6 +2156,7 @@ impl EditorView {
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
     /// moved under the pointer and there is nothing to do.
+    #[cfg(test)]
     fn rendered_line(&self, line: usize) -> Option<VisualLine> {
         let (id, at) = self.line_owners.get(&line)?;
         self.block_cache.get(id)?.lines.get(*at).cloned()
@@ -2169,16 +2172,16 @@ impl EditorView {
         window_x: f32,
         window: &Window,
     ) -> Option<SourceOffset> {
-        let visual = self.rendered_line(line)?;
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?;
+        let layout = &self.layout_cache.get(&block_id)?.layout;
+        let row_index = layout
+            .lines
+            .iter()
+            .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment.clone(), x);
-        Some(source_offset_for_visual_position(
-            self.editor(),
-            line,
-            &visual,
-            visual_offset,
-            Some(&fragment),
-        ))
+        let shaper = WindowShaper::new(window);
+        layout.source_at_x(visual, row_index, x, &shaper)
     }
 
     fn on_row_mouse_down(
@@ -4205,6 +4208,7 @@ impl EditorView {
 /// collapsed boundary the click actually landed on; `None` (as from the
 /// non-row test helpers below) leaves that disambiguation off, matching the
 /// unwrapped, whole-line behavior.
+#[cfg(test)]
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
@@ -4265,6 +4269,7 @@ fn source_offset_for_visual_position(
 /// row closes with. This is checked before the marker-edge fallback because
 /// it reflects where the click physically landed, which the marker's own
 /// direction cannot.
+#[cfg(test)]
 fn collapsed_boundary_bias(
     block: &VisualLine,
     visual_offset: usize,
@@ -4587,7 +4592,7 @@ mod tests {
         let lines = presented_lines(&editor);
 
         let line = &lines[0];
-        assert_eq!(line.visual_text, "  \u{2022} item");
+        assert_eq!(line.visual_text, "\u{2022} item");
         let visual_offset = line.visual_text.find("item").unwrap();
         // "  - item" hides the bullet `- ` (source offsets 2..4) and replaces
         // it with a synthesized `•`; canonical is source offset 4, just after
@@ -6628,10 +6633,6 @@ mod tests {
             view.read_with(app, |editor_view, _| {
                 let visual = editor_view.rendered_line(line).expect("line rendered");
                 let shaper = WindowShaper::new(window);
-                let x = f32::from(bounds.origin.x)
-                    + editor_view.theme.line_horizontal_padding
-                    + shaper.x_for_offset(&visual, fragment.clone(), visual_offset);
-                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
@@ -6639,6 +6640,31 @@ mod tests {
                     visual_offset,
                     Some(&fragment),
                 );
+                let (block_id, visual_line) = *editor_view
+                    .line_owners
+                    .get(&line)
+                    .expect("line owner recorded");
+                let layout = &editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout;
+                let block = editor_view
+                    .block_cache
+                    .get(&block_id)
+                    .expect("block cached");
+                let layout_point = layout
+                    .point_for_source(block, expected, &shaper)
+                    .expect("expected source has a layout point");
+                let row = layout
+                    .lines
+                    .get(layout_point.row)
+                    .expect("layout point row exists");
+                assert_eq!(row.line, visual_line);
+                let x = f32::from(bounds.origin.x)
+                    + editor_view.theme.line_horizontal_padding
+                    + layout_point.x;
+                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 (point(px(x), px(y)), expected)
             })
         })

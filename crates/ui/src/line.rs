@@ -381,9 +381,24 @@ pub(crate) fn row_element(
         selected_visual,
         marked_visual,
         &line.style_runs,
+        row.body_visual_start,
     );
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
     for segment in &segments {
+        if row.marker_body_gap > 0.0
+            && row.body_visual_start.is_some_and(|body| {
+                body > row.line_visual_range.start
+                    && body <= row.line_visual_range.end
+                    && segment.visual_range.start >= body
+            })
+        {
+            elements.push(
+                div()
+                    .flex_none()
+                    .w(px(row.marker_body_gap))
+                    .into_any_element(),
+            );
+        }
         if segment.cursor_before {
             elements.push(cursor_overlay(theme).into_any_element());
         }
@@ -430,7 +445,8 @@ pub(crate) fn row_element(
             // The row already holds exactly what fits: any further wrapping here
             // would put text where no layout row accounts for it.
             .whitespace_nowrap()
-            .px(px(theme.line_horizontal_padding)),
+            .pl(px(theme.line_horizontal_padding + row.text_x_origin))
+            .pr(px(theme.line_horizontal_padding)),
         display,
         theme,
     )
@@ -479,9 +495,11 @@ fn line_segments(
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
     style_runs: &[hane_presentation::StyleRun],
+    body_visual_start: Option<usize>,
 ) -> Vec<LineSegment> {
     let mut boundaries = Vec::new();
     boundaries.extend(cursor);
+    boundaries.extend(body_visual_start);
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
         boundaries.push(range.start);
         boundaries.push(range.end);
@@ -560,7 +578,7 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs);
+        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs, None);
         let overlap = segments
             .iter()
             .find(|segment| segment.visual_range == (3..6))
@@ -646,6 +664,7 @@ mod tests {
             marker_x_origin: None,
             body_visual_start: None,
             marker_visual_range: None,
+            marker_body_gap: 0.0,
         }
     }
 
@@ -671,7 +690,7 @@ mod tests {
         // Selection and IME ranges that reach past the row are clipped to it, so
         // a construct spanning a soft wrap is painted on both rows and neither
         // row draws outside its own text.
-        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[]);
+        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[], None);
         assert_eq!(
             segments.first().map(|segment| segment.visual_range.start),
             Some(6)
@@ -690,7 +709,7 @@ mod tests {
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[]),
+            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[], None),
             vec![
                 LineSegment {
                     visual_range: 0..3,
@@ -721,6 +740,25 @@ mod tests {
                     display: InlineDisplay::default()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn list_body_boundary_splits_paint_segments_without_adding_text() {
+        let segments = line_segments(0..8, None, None, None, &[], Some(3));
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..3, 3..8]
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.len())
+                .sum::<usize>(),
+            8
         );
     }
 
