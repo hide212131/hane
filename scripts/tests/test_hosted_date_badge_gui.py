@@ -19,9 +19,22 @@ sys.modules["hosted_date_badge_gui"] = mod
 spec.loader.exec_module(mod)
 
 
+# Trusted procedure v5 contract for a 960x680 raw screenshot: ROI crop_size is
+# source_size * EXPECTED_ROI fraction (rounded to whole pixels), processed_size
+# is crop_size * scale_factor.
+VALID_PREPROCESSING_EVIDENCE = {
+    "method": "roi_crop_uniform_upscale",
+    "scale_factor": 4,
+    "source_size": {"width": 960, "height": 680},
+    "roi": dict(mod.EXPECTED_ROI),
+    "crop_size": {"width": 288, "height": 238},
+    "processed_size": {"width": 1152, "height": 952},
+}
+
+
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/4")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/5")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -40,9 +53,11 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             mod.date_token_pattern("20260901")
 
     def test_helper_find_all_parses_matches_and_preprocessing_evidence(self):
-        # Issue #190: `hosted_date_badge_gui.swift` now uniformly upscales
-        # the whole screenshot before OCR and reports that as evidence
-        # alongside the matches, instead of returning a bare match list.
+        # Issue #190 follow-up: `hosted_date_badge_gui.swift` now crops the
+        # screenshot to the trusted sidebar ROI, uniformly upscales that
+        # crop before OCR, and reports both the ROI contract and pixel sizes
+        # as evidence alongside the matches, instead of returning a bare
+        # match list.
         payload = json.dumps({
             "matches": [{
                 "observation_index": 0,
@@ -51,12 +66,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 "recognized_line": "Alpha.md",
                 "bounding_box": {"minX": 0.0, "maxX": 0.1, "minY": 0.0, "maxY": 0.02},
             }],
-            "preprocessing": {
-                "method": "uniform_upscale",
-                "scale_factor": 4,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 3840, "height": 2720},
-            },
+            "preprocessing": VALID_PREPROCESSING_EVIDENCE,
         })
         with tempfile.TemporaryDirectory() as directory:
             helper = Path(directory) / "helper"
@@ -70,10 +80,12 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                     helper, digest, Path(directory) / "shot.png", "Alpha"
                 )
         self.assertEqual(len(matches), 1)
-        self.assertEqual(preprocessing["method"], "uniform_upscale")
+        self.assertEqual(preprocessing["method"], "roi_crop_uniform_upscale")
         self.assertEqual(preprocessing["scale_factor"], 4)
         self.assertEqual(preprocessing["source_size"], {"width": 960, "height": 680})
-        self.assertEqual(preprocessing["processed_size"], {"width": 3840, "height": 2720})
+        self.assertEqual(preprocessing["roi"], mod.EXPECTED_ROI)
+        self.assertEqual(preprocessing["crop_size"], {"width": 288, "height": 238})
+        self.assertEqual(preprocessing["processed_size"], {"width": 1152, "height": 952})
 
     def test_helper_find_all_rejects_bare_match_list_without_preprocessing_evidence(self):
         # Fail-closed: the pre-#190 helper contract (a bare JSON list) must
@@ -92,7 +104,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                     mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
 
     def test_helper_find_all_rejects_incomplete_preprocessing_evidence(self):
-        payload = json.dumps({"matches": [], "preprocessing": {"method": "uniform_upscale"}})
+        payload = json.dumps({"matches": [], "preprocessing": {"method": "roi_crop_uniform_upscale"}})
         with tempfile.TemporaryDirectory() as directory:
             helper = Path(directory) / "helper"
             helper.write_bytes(b"trusted")
@@ -107,59 +119,50 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_validate_preprocessing_evidence_accepts_valid_evidence(self):
         # Should not raise, and unknown extra fields are forward-compatible.
         mod.validate_preprocessing_evidence({
-            "method": "uniform_upscale",
-            "scale_factor": 4,
-            "source_size": {"width": 960, "height": 680},
-            "processed_size": {"width": 3840, "height": 2720},
+            **VALID_PREPROCESSING_EVIDENCE,
             "future_field": "ignored",
         })
 
     def test_validate_preprocessing_evidence_rejects_disabled_method(self):
         # Issue #191 P1: a helper that stopped preprocessing must not be
-        # silently accepted just because the four required keys exist.
+        # silently accepted just because the required keys exist.
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
+                **VALID_PREPROCESSING_EVIDENCE,
                 "method": "none",
-                "scale_factor": 4,
-                "source_size": {"width": 960, "height": 680},
                 "processed_size": {"width": 960, "height": 680},
             })
 
     def test_validate_preprocessing_evidence_rejects_no_op_scale_factor(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
+                **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": 1,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 288, "height": 238},
             })
 
     def test_validate_preprocessing_evidence_rejects_wrong_scale_factor(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
+                **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": 2,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 1920, "height": 1360},
+                "processed_size": {"width": 576, "height": 476},
             })
 
     def test_validate_preprocessing_evidence_rejects_bool_scale_factor(self):
         # `bool` is an `int` subclass in Python; must not be misread as 1/0.
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
+                **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": True,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 288, "height": 238},
             })
 
     def test_validate_preprocessing_evidence_rejects_non_dict_sizes(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
-                "scale_factor": 4,
+                **VALID_PREPROCESSING_EVIDENCE,
                 "source_size": [960, 680],
-                "processed_size": {"width": 3840, "height": 2720},
             })
 
     def test_validate_preprocessing_evidence_rejects_zero_or_negative_size(self):
@@ -167,49 +170,86 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             with self.subTest(width=width):
                 with self.assertRaises(RuntimeError):
                     mod.validate_preprocessing_evidence({
-                        "method": "uniform_upscale",
-                        "scale_factor": 4,
+                        **VALID_PREPROCESSING_EVIDENCE,
                         "source_size": {"width": width, "height": 680},
-                        "processed_size": {"width": width * 4, "height": 2720},
                     })
 
     def test_validate_preprocessing_evidence_rejects_non_integer_size(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
-                "scale_factor": 4,
+                **VALID_PREPROCESSING_EVIDENCE,
                 "source_size": {"width": 960.5, "height": 680},
-                "processed_size": {"width": 3842.0, "height": 2720},
             })
 
     def test_validate_preprocessing_evidence_rejects_bool_size(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
-                "scale_factor": 4,
+                **VALID_PREPROCESSING_EVIDENCE,
                 "source_size": {"width": True, "height": 680},
-                "processed_size": {"width": 4, "height": 2720},
             })
 
     def test_validate_preprocessing_evidence_rejects_string_size(self):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
-                "scale_factor": 4,
+                **VALID_PREPROCESSING_EVIDENCE,
                 "source_size": {"width": "960", "height": 680},
-                "processed_size": {"width": 3840, "height": 2720},
             })
 
     def test_validate_preprocessing_evidence_rejects_source_processed_mismatch(self):
-        # Correct method/scale_factor but processed_size does not actually
-        # reflect source_size * scale_factor.
+        # Correct method/scale_factor/roi but processed_size does not
+        # actually reflect crop_size * scale_factor.
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
-                "method": "uniform_upscale",
-                "scale_factor": 4,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 3840, "height": 2721},
+                **VALID_PREPROCESSING_EVIDENCE,
+                "processed_size": {"width": 1152, "height": 953},
             })
+
+    def test_validate_preprocessing_evidence_rejects_roi_missing(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                **VALID_PREPROCESSING_EVIDENCE,
+                "roi": None,
+            })
+
+    def test_validate_preprocessing_evidence_rejects_roi_origin_mismatch(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                **VALID_PREPROCESSING_EVIDENCE,
+                "roi": {**mod.EXPECTED_ROI, "origin": "bottom_left_y_up"},
+            })
+
+    def test_validate_preprocessing_evidence_rejects_roi_fraction_drift(self):
+        # A helper that widened the ROI (e.g. back toward the full window)
+        # must not be silently accepted just because `roi` is present and
+        # well-formed.
+        for key in ("x_fraction", "y_fraction_from_top", "width_fraction", "height_fraction"):
+            with self.subTest(key=key):
+                with self.assertRaises(RuntimeError):
+                    mod.validate_preprocessing_evidence({
+                        **VALID_PREPROCESSING_EVIDENCE,
+                        "roi": {**mod.EXPECTED_ROI, key: mod.EXPECTED_ROI[key] + 0.1},
+                    })
+
+    def test_validate_preprocessing_evidence_rejects_crop_size_not_matching_roi(self):
+        with self.assertRaises(RuntimeError):
+            mod.validate_preprocessing_evidence({
+                **VALID_PREPROCESSING_EVIDENCE,
+                "crop_size": {"width": 480, "height": 238},
+                "processed_size": {"width": 1920, "height": 952},
+            })
+
+    def test_validate_crop_size_rejects_crop_not_smaller_than_source(self):
+        # Defense in depth beyond `_validate_roi`'s fixed-contract check:
+        # even if a caller's `roi` fractions were 1.0 (matching a would-be
+        # full-frame crop that never actually shrank the analyzed frame),
+        # `_validate_crop_size` itself must still reject a `crop_size` equal
+        # to `source_size`.
+        with self.assertRaises(RuntimeError):
+            mod._validate_crop_size(
+                {"width": 288, "height": 238},
+                288, 238,
+                {"width_fraction": 1.0, "height_fraction": 1.0},
+            )
 
     def test_helper_find_all_rejects_inconsistent_preprocessing_evidence(self):
         # End-to-end: `helper_find_all` itself must reject a structurally
@@ -218,10 +258,10 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         payload = json.dumps({
             "matches": [],
             "preprocessing": {
+                **VALID_PREPROCESSING_EVIDENCE,
                 "method": "none",
                 "scale_factor": 1,
-                "source_size": {"width": 960, "height": 680},
-                "processed_size": {"width": 960, "height": 680},
+                "processed_size": {"width": 288, "height": 238},
             },
         })
         with tempfile.TemporaryDirectory() as directory:
@@ -235,25 +275,27 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
 
-    def test_ocr_preprocessing_is_a_uniform_whole_image_upscale(self):
+    def test_ocr_preprocessing_is_an_roi_crop_then_uniform_upscale(self):
         # Structural evidence (mirrors the existing `hosted_gui_interaction`
-        # helper-source assertions) that the OCR input transform is a plain
-        # full-frame integer upscale: both dimensions scaled by the same
-        # factor, drawn with no crop/offset, and that Vision actually
-        # analyzes the upscaled in-memory image (not the raw screenshot
-        # file) so the resolution fix is really applied.
+        # helper-source assertions) that the OCR input transform crops to
+        # the trusted sidebar ROI before uniformly upscaling that crop by a
+        # fixed integer factor, and that Vision actually analyzes the
+        # cropped-and-upscaled in-memory image (not the raw screenshot file)
+        # so the fix is really applied.
         swift_source = SCRIPT.with_name("hosted_date_badge_gui.swift").read_text()
         self.assertIn("let ocrUpscaleFactor = 4", swift_source)
+        self.assertIn("sourceImage.cropping(to: cropPixelRect)", swift_source)
+        self.assertIn("uniformlyUpscaled(croppedImage, factor: ocrUpscaleFactor)", swift_source)
         self.assertIn("image.width * factor", swift_source)
         self.assertIn("image.height * factor", swift_source)
-        self.assertRegex(
-            swift_source, r"CGRect\(x:\s*0,\s*y:\s*0,\s*width:\s*width,\s*height:\s*height\)"
-        )
         self.assertIn("VNImageRequestHandler(cgImage: processedImage", swift_source)
-        self.assertIn('"method": "uniform_upscale"', swift_source)
-        self.assertIn('"scale_factor": ocrUpscaleFactor', swift_source)
+        self.assertIn('"method": "roi_crop_uniform_upscale"', swift_source)
         self.assertIn('"source_size"', swift_source)
+        self.assertIn('"crop_size"', swift_source)
         self.assertIn('"processed_size"', swift_source)
+        for key in ("originContract", "xFraction", "yFractionFromTop", "widthFraction", "heightFraction"):
+            self.assertIn(f"static let {key}", swift_source)
+        self.assertIn('"scale_factor": ocrUpscaleFactor', swift_source)
 
     def test_uniform_whole_image_scale_preserves_normalized_coordinates(self):
         # Pure geometry proof behind the fix (Issue #190): Vision's own
@@ -275,6 +317,70 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             scaled_size = (source_size[0] * factor, source_size[1] * factor)
             scaled_rect = tuple(value * factor for value in pixel_rect)
             self.assertEqual(normalized(scaled_rect, scaled_size), baseline)
+
+    def test_roi_crop_reprojects_normalized_coordinates_to_full_window(self):
+        # Pure geometry proof behind the ROI crop fix (Issue #190
+        # follow-up): mirrors `reprojectToFullWindow` in
+        # hosted_date_badge_gui.swift so the affine reprojection math is
+        # independently verifiable without Swift/Vision. `crop_pixel_rect`
+        # is in `CGImage.cropping(to:)`'s top-left-origin, y-down pixel
+        # space; Vision's own boundingBox is bottom-left-origin, y-up,
+        # normalized to whichever image it analyzed (here, the crop). This
+        # reprojects a crop-normalized rect into the raw screenshot's own
+        # bottom-left-origin normalized coordinates.
+        def reproject_rect(rect, crop_pixel_rect, source_width, source_height):
+            crop_x, crop_y_from_top, crop_w, crop_h = crop_pixel_rect
+            crop_x_fraction = crop_x / source_width
+            crop_width_fraction = crop_w / source_width
+            crop_y_fraction_from_top = crop_y_from_top / source_height
+            crop_height_fraction = crop_h / source_height
+
+            def reproject_x(x):
+                return crop_x_fraction + x * crop_width_fraction
+
+            def reproject_y(y):
+                return (
+                    1.0 - crop_y_fraction_from_top - crop_height_fraction
+                ) + y * crop_height_fraction
+
+            min_x, max_x, min_y, max_y = rect
+            return (reproject_x(min_x), reproject_x(max_x), reproject_y(min_y), reproject_y(max_y))
+
+        source_width, source_height = 960.0, 680.0
+        # The trusted sidebar ROI's pixel crop for this source size (matches
+        # `VALID_PREPROCESSING_EVIDENCE["crop_size"]`): x=0, y=34 from the
+        # top, width=288, height=238.
+        crop_pixel_rect = (0.0, 34.0, 288.0, 238.0)
+
+        # The whole crop, in Vision's own bottom-left-origin normalized
+        # space, must reproject to exactly the ROI's full-window fractions.
+        whole_crop = (0.0, 1.0, 0.0, 1.0)
+        min_x, max_x, min_y, max_y = reproject_rect(whole_crop, crop_pixel_rect, source_width, source_height)
+        self.assertAlmostEqual(min_x, 0.0)
+        self.assertAlmostEqual(max_x, 0.30)  # EXPECTED_ROI width_fraction
+        # Vision y=0 is the *bottom* of the crop, which sits 272px (34+238)
+        # from the top of a 680px-tall window -> bottom-left fraction
+        # 1 - 272/680 = 0.60. Vision y=1 is the crop's top edge, 34px from
+        # the window's top -> 1 - 34/680 = 0.95. min maps to the smaller
+        # full-window value despite the top-left/bottom-left origin flip,
+        # because the reprojection is a monotonically increasing affine map.
+        self.assertAlmostEqual(min_y, 0.60)
+        self.assertAlmostEqual(max_y, 0.95)
+        self.assertLess(min_y, max_y)
+        self.assertLess(min_x, max_x)
+
+        # The same pure function reprojects both a whole recognized-line box
+        # (`line_bounding_box`, `observation.boundingBox`) and a narrower
+        # per-candidate regex-match box (`bounding_box`,
+        # `candidate.boundingBox(for:)`) identically -- there is only one
+        # coordinate contract, not one per box kind.
+        candidate_match_box = (0.1, 0.4, 0.2, 0.3)
+        line_box = (0.0, 1.0, 0.15, 0.35)
+        for rect in (candidate_match_box, line_box):
+            with self.subTest(rect=rect):
+                reprojected = reproject_rect(rect, crop_pixel_rect, source_width, source_height)
+                self.assertTrue(0.0 <= reprojected[0] <= reprojected[1] <= 1.0)
+                self.assertTrue(0.0 <= reprojected[2] <= reprojected[3] <= 1.0)
 
     def test_group_candidates_by_observation_sorts_by_rank(self):
         rank1 = {"observation_index": 0, "candidate_rank": 1, "confidence": 0.4}
