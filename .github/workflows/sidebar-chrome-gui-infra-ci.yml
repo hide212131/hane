@@ -1,0 +1,45 @@
+name: Sidebar Chrome GUI Infra CI
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/aadw_gui_command.py'
+      - '.github/tests/test_aadw_gui_command.py'
+      - '.github/scripts/stage_sidebar_chrome_gui_evidence.py'
+      - '.github/workflows/aadw-sidebar-chrome-gui-validation.yml'
+      - '.github/workflows/sidebar-chrome-gui-infra-ci.yml'
+      - 'scripts/hosted_sidebar_chrome_gui.py'
+      - 'scripts/hosted_sidebar_chrome_gui.swift'
+      - 'scripts/tests/test_hosted_sidebar_chrome_gui.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compile Python sources
+        run: |
+          python3 -m py_compile \
+            .github/scripts/aadw_gui_command.py \
+            .github/scripts/stage_sidebar_chrome_gui_evidence.py \
+            scripts/hosted_sidebar_chrome_gui.py \
+            scripts/tests/test_hosted_sidebar_chrome_gui.py
+      - name: Run GUI router tests
+        run: python3 .github/tests/test_aadw_gui_command.py
+      - name: Run focused validator unit tests
+        run: python3 -m unittest scripts/tests/test_hosted_sidebar_chrome_gui.py
+
+  swift-helper-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compile trusted sidebar chrome helper
+        run: swiftc scripts/hosted_sidebar_chrome_gui.swift -o "$RUNNER_TEMP/sidebar-chrome-helper"
