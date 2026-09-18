@@ -364,6 +364,16 @@ impl ListProjection {
         self.items.get(index)
     }
 
+    pub fn item_for_source_range(&self, item_range: SourceRange) -> Option<&ListProjectionItem> {
+        let index = self
+            .items
+            .binary_search_by_key(&(item_range.start, item_range.end), |item| {
+                (item.item_range.start, item.item_range.end)
+            })
+            .ok()?;
+        self.items.get(index)
+    }
+
     /// Finds the deepest formal list item owning a physical source line. The
     /// row index is built with the formal parse, so a viewport parse does not
     /// have to scan every item in a large list to recover its owner.

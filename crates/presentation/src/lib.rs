@@ -1209,11 +1209,32 @@ fn list_item_range_touches(
     })
 }
 
+fn projected_list_item_range_touches(
+    projection: &ListProjection,
+    item: &ListProjectionItem,
+    disclosure: SourceRange,
+) -> bool {
+    if !range_touches(item.item_range, disclosure) {
+        return false;
+    }
+    if !disclosure.is_empty() || disclosure.start != item.item_range.end {
+        return true;
+    }
+    let sibling = projection
+        .items
+        .partition_point(|candidate| candidate.item_range.start < disclosure.start);
+    !projection.items[sibling..]
+        .iter()
+        .take_while(|candidate| candidate.item_range.start == disclosure.start)
+        .any(|candidate| candidate.list_range == item.list_range)
+}
+
 fn marker_is_disclosed(
     marker: &ProjectedMarker,
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
     disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
 ) -> bool {
     let Some(disclosure) = disclosure else {
         return false;
@@ -1243,7 +1264,12 @@ fn marker_is_disclosed(
     // caret, selection or IME touches any of the owning item's own source
     // range, not just the physical line the indentation itself sits on.
     if let Some(prefix) = marker.global_list_prefix {
-        return range_touches(prefix.item_range, disclosure);
+        let Some(projection) = list_projection else {
+            return false;
+        };
+        return projection
+            .item_for_source_range(prefix.item_range)
+            .is_some_and(|item| projected_list_item_range_touches(projection, item, disclosure));
     }
     if let Some((owner, _)) = marker.list_prefix {
         return parsed
@@ -1535,8 +1561,10 @@ fn present_markdown_from_parse(
         })
         .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
         .unwrap_or_default();
-    if formal_code_block == Some(false) && kind == BlockKind::CodeBlock {
-        kind = BlockKind::ListItem;
+    match formal_code_block {
+        Some(false) if kind == BlockKind::CodeBlock => kind = BlockKind::ListItem,
+        Some(true) => kind = BlockKind::CodeBlock,
+        _ => {}
     }
     let mut visual = String::with_capacity(source.len());
     // The ordered plan belongs to the semantic snapshot. Binary search avoids
@@ -1583,7 +1611,13 @@ fn present_markdown_from_parse(
                 None,
             );
         }
-        let expanded = marker_is_disclosed(planned, parsed, &shared.projection.nodes, disclosure);
+        let expanded = marker_is_disclosed(
+            planned,
+            parsed,
+            &shared.projection.nodes,
+            disclosure,
+            shared.list_projection,
+        );
         append_segment(
             &mut visual,
             &mut segments,
@@ -1684,6 +1718,19 @@ fn present_markdown_from_parse(
             })
         })
         .collect::<Vec<_>>();
+    if formal_code_block == Some(true)
+        && !style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock)
+    {
+        let content_end = visual.trim_end_matches(['\r', '\n']).len();
+        if content_end > 0 {
+            style_runs.push(StyleRun {
+                visual_range: VisualRange::new(0, content_end),
+                kind: StyleKind::CodeBlock,
+            });
+        }
+    }
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
     let list = list_row_metadata(
         parsed,
@@ -2265,7 +2312,7 @@ fn list_marker_metadata(
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
 ) -> Option<ListMarkerMetadata> {
-    let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure);
+    let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure, None);
     let visual_range = if expanded {
         source_map
             .segments

@@ -45,7 +45,7 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
-use hane_presentation::VisualOffset;
+use hane_presentation::{BlockKind, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_heights, block_is_joinable, block_line_span, layout_block,
@@ -4910,6 +4910,67 @@ mod tests {
         assert_eq!(list.structural_prefixes.len(), 1);
         assert_eq!(list.structural_prefixes[0].columns, 4);
         assert!(line.style_runs.is_empty(), "continuation is not code");
+    }
+
+    #[test]
+    fn a_late_list_code_row_keeps_formal_code_display() {
+        let mut source = String::from("- opening\n");
+        for _ in 0..5_000 {
+            source.push_str("  continued\n");
+        }
+        source.push_str("\n  ```\n  code\n  ```\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let code_line = source[..source.find("  code").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late code row presents");
+        let line = &code.lines[0];
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
+    }
+
+    #[test]
+    fn a_sibling_boundary_does_not_disclose_the_previous_formal_prefix() {
+        let mut source = String::from("- first\n");
+        for _ in 0..5_000 {
+            source.push_str("  continued\n");
+        }
+        source.push_str("- second\n");
+        let second_start = source.find("- second").expect("second item");
+        let mut editor = Editor::new(&source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(second_start)))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let continuation_line = 5_000;
+
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(continuation_line..continuation_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("formal continuation presents");
+        assert_eq!(late.lines[0].visual_text, "continued");
     }
 
     #[test]
