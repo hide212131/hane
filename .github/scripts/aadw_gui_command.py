@@ -21,6 +21,7 @@ from typing import Any
 COMMAND_RE = re.compile(r"/gui-validate[ \t]+(head|merge)")
 DATE_BADGE_COMMAND_RE = re.compile(r"/gui-validate[ \t]+date-badge[ \t]+(head|merge)")
 NORMAL_LIST_COMMAND_RE = re.compile(r"/gui-validate[ \t]+normal-list[ \t]+(head|merge)")
+SIDEBAR_COMMAND_RE = re.compile(r"/gui-validate[ \t]+sidebar[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
 RUN_NAME_PREFIX = "AADW GUI"
@@ -40,6 +41,10 @@ TRUSTED_ROUTES = {
     "normal-list": {
         "workflow_file": "aadw-gui-validation.yml",
         "procedure_path": "scripts/hosted_normal_list_gui.py",
+    },
+    "sidebar": {
+        "workflow_file": "aadw-gui-validation.yml",
+        "procedure_path": "scripts/hosted_sidebar_gui.py",
     },
 }
 
@@ -80,10 +85,15 @@ def parse_route(body: str) -> dict[str, str] | None:
             execution_context = date_badge.group(1)
         else:
             normal_list = NORMAL_LIST_COMMAND_RE.fullmatch(normalized)
-            if not normal_list:
-                return None
-            validation_kind = "normal-list"
-            execution_context = normal_list.group(1)
+            if normal_list:
+                validation_kind = "normal-list"
+                execution_context = normal_list.group(1)
+            else:
+                sidebar = SIDEBAR_COMMAND_RE.fullmatch(normalized)
+                if not sidebar:
+                    return None
+                validation_kind = "sidebar"
+                execution_context = sidebar.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {
