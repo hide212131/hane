@@ -632,8 +632,17 @@ fn line_geometry(
             )
         })
         .sum::<f32>();
-    let body_x =
-        marker_x + expanded_prefix_width + aggregate_marker_width.max(disclosed_marker_width);
+    // A disclosed continuation has no marker of its own. Its expanded
+    // structural prefix already paints the indentation that leads to the
+    // item's body, so adding the aggregate marker width would reserve that
+    // column a second time. When the prefix is hidden, keep the aggregate
+    // marker column so inactive continuation rows still hang under the body.
+    let marker_column_width = if list.marker.is_none() && expanded_prefix_width > 0.0 {
+        0.0
+    } else {
+        aggregate_marker_width.max(disclosed_marker_width)
+    };
+    let body_x = marker_x + expanded_prefix_width + marker_column_width;
     LineGeometry {
         marker_x_origin: list.marker.as_ref().map(|_| marker_x),
         body_x_origin: body_x,

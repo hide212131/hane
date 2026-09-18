@@ -769,8 +769,8 @@ fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
         .iter()
         .find(|row| row.line == 1)
         .expect("continuation row is laid out");
-    assert_eq!(continuation.text_x_origin, 16.0);
-    assert_eq!(continuation.body_x_origin, 48.0);
+    assert_eq!(continuation.text_x_origin, 0.0);
+    assert_eq!(continuation.body_x_origin, 32.0);
 
     let item = SourceOffset(source.find("item").expect("item in source"));
     let continued = SourceOffset(source.find("continued").expect("continued in source"));
@@ -783,8 +783,32 @@ fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
             .point_for_source(&block, continued, &shaper())
             .unwrap()
             .x,
-        48.0
+        32.0
     );
+}
+
+#[test]
+fn disclosed_continuation_prefix_does_not_readd_marker_width() {
+    let source = "- item\n  continued\n";
+    let cursor = source.find("continued").expect("continuation in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("continuation row is laid out");
+    assert_eq!(opening.body_x_origin, 16.0);
+    assert_eq!(continuation.body_x_origin, 16.0);
 }
 
 #[test]
