@@ -21,8 +21,8 @@ use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 use crate::line::{
-    block_element, block_fits_sync_join_budget, expected_block_disclosures, presented_block,
-    row_element,
+    BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
+    presented_block, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -4011,6 +4011,7 @@ impl EditorView {
                         .pr(px(SIDEBAR_PADDING + SCROLLBAR_TRACK_WIDTH))
                         .bg(rgb(self.theme.sidebar_background))
                         .text_color(rgb(self.theme.sidebar_foreground))
+                        .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
                         .child(root_row)
                         .children(tree)
