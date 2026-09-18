@@ -89,6 +89,14 @@ const DATE_BADGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
+/// Width of the sidebar's overlay scrollbar thumb while it is shown. Thinner
+/// than `SCROLLBAR_THUMB_WIDTH` (the editor's always-visible thumb) because
+/// the sidebar thumb is a transient overlay over the idle border, not a
+/// permanent track.
+const SIDEBAR_SCROLLBAR_OVERLAY_THUMB_WIDTH: f32 = 3.0;
+/// How long the sidebar's overlay scrollbar thumb stays visible after the
+/// last wheel/trackpad scroll before it hides again.
+const SIDEBAR_SCROLLBAR_OVERLAY_HIDE_DELAY: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug)]
 struct SidebarResizeDrag {
@@ -284,6 +292,16 @@ pub struct EditorView {
     sidebar_scroll: ScrollHandle,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
+    /// Whether the sidebar's overlay scrollbar thumb is currently shown. Idle
+    /// sidebar scrolling shows only the thin sidebar/main border; this flips
+    /// true for the duration of active wheel/trackpad scrolling (see
+    /// `note_sidebar_scroll_activity`) and is also treated as true whenever
+    /// `sidebar_scrollbar_drag` is active, so a drag never disappears out
+    /// from under the pointer.
+    sidebar_scrollbar_overlay_visible: bool,
+    /// Invalidates a previously scheduled auto-hide so only the most recent
+    /// scroll's timer can turn `sidebar_scrollbar_overlay_visible` back off.
+    sidebar_scrollbar_overlay_ticket: u64,
     /// Active drag of the editor's visible scrollbar thumb.
     editor_scrollbar_drag: Option<ScrollbarDrag>,
     /// The local calendar date the sidebar's file-name badges last used for
@@ -657,6 +675,8 @@ impl EditorView {
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
+            sidebar_scrollbar_overlay_visible: false,
+            sidebar_scrollbar_overlay_ticket: 0,
             editor_scrollbar_drag: None,
             sidebar_date_badge_today: local_today(),
             _date_badge_refresh_task: date_badge_refresh_task,
@@ -3240,6 +3260,29 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Shows the sidebar's overlay scrollbar thumb and (re)arms the timer
+    /// that hides it again after `SIDEBAR_SCROLLBAR_OVERLAY_HIDE_DELAY` of no
+    /// further activity. Called on every sidebar wheel/trackpad scroll and
+    /// once a sidebar scrollbar drag ends, so the thumb only disappears once
+    /// scrolling has actually stopped.
+    fn note_sidebar_scroll_activity(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_scrollbar_overlay_visible = true;
+        self.sidebar_scrollbar_overlay_ticket =
+            self.sidebar_scrollbar_overlay_ticket.wrapping_add(1);
+        let ticket = self.sidebar_scrollbar_overlay_ticket;
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(SIDEBAR_SCROLLBAR_OVERLAY_HIDE_DELAY).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.sidebar_scrollbar_overlay_ticket == ticket {
+                    view.sidebar_scrollbar_overlay_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn on_panel_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -3290,9 +3333,17 @@ impl EditorView {
     }
 
     fn finish_panel_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let was_dragging = self.sidebar_resize_drag.take().is_some()
-            || self.sidebar_scrollbar_drag.take().is_some()
-            || self.editor_scrollbar_drag.take().is_some();
+        let sidebar_resize_ended = self.sidebar_resize_drag.take().is_some();
+        let sidebar_scrollbar_ended = self.sidebar_scrollbar_drag.take().is_some();
+        let editor_scrollbar_ended = self.editor_scrollbar_drag.take().is_some();
+        let was_dragging =
+            sidebar_resize_ended || sidebar_scrollbar_ended || editor_scrollbar_ended;
+        if sidebar_scrollbar_ended {
+            // Keeps the just-dragged thumb visible for the same grace period
+            // as an ordinary scroll instead of vanishing the instant the
+            // pointer releases.
+            self.note_sidebar_scroll_activity(cx);
+        }
         if was_dragging {
             cx.stop_propagation();
             cx.notify();
@@ -3355,6 +3406,16 @@ impl EditorView {
         )
     }
 
+    /// Renders the sidebar's directory-tree scrollbar. Idle sidebar scrolling
+    /// shows nothing here but the thin border `sidebar_resizer` already draws
+    /// between the sidebar and the main column: this returns `None` unless a
+    /// scroll or drag is actually in progress
+    /// (`sidebar_scrollbar_overlay_visible`), so no permanent track ever
+    /// paints over that border. The track div itself stays unfilled even
+    /// while shown; only the thin overlay thumb is visible, and it keeps the
+    /// same `SCROLLBAR_TRACK_WIDTH` hit area (and the padding reserved for it
+    /// in the sidebar's content) so drag hit-testing and sidebar/main layout
+    /// are unaffected by whether the thumb currently paints.
     fn sidebar_scrollbar(
         &self,
         viewport_height: f32,
@@ -3365,6 +3426,9 @@ impl EditorView {
         let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
         let (top, thumb_height) =
             scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
+        if !self.sidebar_scrollbar_overlay_visible && self.sidebar_scrollbar_drag.is_none() {
+            return None;
+        }
         Some(
             div()
                 .id("work-folder-scrollbar")
@@ -3373,14 +3437,15 @@ impl EditorView {
                 .right(px(0.0))
                 .w(px(SCROLLBAR_TRACK_WIDTH))
                 .h(px(viewport_height))
-                .bg(rgb(self.theme.sidebar_active_background))
                 .child(
                     div()
                         .id("work-folder-scrollbar-thumb")
                         .absolute()
                         .top(px(top))
-                        .right(px((SCROLLBAR_TRACK_WIDTH - SCROLLBAR_THUMB_WIDTH) / 2.0))
-                        .w(px(SCROLLBAR_THUMB_WIDTH))
+                        .right(px(
+                            (SCROLLBAR_TRACK_WIDTH - SIDEBAR_SCROLLBAR_OVERLAY_THUMB_WIDTH) / 2.0,
+                        ))
+                        .w(px(SIDEBAR_SCROLLBAR_OVERLAY_THUMB_WIDTH))
                         .h(px(thumb_height))
                         .rounded_sm()
                         .cursor(CursorStyle::OpenHand)
@@ -4026,7 +4091,9 @@ impl EditorView {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.sidebar_scroll)
-                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .on_scroll_wheel(cx.listener(|view, _, _, cx| {
+                            view.note_sidebar_scroll_activity(cx);
+                        }))
                         .flex()
                         .flex_col()
                         .pt(px(SIDEBAR_PADDING))
@@ -6256,6 +6323,54 @@ mod tests {
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(900));
         cx.run_until_parked();
+    }
+
+    // Issue #195: idle sidebar scrolling must not paint a permanent
+    // scrollbar track over the thin sidebar/main border; the overlay thumb
+    // only appears while a wheel/trackpad scroll (or a drag of the thumb
+    // itself) is actually in progress, and disappears again once it settles.
+    #[gpui::test]
+    fn sidebar_scrollbar_overlay_shows_during_scroll_activity(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.sidebar_scrollbar(100.0, 400.0, cx).is_none(),
+                "idle sidebar scrolling must not show a permanent scrollbar track"
+            );
+            view.note_sidebar_scroll_activity(cx);
+            assert!(
+                view.sidebar_scrollbar(100.0, 400.0, cx).is_some(),
+                "an active wheel/trackpad scroll must show the overlay thumb"
+            );
+        });
+
+        settle_debounce(cx);
+
+        view.update(cx, |view, cx| {
+            assert!(
+                view.sidebar_scrollbar(100.0, 400.0, cx).is_none(),
+                "the overlay thumb must hide again once scrolling has settled"
+            );
+            view.sidebar_scrollbar_drag = Some(ScrollbarDrag {
+                pointer_y: 0.0,
+                scroll_y: 0.0,
+                viewport_height: 100.0,
+                content_height: 400.0,
+            });
+            assert!(
+                view.sidebar_scrollbar(100.0, 400.0, cx).is_some(),
+                "an in-progress thumb drag must keep the overlay visible even \
+                 without recent wheel activity"
+            );
+        });
     }
 
     // Issue #6: an unnamed work-folder note earns its filename from the
