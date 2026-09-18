@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-normal-list/1"
+PROCEDURE_VERSION = "hosted-normal-list/2"
 VERIFICATION_KIND = "normal_list_focused"
 SCOPE_NOTE = (
     "Issue #126 の normal list 表示(B: ネスト混在、C: 複数段落+子リスト+親リストへの復帰、"
@@ -48,14 +48,10 @@ SCOPE_NOTE = (
     "hosted-gui-interaction/7 や hosted-date-badge の包括的/専用 GUI 検証合格を意味しない。"
     "product PR #189 でリスト内部レイアウトが変更され続けている間、幾何座標ではなく "
     "OCR テキストベースの検証に限定し、内部レイアウト型には依存しない。"
+    "編集、IME、選択範囲、undo/redo、再オープンはこの focused 手順の判定対象外とする。"
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
-
-JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
-IME_ROMAJI = "nihongo"
-IME_EXPECTED_TEXT = "日本語"
-
 
 def load_module(control_dir: Path, relative: str, name: str):
     sys.dont_write_bytecode = True
@@ -95,33 +91,6 @@ def normalized_ocr_text(value: str) -> str:
 # Pure source-byte transforms and OCR/step decision logic. No subprocess, no
 # filesystem, no GUI: these are exercised directly by scripts/tests/.
 # ---------------------------------------------------------------------------
-
-
-def match_insertion_offset(text: str, pattern: str, *, edge: str) -> int:
-    match = re.search(pattern, text)
-    if not match:
-        raise ValueError(f"pattern not found in expected fixture text: {pattern}")
-    return match.end() if edge == "end" else match.start()
-
-
-def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
-    position = match_insertion_offset(text, pattern, edge=edge)
-    return text[:position] + insertion + text[position:]
-
-
-def replace_unique_word(text: str, word: str, replacement: str) -> str:
-    """Replace exactly one whole-word occurrence of `word`, fail-closed otherwise.
-
-    A fixture whose selection-replacement target word became ambiguous (zero
-    or multiple occurrences) after an earlier mutation must not silently pick
-    one; this raises instead of guessing.
-    """
-    pattern = rf"\b{re.escape(word)}\b"
-    matches = list(re.finditer(pattern, text))
-    if len(matches) != 1:
-        raise ValueError(f"expected exactly one occurrence of {word!r}, found {len(matches)}")
-    match = matches[0]
-    return text[: match.start()] + replacement + text[match.end() :]
 
 
 def expected_sequential_numbers(seed: int, count: int) -> list:
@@ -189,32 +158,12 @@ class MarkerCheck:
 
 
 @dataclass(frozen=True)
-class EditCheck:
-    content_pattern: str
-    insertion: str
-
-
-@dataclass(frozen=True)
-class ImeCheck:
-    content_pattern: str
-
-
-@dataclass(frozen=True)
-class SelectionCheck:
-    word: str
-    replacement: str
-
-
-@dataclass(frozen=True)
 class ScenarioSpec:
     name: str
     fixture_filename: str
     fixture_text: str
     initial_checks: tuple
     marker_check: MarkerCheck
-    edit_check: EditCheck
-    ime_check: ImeCheck
-    selection_check: SelectionCheck
 
 
 def build_mixed_nested_list_fixture() -> str:
@@ -251,9 +200,6 @@ MIXED_NESTED_LIST_SPEC = ScenarioSpec(
         content_pattern=r"Beta lead item",
         raw_marker_pattern=r"-\s*Beta lead item",
     ),
-    edit_check=EditCheck(content_pattern=r"Gamma lead second", insertion=" EDITED-MIXED"),
-    ime_check=ImeCheck(content_pattern=r"Alpha nested two"),
-    selection_check=SelectionCheck(word="bullet", replacement="marker"),
 )
 
 
@@ -287,9 +233,6 @@ PARAGRAPH_CHILD_LIST_SPEC = ScenarioSpec(
         content_pattern=r"Second item after return",
         raw_marker_pattern=r"2\.\s*Second item after return",
     ),
-    edit_check=EditCheck(content_pattern=r"Second item after return", insertion=" EDITED-CHILD"),
-    ime_check=ImeCheck(content_pattern=r"First item continued paragraph\."),
-    selection_check=SelectionCheck(word="one", replacement="uno"),
 )
 
 
@@ -331,31 +274,10 @@ NONSEQUENTIAL_ORDERED_SPEC = ScenarioSpec(
         raw_marker_pattern=rf"{NONSEQUENTIAL_ORDERED_RAW_NUMBERS[1]}\.\s*Beta row",
         normalized_pattern=rf"{NONSEQUENTIAL_ORDERED_EXPECTED_NUMBERS[1]}\.\s*Beta row",
     ),
-    edit_check=EditCheck(content_pattern=r"Gamma row", insertion=" EDITED-ORDERED"),
-    ime_check=ImeCheck(content_pattern=r"Alpha row"),
-    selection_check=SelectionCheck(word="Beta", replacement="Bravo"),
 )
 
 
 ALL_SCENARIO_SPECS = (MIXED_NESTED_LIST_SPEC, PARAGRAPH_CHILD_LIST_SPEC, NONSEQUENTIAL_ORDERED_SPEC)
-
-
-def compute_expected_states(spec: ScenarioSpec) -> dict:
-    """The pure byte-transition chain a real run must reproduce on disk.
-
-    Mirrors the exact runtime step order (edit -> ime -> selection replace),
-    so this is directly comparable against `wait_for_fixture_bytes` results.
-    """
-    baseline = spec.fixture_text
-    after_edit = insert_at_match(baseline, spec.edit_check.content_pattern, spec.edit_check.insertion, edge="end")
-    after_ime = insert_at_match(after_edit, spec.ime_check.content_pattern, IME_EXPECTED_TEXT, edge="end")
-    after_select = replace_unique_word(after_ime, spec.selection_check.word, spec.selection_check.replacement)
-    return {
-        "baseline": baseline,
-        "after_edit": after_edit,
-        "after_ime": after_ime,
-        "after_select": after_select,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -461,16 +383,14 @@ def click_content(interaction_module, helper, pid, screenshot: Path, pattern: st
 def run_scenario(
     gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, base_run_dir: Path,
     binary_path: Path, expected_sha: str, request_id: str, startup_timeout: float, window_timeout: float,
-    helper_timeout: float, poll_timeout: float, priority: dict, spec: ScenarioSpec,
+    helper_timeout: float, priority: dict, spec: ScenarioSpec,
 ) -> dict:
     run_dir = base_run_dir / spec.name
     fixture_path = run_dir / spec.fixture_filename
     run_dir.mkdir(parents=True, exist_ok=True)
     fixture_path.write_text(spec.fixture_text, encoding="utf-8")
-    states = compute_expected_states(spec)
     steps: list = []
     process_holder: dict = {"process": None}
-    original_source: Optional[str] = None
     config = interaction_module.make_config(
         gui_validate_module, workspace_dir=target_dir, scenario=f"normal-list-{spec.name}",
         expected_sha=expected_sha, request_id=request_id, generation="1", run_dir=run_dir,
@@ -525,173 +445,9 @@ def run_scenario(
                         else:
                             steps.append(evaluate_marker_reclosure(reclosed_lines, marker_check))
 
-            edit_check = spec.edit_check
-            steps.append(interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "before_edit"))
-            clicked, evidence, err = click_content(
-                interaction_module, swift_helper, pid, run_dir / "before_edit.png",
-                edit_check.content_pattern, "end", helper_timeout,
-            )
-            if not clicked:
-                steps.append(step("edit_click", "blocked", err, content_pattern=edit_check.content_pattern))
-                steps.append(skipped_step("edit_save", "編集対象へのクリックに失敗した"))
-            else:
-                steps.append(step("edit_click", "pass", click_evidence=evidence))
-                ok, _out, err = interaction_module.run_helper(swift_helper, ["type-save", str(pid), edit_check.insertion], helper_timeout)
-                if not ok:
-                    steps.append(step("edit_save", "blocked", err))
-                else:
-                    matched, actual = interaction_module.wait_for_fixture_bytes(
-                        fixture_path, states["after_edit"].encode("utf-8"), poll_timeout
-                    )
-                    steps.append(step(
-                        "edit_save", "pass" if matched else "fail",
-                        None if matched else "直接ソース編集の保存後バイト列が期待値と一致しない",
-                        expected=states["after_edit"], actual=actual.decode("utf-8", errors="replace"),
-                    ))
-
-            ok, out, _err = interaction_module.run_helper(swift_helper, ["current-source"], helper_timeout)
-            if ok:
-                original_source = out
-            ok, out, err = interaction_module.run_helper(swift_helper, ["list-sources"], helper_timeout)
-            available = [line for line in out.splitlines() if line.strip()] if ok else []
-            if not ok:
-                steps.append(step("list_input_sources", "blocked", err))
-                steps.append(skipped_step("ime_input_save", "入力ソース一覧を取得できなかった"))
-            elif JAPANESE_SOURCE not in available:
-                steps.append(step("select_japanese_source", "blocked", "このランナーに組み込みの日本語入力ソースが見つからない", available_sources=available))
-                steps.append(skipped_step("ime_input_save", "日本語入力ソースを選択できなかった"))
-            else:
-                ime_check = spec.ime_check
-                steps.append(interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "before_ime"))
-                clicked, evidence, err = click_content(
-                    interaction_module, swift_helper, pid, run_dir / "before_ime.png",
-                    ime_check.content_pattern, "end", helper_timeout,
-                )
-                if not clicked:
-                    steps.append(step("ime_click", "blocked", err, content_pattern=ime_check.content_pattern))
-                    steps.append(skipped_step("ime_input_save", "IME 入力対象へのクリックに失敗した"))
-                else:
-                    steps.append(step("ime_click", "pass", click_evidence=evidence))
-                    ok, _out, err = interaction_module.run_helper(
-                        swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_ROMAJI, JAPANESE_SOURCE], helper_timeout
-                    )
-                    if not ok:
-                        steps.append(step("ime_input_save", "blocked", err))
-                    else:
-                        matched, actual = interaction_module.wait_for_fixture_bytes(
-                            fixture_path, states["after_ime"].encode("utf-8"), poll_timeout
-                        )
-                        steps.append(step(
-                            "ime_input_save", "pass" if matched else "fail",
-                            None if matched else "日本語 IME 入力後の保存バイト列が期待値と一致しない",
-                            expected=states["after_ime"], actual=actual.decode("utf-8", errors="replace"),
-                        ))
-
-            selection_check = spec.selection_check
-            steps.append(interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "before_select"))
-            word_pattern = rf"\b{re.escape(selection_check.word)}\b"
-            ok, out, err = interaction_module.run_helper(
-                swift_helper,
-                ["drag-select-text", str(pid), str(run_dir / "before_select.png"), word_pattern, "start", word_pattern, "end"],
-                helper_timeout,
-            )
-            if not ok:
-                steps.append(step("selection_drag", "blocked", err, word=selection_check.word))
-                steps.append(skipped_step("selection_replace_save", "選択範囲のドラッグに失敗した"))
-                steps.append(skipped_step("undo_selection_replace", "選択範囲のドラッグに失敗した"))
-                steps.append(skipped_step("redo_selection_replace", "選択範囲のドラッグに失敗した"))
-            else:
-                steps.append(step("selection_drag", "pass", drag_evidence=out))
-                ok, _out, err = interaction_module.run_helper(
-                    swift_helper, ["type-save", str(pid), selection_check.replacement], helper_timeout
-                )
-                if not ok:
-                    steps.append(step("selection_replace_save", "blocked", err))
-                    steps.append(skipped_step("undo_selection_replace", "選択範囲の置換に失敗した"))
-                    steps.append(skipped_step("redo_selection_replace", "選択範囲の置換に失敗した"))
-                else:
-                    matched, actual = interaction_module.wait_for_fixture_bytes(
-                        fixture_path, states["after_select"].encode("utf-8"), poll_timeout
-                    )
-                    steps.append(step(
-                        "selection_replace_save", "pass" if matched else "fail",
-                        None if matched else "選択範囲の置換後バイト列が期待値と一致しない",
-                        expected=states["after_select"], actual=actual.decode("utf-8", errors="replace"),
-                    ))
-                    ok, _out, err = interaction_module.run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
-                    if not ok:
-                        steps.append(step("undo_selection_replace", "blocked", err))
-                    else:
-                        matched, actual = interaction_module.wait_for_fixture_bytes(
-                            fixture_path, states["after_ime"].encode("utf-8"), poll_timeout
-                        )
-                        steps.append(step(
-                            "undo_selection_replace", "pass" if matched else "fail",
-                            None if matched else "undo 後に選択置換前のバイト列へ戻らない",
-                            expected=states["after_ime"], actual=actual.decode("utf-8", errors="replace"),
-                        ))
-                    ok, _out, err = interaction_module.run_helper(swift_helper, ["redo-save", str(pid)], helper_timeout)
-                    if not ok:
-                        steps.append(step("redo_selection_replace", "blocked", err))
-                    else:
-                        matched, actual = interaction_module.wait_for_fixture_bytes(
-                            fixture_path, states["after_select"].encode("utf-8"), poll_timeout
-                        )
-                        steps.append(step(
-                            "redo_selection_replace", "pass" if matched else "fail",
-                            None if matched else "redo 後に選択置換後のバイト列へ戻らない",
-                            expected=states["after_select"], actual=actual.decode("utf-8", errors="replace"),
-                        ))
             steps.append(interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "after"))
     finally:
         steps.append(interaction_module.close_session(gui_validate_module, env, process_holder))
-        if original_source:
-            ok, _out, err = interaction_module.run_helper(swift_helper, ["select-source", original_source], helper_timeout)
-            steps.append(step("restore_input_source", "pass" if ok else "blocked", None if ok else err))
-
-    if worst(steps, priority) != "pass":
-        for name in ("launch_reopen", "window_discovery_reopen", "capture_reopen", "reopen_content_check"):
-            steps.append(skipped_step(name, "再オープン前の工程が pass しなかった"))
-        return {
-            "name": spec.name, "steps": steps, "result": worst(steps, priority), "reason": reason_for(steps),
-            "evidence": {"fixture_path": str(fixture_path), "run_dir": str(run_dir)},
-        }
-
-    reopen_dir = run_dir / "reopen"
-    reopen_holder: dict = {"process": None}
-    reopen_config = interaction_module.make_config(
-        gui_validate_module, workspace_dir=target_dir, scenario=f"normal-list-{spec.name}-reopen",
-        expected_sha=expected_sha, request_id=request_id, generation="2", run_dir=reopen_dir,
-        fixture_path=fixture_path, features=["timing-probe"], extra_env={},
-        startup_timeout=startup_timeout, window_timeout=window_timeout,
-    )
-    try:
-        session_steps, reopen_window_id = interaction_module.open_session(
-            gui_validate_module, env, reopen_config, binary_path, reopen_holder, "reopen"
-        )
-        steps += session_steps
-        matched, actual = interaction_module.wait_for_fixture_bytes(
-            fixture_path, states["after_select"].encode("utf-8"), 1.0
-        )
-        steps.append(step(
-            "reopen_content_check", "pass" if matched else "fail",
-            None if matched else "再オープン後もフィクスチャ内容が最終編集結果と一致することを確認できない",
-            note="ファイル内容の一致は再オープンの証跡の一部に過ぎず、描画結果そのものの証明ではない",
-            expected=states["after_select"], actual=actual.decode("utf-8", errors="replace"),
-        ))
-        if reopen_window_id is not None:
-            ok, lines, err = ocr_lines(interaction_module, swift_helper, reopen_dir / "reopen.png", helper_timeout)
-            if not ok:
-                steps.append(step("reopen_visible_text", "blocked", err))
-            else:
-                found = find_line(lines, re.escape(spec.selection_check.replacement))
-                steps.append(step(
-                    "reopen_visible_text", "pass" if found else "fail",
-                    None if found else "再オープン後の画面で最終編集内容を OCR で確認できない",
-                    replacement=spec.selection_check.replacement, ocr_lines=lines,
-                ))
-    finally:
-        steps.append(interaction_module.close_session(gui_validate_module, env, reopen_holder))
 
     return {
         "name": spec.name, "steps": steps, "result": worst(steps, priority), "reason": reason_for(steps),
@@ -727,7 +483,6 @@ def main() -> int:
     startup_timeout = env_float("HANE_NORMAL_LIST_GUI_STARTUP_TIMEOUT_SECS", 15.0)
     window_timeout = env_float("HANE_NORMAL_LIST_GUI_WINDOW_TIMEOUT_SECS", 30.0)
     helper_timeout = env_float("HANE_NORMAL_LIST_GUI_HELPER_TIMEOUT_SECS", 20.0)
-    poll_timeout = env_float("HANE_NORMAL_LIST_GUI_POLL_TIMEOUT_SECS", 10.0)
     run_dir.mkdir(parents=True, exist_ok=True)
     result_path = run_dir / "result.json"
 
@@ -781,7 +536,7 @@ def main() -> int:
                         scenarios.append(run_scenario(
                             gui_validate_module, interaction_module, env, target_dir, swift_helper,
                             run_dir, binary_path, expected_sha, request_id,
-                            startup_timeout, window_timeout, helper_timeout, poll_timeout,
+                            startup_timeout, window_timeout, helper_timeout,
                             priority, spec,
                         ))
                     except (gui_validate_module.Aborted, Exception) as exc:
