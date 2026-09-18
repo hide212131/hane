@@ -143,7 +143,7 @@ jobs:
               echo '::error::Could not resolve routed comment actor.'
               exit 1
             fi
-            if [[ "$comment_kind" != 'comprehensive' && "$comment_kind" != 'normal-list' ]]; then
+            if [[ "$comment_kind" != 'comprehensive' && "$comment_kind" != 'normal-list' && "$comment_kind" != 'sidebar' ]]; then
               echo "::error::Routed comment selected an unsupported validation kind for this workflow: ${comment_kind:-invalid}."
               exit 1
             fi
@@ -220,6 +220,10 @@ jobs:
             'hosted-normal-list/1'|'hosted-normal-list/2')
               procedure_path='scripts/hosted_normal_list_gui.py'
               validation_kind='normal-list'
+              ;;
+            'hosted-sidebar/1')
+              procedure_path='scripts/hosted_sidebar_gui.py'
+              validation_kind='sidebar'
               ;;
             *)
               echo "::error::Unsupported trusted procedure: ${REQUESTED_PROCEDURE}"
@@ -396,6 +400,14 @@ jobs:
               HANE_NORMAL_LIST_GUI_EXPECTED_SHA="$EXPECTED_SHA" \
               HANE_NORMAL_LIST_GUI_RUN_DIR="$RUN_DIR" \
               HANE_NORMAL_LIST_GUI_REQUEST_ID="$REQUEST_ID" \
+              python3 "$CONTROL_DIR/$PROCEDURE_PATH"
+              ;;
+            scripts/hosted_sidebar_gui.py)
+              HANE_SIDEBAR_GUI_TARGET_DIR="$TARGET_DIR" \
+              HANE_SIDEBAR_GUI_CONTROL_DIR="$CONTROL_DIR" \
+              HANE_SIDEBAR_GUI_EXPECTED_SHA="$EXPECTED_SHA" \
+              HANE_SIDEBAR_GUI_RUN_DIR="$RUN_DIR" \
+              HANE_SIDEBAR_GUI_REQUEST_ID="$REQUEST_ID" \
               python3 "$CONTROL_DIR/$PROCEDURE_PATH"
               ;;
             *)
