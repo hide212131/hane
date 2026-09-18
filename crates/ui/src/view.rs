@@ -29,8 +29,8 @@ use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
-    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, div, point, prelude::FluentBuilder, px, rgb,
+    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task,
+    Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 #[cfg(test)]
 use hane_document::Bias;
@@ -4081,13 +4081,8 @@ fn file_name_label(
     };
     let remainder = badge.remainder();
     let chip = date_badge_chip(badge.date, today, theme);
-    let remainder_child = (!remainder.is_empty()).then(|| {
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .truncate()
-            .child(remainder)
-    });
+    let remainder_child =
+        (!remainder.is_empty()).then(|| div().flex_1().min_w(px(0.0)).truncate().child(remainder));
     if badge_renders_before_remainder(badge_position) {
         row.child(chip).children(remainder_child)
     } else {
@@ -4349,8 +4344,9 @@ mod tests {
 
         // Rechecking the same day the sidebar already knows about must not
         // report a change: nothing new to redraw.
-        let changed =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(initial, cx));
+        let changed = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(initial, cx)
+        });
         assert!(!changed);
         assert_eq!(
             view.update(cx, |view, _cx| view.sidebar_date_badge_today),
@@ -4359,8 +4355,9 @@ mod tests {
 
         // A genuine date-boundary crossing updates the cached date and
         // reports that the sidebar has something new to show.
-        let changed =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        let changed = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(other_day, cx)
+        });
         assert!(changed);
         assert_eq!(
             view.update(cx, |view, _cx| view.sidebar_date_badge_today),
@@ -4368,8 +4365,9 @@ mod tests {
         );
 
         // Rechecking again on the new day is once more a no-op.
-        let changed_again =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        let changed_again = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(other_day, cx)
+        });
         assert!(!changed_again);
     }
 

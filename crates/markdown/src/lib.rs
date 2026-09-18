@@ -1086,8 +1086,7 @@ fn list_structural_prefixes(
 
         let mut line_start = opening_line_start + opening_line.len();
         for line in markdown_lines(&source[line_start..end]) {
-            if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes())
-            {
+            if let Some(mut cursor) = consume_containers(&containers, line_start, line.as_bytes()) {
                 let before = cursor.byte;
                 if cursor.indent(line.as_bytes(), indent) == indent && cursor.byte > before {
                     prefixes.push((
@@ -1921,28 +1920,28 @@ mod tests {
         // continues onto, including the nested list's own opening line and
         // its own later paragraph, but not the nested item's own inner share
         // of "second"'s indentation.
-        assert!(parsed.list_structural_prefixes.contains(&(
-            SourceRange::new(9, 11),
-            outer,
-            2
-        )));
-        assert!(parsed.list_structural_prefixes.contains(&(
-            SourceRange::new(20, 22),
-            outer,
-            2
-        )));
-        assert!(parsed.list_structural_prefixes.contains(&(
-            SourceRange::new(32, 34),
-            outer,
-            2
-        )));
+        assert!(
+            parsed
+                .list_structural_prefixes
+                .contains(&(SourceRange::new(9, 11), outer, 2))
+        );
+        assert!(
+            parsed
+                .list_structural_prefixes
+                .contains(&(SourceRange::new(20, 22), outer, 2))
+        );
+        assert!(
+            parsed
+                .list_structural_prefixes
+                .contains(&(SourceRange::new(32, 34), outer, 2))
+        );
         // The nested item owns only the remainder of "second"'s indentation,
         // past the outer item's own share of the same physical line.
-        assert!(parsed.list_structural_prefixes.contains(&(
-            SourceRange::new(22, 24),
-            inner,
-            2
-        )));
+        assert!(
+            parsed
+                .list_structural_prefixes
+                .contains(&(SourceRange::new(22, 24), inner, 2))
+        );
         assert_structural_prefixes_are_whitespace(source, &parsed.list_structural_prefixes);
     }
 

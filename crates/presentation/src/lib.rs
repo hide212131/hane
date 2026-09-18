@@ -40,8 +40,8 @@ mod layout;
 pub mod testing;
 
 pub use layout::{
-    BlockLayout, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove, layout_block,
-    line_visual_start, LIST_DEPTH_INDENT,
+    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove,
+    layout_block, line_visual_start,
 };
 
 use hane_document::{
@@ -1241,7 +1241,9 @@ fn marker_edge(
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
 ) -> Option<MarkerEdge> {
-    if planned.quote_owner.is_some() || planned.list_owner.is_some() || planned.list_prefix.is_some()
+    if planned.quote_owner.is_some()
+        || planned.list_owner.is_some()
+        || planned.list_prefix.is_some()
     {
         return Some(MarkerEdge::Opening);
     }
@@ -1480,7 +1482,8 @@ fn present_markdown_from_parse(
         // together.
         if !expanded
             && let Some(owner) = planned.list_owner
-            && let Some(label) = list_item_label(parsed, &shared.projection.list_item_ordinals, owner)
+            && let Some(label) =
+                list_item_label(parsed, &shared.projection.list_item_ordinals, owner)
         {
             let visual_start = visual.len();
             visual.push_str(&label);
@@ -2042,7 +2045,12 @@ impl ProjectionIndex {
             .iter()
             .chain(&parsed.code_padding)
             .chain(&parsed.line_break_padding)
-            .chain(parsed.list_structural_prefixes.iter().map(|(range, _, _)| range))
+            .chain(
+                parsed
+                    .list_structural_prefixes
+                    .iter()
+                    .map(|(range, _, _)| range),
+            )
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
@@ -3676,8 +3684,7 @@ mod tests {
         // content is interrupted by a nested child list with its own second
         // paragraph, followed by the outer item's own second paragraph, then
         // an unrelated top-level sibling.
-        let source =
-            "- outer\n\n  - inner\n\n    second\n\n  outer second\n\n- sibling";
+        let source = "- outer\n\n  - inner\n\n    second\n\n  outer second\n\n- sibling";
         let start = 50;
         let range = SourceRange::new(start, start + source.len());
         let outer_line = 0;
@@ -3694,7 +3701,10 @@ mod tests {
         let collapsed = present(None);
         assert_eq!(line(&collapsed.visual_text, outer_line), "\u{2022} outer");
         assert_eq!(line(&collapsed.visual_text, inner_line), "\u{2022} inner");
-        assert_eq!(line(&collapsed.visual_text, sibling_line), "\u{2022} sibling");
+        assert_eq!(
+            line(&collapsed.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
 
         // A caret inside the nested child's own first line discloses both the
         // nested item's own marker and its ancestor's, since the caret's
@@ -4078,7 +4088,10 @@ mod tests {
             .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
             .expect("a list item");
         let populated = list_item_ordinals(&parsed.tree);
-        assert_eq!(list_item_label(&parsed, &populated, item), Some("1. ".to_owned()));
+        assert_eq!(
+            list_item_label(&parsed, &populated, item),
+            Some("1. ".to_owned())
+        );
         let empty = vec![None; parsed.tree.len()];
         assert_eq!(list_item_label(&parsed, &empty, item), None);
     }
@@ -4120,7 +4133,14 @@ mod tests {
             projection: &joined.projection,
         };
         let middle = ITEMS / 2;
-        for &index in &[middle - 2, middle - 1, middle, ITEMS - 3, ITEMS - 2, ITEMS - 1] {
+        for &index in &[
+            middle - 2,
+            middle - 1,
+            middle,
+            ITEMS - 3,
+            ITEMS - 2,
+            ITEMS - 1,
+        ] {
             let line = &lines[index];
             let presented = present_markdown_from_parse(
                 line.line as u64,
@@ -4136,7 +4156,10 @@ mod tests {
                 format!("{}. item {index}\n", start_value + index as u64),
                 "item {index}"
             );
-            assert!(segments_tile_range(line.range, &presented.source_map.segments));
+            assert!(segments_tile_range(
+                line.range,
+                &presented.source_map.segments
+            ));
             assert!(
                 presented.source_map.segments.capacity() <= 5,
                 "mapping storage must depend on this line's own markers, not item {index}'s position"
