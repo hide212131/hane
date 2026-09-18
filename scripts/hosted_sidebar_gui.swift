@@ -236,7 +236,7 @@ case "capture":
     guard args.count == 3, let pid = pid_t(args[1]) else { fail("capture requires PID path") }
     capture(pid, args[2])
 case "wheel-capture":
-    guard args.count == 7,
+    guard args.count == 6,
           let pid = pid_t(args[1]),
           let x = Double(args[2]), let y = Double(args[3]),
           let pixels = Int32(args[4])
