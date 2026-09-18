@@ -28,6 +28,7 @@
 //! `PathBuf`, never writes a file, and never reaches for the process working
 //! directory.
 
+mod date_badge;
 mod draft;
 mod identity;
 mod naming;
@@ -38,6 +39,10 @@ mod store;
 pub mod testing;
 mod workfolder;
 
+pub use date_badge::{
+    CalendarDate, FileNameDateBadge, format_relative_date_label, local_today,
+    split_file_name_for_badge,
+};
 pub use draft::{DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts};
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};
 pub use naming::{
