@@ -85,6 +85,15 @@ const DATE_BADGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
+/// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
+/// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
+/// editor's always-visible thumb) so the sidebar's idle right edge reads as
+/// the thin `sidebar_resizer` boundary line rather than a second, thicker
+/// scrollbar track (see issue #195).
+const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
+/// How long the sidebar's overlay scrollbar thumb stays shown after the most
+/// recent wheel/trackpad scroll or thumb drag before it fades back out.
+const SIDEBAR_SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug)]
 struct SidebarResizeDrag {
@@ -282,6 +291,15 @@ pub struct EditorView {
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
     editor_scrollbar_drag: Option<ScrollbarDrag>,
+    /// Whether the sidebar's overlay scrollbar thumb is currently shown. Set
+    /// on a wheel/trackpad scroll or thumb drag and cleared by the delayed
+    /// hide task armed in `show_sidebar_scrollbar_briefly` once
+    /// `sidebar_scrollbar_activity` shows no newer scroll happened meanwhile.
+    sidebar_scrollbar_visible: bool,
+    /// Generation counter bumped on every call to
+    /// `show_sidebar_scrollbar_briefly`, so a hide task armed by an earlier
+    /// scroll can tell it has been superseded by a later one and skip hiding.
+    sidebar_scrollbar_activity: u64,
     /// The local calendar date the sidebar's file-name badges last used for
     /// "today" (see `refresh_sidebar_date_badge_today`). The render path
     /// itself always reads a fresh `local_today()`; this is only kept so the
@@ -654,6 +672,8 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
+            sidebar_scrollbar_visible: false,
+            sidebar_scrollbar_activity: 0,
             sidebar_date_badge_today: local_today(),
             _date_badge_refresh_task: date_badge_refresh_task,
             pending_new_folders: HashSet::new(),
@@ -3266,13 +3286,43 @@ impl EditorView {
     }
 
     fn finish_panel_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let was_sidebar_scrollbar_drag = self.sidebar_scrollbar_drag.take().is_some();
         let was_dragging = self.sidebar_resize_drag.take().is_some()
-            || self.sidebar_scrollbar_drag.take().is_some()
+            || was_sidebar_scrollbar_drag
             || self.editor_scrollbar_drag.take().is_some();
         if was_dragging {
             cx.stop_propagation();
             cx.notify();
         }
+        if was_sidebar_scrollbar_drag {
+            // Keep the just-dragged thumb visible for the same brief window
+            // as a wheel scroll, rather than snapping it away the instant
+            // the mouse comes up.
+            self.show_sidebar_scrollbar_briefly(cx);
+        }
+    }
+
+    /// Shows the sidebar's overlay scrollbar thumb, then hides it again after
+    /// `SIDEBAR_SCROLLBAR_HIDE_DELAY` unless a later scroll or drag
+    /// (identified by `sidebar_scrollbar_activity`) supersedes this call
+    /// first. Called on sidebar wheel/trackpad scrolling and at the end of a
+    /// thumb drag; the idle sidebar shows no track or thumb, only the
+    /// existing thin `sidebar_resizer` boundary line.
+    fn show_sidebar_scrollbar_briefly(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_scrollbar_visible = true;
+        self.sidebar_scrollbar_activity = self.sidebar_scrollbar_activity.wrapping_add(1);
+        let activity = self.sidebar_scrollbar_activity;
+        cx.spawn(async move |view, cx| {
+            gpui::Timer::after(SIDEBAR_SCROLLBAR_HIDE_DELAY).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.sidebar_scrollbar_activity == activity {
+                    view.sidebar_scrollbar_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn sidebar_resizer(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -3341,6 +3391,12 @@ impl EditorView {
         let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
         let (top, thumb_height) =
             scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
+        // Idle sidebar shows no track or thumb at all: the only visible
+        // right-edge boundary is the thin `sidebar_resizer` line. The thumb
+        // appears only while actively scrolling or being dragged.
+        if !self.sidebar_scrollbar_visible && self.sidebar_scrollbar_drag.is_none() {
+            return None;
+        }
         Some(
             div()
                 .id("work-folder-scrollbar")
@@ -3349,14 +3405,15 @@ impl EditorView {
                 .right(px(0.0))
                 .w(px(SCROLLBAR_TRACK_WIDTH))
                 .h(px(viewport_height))
-                .bg(rgb(self.theme.sidebar_active_background))
                 .child(
                     div()
                         .id("work-folder-scrollbar-thumb")
                         .absolute()
                         .top(px(top))
-                        .right(px((SCROLLBAR_TRACK_WIDTH - SCROLLBAR_THUMB_WIDTH) / 2.0))
-                        .w(px(SCROLLBAR_THUMB_WIDTH))
+                        .right(px(
+                            (SCROLLBAR_TRACK_WIDTH - SIDEBAR_SCROLLBAR_THUMB_WIDTH) / 2.0
+                        ))
+                        .w(px(SIDEBAR_SCROLLBAR_THUMB_WIDTH))
                         .h(px(thumb_height))
                         .rounded_sm()
                         .cursor(CursorStyle::OpenHand)
@@ -4002,7 +4059,9 @@ impl EditorView {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.sidebar_scroll)
-                        .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                        .on_scroll_wheel(
+                            cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)),
+                        )
                         .flex()
                         .flex_col()
                         .pt(px(SIDEBAR_PADDING))
@@ -4367,6 +4426,56 @@ mod tests {
         let changed_again =
             view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
         assert!(!changed_again);
+    }
+
+    // Issue #195: the sidebar's overlay scrollbar thumb must appear only
+    // while the user is actively scrolling, not sit visible at rest.
+    #[gpui::test]
+    fn sidebar_scrollbar_thumb_shows_on_scroll_and_hides_after_the_delay(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            assert!(!view.sidebar_scrollbar_visible);
+            view.show_sidebar_scrollbar_briefly(cx);
+            assert!(view.sidebar_scrollbar_visible);
+        });
+
+        // `show_sidebar_scrollbar_briefly` debounces on a real `gpui::Timer`
+        // (wall-clock, not the deterministic test dispatcher, see
+        // `draft_save_survives_switching_sessions_within_the_debounce_window`),
+        // so the test has to wait for real time to pass.
+        cx.run_until_parked();
+        std::thread::sleep(SIDEBAR_SCROLLBAR_HIDE_DELAY + Duration::from_millis(200));
+        cx.run_until_parked();
+
+        view.update(cx, |view, _cx| {
+            assert!(!view.sidebar_scrollbar_visible);
+        });
+    }
+
+    // Issue #195: the idle sidebar right edge must show no scrollbar track
+    // or thumb, only the existing thin `sidebar_resizer` boundary line; the
+    // thumb must still render (and keep its existing position/size contract
+    // from `scrollbar_thumb_geometry`) while a drag is in progress.
+    #[gpui::test]
+    fn sidebar_scrollbar_element_is_hidden_at_rest_and_shown_during_a_drag(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_none());
+
+            view.sidebar_scrollbar_drag = Some(ScrollbarDrag {
+                pointer_y: 0.0,
+                scroll_y: 0.0,
+                viewport_height: 100.0,
+                content_height: 400.0,
+            });
+            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_some());
+        });
     }
 
     #[test]
