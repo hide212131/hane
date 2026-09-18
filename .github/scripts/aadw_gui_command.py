@@ -20,6 +20,7 @@ from typing import Any
 # workflow cannot accept a focused command if it is ever mis-dispatched.
 COMMAND_RE = re.compile(r"/gui-validate[ \t]+(head|merge)")
 DATE_BADGE_COMMAND_RE = re.compile(r"/gui-validate[ \t]+date-badge[ \t]+(head|merge)")
+NORMAL_LIST_COMMAND_RE = re.compile(r"/gui-validate[ \t]+normal-list[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
 RUN_NAME_PREFIX = "AADW GUI"
@@ -35,6 +36,10 @@ TRUSTED_ROUTES = {
     "date-badge": {
         "workflow_file": "aadw-date-badge-gui-validation.yml",
         "procedure_path": "scripts/hosted_date_badge_gui.py",
+    },
+    "normal-list": {
+        "workflow_file": "aadw-gui-validation.yml",
+        "procedure_path": "scripts/hosted_normal_list_gui.py",
     },
 }
 
@@ -70,10 +75,15 @@ def parse_route(body: str) -> dict[str, str] | None:
         execution_context = comprehensive.group(1)
     else:
         date_badge = DATE_BADGE_COMMAND_RE.fullmatch(normalized)
-        if not date_badge:
-            return None
-        validation_kind = "date-badge"
-        execution_context = date_badge.group(1)
+        if date_badge:
+            validation_kind = "date-badge"
+            execution_context = date_badge.group(1)
+        else:
+            normal_list = NORMAL_LIST_COMMAND_RE.fullmatch(normalized)
+            if not normal_list:
+                return None
+            validation_kind = "normal-list"
+            execution_context = normal_list.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {

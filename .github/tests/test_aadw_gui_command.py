@@ -96,6 +96,19 @@ class ParseRouteTests(unittest.TestCase):
                     },
                 )
 
+    def test_routes_normal_list_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate normal-list {context}"),
+                    {
+                        "validation_kind": "normal-list",
+                        "execution_context": context,
+                        "workflow_file": "aadw-gui-validation.yml",
+                        "procedure_path": "scripts/hosted_normal_list_gui.py",
+                    },
+                )
+
     def test_rejects_prose_extra_args_and_unknown_validation_kind(self):
         invalid = (
             "/gui-validate date-badge",
@@ -103,6 +116,8 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate unknown merge",
             "このPRは /gui-validate date-badge merge してください",
             "/gui-validate date-badge\nmerge",
+            "/gui-validate normal-list",
+            "/gui-validate normal-list merge extra",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
