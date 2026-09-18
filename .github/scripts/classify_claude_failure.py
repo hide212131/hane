@@ -34,6 +34,10 @@ def _error_result_text(events: list[dict[str, Any]]) -> str:
         result = event.get("result")
         if isinstance(result, str):
             parts.append(result.lower())
+
+        errors = event.get("errors")
+        if isinstance(errors, list):
+            parts.extend(error.lower() for error in errors if isinstance(error, str))
     return "\n".join(parts)
 
 
@@ -128,13 +132,12 @@ def classify_events(events: list[dict[str, Any]]) -> str:
         return CATEGORY_MODEL_PROVIDER
 
     if result is not None:
-        turns = result.get("num_turns")
-        cost = result.get("total_cost_usd")
+        turns = _safe_number(result.get("num_turns"), integer=True)
+        cost = _safe_number(result.get("total_cost_usd"), integer=False)
         model_usage = result.get("modelUsage")
         if (
-            isinstance(turns, (int, float))
+            turns is not None
             and turns <= 1
-            and isinstance(cost, (int, float))
             and cost == 0
             and (model_usage is None or model_usage == {})
         ):
