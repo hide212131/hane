@@ -527,6 +527,35 @@ fn a_long_marker_stays_intact_before_the_body_when_the_column_is_narrow() {
 }
 
 #[test]
+fn disclosed_prefix_and_marker_stay_intact_before_the_body_when_the_column_is_narrow() {
+    let source = "> 1. one two three four five six\n";
+    let cursor = source.find("one").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the quoted list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let layout = layout_block(&block, 32.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() >= 2, "the body must continue on a later row");
+    assert_eq!(rows[0].line_visual_range, 0..body);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[1].line_visual_range.start, body);
+    assert_eq!(rows[1].text_x_origin, rows[1].body_x_origin);
+}
+
+#[test]
 fn disclosed_list_prefix_is_subtracted_only_on_the_first_wrap_fragment() {
     let source = "  - one two three four five six seven eight\n";
     let cursor = source.find("one").expect("list body");

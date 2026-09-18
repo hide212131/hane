@@ -698,15 +698,16 @@ fn fragment_boundaries(
         let body = body.min(len);
         if body < len {
             let marker_overflows_first_row =
-                geometry.marker_visual_range.as_ref().is_some_and(|marker| {
-                    shaper.x_for_offset(line, marker.clone(), marker.end) + geometry.marker_body_gap
-                        > first_width
+                geometry.marker_visual_range.as_ref().is_some_and(|_| {
+                    let opening_width = shaper.x_for_offset(line, 0..body, body);
+                    opening_width + geometry.marker_body_gap > first_width
                 });
             if marker_overflows_first_row {
-                // A marker is one indivisible synthesized/source projection. If
-                // its aligned column cannot fit in the opening-row budget, let it
-                // overflow to the body boundary instead of wrapping the marker
-                // itself into fragments that would be painted at the body origin.
+                // The disclosed prefix and marker are one indivisible
+                // synthesized/source projection. If their aligned column cannot
+                // fit in the opening-row budget, let it overflow to the body
+                // boundary instead of wrapping either part into fragments that
+                // would be painted at the body origin.
                 boundaries.push(body);
                 boundaries.extend(valid_boundaries(body, geometry.effective_width));
             } else {
