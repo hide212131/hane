@@ -121,6 +121,22 @@ impl LayoutLine {
             && body <= self.line_visual_range.end
         {
             let body_fragment_start = body.max(self.line_visual_range.start);
+            if self.marker_body_gap > 0.0
+                && body_fragment_start == body
+                && let Some(marker) = &self.marker_visual_range
+                && marker.start >= self.line_visual_range.start
+                && marker.end <= self.line_visual_range.end
+            {
+                let marker_end_x = self.text_x_origin
+                    + shaper.x_for_offset(
+                        line,
+                        self.line_visual_range.start..marker.end,
+                        marker.end,
+                    );
+                if (marker_end_x..self.body_x_origin).contains(&x) {
+                    return body_fragment_start;
+                }
+            }
             if body_fragment_start < self.line_visual_range.end && x >= self.body_x_origin {
                 return shaper
                     .offset_for_x(
@@ -635,7 +651,8 @@ fn fragment_boundaries(
     let first_x_origin = geometry
         .marker_x_origin
         .unwrap_or(geometry.body_x_origin - geometry.expanded_prefix_width);
-    let first_width = (width - first_x_origin).max(MIN_EFFECTIVE_WRAP_WIDTH);
+    let first_width =
+        (width - first_x_origin - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);
     let mut start = 0;

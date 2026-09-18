@@ -256,6 +256,50 @@ fn list_body_columns_are_shared_by_inactive_ordered_labels() {
 }
 
 #[test]
+fn list_marker_body_gap_clicks_clamp_to_the_body_boundary() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the short ordered row is laid out");
+    let foo = SourceOffset(source.find("foo").expect("foo in source"));
+
+    assert_eq!(row.body_x_origin, 32.0);
+    assert_eq!(row.marker_body_gap, 8.0);
+    assert_eq!(layout.source_at_x(&block, 0, 28.0, &shaper()), Some(foo));
+}
+
+#[test]
+fn list_marker_body_gap_counts_against_the_opening_wrap_budget() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 48.0, &shaper());
+    let body_start = block.lines[0]
+        .list
+        .as_ref()
+        .expect("the first line has list metadata")
+        .body_visual_start
+        .0;
+    let first_rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(first_rows.len() > 1, "the marker and body must not overrun");
+    assert_eq!(first_rows[0].line_visual_range.end, body_start);
+}
+
+#[test]
 fn list_continuations_and_wrapped_fragments_start_at_the_body_column() {
     let source = "- first\n  continuation\n\n- one two three four five six\n";
     let list = present(source, None)
