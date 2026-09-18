@@ -753,8 +753,7 @@ mod tests {
 
     #[test]
     fn list_marker_body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
-        let mut row = row();
-        row.line_visual_range = 0..12;
+        let mut row = row(0..12, LineWrap::Hard);
         row.body_visual_start = Some(3);
         row.marker_body_gap = 8.0;
         let segments = line_segments(
