@@ -19,6 +19,8 @@ use hane_presentation::{
     BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove, VisualBlock,
     block_line_span, layout_block, present_block, trailing_blank_lines,
 };
+use std::cell::Cell;
+use std::ops::Range;
 
 const LINE_HEIGHT: f32 = 26.0;
 /// Ten columns wide with the test shaper's 8 px advance.
@@ -26,6 +28,181 @@ const WIDTH: f32 = 80.0;
 
 fn shaper() -> FixedAdvanceShaper {
     FixedAdvanceShaper::new(8.0)
+}
+
+struct CountingShaper {
+    inner: FixedAdvanceShaper,
+    wrap_calls: Cell<usize>,
+    width_calls: Cell<usize>,
+}
+
+impl CountingShaper {
+    fn new(advance: f32) -> Self {
+        Self {
+            inner: FixedAdvanceShaper::new(advance),
+            wrap_calls: Cell::new(0),
+            width_calls: Cell::new(0),
+        }
+    }
+}
+
+impl LineShaper for CountingShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        self.wrap_calls.set(self.wrap_calls.get() + 1);
+        self.inner.wrap_boundaries(line, fragment, width)
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        self.inner.x_for_offset(line, fragment, offset)
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        self.inner.offset_for_x(line, fragment, x)
+    }
+
+    fn width_for_text(&self, line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        self.width_calls.set(self.width_calls.get() + 1);
+        self.inner.width_for_text(line, text)
+    }
+}
+
+struct VariableLabelShaper {
+    inner: FixedAdvanceShaper,
+}
+
+impl VariableLabelShaper {
+    fn new(advance: f32) -> Self {
+        Self {
+            inner: FixedAdvanceShaper::new(advance),
+        }
+    }
+}
+
+impl LineShaper for VariableLabelShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        self.inner.wrap_boundaries(line, fragment, width)
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        self.inner.x_for_offset(line, fragment, offset)
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        self.inner.offset_for_x(line, fragment, x)
+    }
+
+    fn width_for_text(&self, line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        if text == "12. " {
+            48.0
+        } else {
+            self.inner.width_for_text(line, text)
+        }
+    }
+}
+
+/// A variable-width fixture where the first body glyph is narrow enough to fit
+/// after an aligned marker gap. This makes double-counting that gap observable.
+struct NarrowBodyShaper;
+
+impl NarrowBodyShaper {
+    fn advance(line: &hane_presentation::VisualLine, offset: usize) -> f32 {
+        if line.visual_text[..offset].chars().count() >= 5 {
+            4.0
+        } else {
+            8.0
+        }
+    }
+}
+
+impl LineShaper for NarrowBodyShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        let mut boundaries = Vec::new();
+        let mut row_start = fragment.start;
+        let mut row_width = 0.0;
+        for (relative, _) in line.visual_text[fragment.clone()].char_indices() {
+            let offset = fragment.start + relative;
+            let advance = Self::advance(line, offset);
+            if row_width + advance > width && offset > row_start {
+                boundaries.push(offset);
+                row_start = offset;
+                row_width = advance;
+            } else {
+                row_width += advance;
+            }
+        }
+        boundaries
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        let offset = offset.clamp(fragment.start, fragment.end);
+        line.visual_text[fragment.clone()]
+            .char_indices()
+            .take_while(|(relative, _)| fragment.start + *relative < offset)
+            .map(|(relative, _)| Self::advance(line, fragment.start + relative))
+            .sum()
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        let mut width = 0.0;
+        for (relative, _) in line.visual_text[fragment.clone()].char_indices() {
+            let offset = fragment.start + relative;
+            let advance = Self::advance(line, offset);
+            if x < width + advance / 2.0 {
+                return offset;
+            }
+            width += advance;
+        }
+        fragment.end
+    }
+
+    fn width_for_text(&self, _line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        text.chars().count() as f32 * 8.0
+    }
 }
 
 /// Presents a whole document into blocks the way `EditorView` does: block
@@ -217,6 +394,493 @@ fn multi_line_constructs_lay_out_one_row_per_source_line_when_they_fit() {
             Some(block.source_range.end)
         );
     }
+}
+
+#[test]
+fn list_body_columns_are_shared_by_inactive_ordered_labels() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line < 2)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.marker_x_origin == Some(0.0)));
+    assert!(rows.iter().all(|row| row.body_x_origin == 32.0));
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.marker_body_gap)
+            .collect::<Vec<_>>(),
+        vec![8.0, 0.0]
+    );
+    assert_eq!(rows[0].effective_width, 128.0);
+
+    let foo = SourceOffset(source.find("foo").expect("foo in source"));
+    let bar = SourceOffset(source.find("bar").expect("bar in source"));
+    let foo_point = layout
+        .point_for_source(&block, foo, &shaper())
+        .expect("foo has a point");
+    let bar_point = layout
+        .point_for_source(&block, bar, &shaper())
+        .expect("bar has a point");
+    assert_eq!(foo_point.x, bar_point.x);
+    assert_eq!(foo_point.x, 32.0);
+}
+
+#[test]
+fn list_body_columns_use_the_widest_actual_marker_label() {
+    let source = "10. first\n11. second\n12. third\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let shaper = VariableLabelShaper::new(8.0);
+    let layout = layout_block(&block, 160.0, &shaper);
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line < 3)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.body_x_origin == 48.0));
+    for word in ["first", "second", "third"] {
+        let source_offset = SourceOffset(source.find(word).expect("list item body"));
+        assert_eq!(
+            layout
+                .point_for_source(&block, source_offset, &shaper)
+                .expect("body has a point")
+                .x,
+            48.0
+        );
+    }
+}
+
+#[test]
+fn list_marker_widths_cache_each_font_scale_once() {
+    let source = "- # heading one\n- body two\n- # heading three\n- body four\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the mixed-style list block is presented");
+    let scales = block
+        .lines
+        .iter()
+        .filter_map(|line| {
+            line.list
+                .as_ref()
+                .map(|_| line.display().font_scale.to_bits())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scales.len(), 4);
+    assert_eq!(scales[0], scales[2]);
+    assert_eq!(scales[1], scales[3]);
+    assert_ne!(scales[0], scales[1]);
+
+    let marker_labels = block
+        .lines
+        .first()
+        .and_then(|line| line.list.as_ref())
+        .expect("the first list row has metadata")
+        .owner
+        .alignment
+        .marker_labels
+        .len();
+    let shaper = CountingShaper::new(8.0);
+    let _layout = layout_block(&block, 240.0, &shaper);
+
+    assert_eq!(shaper.width_calls.get(), marker_labels * 2);
+}
+
+#[test]
+fn list_marker_body_gap_clicks_clamp_to_the_body_boundary() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the short ordered row is laid out");
+    let foo = SourceOffset(source.find("foo").expect("foo in source"));
+
+    assert_eq!(row.body_x_origin, 32.0);
+    assert_eq!(row.marker_body_gap, 8.0);
+    assert_eq!(layout.source_at_x(&block, 0, 28.0, &shaper()), Some(foo));
+}
+
+#[test]
+fn list_marker_body_gap_counts_against_the_opening_wrap_budget() {
+    let source = "9. foo\n1. bar\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 48.0, &shaper());
+    let body_start = block.lines[0]
+        .list
+        .as_ref()
+        .expect("the first line has list metadata")
+        .body_visual_start
+        .0;
+    let first_rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(first_rows.len() > 1, "the marker and body must not overrun");
+    assert_eq!(first_rows[0].line_visual_range.end, body_start);
+}
+
+#[test]
+fn long_wrapped_lines_reuse_all_boundaries_from_one_shape() {
+    let source = "word ".repeat(400);
+    let block = present(&source, None)
+        .into_iter()
+        .next()
+        .expect("the paragraph is presented");
+    let shaper = CountingShaper::new(8.0);
+    let layout = layout_block(&block, 40.0, &shaper);
+
+    assert!(layout.lines.len() > 10, "the long line must wrap");
+    assert_eq!(shaper.wrap_calls.get(), 1);
+}
+
+#[test]
+fn list_continuations_and_wrapped_fragments_start_at_the_body_column() {
+    let source = "- first\n  continuation\n\n- one two three four five six\n";
+    let list = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&list, WIDTH, &shaper());
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the continuation row is laid out");
+    assert_eq!(continuation.text_x_origin, 16.0);
+    assert_eq!(continuation.body_x_origin, 16.0);
+
+    let wrapped = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 3)
+        .collect::<Vec<_>>();
+    assert!(wrapped.len() > 1, "the final item wraps");
+    assert_eq!(wrapped[0].text_x_origin, 0.0);
+    assert!(wrapped[1..].iter().all(|row| row.text_x_origin == 16.0));
+    assert!(wrapped.iter().all(|row| row.effective_width == 64.0));
+}
+
+#[test]
+fn opening_list_wrap_counts_the_marker_only_in_the_first_row_budget() {
+    let source = "- one two three four five six\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, WIDTH, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+    assert!(rows.len() > 1, "the item must wrap");
+
+    let line = &block.lines[0];
+    let body_start = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let first_body_text = line.visual_text[body_start..]
+        .find("three")
+        .map(|offset| body_start + offset)
+        .expect("the first body row reaches the word after the marker budget");
+    assert_eq!(rows[0].line_visual_range.end, first_body_text);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[0].body_x_origin, 16.0);
+}
+
+#[test]
+fn a_long_marker_stays_intact_before_the_body_when_the_column_is_narrow() {
+    let source = "999999999. value\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 40.0, &shaper());
+    let body = block.lines[0]
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() >= 2, "the body must continue on a later row");
+    assert_eq!(rows[0].line_visual_range, 0..body);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[1].line_visual_range.start, body);
+    assert_eq!(rows[1].text_x_origin, rows[1].body_x_origin);
+}
+
+#[test]
+fn disclosed_prefix_and_marker_stay_intact_before_the_body_when_the_column_is_narrow() {
+    let source = "> 1. one two three four five six\n";
+    let cursor = source.find("one").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the quoted list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let layout = layout_block(&block, 32.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() >= 2, "the body must continue on a later row");
+    assert_eq!(rows[0].line_visual_range, 0..body);
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert_eq!(rows[1].line_visual_range.start, body);
+    assert_eq!(rows[1].text_x_origin, rows[1].body_x_origin);
+}
+
+#[test]
+fn disclosed_prefix_marker_gap_is_not_double_counted_in_the_opening_budget() {
+    let source = "> 9. first character\n> 10. second\n";
+    let cursor = source.find("first").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the quoted ordered list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let layout = layout_block(&block, 52.0, &NarrowBodyShaper);
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+
+    assert_eq!(opening.line_visual_range, 0..body + 1);
+}
+
+#[test]
+fn disclosed_list_prefix_is_subtracted_only_on_the_first_wrap_fragment() {
+    let source = "  - one two three four five six seven eight\n";
+    let cursor = source.find("one").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 64.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(rows.len() > 1, "the disclosed list line must wrap");
+    assert_eq!(rows[0].text_x_origin, 0.0);
+    assert!(
+        rows[1..]
+            .iter()
+            .all(|row| row.text_x_origin == row.body_x_origin)
+    );
+}
+
+#[test]
+fn disclosed_empty_long_marker_stays_in_one_opening_row() {
+    let source = "999999999.\n";
+    let block = present(source, Some(0))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    assert_eq!(body, line.visual_text.len());
+
+    let layout = layout_block(&block, 40.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].line_visual_range, 0..line.visual_text.len());
+    assert_eq!(rows[0].wrap, LineWrap::Hard);
+}
+
+#[test]
+fn disclosed_structural_prefix_width_is_included_in_list_body_geometry() {
+    let source = "  - item\n    continued\n";
+    let cursor = source.find("continued").expect("continuation in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+    assert_eq!(opening.text_x_origin, 0.0);
+    assert_eq!(opening.body_x_origin, 32.0);
+
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("continuation row is laid out");
+    assert_eq!(continuation.text_x_origin, 0.0);
+    assert_eq!(continuation.body_x_origin, 32.0);
+
+    let item = SourceOffset(source.find("item").expect("item in source"));
+    let continued = SourceOffset(source.find("continued").expect("continued in source"));
+    assert_eq!(
+        layout.point_for_source(&block, item, &shaper()).unwrap().x,
+        32.0
+    );
+    assert_eq!(
+        layout
+            .point_for_source(&block, continued, &shaper())
+            .unwrap()
+            .x,
+        32.0
+    );
+}
+
+#[test]
+fn disclosed_continuation_prefix_does_not_readd_marker_width() {
+    let source = "- item\n  continued\n";
+    let cursor = source.find("continued").expect("continuation in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+    let continuation = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("continuation row is laid out");
+    assert_eq!(opening.body_x_origin, 16.0);
+    assert_eq!(continuation.body_x_origin, 16.0);
+}
+
+#[test]
+fn disclosed_quote_prefix_width_is_included_in_list_body_geometry() {
+    let source = "> 1. item\n";
+    let cursor = source.find("item").expect("item in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the quoted list row is laid out");
+
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 40.0);
+    assert_eq!(
+        layout
+            .point_for_source(&block, SourceOffset(cursor), &shaper())
+            .expect("item has a point")
+            .x,
+        40.0
+    );
+}
+
+#[test]
+fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
+    let source = "- outer\n\n  - inner\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        })
+        .expect("the nested list block is presented");
+    let inner_line = block
+        .lines
+        .iter()
+        .position(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        .expect("the nested row is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == inner_line)
+        .expect("the nested row is laid out");
+    assert_eq!(row.marker_x_origin, Some(24.0));
+    assert_eq!(row.text_x_origin, 24.0);
+    assert_eq!(row.body_x_origin, 40.0);
+
+    let inner = SourceOffset(source.find("inner").expect("inner in source"));
+    let point = layout
+        .point_for_source(&block, inner, &shaper())
+        .expect("inner has a point");
+    assert_eq!(point.x, 40.0);
+}
+
+#[test]
+fn deeply_nested_or_narrow_lists_keep_a_positive_effective_width() {
+    let source = "999999999. value\n";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 1.0, &shaper());
+    assert!(!layout.lines.is_empty());
+    assert!(layout.lines.iter().all(|row| row.effective_width >= 1.0));
 }
 
 #[test]

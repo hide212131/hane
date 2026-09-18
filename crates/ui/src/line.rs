@@ -15,11 +15,12 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::IndexedBlock;
+use hane_markdown::{IndexedBlock, ListProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
     InlineDisplay, JoinedParse, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset,
-    block_is_joinable, block_line_span, expected_disclosures, present_block, trailing_blank_lines,
+    block_is_joinable, block_line_span, expected_disclosures, present_block_with_list_projection,
+    trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -105,18 +106,29 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
 /// (see [`JoinedParse`]); it is what lets a block that exceeds either sync
 /// budget still resolve a marker pair arbitrarily far apart without this
 /// function reading the whole span itself on every call.
+#[cfg(test)]
 pub(crate) fn presented_block(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
+    presented_block_with_list_projection(editor, block, visible, joined, None)
+}
+
+pub(crate) fn presented_block_with_list_projection(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
     let ctx = block_context(editor, block, &span, &render, joined)?;
     let lines = block_lines(editor, &ctx);
-    Some(present_block(
+    Some(present_block_with_list_projection(
         block,
         document.revision(),
         &BlockWindow {
@@ -128,6 +140,7 @@ pub(crate) fn presented_block(
             block_disclosure: ctx.block_disclosure,
         },
         DEFAULT_LINE_HEIGHT,
+        list_projection,
     ))
 }
 
@@ -381,9 +394,19 @@ pub(crate) fn row_element(
         selected_visual,
         marked_visual,
         &line.style_runs,
+        row.body_visual_start,
     );
+    let marker_body_gap_segment = marker_body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
-    for segment in &segments {
+    for (segment_index, segment) in segments.iter().enumerate() {
+        if marker_body_gap_segment == Some(segment_index) {
+            elements.push(
+                div()
+                    .flex_none()
+                    .w(px(row.marker_body_gap))
+                    .into_any_element(),
+            );
+        }
         if segment.cursor_before {
             elements.push(cursor_overlay(theme).into_any_element());
         }
@@ -417,6 +440,14 @@ pub(crate) fn row_element(
             );
         }
     }
+    if marker_body_gap_segment == Some(segments.len()) {
+        elements.push(
+            div()
+                .flex_none()
+                .w(px(row.marker_body_gap))
+                .into_any_element(),
+        );
+    }
     if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
         elements.push(cursor_overlay(theme).into_any_element());
     }
@@ -430,7 +461,8 @@ pub(crate) fn row_element(
             // The row already holds exactly what fits: any further wrapping here
             // would put text where no layout row accounts for it.
             .whitespace_nowrap()
-            .px(px(theme.line_horizontal_padding)),
+            .pl(px(theme.line_horizontal_padding + row.text_x_origin))
+            .pr(px(theme.line_horizontal_padding)),
         display,
         theme,
     )
@@ -479,9 +511,11 @@ fn line_segments(
     selected: Option<Range<usize>>,
     marked: Option<Range<usize>>,
     style_runs: &[hane_presentation::StyleRun],
+    body_visual_start: Option<usize>,
 ) -> Vec<LineSegment> {
     let mut boundaries = Vec::new();
     boundaries.extend(cursor);
+    boundaries.extend(body_visual_start);
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
         boundaries.push(range.start);
         boundaries.push(range.end);
@@ -504,6 +538,20 @@ fn line_segments(
             visual_range: range.clone(),
         })
         .collect()
+}
+
+fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
+    let body = row.body_visual_start?;
+    (row.marker_body_gap > 0.0
+        && body > row.line_visual_range.start
+        && body <= row.line_visual_range.end)
+        .then(|| {
+            segments
+                .iter()
+                .position(|segment| segment.visual_range.start >= body)
+                .or_else(|| (body == row.line_visual_range.end).then_some(segments.len()))
+        })
+        .flatten()
 }
 
 fn cursor_overlay(theme: Theme) -> Div {
@@ -560,7 +608,7 @@ mod tests {
             visual_range: hane_presentation::VisualRange::new(3, 9),
             kind: hane_presentation::StyleKind::InlineCode,
         }];
-        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs);
+        let segments = line_segments(0..9, None, Some(0..6), None, &style_runs, None);
         let overlap = segments
             .iter()
             .find(|segment| segment.visual_range == (3..6))
@@ -640,6 +688,13 @@ mod tests {
             source_range: SourceRange::new(0, 0),
             y: 0.0,
             height: 26.0,
+            text_x_origin: 0.0,
+            body_x_origin: 0.0,
+            effective_width: 80.0,
+            marker_x_origin: None,
+            body_visual_start: None,
+            marker_visual_range: None,
+            marker_body_gap: 0.0,
         }
     }
 
@@ -665,7 +720,7 @@ mod tests {
         // Selection and IME ranges that reach past the row are clipped to it, so
         // a construct spanning a soft wrap is painted on both rows and neither
         // row draws outside its own text.
-        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[]);
+        let segments = line_segments(6..12, Some(3), Some(0..9), None, &[], None);
         assert_eq!(
             segments.first().map(|segment| segment.visual_range.start),
             Some(6)
@@ -684,7 +739,7 @@ mod tests {
     #[test]
     fn selection_and_ime_boundaries_split_only_the_affected_text() {
         assert_eq!(
-            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[]),
+            line_segments(0..12, Some(3), Some(3..9), Some(6..12), &[], None),
             vec![
                 LineSegment {
                     visual_range: 0..3,
@@ -715,6 +770,68 @@ mod tests {
                     display: InlineDisplay::default()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn list_marker_body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
+        let mut row = row(0..12, LineWrap::Hard);
+        row.body_visual_start = Some(3);
+        row.marker_body_gap = 8.0;
+        let segments = line_segments(
+            0..12,
+            None,
+            Some(5..9),
+            Some(7..11),
+            &[],
+            row.body_visual_start,
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..3, 3..5, 5..7, 7..9, 9..11, 11..12]
+        );
+        assert_eq!(marker_body_gap_segment(&row, &segments), Some(1));
+    }
+
+    #[test]
+    fn list_marker_body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
+        let mut row = row(0..4, LineWrap::Hard);
+        row.body_visual_start = Some(4);
+        row.marker_body_gap = 8.0;
+        let segments = line_segments(0..4, None, None, None, &[], row.body_visual_start);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..4]
+        );
+        assert_eq!(
+            marker_body_gap_segment(&row, &segments),
+            Some(segments.len())
+        );
+    }
+
+    #[test]
+    fn list_body_boundary_splits_paint_segments_without_adding_text() {
+        let segments = line_segments(0..8, None, None, None, &[], Some(3));
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..3, 3..8]
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.len())
+                .sum::<usize>(),
+            8
         );
     }
 

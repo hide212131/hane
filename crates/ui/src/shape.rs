@@ -2,7 +2,7 @@
 //!
 //! Layout decides where rows begin and end; only the font can say how wide a
 //! stretch of text is. This is the whole of that dependency: presentation asks
-//! three questions, this answers them with the same runs the painted elements
+//! four questions, this answers them with the same font policy the painted elements
 //! use, so hit testing, the caret and the painted text cannot drift apart.
 
 use crate::line::{block_font_size, inline_display_for};
@@ -90,14 +90,13 @@ impl WindowShaper {
 }
 
 impl LineShaper for WindowShaper {
-    fn wrap_boundaries(&self, line: &VisualLine, width: f32) -> Vec<usize> {
-        let whole = 0..line.visual_text.len();
-        if whole.is_empty() {
+    fn wrap_boundaries(&self, line: &VisualLine, fragment: Range<usize>, width: f32) -> Vec<usize> {
+        if fragment.is_empty() {
             return Vec::new();
         }
-        let runs = self.runs(line, &whole);
+        let runs = self.runs(line, &fragment);
         let Ok(wrapped) = self.text_system.shape_text(
-            line.visual_text.clone().into(),
+            line.visual_text[fragment.clone()].to_owned().into(),
             px(block_font_size(line)),
             &runs,
             Some(px(width)),
@@ -114,7 +113,9 @@ impl LineShaper for WindowShaper {
                     .iter()
                     .filter_map(|boundary| {
                         let run = line.unwrapped_layout.runs.get(boundary.run_ix)?;
-                        run.glyphs.get(boundary.glyph_ix).map(|glyph| glyph.index)
+                        run.glyphs
+                            .get(boundary.glyph_ix)
+                            .map(|glyph| fragment.start + glyph.index)
                     })
                     .collect()
             })
@@ -138,6 +139,34 @@ impl LineShaper for WindowShaper {
             + self
                 .shape_fragment(line, &fragment)
                 .closest_index_for_x(px(x))
+    }
+
+    fn width_for_text(&self, line: &VisualLine, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let mut font = self.style.font();
+        if line.display().weight == BlockWeight::Semibold {
+            font.weight = FontWeight::SEMIBOLD;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: self.style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(
+            self.text_system
+                .shape_line(
+                    text.to_owned().into(),
+                    px(block_font_size(line)),
+                    &[run],
+                    None,
+                )
+                .x_for_index(text.len()),
+        )
     }
 }
 

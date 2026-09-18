@@ -23,7 +23,10 @@
 //!   not touch.
 
 use crate::block_store::BlockStore;
-use crate::{MarkdownTree, NodeKind, parse_document};
+use crate::{
+    ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
+    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, parse_document,
+};
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -162,6 +165,203 @@ fn count_line_endings(slice: &str) -> usize {
     count
 }
 
+fn list_projection_label(start: Option<u64>, ordinal: usize) -> String {
+    match start {
+        None => "\u{2022} ".to_owned(),
+        Some(start) => format!("{}. ", start.saturating_add(ordinal as u64)),
+    }
+}
+
+fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
+    let mut ranges = Vec::new();
+    let mut start = range.start.0;
+    while start < range.end.0 {
+        let tail = &source[start..range.end.0];
+        let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
+            offset
+                + if tail.as_bytes()[offset] == b'\r'
+                    && tail.as_bytes().get(offset + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                }
+        });
+        let next = (start + end).min(range.end.0);
+        if next <= start {
+            break;
+        }
+        ranges.push(SourceRange::new(start, next));
+        start = next;
+    }
+    ranges
+}
+
+fn build_list_rows(
+    block_range: SourceRange,
+    source: &str,
+    items: &[ListProjectionItem],
+    code_blocks: &[SourceRange],
+) -> Vec<ListProjectionRow> {
+    let mut rows = Vec::new();
+    let mut active = Vec::new();
+    let mut next_item = 0;
+    for source_range in source_line_ranges(block_range, source) {
+        while next_item < items.len() && items[next_item].item_range.start < source_range.end {
+            active.push(next_item);
+            next_item += 1;
+        }
+        active.retain(|index| items[*index].item_range.end > source_range.start);
+        if let Some(item_index) = active
+            .iter()
+            .copied()
+            .max_by_key(|index| items[*index].depth)
+        {
+            let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
+            rows.push(ListProjectionRow {
+                source_range,
+                item_index,
+                is_code_block: code_blocks
+                    .get(code_block)
+                    .is_some_and(|code| code.intersects(source_range)),
+            });
+        }
+    }
+    rows
+}
+
+fn build_list_projections(
+    parsed: &MarkdownParse,
+    blocks: &[TiledBlock],
+    range: SourceRange,
+    source: &str,
+) -> Vec<Option<ListProjection>> {
+    let block_ranges = blocks
+        .iter()
+        .scan(range.start.0, |start, (_, length, _)| {
+            let block = SourceRange::new(*start, *start + *length);
+            *start = block.end.0;
+            Some(block)
+        })
+        .collect::<Vec<_>>();
+    let mut ordinals = vec![None; parsed.tree.len()];
+    let mut lists = Vec::new();
+    let mut code_blocks = parsed
+        .tree
+        .iter()
+        .filter_map(|(_, node)| {
+            matches!(node.kind, NodeKind::CodeBlock).then_some(node.source_range)
+        })
+        .collect::<Vec<_>>();
+    code_blocks.sort_by_key(|range| (range.start, range.end));
+    for (list_id, node) in parsed.tree.iter() {
+        let NodeKind::List { start } = node.kind else {
+            continue;
+        };
+        let marker_labels = parsed
+            .tree
+            .children(list_id)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| list_projection_label(start, ordinal))
+            .collect::<Vec<_>>();
+        let mut max_marker_label = String::new();
+        let mut max_marker_columns = 0;
+        for label in &marker_labels {
+            let columns = label.chars().count();
+            if columns > max_marker_columns {
+                max_marker_columns = columns;
+                max_marker_label.clone_from(label);
+            }
+        }
+        lists.push(ListProjectionList {
+            source_range: node.source_range,
+            start,
+            item_count: marker_labels.len(),
+            max_marker_label,
+            max_marker_columns,
+            marker_labels: marker_labels.into(),
+        });
+        for (ordinal, child) in parsed.tree.children(list_id).iter().enumerate() {
+            ordinals[child.0] = Some((list_id, ordinal));
+        }
+    }
+    let mut items = vec![Vec::new(); blocks.len()];
+    for (marker_range, item_id) in &parsed.list_item_markers {
+        let Some(item) = parsed.tree.node(*item_id) else {
+            continue;
+        };
+        let Some((list_id, ordinal)) = ordinals.get(item_id.0).and_then(|entry| *entry) else {
+            continue;
+        };
+        let Some(NodeKind::List { start }) = parsed.tree.node(list_id).map(|node| node.kind) else {
+            continue;
+        };
+        let Some(list) = parsed.tree.node(list_id) else {
+            continue;
+        };
+        let Some(block) = block_ranges.iter().position(|block| {
+            block.start <= item.source_range.start && item.source_range.start < block.end
+        }) else {
+            continue;
+        };
+        items[block].push(ListProjectionItem {
+            item_range: item.source_range,
+            marker_range: *marker_range,
+            list_range: list.source_range,
+            start,
+            ordinal,
+            depth: parsed.tree.list_depth(*item_id),
+            item_count: parsed.tree.children(list_id).len(),
+        });
+    }
+    let mut prefixes = vec![Vec::new(); blocks.len()];
+    for (source_range, item_id, columns) in &parsed.list_structural_prefixes {
+        let Some(item) = parsed.tree.node(*item_id) else {
+            continue;
+        };
+        let Some(block) = block_ranges
+            .iter()
+            .position(|block| block.start <= source_range.start && source_range.start < block.end)
+        else {
+            continue;
+        };
+        prefixes[block].push(ListProjectionPrefix {
+            source_range: *source_range,
+            item_range: item.source_range,
+            columns: *columns,
+        });
+    }
+    for block_items in &mut items {
+        block_items.sort_by_key(|item| (item.item_range.start, item.item_range.end));
+    }
+    for block_prefixes in &mut prefixes {
+        block_prefixes.sort_by_key(|prefix| (prefix.source_range.start, prefix.source_range.end));
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(block, _)| {
+            (!items[block].is_empty()).then(|| {
+                let block_range = block_ranges[block];
+                let block_items = std::mem::take(&mut items[block]);
+                let block_prefixes = std::mem::take(&mut prefixes[block]);
+                let block_lists = lists
+                    .iter()
+                    .filter(|list| {
+                        block_items
+                            .iter()
+                            .any(|item| item.list_range == list.source_range)
+                    })
+                    .cloned()
+                    .collect();
+                let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
+                ListProjection::new(block_items, block_prefixes, block_lists, rows)
+            })
+        })
+        .collect()
+}
+
 /// Tiles one parsed slice into block spans covering `range` exactly: each
 /// top-level block runs from its own start to the next block's start, the first
 /// starts at `range.start`, and the last ends at `range.end`. Returns no block
@@ -210,6 +410,9 @@ pub struct BlockIndex {
     revision: Revision,
     store: BlockStore<Entry>,
     next_id: u64,
+    /// Compact list context from the last formal full parse. Incremental
+    /// updates clear it because a changed list can alter every later ordinal.
+    list_projections: Vec<Option<ListProjection>>,
     /// First ordinal of the conservatively invalidated tail, if any. Invalidation
     /// always covers a suffix, so one ordinal answers "is this block provisional"
     /// in constant time instead of writing a flag into every affected block.
@@ -223,6 +426,7 @@ impl BlockIndex {
         let range = SourceRange::new(0, source.len());
         let parsed = parse_document(revision, range, source);
         let blocks = tiled_blocks(&parsed.tree, range, source);
+        let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
             |(index, (kind, length, lines))| {
@@ -241,6 +445,7 @@ impl BlockIndex {
             revision,
             store,
             next_id,
+            list_projections,
             provisional_from: None,
         }
     }
@@ -319,6 +524,21 @@ impl BlockIndex {
         self.block(self.ordinal_at(offset)?)
     }
 
+    /// Document-wide list context for a block from the last formal parse.
+    /// Provisional or stale block values never receive a projection.
+    pub fn list_projection(&self, block: &IndexedBlock) -> Option<&ListProjection> {
+        let current = self.block(block.ordinal)?;
+        (current.id == block.id
+            && current.source_range == block.source_range
+            && current.confidence == Confidence::Formal)
+            .then(|| {
+                self.list_projections
+                    .get(block.ordinal)
+                    .and_then(Option::as_ref)
+            })
+            .flatten()
+    }
+
     /// Every block in document order.
     pub fn blocks(&self) -> impl Iterator<Item = IndexedBlock> + '_ {
         self.blocks_from(0)
@@ -373,6 +593,7 @@ impl BlockIndex {
         if deltas.is_empty() {
             return finish(self, 0, 0, 0, 0, 0, true);
         }
+        self.list_projections.clear();
         // Only a document with no block at all indexes to nothing, so this
         // rebuild parses a blank (hence tiny) document.
         if self.is_empty() {

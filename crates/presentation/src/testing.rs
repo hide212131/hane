@@ -33,24 +33,28 @@ impl Default for FixedAdvanceShaper {
 }
 
 impl LineShaper for FixedAdvanceShaper {
-    fn wrap_boundaries(&self, line: &VisualLine, width: f32) -> Vec<usize> {
+    fn wrap_boundaries(&self, line: &VisualLine, fragment: Range<usize>, width: f32) -> Vec<usize> {
         let advance = self.advance_for(line);
         if advance <= 0.0 || width < advance {
             return Vec::new();
         }
         let columns = (width / advance).floor().max(1.0) as usize;
         let mut boundaries = Vec::new();
-        let mut start = 0;
+        let mut start = fragment.start;
         let mut taken = 0;
         // The last place a break could go without splitting a word, if there was
         // one since the current row started.
         let mut breakable = None;
-        for (offset, character) in line.visual_text.char_indices() {
+        for (relative, character) in line.visual_text[fragment.clone()].char_indices() {
+            let offset = fragment.start + relative;
             if taken == columns {
                 let at = match breakable {
                     Some(at) if at > start => at,
                     _ => offset,
                 };
+                if at >= fragment.end {
+                    break;
+                }
                 boundaries.push(at);
                 start = at;
                 breakable = None;
@@ -82,5 +86,9 @@ impl LineShaper for FixedAdvanceShaper {
                 .char_indices()
                 .nth(column)
                 .map_or(text.len(), |(offset, _)| offset)
+    }
+
+    fn width_for_text(&self, line: &VisualLine, text: &str) -> f32 {
+        text.chars().count() as f32 * self.advance_for(line)
     }
 }

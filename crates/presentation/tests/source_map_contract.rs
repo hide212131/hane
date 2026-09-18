@@ -215,6 +215,51 @@ fn hidden_and_synthesized_positions_normalize_idempotently() {
 }
 
 #[test]
+fn adjacent_hidden_list_and_heading_markers_normalize_stably() {
+    // PR #189 / Issue #126: a list item's synthesized bullet sits directly
+    // against its own nested ATX heading's hidden opening marker, with no
+    // visible content between the list marker, the bullet and the heading
+    // marker. A single source→visual→source round trip only walked from the
+    // list marker to the heading marker's own boundary — itself not an
+    // editable position — so `normalize_source` was not idempotent there.
+    let source = "- ### item ###";
+    let range = SourceRange::new(0, source.len());
+    let block = present_markdown_with_disclosure(1, Revision(1), range, source, 26.0, None);
+    assert_eq!(block.visual_text, "\u{2022} item");
+
+    let list_marker_start = SourceOffset(0);
+    let item_start = SourceOffset(source.find("item").unwrap());
+
+    assert_eq!(
+        block
+            .source_map
+            .normalize_source(list_marker_start, Bias::Before)
+            .unwrap(),
+        list_marker_start,
+    );
+    assert_eq!(
+        block
+            .source_map
+            .normalize_source(list_marker_start, Bias::After)
+            .unwrap(),
+        item_start,
+        "After affinity should walk past both hidden markers to the heading's visible text"
+    );
+
+    for affinity in [Bias::Before, Bias::After] {
+        let normalized = block
+            .source_map
+            .normalize_source(list_marker_start, affinity)
+            .unwrap();
+        assert_eq!(
+            block.source_map.normalize_source(normalized, affinity),
+            Some(normalized),
+            "normalize_source must be idempotent for {affinity:?}"
+        );
+    }
+}
+
+#[test]
 fn visual_click_and_drag_endpoints_produce_a_source_selection() {
     let source = "before **日本🙂** after";
     let range = SourceRange::new(300, 300 + source.len());

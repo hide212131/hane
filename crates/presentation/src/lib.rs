@@ -40,18 +40,20 @@ mod layout;
 pub mod testing;
 
 pub use layout::{
-    BlockLayout, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove, layout_block,
-    line_visual_start,
+    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove,
+    layout_block, line_visual_start,
 };
 
 use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, MarkdownParse, NodeId, NodeKind,
+    BlockId, BlockIndex, Confidence, IndexedBlock, ListProjection, ListProjectionItem,
+    ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct VisualOffset(pub usize);
@@ -226,16 +228,43 @@ impl SourceMap {
         }
     }
 
+    /// Hidden and synthesized segments can sit back-to-back with no visible
+    /// content between them (e.g. a list marker's synthesized bullet
+    /// immediately followed by a nested ATX heading's hidden marker). A
+    /// single source→visual→source round trip only walks to the next such
+    /// boundary rather than settling on an editable position (ADR-0004), so
+    /// `next` can differ from `current` and itself still not be a fixed
+    /// point. Repeating the round trip walks the whole chain; each affinity
+    /// only ever advances toward candidates sorted later (`After`) or
+    /// earlier (`Before`) for that same affinity, so the source offset it
+    /// produces is monotonic and bounded, and it stabilizes in at most
+    /// `segments.len()` steps.
     pub fn normalize_source(&self, source: SourceOffset, affinity: Bias) -> Option<SourceOffset> {
-        let visual = self.source_to_visual(source, affinity)?.visual_offset;
-        self.visual_to_source(visual, affinity)
-            .map(|candidate| candidate.source_offset)
+        let mut current = source;
+        for _ in 0..=self.segments.len() {
+            let visual = self.source_to_visual(current, affinity)?.visual_offset;
+            let next = self.visual_to_source(visual, affinity)?.source_offset;
+            if next == current {
+                return Some(current);
+            }
+            current = next;
+        }
+        Some(current)
     }
 
+    /// Mirrors [`Self::normalize_source`]'s chained-boundary walk in the
+    /// visual direction.
     pub fn normalize_visual(&self, visual: VisualOffset, affinity: Bias) -> Option<VisualOffset> {
-        let source = self.visual_to_source(visual, affinity)?.source_offset;
-        self.source_to_visual(source, affinity)
-            .map(|candidate| candidate.visual_offset)
+        let mut current = visual;
+        for _ in 0..=self.segments.len() {
+            let source = self.visual_to_source(current, affinity)?.source_offset;
+            let next = self.source_to_visual(source, affinity)?.visual_offset;
+            if next == current {
+                return Some(current);
+            }
+            current = next;
+        }
+        Some(current)
     }
 }
 
@@ -398,6 +427,116 @@ pub enum BlockKind {
     Unsupported,
 }
 
+/// Opaque presentation identity for a semantic list. The value is local to a
+/// parsed snapshot; consumers use it to group rows, never to inspect Markdown
+/// syntax.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ListId(pub u64);
+
+/// Opaque presentation identity for a list item. The value is local to a
+/// parsed snapshot and is intentionally separate from [`ListId`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ListItemId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListMarkerKind {
+    Bullet,
+    Ordered,
+}
+
+/// The semantic role of one physical list row. The opening row is the only
+/// row that owns the item marker; every other role hangs from the same item's
+/// body column. Paragraph ordinals are zero-based within the item's direct
+/// paragraph content, so `1` is the second paragraph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListRowRole {
+    Opening,
+    Continuation,
+    LooseParagraph { ordinal: usize },
+    ParentParagraphAfterNestedList { ordinal: usize },
+}
+
+/// Aggregate marker information for one semantic list. The width is measured
+/// from the inactive display labels (`3. `, `10. `, `• `), never from source
+/// digits such as `003)`. `marker_labels` retains every direct-child label so
+/// layout can measure actual font widths instead of assuming that equal digit
+/// counts have equal advances.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListAlignment {
+    pub max_marker_label: String,
+    pub max_marker_columns: usize,
+    pub marker_labels: Arc<[String]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListOwnerMetadata {
+    pub list_id: ListId,
+    pub item_id: ListItemId,
+    pub marker_kind: ListMarkerKind,
+    pub start: Option<u64>,
+    pub ordinal: usize,
+    pub depth: usize,
+    pub alignment: ListAlignment,
+}
+
+/// The marker a row currently displays. `visual_range` points at either the
+/// synthesized inactive label or the disclosed source marker. In both cases
+/// `anchor` is the real source marker start; no synthetic edit position is
+/// introduced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListMarkerMetadata {
+    pub source_range: SourceRange,
+    pub anchor: SourceOffset,
+    pub visual_range: VisualRange,
+    pub label: String,
+    pub synthesized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListStructuralPrefixMetadata {
+    pub item_id: ListItemId,
+    pub source_range: SourceRange,
+    pub columns: usize,
+}
+
+/// Presentation-level list policy for one physical line. This is deliberately
+/// a render contract rather than a Markdown AST node, so layout can establish
+/// hanging indents and marker columns without parsing source text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListRowMetadata {
+    pub owner: ListOwnerMetadata,
+    pub role: ListRowRole,
+    pub marker: Option<ListMarkerMetadata>,
+    pub structural_prefixes: Vec<ListStructuralPrefixMetadata>,
+    /// Visual offset at which the item's body begins in the current inactive
+    /// presentation. Phase 2 may replace this source-derived visual padding
+    /// with absolute layout geometry while retaining the same semantic owner.
+    pub body_visual_start: VisualOffset,
+}
+
+impl ListRowMetadata {
+    fn rebase(&mut self, deltas: &[RevisionDelta]) -> bool {
+        if let Some(marker) = &mut self.marker {
+            for delta in deltas {
+                let Some(range) = delta.transform_range(marker.source_range) else {
+                    return false;
+                };
+                marker.source_range = range;
+                marker.anchor = range.start;
+            }
+        }
+        for prefix in &mut self.structural_prefixes {
+            for delta in deltas {
+                let Some(range) = delta.transform_range(prefix.source_range) else {
+                    return false;
+                };
+                prefix.source_range = range;
+            }
+        }
+        true
+    }
+}
+
 /// Block-level font weight the UI must apply.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlockWeight {
@@ -529,6 +668,10 @@ pub struct VisualLine {
     /// relative destinations against the document directory and loads only
     /// visible image blocks.
     pub image: Option<ImagePresentation>,
+    /// Semantic list geometry policy for this physical line. `None` means the
+    /// line is not owned by a list item (or was deliberately rendered through
+    /// a literal/raw fallback).
+    pub list: Option<ListRowMetadata>,
 }
 
 impl VisualLine {
@@ -561,6 +704,11 @@ impl VisualLine {
                 };
                 self.disclosure = Some(rebased);
             }
+        }
+        if let Some(list) = &mut self.list
+            && !list.rebase(deltas)
+        {
+            return false;
         }
         self.source_range = range;
         self.revision = current;
@@ -802,18 +950,35 @@ pub fn present_block(
     window: &BlockWindow<'_>,
     line_height: f32,
 ) -> VisualBlock {
+    present_block_with_list_projection(block, revision, window, line_height, None)
+}
+
+/// Presents a block with document-wide list context from a formal block index.
+///
+/// A block larger than the synchronous join budget is intentionally parsed only
+/// for the visible lines. The compact projection lets those lines retain the
+/// formal list's numbering, depth, and marker-column width until a whole-block
+/// [`JoinedParse`] becomes available.
+pub fn present_block_with_list_projection(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+    list_projection: Option<&ListProjection>,
+) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
         if run_uses_shared_parse(run.len(), window.joined) {
-            present_joined_run(
+            present_joined_run_with_list_projection(
                 &window.lines[run.clone()],
                 revision,
                 line_height,
                 &window.render,
                 window.joined,
                 window.block_disclosure,
+                list_projection,
                 &mut lines,
             );
             continue;
@@ -827,7 +992,7 @@ pub fn present_block(
         } else {
             LineContext::Normal
         };
-        let mut presented = present_polished_line(
+        let mut presented = present_polished_line_with_list_projection(
             line.line as u64,
             revision,
             line.range,
@@ -835,6 +1000,7 @@ pub fn present_block(
             line_height,
             line.disclosure,
             line_context,
+            list_projection,
         );
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
@@ -881,6 +1047,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         context: LineContext::Normal,
         disclosure: None,
         image: None,
+        list: None,
     }
 }
 
@@ -1012,11 +1179,62 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     }
 }
 
+/// Resolves an empty disclosure at a list-item boundary to the item that
+/// starts there. Markdown list-item ranges are allowed to meet exactly at the
+/// following item's start, so the generic inclusive caret check would
+/// disclose both sibling markers and make the preceding row change width too.
+/// Keep the inclusive end for an item's ordinary terminal caret unless that
+/// same offset is also the start of a sibling.
+fn list_item_range_touches(
+    tree: &MarkdownTree,
+    item_id: NodeId,
+    item: &MarkdownNode,
+    disclosure: SourceRange,
+) -> bool {
+    if !range_touches(item.source_range, disclosure) {
+        return false;
+    }
+    if !disclosure.is_empty() || disclosure.start != item.source_range.end {
+        return true;
+    }
+    let Some(list_id) = item.parent else {
+        return true;
+    };
+    !tree.children(list_id).iter().any(|sibling_id| {
+        *sibling_id != item_id
+            && tree.node(*sibling_id).is_some_and(|sibling| {
+                matches!(sibling.kind, NodeKind::ListItem { .. })
+                    && sibling.source_range.start == disclosure.start
+            })
+    })
+}
+
+fn projected_list_item_range_touches(
+    projection: &ListProjection,
+    item: &ListProjectionItem,
+    disclosure: SourceRange,
+) -> bool {
+    if !range_touches(item.item_range, disclosure) {
+        return false;
+    }
+    if !disclosure.is_empty() || disclosure.start != item.item_range.end {
+        return true;
+    }
+    let sibling = projection
+        .items
+        .partition_point(|candidate| candidate.item_range.start < disclosure.start);
+    !projection.items[sibling..]
+        .iter()
+        .take_while(|candidate| candidate.item_range.start == disclosure.start)
+        .any(|candidate| candidate.list_range == item.list_range)
+}
+
 fn marker_is_disclosed(
     marker: &ProjectedMarker,
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
     disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
 ) -> bool {
     let Some(disclosure) = disclosure else {
         return false;
@@ -1028,6 +1246,37 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
+    // A list item's own bullet/number marker discloses whenever the caret,
+    // selection or IME touches any of the item's own source range — its
+    // opening line, its own paragraphs, and any nested child list or item it
+    // contains. A nested item's `source_range` sits inside every enclosing
+    // ancestor's own `source_range`, so entering nested content discloses the
+    // whole ancestor chain down to the item actually touched, while a sibling
+    // item — whose `source_range` never overlaps — stays hidden.
+    if let Some(owner) = marker.list_owner {
+        return parsed
+            .tree
+            .node(owner)
+            .is_some_and(|item| list_item_range_touches(&parsed.tree, owner, item, disclosure));
+    }
+    // A list item's own structural continuation indentation follows the same
+    // ownership rule as its opening marker above: it discloses whenever the
+    // caret, selection or IME touches any of the owning item's own source
+    // range, not just the physical line the indentation itself sits on.
+    if let Some(prefix) = marker.global_list_prefix {
+        let Some(projection) = list_projection else {
+            return false;
+        };
+        return projection
+            .item_for_source_range(prefix.item_range)
+            .is_some_and(|item| projected_list_item_range_touches(projection, item, disclosure));
+    }
+    if let Some((owner, _)) = marker.list_prefix {
+        return parsed
+            .tree
+            .node(owner)
+            .is_some_and(|item| list_item_range_touches(&parsed.tree, owner, item, disclosure));
+    }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
         return true;
@@ -1036,10 +1285,7 @@ fn marker_is_disclosed(
         let span = parsed.tree.node(*id).expect("indexed node");
         let owns_marker = if has_delimiter_markers(span.kind) {
             span.source_range.start <= marker.start && marker.end <= span.source_range.end
-        } else if matches!(
-            span.kind,
-            NodeKind::Heading(_) | NodeKind::ListItem { .. } | NodeKind::CodeBlock
-        ) {
+        } else if matches!(span.kind, NodeKind::Heading(_) | NodeKind::CodeBlock) {
             (marker.start == span.source_range.start
                 || (matches!(span.kind, NodeKind::Heading(_))
                     && span
@@ -1077,7 +1323,11 @@ fn marker_edge(
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
 ) -> Option<MarkerEdge> {
-    if planned.quote_owner.is_some() || planned.list_owner.is_some() {
+    if planned.quote_owner.is_some()
+        || planned.list_owner.is_some()
+        || planned.list_prefix.is_some()
+        || planned.global_list_prefix.is_some()
+    {
         return Some(MarkerEdge::Opening);
     }
     let marker = planned.range;
@@ -1105,6 +1355,53 @@ fn marker_edge(
             None
         }
     })
+}
+
+/// The synthesized replacement text for an inactive list item's own hidden
+/// bullet/number marker: `"• "` for an unordered item, or `"{n}. "` for an
+/// ordered item, where `n` is the owning list's `start` plus the item's
+/// zero-based sibling position — never the item's own source digits, which
+/// [`NodeKind::List`] documents as possibly `0`, non-sequential, or
+/// leading-zero-padded. The synthesized delimiter is always `.`, independent
+/// of the source's own `.`/`)`; only disclosing the marker (see
+/// [`marker_is_disclosed`]) shows those source bytes, unchanged, as editable
+/// [`Visibility::ExpandedMarkup`].
+///
+/// `ordinals` is [`ProjectionIndex::list_item_ordinals`], the whole tree's
+/// owner/position table built once per parse: looking `item` up here is
+/// `O(1)`, unlike `MarkdownTree::list_item_ordinal`'s preceding-sibling scan,
+/// which this function must not call per visible line — a large list's
+/// viewport projects one line at a time (see
+/// [`present_markdown_from_parse`]), and a scan there would cost proportional
+/// to each visible item's position rather than the visible range.
+#[cfg(test)]
+fn list_item_label(
+    parsed: &MarkdownParse,
+    ordinals: &[Option<(NodeId, usize)>],
+    item: NodeId,
+) -> Option<String> {
+    let (owner, ordinal) = (*ordinals.get(item.0)?)?;
+    match parsed.tree.node(owner)?.kind {
+        NodeKind::List { start } => Some(list_label(start, ordinal)),
+        _ => None,
+    }
+}
+
+fn list_item_label_with_projection(
+    parsed: &MarkdownParse,
+    ordinals: &[Option<(NodeId, usize)>],
+    item: NodeId,
+    list_projection: Option<&ListProjection>,
+    marker_range: SourceRange,
+) -> Option<String> {
+    if let Some(projected) = projected_item_for_marker(list_projection, marker_range) {
+        return Some(list_label(projected.start, projected.ordinal));
+    }
+    let (owner, ordinal) = (*ordinals.get(item.0)?)?;
+    match parsed.tree.node(owner)?.kind {
+        NodeKind::List { start } => Some(list_label(start, ordinal)),
+        _ => None,
+    }
 }
 
 /// Returns true when `segments` tile `range` contiguously, so every source byte
@@ -1160,6 +1457,26 @@ pub fn present_markdown_with_disclosure(
     line_height: f32,
     disclosure: Option<SourceRange>,
 ) -> VisualLine {
+    present_markdown_with_list_projection(
+        line_id,
+        revision,
+        range,
+        source,
+        line_height,
+        disclosure,
+        None,
+    )
+}
+
+fn present_markdown_with_list_projection(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
+) -> VisualLine {
     if source.is_empty() {
         let mut block = present_plain(line_id, revision, range, source);
         block.estimated_height = line_height;
@@ -1177,6 +1494,7 @@ pub fn present_markdown_with_disclosure(
         &SharedParse {
             parsed: &parsed,
             projection: &projection,
+            list_projection,
         },
     )
 }
@@ -1186,6 +1504,7 @@ pub fn present_markdown_with_disclosure(
 struct SharedParse<'a> {
     parsed: &'a MarkdownParse,
     projection: &'a ProjectionIndex,
+    list_projection: Option<&'a ListProjection>,
 }
 
 /// Presents one physical line from an already-parsed tree instead of parsing
@@ -1219,6 +1538,9 @@ fn present_markdown_from_parse(
         return block;
     }
     let parsed = shared.parsed;
+    let formal_code_block = shared
+        .list_projection
+        .and_then(|projection| projection.is_code_block_for_range(range));
     // An ATX heading nested in an existing quote/list still carries its
     // heading level. Only nodes intersecting this physical line contribute:
     // the shared tree also contains other headings and trailing blank lines.
@@ -1232,20 +1554,53 @@ fn present_markdown_from_parse(
             .filter_map(|id| parsed.tree.node(**id))
             .filter(|node| node.kind.is_block())
     };
-    let kind = blocks()
+    let mut kind = blocks()
         .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             _ => None,
         })
         .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
         .unwrap_or_default();
+    match formal_code_block {
+        Some(false) if kind == BlockKind::CodeBlock => kind = BlockKind::ListItem,
+        Some(true) => kind = BlockKind::CodeBlock,
+        _ => {}
+    }
     let mut visual = String::with_capacity(source.len());
     // The ordered plan belongs to the semantic snapshot. Binary search avoids
     // copying or walking off-screen markers for each physical line.
     let plan = &shared.projection.markers;
     let start = plan.partition_point(|marker| marker.range.start < range.start);
     let end = plan.partition_point(|marker| marker.range.start < range.end);
-    let markers_on_line = &plan[start..end];
+    let mut projected_markers = plan[start..end].to_vec();
+    if let Some(global) = shared.list_projection {
+        for prefix in global.prefixes_in(range) {
+            if let Some(marker) = projected_markers
+                .iter_mut()
+                .find(|marker| marker.range == prefix.source_range)
+            {
+                marker.global_list_prefix = Some(*prefix);
+            } else {
+                projected_markers.push(ProjectedMarker {
+                    range: prefix.source_range,
+                    quote_owner: None,
+                    list_owner: None,
+                    list_prefix: None,
+                    global_list_prefix: Some(*prefix),
+                });
+            }
+        }
+        projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+    }
+    if formal_code_block == Some(true) {
+        projected_markers.retain(|marker| {
+            marker.quote_owner.is_some()
+                || marker.list_owner.is_some()
+                || marker.list_prefix.is_some()
+                || marker.global_list_prefix.is_some()
+        });
+    }
+    let markers_on_line = projected_markers.as_slice();
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
     for planned in markers_on_line {
@@ -1264,7 +1619,13 @@ fn present_markdown_from_parse(
                 None,
             );
         }
-        let expanded = marker_is_disclosed(planned, parsed, &shared.projection.nodes, disclosure);
+        let expanded = marker_is_disclosed(
+            planned,
+            parsed,
+            &shared.projection.nodes,
+            disclosure,
+            shared.list_projection,
+        );
         append_segment(
             &mut visual,
             &mut segments,
@@ -1278,6 +1639,37 @@ fn present_markdown_from_parse(
             },
             marker_edge(planned, parsed, &shared.projection.nodes),
         );
+        // An inactive list item marker is replaced by one synthesized
+        // bullet/number, anchored at the hidden marker's own start rather
+        // than carrying an independent fake source position (see
+        // `list_item_label`). Disclosing the marker (`expanded` above) shows
+        // its real source bytes directly instead, so the two never render
+        // together.
+        if !expanded
+            && let Some(owner) = planned.list_owner
+            && let Some(label) = list_item_label_with_projection(
+                parsed,
+                &shared.projection.list_item_ordinals,
+                owner,
+                shared.list_projection,
+                planned.range,
+            )
+        {
+            let visual_start = visual.len();
+            visual.push_str(&label);
+            segments.push(MappingSegment {
+                source_range: SourceRange::empty(marker.start.0),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                visibility: Visibility::Synthesized,
+                marker_edge: None,
+            });
+        }
+        // An inactive list item's structural continuation indentation has no
+        // visual representation. Layout owns the semantic body column; adding
+        // spaces here would make source indentation part of the text being
+        // shaped and would make caret/hit-test geometry disagree with it.
+        // Disclosing the item still shows the original source spaces or tabs
+        // through this marker's ExpandedMarkup segment.
         source_cursor = marker.end.0;
     }
     if source_cursor < range.end.0 {
@@ -1312,6 +1704,10 @@ fn present_markdown_from_parse(
     let mut style_runs = nodes
         .iter()
         .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| {
+            formal_code_block != Some(true)
+                && !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
+        })
         .filter(|node| has_delimiter_markers(node.kind))
         .filter_map(|span| {
             let style = syntax_display(span.kind).inline_style?;
@@ -1331,7 +1727,30 @@ fn present_markdown_from_parse(
             })
         })
         .collect::<Vec<_>>();
+    if formal_code_block == Some(true)
+        && !style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock)
+    {
+        let content_end = visual.trim_end_matches(['\r', '\n']).len();
+        if content_end > 0 {
+            style_runs.push(StyleRun {
+                visual_range: VisualRange::new(0, content_end),
+                kind: StyleKind::CodeBlock,
+            });
+        }
+    }
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+    let list = list_row_metadata(
+        parsed,
+        shared.projection,
+        range,
+        markers_on_line,
+        &visual,
+        &source_map,
+        disclosure,
+        shared.list_projection,
+    );
     VisualLine {
         line_id,
         source_range: range,
@@ -1346,6 +1765,7 @@ fn present_markdown_from_parse(
         context: LineContext::Normal,
         disclosure,
         image: None,
+        list,
     }
 }
 
@@ -1602,12 +2022,228 @@ struct ProjectedMarker {
     range: SourceRange,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
+    /// `Some((owner, columns))` for a list item's own structural continuation
+    /// indentation (`MarkdownParse::list_structural_prefixes`): the owning
+    /// item and the semantic column width the layout uses for its body.
+    /// Distinct from `list_owner`, which is the item's own opening
+    /// bullet/number and gets a synthesized label.
+    list_prefix: Option<(NodeId, usize)>,
+    /// A structural prefix recovered from the formal block projection when
+    /// the viewport parse has no local `ListItem` owner for this line.
+    global_list_prefix: Option<ListProjectionPrefix>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ListParagraphRegion {
+    range: SourceRange,
+    ordinal: usize,
+    after_nested_list: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ListItemProjection {
+    owner: ListOwnerMetadata,
+    paragraphs: Vec<ListParagraphRegion>,
+    nested_lists: Vec<SourceRange>,
+}
+
+fn list_marker_kind(start: Option<u64>) -> ListMarkerKind {
+    start.map_or(ListMarkerKind::Bullet, |_| ListMarkerKind::Ordered)
+}
+
+fn list_label(start: Option<u64>, ordinal: usize) -> String {
+    match start {
+        None => "\u{2022} ".to_owned(),
+        Some(start) => format!("{}. ", start.saturating_add(ordinal as u64)),
+    }
+}
+
+fn projected_item_for_marker(
+    projection: Option<&ListProjection>,
+    marker_range: SourceRange,
+) -> Option<&ListProjectionItem> {
+    projection?.item_for_marker(marker_range)
+}
+
+fn projected_item_for_range(
+    projection: Option<&ListProjection>,
+    range: SourceRange,
+) -> Option<&ListProjectionItem> {
+    projection?.item_for_range(range)
+}
+
+fn projected_list_alignment(
+    projection: &ListProjection,
+    item: &ListProjectionItem,
+) -> Option<ListAlignment> {
+    let list = projection.list(item.list_range)?;
+    Some(ListAlignment {
+        max_marker_label: list.max_marker_label.clone(),
+        max_marker_columns: list.max_marker_columns,
+        marker_labels: list.marker_labels.clone(),
+    })
+}
+
+fn list_alignments(tree: &MarkdownTree) -> Vec<Option<ListAlignment>> {
+    let mut alignments = vec![None; tree.len()];
+    for (id, node) in tree.iter() {
+        let NodeKind::List { start } = node.kind else {
+            continue;
+        };
+        let marker_labels = tree
+            .children(id)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, _)| list_label(start, ordinal))
+            .collect::<Vec<_>>();
+        let mut max_marker_label = String::new();
+        let mut max_marker_columns = 0;
+        for label in &marker_labels {
+            let columns = label.chars().count();
+            if columns > max_marker_columns {
+                max_marker_columns = columns;
+                max_marker_label.clone_from(label);
+            }
+        }
+        alignments[id.0] = Some(ListAlignment {
+            max_marker_label,
+            max_marker_columns,
+            marker_labels: marker_labels.into(),
+        });
+    }
+    alignments
+}
+
+/// Groups the direct content of an item into semantic paragraph regions. Tight
+/// list items have inline children directly under the item, while loose items
+/// have explicit Paragraph nodes; treating adjacent inline children as one
+/// region keeps both forms on the same presentation contract.
+fn list_paragraph_regions(tree: &MarkdownTree, item: NodeId) -> Vec<ListParagraphRegion> {
+    let mut regions = Vec::new();
+    let mut paragraph_ordinal = 0;
+    let mut after_nested_list = false;
+    let mut inline_region: Option<(SourceOffset, SourceOffset, bool)> = None;
+
+    let flush_inline = |regions: &mut Vec<ListParagraphRegion>,
+                        inline_region: &mut Option<(SourceOffset, SourceOffset, bool)>,
+                        ordinal: &mut usize| {
+        if let Some((start, end, after_nested_list)) = inline_region.take() {
+            regions.push(ListParagraphRegion {
+                range: SourceRange { start, end },
+                ordinal: *ordinal,
+                after_nested_list,
+            });
+            *ordinal += 1;
+        }
+    };
+
+    for child_id in tree.children(item) {
+        let Some(child) = tree.node(*child_id) else {
+            continue;
+        };
+        if matches!(child.kind, NodeKind::List { .. }) {
+            flush_inline(&mut regions, &mut inline_region, &mut paragraph_ordinal);
+            after_nested_list = true;
+            continue;
+        }
+        if child.kind.is_block() {
+            flush_inline(&mut regions, &mut inline_region, &mut paragraph_ordinal);
+            regions.push(ListParagraphRegion {
+                range: child.source_range,
+                ordinal: paragraph_ordinal,
+                after_nested_list,
+            });
+            paragraph_ordinal += 1;
+        } else {
+            let entry = inline_region.get_or_insert((
+                child.source_range.start,
+                child.source_range.end,
+                after_nested_list,
+            ));
+            entry.0 = entry.0.min(child.source_range.start);
+            entry.1 = entry.1.max(child.source_range.end);
+        }
+    }
+    flush_inline(&mut regions, &mut inline_region, &mut paragraph_ordinal);
+    regions
+}
+
+fn list_nested_ranges(tree: &MarkdownTree, item: NodeId) -> Vec<SourceRange> {
+    tree.children(item)
+        .iter()
+        .filter_map(|child_id| {
+            let child = tree.node(*child_id)?;
+            matches!(child.kind, NodeKind::List { .. }).then_some(child.source_range)
+        })
+        .collect()
+}
+
+fn list_item_projections(
+    tree: &MarkdownTree,
+    ordinals: &[Option<(NodeId, usize)>],
+    alignments: &[Option<ListAlignment>],
+) -> Vec<Option<ListItemProjection>> {
+    let mut items = vec![None; tree.len()];
+    for (item_id, node) in tree.iter() {
+        if !matches!(node.kind, NodeKind::ListItem { .. }) {
+            continue;
+        }
+        let Some((list_id, ordinal)) = ordinals.get(item_id.0).and_then(|entry| *entry) else {
+            continue;
+        };
+        let Some(NodeKind::List { start }) = tree.node(list_id).map(|node| node.kind) else {
+            continue;
+        };
+        let Some(alignment) = alignments.get(list_id.0).and_then(Clone::clone) else {
+            continue;
+        };
+        items[item_id.0] = Some(ListItemProjection {
+            owner: ListOwnerMetadata {
+                list_id: ListId(list_id.0 as u64),
+                item_id: ListItemId(item_id.0 as u64),
+                marker_kind: list_marker_kind(start),
+                start,
+                ordinal,
+                depth: tree.list_depth(item_id),
+                alignment,
+            },
+            paragraphs: list_paragraph_regions(tree, item_id),
+            nested_lists: list_nested_ranges(tree, item_id),
+        });
+    }
+    items
 }
 
 #[derive(Clone, Debug)]
 struct ProjectionIndex {
     markers: Vec<ProjectedMarker>,
     nodes: SourceIndex<NodeId>,
+    list_items: SourceIndex<NodeId>,
+    /// Owner list and zero-based sibling position for every list item in
+    /// the parse, indexed by [`NodeId::0`]. Built once here — a single pass
+    /// over each list's own children — so [`list_item_label`] looks a
+    /// visible item's ordinal up in `O(1)` instead of every visible line
+    /// re-deriving it with [`MarkdownTree::list_item_ordinal`]'s
+    /// preceding-sibling scan.
+    list_item_ordinals: Vec<Option<(NodeId, usize)>>,
+    list_item_projections: Vec<Option<ListItemProjection>>,
+}
+
+/// [`ProjectionIndex::list_item_ordinals`]'s builder: every `List` node's
+/// children, in the document order [`MarkdownTree::children`] already keeps
+/// them in, get positions `0, 1, 2, ...`. Each list item is visited exactly
+/// once across the whole tree, so this is `O(node count)` total regardless
+/// of how many lines a later viewport projects from it.
+fn list_item_ordinals(tree: &MarkdownTree) -> Vec<Option<(NodeId, usize)>> {
+    let mut ordinals = vec![None; tree.len()];
+    for (id, node) in tree.iter() {
+        if matches!(node.kind, NodeKind::List { .. }) {
+            for (position, child) in tree.children(id).iter().enumerate() {
+                ordinals[child.0] = Some((id, position));
+            }
+        }
+    }
+    ordinals
 }
 
 impl ProjectionIndex {
@@ -1622,15 +2258,28 @@ impl ProjectionIndex {
             .iter()
             .map(|(range, owner)| ((range.start, range.end), *owner))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let list_prefixes = parsed
+            .list_structural_prefixes
+            .iter()
+            .map(|(range, owner, columns)| ((range.start, range.end), (*owner, *columns)))
+            .collect::<std::collections::BTreeMap<_, _>>();
         let mut markers = parsed
             .markers
             .iter()
             .chain(&parsed.code_padding)
             .chain(&parsed.line_break_padding)
+            .chain(
+                parsed
+                    .list_structural_prefixes
+                    .iter()
+                    .map(|(range, _, _)| range),
+            )
             .map(|range| ProjectedMarker {
                 range: *range,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
+                list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
+                global_list_prefix: None,
             })
             .collect::<Vec<_>>();
         markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
@@ -1642,8 +2291,246 @@ impl ProjectionIndex {
                 .map(|(id, node)| (node.source_range, id))
                 .collect(),
         );
-        Self { markers, nodes }
+        let list_item_ordinals = list_item_ordinals(&parsed.tree);
+        let list_alignments = list_alignments(&parsed.tree);
+        let list_item_projections =
+            list_item_projections(&parsed.tree, &list_item_ordinals, &list_alignments);
+        let list_items = SourceIndex::new(
+            parsed
+                .tree
+                .iter()
+                .filter(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+                .map(|(id, node)| (node.source_range, id))
+                .collect(),
+        );
+        Self {
+            markers,
+            nodes,
+            list_items,
+            list_item_ordinals,
+            list_item_projections,
+        }
     }
+}
+
+fn list_marker_metadata(
+    planned: &ProjectedMarker,
+    parsed: &MarkdownParse,
+    nodes: &SourceIndex<NodeId>,
+    visual: &str,
+    source_map: &SourceMap,
+    disclosure: Option<SourceRange>,
+) -> Option<ListMarkerMetadata> {
+    let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure, None);
+    let visual_range = if expanded {
+        source_map
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.source_range == planned.range
+                    && segment.visibility == Visibility::ExpandedMarkup
+            })
+            .map(|segment| segment.visual_range)
+    } else {
+        source_map
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.visibility == Visibility::Synthesized
+                    && segment.source_range.is_empty()
+                    && segment.source_range.start == planned.range.start
+                    && segment.visual_range.start.0 < segment.visual_range.end.0
+            })
+            .map(|segment| segment.visual_range)
+    }?;
+    let label = visual
+        .get(visual_range.start.0..visual_range.end.0)?
+        .to_owned();
+    Some(ListMarkerMetadata {
+        source_range: planned.range,
+        anchor: planned.range.start,
+        visual_range,
+        label,
+        synthesized: !expanded,
+    })
+}
+
+fn list_row_paragraph(
+    projection: &ListItemProjection,
+    range: SourceRange,
+) -> Option<&ListParagraphRegion> {
+    projection
+        .paragraphs
+        .iter()
+        .find(|region| region.range.intersects(range))
+        .or_else(|| {
+            let nested_before = projection
+                .nested_lists
+                .iter()
+                .filter(|nested| nested.end <= range.start)
+                .max_by_key(|nested| nested.end);
+            projection.paragraphs.iter().find(|region| {
+                if region.range.start < range.end {
+                    return false;
+                }
+                // A blank row before a nested list belongs to the item but not
+                // to the paragraph after that list. Once the nested range is
+                // behind the row, the following parent paragraph is the
+                // correct hanging-indent owner.
+                !region.after_nested_list || nested_before.is_some()
+            })
+        })
+        .or_else(|| {
+            let nested_before = projection
+                .nested_lists
+                .iter()
+                .any(|nested| nested.end <= range.start);
+            nested_before
+                .then(|| {
+                    projection
+                        .paragraphs
+                        .iter()
+                        .rev()
+                        .find(|region| region.after_nested_list)
+                })
+                .flatten()
+        })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "list row projection keeps source, visual and disclosure inputs together"
+)]
+fn list_row_metadata(
+    parsed: &MarkdownParse,
+    projection: &ProjectionIndex,
+    range: SourceRange,
+    markers_on_line: &[ProjectedMarker],
+    visual: &str,
+    source_map: &SourceMap,
+    disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
+) -> Option<ListRowMetadata> {
+    let item = projection
+        .list_items
+        .intersecting(range)
+        .into_iter()
+        .copied()
+        .max_by_key(|id| parsed.tree.list_depth(*id));
+    let item_projection = item.and_then(|item| {
+        projection
+            .list_item_projections
+            .get(item.0)
+            .and_then(Option::as_ref)
+    });
+    let projected = projected_item_for_range(list_projection, range);
+    if item_projection.is_none() && projected.is_none() {
+        return None;
+    }
+    let opening = item.and_then(|item| {
+        markers_on_line.iter().find(|planned| {
+            planned.list_owner == Some(item)
+                && planned.range.start >= range.start
+                && planned.range.start < range.end
+        })
+    });
+    let role = if opening.is_some() {
+        ListRowRole::Opening
+    } else if let Some(item_projection) = item_projection
+        && let Some(region) = list_row_paragraph(item_projection, range)
+    {
+        if region.after_nested_list {
+            ListRowRole::ParentParagraphAfterNestedList {
+                ordinal: region.ordinal,
+            }
+        } else if region.ordinal > 0 {
+            ListRowRole::LooseParagraph {
+                ordinal: region.ordinal,
+            }
+        } else {
+            ListRowRole::Continuation
+        }
+    } else {
+        ListRowRole::Continuation
+    };
+    let marker = opening.and_then(|planned| {
+        list_marker_metadata(
+            planned,
+            parsed,
+            &projection.nodes,
+            visual,
+            source_map,
+            disclosure,
+        )
+    });
+    let structural_prefixes = markers_on_line
+        .iter()
+        .filter_map(|planned| {
+            if let Some((owner, columns)) = planned.list_prefix {
+                return Some(ListStructuralPrefixMetadata {
+                    item_id: ListItemId(owner.0 as u64),
+                    source_range: planned.range,
+                    columns,
+                });
+            }
+            let prefix = planned.global_list_prefix?;
+            Some(ListStructuralPrefixMetadata {
+                item_id: ListItemId(prefix.item_range.start.0 as u64),
+                source_range: prefix.source_range,
+                columns: prefix.columns,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body_visual_start = markers_on_line
+        .iter()
+        .filter(|planned| {
+            planned.list_owner.is_some()
+                || planned.list_prefix.is_some()
+                || planned.global_list_prefix.is_some()
+        })
+        .flat_map(|planned| {
+            source_map.segments.iter().filter_map(|segment| {
+                let same_source = segment.source_range == planned.range;
+                let synthesized = segment.visibility == Visibility::Synthesized
+                    && segment.source_range.is_empty()
+                    && segment.source_range.start == planned.range.start;
+                (same_source || synthesized).then_some(segment.visual_range.end)
+            })
+        })
+        .max()
+        .unwrap_or(VisualOffset(0));
+    let owner = if let Some(projected) = projected {
+        let list_projection = list_projection?;
+        let alignment = projected_list_alignment(list_projection, projected)?;
+        let mut owner = item_projection.map_or_else(
+            || ListOwnerMetadata {
+                list_id: ListId(projected.list_range.start.0 as u64),
+                item_id: ListItemId(projected.item_range.start.0 as u64),
+                marker_kind: list_marker_kind(projected.start),
+                start: projected.start,
+                ordinal: projected.ordinal,
+                depth: projected.depth,
+                alignment: alignment.clone(),
+            },
+            |item_projection| item_projection.owner.clone(),
+        );
+        owner.list_id = ListId(projected.list_range.start.0 as u64);
+        owner.item_id = ListItemId(projected.item_range.start.0 as u64);
+        owner.start = projected.start;
+        owner.ordinal = projected.ordinal;
+        owner.depth = projected.depth;
+        owner.alignment = alignment;
+        owner
+    } else {
+        item_projection?.owner.clone()
+    };
+    Some(ListRowMetadata {
+        owner,
+        role,
+        marker,
+        structural_prefixes,
+        body_visual_start,
+    })
 }
 
 /// One joinable block's whole-span parse, kept independent of which lines a
@@ -1742,6 +2629,7 @@ pub fn parse_joined_span(
 /// rejoining and reparsing `lines`; only `lines` themselves still have to be
 /// this run's own, since each is presented against its own physical range
 /// regardless of which parse supplied it.
+#[cfg(test)]
 fn present_joined_run(
     lines: &[BlockLine<'_>],
     revision: Revision,
@@ -1749,6 +2637,32 @@ fn present_joined_run(
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
     block_disclosure: Option<SourceRange>,
+    out: &mut Vec<VisualLine>,
+) {
+    present_joined_run_with_list_projection(
+        lines,
+        revision,
+        line_height,
+        render,
+        joined,
+        block_disclosure,
+        None,
+        out,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "joined presentation keeps the render window and parse context together"
+)]
+fn present_joined_run_with_list_projection(
+    lines: &[BlockLine<'_>],
+    revision: Revision,
+    line_height: f32,
+    render: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    block_disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
     out: &mut Vec<VisualLine>,
 ) {
     let computed;
@@ -1762,6 +2676,7 @@ fn present_joined_run(
     let shared = SharedParse {
         parsed: &joined.parsed,
         projection: &joined.projection,
+        list_projection,
     };
     // A single active disclosure (caret, selection or IME) may touch a shared
     // construct whose markers live on different physical lines; `marker_is_disclosed`
@@ -1820,6 +2735,32 @@ pub fn present_polished_line(
     disclosure: Option<SourceRange>,
     context: LineContext,
 ) -> VisualLine {
+    present_polished_line_with_list_projection(
+        line_id,
+        revision,
+        range,
+        source,
+        line_height,
+        disclosure,
+        context,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "line presentation keeps the existing public dispatch inputs plus list context"
+)]
+fn present_polished_line_with_list_projection(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    context: LineContext,
+    list_projection: Option<&ListProjection>,
+) -> VisualLine {
     // A fenced-code line has no disclosable inline markup; its content is literal,
     // so it stays a code block regardless of cursor position and wins over image
     // and table recognition that would otherwise mis-read the literal text.
@@ -1832,7 +2773,15 @@ pub fn present_polished_line(
     {
         present_table_line(line_id, revision, range, source, line_height)
     } else {
-        present_markdown_with_disclosure(line_id, revision, range, source, line_height, disclosure)
+        present_markdown_with_list_projection(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+            list_projection,
+        )
     };
     block.context = context;
     block
@@ -1965,6 +2914,7 @@ fn present_image(
             alt: image.alt.to_owned(),
             destination: image.destination.to_owned(),
         }),
+        list: None,
     }
 }
 
@@ -1997,6 +2947,7 @@ fn present_table_line(
             context: LineContext::Normal,
             disclosure: None,
             image: None,
+            list: None,
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
@@ -2063,6 +3014,7 @@ fn present_table_line(
         context: LineContext::Normal,
         disclosure: None,
         image: None,
+        list: None,
     }
 }
 
@@ -2368,6 +3320,7 @@ mod tests {
         let shared = SharedParse {
             parsed: &joined.parsed,
             projection: &joined.projection,
+            list_projection: None,
         };
         // The caret is off-screen inside the strong span. Prefix ownership and
         // both distant delimiters still use the same complete snapshot.
@@ -2826,9 +3779,12 @@ mod tests {
         // the same paragraph as an ordinary soft break, so their leading
         // whitespace must disappear from inactive visual text the same way — all
         // while every source byte, including the hidden padding, stays mapped.
-        for (first_line, second_line, hidden_marker, hidden_padding) in [
-            ("> foo\n", "  bar", (0, 2), (6, 8)),
-            ("- foo\n", " bar", (0, 2), (6, 7)),
+        // The list fixture's opening line carries the synthesized bullet
+        // marker even while inactive (#126 contract); the quote fixture has
+        // no such marker since `>` markup is hidden rather than synthesized.
+        for (first_line, second_line, hidden_marker, hidden_padding, expected_first) in [
+            ("> foo\n", "  bar", (0, 2), (6, 8), "foo"),
+            ("- foo\n", " bar", (0, 2), (6, 7), "• foo"),
         ] {
             let base = 12;
             let first_range = SourceRange::new(base, base + first_line.len());
@@ -2860,7 +3816,7 @@ mod tests {
                 &mut out,
             );
             assert_eq!(
-                out[0].visual_text, "foo",
+                out[0].visual_text, expected_first,
                 "source: {first_line:?}{second_line:?}"
             );
             assert_eq!(
@@ -2970,7 +3926,10 @@ mod tests {
             ("> > `\n> > x\n> > `", vec!["", "x", ""]),
             ("> ` \n>  `", vec![" ", " "]),
             ("> ` x\n> y `", vec!["x", "y"]),
-            ("- `\n  x\n  `", vec!["", "  x", "  "]),
+            // The list item's opening line carries the synthesized bullet
+            // marker even while inactive (#126 contract), unlike the quote
+            // fixtures above whose `>` markup is real source text instead.
+            ("- `\n  x\n  `", vec!["• ", "x", ""]),
         ] {
             let mut offset = 50;
             let lines: Vec<_> = source
@@ -2993,7 +3952,7 @@ mod tests {
                 kind: if source.starts_with('>') {
                     NodeKind::Quote
                 } else {
-                    NodeKind::List { ordered: false }
+                    NodeKind::List { start: None }
                 },
                 source_range: SourceRange::new(50, offset),
                 revision: Revision(1),
@@ -3058,6 +4017,536 @@ mod tests {
             Some(SourceRange::empty(start + 4)),
         );
         assert_eq!(visual.visual_text, "> outer\n> nested");
+    }
+
+    #[test]
+    fn list_marker_discloses_for_every_ancestor_whose_source_range_the_caret_enters() {
+        // A nested/mixed fixture (#126): an outer item whose own directly-owned
+        // content is interrupted by a nested child list with its own second
+        // paragraph, followed by the outer item's own second paragraph, then
+        // an unrelated top-level sibling.
+        let source = "- outer\n\n  - inner\n\n    second\n\n  outer second\n\n- sibling";
+        let start = 50;
+        let range = SourceRange::new(start, start + source.len());
+        let outer_line = 0;
+        let inner_line = 2;
+        let sibling_line = 8;
+        let line = |visual_text: &str, index: usize| -> String {
+            visual_text.split('\n').nth(index).unwrap().to_string()
+        };
+        let present = |disclosure: Option<SourceRange>| {
+            present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, disclosure)
+        };
+
+        // Nothing disclosed: both markers collapse to their synthesized bullet.
+        let collapsed = present(None);
+        assert_eq!(line(&collapsed.visual_text, outer_line), "\u{2022} outer");
+        assert_eq!(line(&collapsed.visual_text, inner_line), "\u{2022} inner");
+        assert_eq!(
+            line(&collapsed.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A caret inside the nested child's own first line discloses both the
+        // nested item's own marker and its ancestor's, since the caret's
+        // source range intersects both owners' source ranges.
+        let at_inner = start + source.find("inner").unwrap();
+        let inner_caret = present(Some(SourceRange::empty(at_inner)));
+        assert_eq!(line(&inner_caret.visual_text, outer_line), "- outer");
+        assert_eq!(line(&inner_caret.visual_text, inner_line), "  - inner");
+        assert_eq!(
+            line(&inner_caret.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A selection inside the nested child's own second paragraph — not on
+        // the marker's own line — still discloses the nested item's marker and
+        // every ancestor whose source range contains that paragraph.
+        let second_start = start + source.find("second").unwrap();
+        let second_selection = present(Some(SourceRange::new(
+            second_start,
+            second_start + "second".len(),
+        )));
+        assert_eq!(line(&second_selection.visual_text, outer_line), "- outer");
+        assert_eq!(line(&second_selection.visual_text, inner_line), "  - inner");
+        assert_eq!(
+            line(&second_selection.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A caret back in the outer item's own paragraph, past the nested
+        // child, discloses only the outer marker: the caret's source range no
+        // longer intersects the nested item's own source range.
+        let at_outer_second = start + source.find("outer second").unwrap();
+        let outer_second_caret = present(Some(SourceRange::empty(at_outer_second)));
+        assert_eq!(line(&outer_second_caret.visual_text, outer_line), "- outer");
+        assert_eq!(
+            line(&outer_second_caret.visual_text, inner_line),
+            "  \u{2022} inner"
+        );
+        assert_eq!(
+            line(&outer_second_caret.visual_text, sibling_line),
+            "\u{2022} sibling"
+        );
+
+        // A caret in the unrelated sibling item discloses only its own
+        // marker, never the outer or nested ancestors of a different subtree.
+        let at_sibling = start + source.find("sibling").unwrap();
+        let sibling_caret = present(Some(SourceRange::empty(at_sibling)));
+        assert_eq!(
+            line(&sibling_caret.visual_text, outer_line),
+            "\u{2022} outer"
+        );
+        assert_eq!(
+            line(&sibling_caret.visual_text, inner_line),
+            "\u{2022} inner"
+        );
+        assert_eq!(line(&sibling_caret.visual_text, sibling_line), "- sibling");
+    }
+
+    #[test]
+    fn list_item_boundary_discloses_only_the_item_that_starts_there() {
+        let source = "- first\n- second";
+        let range = SourceRange::new(0, source.len());
+        let second_start = source.find("- second").expect("second list item");
+        let presented = present_markdown_with_disclosure(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(second_start)),
+        );
+        let lines = presented.visual_text.split('\n').collect::<Vec<_>>();
+
+        assert_eq!(lines, &["• first", "- second"]);
+    }
+
+    #[test]
+    fn list_structural_prefix_synthesizes_columns_and_discloses_the_owning_items_raw_bytes() {
+        // A two-digit ordered marker ("10. ") is four columns wide; the
+        // continuation line reaches that width with a single leading tab, so
+        // the inactive synthesized replacement (four plain spaces) and the
+        // disclosed original byte (one tab character) are visibly different,
+        // unlike the common all-spaces case.
+        let source = "10. item\n\tcontinued\n";
+        let start = 40;
+        let range = SourceRange::new(start, start + source.len());
+        let line = |visual_text: &str, index: usize| -> String {
+            visual_text.split('\n').nth(index).unwrap().to_string()
+        };
+        let present = |disclosure: Option<SourceRange>| {
+            present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, disclosure)
+        };
+
+        let collapsed = present(None);
+        assert_eq!(line(&collapsed.visual_text, 1), "continued");
+
+        let at_continued = start + source.find("continued").unwrap();
+        let disclosed = present(Some(SourceRange::empty(at_continued)));
+        assert_eq!(line(&disclosed.visual_text, 1), "\tcontinued");
+    }
+
+    #[test]
+    fn opening_list_structural_prefix_uses_source_mapping_without_fake_text() {
+        let source = "  - item\n";
+        let start = 40;
+        let range = SourceRange::new(start, start + source.len());
+        let collapsed = present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+        assert_eq!(collapsed.visual_text, "• item\n");
+        let prefix = collapsed
+            .list
+            .as_ref()
+            .and_then(|list| list.structural_prefixes.first())
+            .expect("opening indentation is owned by the item");
+        assert_eq!(prefix.source_range, SourceRange::new(start, start + 2));
+        assert_eq!(prefix.columns, 2);
+
+        let item = start + source.find("item").expect("item in source");
+        let disclosed = present_markdown_with_disclosure(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(item)),
+        );
+        assert_eq!(disclosed.visual_text, source);
+    }
+
+    #[test]
+    fn opening_list_marker_padding_is_hidden_but_disclosed_with_the_item() {
+        for (source, expected) in [("-   item\n", "• item\n"), ("1.    item\n", "1. item\n")] {
+            let start = 40;
+            let range = SourceRange::new(start, start + source.len());
+            let collapsed =
+                present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+            assert_eq!(collapsed.visual_text, expected, "source: {source:?}");
+
+            let item = start + source.find("item").expect("item in source");
+            let disclosed = present_markdown_with_disclosure(
+                0,
+                Revision(1),
+                range,
+                source,
+                26.0,
+                Some(SourceRange::empty(item)),
+            );
+            assert_eq!(disclosed.visual_text, source, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_list_labels_use_owner_start_plus_sibling_position() {
+        for (source, expected_labels) in [
+            // Loose/irregular source digits never leak into the synthesized
+            // label; only the first item's marker sets the owner's `start`,
+            // and later items number sequentially from it regardless of
+            // their own written digits.
+            ("3. a\n1. b\n1. c", vec!["3. a", "4. b", "5. c"]),
+            // `0` is a valid ordered-list start.
+            ("0. a\n0. b", vec!["0. a", "1. b"]),
+        ] {
+            let start = 40;
+            let range = SourceRange::new(start, start + source.len());
+            let presented =
+                present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+            let lines: Vec<_> = presented.visual_text.split('\n').collect();
+            assert_eq!(lines, expected_labels, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn nested_lists_number_independently_of_their_ancestors_and_siblings() {
+        // A mixed fixture: an ordered outer list whose first item contains a
+        // nested bullet list, followed by the outer list's second item. The
+        // nested items are siblings of each other only, and the outer
+        // second item's ordinal must not count the nested items at all.
+        let source = "3. outer-a\n   - nested-a\n   - nested-b\n1. outer-b";
+        let start = 40;
+        let range = SourceRange::new(start, start + source.len());
+        let presented = present_markdown_with_disclosure(0, Revision(1), range, source, 26.0, None);
+        let lines: Vec<_> = presented.visual_text.split('\n').collect();
+        assert_eq!(
+            lines,
+            vec![
+                "3. outer-a",
+                "\u{2022} nested-a",
+                "\u{2022} nested-b",
+                "4. outer-b",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_rows_expose_semantic_geometry_policy_without_reparsing_in_layout() {
+        let source = "- parent\n\n  3. child\n\n     - grandchild\n  8. child2\n\n  parent second\n- sibling";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(1));
+        let mut presented = Vec::new();
+        present_joined_run(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..lines.len()),
+            Some(&joined),
+            None,
+            &mut presented,
+        );
+
+        let rows = presented
+            .iter()
+            .filter_map(|line| line.list.as_ref().map(|list| (line, list)))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 9);
+
+        let (parent, parent_meta) = rows[0];
+        assert_eq!(parent.visual_text, "\u{2022} parent");
+        assert_eq!(parent_meta.owner.depth, 1);
+        assert_eq!(parent_meta.owner.marker_kind, ListMarkerKind::Bullet);
+        assert_eq!(parent_meta.owner.ordinal, 0);
+        assert_eq!(parent_meta.owner.alignment.max_marker_label, "\u{2022} ");
+        assert_eq!(parent_meta.owner.alignment.max_marker_columns, 2);
+        assert_eq!(parent_meta.role, ListRowRole::Opening);
+        let parent_marker = parent_meta.marker.as_ref().expect("parent marker");
+        assert!(parent_marker.synthesized);
+        assert_eq!(parent_marker.label, "\u{2022} ");
+        assert_eq!(parent_marker.anchor, parent_marker.source_range.start);
+        assert_eq!(
+            parent_meta.body_visual_start,
+            parent_marker.visual_range.end
+        );
+
+        let (_, child_meta) = rows[2];
+        assert_eq!(child_meta.owner.depth, 2);
+        assert_eq!(child_meta.owner.marker_kind, ListMarkerKind::Ordered);
+        assert_eq!(child_meta.owner.start, Some(3));
+        assert_eq!(child_meta.owner.ordinal, 0);
+        assert_eq!(child_meta.owner.alignment.max_marker_label, "3. ");
+        assert_eq!(child_meta.owner.alignment.max_marker_columns, 3);
+        assert_eq!(child_meta.role, ListRowRole::Opening);
+
+        let (_, grandchild_meta) = rows[4];
+        assert_eq!(grandchild_meta.owner.depth, 3);
+        assert_eq!(grandchild_meta.owner.marker_kind, ListMarkerKind::Bullet);
+        assert_eq!(grandchild_meta.role, ListRowRole::Opening);
+        assert_eq!(grandchild_meta.structural_prefixes.len(), 2);
+
+        let (_, second_child_meta) = rows[5];
+        assert_eq!(second_child_meta.owner.list_id, child_meta.owner.list_id);
+        assert_eq!(second_child_meta.owner.ordinal, 1);
+        assert_eq!(second_child_meta.marker.as_ref().unwrap().label, "4. ");
+
+        let (_, parent_second_meta) = rows[7];
+        assert_eq!(parent_second_meta.owner.item_id, parent_meta.owner.item_id);
+        assert_eq!(
+            parent_second_meta.role,
+            ListRowRole::ParentParagraphAfterNestedList { ordinal: 1 }
+        );
+        assert_eq!(parent_second_meta.owner.depth, 1);
+
+        let (_, sibling_meta) = rows[8];
+        assert_eq!(sibling_meta.owner.list_id, parent_meta.owner.list_id);
+        assert_eq!(sibling_meta.owner.ordinal, 1);
+        assert_eq!(sibling_meta.role, ListRowRole::Opening);
+    }
+
+    #[test]
+    fn list_row_metadata_distinguishes_continuation_and_loose_paragraphs() {
+        let source = "- first\ncontinued\n\n  second\n\n  third\n- next";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(1));
+        let mut presented = Vec::new();
+        present_joined_run(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..lines.len()),
+            Some(&joined),
+            None,
+            &mut presented,
+        );
+
+        let metadata = |line: usize| presented[line].list.as_ref().expect("list row");
+        assert_eq!(metadata(0).role, ListRowRole::Opening);
+        assert_eq!(metadata(1).role, ListRowRole::Continuation);
+        assert!(metadata(1).structural_prefixes.is_empty());
+        assert_eq!(metadata(3).role, ListRowRole::LooseParagraph { ordinal: 1 });
+        assert_eq!(metadata(5).role, ListRowRole::LooseParagraph { ordinal: 2 });
+        assert_eq!(metadata(6).role, ListRowRole::Opening);
+        assert_eq!(metadata(6).owner.ordinal, 1);
+        assert_eq!(metadata(0).owner.item_id, metadata(1).owner.item_id);
+        assert_eq!(metadata(3).owner.item_id, metadata(0).owner.item_id);
+    }
+
+    #[test]
+    fn ordered_row_metadata_uses_inactive_labels_for_shared_alignment() {
+        let source = "9. first\n1. second";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(1));
+        let mut presented = Vec::new();
+        present_joined_run(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..lines.len()),
+            Some(&joined),
+            None,
+            &mut presented,
+        );
+
+        let first = presented[0].list.as_ref().expect("first list row");
+        let second = presented[1].list.as_ref().expect("second list row");
+        assert_eq!(first.marker.as_ref().unwrap().label, "9. ");
+        assert_eq!(second.marker.as_ref().unwrap().label, "10. ");
+        assert_eq!(first.owner.list_id, second.owner.list_id);
+        assert_eq!(first.owner.alignment.max_marker_label, "10. ");
+        assert_eq!(first.owner.alignment.max_marker_columns, 4);
+        assert_eq!(second.owner.alignment, first.owner.alignment);
+    }
+
+    #[test]
+    fn disclosed_ordered_marker_metadata_keeps_leading_zero_and_delimiter() {
+        let source = "003) first\n9) second";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: (line == 0).then_some(SourceRange::empty(0)),
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(1));
+        let mut presented = Vec::new();
+        present_joined_run(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..lines.len()),
+            Some(&joined),
+            None,
+            &mut presented,
+        );
+
+        let disclosed = presented[0].list.as_ref().expect("disclosed list row");
+        assert_eq!(disclosed.marker.as_ref().unwrap().label, "003) ");
+        assert!(!disclosed.marker.as_ref().unwrap().synthesized);
+        assert_eq!(
+            presented[1]
+                .list
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .label,
+            "4. "
+        );
+        assert_eq!(disclosed.owner.start, Some(3));
+        assert_eq!(disclosed.owner.alignment.max_marker_label, "3. ");
+    }
+
+    #[test]
+    fn list_item_label_returns_none_when_the_ordinal_table_omits_the_item() {
+        // `list_item_label` must read only the precomputed ordinal table, not
+        // fall back to `MarkdownTree::list_item_ordinal`'s preceding-sibling
+        // scan when an entry is missing — a fallback here would mask a
+        // construction gap and silently reintroduce a per-line sibling walk.
+        let source = "1. a\n2. b\n3. c\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let (item, _) = parsed
+            .tree
+            .blocks()
+            .find(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. }))
+            .expect("a list item");
+        let populated = list_item_ordinals(&parsed.tree);
+        assert_eq!(
+            list_item_label(&parsed, &populated, item),
+            Some("1. ".to_owned())
+        );
+        let empty = vec![None; parsed.tree.len()];
+        assert_eq!(list_item_label(&parsed, &empty, item), None);
+    }
+
+    #[test]
+    fn large_ordered_list_viewport_labels_reuse_one_shared_parse_at_middle_and_tail() {
+        // 100,000 flat items in one ordered list. If a visible item's label
+        // still re-derived its ordinal via `MarkdownTree::list_item_ordinal`
+        // per line (a scan of every preceding sibling), presenting only the
+        // handful of lines drawn from the middle and the tail below would
+        // still be correct but would cost proportional to each item's
+        // position rather than to the lines actually presented; this test
+        // fixes correctness at that position, and
+        // `list_item_label_returns_none_when_the_ordinal_table_omits_the_item`
+        // fixes structurally that no such fallback scan exists at all.
+        const ITEMS: usize = 100_000;
+        let start_value = 3u64;
+        let source = (0..ITEMS)
+            .map(|i| format!("{start_value}. item {i}\n"))
+            .collect::<String>();
+        let mut cursor = 40;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(cursor, cursor + text.len());
+                cursor = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let joined = parse_joined_block(&lines, Revision(9));
+        let shared = SharedParse {
+            parsed: &joined.parsed,
+            projection: &joined.projection,
+            list_projection: None,
+        };
+        let middle = ITEMS / 2;
+        for &index in &[
+            middle - 2,
+            middle - 1,
+            middle,
+            ITEMS - 3,
+            ITEMS - 2,
+            ITEMS - 1,
+        ] {
+            let line = &lines[index];
+            let presented = present_markdown_from_parse(
+                line.line as u64,
+                Revision(9),
+                line.range,
+                line.text,
+                26.0,
+                None,
+                &shared,
+            );
+            assert_eq!(
+                presented.visual_text,
+                format!("{}. item {index}\n", start_value + index as u64),
+                "item {index}"
+            );
+            assert!(segments_tile_range(
+                line.range,
+                &presented.source_map.segments
+            ));
+            assert!(
+                presented.source_map.segments.capacity() <= 5,
+                "mapping storage must depend on this line's own markers, not item {index}'s position"
+            );
+        }
     }
 
     #[test]

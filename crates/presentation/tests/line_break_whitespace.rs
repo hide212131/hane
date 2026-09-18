@@ -79,17 +79,19 @@ const FIXTURES: &[MarkdownFixture] = &[
         // Start/End(Paragraph) for a tight item's `TightParagraph`, so HardBreak
         // sits directly under ListItem, matching every other tight-list fixture.
         tree_paths: &[&[
-            NodeKind::List { ordered: false },
+            NodeKind::List { start: None },
             NodeKind::ListItem { task: None },
             NodeKind::HardBreak,
         ]],
         markers: &["- ", "  "],
         block_kinds: &[BlockKind::ListItem, BlockKind::ListItem],
         style_runs: &[NO_STYLES, NO_STYLES],
-        // The two spaces required by the list continuation belong to the
-        // existing list presentation; break-adjacent whitespace behavior is
-        // covered independently above and inside the quote fixture.
-        visual_lines: &["foo", "  baz"],
+        // The two spaces required by the list continuation are layout
+        // geometry, not synthesized text. Break-adjacent whitespace behavior
+        // (the `"  "` marker above, from the hard break's own trailing spaces
+        // on line one) remains independently source-addressable. The item's
+        // opening line also carries its synthesized `•`.
+        visual_lines: &["\u{2022} foo", "baz"],
     },
     MarkdownFixture {
         name: "internal paragraph spaces stay visible",

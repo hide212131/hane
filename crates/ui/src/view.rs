@@ -20,9 +20,11 @@ use crate::capture::InputCapture;
 use crate::icons;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
+#[cfg(test)]
+use crate::line::presented_block;
 use crate::line::{
     BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
-    presented_block, row_element,
+    presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -39,13 +41,15 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    local_block_index,
+    ListProjection, local_block_index,
 };
 use hane_metrics::FrameMetrics;
+#[cfg(test)]
+use hane_presentation::{BlockKind, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
-    VisualBlock, VisualLine, VisualOffset, block_heights, block_is_joinable, block_line_span,
-    layout_block, parse_joined_span, trailing_blank_lines,
+    VisualBlock, VisualLine, block_heights, block_is_joinable, block_line_span, layout_block,
+    parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService,
@@ -2154,6 +2158,7 @@ impl EditorView {
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
     /// moved under the pointer and there is nothing to do.
+    #[cfg(test)]
     fn rendered_line(&self, line: usize) -> Option<VisualLine> {
         let (id, at) = self.line_owners.get(&line)?;
         self.block_cache.get(id)?.lines.get(*at).cloned()
@@ -2169,16 +2174,19 @@ impl EditorView {
         window_x: f32,
         window: &Window,
     ) -> Option<SourceOffset> {
-        let visual = self.rendered_line(line)?;
+        let (block_id, visual_line) = *self.line_owners.get(&line)?;
+        let visual = self.block_cache.get(&block_id)?;
+        let layout = &self.layout_cache.get(&block_id)?.layout;
+        let row_index = layout
+            .lines
+            .iter()
+            .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let visual_offset = WindowShaper::new(window).offset_for_x(&visual, fragment.clone(), x);
-        Some(source_offset_for_visual_position(
-            self.editor(),
-            line,
-            &visual,
-            visual_offset,
-            Some(&fragment),
-        ))
+        let shaper = WindowShaper::new(window);
+        let visual_offset = layout.visual_at_x(visual, row_index, x, &shaper)?;
+        let line = visual.lines.get(visual_line)?;
+        let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
+        layout.source_at_x_with_bias(visual, row_index, x, &shaper, bias)
     }
 
     fn on_row_mouse_down(
@@ -2331,11 +2339,15 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
             cached.revision == revision && cached.source_range == indexed.source_range
         });
-        let visual = presented_block(
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
+        let visual = presented_block_with_list_projection(
             self.editor(),
             &indexed,
             &window,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
@@ -2364,6 +2376,9 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
             cached.revision == revision && cached.source_range == indexed.source_range
         });
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
         target_in_neighbor(
             self.editor(),
             &indexed,
@@ -2373,6 +2388,7 @@ impl EditorView {
             self.content_width,
             shaper,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )
     }
 
@@ -2767,11 +2783,15 @@ impl EditorView {
         let joined = self.joined_parse_cache.get(&block.id).filter(|cached| {
             cached.revision == revision && cached.source_range == block.source_range
         });
-        let presented = presented_block(
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(block));
+        let presented = presented_block_with_list_projection(
             self.sessions.active().editor(),
             block,
             visible,
             joined.map(|cached| &cached.parse),
+            list_projection,
         )?;
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
@@ -2897,8 +2917,10 @@ fn target_in_neighbor(
     width: f32,
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
 ) -> Option<SourceOffset> {
-    let visual = presented_block(editor, indexed, &window, joined)?;
+    let visual =
+        presented_block_with_list_projection(editor, indexed, &window, joined, list_projection)?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -2932,7 +2954,9 @@ fn neighbor_row_target(
     joined: Option<&JoinedParse>,
 ) -> Option<SourceOffset> {
     let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
-    target_in_neighbor(editor, &indexed, window, down, x, width, shaper, joined)
+    target_in_neighbor(
+        editor, &indexed, window, down, x, width, shaper, joined, None,
+    )
 }
 
 /// The block holding one source offset: the formal index while it describes the
@@ -4079,13 +4103,8 @@ fn file_name_label(
     };
     let remainder = badge.remainder();
     let chip = date_badge_chip(badge.date, today, theme);
-    let remainder_child = (!remainder.is_empty()).then(|| {
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .truncate()
-            .child(remainder)
-    });
+    let remainder_child =
+        (!remainder.is_empty()).then(|| div().flex_1().min_w(px(0.0)).truncate().child(remainder));
     if badge_renders_before_remainder(badge_position) {
         row.child(chip).children(remainder_child)
     } else {
@@ -4206,6 +4225,7 @@ impl EditorView {
 /// collapsed boundary the click actually landed on; `None` (as from the
 /// non-row test helpers below) leaves that disambiguation off, matching the
 /// unwrapped, whole-line behavior.
+#[cfg(test)]
 fn source_offset_for_visual_position(
     editor: &Editor,
     line: usize,
@@ -4345,8 +4365,9 @@ mod tests {
 
         // Rechecking the same day the sidebar already knows about must not
         // report a change: nothing new to redraw.
-        let changed =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(initial, cx));
+        let changed = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(initial, cx)
+        });
         assert!(!changed);
         assert_eq!(
             view.update(cx, |view, _cx| view.sidebar_date_badge_today),
@@ -4355,8 +4376,9 @@ mod tests {
 
         // A genuine date-boundary crossing updates the cached date and
         // reports that the sidebar has something new to show.
-        let changed =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        let changed = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(other_day, cx)
+        });
         assert!(changed);
         assert_eq!(
             view.update(cx, |view, _cx| view.sidebar_date_badge_today),
@@ -4364,8 +4386,9 @@ mod tests {
         );
 
         // Rechecking again on the new day is once more a no-op.
-        let changed_again =
-            view.update(cx, |view, cx| view.apply_sidebar_date_badge_today(other_day, cx));
+        let changed_again = view.update(cx, |view, cx| {
+            view.apply_sidebar_date_badge_today(other_day, cx)
+        });
         assert!(!changed_again);
     }
 
@@ -4388,9 +4411,15 @@ mod tests {
         index
             .blocks()
             .flat_map(|block| {
-                presented_block(editor, &block, &(0..usize::MAX), None)
-                    .expect("block presents")
-                    .lines
+                presented_block_with_list_projection(
+                    editor,
+                    &block,
+                    &(0..usize::MAX),
+                    None,
+                    index.list_projection(&block),
+                )
+                .expect("block presents")
+                .lines
             })
             .collect()
     }
@@ -4502,6 +4531,38 @@ mod tests {
     }
 
     #[test]
+    fn layout_click_mapping_preserves_collapsed_marker_affinity() {
+        let text = "**bold** more";
+        let mut editor = Editor::new(text);
+        editor
+            .set_selection(Selection::caret(SourceOffset(text.len())))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (block, layout) = laid_out(&editor, &index, 0, &shaper);
+        let line = &block.lines[0];
+        let boundary = "bold".len();
+        let x = boundary as f32 * 8.0;
+
+        assert_eq!(
+            layout.source_at_x_with_bias(&block, 0, x, &shaper, Bias::Before),
+            Some(SourceOffset(6))
+        );
+        assert_eq!(
+            layout.source_at_x_with_bias(&block, 0, x, &shaper, Bias::After),
+            Some(SourceOffset(8))
+        );
+        assert_eq!(
+            collapsed_boundary_bias(line, boundary, Some(&(0..boundary))),
+            Bias::Before
+        );
+        assert_eq!(
+            collapsed_boundary_bias(line, boundary, Some(&(boundary..line.visual_text.len()))),
+            Bias::After
+        );
+    }
+
+    #[test]
     fn hidden_closing_marker_boundary_lands_before_the_marker_across_a_joined_multiline_span() {
         // CommonMark resolves a backtick-delimited code span across a soft
         // line break, so the closing marker for `co` on the first physical
@@ -4576,7 +4637,11 @@ mod tests {
     // visible text landed before the bullet instead of after it.
     #[test]
     fn hidden_list_marker_boundary_lands_after_the_marker_even_when_indented() {
-        let text = "  - item\nnext line";
+        // A blank line closes the list before "next line", so the caret at
+        // document end sits in an unrelated trailing paragraph rather than
+        // (per CommonMark lazy continuation) inside the list item's own
+        // source range, keeping the marker hidden for this boundary check.
+        let text = "  - item\n\nnext line";
         let mut editor = Editor::new(text);
         editor
             .set_selection(Selection::caret(SourceOffset(text.len())))
@@ -4584,11 +4649,12 @@ mod tests {
         let lines = presented_lines(&editor);
 
         let line = &lines[0];
-        assert_eq!(line.visual_text, "  item");
+        assert_eq!(line.visual_text, "\u{2022} item");
         let visual_offset = line.visual_text.find("item").unwrap();
-        // "  - item" hides the bullet `- ` (source offsets 2..4); canonical is
-        // source offset 4, just after the marker and before "item", not
-        // offset 2, just before the marker in the leading indentation.
+        // "  - item" hides the bullet `- ` (source offsets 2..4) and replaces
+        // it with a synthesized `•`; canonical is source offset 4, just after
+        // the marker and before "item", not offset 2, just before the marker
+        // in the leading indentation.
         assert_eq!(
             source_offset_for_visual_position(&editor, 0, line, visual_offset, None),
             SourceOffset(text.find("- item").unwrap() + 2)
@@ -4774,6 +4840,140 @@ mod tests {
         assert_eq!(visual.leading_space(), 40_000.0 * 26.0);
         assert!(visual.covers(&(40_010..40_040)));
         assert!(!visual.covers(&(39_000..39_050)));
+    }
+
+    #[test]
+    fn a_large_list_viewport_keeps_formal_numbering_and_nesting() {
+        let mut source = String::from("1. outer\n   1. nested\n1. second\n");
+        for _ in 3..5_000 {
+            source.push_str("1. item\n");
+        }
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+
+        // The nested item is rendered from a one-line viewport parse. Its
+        // parent list is outside that parse, so the formal depth must come
+        // from the projection retained by BlockIndex.
+        let nested =
+            presented_block_with_list_projection(&editor, &block, &(1..2), None, Some(projection))
+                .expect("nested item presents");
+        assert_eq!(nested.lines[0].visual_text, "1. nested");
+        assert_eq!(nested.lines[0].list.as_ref().unwrap().owner.depth, 2);
+
+        // The late item is past the synchronous 4,096-line join budget. Its
+        // source marker is still `1.`, but the inactive presentation must use
+        // the direct-child ordinal from the whole list rather than restarting
+        // at `1.` in the viewport.
+        let late_line = 3_000;
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(late_line..late_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late item presents");
+        assert_eq!(late.lines[0].visual_text, "3000. item");
+        assert_eq!(late.lines[0].list.as_ref().unwrap().owner.ordinal, 2_999);
+    }
+
+    #[test]
+    fn a_late_list_continuation_keeps_formal_owner_and_structural_indent() {
+        let mut source = String::from("10. opening\n");
+        for _ in 0..5_000 {
+            source.push_str("    continued\n");
+        }
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+
+        // The opening marker is outside the synchronous viewport parse. The
+        // formal projection must still identify this row as the first item and
+        // hide its structural four-column continuation prefix.
+        let late_line = 4_500;
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(late_line..late_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late continuation presents");
+        let line = &late.lines[0];
+        assert_eq!(line.visual_text, "continued");
+        let list = line.list.as_ref().expect("formal list row metadata");
+        assert_eq!(list.owner.ordinal, 0);
+        assert_eq!(list.owner.depth, 1);
+        assert_eq!(list.structural_prefixes.len(), 1);
+        assert_eq!(list.structural_prefixes[0].columns, 4);
+        assert!(line.style_runs.is_empty(), "continuation is not code");
+    }
+
+    #[test]
+    fn a_late_list_code_row_keeps_formal_code_display() {
+        let mut source = String::from("- opening\n");
+        for _ in 0..5_000 {
+            source.push_str("  continued\n");
+        }
+        source.push_str("\n  ```\n  **literal**\n  ```\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let code_line = source[..source.find("  **literal**").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late code row presents");
+        let line = &code.lines[0];
+        assert_eq!(line.visual_text, "**literal**");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
+        assert_eq!(line.style_runs.len(), 1);
+        assert_eq!(line.style_runs[0].kind, StyleKind::CodeBlock);
+    }
+
+    #[test]
+    fn a_sibling_boundary_does_not_disclose_the_previous_formal_prefix() {
+        let mut source = String::from("- first\n");
+        for _ in 0..5_000 {
+            source.push_str("  continued\n");
+        }
+        source.push_str("- second\n");
+        let second_start = source.find("- second").expect("second item");
+        let mut editor = Editor::new(&source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(second_start)))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let continuation_line = 5_000;
+
+        let late = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(continuation_line..continuation_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("formal continuation presents");
+        assert_eq!(late.lines[0].visual_text, "continued");
     }
 
     #[test]
@@ -6624,10 +6824,6 @@ mod tests {
             view.read_with(app, |editor_view, _| {
                 let visual = editor_view.rendered_line(line).expect("line rendered");
                 let shaper = WindowShaper::new(window);
-                let x = f32::from(bounds.origin.x)
-                    + editor_view.theme.line_horizontal_padding
-                    + shaper.x_for_offset(&visual, fragment.clone(), visual_offset);
-                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
@@ -6635,6 +6831,31 @@ mod tests {
                     visual_offset,
                     Some(&fragment),
                 );
+                let (block_id, visual_line) = *editor_view
+                    .line_owners
+                    .get(&line)
+                    .expect("line owner recorded");
+                let layout = &editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout;
+                let block = editor_view
+                    .block_cache
+                    .get(&block_id)
+                    .expect("block cached");
+                let layout_point = layout
+                    .point_for_source(block, expected, &shaper)
+                    .expect("expected source has a layout point");
+                let row = layout
+                    .lines
+                    .get(layout_point.row)
+                    .expect("layout point row exists");
+                assert_eq!(row.line, visual_line);
+                let x = f32::from(bounds.origin.x)
+                    + editor_view.theme.line_horizontal_padding
+                    + layout_point.x;
+                let y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
                 (point(px(x), px(y)), expected)
             })
         })
