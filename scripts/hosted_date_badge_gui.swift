@@ -38,28 +38,27 @@ let maxCandidatesPerObservation = 3
 // of the *entire* screenshot (procedure v4) did not fix this: scaling every
 // dimension by the same factor leaves each glyph's share of the analyzed
 // frame unchanged, and PR #175 run #35286639940 confirmed a 4x full-frame
-// upscale still returned zero filename/badge candidates. The sidebar rows
-// this validator inspects occupy only a small, known region of the raw
-// screenshot, so cropping to that region *before* upscaling multiplies the
-// glyph's share of the analyzed frame by roughly
-// `1 / (widthFraction * heightFraction)`, independent of any upscale factor.
+// upscale still returned zero filename/badge candidates. The sidebar this
+// validator inspects occupies only a narrow x-extent of the raw screenshot
+// (full window height), so cropping to that x-extent *before* upscaling
+// multiplies the glyph's share of the analyzed frame by roughly
+// `1 / widthFraction`, independent of any upscale factor.
 //
 // `SidebarROI` is a fixed, trusted contract (top-left origin, y-down,
 // fraction of the raw screenshot) -- not read from target product code at
 // runtime -- so this validator's pass/fail behavior cannot be steered by
-// changes to the app under test. The values are chosen from PR #175 run
-// #35286639940 raw-screenshot facts (960x681): the sidebar divider sits at
-// about x=222px (~0.231 of width) and the fixture rows span about
-// y=74..205px (~0.109..0.301 of height). Every edge below has margin beyond
-// those observed facts so the crop keeps the whole sidebar rows region and
-// the badges' right edge even if the hosted window size varies slightly.
+// changes to the app under test. This crop is deliberately limited to the
+// sidebar's x-extent only, at full window height: PR #175 run
+// #35286639940 raw-screenshot facts (960x681) put the sidebar divider at
+// about x=222px (~0.231 of width), so `widthFraction` below keeps margin
+// beyond that observed fact even if the hosted window size varies slightly.
 // Must match `EXPECTED_ROI` in hosted_date_badge_gui.py.
 enum SidebarROI {
     static let originContract = "top_left_y_down"
     static let xFraction = 0.0
-    static let yFractionFromTop = 0.05
+    static let yFractionFromTop = 0.0
     static let widthFraction = 0.30
-    static let heightFraction = 0.35
+    static let heightFraction = 1.0
 }
 
 // Pure geometry, independent of Vision/CoreGraphics image decoding: the

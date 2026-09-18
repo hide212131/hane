@@ -21,14 +21,15 @@ spec.loader.exec_module(mod)
 
 # Trusted procedure v5 contract for a 960x680 raw screenshot: ROI crop_size is
 # source_size * EXPECTED_ROI fraction (rounded to whole pixels), processed_size
-# is crop_size * scale_factor.
+# is crop_size * scale_factor. The ROI is full window height, so crop_size
+# height equals source_size height.
 VALID_PREPROCESSING_EVIDENCE = {
     "method": "roi_crop_uniform_upscale",
     "scale_factor": 4,
     "source_size": {"width": 960, "height": 680},
     "roi": dict(mod.EXPECTED_ROI),
-    "crop_size": {"width": 288, "height": 238},
-    "processed_size": {"width": 1152, "height": 952},
+    "crop_size": {"width": 288, "height": 680},
+    "processed_size": {"width": 1152, "height": 2720},
 }
 
 
@@ -84,8 +85,8 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(preprocessing["scale_factor"], 4)
         self.assertEqual(preprocessing["source_size"], {"width": 960, "height": 680})
         self.assertEqual(preprocessing["roi"], mod.EXPECTED_ROI)
-        self.assertEqual(preprocessing["crop_size"], {"width": 288, "height": 238})
-        self.assertEqual(preprocessing["processed_size"], {"width": 1152, "height": 952})
+        self.assertEqual(preprocessing["crop_size"], {"width": 288, "height": 680})
+        self.assertEqual(preprocessing["processed_size"], {"width": 1152, "height": 2720})
 
     def test_helper_find_all_rejects_bare_match_list_without_preprocessing_evidence(self):
         # Fail-closed: the pre-#190 helper contract (a bare JSON list) must
@@ -138,7 +139,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             mod.validate_preprocessing_evidence({
                 **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": 1,
-                "processed_size": {"width": 288, "height": 238},
+                "processed_size": {"width": 288, "height": 680},
             })
 
     def test_validate_preprocessing_evidence_rejects_wrong_scale_factor(self):
@@ -146,7 +147,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             mod.validate_preprocessing_evidence({
                 **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": 2,
-                "processed_size": {"width": 576, "height": 476},
+                "processed_size": {"width": 576, "height": 1360},
             })
 
     def test_validate_preprocessing_evidence_rejects_bool_scale_factor(self):
@@ -155,7 +156,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             mod.validate_preprocessing_evidence({
                 **VALID_PREPROCESSING_EVIDENCE,
                 "scale_factor": True,
-                "processed_size": {"width": 288, "height": 238},
+                "processed_size": {"width": 288, "height": 680},
             })
 
     def test_validate_preprocessing_evidence_rejects_non_dict_sizes(self):
@@ -201,7 +202,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
                 **VALID_PREPROCESSING_EVIDENCE,
-                "processed_size": {"width": 1152, "height": 953},
+                "processed_size": {"width": 1152, "height": 2721},
             })
 
     def test_validate_preprocessing_evidence_rejects_roi_missing(self):
@@ -256,9 +257,9 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             '{"matches": [], "preprocessing": {"method": "roi_crop_uniform_upscale", '
             '"scale_factor": 4, "source_size": {"width": 960, "height": 680}, '
             '"roi": {"origin": "top_left_y_down", "x_fraction": 0.0, '
-            '"y_fraction_from_top": 0.05, "width_fraction": NaN, "height_fraction": 0.35}, '
-            '"crop_size": {"width": 288, "height": 238}, '
-            '"processed_size": {"width": 1152, "height": 952}}}'
+            '"y_fraction_from_top": 0.0, "width_fraction": NaN, "height_fraction": 1.0}, '
+            '"crop_size": {"width": 288, "height": 680}, '
+            '"processed_size": {"width": 1152, "height": 2720}}}'
         )
         with tempfile.TemporaryDirectory() as directory:
             helper = Path(directory) / "helper"
@@ -275,8 +276,8 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mod.validate_preprocessing_evidence({
                 **VALID_PREPROCESSING_EVIDENCE,
-                "crop_size": {"width": 480, "height": 238},
-                "processed_size": {"width": 1920, "height": 952},
+                "crop_size": {"width": 480, "height": 680},
+                "processed_size": {"width": 1920, "height": 2720},
             })
 
     def test_validate_crop_size_rejects_crop_not_smaller_than_source(self):
@@ -292,6 +293,20 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 {"width_fraction": 1.0, "height_fraction": 1.0},
             )
 
+    def test_validate_crop_size_accepts_crop_matching_source_in_one_dimension_only(self):
+        # The trusted sidebar ROI keeps full window height while cropping
+        # only the x-extent: a crop equal to source height (but strictly
+        # smaller width) is a real x-only crop, not a full-frame no-op, and
+        # must be accepted.
+        self.assertEqual(
+            mod._validate_crop_size(
+                {"width": 288, "height": 680},
+                960, 680,
+                {"width_fraction": 0.30, "height_fraction": 1.0},
+            ),
+            (288, 680),
+        )
+
     def test_helper_find_all_rejects_inconsistent_preprocessing_evidence(self):
         # End-to-end: `helper_find_all` itself must reject a structurally
         # complete but semantically invalid preprocessing report, not just
@@ -302,7 +317,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 **VALID_PREPROCESSING_EVIDENCE,
                 "method": "none",
                 "scale_factor": 1,
-                "processed_size": {"width": 288, "height": 238},
+                "processed_size": {"width": 288, "height": 680},
             },
         })
         with tempfile.TemporaryDirectory() as directory:
@@ -389,9 +404,9 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
 
         source_width, source_height = 960.0, 680.0
         # The trusted sidebar ROI's pixel crop for this source size (matches
-        # `VALID_PREPROCESSING_EVIDENCE["crop_size"]`): x=0, y=34 from the
-        # top, width=288, height=238.
-        crop_pixel_rect = (0.0, 34.0, 288.0, 238.0)
+        # `VALID_PREPROCESSING_EVIDENCE["crop_size"]`): x=0, y=0 (full window
+        # height), width=288, height=680.
+        crop_pixel_rect = (0.0, 0.0, 288.0, 680.0)
 
         # The whole crop, in Vision's own bottom-left-origin normalized
         # space, must reproject to exactly the ROI's full-window fractions.
@@ -399,14 +414,13 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         min_x, max_x, min_y, max_y = reproject_rect(whole_crop, crop_pixel_rect, source_width, source_height)
         self.assertAlmostEqual(min_x, 0.0)
         self.assertAlmostEqual(max_x, 0.30)  # EXPECTED_ROI width_fraction
-        # Vision y=0 is the *bottom* of the crop, which sits 272px (34+238)
-        # from the top of a 680px-tall window -> bottom-left fraction
-        # 1 - 272/680 = 0.60. Vision y=1 is the crop's top edge, 34px from
-        # the window's top -> 1 - 34/680 = 0.95. min maps to the smaller
-        # full-window value despite the top-left/bottom-left origin flip,
-        # because the reprojection is a monotonically increasing affine map.
-        self.assertAlmostEqual(min_y, 0.60)
-        self.assertAlmostEqual(max_y, 0.95)
+        # The ROI is full window height (`y_fraction_from_top` 0.0,
+        # `height_fraction` 1.0), so the crop's y-extent already spans the
+        # whole window and reprojection is the y identity map, despite the
+        # top-left/bottom-left origin flip: confirms deterministically that
+        # this x-only crop leaves y-coordinates effectively unchanged.
+        self.assertAlmostEqual(min_y, 0.0)
+        self.assertAlmostEqual(max_y, 1.0)
         self.assertLess(min_y, max_y)
         self.assertLess(min_x, max_x)
 
@@ -422,6 +436,9 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 reprojected = reproject_rect(rect, crop_pixel_rect, source_width, source_height)
                 self.assertTrue(0.0 <= reprojected[0] <= reprojected[1] <= 1.0)
                 self.assertTrue(0.0 <= reprojected[2] <= reprojected[3] <= 1.0)
+                # Full window height ROI: y reprojection is the identity map.
+                self.assertAlmostEqual(reprojected[2], rect[2])
+                self.assertAlmostEqual(reprojected[3], rect[3])
 
     def test_group_candidates_by_observation_sorts_by_rank(self):
         rank1 = {"observation_index": 0, "candidate_rank": 1, "confidence": 0.4}

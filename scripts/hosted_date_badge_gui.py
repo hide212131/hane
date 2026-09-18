@@ -83,19 +83,20 @@ EXPECTED_PREPROCESSING_SCALE_FACTOR = 4
 # share of the analyzed frame so much that no bounded candidate at any rank
 # recovered it, and PR #175 run #35286639940 showed a uniform 4x full-frame
 # upscale (procedure v4) is a no-op on that share -- it still returned zero
-# filename/badge candidates. Cropping to just the sidebar rows before
-# upscaling multiplies the glyph's share of the analyzed frame instead. These
-# values are fixed constants, not read from the target product code at
-# runtime, so the validator's pass/fail behavior cannot be steered by changes
-# to the app under test. Chosen from PR #175 run #35286639940 raw-screenshot
-# facts (960x681): sidebar divider ~222px (~0.231 of width), fixture rows
-# ~y 74..205px (~0.109..0.301 of height), with margin on every edge.
+# filename/badge candidates. Cropping to just the sidebar's x-extent (at full
+# window height) before upscaling multiplies the glyph's share of the
+# analyzed frame instead. These values are fixed constants, not read from the
+# target product code at runtime, so the validator's pass/fail behavior
+# cannot be steered by changes to the app under test. `width_fraction` is
+# chosen from PR #175 run #35286639940 raw-screenshot facts (960x681): the
+# sidebar divider sits at ~222px (~0.231 of width), with margin beyond that
+# observed fact.
 EXPECTED_ROI = {
     "origin": "top_left_y_down",
     "x_fraction": 0.0,
-    "y_fraction_from_top": 0.05,
+    "y_fraction_from_top": 0.0,
     "width_fraction": 0.30,
-    "height_fraction": 0.35,
+    "height_fraction": 1.0,
 }
 ROI_FRACTION_TOLERANCE = 1e-9
 # Pixel rounding slack between `source_size * roi fraction` and the reported
@@ -157,9 +158,12 @@ def _validate_crop_size(value: object, source_width: int, source_height: int, ro
 
     Beyond structural positive-integer checks, this proves the crop is
     consistent with the trusted `roi` fractions (within the Swift helper's
-    whole-pixel rounding) and strictly smaller than the source in both
-    dimensions, so a helper that reported the trusted `roi` values but never
-    actually shrank the analyzed frame cannot pass.
+    whole-pixel rounding) and strictly smaller than the source in at least
+    one dimension, so a helper that reported the trusted `roi` values but
+    never actually shrank the analyzed frame (a full-frame no-op crop) cannot
+    pass. The trusted ROI itself may keep one dimension at full size (e.g.
+    the sidebar crop's full window height), so this does not require both
+    dimensions to shrink.
     """
     crop_width, crop_height = _validate_pixel_size(value, "crop_size")
     expected_width = source_width * roi["width_fraction"]
@@ -174,9 +178,9 @@ def _validate_crop_size(value: object, source_width: int, source_height: int, ro
             "vision helper preprocessing crop_size height is not source_size.height * roi.height_fraction: "
             f"crop_height={crop_height!r} source_height={source_height!r} height_fraction={roi['height_fraction']!r}"
         )
-    if crop_width >= source_width or crop_height >= source_height:
+    if crop_width >= source_width and crop_height >= source_height:
         raise RuntimeError(
-            "vision helper preprocessing crop_size is not smaller than source_size: "
+            "vision helper preprocessing crop_size is not smaller than source_size in any dimension: "
             f"crop_size={value!r} source=({source_width!r}, {source_height!r})"
         )
     return crop_width, crop_height
