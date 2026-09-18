@@ -700,7 +700,7 @@ fn fragment_boundaries(
             let marker_overflows_first_row =
                 geometry.marker_visual_range.as_ref().is_some_and(|_| {
                     let opening_width = shaper.x_for_offset(line, 0..body, body);
-                    opening_width + geometry.marker_body_gap > first_width
+                    opening_width > first_width
                 });
             if marker_overflows_first_row {
                 // The disclosed prefix and marker are one indivisible

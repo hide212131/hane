@@ -127,6 +127,81 @@ impl LineShaper for VariableLabelShaper {
     }
 }
 
+/// A variable-width fixture where the first body glyph is narrow enough to fit
+/// after an aligned marker gap. This makes double-counting that gap observable.
+struct NarrowBodyShaper;
+
+impl NarrowBodyShaper {
+    fn advance(line: &hane_presentation::VisualLine, offset: usize) -> f32 {
+        if line.visual_text[..offset].chars().count() >= 5 {
+            4.0
+        } else {
+            8.0
+        }
+    }
+}
+
+impl LineShaper for NarrowBodyShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        let mut boundaries = Vec::new();
+        let mut row_start = fragment.start;
+        let mut row_width = 0.0;
+        for (relative, _) in line.visual_text[fragment.clone()].char_indices() {
+            let offset = fragment.start + relative;
+            let advance = Self::advance(line, offset);
+            if row_width + advance > width && offset > row_start {
+                boundaries.push(offset);
+                row_start = offset;
+                row_width = advance;
+            } else {
+                row_width += advance;
+            }
+        }
+        boundaries
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        let offset = offset.clamp(fragment.start, fragment.end);
+        line.visual_text[fragment.clone()]
+            .char_indices()
+            .take_while(|(relative, _)| fragment.start + *relative < offset)
+            .map(|(relative, _)| Self::advance(line, fragment.start + relative))
+            .sum()
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        let mut width = 0.0;
+        for (relative, _) in line.visual_text[fragment.clone()].char_indices() {
+            let offset = fragment.start + relative;
+            let advance = Self::advance(line, offset);
+            if x < width + advance / 2.0 {
+                return offset;
+            }
+            width += advance;
+        }
+        fragment.end
+    }
+
+    fn width_for_text(&self, _line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        text.chars().count() as f32 * 8.0
+    }
+}
+
 /// Presents a whole document into blocks the way `EditorView` does: block
 /// boundaries from the index, then one `present_block` call per block with all
 /// of its lines.
@@ -553,6 +628,31 @@ fn disclosed_prefix_and_marker_stay_intact_before_the_body_when_the_column_is_na
     assert_eq!(rows[0].text_x_origin, 0.0);
     assert_eq!(rows[1].line_visual_range.start, body);
     assert_eq!(rows[1].text_x_origin, rows[1].body_x_origin);
+}
+
+#[test]
+fn disclosed_prefix_marker_gap_is_not_double_counted_in_the_opening_budget() {
+    let source = "> 9. first character\n> 10. second\n";
+    let cursor = source.find("first").expect("list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the quoted ordered list block is presented");
+    let line = &block.lines[0];
+    let body = line
+        .list
+        .as_ref()
+        .expect("the line has list metadata")
+        .body_visual_start
+        .0;
+    let layout = layout_block(&block, 52.0, &NarrowBodyShaper);
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("opening row is laid out");
+
+    assert_eq!(opening.line_visual_range, 0..body + 1);
 }
 
 #[test]
