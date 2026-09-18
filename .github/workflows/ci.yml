@@ -70,6 +70,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-features
 
+      - name: Compile focused sidebar GUI helper
+        run: /usr/bin/swiftc scripts/hosted_sidebar_gui.swift -o "$RUNNER_TEMP/hosted-sidebar-gui-helper"
+
       - name: Test macOS fallback glyph rasterization
         run: cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::text_system::tests
 
