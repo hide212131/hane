@@ -14,7 +14,7 @@ spec.loader.exec_module(mod)
 
 class ProcedureIdentityTests(unittest.TestCase):
     def test_procedure_identity_is_focused_and_distinct(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/1")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/2")
         self.assertEqual(mod.VERIFICATION_KIND, "normal_list_focused")
         self.assertIn("#126", mod.SCOPE_NOTE)
         self.assertIn("hosted-gui-interaction/7", mod.SCOPE_NOTE)
@@ -25,38 +25,6 @@ class ProcedureIdentityTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(len(filenames), len(set(filenames)))
         self.assertEqual(len(mod.ALL_SCENARIO_SPECS), 3)
-
-
-class PureByteTransformTests(unittest.TestCase):
-    def test_match_insertion_offset_start_and_end(self):
-        text = "abc def ghi"
-        self.assertEqual(mod.match_insertion_offset(text, r"def", edge="start"), 4)
-        self.assertEqual(mod.match_insertion_offset(text, r"def", edge="end"), 7)
-
-    def test_match_insertion_offset_missing_pattern_raises(self):
-        with self.assertRaises(ValueError):
-            mod.match_insertion_offset("abc", r"zzz", edge="start")
-
-    def test_insert_at_match_inserts_at_requested_edge(self):
-        text = "Gamma row\n"
-        self.assertEqual(mod.insert_at_match(text, r"Gamma row", " X", edge="end"), "Gamma row X\n")
-        self.assertEqual(mod.insert_at_match(text, r"row", "X", edge="start"), "Gamma Xrow\n")
-
-    def test_replace_unique_word_replaces_the_single_whole_word_match(self):
-        text = "Child bullet one\nChild bullet two\n"
-        self.assertEqual(mod.replace_unique_word(text, "one", "uno"), "Child bullet uno\nChild bullet two\n")
-
-    def test_replace_unique_word_rejects_zero_occurrences(self):
-        with self.assertRaises(ValueError):
-            mod.replace_unique_word("no match here", "missing", "x")
-
-    def test_replace_unique_word_rejects_ambiguous_multiple_occurrences(self):
-        with self.assertRaises(ValueError):
-            mod.replace_unique_word("one one", "one", "two")
-
-    def test_replace_unique_word_uses_word_boundaries(self):
-        # "one" inside "someone" must not be treated as a standalone match.
-        self.assertEqual(mod.replace_unique_word("lone one", "one", "two"), "lone two")
 
 
 class SequentialNumberingTests(unittest.TestCase):
@@ -121,52 +89,6 @@ class FixtureConstructionTests(unittest.TestCase):
                     self.assertIsNotNone(re.search(check.content_pattern, text))
                 self.assertIsNotNone(re.search(scenario.marker_check.content_pattern, text))
                 self.assertIsNotNone(re.search(scenario.marker_check.raw_marker_pattern, text))
-                self.assertIsNotNone(re.search(scenario.edit_check.content_pattern, text))
-                self.assertIsNotNone(re.search(scenario.ime_check.content_pattern, text))
-                word_pattern = rf"\b{re.escape(scenario.selection_check.word)}\b"
-                self.assertEqual(len(re.findall(word_pattern, text)), 1)
-
-
-class ExpectedByteTransitionTests(unittest.TestCase):
-    def test_mixed_nested_list_expected_state_chain(self):
-        states = mod.compute_expected_states(mod.MIXED_NESTED_LIST_SPEC)
-        self.assertIn("Gamma lead second EDITED-MIXED\n", states["after_edit"])
-        self.assertIn("Alpha nested two日本語\n", states["after_ime"])
-        self.assertIn("Gamma nested marker\n", states["after_select"])
-        self.assertNotIn("Gamma nested bullet", states["after_select"])
-        # Earlier mutations must survive later ones (cumulative, not replaced).
-        self.assertIn("Gamma lead second EDITED-MIXED\n", states["after_select"])
-        self.assertIn("Alpha nested two日本語\n", states["after_select"])
-
-    def test_paragraph_child_list_expected_state_chain(self):
-        states = mod.compute_expected_states(mod.PARAGRAPH_CHILD_LIST_SPEC)
-        self.assertIn("2. Second item after return EDITED-CHILD\n", states["after_edit"])
-        self.assertIn("First item continued paragraph.日本語\n", states["after_ime"])
-        self.assertIn("Child bullet uno\n", states["after_select"])
-        self.assertIn("2. Second item after return EDITED-CHILD\n", states["after_select"])
-
-    def test_nonsequential_ordered_expected_state_chain_preserves_untouched_raw_markers(self):
-        states = mod.compute_expected_states(mod.NONSEQUENTIAL_ORDERED_SPEC)
-        self.assertIn("100. Gamma row EDITED-ORDERED\n", states["after_edit"])
-        self.assertIn("3. Alpha row日本語\n", states["after_ime"])
-        self.assertIn("41. Bravo row\n", states["after_select"])
-        # The edit/ime mutations on Gamma/Alpha must not disturb the raw "41."
-        # marker that selection-replacement later mutates only the word after.
-        self.assertIn("41. Bravo row\n", states["after_select"])
-        self.assertIn("100. Gamma row EDITED-ORDERED\n", states["after_select"])
-        self.assertIn("3. Alpha row日本語\n", states["after_select"])
-
-    def test_expected_state_chain_round_trips_through_undo(self):
-        # undo after selection-replace must restore exactly `after_ime`.
-        for scenario in mod.ALL_SCENARIO_SPECS:
-            with self.subTest(scenario=scenario.name):
-                states = mod.compute_expected_states(scenario)
-                restored = mod.replace_unique_word(
-                    states["after_select"], scenario.selection_check.replacement, scenario.selection_check.word
-                )
-                self.assertEqual(restored, states["after_ime"])
-
-
 class InitialCheckEvaluationTests(unittest.TestCase):
     def test_pass_when_content_and_number_match(self):
         lines = ["some header", "4. Beta row", "trailer"]
