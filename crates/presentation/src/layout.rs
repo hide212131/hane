@@ -655,23 +655,43 @@ fn fragment_boundaries(
         (width - first_x_origin - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);
-    let mut start = 0;
-    while start < len {
-        let row_width = geometry
-            .body_visual_start
-            .filter(|body| start >= *body)
-            .map_or(first_width, |_| geometry.effective_width);
-        let Some(next) = shaper
+    let valid_boundaries = |start: usize, row_width: f32| {
+        let mut candidates = shaper
             .wrap_boundaries(line, start..len, row_width)
             .into_iter()
-            .find(|offset| {
+            .filter(|offset| {
                 *offset > start && *offset < len && line.visual_text.is_char_boundary(*offset)
             })
-        else {
-            break;
-        };
-        boundaries.push(next);
-        start = next;
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+    };
+    // A shaper returns every boundary for the requested stretch, so reuse that
+    // result instead of shaping the progressively shorter suffix once per row.
+    // Opening list rows are the one exception: the first row has a marker
+    // budget, while rows starting at the body use the hanging budget. At most
+    // one shaping pass is needed for each of those two width regions.
+    let body_boundary = geometry
+        .body_visual_start
+        .filter(|body| *body > 0 && *body < len);
+    if let Some(body) = body_boundary {
+        let first_boundaries = valid_boundaries(0, first_width);
+        if let Some(split) = first_boundaries.iter().position(|offset| *offset >= body) {
+            boundaries.extend(first_boundaries[..=split].iter().copied());
+            let start = first_boundaries[split];
+            if start < len {
+                boundaries.extend(valid_boundaries(start, geometry.effective_width));
+            }
+        } else {
+            boundaries.extend(first_boundaries);
+        }
+    } else {
+        let row_width = geometry
+            .body_visual_start
+            .filter(|body| *body == 0)
+            .map_or(first_width, |_| geometry.effective_width);
+        boundaries.extend(valid_boundaries(0, row_width));
     }
     // Rows are built from consecutive pairs, so out-of-order or repeated
     // boundaries from a shaper would slice text backwards rather than fail a

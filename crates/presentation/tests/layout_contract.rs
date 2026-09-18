@@ -19,6 +19,8 @@ use hane_presentation::{
     BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove, VisualBlock,
     block_line_span, layout_block, present_block, trailing_blank_lines,
 };
+use std::cell::Cell;
+use std::ops::Range;
 
 const LINE_HEIGHT: f32 = 26.0;
 /// Ten columns wide with the test shaper's 8 px advance.
@@ -26,6 +28,54 @@ const WIDTH: f32 = 80.0;
 
 fn shaper() -> FixedAdvanceShaper {
     FixedAdvanceShaper::new(8.0)
+}
+
+struct CountingShaper {
+    inner: FixedAdvanceShaper,
+    wrap_calls: Cell<usize>,
+}
+
+impl CountingShaper {
+    fn new(advance: f32) -> Self {
+        Self {
+            inner: FixedAdvanceShaper::new(advance),
+            wrap_calls: Cell::new(0),
+        }
+    }
+}
+
+impl LineShaper for CountingShaper {
+    fn wrap_boundaries(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        width: f32,
+    ) -> Vec<usize> {
+        self.wrap_calls.set(self.wrap_calls.get() + 1);
+        self.inner.wrap_boundaries(line, fragment, width)
+    }
+
+    fn x_for_offset(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        offset: usize,
+    ) -> f32 {
+        self.inner.x_for_offset(line, fragment, offset)
+    }
+
+    fn offset_for_x(
+        &self,
+        line: &hane_presentation::VisualLine,
+        fragment: Range<usize>,
+        x: f32,
+    ) -> usize {
+        self.inner.offset_for_x(line, fragment, x)
+    }
+
+    fn width_for_text(&self, line: &hane_presentation::VisualLine, text: &str) -> f32 {
+        self.inner.width_for_text(line, text)
+    }
 }
 
 /// Presents a whole document into blocks the way `EditorView` does: block
@@ -297,6 +347,20 @@ fn list_marker_body_gap_counts_against_the_opening_wrap_budget() {
 
     assert!(first_rows.len() > 1, "the marker and body must not overrun");
     assert_eq!(first_rows[0].line_visual_range.end, body_start);
+}
+
+#[test]
+fn long_wrapped_lines_reuse_all_boundaries_from_one_shape() {
+    let source = "word ".repeat(400);
+    let block = present(&source, None)
+        .into_iter()
+        .next()
+        .expect("the paragraph is presented");
+    let shaper = CountingShaper::new(8.0);
+    let layout = layout_block(&block, 40.0, &shaper);
+
+    assert!(layout.lines.len() > 10, "the long line must wrap");
+    assert_eq!(shaper.wrap_calls.get(), 1);
 }
 
 #[test]
