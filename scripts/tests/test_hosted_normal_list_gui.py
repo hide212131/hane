@@ -417,6 +417,19 @@ class EditingFixtureTests(unittest.TestCase):
                 self.assertEqual(len(differing), 1)
 
 
+class ReopenExpectationTests(unittest.TestCase):
+    # Issue #126 review discussion_r4051650814: 再起動後の再オープン検証は編集済み
+    # 通常リストの復元を確認する必要があり、元のフィクスチャ内容をそのまま確認しても
+    # 変更済みリストの復元が壊れていることを検出できない。
+    def test_reopen_expected_bytes_is_the_edited_state_not_the_original(self):
+        self.assertEqual(mod.REOPEN_EXPECTED_BYTES, mod.EDITING_AFTER_SELECTION_REPLACE)
+        self.assertNotEqual(mod.REOPEN_EXPECTED_BYTES, mod.EDITING_FIXTURE_ORIGINAL)
+
+    def test_reopen_visible_text_identifies_edited_content_not_original(self):
+        self.assertIn(mod.REOPEN_VISIBLE_TEXT, mod.EDITING_AFTER_SELECTION_REPLACE)
+        self.assertNotIn(mod.REOPEN_VISIBLE_TEXT, mod.EDITING_FIXTURE_ORIGINAL)
+
+
 class ClickEvidenceParsingTests(unittest.TestCase):
     def test_parse_click_evidence_accepts_complete_payload(self):
         import json

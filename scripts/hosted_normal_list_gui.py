@@ -432,6 +432,13 @@ EDITING_AFTER_SELECTION_REPLACE = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "100. Gamma row", "100. Delta row"
 )
 
+# 再起動直前に実ファイルへ残す通常リストの変更済み状態と、再オープン後にその変更を
+# 識別するための OCR 手がかり。EDITING_FIXTURE_ORIGINAL ではなく選択置換後の編集済み
+# 状態そのものを再オープン検証の期待値にすることで、変更済みリストの復元が壊れていて
+# 元の内容のまま復元される製品を pass にしない。
+REOPEN_EXPECTED_BYTES = EDITING_AFTER_SELECTION_REPLACE
+REOPEN_VISIBLE_TEXT = "Delta row"
+
 
 # ---------------------------------------------------------------------------
 # Fail-closed OCR/step evaluation (pure, given already-fetched OCR lines).
@@ -815,6 +822,26 @@ def _selection_replace_subtest(
     detail["restored_actual"] = actual.decode("utf-8", errors="replace")
     steps.append(step(name, "pass" if matched else "fail",
                       reason=None if matched else "最終 undo 後に元の内容へ戻らない", **detail))
+    if not matched:
+        return steps
+    # 再起動・再オープンの検証(#126 E)は、実ファイルが変更済み状態のまま再起動された
+    # ケースを確認する必要がある。上の undo/redo の往復確認自体は変更しないまま、
+    # ここで改めて redo して、再起動直前の実ファイルを選択置換後の編集済み状態に戻す。
+    ok, _out, err = interaction_module.run_helper(swift_helper, ["redo-save", str(pid)], helper_timeout)
+    if not ok:
+        steps.append(step(
+            "redo_to_edited_state_before_reopen", "blocked",
+            f"再起動前に編集済み状態へ戻す redo に失敗した: {err}",
+        ))
+        return steps
+    matched_edited, actual_edited = interaction_module.wait_for_fixture_bytes(
+        fixture_path, EDITING_AFTER_SELECTION_REPLACE.encode("utf-8"), poll_timeout
+    )
+    steps.append(step(
+        "redo_to_edited_state_before_reopen", "pass" if matched_edited else "fail",
+        reason=None if matched_edited else "再起動前に編集済み状態へ戻す redo 後、内容が編集済み状態と一致しない",
+        expected=EDITING_AFTER_SELECTION_REPLACE, actual=actual_edited.decode("utf-8", errors="replace"),
+    ))
     return steps
 
 
@@ -921,15 +948,16 @@ def run_editing_scenario(
         )
         steps += session_steps
         steps.append(interaction_module.verify_visible_text(
-            swift_helper, reopen_dir / "reopen.png", "Beta row", helper_timeout
+            swift_helper, reopen_dir / "reopen.png", REOPEN_VISIBLE_TEXT, helper_timeout
         ))
         matched, actual = interaction_module.wait_for_fixture_bytes(
-            fixture_path, EDITING_FIXTURE_ORIGINAL.encode("utf-8"), 1.0
+            fixture_path, REOPEN_EXPECTED_BYTES.encode("utf-8"), 1.0
         )
         steps.append(step(
             "reopen_content_check", "pass" if matched else "fail",
-            reason=None if matched else "再オープン後もフィクスチャ内容が期待通りであることを確認できない",
+            reason=None if matched else "再オープン後もフィクスチャが再起動直前の編集済み内容と一致することを確認できない",
             note="ファイル内容の一致は再オープンの証跡の一部に過ぎず、描画結果そのものの証明ではない",
+            expected=REOPEN_EXPECTED_BYTES,
             actual=actual.decode("utf-8", errors="replace"),
         ))
     finally:
