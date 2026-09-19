@@ -56,9 +56,9 @@ use hane_session::{
     LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
     RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket,
     SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction,
-    WorkFolder, WorkFolderNode, WorkFolderScanner, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
-    unique_folder_name, unique_markdown_filename,
+    WorkFolder, WorkFolderNode, WorkFolderScanner, date_badge_range, decide_title_sync,
+    extract_h1_title, format_relative_date_label, local_today, run_save_job,
+    split_file_name_for_badge, unique_folder_name, unique_markdown_filename, DateBadgeRange,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -4171,16 +4171,33 @@ fn file_name_label(
     }
 }
 
-/// A small rounded chip for one badge-worthy date, styled like the header's
-/// recent-file chips (`self.theme.code_background`) so it reads as a
-/// decoration rather than more filename text.
-fn date_badge_chip(date: CalendarDate, today: CalendarDate, theme: &Theme) -> gpui::Div {
+const DATE_BADGE_TODAY_BACKGROUND: u32 = 0x5d94ba;
+const DATE_BADGE_THIS_WEEK_BACKGROUND: u32 = 0x4d83a9;
+const DATE_BADGE_THIS_MONTH_BACKGROUND: u32 = 0x3f7194;
+const DATE_BADGE_THIS_YEAR_BACKGROUND: u32 = 0x326584;
+const DATE_BADGE_OTHER_BACKGROUND: u32 = 0x285b7c;
+const DATE_BADGE_FOREGROUND: u32 = 0xf7fbff;
+
+fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
+    match date_badge_range(date, today) {
+        DateBadgeRange::Today => DATE_BADGE_TODAY_BACKGROUND,
+        DateBadgeRange::ThisWeek => DATE_BADGE_THIS_WEEK_BACKGROUND,
+        DateBadgeRange::ThisMonth => DATE_BADGE_THIS_MONTH_BACKGROUND,
+        DateBadgeRange::ThisYear => DATE_BADGE_THIS_YEAR_BACKGROUND,
+        DateBadgeRange::Other => DATE_BADGE_OTHER_BACKGROUND,
+    }
+}
+
+/// A small rounded chip for one badge-worthy date. Its background follows
+/// Hane's feather blues: today is the brightest tier, then the same week,
+/// month, year, and finally all other dates become progressively darker.
+fn date_badge_chip(date: CalendarDate, today: CalendarDate, _theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
         .px(px(4.0))
         .rounded_sm()
-        .bg(rgb(theme.code_background))
-        .text_color(rgb(theme.quote_foreground))
+        .bg(rgb(date_badge_background(date, today)))
+        .text_color(rgb(DATE_BADGE_FOREGROUND))
         .text_size(px(10.0))
         .child(format_relative_date_label(date, today))
 }
