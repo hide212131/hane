@@ -46,8 +46,15 @@ class ReleaseVersionTests(unittest.TestCase):
             "should_release",
             "group: release-builds",
             "cancel-in-progress: false",
+            "if ! gh api --paginate",
+            "Failed to read repository tags; refusing to release.",
         ):
             self.assertIn(expected, workflow)
+
+        self.assertNotIn(
+            'gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag"',
+            workflow,
+        )
 
 
 if __name__ == "__main__":
