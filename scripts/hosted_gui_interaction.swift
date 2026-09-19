@@ -181,16 +181,24 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
 }
 
 func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, commit: Bool, save: Bool) {
+    // Select the source before focusing Hane. When the requested source is
+    // already active, avoid TISSelectInputSource entirely: macOS can publish a
+    // redundant keyboard-source notification and GPUI will synchronously
+    // reactivate Hane's NSTextInputContext, which may block in Kotoeri's IME
+    // XPC service. The callers that switch sources explicitly do so while the
+    // target editor is unfocused.
+    if currentSourceID() != inputSource {
+        selectSource(inputSource)
+    }
     focus(pid)
-    selectSource(inputSource)
-    // TISSelectInputSource() making currentSourceID() report the Japanese source
-    // does not by itself guarantee the app's IME session is actually ready to
-    // convert keystrokes yet; on a hosted runner the switch can still be
-    // settling. Re-check with a bounded, deterministic poll instead of a single
-    // immediate check, and require the match to still hold after an explicit
-    // settle delay before typing (Issue #126 post-merge GUI run 35410838091:
-    // currentSourceID() already reported the Japanese source, yet the romaji
-    // was saved unconverted).
+    // A successful TISSelectInputSource/currentSourceID match does not by
+    // itself guarantee the app's IME session is ready to convert keystrokes;
+    // on a hosted runner the switch can still be settling. Re-check with a
+    // bounded, deterministic poll instead of a single immediate check, and
+    // require the match to still hold after an explicit settle delay before
+    // typing (Issue #126 post-merge GUI run 35410838091: currentSourceID()
+    // already reported the Japanese source, yet the romaji was saved
+    // unconverted).
     let settleDeadline = Date().addingTimeInterval(3.0)
     while currentSourceID() != inputSource && Date() < settleDeadline {
         Thread.sleep(forTimeInterval: 0.1)
