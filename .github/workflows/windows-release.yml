@@ -2,7 +2,10 @@ name: Release builds
 
 on:
   push:
+    branches: [main]
     tags: ["v*.*.*"]
+    paths:
+      - Cargo.toml
   workflow_dispatch:
     inputs:
       version:
@@ -19,7 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
+      should_release: ${{ steps.release.outputs.should_release }}
     steps:
+      - uses: actions/checkout@v6
+
       - name: Resolve and validate release tag
         id: release
         shell: bash
@@ -29,14 +35,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "hane") | .version')"
+          manifest_tag="v$cargo_version"
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [ "${{ github.ref }}" != "refs/heads/main" ]; then
               echo "Manual releases must be run from the main branch." >&2
               exit 1
             fi
             release_tag="$INPUT_VERSION"
-          else
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
             release_tag="$GITHUB_REF_NAME"
+          else
+            release_tag="$manifest_tag"
           fi
 
           if ! [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -45,17 +56,59 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
-             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+          if [ "$release_tag" != "$manifest_tag" ]; then
+            echo "Release version $release_tag does not match Cargo package version $cargo_version." >&2
+            exit 1
+          fi
+
+          tag_exists=false
+          latest_tag=""
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            tag_names_file="$(mktemp)"
+            trap 'rm -f "$tag_names_file"' EXIT
+            if ! gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+              --jq '.[].name' > "$tag_names_file"; then
+              echo "Failed to read repository tags; refusing to release." >&2
+              exit 1
+            fi
+
+            if grep -Fxq -- "$release_tag" "$tag_names_file"; then
+              tag_exists=true
+            fi
+            latest_tag="$(
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$tag_names_file" |
+                sort -V |
+                tail -n 1 || true
+            )"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$tag_exists" = true ]; then
             echo "Tag already exists: $release_tag" >&2
             exit 1
           fi
 
+          should_release=true
+          if [ "${{ github.event_name }}" = "push" ] && \
+             [ "${{ github.ref_type }}" = "branch" ] && \
+             [ "$tag_exists" = true ]; then
+            echo "Cargo version $cargo_version is already released as $release_tag; skipping."
+            should_release=false
+          fi
+
+          if [ "$should_release" = true ] && [ "${{ github.ref_type }}" != "tag" ]; then
+            if [ -n "$latest_tag" ] && [ "$(printf '%s\n%s\n' "$latest_tag" "$release_tag" | sort -V | tail -n 1)" != "$release_tag" ]; then
+              echo "Release version $release_tag must be newer than latest tag $latest_tag." >&2
+              exit 1
+            fi
+          fi
+
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
 
   build-windows:
     name: Build hane-windows-x64
     needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -89,6 +142,7 @@ jobs:
   build-macos:
     name: Build hane-macos-arm64
     needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
@@ -129,6 +183,7 @@ jobs:
       - prepare
       - build-windows
       - build-macos
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -164,7 +219,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY"
             )
 
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.ref_type }}" != "tag" ]; then
               create_args+=(--target "$GITHUB_SHA")
             fi
 
