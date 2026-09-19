@@ -140,8 +140,8 @@ impl FileService for OsFileService {
         // filesystems makes `to` resolve to the same entry as `from`. The
         // normal no-replace path deliberately rejects an existing `to`, so
         // move through a collision-proof sibling name only for that exact
-        // same-entry case. A distinct existing destination still takes the
-        // ordinary no-replace path below and is never overwritten.
+        // same-entry case, while preserving the ordinary collision rule. A
+        // distinct existing destination still takes the no-replace path below.
         if from != to && paths_refer_to_same_entry(from, to) {
             return rename_file_case_alias(from, to);
         }
