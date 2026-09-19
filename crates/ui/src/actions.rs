@@ -82,14 +82,22 @@ command_actions! {
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, _window, cx| {
         if view.inline_rename_active() {
-            view.confirm_inline_rename(cx);
+            if view.inline_rename_has_composition() {
+                view.commit_inline_rename_composition(cx);
+            } else {
+                view.confirm_inline_rename(cx);
+            }
         } else if view.editor().ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
         if view.inline_rename_active() {
-            view.confirm_inline_rename(cx);
+            if view.inline_rename_has_composition() {
+                view.commit_inline_rename_composition(cx);
+            } else {
+                view.confirm_inline_rename(cx);
+            }
         } else if view.editor().ime().is_none() {
             view.dispatch(EditorCommand::Insert("\n"), cx);
         }
@@ -119,10 +127,12 @@ command_actions! {
         if view.inline_rename_active() { view.select_inline_rename_right(cx); } else { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); }
     },
     SelectUp ("shift-up") => select_up |view, window, cx| {
-        if !view.inline_rename_active() { view.move_vertical(false, true, window, cx); }
+        if view.inline_rename_active() { return; }
+        view.move_vertical(false, true, window, cx);
     },
     SelectDown ("shift-down") => select_down |view, window, cx| {
-        if !view.inline_rename_active() { view.move_vertical(true, true, window, cx); }
+        if view.inline_rename_active() { return; }
+        view.move_vertical(true, true, window, cx);
     },
     SelectAll ("secondary-a") => select_all |view, _window, cx| {
         if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::SelectAll, cx); }
@@ -134,36 +144,36 @@ command_actions! {
         if view.inline_rename_active() { view.move_inline_rename_end(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: false }, cx); }
     },
     SelectHome ("shift-home") => select_home |view, _window, cx| {
-        if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx); }
+        if view.inline_rename_active() { view.select_inline_rename_home(cx); return; }
+        view.dispatch(EditorCommand::MoveToLineStart { extend: true }, cx);
     },
     SelectEnd ("shift-end") => select_end |view, _window, cx| {
-        if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx); }
+        if view.inline_rename_active() { view.select_inline_rename_end(cx); return; }
+        view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx);
     },
     DocumentStart ("secondary-up") => document_start |view, _window, cx| {
-        if !view.inline_rename_active() {
-            view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
-        }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
     },
     DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
-        if !view.inline_rename_active() {
-            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
-        }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
     },
     SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
-        if !view.inline_rename_active() {
-            view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
-        }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
     },
     SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
-        if !view.inline_rename_active() {
-            view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
-        }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
     },
     Undo ("secondary-z") => undo |view, _window, cx| {
-        if !view.inline_rename_active() { view.dispatch(EditorCommand::Undo, cx); }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::Undo, cx);
     },
     Redo ("secondary-shift-z") => redo |view, _window, cx| {
-        if !view.inline_rename_active() { view.dispatch(EditorCommand::Redo, cx); }
+        if view.inline_rename_active() { return; }
+        view.dispatch(EditorCommand::Redo, cx);
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
         let text = if view.inline_rename_active() {
@@ -200,6 +210,14 @@ command_actions! {
         }
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| {
-        if view.inline_rename_active() { view.cancel_inline_rename(cx); } else { view.perform_cancel_composition(cx); }
+        if view.inline_rename_active() {
+            if view.inline_rename_has_composition() {
+                view.cancel_inline_rename_composition(cx);
+            } else {
+                view.cancel_inline_rename(cx);
+            }
+        } else {
+            view.perform_cancel_composition(cx);
+        }
     },
 }

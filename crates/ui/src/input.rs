@@ -1,4 +1,4 @@
-use crate::view::EditorView;
+use crate::view::{EditorView, InlineRenameRenderState};
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     GlobalElementId, IntoElement, LayoutId, PaintQuad, Pixels, ShapedLine, Size, Style, TextRun,
@@ -27,6 +27,51 @@ pub struct InlineRenamePrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+}
+
+pub(crate) fn shape_inline_rename_line(
+    state: &InlineRenameRenderState,
+    window: &mut Window,
+) -> ShapedLine {
+    let style = window.text_style();
+    let run = TextRun {
+        len: state.text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let runs = if let Some(marked_range) = state.marked_range.as_ref() {
+        vec![
+            TextRun {
+                len: marked_range.start,
+                ..run.clone()
+            },
+            TextRun {
+                len: marked_range.end.saturating_sub(marked_range.start),
+                underline: Some(UnderlineStyle {
+                    color: Some(run.color),
+                    thickness: px(1.0),
+                    wavy: false,
+                }),
+                ..run.clone()
+            },
+            TextRun {
+                len: state.text.len().saturating_sub(marked_range.end),
+                ..run
+            },
+        ]
+        .into_iter()
+        .filter(|run| run.len > 0)
+        .collect()
+    } else {
+        vec![run]
+    };
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    window
+        .text_system()
+        .shape_line(state.text.clone().into(), font_size, &runs, None)
 }
 
 impl Element for InlineRenameInput {
@@ -63,6 +108,8 @@ impl Element for InlineRenameInput {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        self.input
+            .update(cx, |view, _| view.set_inline_rename_input_bounds(bounds));
         let input = self.input.read(cx);
         let Some(state) = input.inline_rename_render_state() else {
             return InlineRenamePrepaintState {
@@ -71,45 +118,7 @@ impl Element for InlineRenameInput {
                 selection: None,
             };
         };
-        let style = window.text_style();
-        let run = TextRun {
-            len: state.text.len(),
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let runs = if let Some(marked_range) = state.marked_range.as_ref() {
-            vec![
-                TextRun {
-                    len: marked_range.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked_range.end.saturating_sub(marked_range.start),
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: state.text.len().saturating_sub(marked_range.end),
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
-        };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(state.text.into(), font_size, &runs, None);
+        let line = shape_inline_rename_line(&state, window);
         let selection = if state.selected_range.is_empty() {
             None
         } else {
@@ -227,9 +236,9 @@ impl EntityInputHandler for EditorView {
             .and_then(|ime| self.editor().source_range_to_utf16(ime.current_range).ok())
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if self.inline_rename_active() {
-            self.unmark_inline_rename();
+            self.commit_inline_rename_composition(cx);
         } else {
             self.editor_mut().commit_composition();
         }
@@ -292,11 +301,24 @@ impl EntityInputHandler for EditorView {
         &mut self,
         _: Range<usize>,
         bounds: Bounds<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         if self.inline_rename_active() {
-            return Some(bounds);
+            let state = self.inline_rename_render_state()?;
+            let line = shape_inline_rename_line(&state, window);
+            let caret = if state.selection_reversed {
+                state.selected_range.start
+            } else {
+                state.selected_range.end
+            };
+            return Some(Bounds {
+                origin: point(bounds.left() + line.x_for_index(caret), bounds.top()),
+                size: Size {
+                    width: px(1.0),
+                    height: bounds.size.height,
+                },
+            });
         }
         let Some(caret) = self.caret_geometry() else {
             return Some(bounds);
@@ -312,12 +334,12 @@ impl EntityInputHandler for EditorView {
 
     fn character_index_for_point(
         &mut self,
-        _: gpui::Point<Pixels>,
-        _: &mut Window,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
         if self.inline_rename_active() {
-            return self.inline_rename_selection().map(|(range, _)| range.end);
+            return self.inline_rename_character_index_for_point(point, window);
         }
         self.editor()
             .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))

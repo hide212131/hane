@@ -18,7 +18,7 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 use crate::icons;
-use crate::input::InlineRenameInput;
+use crate::input::{InlineRenameInput, shape_inline_rename_line};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
@@ -30,10 +30,10 @@ use crate::line::{
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
-    App, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
-    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task,
-    Window, div, point, prelude::FluentBuilder, px, rgb,
+    App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathPromptOptions, Pixels, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, point, prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -255,13 +255,22 @@ struct InlineRename {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
+    composition: Option<InlineRenameComposition>,
     pending: bool,
+}
+
+#[derive(Clone, Debug)]
+struct InlineRenameComposition {
+    text: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct InlineRenameRenderState {
     pub(crate) text: String,
     pub(crate) selected_range: Range<usize>,
+    pub(crate) selection_reversed: bool,
     pub(crate) marked_range: Option<Range<usize>>,
 }
 
@@ -470,6 +479,11 @@ pub struct EditorView {
     /// finishes reserve the same name; this set is checked alongside the
     /// tree so the second click picks the next name instead.
     pending_new_folders: HashSet<PathBuf>,
+    /// The last laid-out bounds of the inline rename input. Native text-input
+    /// callbacks report window coordinates rather than the element hitbox, so
+    /// this lets click-to-caret conversion use the same geometry the input
+    /// just painted.
+    inline_rename_input_bounds: Option<Bounds<Pixels>>,
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
@@ -487,6 +501,13 @@ pub struct EditorView {
     /// second debounce firing before the first completes is skipped instead
     /// of racing it into a duplicate file.
     title_sync_in_flight: HashSet<SessionId>,
+    /// The newest H1 debounce still waiting to fire for each session. A folder
+    /// rename must wait for this too, because an unnamed draft's timer carries
+    /// its target directory into the background create operation.
+    title_sync_scheduled: HashMap<SessionId, Revision>,
+    /// H1 sync timers that fired while a filesystem rename was already pending.
+    /// They are retried after the user-controlled rename releases the path.
+    title_sync_deferred: HashSet<SessionId>,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -773,8 +794,60 @@ impl EditorView {
             .map(|rename| InlineRenameRenderState {
                 text: rename.text.clone(),
                 selected_range: rename.selected_range.clone(),
+                selection_reversed: rename.selection_reversed,
                 marked_range: rename.marked_range.clone(),
             })
+    }
+
+    pub(crate) fn set_inline_rename_input_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.inline_rename_input_bounds = Some(bounds);
+    }
+
+    /// Converts a native mouse position into the UTF-16 offset expected by the
+    /// platform input handler, using the same shaped line that is painted for
+    /// the inline rename field.
+    pub(crate) fn inline_rename_character_index_for_point(
+        &self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<usize> {
+        let bounds = self.inline_rename_input_bounds?;
+        let state = self.inline_rename_render_state()?;
+        let line = shape_inline_rename_line(&state, window);
+        let x = if position.x <= bounds.left() {
+            px(0.0)
+        } else {
+            position.x - bounds.left()
+        };
+        let byte = line.closest_index_for_x(x).min(state.text.len());
+        Some(utf16_offset_from_byte(&state.text, byte))
+    }
+
+    pub(crate) fn move_inline_rename_to_point(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.inline_rename_character_index_for_point(position, window) else {
+            return;
+        };
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        if rename.pending || rename.composition.is_some() {
+            return;
+        }
+        let byte = byte_offset_from_utf16(&rename.text, index);
+        rename.selected_range = byte..byte;
+        rename.selection_reversed = false;
+        cx.notify();
+    }
+
+    pub(crate) fn inline_rename_has_composition(&self) -> bool {
+        self.inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.composition.is_some())
     }
 
     pub(crate) fn inline_rename_text_for_range(
@@ -832,6 +905,7 @@ impl EditorView {
         rename.selected_range = next..next;
         rename.selection_reversed = false;
         rename.marked_range = None;
+        rename.composition = None;
         cx.notify();
         true
     }
@@ -848,6 +922,13 @@ impl EditorView {
         };
         if rename.pending {
             return true;
+        }
+        if rename.composition.is_none() {
+            rename.composition = Some(InlineRenameComposition {
+                text: rename.text.clone(),
+                selected_range: rename.selected_range.clone(),
+                selection_reversed: rename.selection_reversed,
+            });
         }
         let range = range_utf16
             .as_ref()
@@ -872,10 +953,28 @@ impl EditorView {
         true
     }
 
-    pub(crate) fn unmark_inline_rename(&mut self) {
-        if let Some(rename) = self.inline_rename.as_mut() {
+    pub(crate) fn commit_inline_rename_composition(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        if rename.composition.take().is_some() {
             rename.marked_range = None;
+            cx.notify();
         }
+    }
+
+    pub(crate) fn cancel_inline_rename_composition(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        let Some(composition) = rename.composition.take() else {
+            return;
+        };
+        rename.text = composition.text;
+        rename.selected_range = composition.selected_range;
+        rename.selection_reversed = composition.selection_reversed;
+        rename.marked_range = None;
+        cx.notify();
     }
 
     pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {
@@ -961,6 +1060,28 @@ impl EditorView {
         }
     }
 
+    pub(crate) fn select_inline_rename_home(&mut self, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.as_mut()
+            && !rename.pending
+        {
+            select_inline_rename_to(rename, 0);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_inline_rename_end(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .inline_rename
+            .as_ref()
+            .map_or(0, |rename| rename.text.len());
+        if let Some(rename) = self.inline_rename.as_mut()
+            && !rename.pending
+        {
+            select_inline_rename_to(rename, target);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn move_inline_rename_home(&mut self, cx: &mut Context<Self>) {
         self.move_inline_rename_to(0, cx);
     }
@@ -1012,6 +1133,7 @@ impl EditorView {
         rename.selected_range = range.start..range.start;
         rename.selection_reversed = false;
         rename.marked_range = None;
+        rename.composition = None;
         cx.notify();
     }
 
@@ -1069,6 +1191,7 @@ impl EditorView {
             selected_range: 0..text_len,
             selection_reversed: false,
             marked_range: None,
+            composition: None,
             pending: false,
         });
         window.focus(&self.focus_handle);
@@ -1086,13 +1209,16 @@ impl EditorView {
                 session.path().is_some_and(belongs)
                     && (session.save_in_flight()
                         || self.title_sync_in_flight.contains(&session.id())
-                        || self.title_sync_pending.contains_key(&session.id()))
+                        || self.title_sync_pending.contains_key(&session.id())
+                        || (session.auto_title().is_some()
+                            && self.title_sync_scheduled.contains_key(&session.id())))
             })
             || (kind == InlineRenameKind::Folder
                 && self.work_folder_drafts.iter().any(|(id, draft)| {
                     belongs(&draft.target_directory)
                         && (self.title_sync_in_flight.contains(id)
-                            || self.title_sync_pending.contains_key(id))
+                            || self.title_sync_pending.contains_key(id)
+                            || self.title_sync_scheduled.contains_key(id))
                 }))
     }
 
@@ -1272,6 +1398,7 @@ impl EditorView {
         for (id, pending) in queued_saves {
             self.save_session(id, pending, cx);
         }
+        self.retry_deferred_title_sync(cx);
         cx.notify();
     }
 
@@ -1325,6 +1452,7 @@ impl EditorView {
             return false;
         }
         self.inline_rename = None;
+        self.retry_deferred_title_sync(cx);
         cx.notify();
         true
     }
@@ -1398,10 +1526,13 @@ impl EditorView {
             sidebar_date_badge_today: local_today(),
             _date_badge_refresh_task: date_badge_refresh_task,
             pending_new_folders: HashSet::new(),
+            inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
+            title_sync_scheduled: HashMap::new(),
+            title_sync_deferred: HashSet::new(),
             loading_paths: HashSet::new(),
             latest_open_target: None,
             work_folder_generation: 0,
@@ -1817,10 +1948,14 @@ impl EditorView {
         let id = self.sessions.active_id();
         let generation = self.sessions.active().generation();
         let revision = self.sessions.active().revision();
+        self.title_sync_scheduled.insert(id, revision);
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(750)).await;
             let _ = view.update(cx, |view, cx| {
-                view.run_title_sync(id, generation, revision, cx);
+                if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
+                    view.title_sync_scheduled.remove(&id);
+                    view.run_title_sync(id, generation, revision, cx);
+                }
             });
         })
         .detach();
@@ -1837,6 +1972,14 @@ impl EditorView {
         revision: Revision,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.pending)
+        {
+            self.title_sync_deferred.insert(id);
+            return;
+        }
         if self.title_sync_in_flight.contains(&id) {
             // Another probe or write for this session is already running; the
             // next edit re-arms this timer, so nothing is lost by skipping.
@@ -2241,6 +2384,20 @@ impl EditorView {
         self.run_title_sync(id, generation, revision, cx);
     }
 
+    /// Retries title synchronization that was held back by a user-controlled
+    /// filesystem rename. Keeping this at the orchestration boundary means an
+    /// untitled draft is re-evaluated against its rebased directory rather
+    /// than reusing a stale path captured before the folder move.
+    fn retry_deferred_title_sync(&mut self, cx: &mut Context<Self>) {
+        if self.inline_rename.is_some() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.title_sync_deferred);
+        for id in deferred {
+            self.retry_title_sync(id, cx);
+        }
+    }
+
     pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
         self.save_active(SaveIntent::Current, cx);
     }
@@ -2528,6 +2685,8 @@ impl EditorView {
         self.draft_recovery_warning = None;
         self.title_sync_pending.clear();
         self.title_sync_in_flight.clear();
+        self.title_sync_scheduled.clear();
+        self.title_sync_deferred.clear();
         self.loading_paths.clear();
         self.latest_open_target = None;
         // Any background read still in flight for the old folder (or for
@@ -4784,6 +4943,9 @@ impl EditorView {
                                     .is_some_and(|rename| rename.from == path)
                                 {
                                     window.focus(&view.focus_handle);
+                                    if let Some(position) = event.mouse_position() {
+                                        view.move_inline_rename_to_point(position, window, cx);
+                                    }
                                 } else {
                                     view.open_work_folder_entry(&path, cx);
                                 }
@@ -4852,6 +5014,9 @@ impl EditorView {
                                     .is_some_and(|rename| rename.from == path)
                                 {
                                     window.focus(&view.focus_handle);
+                                    if let Some(position) = event.mouse_position() {
+                                        view.move_inline_rename_to_point(position, window, cx);
+                                    }
                                 } else {
                                     view.toggle_and_select_work_folder_folder(path.clone(), cx);
                                 }
@@ -5278,6 +5443,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_rename_shift_home_and_end_extend_from_the_active_caret() {
+        let mut forward = InlineRename {
+            kind: InlineRenameKind::File,
+            from: PathBuf::from("note.md"),
+            text: "abcdef".to_owned(),
+            fixed_extension: Some(".md".to_owned()),
+            selected_range: 2..4,
+            selection_reversed: false,
+            marked_range: None,
+            composition: None,
+            pending: false,
+        };
+        select_inline_rename_to(&mut forward, 0);
+        assert_eq!(forward.selected_range, 0..2);
+        assert!(forward.selection_reversed);
+
+        let mut reversed = InlineRename {
+            selection_reversed: true,
+            ..forward
+        };
+        reversed.selected_range = 2..4;
+        select_inline_rename_to(&mut reversed, 6);
+        assert_eq!(reversed.selected_range, 4..6);
+        assert!(!reversed.selection_reversed);
+    }
+
     #[gpui::test]
     fn inline_rename_ime_selection_is_relative_to_the_marked_replacement(
         cx: &mut gpui::TestAppContext,
@@ -5299,6 +5491,77 @@ mod tests {
             );
         });
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn inline_rename_escape_cancels_ime_composition_before_the_rename(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-ime-cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("Alpha.md");
+        std::fs::write(&original, "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        view.update(cx, |view, cx| {
+            assert!(view.replace_and_mark_inline_rename_text(None, "かな", Some(2..2), cx));
+            assert!(view.inline_rename_has_composition());
+        });
+
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            assert!(!view.inline_rename_has_composition());
+            assert_eq!(
+                view.inline_rename_render_state().unwrap().text,
+                "Alpha".to_owned()
+            );
+        });
+        assert!(original.exists());
+        assert!(!root.join("かな.md").exists());
+
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn inline_rename_enter_commits_ime_composition_before_the_rename(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-ime-commit");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("Alpha.md");
+        std::fs::write(&original, "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        view.update(cx, |view, cx| {
+            assert!(view.replace_and_mark_inline_rename_text(None, "日本", Some(2..2), cx));
+        });
+
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            assert!(!view.inline_rename_has_composition());
+            assert_eq!(
+                view.inline_rename_render_state().unwrap().text,
+                "日本".to_owned()
+            );
+        });
+        assert!(original.exists());
+        assert!(!root.join("日本.md").exists());
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!original.exists());
+        assert!(root.join("日本.md").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -8274,6 +8537,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn clicking_inside_an_inline_rename_moves_the_caret_to_that_text_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-click-caret");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("LongFileName.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        let input_bounds = view.read_with(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            view.inline_rename_input_bounds.unwrap()
+        });
+        let click = point(input_bounds.left() + px(24.0), input_bounds.center().y);
+        cx.simulate_click(click, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            let (range, reversed) = view.inline_rename_selection().unwrap();
+            assert!(!reversed);
+            assert_eq!(range.start, range.end);
+            assert!(range.start > 0 && range.start < "LongFileName".encode_utf16().count());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn sidebar_file_and_folder_double_click_start_inline_rename_but_root_does_not(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8387,6 +8679,7 @@ mod tests {
                 selected_range: 0..0,
                 selection_reversed: false,
                 marked_range: None,
+                composition: None,
                 pending: true,
             });
             view.latest_open_target = None;
@@ -8483,6 +8776,34 @@ mod tests {
             std::fs::read_to_string(renamed_nested).unwrap(),
             "before after"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn folder_rename_waits_for_an_unnamed_drafts_scheduled_title_sync(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-title-sync-scheduled");
+        let project = root.join("Project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: project.clone(),
+                },
+            );
+            view.editor_mut().insert_text("# Draft").unwrap();
+            view.after_input(cx);
+
+            assert!(view.title_sync_scheduled.contains_key(&id));
+            assert!(view.inline_rename_has_background_conflict(&project, InlineRenameKind::Folder));
+        });
 
         std::fs::remove_dir_all(root).unwrap();
     }

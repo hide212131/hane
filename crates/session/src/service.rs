@@ -179,15 +179,10 @@ fn rename_file_without_replace(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn is_case_only_name(from: &Path, to: &Path) -> bool {
-    from.parent() == to.parent()
-        && from.file_name() != to.file_name()
-        && from
-            .file_name()
-            .zip(to.file_name())
-            .is_some_and(|(from, to)| {
-                from.to_string_lossy()
-                    .eq_ignore_ascii_case(&to.to_string_lossy())
-            })
+    // Do not restrict this to ASCII. On a case-insensitive volume the
+    // filesystem-object check below is the authoritative answer, including
+    // names such as `Ä.md` -> `ä.md` that NTFS/APFS may fold together.
+    from.parent() == to.parent() && from.file_name() != to.file_name()
 }
 
 /// A case-only rename looks like a collision on case-insensitive filesystems:
@@ -572,6 +567,27 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["note.md"]);
         assert_eq!(fs::read_to_string(&to).unwrap(), "case only\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_non_ascii_case_only_file_rename_keeps_the_requested_spelling() {
+        let root = temporary_directory("rename-non-ascii-case-only-file");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("Ä.md");
+        let to = root.join("ä.md");
+        OsFileService
+            .save(&from, &RopeBuffer::from_text("non-ascii case only\n"))
+            .unwrap();
+
+        OsFileService.rename(&from, &to).unwrap();
+
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["ä.md"]);
+        assert_eq!(fs::read_to_string(&to).unwrap(), "non-ascii case only\n");
         fs::remove_dir_all(root).unwrap();
     }
 
