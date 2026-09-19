@@ -477,17 +477,33 @@ pub fn fence_open(source: &str) -> Option<FenceOpen> {
     })
 }
 
+/// The `(marker byte, run length)` of a physical line's own fence delimiter
+/// shape, if `source` has one: [`fence_delimiter`]'s run-of-3+ backtick or
+/// tilde characters. This is what CommonMark's closing rule checks a
+/// candidate closing line against — the *opening* line's own marker and
+/// length, not a shape the closing line could satisfy alone — so
+/// [`is_fence_close`] takes it as its `marker`/`min_len` arguments.
+pub fn fence_marker(source: &str) -> Option<(u8, usize)> {
+    fence_delimiter(source).map(|delimiter| (delimiter.marker, delimiter.len))
+}
+
 /// Whether `source` (one physical line's own text) is a fenced code block's
-/// closing delimiter: [`fence_delimiter`]'s run-of-3+ shape, with nothing but
-/// trailing whitespace after it. An unclosed fence's own last physical line
-/// can itself start with a look-alike run of backticks or tildes as ordinary
-/// content (for example prose about Markdown fences); requiring the rest of
-/// the line to be blank is what tells the two apart without re-parsing the
-/// whole block.
-pub fn is_fence_close(source: &str) -> bool {
+/// closing delimiter for an opening fence whose marker character is `marker`
+/// and whose run length is `min_len` (see [`fence_marker`]): the same marker
+/// character, a run at least as long as the opening's, with nothing but
+/// trailing whitespace after it — CommonMark defines a closing fence relative
+/// to its opening, not as a shape a line can satisfy alone. An unclosed
+/// fence's own last physical line can itself start with a look-alike run of
+/// backticks or tildes as ordinary content (for example prose about Markdown
+/// fences, or a shorter run, or the other marker character); tying the check
+/// to the opening's own marker and length is what tells the two apart.
+pub fn is_fence_close(source: &str, marker: u8, min_len: usize) -> bool {
     let Some(delimiter) = fence_delimiter(source) else {
         return false;
     };
+    if delimiter.marker != marker || delimiter.len < min_len {
+        return false;
+    }
     let leading = source.len() - source.trim_start_matches(' ').len();
     source[leading + delimiter.len..]
         .trim_end_matches(['\r', '\n'])
@@ -1106,7 +1122,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                 let body = tail
                     .get(..block.source_range.end.0 - block.source_range.start.0)
                     .unwrap_or(tail);
-                if fence_delimiter(body).is_some() {
+                if let Some(opening_delimiter) = fence_delimiter(body) {
                     let opening_end = body.find('\n').unwrap_or(body.len());
                     let opening = body[..opening_end].trim_end_matches(['\r', '\n']).len();
                     if opening > 0 {
@@ -1118,7 +1134,11 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     let closed = body.trim_end_matches(['\r', '\n']);
                     if let Some(closing_start) = closed.rfind('\n').map(|line_end| line_end + 1)
                         && closing_start > opening_end
-                        && fence_delimiter(&closed[closing_start..]).is_some()
+                        && is_fence_close(
+                            &closed[closing_start..],
+                            opening_delimiter.marker,
+                            opening_delimiter.len,
+                        )
                     {
                         markers.push(SourceRange::new(
                             block.source_range.start.0 + closing_start,
@@ -1519,14 +1539,29 @@ mod tests {
 
     #[test]
     fn is_fence_close_requires_a_blank_rest_of_line() {
-        assert!(is_fence_close("```\n"));
-        assert!(is_fence_close("```"));
-        assert!(is_fence_close("   ~~~~~  \n"));
+        assert!(is_fence_close("```\n", b'`', 3));
+        assert!(is_fence_close("```", b'`', 3));
+        assert!(is_fence_close("   ~~~~~  \n", b'~', 4));
         // Trailing content past the run means the line never actually closed
         // the fence, so the parser would have kept treating it as content.
-        assert!(!is_fence_close("```rust\n"));
-        assert!(!is_fence_close("``` more code\n"));
-        assert!(!is_fence_close("plain text\n"));
+        assert!(!is_fence_close("```rust\n", b'`', 3));
+        assert!(!is_fence_close("``` more code\n", b'`', 3));
+        assert!(!is_fence_close("plain text\n", b'`', 3));
+    }
+
+    #[test]
+    fn is_fence_close_requires_the_opening_marker_and_length() {
+        // A shorter closing run never closes a longer opening fence: the
+        // unclosed block's own last physical line can look fence-shaped while
+        // still being literal content.
+        assert!(!is_fence_close("```\n", b'`', 4));
+        assert!(is_fence_close("````\n", b'`', 4));
+        // A different marker character never closes the other kind of fence,
+        // even at the same or greater length.
+        assert!(!is_fence_close("~~~~\n", b'`', 3));
+        assert!(!is_fence_close("```\n", b'~', 3));
+        // A longer closing run than the opening still closes it.
+        assert!(is_fence_close("~~~~~~\n", b'~', 4));
     }
 
     #[test]
@@ -1599,6 +1634,37 @@ mod tests {
                 .blocks()
                 .any(|(_, block)| block.kind == NodeKind::CodeBlock)
         );
+    }
+
+    #[test]
+    fn unclosed_fence_markers_never_mistake_a_look_alike_last_line_for_closing() {
+        // Four opening backticks require a closing run of at least four; three
+        // backticks on the last physical line looks fence-shaped but does not
+        // close it, so the whole rest of the document stays literal code
+        // content instead of a second (fake) marker.
+        let backtick_source = "````rust\nlet answer = 42;\n```\n";
+        let parsed = parse_document(
+            Revision(1),
+            SourceRange::new(0, backtick_source.len()),
+            backtick_source,
+        );
+        assert!(parsed.tree.blocks().any(|(_, block)| block.kind
+            == NodeKind::CodeBlock
+            && block.source_range.end.0 == backtick_source.len()));
+        assert_eq!(parsed.markers, vec![SourceRange::new(0, 8)]);
+
+        // A tilde opening is never closed by a backtick run, regardless of
+        // length.
+        let tilde_source = "~~~\nlet answer = 42;\n```\n";
+        let parsed = parse_document(
+            Revision(1),
+            SourceRange::new(0, tilde_source.len()),
+            tilde_source,
+        );
+        assert!(parsed.tree.blocks().any(|(_, block)| block.kind
+            == NodeKind::CodeBlock
+            && block.source_range.end.0 == tilde_source.len()));
+        assert_eq!(parsed.markers, vec![SourceRange::new(0, 3)]);
     }
 
     #[test]

@@ -50,7 +50,8 @@ use hane_document::{
 use hane_markdown::{
     BlockId, BlockIndex, Confidence, FenceOpen, IndexedBlock, ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
-    fence_open, has_delimiter_markers, is_fence_close, is_table_delimiter, parse_document,
+    fence_marker, fence_open, has_delimiter_markers, is_fence_close, is_table_delimiter,
+    parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -986,6 +987,16 @@ pub fn present_block_with_list_projection(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    // Only available when the block's own first physical line is loaded into
+    // `window.lines` (see [`BlockWindow::lines`]); a huge block scrolled past
+    // its opening line never reads it just to check this, so a closing-shaped
+    // last line without it stays literal content (see `fence_edge`) rather
+    // than guessing.
+    let opening_fence = window
+        .lines
+        .first()
+        .filter(|line| line.line == window.span.start)
+        .and_then(|line| fence_marker(line.text));
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
         if run_uses_shared_parse(run.len(), window.joined) {
@@ -1011,7 +1022,15 @@ pub fn present_block_with_list_projection(
             LineContext::Normal
         };
         let edge = (line_context == LineContext::FencedCode)
-            .then(|| fence_edge(window.span.start, content_end, line.line, line.text))
+            .then(|| {
+                fence_edge(
+                    window.span.start,
+                    content_end,
+                    line.line,
+                    line.text,
+                    opening_fence,
+                )
+            })
             .flatten();
         let mut presented = if let Some(edge) = edge {
             present_fenced_code_edge_line(
@@ -2853,14 +2872,29 @@ fn present_fenced_code_line(
 /// an indented code block's lines match neither shape, since
 /// [`fence_open`]/[`is_fence_close`] already draw that distinction the same
 /// way marker derivation does.
-fn fence_edge(span_start: usize, content_end: usize, line: usize, text: &str) -> Option<FenceEdge> {
+///
+/// `opening` is the block's own opening line's `(marker, length)` (see
+/// [`fence_marker`]), when known — CommonMark closes a fence only with the
+/// same marker character and a run at least as long as the opening's, so a
+/// last physical line that merely looks fence-shaped never closes a longer or
+/// differently-marked opening; it stays literal code content instead.
+/// `opening` is `None` when the opening line itself is not loaded (a large
+/// block scrolled away from its own top), in which case the candidate
+/// closing line cannot be verified and is likewise left as content rather
+/// than guessed.
+fn fence_edge(
+    span_start: usize,
+    content_end: usize,
+    line: usize,
+    text: &str,
+    opening: Option<(u8, usize)>,
+) -> Option<FenceEdge> {
     if line == span_start {
         return fence_open(text).map(FenceEdge::Opening);
     }
-    if line + 1 == content_end && is_fence_close(text) {
-        return Some(FenceEdge::Closing);
-    }
-    None
+    let (marker, min_len) = opening?;
+    (line + 1 == content_end && is_fence_close(text, marker, min_len))
+        .then_some(FenceEdge::Closing)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5312,17 +5346,46 @@ mod tests {
         // span_start = 10, content ends at 13 (lines 10, 11, 12), so only line
         // 10 can open and only line 12 can close.
         assert_eq!(
-            fence_edge(10, 13, 10, "```rust\n"),
+            fence_edge(10, 13, 10, "```rust\n", Some((b'`', 3))),
             Some(FenceEdge::Opening(fence_open("```rust\n").unwrap()))
         );
-        assert_eq!(fence_edge(10, 13, 11, "let x = 1;\n"), None);
-        assert_eq!(fence_edge(10, 13, 12, "```\n"), Some(FenceEdge::Closing));
+        assert_eq!(fence_edge(10, 13, 11, "let x = 1;\n", Some((b'`', 3))), None);
+        assert_eq!(
+            fence_edge(10, 13, 12, "```\n", Some((b'`', 3))),
+            Some(FenceEdge::Closing)
+        );
         // An unclosed fence's own last line can look like a fence without
         // actually closing one; trailing content after the run keeps it a
         // content line instead.
-        assert_eq!(fence_edge(10, 13, 12, "``` still typing\n"), None);
+        assert_eq!(
+            fence_edge(10, 13, 12, "``` still typing\n", Some((b'`', 3))),
+            None
+        );
         // An indented code block's first line is never a fence line.
-        assert_eq!(fence_edge(10, 13, 10, "    plain code\n"), None);
+        assert_eq!(
+            fence_edge(10, 13, 10, "    plain code\n", Some((b'`', 3))),
+            None
+        );
+    }
+
+    #[test]
+    fn fence_edge_requires_the_closing_line_to_match_the_opening_marker_and_length() {
+        // The opening fence is four backticks; a three-backtick run on the
+        // block's own last line looks fence-shaped but is shorter than the
+        // opening, so CommonMark never treats it as closing — it stays
+        // literal code content.
+        assert_eq!(fence_edge(10, 13, 12, "```\n", Some((b'`', 4))), None);
+        assert_eq!(
+            fence_edge(10, 13, 12, "````\n", Some((b'`', 4))),
+            Some(FenceEdge::Closing)
+        );
+        // A tilde opening is never closed by a backtick run, and vice versa,
+        // regardless of length.
+        assert_eq!(fence_edge(10, 13, 12, "```\n", Some((b'~', 3))), None);
+        // When the opening line itself is not loaded (a block scrolled away
+        // from its own top), a candidate closing line cannot be verified and
+        // is left as content rather than guessed.
+        assert_eq!(fence_edge(10, 13, 12, "```\n", None), None);
     }
 
     #[test]

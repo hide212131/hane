@@ -178,6 +178,23 @@ const FIXTURES: &[MarkdownFixture] = &[
         style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[]],
     },
     MarkdownFixture {
+        name: "unclosed fenced code with a shorter look-alike last line",
+        // The opening fence is four backticks; CommonMark only closes it with
+        // a run of four or more of the same marker, so the three-backtick
+        // last line never closes it — the whole rest of the document,
+        // including that line, stays literal code content.
+        source: "````rust\nlet answer = 42;\n```",
+        tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
+        markers: &["````rust"],
+        block_kinds: &[
+            BlockKind::CodeFence,
+            BlockKind::CodeBlock,
+            BlockKind::CodeBlock,
+        ],
+        visual_lines: &["rust", "let answer = 42;", "```"],
+        style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[style(CodeBlock, 0, 3)]],
+    },
+    MarkdownFixture {
         name: "image",
         source: "![羽](assets/feather.svg)",
         tree_paths: &[&[NodeKind::Paragraph, NodeKind::Image, NodeKind::Text]],
