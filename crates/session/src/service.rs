@@ -277,19 +277,13 @@ fn same_filesystem_object(from: &Path, to: &Path) -> io::Result<bool> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        match (
-            source.volume_serial_number(),
-            source.file_index(),
-            target.volume_serial_number(),
-            target.file_index(),
-        ) {
-            (Some(source_volume), Some(source_index), Some(target_volume), Some(target_index)) => {
-                Ok(source_volume == target_volume && source_index == target_index)
-            }
-            _ => Ok(false),
-        }
+        // `std::os::windows::fs::MetadataExt` exposes the native file-index
+        // fields only through unstable APIs. Canonicalizing both existing
+        // paths uses the stable filesystem boundary and gives the same result
+        // needed here: case aliases on a case-insensitive volume resolve to
+        // one spelling, while distinct entries on a case-sensitive volume do
+        // not.
+        Ok(fs::canonicalize(from)? == fs::canonicalize(to)?)
     }
 }
 
