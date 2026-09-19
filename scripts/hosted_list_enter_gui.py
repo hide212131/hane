@@ -318,6 +318,42 @@ def run_case(
             )
 
             for index, action in enumerate(spec.actions, start=1):
+                if action[0].startswith("type-romaji-at-caret-"):
+                    ok, _output, error = interaction_module.run_helper(
+                        helper, ["deactivate"], helper_timeout,
+                    )
+                    steps.append(
+                        step(
+                            f"ime_action_{index}_deactivate_target_before_source_switch",
+                            "pass" if ok else "blocked",
+                            None if ok else error,
+                        )
+                    )
+                    if ok:
+                        selected, observed_source, select_error, attempts = interaction_module.select_input_source(
+                            helper, action[2], helper_timeout,
+                        )
+                        steps.append(
+                            step(
+                                f"ime_action_{index}_select_source_while_unfocused",
+                                "pass" if selected else "blocked",
+                                None if selected else select_error,
+                                source_id=action[2],
+                                observed_source=observed_source,
+                                attempts=attempts,
+                            )
+                        )
+                        ok = selected
+                        error = select_error
+                    if not ok:
+                        steps.append(
+                            step(
+                                f"action_{index}", "blocked",
+                                error or "IME 入力ソースを対象 editor 非アクティブ時に選択できなかった",
+                                command=[action[0], str(pid), *action[1:]],
+                            )
+                        )
+                        break
                 command = [action[0], str(pid), *action[1:]]
                 ok, output, error = interaction_module.run_helper(helper, command, helper_timeout)
                 steps.append(
