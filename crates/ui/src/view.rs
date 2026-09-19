@@ -2296,7 +2296,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !event.dragging() {
+        if !self.text_selection_drag || !event.dragging() {
             return;
         }
         let Some(offset) =
@@ -7692,10 +7692,19 @@ mod tests {
             view.text_autoscroll_activity
         });
 
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             view.sessions.open_untitled("replacement", "Replacement");
             view.on_document_replaced();
+            cx.notify();
         });
+
+        cx.run_until_parked();
+        let (replacement_move, _) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_move(
+            replacement_move,
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
 
         view.read_with(cx, |view, _| {
             assert!(!view.text_selection_drag);
