@@ -1745,6 +1745,7 @@ impl UTType {
 #[cfg(test)]
 mod tests {
     use std::{
+        ops::Range,
         ptr,
         sync::{
             atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
@@ -1753,21 +1754,111 @@ mod tests {
     };
 
     use objc::{declare::ClassDecl, runtime::Class};
+    use parking_lot::Mutex;
 
-    use crate::ClipboardItem;
+    use crate::{
+        App, Bounds, ClipboardItem, Empty, InputHandler, PlatformInputHandler, Point,
+        TestAppContext, UTF16Selection, Window,
+    };
 
     use super::super::NSRange as GpuiNSRange;
+    use super::super::window::{insert_text, with_test_input_handler};
     use super::*;
 
-    const TEST_COMMIT_OFFSET: usize = "3. Alpha row".len();
+    const TEST_DOCUMENT: &str =
+        "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Gamma row\n";
+    const TEST_COMMIT_TEXT: &str = "日本語";
+    const TEST_COMMIT_OFFSET: usize = "# Normal List Editing Fixture\n\n3. Alpha row".len();
 
     static TEST_ACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
     static TEST_DEACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static TEST_COMMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static TEST_COMMIT_OFFSET_SEEN: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static TEST_COMMIT_TEXT_MATCH: AtomicBool = AtomicBool::new(false);
     static TEST_REENTER_ON_DEACTIVATE: AtomicBool = AtomicBool::new(false);
     static TEST_NOTIFICATION_OBSERVER: AtomicPtr<Object> = AtomicPtr::new(ptr::null_mut());
+
+    #[derive(Debug)]
+    struct TestInputState {
+        document: String,
+        commit_count: usize,
+        commit_range: Option<Range<usize>>,
+        commit_text: String,
+    }
+
+    struct TestInputHandler {
+        state: Arc<Mutex<TestInputState>>,
+    }
+
+    impl InputHandler for TestInputHandler {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET,
+                reversed: false,
+            })
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            range_utf16: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            self.state.lock().document.get(range_utf16).map(str::to_owned)
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            replacement_range: Option<Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            let mut state = self.state.lock();
+            let range = replacement_range.unwrap_or(TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET);
+            state.document.replace_range(range.clone(), text);
+            state.commit_count += 1;
+            state.commit_range = Some(range);
+            state.commit_text = text.to_owned();
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<crate::Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<crate::Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
 
     extern "C" fn test_key_window_first_responder(this: &Object, _: Sel) -> id {
         unsafe { *this.get_ivar::<id>("firstResponder") }
@@ -1782,10 +1873,10 @@ mod tests {
         unsafe {
             let client = *this.get_ivar::<id>("client");
             if !client.is_null() {
-                let text = ns_string("日本語");
+                let text = *this.get_ivar::<id>("commitText");
                 let replacement_range = GpuiNSRange {
-                    location: TEST_COMMIT_OFFSET as NSUInteger,
-                    length: 0,
+                    location: *this.get_ivar::<NSUInteger>("commitOffset"),
+                    length: *this.get_ivar::<NSUInteger>("commitLength"),
                 };
                 let _: () = msg_send![client, insertText: text replacementRange: replacement_range];
             }
@@ -1803,16 +1894,12 @@ mod tests {
     }
 
     extern "C" fn test_responder_insert_text(
-        _: &Object,
-        _: Sel,
+        this: &Object,
+        selector: Sel,
         text: id,
         replacement_range: GpuiNSRange,
     ) {
-        TEST_COMMIT_COUNT.fetch_add(1, Ordering::SeqCst);
-        TEST_COMMIT_OFFSET_SEEN.store(replacement_range.location as usize, Ordering::SeqCst);
-        let expected_text = unsafe { ns_string("日本語") };
-        let text_matches: BOOL = unsafe { msg_send![text, isEqualToString: expected_text] };
-        TEST_COMMIT_TEXT_MATCH.store(text_matches == YES, Ordering::SeqCst);
+        insert_text(this, selector, text, replacement_range);
     }
 
     fn test_classes() -> (*const Class, *const Class, *const Class) {
@@ -1821,6 +1908,9 @@ mod tests {
             let mut input_context = ClassDecl::new("HaneImeTestInputContext", class!(NSObject))
                 .unwrap();
             input_context.add_ivar::<id>("client");
+            input_context.add_ivar::<id>("commitText");
+            input_context.add_ivar::<NSUInteger>("commitOffset");
+            input_context.add_ivar::<NSUInteger>("commitLength");
             input_context.add_method(
                 sel!(activate),
                 test_input_context_activate as extern "C" fn(&Object, Sel),
@@ -1898,14 +1988,14 @@ mod tests {
         let input_context = unsafe { new_test_object(input_context_class) };
         TEST_ACTIVATE_COUNT.store(0, Ordering::SeqCst);
         TEST_DEACTIVATE_COUNT.store(0, Ordering::SeqCst);
-        TEST_COMMIT_COUNT.store(0, Ordering::SeqCst);
-        TEST_COMMIT_OFFSET_SEEN.store(usize::MAX, Ordering::SeqCst);
-        TEST_COMMIT_TEXT_MATCH.store(false, Ordering::SeqCst);
         TEST_REENTER_ON_DEACTIVATE.store(true, Ordering::SeqCst);
         let text_responder = unsafe { new_test_object(responder_class) };
         unsafe {
             (*text_responder).set_ivar("inputContext", input_context);
             (*input_context).set_ivar("client", text_responder);
+            (*input_context).set_ivar("commitText", ns_string(TEST_COMMIT_TEXT));
+            (*input_context).set_ivar("commitOffset", TEST_COMMIT_OFFSET as NSUInteger);
+            (*input_context).set_ivar("commitLength", 0usize as NSUInteger);
         }
         let key_window = unsafe { new_test_object(key_window_class) };
         unsafe {
@@ -1925,46 +2015,71 @@ mod tests {
         };
         TEST_NOTIFICATION_OBSERVER.store(delegate, Ordering::SeqCst);
 
-        unsafe { post_keyboard_selection_change(delegate) };
-
-        assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            callback_count.load(Ordering::SeqCst),
-            2,
-            "the outer and reentrant notifications both reach the mapper callback"
+        let state = Arc::new(Mutex::new(TestInputState {
+            document: TEST_DOCUMENT.to_owned(),
+            commit_count: 0,
+            commit_range: None,
+            commit_text: String::new(),
+        }));
+        let mut test_app = TestAppContext::single();
+        let (_, test_window_cx) = test_app.add_window_view(|_, _| Empty);
+        let async_window_context = test_window_cx.update(|window, cx| window.to_async(cx));
+        let input_handler = PlatformInputHandler::new(
+            async_window_context,
+            Box::new(TestInputHandler {
+                state: state.clone(),
+            }),
         );
-        assert_eq!(TEST_COMMIT_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            TEST_COMMIT_OFFSET_SEEN.load(Ordering::SeqCst),
-            TEST_COMMIT_OFFSET
-        );
-        assert!(TEST_COMMIT_TEXT_MATCH.load(Ordering::SeqCst));
 
-        *TEST_KEY_WINDOW_OVERRIDE
-            .get_or_init(|| Mutex::new(None))
-            .lock() = Some(None);
-        unsafe { post_keyboard_selection_change(delegate) };
+        with_test_input_handler(input_handler, || {
+            unsafe { post_keyboard_selection_change(delegate) };
 
-        let non_text_responder: id = unsafe { msg_send![class!(NSObject), new] };
-        unsafe {
-            (*key_window).set_ivar("firstResponder", non_text_responder);
-        }
-        *TEST_KEY_WINDOW_OVERRIDE
-            .get_or_init(|| Mutex::new(None))
-            .lock() = Some(Some(key_window as usize));
-        unsafe { post_keyboard_selection_change(delegate) };
+            assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                callback_count.load(Ordering::SeqCst),
+                2,
+                "the outer and reentrant notifications both reach the mapper callback"
+            );
 
-        let contextless_responder = unsafe { new_test_object(responder_class) };
-        unsafe {
-            (*contextless_responder).set_ivar("inputContext", nil);
-            (*key_window).set_ivar("firstResponder", contextless_responder);
-        }
-        unsafe { post_keyboard_selection_change(delegate) };
+            let input_state = state.lock();
+            assert_eq!(input_state.commit_count, 1);
+            assert_eq!(
+                input_state.commit_range,
+                Some(TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET)
+            );
+            assert_eq!(input_state.commit_text, TEST_COMMIT_TEXT);
+            assert_eq!(
+                input_state.document,
+                "# Normal List Editing Fixture\n\n3. Alpha row日本語\n41. Beta row\n100. Gamma row\n"
+            );
+            drop(input_state);
 
-        assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(TEST_COMMIT_COUNT.load(Ordering::SeqCst), 1);
+            *TEST_KEY_WINDOW_OVERRIDE
+                .get_or_init(|| Mutex::new(None))
+                .lock() = Some(None);
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            let non_text_responder: id = unsafe { msg_send![class!(NSObject), new] };
+            unsafe {
+                (*key_window).set_ivar("firstResponder", non_text_responder);
+            }
+            *TEST_KEY_WINDOW_OVERRIDE
+                .get_or_init(|| Mutex::new(None))
+                .lock() = Some(Some(key_window as usize));
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            let contextless_responder = unsafe { new_test_object(responder_class) };
+            unsafe {
+                (*contextless_responder).set_ivar("inputContext", nil);
+                (*key_window).set_ivar("firstResponder", contextless_responder);
+            }
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(state.lock().commit_count, 1);
+        });
 
         TEST_NOTIFICATION_OBSERVER.store(ptr::null_mut(), Ordering::SeqCst);
         *TEST_KEY_WINDOW_OVERRIDE
