@@ -203,7 +203,9 @@ func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, co
         fail("input source became inactive again before typing: \(inputSource)")
     }
     let escaped = escapeForAppleScript(romaji)
-    let finishAction = commit ? "key code 36" : "key code 53"
+    let finishAction = commit
+        ? "key code 49\ndelay 0.5\nkey code 36"
+        : "key code 53"
     let saveAction = save ? "keystroke \"s\" using command down\ndelay 0.3" : ""
     runAppleScript("""
     tell application "System Events"
@@ -211,8 +213,6 @@ func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, co
             set frontmost to true
             delay 0.3
             keystroke "\(escaped)"
-            delay 0.5
-            key code 49
             delay 0.5
             \(finishAction)
             delay 0.3
