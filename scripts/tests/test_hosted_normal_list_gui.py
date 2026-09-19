@@ -14,7 +14,7 @@ spec.loader.exec_module(mod)
 
 class ProcedureIdentityTests(unittest.TestCase):
     def test_procedure_identity_is_focused_and_distinct(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/2")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/3")
         self.assertEqual(mod.VERIFICATION_KIND, "normal_list_focused")
         self.assertIn("#126", mod.SCOPE_NOTE)
         self.assertIn("hosted-gui-interaction/7", mod.SCOPE_NOTE)
@@ -122,6 +122,189 @@ class InitialCheckEvaluationTests(unittest.TestCase):
         self.assertEqual(result["result"], "pass")
 
 
+class DisplayOrderEvaluationTests(unittest.TestCase):
+    def test_pass_when_patterns_appear_in_expected_top_to_bottom_order(self):
+        lines = ["Alpha lead item", "1. Alpha nested one", "2. Alpha nested two", "Beta lead item"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two", r"Beta lead item"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["matched_line_indices"], [0, 1, 2, 3])
+
+    def test_fail_closed_when_two_items_are_swapped(self):
+        # "Beta lead item" と "Alpha nested two" が入れ替わった、mixed fixture が
+        # 崩れた場合の再現(Issue #126 review discussion_r4051349760)。
+        lines = ["Alpha lead item", "1. Alpha nested one", "Beta lead item", "2. Alpha nested two"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two", r"Beta lead item"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "fail")
+
+    def test_fail_closed_when_a_pattern_is_entirely_missing(self):
+        lines = ["Alpha lead item", "1. Alpha nested one"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "fail")
+
+    def test_find_ordered_line_indices_does_not_reuse_an_earlier_line(self):
+        # 同じ行を 2 つの pattern が両方とも指す(=実質的に一方が別の場所に無い)場合は
+        # 順序どおりに前進できず None になる。
+        lines = ["Alpha lead item Beta lead item"]
+        patterns = [r"Alpha lead item", r"Beta lead item"]
+        self.assertIsNone(mod.find_ordered_line_indices(lines, patterns))
+
+
+class NestedPositionEvaluationTests(unittest.TestCase):
+    def test_pass_when_child_bounding_box_is_right_of_baseline(self):
+        baseline = {"bounding_box": {"minX": 0.1}}
+        child = {"bounding_box": {"minX": 0.2}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", baseline, child)
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["name"], "nested_position_alpha_Alpha nested one")
+
+    def test_fail_closed_when_child_is_not_right_of_baseline(self):
+        baseline = {"bounding_box": {"minX": 0.2}}
+        child = {"bounding_box": {"minX": 0.2}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", baseline, child)
+        self.assertEqual(result["result"], "fail")
+
+    def test_fail_closed_when_child_is_left_of_baseline(self):
+        # 子項目が親から外れて平坦化された場合、子の x 位置は baseline と同じか左に来る。
+        baseline = {"bounding_box": {"minX": 0.2}}
+        child = {"bounding_box": {"minX": 0.05}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", baseline, child)
+        self.assertEqual(result["result"], "fail")
+
+    def test_fail_closed_when_marker_width_alone_would_move_child_right_of_a_cross_kind_parent(self):
+        # Issue #126 review, discussion_r4051650816: 実際には平坦(非ネスト)でも、ordered
+        # marker("1.")は bullet marker("-")より幅が広いため、marker 種別が異なる親の本文 x を
+        # そのまま基準にすると child_x が親の本文 x より右に出てしまい、誤って pass になり得る。
+        # baseline は child と同じ ordered marker のトップレベル行なので、marker 幅の差は
+        # 打ち消され、平坦なケースは正しく fail になる。
+        bullet_parent_body_x = 0.12  # "-" (1 glyph) + space の直後
+        ordered_child_body_x = 0.14  # 同じ物理位置に "1." (2 glyph) + space の直後で並んだだけ
+        same_kind_ordered_baseline_x = ordered_child_body_x  # 同じ marker 種別・同じネスト深さ
+        naive_result = mod.evaluate_nested_position(
+            "alpha", "Alpha nested one",
+            {"bounding_box": {"minX": bullet_parent_body_x}},
+            {"bounding_box": {"minX": ordered_child_body_x}},
+        )
+        self.assertEqual(naive_result["result"], "pass", "regression fixture 自体が旧バグを再現できていない")
+        fixed_result = mod.evaluate_nested_position(
+            "alpha", "Alpha nested one",
+            {"bounding_box": {"minX": same_kind_ordered_baseline_x}},
+            {"bounding_box": {"minX": ordered_child_body_x}},
+        )
+        self.assertEqual(fixed_result["result"], "fail")
+
+
+class MixedNestedListNestedPositionSpecTests(unittest.TestCase):
+    def test_mixed_nested_list_spec_declares_alpha_and_gamma_nested_position_checks(self):
+        labels = [check.label for check in mod.MIXED_NESTED_LIST_SPEC.nested_position_checks]
+        self.assertEqual(labels, ["alpha", "gamma"])
+        alpha = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[0]
+        self.assertEqual(alpha.child_content_patterns, (r"Alpha nested one", r"Alpha nested two"))
+        gamma = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[1]
+        self.assertEqual(gamma.baseline_content_pattern, r"Beta lead item")
+        self.assertEqual(gamma.child_content_patterns, (r"Gamma nested bullet", r"Gamma nested second"))
+
+    def test_baseline_content_pattern_matches_the_same_marker_kind_as_its_children(self):
+        # Alpha の子は ordered marker("1."/"2.")なので baseline も ordered marker の
+        # トップレベル行("Gamma lead first")でなければならない。bullet の "Alpha lead item"
+        # 自身を baseline にすると marker 幅の差で誤判定しうる(discussion_r4051650816)。
+        alpha = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[0]
+        self.assertEqual(alpha.baseline_content_pattern, r"Gamma lead first")
+        # Gamma の子は bullet marker("-")なので baseline も bullet marker のトップレベル行
+        # ("Beta lead item")でなければならない。
+        gamma = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[1]
+        self.assertEqual(gamma.baseline_content_pattern, r"Beta lead item")
+
+    def test_paragraph_and_nonsequential_specs_have_no_nested_position_checks(self):
+        self.assertEqual(mod.PARAGRAPH_CHILD_LIST_SPEC.nested_position_checks, ())
+        self.assertEqual(mod.NONSEQUENTIAL_ORDERED_SPEC.nested_position_checks, ())
+
+
+class ParagraphChildListReturnsToParentNumberingTests(unittest.TestCase):
+    def test_second_after_return_check_requires_normal_display_number_2(self):
+        check = next(
+            c for c in mod.PARAGRAPH_CHILD_LIST_SPEC.initial_checks if c.label == "second_after_return"
+        )
+        self.assertEqual(check.expected_number, 2)
+
+    def test_second_after_return_check_passes_only_with_number_2(self):
+        check = next(
+            c for c in mod.PARAGRAPH_CHILD_LIST_SPEC.initial_checks if c.label == "second_after_return"
+        )
+        passing = mod.evaluate_initial_check(["2. Second item after return"], check)
+        self.assertEqual(passing["result"], "pass")
+        failing = mod.evaluate_initial_check(["3. Second item after return"], check)
+        self.assertEqual(failing["result"], "fail")
+
+
+class NestedPositionCheckRunnerTests(unittest.TestCase):
+    def test_blocked_when_baseline_click_fails_and_children_are_skipped(self):
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                return False, "", "click helper failed"
+
+        check = mod.NestedPositionCheck(
+            label="alpha", baseline_content_pattern=r"Gamma lead first",
+            child_content_patterns=(r"Alpha nested one",),
+        )
+        steps = mod.run_nested_position_checks(FakeInteraction(), object(), 123, Path("shot.png"), (check,), 1.0)
+        names_results = {s["name"]: s["result"] for s in steps}
+        self.assertEqual(names_results["nested_position_alpha_baseline_click"], "blocked")
+        self.assertEqual(names_results["nested_position_alpha_Alpha nested one"], "skipped")
+
+    def test_pass_when_baseline_and_child_clicks_succeed_with_child_to_the_right(self):
+        import json
+
+        class FakeInteraction:
+            call_count = 0
+
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                FakeInteraction.call_count += 1
+                min_x = 0.1 if FakeInteraction.call_count == 1 else 0.2
+                payload = json.dumps({
+                    "matched_text": "x", "bounding_box": {"minX": min_x}, "window_bounds": {},
+                    "click_point": {}, "edge": "start",
+                })
+                return True, payload, ""
+
+        check = mod.NestedPositionCheck(
+            label="alpha", baseline_content_pattern=r"Gamma lead first",
+            child_content_patterns=(r"Alpha nested one",),
+        )
+        steps = mod.run_nested_position_checks(FakeInteraction(), object(), 123, Path("shot.png"), (check,), 1.0)
+        result = next(s for s in steps if s["name"] == "nested_position_alpha_Alpha nested one")
+        self.assertEqual(result["result"], "pass")
+
+    def test_fail_closed_when_child_click_returns_malformed_evidence(self):
+        import json
+
+        class FakeInteraction:
+            call_count = 0
+
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                FakeInteraction.call_count += 1
+                if FakeInteraction.call_count == 1:
+                    payload = json.dumps({
+                        "matched_text": "x", "bounding_box": {"minX": 0.1}, "window_bounds": {},
+                        "click_point": {}, "edge": "start",
+                    })
+                    return True, payload, ""
+                return True, "not json", ""
+
+        check = mod.NestedPositionCheck(
+            label="alpha", baseline_content_pattern=r"Gamma lead first",
+            child_content_patterns=(r"Alpha nested one",),
+        )
+        steps = mod.run_nested_position_checks(FakeInteraction(), object(), 123, Path("shot.png"), (check,), 1.0)
+        result = next(s for s in steps if s["name"] == "nested_position_alpha_Alpha nested one")
+        self.assertEqual(result["result"], "blocked")
+
+
 class MarkerDisclosureEvaluationTests(unittest.TestCase):
     def test_marker_disclosure_pass_when_raw_marker_found_after_click(self):
         check = mod.MarkerCheck(content_pattern=r"Beta lead item", raw_marker_pattern=r"-\s*Beta lead item")
@@ -227,6 +410,82 @@ class OcrHelperFailClosedTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(evidence)
         self.assertIn("JSON", error)
+
+
+class SingleLineReplacementTests(unittest.TestCase):
+    def test_replaces_the_unique_occurrence(self):
+        self.assertEqual(
+            mod.single_line_replacement("a\nb\nc\n", "b", "B"), "a\nB\nc\n",
+        )
+
+    def test_rejects_missing_occurrence(self):
+        with self.assertRaises(ValueError):
+            mod.single_line_replacement("a\nb\nc\n", "z", "Z")
+
+    def test_rejects_ambiguous_occurrence(self):
+        with self.assertRaises(ValueError):
+            mod.single_line_replacement("a\na\n", "a", "A")
+
+
+class EditingFixtureTests(unittest.TestCase):
+    def test_editing_fixture_contains_source_marker_and_body_targets(self):
+        self.assertIn("3. Alpha row", mod.EDITING_FIXTURE_ORIGINAL)
+        self.assertIn("41. Beta row", mod.EDITING_FIXTURE_ORIGINAL)
+        self.assertIn("100. Gamma row", mod.EDITING_FIXTURE_ORIGINAL)
+
+    def test_body_direct_edit_only_changes_its_own_line(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_BODY_DIRECT_EDIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("41. Beta row", "41. Beta row Z", 1),
+        )
+
+    def test_marker_direct_edit_only_changes_its_own_marker(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_MARKER_DIRECT_EDIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("41. Beta row", "941. Beta row", 1),
+        )
+
+    def test_ime_commit_appends_expected_japanese_text_to_its_own_line(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_IME_COMMIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("3. Alpha row", "3. Alpha row" + mod.IME_COMMIT_EXPECTED_TEXT, 1),
+        )
+
+    def test_selection_replace_only_changes_its_own_word(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_SELECTION_REPLACE,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("100. Gamma row", "100. Delta row", 1),
+        )
+
+    def test_every_editing_expectation_differs_from_baseline_in_exactly_one_line(self):
+        baseline_lines = mod.EDITING_FIXTURE_ORIGINAL.splitlines()
+        for expected in (
+            mod.EDITING_AFTER_BODY_DIRECT_EDIT,
+            mod.EDITING_AFTER_MARKER_DIRECT_EDIT,
+            mod.EDITING_AFTER_IME_COMMIT,
+            mod.EDITING_AFTER_SELECTION_REPLACE,
+        ):
+            with self.subTest(expected=expected):
+                expected_lines = expected.splitlines()
+                self.assertEqual(len(expected_lines), len(baseline_lines))
+                differing = [
+                    index for index, (before, after) in enumerate(zip(baseline_lines, expected_lines))
+                    if before != after
+                ]
+                self.assertEqual(len(differing), 1)
+
+
+class ReopenExpectationTests(unittest.TestCase):
+    # Issue #126 review discussion_r4051650814: 再起動後の再オープン検証は編集済み
+    # 通常リストの復元を確認する必要があり、元のフィクスチャ内容をそのまま確認しても
+    # 変更済みリストの復元が壊れていることを検出できない。
+    def test_reopen_expected_bytes_is_the_edited_state_not_the_original(self):
+        self.assertEqual(mod.REOPEN_EXPECTED_BYTES, mod.EDITING_AFTER_SELECTION_REPLACE)
+        self.assertNotEqual(mod.REOPEN_EXPECTED_BYTES, mod.EDITING_FIXTURE_ORIGINAL)
+
+    def test_reopen_visible_text_identifies_edited_content_not_original(self):
+        self.assertIn(mod.REOPEN_VISIBLE_TEXT, mod.EDITING_AFTER_SELECTION_REPLACE)
+        self.assertNotIn(mod.REOPEN_VISIBLE_TEXT, mod.EDITING_FIXTURE_ORIGINAL)
 
 
 class ClickEvidenceParsingTests(unittest.TestCase):

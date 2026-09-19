@@ -217,7 +217,7 @@ jobs:
               procedure_path='scripts/hosted_gui_interaction.py'
               validation_kind='comprehensive'
               ;;
-            'hosted-normal-list/1'|'hosted-normal-list/2')
+            'hosted-normal-list/1'|'hosted-normal-list/2'|'hosted-normal-list/3')
               procedure_path='scripts/hosted_normal_list_gui.py'
               validation_kind='normal-list'
               ;;
