@@ -63,26 +63,28 @@ impl Element for InputCapture {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus = self.input.read(cx).focus_handle.clone();
-        window.handle_input(
-            &focus,
-            ElementInputHandler::new(bounds, self.input.clone()),
-            cx,
-        );
-        self.input.update(cx, |view, _| {
-            let painted_at = Instant::now();
-            let measurements = view.editor_mut().mark_frame_painted();
-            let model_latencies = measurements
-                .iter()
-                .map(|measurement| measurement.keystroke_to_model());
-            let frame_latencies = measurements
-                .iter()
-                .filter_map(|measurement| measurement.keystroke_to_frame());
-            let interval = view
-                .metrics
-                .record_paint(painted_at, model_latencies, frame_latencies);
-            let layout = view.metrics.latest_layout();
-            view.record_frame_instrumentation(&measurements, interval, layout);
-        });
+        if !self.input.read(cx).inline_rename_active() {
+            let focus = self.input.read(cx).focus_handle.clone();
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.input.clone()),
+                cx,
+            );
+            self.input.update(cx, |view, _| {
+                let painted_at = Instant::now();
+                let measurements = view.editor_mut().mark_frame_painted();
+                let model_latencies = measurements
+                    .iter()
+                    .map(|measurement| measurement.keystroke_to_model());
+                let frame_latencies = measurements
+                    .iter()
+                    .filter_map(|measurement| measurement.keystroke_to_frame());
+                let interval =
+                    view.metrics
+                        .record_paint(painted_at, model_latencies, frame_latencies);
+                let layout = view.metrics.latest_layout();
+                view.record_frame_instrumentation(&measurements, interval, layout);
+            });
+        }
     }
 }

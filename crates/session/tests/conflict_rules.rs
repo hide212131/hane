@@ -296,6 +296,48 @@ fn a_rename_moves_the_session_without_touching_the_document() {
 }
 
 #[test]
+fn a_folder_rename_moves_only_the_open_sessions_under_it() {
+    let service = service_with(&[
+        ("/notes/dev/a.md", "a\n"),
+        ("/notes/dev/nested/b.md", "b\n"),
+        ("/notes/other.md", "other\n"),
+    ]);
+    let mut sessions = opened(&service, "/notes/dev/a.md");
+    let inside_root = sessions.active_id();
+    let inside_nested = sessions.apply_open(
+        None,
+        service.load(Path::new("/notes/dev/nested/b.md")).unwrap(),
+    );
+    let outside = sessions.apply_open(None, service.load(Path::new("/notes/other.md")).unwrap());
+
+    let mut outcomes = sessions.rename_folder(Path::new("/notes/dev"), Path::new("/notes/work"));
+    outcomes.sort_by_key(|(id, _)| id.0);
+    let mut expected = vec![
+        (inside_root, FileEventOutcome::Renamed),
+        (inside_nested, FileEventOutcome::Renamed),
+    ];
+    expected.sort_by_key(|(id, _)| id.0);
+    assert_eq!(
+        outcomes, expected,
+        "only sessions under the renamed folder are reported"
+    );
+    assert_eq!(
+        sessions.get(inside_root).unwrap().path(),
+        Some(Path::new("/notes/work/a.md"))
+    );
+    assert_eq!(
+        sessions.get(inside_nested).unwrap().path(),
+        Some(Path::new("/notes/work/nested/b.md")),
+        "a nested relative path is preserved under the new parent"
+    );
+    assert_eq!(
+        sessions.get(outside).unwrap().path(),
+        Some(Path::new("/notes/other.md")),
+        "a session outside the renamed folder is left untouched"
+    );
+}
+
+#[test]
 fn a_delete_keeps_the_unsaved_document_and_a_save_recreates_the_file() {
     let service = service_with(&[("/notes/a.md", "a\n")]);
     let mut sessions = opened(&service, "/notes/a.md");

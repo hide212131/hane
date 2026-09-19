@@ -2479,6 +2479,7 @@ dependencies = [
  "hane-metrics",
  "hane-presentation",
  "hane-session",
+ "unicode-segmentation",
 ]
 
 [[package]]
