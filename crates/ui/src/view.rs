@@ -847,7 +847,10 @@ impl EditorView {
         let marked_end = range.start + replacement.len();
         rename.marked_range = (!replacement.is_empty()).then_some(range.start..marked_end);
         rename.selected_range = new_selected_range_utf16
-            .map(|selected| byte_range_from_utf16(&rename.text, &selected))
+            .map(|selected| {
+                let relative = byte_range_from_utf16(&replacement, &selected);
+                (range.start + relative.start)..(range.start + relative.end)
+            })
             .unwrap_or(marked_end..marked_end);
         rename.selection_reversed = false;
         cx.notify();
@@ -1294,12 +1297,17 @@ impl EditorView {
             .map(|path| rebase(&path).unwrap_or(path));
     }
 
+    /// Cancels an editable rename and reports whether the caller may proceed
+    /// with the navigation/action that requested the cancellation. A pending
+    /// filesystem rename cannot be cancelled safely, so callers must stop.
     pub(crate) fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(rename) = self.inline_rename.as_ref() else {
-            return false;
+            return true;
         };
         if rename.pending {
-            return true;
+            self.status = Some("Rename in progress".to_owned());
+            cx.notify();
+            return false;
         }
         self.inline_rename = None;
         cx.notify();
@@ -2033,7 +2041,9 @@ impl EditorView {
     /// and is journalled into the recovery drafts as soon as it holds
     /// anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = false;
         let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
@@ -2060,7 +2070,9 @@ impl EditorView {
     /// target directory for the next new note or folder, both on the same
     /// click: there is no separate disclosure control in this tree.
     fn toggle_and_select_work_folder_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = true;
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
@@ -2077,7 +2089,9 @@ impl EditorView {
     /// children are always shown, so unlike a subfolder's row this only ever
     /// selects, never toggles.
     fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = true;
         self.selected_folder = None;
         self.sidebar_focus = SidebarFocus::Folder;
@@ -2092,7 +2106,9 @@ impl EditorView {
     /// created, the folder is added to the tree and shown expanded, so it is
     /// immediately visible without waiting for a rescan.
     pub fn new_work_folder_folder(&mut self, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = false;
         let Some(work_folder) = self.work_folder.as_ref() else {
             return;
@@ -2512,7 +2528,9 @@ impl EditorView {
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = false;
         self.open_with_policy(path, OpenPolicy::ReuseActive, cx);
     }
@@ -2521,7 +2539,9 @@ impl EditorView {
     /// an unloaded one is loaded into a session of its own, so switching notes
     /// never asks the user to save whatever else happens to be open.
     pub fn open_work_folder_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.cancel_inline_rename(cx);
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = true;
         self.open_with_policy(path, OpenPolicy::NewSession, cx);
     }
@@ -2916,8 +2936,10 @@ impl EditorView {
     }
 
     fn on_editor_mouse_down(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
         self.sidebar_keyboard_focus = false;
-        self.cancel_inline_rename(cx);
     }
 
     fn on_row_mouse_down(
@@ -4860,7 +4882,9 @@ impl EditorView {
                             .child(draft_preview(session)),
                     )
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        view.cancel_inline_rename(cx);
+                        if !view.cancel_inline_rename(cx) {
+                            return;
+                        }
                         view.sidebar_keyboard_focus = true;
                         view.activate_session(id, cx);
                     }))
@@ -5237,6 +5261,35 @@ mod tests {
             inline_rename_parts(Path::new("folder"), InlineRenameKind::Folder),
             ("folder".to_owned(), None)
         );
+    }
+
+    #[gpui::test]
+    fn inline_rename_ime_selection_is_relative_to_the_marked_replacement(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-ime-relative-selection");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("AlphaBeta.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        view.update(cx, |view, cx| {
+            assert!(view.replace_and_mark_inline_rename_text(
+                Some(5..5),
+                "日本",
+                Some(1..1),
+                cx,
+            ));
+            assert_eq!(
+                view.inline_rename_selection().map(|(range, _)| range),
+                Some(6..6),
+                "IME selection is relative to the inserted marked text"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8235,6 +8288,69 @@ mod tests {
                 !view.inline_rename_active(),
                 "the work-folder root is not a rename target"
             );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn pending_folder_rename_blocks_opening_an_old_child_path(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("inline-rename-pending-open");
+        let project = root.join("Project");
+        let first = project.join("A.md");
+        let second = project.join("B.md");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&second, "b").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::Folder,
+                from: project.clone(),
+                text: "RenamedProject".to_owned(),
+                fixed_extension: None,
+                selected_range: 0..0,
+                selection_reversed: false,
+                marked_range: None,
+                pending: true,
+            });
+            view.latest_open_target = None;
+            view.open_work_folder_entry(&second, cx);
+            assert_eq!(view.latest_open_target, None);
+            assert!(!view.loading_paths.contains(&second));
+            assert!(view.inline_rename.as_ref().is_some_and(|rename| rename.pending));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn undo_is_blocked_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("inline-rename-block-undo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Plain.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" changed").unwrap();
+            view.after_input(cx);
+        });
+        let before = view.read_with(cx, |view, _| view.editor().document().full_text());
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-z");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-z");
+
+        view.read_with(cx, |view, _| {
+            assert!(view.inline_rename_active());
+            assert_eq!(view.editor().document().full_text(), before);
         });
 
         std::fs::remove_dir_all(root).unwrap();

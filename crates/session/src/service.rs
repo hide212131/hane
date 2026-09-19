@@ -2,9 +2,7 @@ use crate::identity::{FileIdentity, FileStamp};
 use hane_document::RopeBuffer;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -138,6 +136,16 @@ impl FileService for OsFileService {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // A case-only rename on the usual Windows/macOS case-insensitive
+        // filesystems makes `to` resolve to the same entry as `from`. The
+        // normal no-replace path deliberately rejects an existing `to`, so
+        // move through a collision-proof sibling name only for that exact
+        // same-entry case. A distinct existing destination still takes the
+        // ordinary no-replace path below and is never overwritten.
+        if from != to && paths_refer_to_same_entry(from, to) {
+            return rename_file_case_alias(from, to);
+        }
+
         // `fs::rename` overwrites an existing destination on most platforms,
         // and this boundary must not: checking `to` first and then renaming
         // is two steps with a race between them, so another process creating
@@ -164,7 +172,96 @@ impl FileService for OsFileService {
 /// existing empty directory, which would violate the same collision rule as
 /// file rename. If a platform cannot provide an atomic no-replace directory
 /// rename, fail closed rather than risking data loss.
+fn paths_refer_to_same_entry(from: &Path, to: &Path) -> bool {
+    match (fs::canonicalize(from), fs::canonicalize(to)) {
+        (Ok(from), Ok(to)) => from == to,
+        _ => false,
+    }
+}
+
+fn temporary_rename_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("item");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{name}.hane-rename-{}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+fn rename_file_case_alias(from: &Path, to: &Path) -> io::Result<()> {
+    let temporary = loop {
+        let candidate = temporary_rename_path(from);
+        match fs::hard_link(from, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) = fs::remove_file(from) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    match fs::rename(&temporary, to) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(rollback) = fs::rename(&temporary, from) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "case-only file rename failed: {error}; rollback failed: {rollback}; data remains at {}",
+                        temporary.display()
+                    ),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
 fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if from != to && paths_refer_to_same_entry(from, to) {
+        return rename_directory_case_alias(from, to);
+    }
+    rename_directory_without_replace_raw(from, to)
+}
+
+fn rename_directory_case_alias(from: &Path, to: &Path) -> io::Result<()> {
+    let temporary = loop {
+        let candidate = temporary_rename_path(from);
+        match rename_directory_without_replace_raw(from, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+
+    match rename_directory_without_replace_raw(&temporary, to) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(rollback) = rename_directory_without_replace_raw(&temporary, from) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "case-only folder rename failed: {error}; rollback failed: {rollback}; data remains at {}",
+                        temporary.display()
+                    ),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn rename_directory_without_replace_raw(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -223,7 +320,7 @@ fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
                 "rename target already exists",
             ));
         }
-        return fs::rename(from, to);
+        fs::rename(from, to)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -371,6 +468,32 @@ mod tests {
     }
 
     #[test]
+    fn a_case_only_file_rename_works_on_case_insensitive_filesystems() {
+        let root = temporary_directory("rename-case-only-file");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("Plain.md");
+        let to = root.join("plain.md");
+        fs::write(&from, "plain\n").unwrap();
+
+        // A case-sensitive filesystem has two distinct names here, so this
+        // platform does not exercise the case-alias path.
+        if !to.exists() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        OsFileService.rename(&from, &to).unwrap();
+        assert_eq!(fs::read_to_string(&to).unwrap(), "plain\n");
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().any(|name| name == "plain.md"));
+        assert!(!names.iter().any(|name| name == "Plain.md"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_rename_refuses_to_overwrite_an_existing_destination() {
         let root = temporary_directory("rename-collision");
         fs::create_dir_all(&root).unwrap();
@@ -413,6 +536,33 @@ mod tests {
             "keep\n"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_case_only_folder_rename_works_on_case_insensitive_filesystems() {
+        let root = temporary_directory("rename-case-only-folder");
+        let from = root.join("Project");
+        let to = root.join("project");
+        fs::create_dir_all(from.join("Deep")).unwrap();
+        fs::write(from.join("Deep/Child.md"), "child\n").unwrap();
+
+        if !to.exists() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        OsFileService.rename_folder(&from, &to).unwrap();
+        assert_eq!(
+            fs::read_to_string(to.join("Deep/Child.md")).unwrap(),
+            "child\n"
+        );
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().any(|name| name == "project"));
+        assert!(!names.iter().any(|name| name == "Project"));
         fs::remove_dir_all(root).unwrap();
     }
 
