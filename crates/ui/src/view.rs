@@ -4176,15 +4176,25 @@ const DATE_BADGE_THIS_WEEK_BACKGROUND: u32 = 0x4d83a9;
 const DATE_BADGE_THIS_MONTH_BACKGROUND: u32 = 0x3f7194;
 const DATE_BADGE_THIS_YEAR_BACKGROUND: u32 = 0x326584;
 const DATE_BADGE_OTHER_BACKGROUND: u32 = 0x285b7c;
-const DATE_BADGE_FOREGROUND: u32 = 0xf7fbff;
+const DATE_BADGE_DARK_FOREGROUND: u32 = 0x101010;
+const DATE_BADGE_LIGHT_FOREGROUND: u32 = 0xf7fbff;
 
-fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
+fn date_badge_colors(date: CalendarDate, today: CalendarDate) -> (u32, u32) {
     match date_badge_range(date, today) {
-        DateBadgeRange::Today => DATE_BADGE_TODAY_BACKGROUND,
-        DateBadgeRange::ThisWeek => DATE_BADGE_THIS_WEEK_BACKGROUND,
-        DateBadgeRange::ThisMonth => DATE_BADGE_THIS_MONTH_BACKGROUND,
-        DateBadgeRange::ThisYear => DATE_BADGE_THIS_YEAR_BACKGROUND,
-        DateBadgeRange::Other => DATE_BADGE_OTHER_BACKGROUND,
+        DateBadgeRange::Today => (DATE_BADGE_TODAY_BACKGROUND, DATE_BADGE_DARK_FOREGROUND),
+        DateBadgeRange::ThisWeek => (
+            DATE_BADGE_THIS_WEEK_BACKGROUND,
+            DATE_BADGE_DARK_FOREGROUND,
+        ),
+        DateBadgeRange::ThisMonth => (
+            DATE_BADGE_THIS_MONTH_BACKGROUND,
+            DATE_BADGE_LIGHT_FOREGROUND,
+        ),
+        DateBadgeRange::ThisYear => (
+            DATE_BADGE_THIS_YEAR_BACKGROUND,
+            DATE_BADGE_LIGHT_FOREGROUND,
+        ),
+        DateBadgeRange::Other => (DATE_BADGE_OTHER_BACKGROUND, DATE_BADGE_LIGHT_FOREGROUND),
     }
 }
 
@@ -4192,12 +4202,13 @@ fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
 /// Hane's feather blues: today is the brightest tier, then the same week,
 /// month, year, and finally all other dates become progressively darker.
 fn date_badge_chip(date: CalendarDate, today: CalendarDate, _theme: &Theme) -> gpui::Div {
+    let (background, foreground) = date_badge_colors(date, today);
     div()
         .flex_none()
         .px(px(4.0))
         .rounded_sm()
-        .bg(rgb(date_badge_background(date, today)))
-        .text_color(rgb(DATE_BADGE_FOREGROUND))
+        .bg(rgb(background))
+        .text_color(rgb(foreground))
         .text_size(px(10.0))
         .child(format_relative_date_label(date, today))
 }
