@@ -38,6 +38,7 @@ impl EntityInputHandler for EditorView {
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.clear_pending_list_editing();
         self.editor_mut().commit_composition();
     }
 
@@ -48,13 +49,15 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let result = if range_utf16.is_none() && self.editor().ime().is_none() {
-            self.editor_mut().insert_text(new_text).map(|_| ())
-        } else {
-            self.editor_mut()
-                .commit_text(range_utf16, new_text)
-                .map(|_| ())
-        };
+        if range_utf16.is_none() && self.editor().ime().is_none() {
+            self.insert_text(new_text, cx);
+            return;
+        }
+        self.clear_pending_list_editing();
+        let result = self
+            .editor_mut()
+            .commit_text(range_utf16, new_text)
+            .map(|_| ());
         if let Err(error) = result {
             self.report_error("text input", error);
         }
@@ -69,10 +72,27 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) =
-            self.editor_mut()
-                .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
-        {
+        let indentation = self.pending_list_indentation();
+        self.clear_pending_list_editing();
+        let prefix_utf16 = indentation.encode_utf16().count();
+        let adjusted_range = if indentation.is_empty() {
+            range_utf16
+        } else {
+            let result = self.editor_mut().insert_text(&indentation);
+            if let Err(error) = result {
+                self.report_error("IME prefix input", error);
+                self.after_input(cx);
+                return;
+            }
+            range_utf16.map(|range| {
+                range.start.saturating_add(prefix_utf16)..range.end.saturating_add(prefix_utf16)
+            })
+        };
+        if let Err(error) = self.editor_mut().replace_and_mark_text(
+            adjusted_range,
+            new_text,
+            new_selected_range_utf16,
+        ) {
             self.report_error("IME update", error);
         }
         self.after_input(cx);
