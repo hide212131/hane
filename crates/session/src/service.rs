@@ -145,14 +145,10 @@ impl FileService for OsFileService {
         if is_case_only_name(from, to) && same_filesystem_object(from, to)? {
             return rename_case_only_file(from, to);
         }
-        // `fs::rename` overwrites an existing destination on most platforms,
-        // and this boundary must not: checking `to` first and then renaming
-        // is two steps with a race between them, so another process creating
-        // `to` in between would still get silently clobbered. `hard_link`
-        // does not have that gap: the underlying `link` syscall itself fails
-        // atomically when `to` already exists, with nothing written. Once the
-        // link exists, `from` is unlinked; if that second step fails, `from`
-        // and `to` are both left in place rather than either being lost.
+        // `fs::rename` may replace an existing destination, and this boundary
+        // must not. Use the platform's atomic no-replace primitive so the
+        // operation does not depend on hard links, which are unavailable on
+        // some filesystems where an ordinary rename is supported.
         rename_file_without_replace(from, to)
     }
 
@@ -173,8 +169,19 @@ impl FileService for OsFileService {
 }
 
 fn rename_file_without_replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::hard_link(from, to)?;
-    fs::remove_file(from)
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        rename_path_without_replace(from, to)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // Keep a conservative fallback for platforms without a native
+        // no-replace rename primitive. It preserves the old collision-safe
+        // behavior, though it requires hard-link support there.
+        fs::hard_link(from, to)?;
+        fs::remove_file(from)
+    }
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -292,6 +299,25 @@ fn same_filesystem_object(from: &Path, to: &Path) -> io::Result<bool> {
 /// file rename. If a platform cannot provide an atomic no-replace directory
 /// rename, fail closed rather than risking data loss.
 fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        rename_path_without_replace(from, to)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory rename without replacement is unsupported on this platform",
+        ))
+    }
+}
+
+/// Renames either a file or a directory without replacing an existing target.
+/// The platform primitive is shared by both boundaries so regular file rename
+/// does not impose the hard-link requirement used by the portable fallback.
+fn rename_path_without_replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -338,7 +364,7 @@ fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
             .ok_or_else(io::Error::last_os_error)
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         // Windows' MoveFileEx implementation, which backs std::fs::rename,
         // refuses an existing destination unless the replace flag is passed.
@@ -353,12 +379,12 @@ fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (from, to);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "directory rename without replacement is unsupported on this platform",
+            "rename without replacement is unsupported on this platform",
         ))
     }
 }
