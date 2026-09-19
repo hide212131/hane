@@ -283,14 +283,14 @@ fn find_folder_mut<'a>(
     path: &Path,
 ) -> Option<&'a mut WorkFolderFolder> {
     for node in nodes {
-        match node {
-            WorkFolderNode::Folder(folder) if folder.path() == path => return Some(folder),
-            WorkFolderNode::Folder(folder) => {
-                if let Some(found) = find_folder_mut(&mut folder.children, path) {
-                    return Some(found);
-                }
-            }
-            WorkFolderNode::File(_) => {}
+        let WorkFolderNode::Folder(folder) = node else {
+            continue;
+        };
+        if folder.path() == path {
+            return Some(folder);
+        }
+        if let Some(found) = find_folder_mut(&mut folder.children, path) {
+            return Some(found);
         }
     }
     None
