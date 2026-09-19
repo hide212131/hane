@@ -490,6 +490,30 @@ impl DocumentSession {
         }
     }
 
+    /// Follows a folder rename this app itself just performed: if this
+    /// session's file lives at `from` or somewhere under it, its path moves
+    /// to the same position under `to`, the same way a single-file
+    /// `FileEvent::Renamed` would, but for every path a folder rename carries
+    /// with it instead of just the one path an exact match would require.
+    /// A session outside `from` is untouched.
+    pub fn apply_folder_rename(&mut self, from: &Path, to: &Path) -> FileEventOutcome {
+        let Some(identity) = self.file.identity() else {
+            return FileEventOutcome::Ignored;
+        };
+        let Ok(relative) = identity.path().strip_prefix(from) else {
+            return FileEventOutcome::Ignored;
+        };
+        let new_path = if relative.as_os_str().is_empty() {
+            to.to_path_buf()
+        } else {
+            to.join(relative)
+        };
+        let moved = identity.moved_to(new_path);
+        let stamp = self.file.stamp();
+        self.file.set_identity(moved, stamp);
+        FileEventOutcome::Renamed
+    }
+
     pub fn presence(&self) -> FilePresence {
         self.file.presence()
     }
@@ -681,6 +705,20 @@ impl SessionSet {
             .iter_mut()
             .filter_map(|session| {
                 let outcome = session.apply_file_event(event);
+                (outcome != FileEventOutcome::Ignored).then_some((session.id(), outcome))
+            })
+            .collect()
+    }
+
+    /// Routes a folder rename to every session whose file lives under `from`,
+    /// leaving every other open session untouched. Complements
+    /// `apply_file_event`'s single-file `FileEvent::Renamed`, which this does
+    /// not change the meaning of.
+    pub fn rename_folder(&mut self, from: &Path, to: &Path) -> Vec<(SessionId, FileEventOutcome)> {
+        self.sessions
+            .iter_mut()
+            .filter_map(|session| {
+                let outcome = session.apply_folder_rename(from, to);
                 (outcome != FileEventOutcome::Ignored).then_some((session.id(), outcome))
             })
             .collect()

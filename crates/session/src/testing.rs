@@ -127,6 +127,51 @@ impl FileService for MemoryFileService {
         Ok(())
     }
 
+    fn rename_folder(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let from = canonical(from);
+        let to = canonical(to);
+        let mut files = self.files.lock().expect("files lock");
+        let mut directories = self.directories.lock().expect("directories lock");
+        if files.contains_key(&to)
+            || directories.contains(&to)
+            || files.keys().any(|path| path.starts_with(&to))
+            || directories.iter().any(|path| path.starts_with(&to))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename target already exists",
+            ));
+        }
+        let has_source =
+            directories.contains(&from) || files.keys().any(|path| path.starts_with(&from));
+        if !has_source {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
+        }
+
+        let moved_files: Vec<_> = files
+            .keys()
+            .filter_map(|path| {
+                rebase_memory_path(path, &from, &to).map(|moved| (path.clone(), moved))
+            })
+            .collect();
+        for (old, new) in moved_files {
+            if let Some(value) = files.remove(&old) {
+                files.insert(new, value);
+            }
+        }
+        let moved_directories: Vec<_> = directories
+            .iter()
+            .filter_map(|path| {
+                rebase_memory_path(path, &from, &to).map(|moved| (path.clone(), moved))
+            })
+            .collect();
+        for (old, new) in moved_directories {
+            directories.remove(&old);
+            directories.insert(new);
+        }
+        Ok(())
+    }
+
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         self.directories
             .lock()
@@ -138,6 +183,15 @@ impl FileService for MemoryFileService {
 
 fn canonical(path: &Path) -> PathBuf {
     FileIdentity::lexical(path).canonical_path().to_path_buf()
+}
+
+fn rebase_memory_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(from).ok()?;
+    Some(if relative.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(relative)
+    })
 }
 
 /// One seeded work folder's Markdown files and empty folders.
