@@ -66,10 +66,18 @@ fn register_secondary_platform_key_bindings(cx: &mut App) {
 fn register_secondary_platform_key_bindings(_cx: &mut App) {}
 
 command_actions! {
-    Open ("secondary-o") => open_action |view, _window, cx| { view.prompt_open(cx); },
-    OpenFolder ("secondary-shift-o") => open_folder_action |view, _window, cx| { view.prompt_open_work_folder(cx); },
-    Save ("secondary-s") => save |view, _window, cx| { view.save_or_prompt(cx); },
-    SaveAs ("secondary-shift-s") => save_as |view, _window, cx| { view.prompt_save_as(cx); },
+    Open ("secondary-o") => open_action |view, _window, cx| {
+        if !view.inline_rename_active() { view.prompt_open(cx); }
+    },
+    OpenFolder ("secondary-shift-o") => open_folder_action |view, _window, cx| {
+        if !view.inline_rename_active() { view.prompt_open_work_folder(cx); }
+    },
+    Save ("secondary-s") => save |view, _window, cx| {
+        if !view.inline_rename_active() { view.save_or_prompt(cx); }
+    },
+    SaveAs ("secondary-shift-s") => save_as |view, _window, cx| {
+        if !view.inline_rename_active() { view.prompt_save_as(cx); }
+    },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, _window, cx| {
@@ -110,8 +118,12 @@ command_actions! {
     SelectRight ("shift-right") => select_right |view, _window, cx| {
         if view.inline_rename_active() { view.select_inline_rename_right(cx); } else { view.dispatch(EditorCommand::MoveRight { extend: true }, cx); }
     },
-    SelectUp ("shift-up") => select_up |view, window, cx| { view.move_vertical(false, true, window, cx); },
-    SelectDown ("shift-down") => select_down |view, window, cx| { view.move_vertical(true, true, window, cx); },
+    SelectUp ("shift-up") => select_up |view, window, cx| {
+        if !view.inline_rename_active() { view.move_vertical(false, true, window, cx); }
+    },
+    SelectDown ("shift-down") => select_down |view, window, cx| {
+        if !view.inline_rename_active() { view.move_vertical(true, true, window, cx); }
+    },
     SelectAll ("secondary-a") => select_all |view, _window, cx| {
         if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::SelectAll, cx); }
     },
@@ -127,12 +139,32 @@ command_actions! {
     SelectEnd ("shift-end") => select_end |view, _window, cx| {
         if view.inline_rename_active() { view.select_all_inline_rename(cx); } else { view.dispatch(EditorCommand::MoveToLineEnd { extend: true }, cx); }
     },
-    DocumentStart ("secondary-up") => document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: false }, cx); },
-    DocumentEnd ("secondary-down") => document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx); },
-    SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| { view.dispatch(EditorCommand::MoveToStart { extend: true }, cx); },
-    SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| { view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx); },
-    Undo ("secondary-z") => undo |view, _window, cx| { view.dispatch(EditorCommand::Undo, cx); },
-    Redo ("secondary-shift-z") => redo |view, _window, cx| { view.dispatch(EditorCommand::Redo, cx); },
+    DocumentStart ("secondary-up") => document_start |view, _window, cx| {
+        if !view.inline_rename_active() {
+            view.dispatch(EditorCommand::MoveToStart { extend: false }, cx);
+        }
+    },
+    DocumentEnd ("secondary-down") => document_end |view, _window, cx| {
+        if !view.inline_rename_active() {
+            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        }
+    },
+    SelectDocumentStart ("secondary-shift-up") => select_document_start |view, _window, cx| {
+        if !view.inline_rename_active() {
+            view.dispatch(EditorCommand::MoveToStart { extend: true }, cx);
+        }
+    },
+    SelectDocumentEnd ("secondary-shift-down") => select_document_end |view, _window, cx| {
+        if !view.inline_rename_active() {
+            view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
+        }
+    },
+    Undo ("secondary-z") => undo |view, _window, cx| {
+        if !view.inline_rename_active() { view.dispatch(EditorCommand::Undo, cx); }
+    },
+    Redo ("secondary-shift-z") => redo |view, _window, cx| {
+        if !view.inline_rename_active() { view.dispatch(EditorCommand::Redo, cx); }
+    },
     Copy ("secondary-c") => copy |view, _window, cx| {
         let text = if view.inline_rename_active() {
             view.selected_inline_rename_text()
