@@ -254,6 +254,11 @@ fn temporary_rename_path(path: &Path) -> PathBuf {
 
 #[cfg(any(target_os = "macos", windows))]
 fn same_filesystem_object(from: &Path, to: &Path) -> io::Result<bool> {
+    if fs::symlink_metadata(from).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        || fs::symlink_metadata(to).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Ok(false);
+    }
     let source = fs::metadata(from)?;
     let target = match fs::metadata(to) {
         Ok(metadata) => metadata,
@@ -518,8 +523,16 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert!(names.iter().any(|name| name == "plain.md"));
-        assert!(!names.iter().any(|name| name == "Plain.md"));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.to_string_lossy() == "plain.md")
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_string_lossy() == "Plain.md")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
