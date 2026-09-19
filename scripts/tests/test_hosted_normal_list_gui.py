@@ -14,7 +14,7 @@ spec.loader.exec_module(mod)
 
 class ProcedureIdentityTests(unittest.TestCase):
     def test_procedure_identity_is_focused_and_distinct(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/3")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/4")
         self.assertEqual(mod.VERIFICATION_KIND, "normal_list_focused")
         self.assertIn("#126", mod.SCOPE_NOTE)
         self.assertIn("hosted-gui-interaction/7", mod.SCOPE_NOTE)
@@ -427,6 +427,321 @@ class SingleLineReplacementTests(unittest.TestCase):
             mod.single_line_replacement("a\na\n", "a", "A")
 
 
+class MatchInsertionOffsetTests(unittest.TestCase):
+    def test_returns_start_offset_for_start_edge(self):
+        self.assertEqual(mod.match_insertion_offset("41. Beta row", r"Beta row", edge="start"), 4)
+
+    def test_returns_end_offset_for_end_edge(self):
+        self.assertEqual(mod.match_insertion_offset("41. Beta row", r"Beta row", edge="end"), 12)
+
+    def test_raises_when_pattern_not_found(self):
+        with self.assertRaises(ValueError):
+            mod.match_insertion_offset("41. Beta row", r"Nowhere", edge="start")
+
+
+class InsertAtMatchTests(unittest.TestCase):
+    def test_inserts_at_the_matched_start(self):
+        self.assertEqual(mod.insert_at_match("41. Beta row", r"41", "9", edge="start"), "941. Beta row")
+
+
+class CaretRightCountFromDocStartTests(unittest.TestCase):
+    # PR #208 review PRRT_kwDOUETGuM6j8L1G: click-text の bounding box start/end は canonical
+    # source caret 位置の証拠ではなく、本文クリック後の固定文字数移動は1文字の OCR 着地誤差
+    # でも正常製品を fail にしうる。source marker/selection replace/IME commit の caret 位置は
+    # すべて、document start(offset 0)からの純粋計算だけによる右移動回数で決定的に求め、
+    # click-text/OCR には一切依存しない。
+    def test_counts_characters_from_document_start_to_pattern(self):
+        text = "41. Beta row"
+        count = mod.caret_right_count_from_doc_start(text, r"Beta row", edge="start")
+        self.assertEqual(count, 4)
+
+    def test_raises_when_pattern_not_found(self):
+        with self.assertRaises(ValueError):
+            mod.caret_right_count_from_doc_start("41. Beta row", r"Nowhere", edge="start")
+
+    def test_marker_direct_edit_offset_matches_raw_marker_start_in_editing_fixture(self):
+        expected = mod.EDITING_FIXTURE_ORIGINAL.index("41. Beta row")
+        self.assertEqual(mod.MARKER_DIRECT_EDIT_CARET_RIGHT_COUNT, expected)
+
+    def test_ime_commit_offset_matches_alpha_row_end_in_editing_fixture(self):
+        expected = mod.EDITING_FIXTURE_ORIGINAL.index("Alpha row") + len("Alpha row")
+        self.assertEqual(mod.IME_COMMIT_CARET_RIGHT_COUNT, expected)
+
+    def test_selection_replace_offset_matches_gamma_start_in_editing_fixture(self):
+        expected = mod.EDITING_FIXTURE_ORIGINAL.index("Gamma")
+        self.assertEqual(mod.SELECTION_REPLACE_CARET_RIGHT_COUNT, expected)
+
+
+class SelectionReplaceWordLengthTests(unittest.TestCase):
+    # Issue #126 post-merge GUI run 35410838091: OCR bounding box の start→end drag は
+    # "Gamma" の末尾を取りこぼし "Deltaa" になった。選択範囲はキーボード(Shift+矢印)による
+    # 既知の文字数で決定的に確定するため、その文字数自体が正しいことを固定する。
+    def test_selection_replace_word_length_matches_the_literal_word(self):
+        self.assertEqual(mod.SELECTION_REPLACE_WORD, "Gamma")
+        self.assertEqual(mod.SELECTION_REPLACE_WORD_LENGTH, 5)
+
+    def test_selection_replace_word_pattern_matches_the_literal_word(self):
+        self.assertRegex(mod.SELECTION_REPLACE_WORD, mod.SELECTION_REPLACE_WORD_PATTERN)
+
+
+class SelectionReplaceSubtestTests(unittest.TestCase):
+    """PR #208 review PRRT_kwDOUETGuM6j8L1G: _selection_replace_subtest must position the
+    selection start with keyboard-only move-doc-start/move-caret from document start, never
+    click-text/OCR (a click-text call is a fixture regression, not a legitimate path)."""
+
+    FIXTURE_PATH = Path("editing-fixture.md")
+
+    def _make_interaction(self, *, move_doc_start_ok=True, move_caret_ok=True, capture_ok=True):
+        calls = {"move_doc_start": 0, "move_caret": [], "shift_select": [], "capture": []}
+
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                command = args[0]
+                if command == "click-text":
+                    raise AssertionError("click-text must not be used for selection-replace caret positioning")
+                if command == "move-doc-start":
+                    calls["move_doc_start"] += 1
+                    return (True, "", "") if move_doc_start_ok else (False, "", "move-doc-start failed")
+                if command == "move-caret":
+                    calls["move_caret"].append(args)
+                    return (True, "", "") if move_caret_ok else (False, "", "move-caret failed")
+                if command == "shift-select":
+                    calls["shift_select"].append(args)
+                    return True, "", ""
+                if command in ("type-save", "undo-save", "redo-save"):
+                    return True, "", ""
+                raise AssertionError(f"unexpected helper call: {args}")
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return True, expected
+
+            @staticmethod
+            def capture_named(gui_validate_module, env, config, window_id, run_dir, label):
+                calls["capture"].append(label)
+                result = "pass" if capture_ok else "blocked"
+                return {"name": f"capture_{label}", "result": result,
+                        "reason": None if capture_ok else "capture failed"}
+
+        return FakeInteraction(), calls
+
+    def _run(self, interaction):
+        return mod._selection_replace_subtest(
+            object(), interaction, object(), object(), "window-1", object(), 4321,
+            self.FIXTURE_PATH, Path("run"), 1.0, 1.0,
+        )
+
+    def test_positions_caret_via_keyboard_only_not_click_text(self):
+        interaction, calls = self._make_interaction()
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "selection_replace_ascii_undo_redo")
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(calls["move_doc_start"], 1)
+        self.assertEqual(len(calls["move_caret"]), 1)
+        self.assertEqual(
+            calls["move_caret"][0],
+            ["move-caret", "4321", "right", str(mod.SELECTION_REPLACE_CARET_RIGHT_COUNT)],
+        )
+        self.assertEqual(
+            calls["shift_select"],
+            [["shift-select", "4321", "right", str(mod.SELECTION_REPLACE_WORD_LENGTH)]],
+        )
+
+    def test_blocked_when_move_doc_start_fails(self):
+        interaction, calls = self._make_interaction(move_doc_start_ok=False)
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "selection_replace_ascii_undo_redo")
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(len(calls["move_caret"]), 0)
+
+    def test_blocked_when_move_caret_fails(self):
+        interaction, calls = self._make_interaction(move_caret_ok=False)
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "selection_replace_ascii_undo_redo")
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(calls["capture"], [])
+
+
+class MarkerDirectEditSubtestTests(unittest.TestCase):
+    """PR #208 review PRRT_kwDOUETGuM6j8L1G: _marker_direct_edit_subtest must position the
+    raw-marker edit with keyboard-only move-doc-start/move-caret from document start, never
+    click-text/OCR (a click-text call is a fixture regression, not a legitimate path)."""
+
+    FIXTURE_PATH = Path("editing-fixture.md")
+
+    def _make_interaction(self, *, move_doc_start_ok=True, move_caret_ok=True, capture_ok=True):
+        calls = {"move_doc_start": 0, "move_caret": [], "capture": []}
+
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                command = args[0]
+                if command == "click-text":
+                    raise AssertionError("click-text must not be used for marker caret positioning")
+                if command == "move-doc-start":
+                    calls["move_doc_start"] += 1
+                    return (True, "", "") if move_doc_start_ok else (False, "", "move-doc-start failed")
+                if command == "move-caret":
+                    calls["move_caret"].append(args)
+                    return (True, "", "") if move_caret_ok else (False, "", "move-caret failed")
+                if command in ("type-save", "undo-save"):
+                    return True, "", ""
+                raise AssertionError(f"unexpected helper call: {args}")
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return True, expected
+
+            @staticmethod
+            def capture_named(gui_validate_module, env, config, window_id, run_dir, label):
+                calls["capture"].append(label)
+                result = "pass" if capture_ok else "blocked"
+                return {"name": f"capture_{label}", "result": result,
+                        "reason": None if capture_ok else "capture failed"}
+
+        return FakeInteraction(), calls
+
+    def _run(self, interaction):
+        return mod._marker_direct_edit_subtest(
+            object(), interaction, object(), object(), "window-1", object(), 4321,
+            self.FIXTURE_PATH, Path("run"), 1.0, 1.0,
+        )
+
+    def test_positions_caret_via_keyboard_only_not_click_text(self):
+        interaction, calls = self._make_interaction()
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "direct_marker_edit_ascii_undo")
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(calls["move_doc_start"], 1)
+        self.assertEqual(len(calls["move_caret"]), 1)
+        self.assertEqual(
+            calls["move_caret"][0],
+            ["move-caret", "4321", "right", str(mod.MARKER_DIRECT_EDIT_CARET_RIGHT_COUNT)],
+        )
+        self.assertEqual(calls["capture"], ["marker_disclosed"])
+
+    def test_blocked_when_move_doc_start_fails(self):
+        interaction, calls = self._make_interaction(move_doc_start_ok=False)
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "direct_marker_edit_ascii_undo")
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(len(calls["move_caret"]), 0)
+
+    def test_blocked_when_move_caret_fails(self):
+        interaction, calls = self._make_interaction(move_caret_ok=False)
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "direct_marker_edit_ascii_undo")
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(calls["capture"], [])
+
+    def test_blocked_when_disclosure_capture_fails(self):
+        interaction, calls = self._make_interaction(capture_ok=False)
+        steps = self._run(interaction)
+        result = next(s for s in steps if s["name"] == "direct_marker_edit_ascii_undo")
+        self.assertEqual(result["result"], "blocked")
+
+
+class CaretMoveEditCheckTests(unittest.TestCase):
+    """_caret_move_edit_check は click-text/OCR を一切使わない(Issue #126 post-merge GUI
+    run 35410838091 の marker 直接編集の2回目の Vision OCR 誤認識に対する回帰固定)。"""
+
+    BASELINE = "41. Beta row"
+    SOURCE_PATTERN = r"41\.\s*Beta row"
+    INSERTED = "941. Beta row"
+
+    def _make_interaction(self, run_helper_results, wait_results):
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                return run_helper_results[args[0]]
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return wait_results[expected.decode("utf-8")]
+
+        return FakeInteraction()
+
+    def test_pass_when_insertion_and_undo_match(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", ""), "undo-save": (True, "", "")},
+            {self.INSERTED: (True, self.INSERTED.encode("utf-8")),
+             self.BASELINE: (True, self.BASELINE.encode("utf-8"))},
+        )
+        status, reason, detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "pass")
+        self.assertIsNone(reason)
+        self.assertEqual(detail["expected_canonical_source_offset"], 0)
+
+    def test_blocked_when_move_caret_fails_without_typing(self):
+        interaction = self._make_interaction({"move-caret": (False, "", "move failed")}, {})
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("move failed", reason)
+
+    def test_blocked_when_type_save_fails(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (False, "", "type failed")}, {},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("type failed", reason)
+
+    def test_fail_closed_when_insertion_does_not_match_expected_bytes(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", "")},
+            {self.INSERTED: (False, b"unexpected")},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "fail")
+        self.assertIn("一致しない", reason)
+
+    def test_fail_closed_when_undo_does_not_restore_baseline(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", ""), "undo-save": (True, "", "")},
+            {self.INSERTED: (True, self.INSERTED.encode("utf-8")),
+             self.BASELINE: (False, self.INSERTED.encode("utf-8"))},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "fail")
+        self.assertIn("undo", reason)
+
+    def test_skips_move_caret_call_when_count_is_zero(self):
+        calls = []
+
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                calls.append(args[0])
+                return True, "", ""
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return True, expected
+
+        status, _reason, _detail = mod._caret_move_edit_check(
+            FakeInteraction(), object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 0, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "pass")
+        self.assertNotIn("move-caret", calls)
+
+
 class EditingFixtureTests(unittest.TestCase):
     def test_editing_fixture_contains_source_marker_and_body_targets(self):
         self.assertIn("3. Alpha row", mod.EDITING_FIXTURE_ORIGINAL)
@@ -505,6 +820,170 @@ class ClickEvidenceParsingTests(unittest.TestCase):
         import json
         with self.assertRaises(ValueError):
             mod.parse_click_evidence(json.dumps({"matched_text": "x"}))
+
+
+class ImeCommitSubtestTests(unittest.TestCase):
+    """Issue #126 focused GUI (PR #208 review PRRT_kwDOUETGuM6j8CB_, P1):
+    currentSourceID() reporting the Japanese source is not proof that Hane's IME
+    session can actually convert keystrokes yet. _ime_commit_subtest must retry
+    with a small, bounded upper limit, restoring a pristine baseline (file + app
+    state) and repositioning the caret before every attempt, rather than trusting
+    a single conversion attempt or an unconditional retry."""
+
+    FIXTURE_PATH = Path("editing-fixture.md")
+
+    def _make_interaction(self, *, japanese_available=True, commit_effects=None,
+                          restore_ok_until=None, move_caret_ok=True, current_source_ok=True):
+        commit_effects = commit_effects or ["ok_matched"]
+        calls = {"commit": 0, "restore": [], "capture": [], "move_caret": []}
+
+        class FakeInteraction:
+            JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
+
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                command = args[0]
+                if command == "current-source":
+                    if not current_source_ok:
+                        return False, "", "current-source failed"
+                    return True, "com.apple.keylayout.ABC", ""
+                if command == "list-sources":
+                    sources = "com.apple.keylayout.ABC"
+                    if japanese_available:
+                        sources += f"\n{FakeInteraction.JAPANESE_SOURCE}"
+                    return True, sources, ""
+                if command == "click-text":
+                    # PR #208 review PRRT_kwDOUETGuM6j8L1G: IME caret positioning must never
+                    # use click-text/OCR. If production code calls it, the fixture regressed.
+                    raise AssertionError("click-text must not be used for IME caret positioning")
+                if command == "move-caret":
+                    calls["move_caret"].append(args)
+                    if not move_caret_ok:
+                        return False, "", "move-caret failed"
+                    return True, "", ""
+                if command == "type-romaji-at-caret-commit-save":
+                    index = calls["commit"]
+                    calls["commit"] += 1
+                    outcome = commit_effects[min(index, len(commit_effects) - 1)]
+                    if outcome == "helper_fail":
+                        return False, "", "commit helper failed"
+                    return True, "", ""
+                raise AssertionError(f"unexpected helper call: {args}")
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                index = calls["commit"] - 1
+                outcome = commit_effects[min(index, len(commit_effects) - 1)]
+                if outcome == "ok_matched":
+                    return True, expected
+                return False, b"unconverted"
+
+            @staticmethod
+            def restore_scenario_baseline(helper, pid, fixture_path, baseline, helper_timeout, poll_timeout, name):
+                calls["restore"].append(name)
+                attempt = len(calls["restore"])
+                result = "pass" if restore_ok_until is None or attempt <= restore_ok_until else "blocked"
+                return {"name": name, "result": result,
+                       "reason": None if result == "pass" else "baseline undo に失敗した"}
+
+            @staticmethod
+            def capture_named(gui_validate_module, env, config, window_id, run_dir, label):
+                calls["capture"].append(label)
+                return {"name": f"capture_{label}", "result": "pass", "reason": None}
+
+        return FakeInteraction(), calls
+
+    def _run(self, interaction):
+        return mod._ime_commit_subtest(
+            object(), interaction, object(), object(), "window-1", object(), 4321,
+            self.FIXTURE_PATH, Path("run"), 1.0, 0.0,
+        )
+
+    def test_pass_on_first_attempt(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_matched"])
+        steps, original_source = self._run(interaction)
+        self.assertEqual(original_source, "com.apple.keylayout.ABC")
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "pass")
+        self.assertEqual(len(commit_step["attempts"]), 1)
+        self.assertEqual(calls["commit"], 1)
+        self.assertEqual(len(calls["restore"]), 1)
+
+    def test_second_attempt_succeeds_after_pristine_baseline_restore(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "pass")
+        attempts = commit_step["attempts"]
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0]["matched"])
+        self.assertTrue(attempts[1]["matched"])
+        # The failed first attempt's unconverted text must not survive into the
+        # second attempt: a pristine baseline restore must have run in between.
+        self.assertEqual(len(calls["restore"]), 2)
+
+    def test_persistent_mismatch_across_all_attempts_is_a_fail_not_a_silent_pass(self):
+        interaction, calls = self._make_interaction(
+            commit_effects=["ok_mismatch"] * mod.IME_COMMIT_MAX_ATTEMPTS
+        )
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "fail")
+        self.assertEqual(len(commit_step["attempts"]), mod.IME_COMMIT_MAX_ATTEMPTS)
+        self.assertTrue(all(not a["matched"] for a in commit_step["attempts"]))
+        self.assertEqual(calls["commit"], mod.IME_COMMIT_MAX_ATTEMPTS)
+
+    def test_no_japanese_source_is_blocked_without_any_attempt(self):
+        interaction, calls = self._make_interaction(japanese_available=False)
+        steps, _original_source = self._run(interaction)
+        identify_step = next(s for s in steps if s["name"] == "ime_commit_identify_japanese_source")
+        self.assertEqual(identify_step["result"], "blocked")
+        self.assertEqual(calls["commit"], 0)
+
+    def test_baseline_restore_failure_blocks_without_a_further_attempt(self):
+        interaction, calls = self._make_interaction(
+            commit_effects=["ok_mismatch", "ok_matched"], restore_ok_until=1,
+        )
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "blocked")
+        self.assertIn("baseline", commit_step["reason"])
+        self.assertEqual(calls["commit"], 1)
+
+    def test_commit_helper_failure_is_blocked_not_failed(self):
+        interaction, calls = self._make_interaction(commit_effects=["helper_fail"])
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "blocked")
+        self.assertEqual(len(commit_step["attempts"]), 1)
+        self.assertEqual(commit_step["attempts"][0]["helper_result"], "blocked")
+
+    def test_each_attempt_captures_its_own_screenshot(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])
+        self._run(interaction)
+        self.assertEqual(calls["capture"], ["ime_commit_attempt_1", "ime_commit_attempt_2"])
+
+    def test_attempt_budget_is_small_and_fixed(self):
+        self.assertGreaterEqual(mod.IME_COMMIT_MAX_ATTEMPTS, 2)
+        self.assertLessEqual(mod.IME_COMMIT_MAX_ATTEMPTS, 5)
+
+    def test_positions_caret_via_move_caret_not_click_text(self):
+        # PR #208 review PRRT_kwDOUETGuM6j8L1G: each attempt must reach caret position with a
+        # keyboard-only move-caret from document start, never click-text/OCR (FakeInteraction
+        # raises AssertionError above if click-text is ever called).
+        interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])
+        self._run(interaction)
+        self.assertEqual(len(calls["move_caret"]), 2)
+        for args in calls["move_caret"]:
+            self.assertEqual(args, ["move-caret", "4321", "right", str(mod.IME_COMMIT_CARET_RIGHT_COUNT)])
+
+    def test_blocked_when_move_caret_fails(self):
+        interaction, calls = self._make_interaction(move_caret_ok=False)
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "blocked")
+        self.assertIn("move-caret failed", commit_step["reason"])
+        self.assertEqual(calls["commit"], 0)
 
 
 if __name__ == "__main__":
