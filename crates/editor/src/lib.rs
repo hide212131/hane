@@ -139,6 +139,7 @@ impl Editor {
         self.ime.as_ref()
     }
     pub fn set_selection(&mut self, selection: Selection) -> Result<(), BufferError> {
+        self.history.break_group();
         self.commit_composition();
         self.document.validate_offset(selection.anchor)?;
         self.document.validate_offset(selection.active)?;
@@ -166,6 +167,7 @@ impl Editor {
         extend: bool,
         preferred_x: f32,
     ) -> Result<(), BufferError> {
+        self.history.break_group();
         self.commit_composition();
         self.document.validate_offset(target)?;
         self.move_to(target, extend);
@@ -179,6 +181,12 @@ impl Editor {
         command: EditorCommand<'_>,
     ) -> Result<Option<EditSummary>, BufferError> {
         let received = Instant::now();
+        if !matches!(
+            command,
+            EditorCommand::Insert(_) | EditorCommand::Backspace | EditorCommand::Delete
+        ) {
+            self.history.break_group();
+        }
         self.commit_composition();
         if !matches!(
             command,
@@ -459,6 +467,85 @@ mod tests {
         assert_eq!(e.document().full_text(), "hello 日本語");
         assert_eq!(e.selection(), original);
         e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(e.document().full_text(), "hello world");
+    }
+
+    #[test]
+    fn characterwise_selection_replacement_is_one_undo_transaction() {
+        let original_text =
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Gamma row\n";
+        let mut e = Editor::new(original_text);
+        let start = original_text.find("Gamma").unwrap();
+        let original = Selection {
+            anchor: SourceOffset(start),
+            active: SourceOffset(start + "Gamma".len()),
+        };
+        e.set_selection(original).unwrap();
+
+        for character in ["D", "e", "l", "t", "a"] {
+            e.dispatch(EditorCommand::Insert(character)).unwrap();
+        }
+        assert_eq!(
+            e.document().full_text(),
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Delta row\n"
+        );
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), original_text);
+        assert_eq!(e.selection(), original);
+
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(
+            e.document().full_text(),
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Delta row\n"
+        );
+        assert_eq!(
+            e.selection(),
+            Selection::caret(SourceOffset(start + "Delta".len()))
+        );
+    }
+
+    #[test]
+    fn selection_replacement_does_not_remerge_after_undo_redo() {
+        let mut e = Editor::new("hello world");
+        let original = Selection {
+            anchor: SourceOffset(6),
+            active: SourceOffset(11),
+        };
+        e.set_selection(original).unwrap();
+        for character in ["n", "e", "w"] {
+            e.dispatch(EditorCommand::Insert(character)).unwrap();
+        }
+        e.dispatch(EditorCommand::Undo).unwrap();
+        e.dispatch(EditorCommand::Redo).unwrap();
+        e.dispatch(EditorCommand::Insert("!")).unwrap();
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "hello new");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "hello world");
+    }
+
+    #[test]
+    fn selection_replacement_does_not_remerge_after_caret_round_trip() {
+        let mut e = Editor::new("hello world");
+        let original = Selection {
+            anchor: SourceOffset(6),
+            active: SourceOffset(11),
+        };
+        e.set_selection(original).unwrap();
+        for character in ["n", "e", "w"] {
+            e.dispatch(EditorCommand::Insert(character)).unwrap();
+        }
+        e.dispatch(EditorCommand::MoveLeft { extend: false })
+            .unwrap();
+        e.dispatch(EditorCommand::MoveRight { extend: false })
+            .unwrap();
+        e.dispatch(EditorCommand::Insert("!")).unwrap();
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "hello new");
+        e.dispatch(EditorCommand::Undo).unwrap();
         assert_eq!(e.document().full_text(), "hello world");
     }
 

@@ -59,9 +59,13 @@ impl HistoryEntry {
             return false;
         }
         match self.kind {
+            // A selection replacement starts as an Insert entry whose
+            // `deleted` text is the selected range. Subsequent characters
+            // typed at the resulting caret are still part of that same user
+            // transaction, so keep appending them even though the first
+            // entry was not an insertion into an empty range.
             EditKind::Insert
-                if self.deleted.is_empty()
-                    && next.deleted.is_empty()
+                if next.deleted.is_empty()
                     && next.start == self.start + self.inserted.len()
                     && !self.inserted.ends_with(is_line_ending)
                     && !next.inserted.contains(is_line_ending) =>
@@ -109,9 +113,14 @@ impl HistoryEntry {
 pub(crate) struct History {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
+    can_merge_last: bool,
 }
 
 impl History {
+    pub(crate) fn break_group(&mut self) {
+        self.can_merge_last = false;
+    }
+
     pub(crate) fn record(
         &mut self,
         summary: &EditSummary,
@@ -129,14 +138,16 @@ impl History {
             kind,
             now,
         );
-        if !self
-            .undo
-            .last_mut()
-            .is_some_and(|previous| previous.try_merge(&entry))
+        if !(self.can_merge_last
+            && self
+                .undo
+                .last_mut()
+                .is_some_and(|previous| previous.try_merge(&entry)))
         {
             self.undo.push(entry);
         }
         self.redo.clear();
+        self.can_merge_last = true;
     }
 
     pub(crate) fn record_replacement(
@@ -158,12 +169,14 @@ impl History {
             last_edit_at: Instant::now(),
         });
         self.redo.clear();
+        self.can_merge_last = false;
     }
 
     pub(crate) fn undo(
         &mut self,
         document: &mut RopeBuffer,
     ) -> Result<Option<(EditSummary, Selection)>, BufferError> {
+        self.break_group();
         let Some(entry) = self.undo.pop() else {
             return Ok(None);
         };
@@ -177,6 +190,7 @@ impl History {
         &mut self,
         document: &mut RopeBuffer,
     ) -> Result<Option<(EditSummary, Selection)>, BufferError> {
+        self.break_group();
         let Some(entry) = self.redo.pop() else {
             return Ok(None);
         };
