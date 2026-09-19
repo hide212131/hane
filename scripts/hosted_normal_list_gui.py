@@ -674,7 +674,8 @@ def run_nested_position_checks(
 
 
 def run_scenario(
-    gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, base_run_dir: Path,
+    gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, capture_helper,
+    base_run_dir: Path,
     binary_path: Path, expected_sha: str, request_id: str, startup_timeout: float, window_timeout: float,
     helper_timeout: float, priority: dict, spec: ScenarioSpec,
 ) -> dict:
@@ -689,6 +690,7 @@ def run_scenario(
         expected_sha=expected_sha, request_id=request_id, generation="1", run_dir=run_dir,
         fixture_path=fixture_path, features=["timing-probe"], extra_env={},
         startup_timeout=startup_timeout, window_timeout=window_timeout,
+        capture_helper=capture_helper,
     )
     try:
         session_steps, window_id = interaction_module.open_session(
@@ -1121,7 +1123,8 @@ def _selection_replace_subtest(
 
 
 def run_editing_scenario(
-    gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, base_run_dir: Path,
+    gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, capture_helper,
+    base_run_dir: Path,
     binary_path: Path, expected_sha: str, request_id: str, startup_timeout: float, window_timeout: float,
     helper_timeout: float, poll_timeout: float, priority: dict,
 ) -> dict:
@@ -1142,6 +1145,7 @@ def run_editing_scenario(
         expected_sha=expected_sha, request_id=request_id, generation="1", run_dir=run_dir,
         fixture_path=fixture_path, features=["timing-probe"], extra_env={},
         startup_timeout=startup_timeout, window_timeout=window_timeout,
+        capture_helper=capture_helper,
     )
     try:
         session_steps, window_id = interaction_module.open_session(
@@ -1199,6 +1203,7 @@ def run_editing_scenario(
         expected_sha=expected_sha, request_id=request_id, generation="2", run_dir=reopen_dir,
         fixture_path=fixture_path, features=["timing-probe"], extra_env={},
         startup_timeout=startup_timeout, window_timeout=window_timeout,
+        capture_helper=capture_helper,
     )
     try:
         session_steps, _window_id = interaction_module.open_session(
@@ -1280,6 +1285,7 @@ def main() -> int:
         top_steps.append(preflight)
         binary_path = None
         swift_helper = None
+        capture_helper = None
         if preflight["result"] != "pass":
             top_steps.append(skipped_step("build", "preflight が pass しなかった"))
         else:
@@ -1292,6 +1298,15 @@ def main() -> int:
                 swift_helper = None
                 top_steps.append(step("prepare_helper", "blocked", str(exc)))
 
+            try:
+                capture_helper = interaction_module.prepare_capture_helper(
+                    control_dir / "scripts" / "window_capture_dlsym.swift", Path(helper_tmp.name)
+                )
+                top_steps.append(step("prepare_capture_helper", "pass", sha256=capture_helper.digest))
+            except (OSError, subprocess.SubprocessError) as exc:
+                capture_helper = None
+                top_steps.append(step("prepare_capture_helper", "blocked", str(exc)))
+
             if swift_helper is None:
                 top_steps.append(skipped_step("build", "trusted helper が利用できない"))
             else:
@@ -1300,11 +1315,11 @@ def main() -> int:
                 if build_step["result"] != "pass":
                     binary_path = None
 
-            if binary_path is not None and swift_helper is not None:
+            if binary_path is not None and swift_helper is not None and capture_helper is not None:
                 for spec in ALL_SCENARIO_SPECS:
                     try:
                         scenarios.append(run_scenario(
-                            gui_validate_module, interaction_module, env, target_dir, swift_helper,
+                            gui_validate_module, interaction_module, env, target_dir, swift_helper, capture_helper,
                             run_dir, binary_path, expected_sha, request_id,
                             startup_timeout, window_timeout, helper_timeout,
                             priority, spec,
@@ -1316,7 +1331,7 @@ def main() -> int:
 
                 try:
                     scenarios.append(run_editing_scenario(
-                        gui_validate_module, interaction_module, env, target_dir, swift_helper,
+                        gui_validate_module, interaction_module, env, target_dir, swift_helper, capture_helper,
                         run_dir, binary_path, expected_sha, request_id,
                         startup_timeout, window_timeout, helper_timeout, poll_timeout, priority,
                     ))

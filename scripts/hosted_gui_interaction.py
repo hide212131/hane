@@ -414,6 +414,19 @@ def prepare_helper(source: Path, directory: Path) -> PreparedHelper:
     return PreparedHelper(binary, hashlib.sha256(binary.read_bytes()).hexdigest())
 
 
+def prepare_capture_helper(source: Path, directory: Path) -> PreparedHelper:
+    binary = directory / "window-capture-helper"
+    subprocess.run(
+        ["/usr/bin/swiftc", str(source), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    binary.chmod(0o500)
+    return PreparedHelper(binary, hashlib.sha256(binary.read_bytes()).hexdigest())
+
+
 def run_helper(swift_helper: PreparedHelper, args: list[str], timeout: float) -> tuple[bool, str, str]:
     try:
         if hashlib.sha256(swift_helper.binary.read_bytes()).hexdigest() != swift_helper.digest:
@@ -483,7 +496,8 @@ def wait_for_fixture_settled_bytes(
 
 
 def make_config(module, *, workspace_dir, scenario, expected_sha, request_id, generation, run_dir,
-                 fixture_path, features, extra_env, startup_timeout, window_timeout):
+                 fixture_path, features, extra_env, startup_timeout, window_timeout,
+                 capture_helper: Optional[PreparedHelper] = None):
     state_dir = run_dir / "state"
     run_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -502,6 +516,7 @@ def make_config(module, *, workspace_dir, scenario, expected_sha, request_id, ge
         extra_env=extra_env,
         startup_timeout_seconds=startup_timeout,
         window_timeout_seconds=window_timeout,
+        capture_cmd=[str(capture_helper.binary)] if capture_helper is not None else None,
     )
 
 
