@@ -183,17 +183,35 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
 func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
     focus(pid)
     selectSource(inputSource)
-    guard currentSourceID() == inputSource else { fail("input source did not become active") }
+    // TISSelectInputSource() making currentSourceID() report the Japanese source
+    // does not by itself guarantee the app's IME session is actually ready to
+    // convert keystrokes yet; on a hosted runner the switch can still be
+    // settling. Re-check with a bounded, deterministic poll instead of a single
+    // immediate check, and require the match to still hold after an explicit
+    // settle delay before typing (Issue #126 post-merge GUI run 35410838091:
+    // currentSourceID() already reported the Japanese source, yet the romaji
+    // was saved unconverted).
+    let settleDeadline = Date().addingTimeInterval(3.0)
+    while currentSourceID() != inputSource && Date() < settleDeadline {
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    guard currentSourceID() == inputSource else {
+        fail("input source did not become active in time: \(inputSource)")
+    }
+    Thread.sleep(forTimeInterval: 0.5)
+    guard currentSourceID() == inputSource else {
+        fail("input source became inactive again before typing: \(inputSource)")
+    }
     let escaped = escapeForAppleScript(romaji)
     runAppleScript("""
     tell application "System Events"
         tell first process whose unix id is \(pid)
             set frontmost to true
-            delay 0.2
+            delay 0.3
             keystroke "\(escaped)"
-            delay 0.3
+            delay 0.5
             key code 49
-            delay 0.3
+            delay 0.5
             key code 36
             delay 0.3
             keystroke "s" using command down

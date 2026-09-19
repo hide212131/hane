@@ -56,6 +56,22 @@ class HelperTests(unittest.TestCase):
         self.assertRegex(source, r'CGRect\(\s*x: 0,\s*y: topInset,')
         self.assertNotIn('VNImageRectForNormalizedRect(normalizedBody', source)
 
+    def test_type_romaji_at_caret_commit_save_settles_and_rechecks_the_input_source(self):
+        # Issue #126 post-merge GUI run 35410838091: currentSourceID() already reported the
+        # Japanese source right after selectSource(), yet the romaji was saved unconverted.
+        # A single immediate check is not sufficient evidence that the IME session is ready;
+        # this locks in a bounded poll-until-settled recheck before any keystrokes are sent,
+        # and a second recheck after an explicit settle delay.
+        source = Path(interaction.__file__).with_name('hosted_gui_interaction.swift').read_text()
+        start = source.index('func typeRomajiAtCaretCommitSave')
+        end = source.index('\nfunc ', start + 1)
+        body = source[start:end]
+        self.assertEqual(body.count('currentSourceID() == inputSource'), 2)
+        self.assertIn('Date().addingTimeInterval', body)
+        self.assertIn('Thread.sleep(forTimeInterval: 0.5)', body)
+        self.assertIn('did not become active in time', body)
+        self.assertIn('became inactive again before typing', body)
+
 
 class InlineSyntaxExpectationTests(unittest.TestCase):
     """Pure source-byte and visible-anchor logic for inline_syntax_boundary."""

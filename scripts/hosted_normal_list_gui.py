@@ -27,10 +27,15 @@ It reuses the existing launcher/input stack (scripts/gui_validate.py and
 scripts/hosted_gui_interaction.py, including its compiled
 scripts/hosted_gui_interaction.swift OS-input helper) rather than inventing a
 second one. It does not weaken or replace the comprehensive interactive-input
-procedure. All visual assertions go through OCR text (`ocr`, `click-text`,
-`drag-select-text`) rather than internal rendering geometry, because product
-PR #189 is still changing the internal list layout; this keeps the assertions
-modular against that in-flight change.
+procedure. All visual assertions go through OCR text (`ocr`, `click-text`)
+rather than internal rendering geometry, because product PR #189 is still
+changing the internal list layout; this keeps the assertions modular against
+that in-flight change. Once a click has placed the caret at a known,
+deterministic position, subsequent movement within the same boundary edit
+(e.g. the source-marker direct edit) uses keyboard-only primitives
+(`move-caret`, `shift-select`) rather than a second Vision OCR pass, because a
+screenshot can be visually unambiguous yet still misread by OCR on a later,
+independent recognition call (Issue #126 post-merge GUI run 35410838091).
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-normal-list/3"
+PROCEDURE_VERSION = "hosted-normal-list/4"
 VERIFICATION_KIND = "normal_list_focused"
 SCOPE_NOTE = (
     "Issue #126 の normal list 表示(B: ネスト混在、C: 複数段落+子リスト+親リストへの復帰、"
@@ -68,10 +73,13 @@ SCOPE_NOTE = (
     "OCR 行順序に加え、nested child list の後に親 ordered list の番号(2)が復帰することを"
     "normal display 自体の番号表示で確認する。marker disclosure/reclosure 検証に加えて、"
     "通常リスト固有の source marker/本文の直接編集、ASCII 入力、日本語 IME 確定、選択置換、"
-    "Undo/Redo、保存、再起動後の再オープンを実ファイルの byte 列で検証する(E)。IME 工程は"
-    "成功・失敗にかかわらず、後続の ASCII 選択置換の前に元の入力ソースへ復元する。"
-    "helper failure・入力ソース未提供・OCR/click-text failure はいずれも pass として扱わない。"
-    "テキストの存在だけでは順序・位置の証跡として扱わない。"
+    "Undo/Redo、保存、再起動後の再オープンを実ファイルの byte 列で検証する(E)。source marker の"
+    "直接編集は、本文クリックで caret が marker/body 境界へ置かれた後、既知の文字数だけの"
+    "キーボード移動(2回目の Vision OCR には依存しない)で行う。選択置換は OCR bounding box の"
+    "start→end drag ではなく、既知位置への click 後に Shift+矢印で正確な文字数を選択する"
+    "決定的な操作で行う。IME 工程は成功・失敗にかかわらず、後続の ASCII 選択置換の前に"
+    "元の入力ソースへ復元する。helper failure・入力ソース未提供・OCR/click-text failure は"
+    "いずれも pass として扱わない。テキストの存在だけでは順序・位置の証跡として扱わない。"
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -408,6 +416,36 @@ def single_line_replacement(text: str, old_line: str, new_line: str) -> str:
     return text.replace(old_line, new_line, 1)
 
 
+def match_insertion_offset(text: str, pattern: str, *, edge: str) -> int:
+    """hosted_gui_interaction.py の同名関数と同じ契約の純粋関数(意図的な複製)。
+
+    この module は GUI 実行時にしか import できない hosted_gui_interaction.py の
+    実装詳細に純粋計算を依存させず、scripts/tests/ から直接ユニットテストできる
+    ように自己完結させる(parse_click_evidence と同じ方針)。
+    """
+    match = re.search(pattern, text)
+    if not match:
+        raise ValueError(f"pattern not found in expected fixture text: {pattern}")
+    return match.end() if edge == "end" else match.start()
+
+
+def insert_at_match(text: str, pattern: str, insertion: str, *, edge: str) -> str:
+    position = match_insertion_offset(text, pattern, edge=edge)
+    return text[:position] + insertion + text[position:]
+
+
+def caret_left_count_between(text: str, from_pattern: str, from_edge: str, to_pattern: str, to_edge: str) -> int:
+    """text 上で from_pattern/from_edge の位置から to_pattern/to_edge の位置まで、左方向へ
+    何文字キーボード移動すれば到達するかを純粋に計算する。to 側が from 側より後ろにある
+    場合は左移動では到達できないため ValueError にする(fail-closed)。
+    """
+    from_offset = match_insertion_offset(text, from_pattern, edge=from_edge)
+    to_offset = match_insertion_offset(text, to_pattern, edge=to_edge)
+    if to_offset > from_offset:
+        raise ValueError("to_pattern/to_edge must be at or before from_pattern/from_edge for a left move")
+    return from_offset - to_offset
+
+
 EDITING_FIXTURE_FILENAME = "normal-list-editing.md"
 EDITING_FIXTURE_ORIGINAL = (
     "# Normal List Editing Fixture\n"
@@ -424,11 +462,21 @@ EDITING_AFTER_BODY_DIRECT_EDIT = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "41. Beta row", "41. Beta row Z"
 )
 
-# source marker の直接編集(ASCII): まず "Beta row" 行へクリックして raw marker "41." を
-# disclosure させ、disclosure された marker の先頭へ直接クリックして ASCII 文字を挿入する。
+# source marker の直接編集(ASCII): まず "Beta row" 行の本文先頭へクリックして raw marker
+# "41." を disclosure させる。この時点で caret はすでに marker/body 境界("41. " の直後、
+# "Beta" の直前)にある。ここから raw marker の先頭まで、既知の文字数
+# (MARKER_DIRECT_EDIT_CARET_LEFT_COUNT)だけキーボードで左移動して ASCII 文字を挿入する。
+# marker_disclosed.png 自体が明瞭でも、そこへの2回目の Vision OCR が別の文字列へ誤認識する
+# ことがある(Issue #126 post-merge GUI run 35410838091)ため、この2手目はスクリーンショット・
+# OCR を一切経由しない。
 MARKER_DIRECT_EDIT_DISCLOSURE_PATTERN = r"Beta row"
 MARKER_DIRECT_EDIT_RAW_PATTERN = r"41\.\s*Beta row"
 MARKER_DIRECT_EDIT_INSERTION = "9"
+MARKER_DIRECT_EDIT_CARET_LEFT_COUNT = caret_left_count_between(
+    EDITING_FIXTURE_ORIGINAL,
+    MARKER_DIRECT_EDIT_DISCLOSURE_PATTERN, "start",
+    MARKER_DIRECT_EDIT_RAW_PATTERN, "start",
+)
 EDITING_AFTER_MARKER_DIRECT_EDIT = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "41. Beta row", "941. Beta row"
 )
@@ -442,8 +490,15 @@ EDITING_AFTER_IME_COMMIT = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "3. Alpha row", "3. Alpha row日本語"
 )
 
-# 選択置換(ASCII) + Undo/Redo: "Gamma" をドラッグ選択し、"Delta" で置換する。
+# 選択置換(ASCII) + Undo/Redo: "Gamma" の先頭へ click した後、Shift+→ で正確に
+# SELECTION_REPLACE_WORD_LENGTH 文字だけキーボード選択して "Delta" で置換する。OCR
+# bounding box の start→end drag は文字境界の真値ではなく、末尾の文字を取りこぼすことが
+# ある(Issue #126 post-merge GUI run 35410838091: "Gamma" の選択が "Gamm" までしか及ばず
+# "Deltaa row" になった)ため、選択範囲そのものは既知の文字数によるキーボード操作で
+# 決定的に確定する。OCR は click 位置の特定にのみ使う。
+SELECTION_REPLACE_WORD = "Gamma"
 SELECTION_REPLACE_WORD_PATTERN = r"Gamma"
+SELECTION_REPLACE_WORD_LENGTH = len(SELECTION_REPLACE_WORD)
 SELECTION_REPLACE_REPLACEMENT = "Delta"
 EDITING_AFTER_SELECTION_REPLACE = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "100. Gamma row", "100. Delta row"
@@ -694,6 +749,55 @@ def _boundary_edit_subtest(
     return step(name, status, reason, **detail)
 
 
+def _caret_move_edit_check(
+    interaction_module, swift_helper, pid, fixture_path, baseline,
+    direction: str, count: int, source_pattern: str, source_edge: str, insertion: str,
+    helper_timeout: float, poll_timeout: float,
+) -> tuple:
+    """caret がすでに決定的な基準位置にある状態から、既知の文字数だけキーボード
+    (move-caret)で移動して境界へ到達し、type-save で挿入した実バイト列と undo 復元を
+    検証する。screenshot・click-text・Vision OCR を一切経由しないため、screenshot 自体が
+    明瞭でも別の文字列へ誤認識する2回目の OCR 失敗の影響を受けない
+    (Issue #126 post-merge GUI run 35410838091: marker_disclosed.png には "41. Beta row" と
+    caret が明瞭に写っていたが、そこへの2回目の click-text の Vision OCR が
+    "AppleM2ScalerParavirtDriver" へ誤認識して失敗した)。挿入位置は既知の移動量から
+    決定的に定まるため、期待値との不一致は helper/OCR 誤差ではなく製品側の疑いとして
+    fail とする(procedure blocked への退避はしない)。
+    """
+    detail = {"move_direction": direction, "move_count": count}
+    expected_offset = match_insertion_offset(baseline, source_pattern, edge=source_edge)
+    detail["expected_canonical_source_offset"] = expected_offset
+    if count > 0:
+        ok, _out, err = interaction_module.run_helper(
+            swift_helper, ["move-caret", str(pid), direction, str(count)], helper_timeout
+        )
+        if not ok:
+            return "blocked", f"境界へのキーボード移動に失敗した: {err}", detail
+    ok, _out, err = interaction_module.run_helper(swift_helper, ["type-save", str(pid), insertion], helper_timeout)
+    if not ok:
+        return "blocked", (
+            f"境界への入力に失敗した(timeout、起動失敗、integrity mismatch などの"
+            f"helper/実行環境側要因の可能性があり、procedure blocked とする): {err}"
+        ), detail
+    expected = insert_at_match(baseline, source_pattern, insertion, edge=source_edge)
+    matched, actual_bytes = interaction_module.wait_for_fixture_bytes(fixture_path, expected.encode("utf-8"), poll_timeout)
+    actual = actual_bytes.decode("utf-8", errors="replace")
+    detail.update(expected_after_insert=expected, actual_after_insert=actual)
+    if not matched:
+        return "fail", (
+            "キーボード移動による境界への直接編集後の内容が期待値と一致しない"
+            "(挿入位置は既知の移動量から決定的に定まるため、製品側の疑いとして fail とする)"
+        ), detail
+    ok, _out, err = interaction_module.run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
+    if not ok:
+        return "fail", f"undo に失敗した: {err}", detail
+    matched, actual_bytes = interaction_module.wait_for_fixture_bytes(fixture_path, baseline.encode("utf-8"), poll_timeout)
+    detail.update(expected_after_undo=baseline, actual_after_undo=actual_bytes.decode("utf-8", errors="replace"))
+    if not matched:
+        return "fail", "undo 後に元の内容へ戻らない", detail
+    return "pass", None, detail
+
+
 def _ime_commit_subtest(
     gui_validate_module, interaction_module, env, config, window_id, swift_helper, pid,
     fixture_path, run_dir: Path, helper_timeout: float, poll_timeout: float,
@@ -703,6 +807,14 @@ def _ime_commit_subtest(
     入力ソース未提供・helper failure・OCR failure はいずれも pass にしない。呼び出し側が
     IME 工程の成功・失敗にかかわらず元の入力ソースへ復元できるよう、ここで確認できた
     original source id (未確認なら None)を合わせて返す。
+
+    source 選択・settle・current-source 再確認・romaji 入力・変換/確定・保存は、すべて
+    単一の helper invocation(type-romaji-at-caret-commit-save)の中で行う。事前に別の
+    helper invocation で select-source を単独実行して「選択 pass」を先に報告すると、
+    実際にはその後の変換が settle せず未変換のまま保存されても、選択自体は pass の
+    ままになってしまう(Issue #126 post-merge GUI run 35410838091: helper が選択 pass と
+    した直後でも保存値は "Alpha rownihongo \\n\\n" のように未変換だった)。そのため選択の
+    成否は、実際に変換・確定・保存まで行った結果からのみ判定する。
     """
     steps: list = []
     capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "ime_commit_before")
@@ -731,22 +843,21 @@ def _ime_commit_subtest(
     japanese_source = next((source_id for source_id in available if source_id == interaction_module.JAPANESE_SOURCE), None)
     if japanese_source is None:
         steps.append(step(
-            "ime_commit_select_japanese_source", "blocked",
+            "ime_commit_identify_japanese_source", "blocked",
             "このランナーに組み込みの日本語入力ソースが見つからない",
         ))
         return steps, original_source
-    ok, _out, err = interaction_module.run_helper(swift_helper, ["select-source", japanese_source], helper_timeout)
-    steps.append(step(
-        "ime_commit_select_japanese_source", "pass" if ok else "blocked",
-        reason=None if ok else err, selected_source=japanese_source,
-    ))
-    if not ok:
-        return steps, original_source
+    steps.append(step("ime_commit_identify_japanese_source", "pass", identified_source=japanese_source))
+    # source 選択・settle・current-source 再確認・romaji 入力・変換/確定・保存を単一の
+    # helper invocation の中で行う。ここで select-source を別途呼ばない(上の docstring 参照)。
     ok, _out, err = interaction_module.run_helper(
         swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_COMMIT_ROMAJI, japanese_source], helper_timeout
     )
     if not ok:
-        steps.append(step("direct_ime_commit_at_caret", "blocked", err))
+        steps.append(step(
+            "direct_ime_commit_at_caret", "blocked",
+            f"source 選択・settle・変換・確定・保存を行う単一 helper invocation が失敗した: {err}",
+        ))
         return steps, original_source
     matched, actual = interaction_module.wait_for_fixture_bytes(fixture_path, EDITING_AFTER_IME_COMMIT.encode("utf-8"), poll_timeout)
     steps.append(step(
@@ -787,7 +898,13 @@ def _selection_replace_subtest(
     gui_validate_module, interaction_module, env, config, window_id, swift_helper, pid,
     fixture_path, run_dir: Path, helper_timeout: float, poll_timeout: float,
 ) -> list:
-    """"Gamma" を ASCII ドラッグ選択して "Delta" へ選択置換し、undo/redo を実バイト列で検証する。"""
+    """"Gamma" の先頭へ click した後 Shift+→ で正確に SELECTION_REPLACE_WORD_LENGTH 文字だけ
+    キーボード選択して "Delta" へ選択置換し、undo/redo を実バイト列で検証する。OCR
+    bounding box の start→end drag は文字境界の真値ではなく、末尾の文字を取りこぼすことが
+    ある(Issue #126 post-merge GUI run 35410838091: "Gamma" の選択が "Gamm" までしか及ばず
+    "Deltaa row" になった)ため、選択範囲そのものは OCR に依存しないキーボード操作で
+    決定的に確定する。OCR は click 位置の特定にのみ使う。
+    """
     name = "selection_replace_ascii_undo_redo"
     steps: list = []
     capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "selection_replace_before")
@@ -797,12 +914,17 @@ def _selection_replace_subtest(
         return steps
     screenshot = run_dir / "selection_replace_before.png"
     ok, _out, err = interaction_module.run_helper(
-        swift_helper, ["drag-select-text", str(pid), str(screenshot),
-                       SELECTION_REPLACE_WORD_PATTERN, "start", SELECTION_REPLACE_WORD_PATTERN, "end"],
+        swift_helper, ["click-text", str(pid), str(screenshot), SELECTION_REPLACE_WORD_PATTERN, "start"],
         helper_timeout,
     )
     if not ok:
-        steps.append(step(name, "blocked", f"選択に失敗した: {err}"))
+        steps.append(step(name, "blocked", f"選択開始位置へのクリックに失敗した: {err}"))
+        return steps
+    ok, _out, err = interaction_module.run_helper(
+        swift_helper, ["shift-select", str(pid), "right", str(SELECTION_REPLACE_WORD_LENGTH)], helper_timeout,
+    )
+    if not ok:
+        steps.append(step(name, "blocked", f"Shift+矢印での選択に失敗した: {err}"))
         return steps
     ok, _out, err = interaction_module.run_helper(swift_helper, ["type-save", str(pid), SELECTION_REPLACE_REPLACEMENT], helper_timeout)
     if not ok:
@@ -907,7 +1029,7 @@ def run_editing_scenario(
                 BODY_DIRECT_EDIT_INSERTION, helper_timeout, poll_timeout, "direct_body_edit_ascii_undo",
             ))
 
-            disclose_ok, _out, disclose_err = interaction_module.run_helper(
+            disclose_ok, disclose_out, disclose_err = interaction_module.run_helper(
                 swift_helper, ["click-text", str(pid), str(before_screenshot), MARKER_DIRECT_EDIT_DISCLOSURE_PATTERN, "start"],
                 helper_timeout,
             )
@@ -917,17 +1039,31 @@ def run_editing_scenario(
                     f"marker disclosure のためのクリックに失敗した: {disclose_err}",
                 ))
             else:
-                disclosed_capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "marker_disclosed")
-                steps.append(disclosed_capture)
-                if disclosed_capture["result"] != "pass":
-                    steps.append(step("direct_marker_edit_ascii_undo", "blocked", disclosed_capture.get("reason")))
-                else:
-                    steps.append(_boundary_edit_subtest(
-                        interaction_module, swift_helper, pid, fixture_path, EDITING_FIXTURE_ORIGINAL,
-                        run_dir / "marker_disclosed.png",
-                        MARKER_DIRECT_EDIT_RAW_PATTERN, "start", MARKER_DIRECT_EDIT_RAW_PATTERN, "start",
-                        MARKER_DIRECT_EDIT_INSERTION, helper_timeout, poll_timeout, "direct_marker_edit_ascii_undo",
-                    ))
+                try:
+                    disclose_evidence = parse_click_evidence(disclose_out)
+                except ValueError as exc:
+                    disclose_evidence = None
+                    steps.append(step("direct_marker_edit_ascii_undo", "blocked", str(exc)))
+                if disclose_evidence is not None:
+                    disclosed_capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "marker_disclosed")
+                    steps.append(disclosed_capture)
+                    if disclosed_capture["result"] != "pass":
+                        steps.append(step("direct_marker_edit_ascii_undo", "blocked", disclosed_capture.get("reason")))
+                    else:
+                        # disclosure クリックで caret はすでに marker/body 境界にある。
+                        # marker_disclosed.png はここでは evidence として撮るだけで、そこへの
+                        # 2回目の click-text/OCR は行わない(上の caret_left_count_between の
+                        # コメント参照)。
+                        status, reason, detail = _caret_move_edit_check(
+                            interaction_module, swift_helper, pid, fixture_path, EDITING_FIXTURE_ORIGINAL,
+                            "left", MARKER_DIRECT_EDIT_CARET_LEFT_COUNT,
+                            MARKER_DIRECT_EDIT_RAW_PATTERN, "start", MARKER_DIRECT_EDIT_INSERTION,
+                            helper_timeout, poll_timeout,
+                        )
+                        steps.append(step(
+                            "direct_marker_edit_ascii_undo", status, reason,
+                            disclosure_click_evidence=disclose_evidence, **detail,
+                        ))
 
             ime_steps, original_source = _ime_commit_subtest(
                 gui_validate_module, interaction_module, env, config, window_id, swift_helper, pid,

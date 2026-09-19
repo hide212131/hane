@@ -14,7 +14,7 @@ spec.loader.exec_module(mod)
 
 class ProcedureIdentityTests(unittest.TestCase):
     def test_procedure_identity_is_focused_and_distinct(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/3")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/4")
         self.assertEqual(mod.VERIFICATION_KIND, "normal_list_focused")
         self.assertIn("#126", mod.SCOPE_NOTE)
         self.assertIn("hosted-gui-interaction/7", mod.SCOPE_NOTE)
@@ -425,6 +425,154 @@ class SingleLineReplacementTests(unittest.TestCase):
     def test_rejects_ambiguous_occurrence(self):
         with self.assertRaises(ValueError):
             mod.single_line_replacement("a\na\n", "a", "A")
+
+
+class MatchInsertionOffsetTests(unittest.TestCase):
+    def test_returns_start_offset_for_start_edge(self):
+        self.assertEqual(mod.match_insertion_offset("41. Beta row", r"Beta row", edge="start"), 4)
+
+    def test_returns_end_offset_for_end_edge(self):
+        self.assertEqual(mod.match_insertion_offset("41. Beta row", r"Beta row", edge="end"), 12)
+
+    def test_raises_when_pattern_not_found(self):
+        with self.assertRaises(ValueError):
+            mod.match_insertion_offset("41. Beta row", r"Nowhere", edge="start")
+
+
+class InsertAtMatchTests(unittest.TestCase):
+    def test_inserts_at_the_matched_start(self):
+        self.assertEqual(mod.insert_at_match("41. Beta row", r"41", "9", edge="start"), "941. Beta row")
+
+
+class CaretLeftCountBetweenTests(unittest.TestCase):
+    # Issue #126 post-merge GUI run 35410838091: marker_disclosed.png 自体は "41. Beta row" と
+    # caret が明瞭に写っていたが、そこへの2回目の click-text の Vision OCR が
+    # "AppleM2ScalerParavirtDriver" へ誤認識して失敗した。marker 直接編集の2手目は、この
+    # 純粋計算だけで求めた既知の移動量によるキーボード操作に置き換え、2回目の OCR に
+    # 依存しない。
+    def test_counts_characters_between_disclosure_click_and_raw_marker_start(self):
+        text = "41. Beta row"
+        count = mod.caret_left_count_between(text, r"Beta row", "start", r"41\.\s*Beta row", "start")
+        self.assertEqual(count, 4)
+
+    def test_matches_editing_fixture_constant(self):
+        self.assertEqual(mod.MARKER_DIRECT_EDIT_CARET_LEFT_COUNT, 4)
+
+    def test_raises_when_target_is_after_the_starting_position(self):
+        with self.assertRaises(ValueError):
+            mod.caret_left_count_between("41. Beta row", r"41", "start", r"Beta row", "start")
+
+
+class SelectionReplaceWordLengthTests(unittest.TestCase):
+    # Issue #126 post-merge GUI run 35410838091: OCR bounding box の start→end drag は
+    # "Gamma" の末尾を取りこぼし "Deltaa" になった。選択範囲はキーボード(Shift+矢印)による
+    # 既知の文字数で決定的に確定するため、その文字数自体が正しいことを固定する。
+    def test_selection_replace_word_length_matches_the_literal_word(self):
+        self.assertEqual(mod.SELECTION_REPLACE_WORD, "Gamma")
+        self.assertEqual(mod.SELECTION_REPLACE_WORD_LENGTH, 5)
+
+    def test_selection_replace_word_pattern_matches_the_literal_word(self):
+        self.assertRegex(mod.SELECTION_REPLACE_WORD, mod.SELECTION_REPLACE_WORD_PATTERN)
+
+
+class CaretMoveEditCheckTests(unittest.TestCase):
+    """_caret_move_edit_check は click-text/OCR を一切使わない(Issue #126 post-merge GUI
+    run 35410838091 の marker 直接編集の2回目の Vision OCR 誤認識に対する回帰固定)。"""
+
+    BASELINE = "41. Beta row"
+    SOURCE_PATTERN = r"41\.\s*Beta row"
+    INSERTED = "941. Beta row"
+
+    def _make_interaction(self, run_helper_results, wait_results):
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                return run_helper_results[args[0]]
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return wait_results[expected.decode("utf-8")]
+
+        return FakeInteraction()
+
+    def test_pass_when_insertion_and_undo_match(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", ""), "undo-save": (True, "", "")},
+            {self.INSERTED: (True, self.INSERTED.encode("utf-8")),
+             self.BASELINE: (True, self.BASELINE.encode("utf-8"))},
+        )
+        status, reason, detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "pass")
+        self.assertIsNone(reason)
+        self.assertEqual(detail["expected_canonical_source_offset"], 0)
+
+    def test_blocked_when_move_caret_fails_without_typing(self):
+        interaction = self._make_interaction({"move-caret": (False, "", "move failed")}, {})
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("move failed", reason)
+
+    def test_blocked_when_type_save_fails(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (False, "", "type failed")}, {},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "blocked")
+        self.assertIn("type failed", reason)
+
+    def test_fail_closed_when_insertion_does_not_match_expected_bytes(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", "")},
+            {self.INSERTED: (False, b"unexpected")},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "fail")
+        self.assertIn("一致しない", reason)
+
+    def test_fail_closed_when_undo_does_not_restore_baseline(self):
+        interaction = self._make_interaction(
+            {"move-caret": (True, "", ""), "type-save": (True, "", ""), "undo-save": (True, "", "")},
+            {self.INSERTED: (True, self.INSERTED.encode("utf-8")),
+             self.BASELINE: (False, self.INSERTED.encode("utf-8"))},
+        )
+        status, reason, _detail = mod._caret_move_edit_check(
+            interaction, object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 4, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "fail")
+        self.assertIn("undo", reason)
+
+    def test_skips_move_caret_call_when_count_is_zero(self):
+        calls = []
+
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                calls.append(args[0])
+                return True, "", ""
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                return True, expected
+
+        status, _reason, _detail = mod._caret_move_edit_check(
+            FakeInteraction(), object(), 123, Path("fixture.md"), self.BASELINE,
+            "left", 0, self.SOURCE_PATTERN, "start", "9", 1.0, 1.0,
+        )
+        self.assertEqual(status, "pass")
+        self.assertNotIn("move-caret", calls)
 
 
 class EditingFixtureTests(unittest.TestCase):
