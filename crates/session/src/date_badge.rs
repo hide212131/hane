@@ -625,6 +625,14 @@ mod tests {
     }
 
     #[test]
+    fn date_badge_range_keeps_a_cross_month_calendar_week_together() {
+        let today = CalendarDate::new(2026, 10, 1).unwrap(); // Thursday
+        let monday = CalendarDate::new(2026, 9, 28).unwrap();
+
+        assert_eq!(date_badge_range(monday, today), DateBadgeRange::ThisWeek);
+    }
+
+    #[test]
     fn date_badge_range_keeps_a_cross_year_calendar_week_together() {
         let today = CalendarDate::new(2026, 1, 1).unwrap(); // Thursday
         let monday = CalendarDate::new(2025, 12, 29).unwrap();
