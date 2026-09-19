@@ -606,7 +606,10 @@ mod tests {
             date_badge_range(previous_sunday, today),
             DateBadgeRange::ThisMonth
         );
-        assert_eq!(date_badge_range(next_monday, today), DateBadgeRange::ThisMonth);
+        assert_eq!(
+            date_badge_range(next_monday, today),
+            DateBadgeRange::ThisMonth
+        );
     }
 
     #[test]

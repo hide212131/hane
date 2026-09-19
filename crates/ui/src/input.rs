@@ -1,7 +1,186 @@
 use crate::view::EditorView;
-use gpui::{Bounds, Context, EntityInputHandler, Pixels, Size, UTF16Selection, Window, point, px};
+use gpui::{
+    App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    GlobalElementId, IntoElement, LayoutId, PaintQuad, Pixels, ShapedLine, Size, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba,
+};
 use hane_document::SourceRange;
 use std::ops::Range;
+
+/// The visible, one-line text field used by a sidebar inline rename. Keeping
+/// this as an element rather than a second view lets the editor entity remain
+/// the single owner of both the rename state and the platform text-input
+/// handler.
+pub(crate) struct InlineRenameInput {
+    pub(crate) input: Entity<EditorView>,
+}
+
+impl IntoElement for InlineRenameInput {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+pub struct InlineRenamePrepaintState {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl Element for InlineRenameInput {
+    type RequestLayoutState = ();
+    type PrepaintState = InlineRenamePrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let Some(state) = input.inline_rename_render_state() else {
+            return InlineRenamePrepaintState {
+                line: None,
+                cursor: None,
+                selection: None,
+            };
+        };
+        let style = window.text_style();
+        let run = TextRun {
+            len: state.text.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if let Some(marked_range) = state.marked_range.as_ref() {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: marked_range.end.saturating_sub(marked_range.start),
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: state.text.len().saturating_sub(marked_range.end),
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        } else {
+            vec![run]
+        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(state.text.into(), font_size, &runs, None);
+        let selection = if state.selected_range.is_empty() {
+            None
+        } else {
+            Some(fill(
+                Bounds::from_corners(
+                    point(
+                        bounds.left() + line.x_for_index(state.selected_range.start),
+                        bounds.top(),
+                    ),
+                    point(
+                        bounds.left() + line.x_for_index(state.selected_range.end),
+                        bounds.bottom(),
+                    ),
+                ),
+                rgba(0x3311ff30),
+            ))
+        };
+        let cursor = if state.selected_range.is_empty() {
+            Some(fill(
+                Bounds::new(
+                    point(
+                        bounds.left() + line.x_for_index(state.selected_range.end),
+                        bounds.top(),
+                    ),
+                    Size {
+                        width: px(2.0),
+                        height: bounds.bottom() - bounds.top(),
+                    },
+                ),
+                gpui::blue(),
+            ))
+        } else {
+            None
+        };
+        InlineRenamePrepaintState {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        if let Some(line) = prepaint.line.take() {
+            line.paint(bounds.origin, window.line_height(), window, cx)
+                .unwrap();
+        }
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
+        }
+    }
+}
 
 impl EntityInputHandler for EditorView {
     fn text_for_range(
@@ -11,6 +190,11 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        if self.inline_rename_active() {
+            let (text, actual) = self.inline_rename_text_for_range(range_utf16)?;
+            actual_range.replace(actual);
+            return Some(text);
+        }
         let (text, actual) = self.editor().text_for_utf16_range(range_utf16).ok()?;
         actual_range.replace(actual);
         Some(text)
@@ -22,6 +206,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some((range, reversed)) = self.inline_rename_selection() {
+            return Some(UTF16Selection { range, reversed });
+        }
         Some(UTF16Selection {
             range: self
                 .editor()
@@ -32,13 +219,20 @@ impl EntityInputHandler for EditorView {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        if self.inline_rename_active() {
+            return self.inline_rename_marked_range();
+        }
         self.editor()
             .ime()
             .and_then(|ime| self.editor().source_range_to_utf16(ime.current_range).ok())
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.editor_mut().commit_composition();
+        if self.inline_rename_active() {
+            self.unmark_inline_rename();
+        } else {
+            self.editor_mut().commit_composition();
+        }
     }
 
     fn replace_text_in_range(
@@ -48,6 +242,10 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.inline_rename_active() {
+            self.replace_inline_rename_text(range_utf16, new_text, cx);
+            return;
+        }
         let result = if range_utf16.is_none() && self.editor().ime().is_none() {
             self.editor_mut().insert_text(new_text).map(|_| ())
         } else {
@@ -69,6 +267,15 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.inline_rename_active() {
+            self.replace_and_mark_inline_rename_text(
+                range_utf16,
+                new_text,
+                new_selected_range_utf16,
+                cx,
+            );
+            return;
+        }
         if let Err(error) =
             self.editor_mut()
                 .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
@@ -88,6 +295,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self.inline_rename_active() {
+            return Some(bounds);
+        }
         let Some(caret) = self.caret_geometry() else {
             return Some(bounds);
         };
@@ -106,6 +316,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.inline_rename_active() {
+            return self.inline_rename_selection().map(|(range, _)| range.end);
+        }
         self.editor()
             .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))
             .ok()

@@ -18,6 +18,7 @@
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
 use crate::icons;
+use crate::input::InlineRenameInput;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
@@ -29,7 +30,7 @@ use crate::line::{
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
-    App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    App, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
     Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task,
     Window, div, point, prelude::FluentBuilder, px, rgb,
@@ -52,13 +53,13 @@ use hane_presentation::{
     parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
-    CalendarDate, DocumentSession, DraftId, DraftStore, FileEvent, FileEventOutcome, FileService,
-    LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
-    RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket,
-    SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction,
-    WorkFolder, WorkFolderNode, WorkFolderScanner, date_badge_range, decide_title_sync,
-    extract_h1_title, format_relative_date_label, local_today, run_save_job,
-    split_file_name_for_badge, unique_folder_name, unique_markdown_filename, DateBadgeRange,
+    CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
+    FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
+    OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
+    SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
+    Settings, StateStores, TitleSyncAction, WorkFolder, WorkFolderNode, WorkFolderScanner,
+    date_badge_range, decide_title_sync, extract_h1_title, format_relative_date_label, local_today,
+    run_save_job, split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -237,6 +238,132 @@ struct TitleRenameAttempt {
     title: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineRenameKind {
+    File,
+    Folder,
+}
+
+/// State for the one sidebar row currently being edited. The editable text is
+/// kept separate from the fixed Markdown extension so input and filesystem
+/// validation cannot accidentally turn a note into another file type.
+struct InlineRename {
+    kind: InlineRenameKind,
+    from: PathBuf,
+    text: String,
+    fixed_extension: Option<String>,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+    pending: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InlineRenameRenderState {
+    pub(crate) text: String,
+    pub(crate) selected_range: Range<usize>,
+    pub(crate) marked_range: Option<Range<usize>>,
+}
+
+fn inline_rename_parts(path: &Path, kind: InlineRenameKind) -> (String, Option<String>) {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    if kind == InlineRenameKind::File
+        && let Some(extension) = path.extension().and_then(|extension| extension.to_str())
+        && extension.eq_ignore_ascii_case("md")
+    {
+        let fixed_extension = format!(".{extension}");
+        let stem = name.strip_suffix(&fixed_extension).map_or_else(
+            || {
+                path.file_stem()
+                    .map_or(name.clone(), |stem| stem.to_string_lossy().into_owned())
+            },
+            ToOwned::to_owned,
+        );
+        return (stem, Some(fixed_extension));
+    }
+    (name, None)
+}
+
+fn valid_inline_rename_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+}
+
+fn rebase_ui_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(from).ok()?;
+    Some(if relative.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(relative)
+    })
+}
+
+fn byte_offset_from_utf16(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, character) in text.char_indices() {
+        if utf16 >= offset {
+            return byte;
+        }
+        utf16 += character.len_utf16();
+    }
+    text.len()
+}
+
+fn utf16_offset_from_byte(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, character) in text.char_indices() {
+        if byte >= offset {
+            break;
+        }
+        utf16 += character.len_utf16();
+    }
+    utf16
+}
+
+fn byte_range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    byte_offset_from_utf16(text, range.start)..byte_offset_from_utf16(text, range.end)
+}
+
+fn range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
+    utf16_offset_from_byte(text, range.start)..utf16_offset_from_byte(text, range.end)
+}
+
+fn previous_inline_rename_boundary(text: &str, offset: usize) -> usize {
+    text[..offset]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_inline_rename_boundary(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .chars()
+        .next()
+        .map_or(text.len(), |character| offset + character.len_utf8())
+}
+
+fn inline_rename_cursor(rename: &InlineRename) -> usize {
+    if rename.selection_reversed {
+        rename.selected_range.start
+    } else {
+        rename.selected_range.end
+    }
+}
+
+fn select_inline_rename_to(rename: &mut InlineRename, offset: usize) {
+    if rename.selection_reversed {
+        rename.selected_range.start = offset;
+    } else {
+        rename.selected_range.end = offset;
+    }
+    if rename.selected_range.end < rename.selected_range.start {
+        rename.selection_reversed = !rename.selection_reversed;
+        rename.selected_range = rename.selected_range.end..rename.selected_range.start;
+    }
+}
+
 /// Which of the sidebar's two selection sources is currently shown
 /// highlighted. The two are tracked separately because they change on
 /// different events — the active session swaps whenever a file or draft is
@@ -285,6 +412,13 @@ pub struct EditorView {
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
+    /// Whether the most recent keyboard focus came from the sidebar. The
+    /// editor and sidebar share one view focus handle, so this explicit bit
+    /// prevents an F2 pressed while editing document text from renaming the
+    /// active file merely because its row is highlighted.
+    sidebar_keyboard_focus: bool,
+    /// The row-local inline rename field, if one is active.
+    inline_rename: Option<InlineRename>,
     /// User-adjustable width of the work-folder sidebar.
     sidebar_width: f32,
     /// Active drag of the vertical divider between sidebar and editor.
@@ -614,6 +748,564 @@ impl LayoutCacheEntry {
 }
 
 impl EditorView {
+    pub(crate) fn inline_rename_active(&self) -> bool {
+        self.inline_rename.is_some()
+    }
+
+    pub(crate) fn inline_rename_render_state(&self) -> Option<InlineRenameRenderState> {
+        self.inline_rename
+            .as_ref()
+            .map(|rename| InlineRenameRenderState {
+                text: rename.text.clone(),
+                selected_range: rename.selected_range.clone(),
+                marked_range: rename.marked_range.clone(),
+            })
+    }
+
+    pub(crate) fn inline_rename_text_for_range(
+        &self,
+        range_utf16: Range<usize>,
+    ) -> Option<(String, Range<usize>)> {
+        let rename = self.inline_rename.as_ref()?;
+        let range = byte_range_from_utf16(&rename.text, &range_utf16);
+        Some((
+            rename.text[range.clone()].to_owned(),
+            range_to_utf16(&rename.text, &range),
+        ))
+    }
+
+    pub(crate) fn inline_rename_selection(&self) -> Option<(Range<usize>, bool)> {
+        self.inline_rename.as_ref().map(|rename| {
+            (
+                range_to_utf16(&rename.text, &rename.selected_range),
+                rename.selection_reversed,
+            )
+        })
+    }
+
+    pub(crate) fn inline_rename_marked_range(&self) -> Option<Range<usize>> {
+        let rename = self.inline_rename.as_ref()?;
+        rename
+            .marked_range
+            .as_ref()
+            .map(|range| range_to_utf16(&rename.text, range))
+    }
+
+    pub(crate) fn replace_inline_rename_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return false;
+        };
+        if rename.pending {
+            return true;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|range| byte_range_from_utf16(&rename.text, range))
+            .or_else(|| rename.marked_range.clone())
+            .unwrap_or_else(|| rename.selected_range.clone());
+        let replacement: String = new_text
+            .chars()
+            .filter(|character| *character != '\n' && *character != '\r')
+            .collect();
+        rename.text.replace_range(range.clone(), &replacement);
+        let next = range.start + replacement.len();
+        rename.selected_range = next..next;
+        rename.selection_reversed = false;
+        rename.marked_range = None;
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn replace_and_mark_inline_rename_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return false;
+        };
+        if rename.pending {
+            return true;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|range| byte_range_from_utf16(&rename.text, range))
+            .or_else(|| rename.marked_range.clone())
+            .unwrap_or_else(|| rename.selected_range.clone());
+        let replacement: String = new_text
+            .chars()
+            .filter(|character| *character != '\n' && *character != '\r')
+            .collect();
+        rename.text.replace_range(range.clone(), &replacement);
+        let marked_end = range.start + replacement.len();
+        rename.marked_range = (!replacement.is_empty()).then_some(range.start..marked_end);
+        rename.selected_range = new_selected_range_utf16
+            .map(|selected| byte_range_from_utf16(&rename.text, &selected))
+            .unwrap_or(marked_end..marked_end);
+        rename.selection_reversed = false;
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn unmark_inline_rename(&mut self) {
+        if let Some(rename) = self.inline_rename.as_mut() {
+            rename.marked_range = None;
+        }
+    }
+
+    pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {
+        let rename = self.inline_rename.as_ref()?;
+        (!rename.selected_range.is_empty())
+            .then(|| rename.text[rename.selected_range.clone()].to_owned())
+    }
+
+    pub(crate) fn move_inline_rename_left(&mut self, extend: bool, cx: &mut Context<Self>) {
+        self.move_inline_rename_horizontal(false, extend, cx);
+    }
+
+    pub(crate) fn move_inline_rename_right(&mut self, extend: bool, cx: &mut Context<Self>) {
+        self.move_inline_rename_horizontal(true, extend, cx);
+    }
+
+    fn move_inline_rename_horizontal(&mut self, right: bool, extend: bool, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        if rename.pending {
+            return;
+        }
+        let cursor = if rename.selection_reversed {
+            rename.selected_range.start
+        } else {
+            rename.selected_range.end
+        };
+        let target = if right {
+            next_inline_rename_boundary(&rename.text, cursor)
+        } else {
+            previous_inline_rename_boundary(&rename.text, cursor)
+        };
+        if extend {
+            select_inline_rename_to(rename, target);
+        } else if rename.selected_range.is_empty() {
+            rename.selected_range = target..target;
+            rename.selection_reversed = false;
+        } else {
+            let target = if right {
+                rename.selected_range.end
+            } else {
+                rename.selected_range.start
+            };
+            rename.selected_range = target..target;
+            rename.selection_reversed = false;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_inline_rename_left(&mut self, cx: &mut Context<Self>) {
+        let target = self.inline_rename.as_ref().map(|rename| {
+            previous_inline_rename_boundary(&rename.text, inline_rename_cursor(rename))
+        });
+        if let Some(target) = target {
+            if let Some(rename) = self.inline_rename.as_mut() {
+                select_inline_rename_to(rename, target);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_inline_rename_right(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .inline_rename
+            .as_ref()
+            .map(|rename| next_inline_rename_boundary(&rename.text, inline_rename_cursor(rename)));
+        if let Some(target) = target {
+            if let Some(rename) = self.inline_rename.as_mut() {
+                select_inline_rename_to(rename, target);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_all_inline_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.as_mut()
+            && !rename.pending
+        {
+            rename.selected_range = 0..rename.text.len();
+            rename.selection_reversed = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn move_inline_rename_home(&mut self, cx: &mut Context<Self>) {
+        self.move_inline_rename_to(0, cx);
+    }
+
+    pub(crate) fn move_inline_rename_end(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .inline_rename
+            .as_ref()
+            .map_or(0, |rename| rename.text.len());
+        self.move_inline_rename_to(target, cx);
+    }
+
+    fn move_inline_rename_to(&mut self, target: usize, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.as_mut()
+            && !rename.pending
+        {
+            rename.selected_range = target..target;
+            rename.selection_reversed = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn backspace_inline_rename(&mut self, cx: &mut Context<Self>) {
+        self.delete_inline_rename_with_direction(true, cx);
+    }
+
+    pub(crate) fn delete_inline_rename(&mut self, cx: &mut Context<Self>) {
+        self.delete_inline_rename_with_direction(false, cx);
+    }
+
+    fn delete_inline_rename_with_direction(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        if rename.pending {
+            return;
+        }
+        let range = if rename.selected_range.is_empty() {
+            let cursor = inline_rename_cursor(rename);
+            if backwards {
+                previous_inline_rename_boundary(&rename.text, cursor)..cursor
+            } else {
+                cursor..next_inline_rename_boundary(&rename.text, cursor)
+            }
+        } else {
+            rename.selected_range.clone()
+        };
+        rename.text.replace_range(range.clone(), "");
+        rename.selected_range = range.start..range.start;
+        rename.selection_reversed = false;
+        rename.marked_range = None;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_inline_rename_from_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_keyboard_focus || self.inline_rename.is_some() {
+            return;
+        }
+        let selected = match self.sidebar_focus {
+            SidebarFocus::Folder => self
+                .selected_folder
+                .clone()
+                .map(|path| (path, InlineRenameKind::Folder)),
+            SidebarFocus::ActiveSession => self
+                .active_session()
+                .path()
+                .map(|path| (path.to_path_buf(), InlineRenameKind::File)),
+        };
+        let Some((path, kind)) = selected else {
+            return;
+        };
+        self.begin_inline_rename(path, kind, window, cx);
+    }
+
+    fn begin_inline_rename(
+        &mut self,
+        path: PathBuf,
+        kind: InlineRenameKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.is_some()
+            || self.work_folder.as_ref().is_none_or(|folder| match kind {
+                InlineRenameKind::File => folder.entry_for_path(&path).is_none(),
+                InlineRenameKind::Folder => folder.children_at(&path).is_none(),
+            })
+        {
+            return;
+        }
+        if self.inline_rename_has_background_conflict(&path, kind) {
+            self.status = Some("Rename deferred while another operation is in progress".to_owned());
+            cx.notify();
+            return;
+        }
+        let (text, fixed_extension) = inline_rename_parts(&path, kind);
+        let text_len = text.len();
+        self.inline_rename = Some(InlineRename {
+            kind,
+            from: path,
+            text,
+            fixed_extension,
+            selected_range: 0..text_len,
+            selection_reversed: false,
+            marked_range: None,
+            pending: false,
+        });
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn inline_rename_has_background_conflict(&self, from: &Path, kind: InlineRenameKind) -> bool {
+        let belongs = |path: &Path| match kind {
+            InlineRenameKind::File => path == from,
+            InlineRenameKind::Folder => rebase_ui_path(path, from, from).is_some(),
+        };
+        (kind == InlineRenameKind::Folder
+            && self.pending_new_folders.iter().any(|path| belongs(path)))
+            || self.sessions.sessions().any(|session| {
+                session.path().is_some_and(belongs)
+                    && (session.save_in_flight()
+                        || self.title_sync_in_flight.contains(&session.id())
+                        || self.title_sync_pending.contains_key(&session.id()))
+            })
+            || (kind == InlineRenameKind::Folder
+                && self.work_folder_drafts.iter().any(|(id, draft)| {
+                    belongs(&draft.target_directory)
+                        && (self.title_sync_in_flight.contains(id)
+                            || self.title_sync_pending.contains_key(id))
+                }))
+    }
+
+    fn reserve_inline_rename_tickets(
+        &mut self,
+        from: &Path,
+        kind: InlineRenameKind,
+    ) -> Option<Vec<(SessionId, SaveTicket)>> {
+        let ids: Vec<SessionId> = self
+            .sessions
+            .sessions()
+            .filter(|session| {
+                session.path().is_some_and(|path| match kind {
+                    InlineRenameKind::File => path == from,
+                    InlineRenameKind::Folder => rebase_ui_path(path, from, from).is_some(),
+                })
+            })
+            .map(DocumentSession::id)
+            .collect();
+        if ids.iter().any(|id| {
+            self.sessions
+                .get(*id)
+                .is_some_and(DocumentSession::save_in_flight)
+        }) {
+            return None;
+        }
+        let mut tickets = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(ticket) = self
+                .sessions
+                .get_mut(id)
+                .and_then(DocumentSession::begin_rename)
+            else {
+                for (reserved_id, reserved_ticket) in tickets {
+                    if let Some(session) = self.sessions.get_mut(reserved_id) {
+                        session.finish_rename(reserved_ticket);
+                    }
+                }
+                return None;
+            };
+            tickets.push((id, ticket));
+        }
+        Some(tickets)
+    }
+
+    pub(crate) fn confirm_inline_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_ref() else {
+            return;
+        };
+        if rename.pending {
+            return;
+        }
+        let from = rename.from.clone();
+        let kind = rename.kind;
+        let name = rename.text.clone();
+        let fixed_extension = rename.fixed_extension.clone();
+        if !valid_inline_rename_name(&name) {
+            self.status = Some("Rename failed: invalid file or folder name".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.loading_paths.iter().any(|path| match kind {
+            InlineRenameKind::File => path == &from,
+            InlineRenameKind::Folder => rebase_ui_path(path, &from, &from).is_some(),
+        }) || self.inline_rename_has_background_conflict(&from, kind)
+        {
+            self.status = Some("Rename deferred while another operation is in progress".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(parent) = from.parent() else {
+            self.status = Some("Rename failed: item has no parent directory".to_owned());
+            cx.notify();
+            return;
+        };
+        let file_name =
+            fixed_extension.map_or_else(|| name.clone(), |extension| format!("{name}{extension}"));
+        let target = parent.join(file_name);
+        if target == from {
+            self.inline_rename = None;
+            cx.notify();
+            return;
+        }
+        let Some(tickets) = self.reserve_inline_rename_tickets(&from, kind) else {
+            self.status = Some("Rename deferred while a save is in progress".to_owned());
+            cx.notify();
+            return;
+        };
+        if let Some(rename) = self.inline_rename.as_mut() {
+            rename.pending = true;
+        }
+        self.status = Some("Renaming…".to_owned());
+        let files = self.files.clone();
+        let operation_from = from.clone();
+        let operation_target = target.clone();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match kind {
+                        InlineRenameKind::File => files.rename(&operation_from, &operation_target),
+                        InlineRenameKind::Folder => {
+                            files.rename_folder(&operation_from, &operation_target)
+                        }
+                    }
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.finish_inline_rename(from, target, kind, tickets, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_inline_rename(
+        &mut self,
+        from: PathBuf,
+        target: PathBuf,
+        kind: InlineRenameKind,
+        tickets: Vec<(SessionId, SaveTicket)>,
+        result: std::io::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut queued_saves = Vec::new();
+        for (id, ticket) in tickets {
+            if let Some(session) = self.sessions.get_mut(id) {
+                session.finish_rename(ticket);
+                if let Some(pending) = session.take_pending_save() {
+                    queued_saves.push((id, pending));
+                }
+            }
+        }
+        match result {
+            Ok(()) => {
+                match kind {
+                    InlineRenameKind::File => {
+                        let outcomes = self.sessions.apply_file_event(&FileEvent::Renamed {
+                            from: from.clone(),
+                            to: target.clone(),
+                        });
+                        for (id, outcome) in outcomes {
+                            if outcome == FileEventOutcome::Renamed
+                                && let Some(session) = self.sessions.get_mut(id)
+                            {
+                                session.stop_auto_naming();
+                            }
+                        }
+                        if let Some(folder) = self.work_folder.as_mut() {
+                            folder.rename(&from, &target);
+                        }
+                        self.recent.rename(&from, &target);
+                    }
+                    InlineRenameKind::Folder => {
+                        self.sessions.rename_folder(&from, &target);
+                        if let Some(folder) = self.work_folder.as_mut() {
+                            folder.rename_folder(&from, &target);
+                        }
+                        self.recent.rename_folder(&from, &target);
+                    }
+                }
+                self.follow_inline_rename_paths(&from, &target, kind);
+                if let Err(error) = self.stores.recent_files().store(&self.recent) {
+                    self.status = Some(format!("Recent files failed: {error}"));
+                } else {
+                    self.status = Some("Renamed".to_owned());
+                }
+                self.inline_rename = None;
+            }
+            Err(error) => {
+                if let Some(rename) = self.inline_rename.as_mut() {
+                    rename.pending = false;
+                }
+                self.status = Some(format!("Rename failed: {error}"));
+            }
+        }
+        for (id, pending) in queued_saves {
+            self.save_session(id, pending, cx);
+        }
+        cx.notify();
+    }
+
+    fn follow_inline_rename_paths(&mut self, from: &Path, target: &Path, kind: InlineRenameKind) {
+        let rebase = |path: &Path| match kind {
+            InlineRenameKind::File => (path == from).then(|| target.to_path_buf()),
+            InlineRenameKind::Folder => rebase_ui_path(path, from, target),
+        };
+        if kind == InlineRenameKind::Folder {
+            self.selected_folder = self
+                .selected_folder
+                .take()
+                .map(|path| rebase(&path).unwrap_or(path));
+            let expanded = std::mem::take(&mut self.expanded_folders);
+            self.expanded_folders = expanded
+                .into_iter()
+                .map(|path| rebase(&path).unwrap_or(path))
+                .collect();
+            let pending = std::mem::take(&mut self.pending_new_folders);
+            self.pending_new_folders = pending
+                .into_iter()
+                .map(|path| rebase(&path).unwrap_or(path))
+                .collect();
+            for draft in self.work_folder_drafts.values_mut() {
+                if let Some(path) = rebase(&draft.target_directory) {
+                    draft.target_directory = path;
+                }
+            }
+        }
+        let loading = std::mem::take(&mut self.loading_paths);
+        self.loading_paths = loading
+            .into_iter()
+            .map(|path| rebase(&path).unwrap_or(path))
+            .collect();
+        self.latest_open_target = self
+            .latest_open_target
+            .take()
+            .map(|path| rebase(&path).unwrap_or(path));
+    }
+
+    pub(crate) fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(rename) = self.inline_rename.as_ref() else {
+            return false;
+        };
+        if rename.pending {
+            return true;
+        }
+        self.inline_rename = None;
+        cx.notify();
+        true
+    }
+
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
         Self::from_sessions(
             SessionSet::with_untitled(text, file_label),
@@ -671,6 +1363,8 @@ impl EditorView {
             selected_folder: None,
             sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
+            sidebar_keyboard_focus: false,
+            inline_rename: None,
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
@@ -1339,6 +2033,8 @@ impl EditorView {
     /// and is journalled into the recovery drafts as soon as it holds
     /// anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = false;
         let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
         };
@@ -1364,6 +2060,8 @@ impl EditorView {
     /// target directory for the next new note or folder, both on the same
     /// click: there is no separate disclosure control in this tree.
     fn toggle_and_select_work_folder_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = true;
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
         } else {
@@ -1379,6 +2077,8 @@ impl EditorView {
     /// children are always shown, so unlike a subfolder's row this only ever
     /// selects, never toggles.
     fn select_work_folder_root(&mut self, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = true;
         self.selected_folder = None;
         self.sidebar_focus = SidebarFocus::Folder;
         cx.notify();
@@ -1392,6 +2092,8 @@ impl EditorView {
     /// created, the folder is added to the tree and shown expanded, so it is
     /// immediately visible without waiting for a rescan.
     pub fn new_work_folder_folder(&mut self, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = false;
         let Some(work_folder) = self.work_folder.as_ref() else {
             return;
         };
@@ -1810,6 +2512,8 @@ impl EditorView {
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = false;
         self.open_with_policy(path, OpenPolicy::ReuseActive, cx);
     }
 
@@ -1817,6 +2521,8 @@ impl EditorView {
     /// an unloaded one is loaded into a session of its own, so switching notes
     /// never asks the user to save whatever else happens to be open.
     pub fn open_work_folder_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.cancel_inline_rename(cx);
+        self.sidebar_keyboard_focus = true;
         self.open_with_policy(path, OpenPolicy::NewSession, cx);
     }
 
@@ -2207,6 +2913,11 @@ impl EditorView {
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
         layout.source_at_x_with_bias(visual, row_index, x, &shaper, bias)
+    }
+
+    fn on_editor_mouse_down(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_keyboard_focus = false;
+        self.cancel_inline_rename(cx);
     }
 
     fn on_row_mouse_down(
@@ -3703,6 +4414,7 @@ impl Render for EditorView {
                 .relative()
                 .flex_1()
                 .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
                 .child(InputCapture { input: cx.entity() })
                 .child(
@@ -3823,6 +4535,32 @@ impl EditorView {
         true
     }
 
+    fn inline_rename_label(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(rename) = self.inline_rename.as_ref() else {
+            return div();
+        };
+        let input = div()
+            .id("inline-rename-input")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .items_center()
+            .child(InlineRenameInput { input: cx.entity() });
+        let mut label = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .flex_1()
+            .min_w(px(0.0))
+            .child(input);
+        if let Some(extension) = rename.fixed_extension.as_ref() {
+            label = label.child(div().flex_none().child(extension.clone()));
+        }
+        label
+    }
+
     /// The folder/file tree for the sidebar, when this window was opened onto
     /// a work folder. File and folder rows reserve the same disclosure slot,
     /// so their file/folder icons line up and a folder does not shift when its
@@ -3936,7 +4674,10 @@ impl EditorView {
                     ))
                     .child(work_folder_root_display_name(work_folder.root())),
             )
-            .on_click(cx.listener(|view, _, _, cx| view.select_work_folder_root(cx)));
+            .on_click(cx.listener(|view, _, window, cx| {
+                window.focus(&view.focus_handle);
+                view.select_work_folder_root(cx);
+            }));
         let mut rows = Vec::new();
         flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
         let tree_row_count = rows.len();
@@ -3951,8 +4692,23 @@ impl EditorView {
                         let is_active = self.sidebar_focus == SidebarFocus::ActiveSession
                             && active_path == Some(entry.path());
                         let path = entry.path().to_path_buf();
+                        let is_renaming = self
+                            .inline_rename
+                            .as_ref()
+                            .is_some_and(|rename| rename.from == path);
+                        let name = if is_renaming {
+                            self.inline_rename_label(cx)
+                        } else {
+                            file_name_label(
+                                entry.file_name(),
+                                today,
+                                &self.theme,
+                                DateBadgePosition::Right,
+                            )
+                        };
                         div()
                             .id(("work-folder-entry", index))
+                            .debug_selector(|| "sidebar-file".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
                             .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
@@ -3973,15 +4729,27 @@ impl EditorView {
                                         None,
                                         self.theme.sidebar_foreground,
                                     ))
-                                    .child(file_name_label(
-                                        entry.file_name(),
-                                        today,
-                                        &self.theme,
-                                        DateBadgePosition::Right,
-                                    )),
+                                    .child(name),
                             )
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.open_work_folder_entry(&path, cx);
+                            .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                                window.focus(&view.focus_handle);
+                                if !event.is_keyboard() && event.click_count() >= 2 {
+                                    view.sidebar_keyboard_focus = true;
+                                    view.begin_inline_rename(
+                                        path.clone(),
+                                        InlineRenameKind::File,
+                                        window,
+                                        cx,
+                                    );
+                                } else if view
+                                    .inline_rename
+                                    .as_ref()
+                                    .is_some_and(|rename| rename.from == path)
+                                {
+                                    window.focus(&view.focus_handle);
+                                } else {
+                                    view.open_work_folder_entry(&path, cx);
+                                }
                             }))
                     }
                     WorkFolderNode::Folder(folder) => {
@@ -3989,13 +4757,26 @@ impl EditorView {
                             && self.selected_folder.as_deref() == Some(folder.path());
                         let is_expanded = self.expanded_folders.contains(folder.path());
                         let path = folder.path().to_path_buf();
+                        let is_renaming = self
+                            .inline_rename
+                            .as_ref()
+                            .is_some_and(|rename| rename.from == path);
                         let disclosure = if is_expanded {
                             icons::ICON_CHEVRON_DOWN
                         } else {
                             icons::ICON_CHEVRON_RIGHT
                         };
+                        let name = if is_renaming {
+                            self.inline_rename_label(cx)
+                        } else {
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(folder.name().to_owned())
+                        };
                         div()
                             .id(("work-folder-folder", index))
+                            .debug_selector(|| "sidebar-folder".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
                             .pl(left_padding)
                             .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
@@ -4016,10 +4797,27 @@ impl EditorView {
                                         Some(disclosure),
                                         self.theme.sidebar_foreground,
                                     ))
-                                    .child(folder.name().to_owned()),
+                                    .child(name),
                             )
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.toggle_and_select_work_folder_folder(path.clone(), cx);
+                            .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                                window.focus(&view.focus_handle);
+                                if !event.is_keyboard() && event.click_count() >= 2 {
+                                    view.sidebar_keyboard_focus = true;
+                                    view.begin_inline_rename(
+                                        path.clone(),
+                                        InlineRenameKind::Folder,
+                                        window,
+                                        cx,
+                                    );
+                                } else if view
+                                    .inline_rename
+                                    .as_ref()
+                                    .is_some_and(|rename| rename.from == path)
+                                {
+                                    window.focus(&view.focus_handle);
+                                } else {
+                                    view.toggle_and_select_work_folder_folder(path.clone(), cx);
+                                }
                             }))
                     }
                 }
@@ -4062,6 +4860,8 @@ impl EditorView {
                             .child(draft_preview(session)),
                     )
                     .on_click(cx.listener(move |view, _, _, cx| {
+                        view.cancel_inline_rename(cx);
+                        view.sidebar_keyboard_focus = true;
                         view.activate_session(id, cx);
                     }))
             })
@@ -4252,6 +5052,7 @@ impl EditorView {
             .flex_none()
             .flex()
             .flex_col()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
             .bg(rgb(self.theme.header_background))
             .text_color(rgb(self.theme.header_foreground))
             .child(
@@ -4420,6 +5221,42 @@ mod tests {
     fn the_date_badge_renders_before_the_remainder_only_on_the_left() {
         assert!(badge_renders_before_remainder(DateBadgePosition::Left));
         assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
+    }
+
+    #[test]
+    fn inline_rename_keeps_markdown_extensions_out_of_the_editable_text() {
+        assert_eq!(
+            inline_rename_parts(Path::new("Meeting 2026-09-19.md"), InlineRenameKind::File),
+            ("Meeting 2026-09-19".to_owned(), Some(".md".to_owned()))
+        );
+        assert_eq!(
+            inline_rename_parts(Path::new("Upper.MD"), InlineRenameKind::File),
+            ("Upper".to_owned(), Some(".MD".to_owned()))
+        );
+        assert_eq!(
+            inline_rename_parts(Path::new("folder"), InlineRenameKind::Folder),
+            ("folder".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn inline_rename_rejects_names_that_escape_the_parent_directory() {
+        for name in ["", ".", "..", "folder/name", r"folder\name"] {
+            assert!(!valid_inline_rename_name(name), "{name:?} must be rejected");
+        }
+        assert!(valid_inline_rename_name("Meeting 2026-09-19"));
+    }
+
+    #[test]
+    fn folder_rename_path_rebasing_preserves_unrelated_ui_paths() {
+        let root = Path::new("/tmp/hane-217");
+        let from = root.join("Project");
+        let to = root.join("Renamed");
+        assert_eq!(
+            rebase_ui_path(&from.join("Deep/Child.md"), &from, &to),
+            Some(to.join("Deep/Child.md"))
+        );
+        assert_eq!(rebase_ui_path(&root.join("Other"), &from, &to), None);
     }
 
     // Regression coverage for the sidebar's `本日` badge going stale across a
@@ -7255,5 +8092,200 @@ mod tests {
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    fn open_inline_rename_test_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        root: &Path,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let work_folder = OsWorkFolderScanner.scan(root).unwrap();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, point: gpui::Point<gpui::Pixels>) {
+        let modifiers = gpui::Modifiers::none();
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: point,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: point,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 1,
+        });
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: point,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: point,
+            modifiers,
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_file_f2_escape_and_enter_rename_without_touching_the_extension(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-file");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = root.join("Plain.md");
+        std::fs::write(&original, "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        cx.simulate_click(file_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.inline_rename_active(),
+                "F2 must open the row-local field"
+            );
+            assert_eq!(
+                view.inline_rename
+                    .as_ref()
+                    .unwrap()
+                    .fixed_extension
+                    .as_deref(),
+                Some(".md")
+            );
+        });
+
+        cx.simulate_input("Discarded");
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
+        assert!(original.exists());
+        assert!(!root.join("Discarded.md").exists());
+
+        cx.simulate_keystrokes("f2");
+        cx.simulate_input("Renamed");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(!original.exists());
+        assert!(root.join("Renamed.md").exists());
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().path(),
+                Some(root.join("Renamed.md").as_path())
+            );
+            assert!(!view.inline_rename_active());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_file_and_folder_double_click_start_inline_rename_but_root_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("inline-rename-double-click");
+        std::fs::create_dir_all(root.join("Project")).unwrap();
+        std::fs::write(root.join("Plain.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let file_point = cx.debug_bounds("sidebar-file").unwrap().center();
+        simulate_double_click(cx, file_point);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.inline_rename.as_ref().map(|rename| rename.kind),
+                Some(InlineRenameKind::File)
+            );
+        });
+        cx.simulate_keystrokes("escape");
+
+        let folder_point = cx.debug_bounds("sidebar-folder").unwrap().center();
+        simulate_double_click(cx, folder_point);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.inline_rename.as_ref().map(|rename| rename.kind),
+                Some(InlineRenameKind::Folder)
+            );
+        });
+        cx.simulate_keystrokes("escape");
+
+        let root_point = cx.debug_bounds("sidebar-root").unwrap().center();
+        simulate_double_click(cx, root_point);
+        cx.simulate_keystrokes("f2");
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.inline_rename_active(),
+                "the work-folder root is not a rename target"
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn folder_rename_moves_open_file_and_save_follows_the_new_path(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("inline-rename-folder-save");
+        let project = root.join("Project");
+        let nested = project.join("Nested.md");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&nested, "before").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| view.open_work_folder_entry(&nested, cx));
+        cx.run_until_parked();
+        let folder_point = cx.debug_bounds("sidebar-folder").unwrap().center();
+        simulate_double_click(cx, folder_point);
+        cx.simulate_input("RenamedProject");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let renamed_project = root.join("RenamedProject");
+        let renamed_nested = renamed_project.join("Nested.md");
+        assert!(!project.exists());
+        assert!(renamed_nested.exists());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(renamed_nested.as_path()));
+            assert_eq!(
+                view.selected_folder.as_deref(),
+                Some(renamed_project.as_path())
+            );
+            assert!(view.expanded_folders.contains(&renamed_project));
+        });
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+        });
+        cx.run_until_parked();
+        assert!(!project.exists());
+        assert_eq!(
+            std::fs::read_to_string(renamed_nested).unwrap(),
+            "before after"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

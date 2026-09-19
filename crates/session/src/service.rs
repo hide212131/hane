@@ -63,6 +63,11 @@ pub trait FileService: Send + Sync + 'static {
     /// caller picks a different target and retries instead.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
+    /// Renames a directory without replacing an existing file or directory at
+    /// `to`. The operation stays at the filesystem boundary so callers never
+    /// need to compose a check and `std::fs::rename` themselves.
+    fn rename_folder(&self, from: &Path, to: &Path) -> io::Result<()>;
+
     /// Creates `path` as a directory, including any missing parent
     /// directories. Creating a directory that already exists is not an
     /// error, the same as `std::fs::create_dir_all`.
@@ -145,8 +150,89 @@ impl FileService for OsFileService {
         fs::remove_file(from)
     }
 
+    fn rename_folder(&self, from: &Path, to: &Path) -> io::Result<()> {
+        rename_directory_without_replace(from, to)
+    }
+
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
+    }
+}
+
+/// Renames a directory using the platform's no-replace primitive. Plain
+/// `fs::rename` is intentionally not used here: on Unix it can replace an
+/// existing empty directory, which would violate the same collision rule as
+/// file rename. If a platform cannot provide an atomic no-replace directory
+/// rename, fail closed rather than risking data loss.
+fn rename_directory_without_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let from = CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source contains NUL"))?;
+        let to = CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target contains NUL"))?;
+        let result = unsafe {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        (result == 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let from = CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source contains NUL"))?;
+        let to = CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target contains NUL"))?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        (result == 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows' MoveFileEx implementation, which backs std::fs::rename,
+        // refuses an existing destination unless the replace flag is passed.
+        // Keep the explicit existence check for a useful, deterministic error
+        // and retain the no-replace call at the OS boundary.
+        if to.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename target already exists",
+            ));
+        }
+        return fs::rename(from, to);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory rename without replacement is unsupported on this platform",
+        ))
     }
 }
 
@@ -299,6 +385,34 @@ mod tests {
         assert!(OsFileService.rename(&from, &to).is_err());
         assert_eq!(fs::read_to_string(&from).unwrap(), "mine\n");
         assert_eq!(fs::read_to_string(&to).unwrap(), "theirs\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_rename_moves_descendants_without_replacing_an_existing_folder() {
+        let root = temporary_directory("folder-rename");
+        fs::create_dir_all(root.join("Project/Deep")).unwrap();
+        fs::write(root.join("Project/Deep/Child.md"), "child\n").unwrap();
+        fs::create_dir_all(root.join("ExistingFolder")).unwrap();
+        fs::write(root.join("ExistingFolder/keep.md"), "keep\n").unwrap();
+
+        let from = root.join("Project");
+        let to = root.join("Renamed");
+        OsFileService.rename_folder(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(
+            fs::read_to_string(to.join("Deep/Child.md")).unwrap(),
+            "child\n"
+        );
+
+        let collision = OsFileService.rename_folder(&to, &root.join("ExistingFolder"));
+        assert!(collision.is_err());
+        assert!(to.join("Deep/Child.md").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("ExistingFolder/keep.md")).unwrap(),
+            "keep\n"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

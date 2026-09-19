@@ -302,10 +302,9 @@ fn remove_folder(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> Option<WorkFol
     if let Some(index) = nodes
         .iter()
         .position(|node| matches!(node, WorkFolderNode::Folder(folder) if folder.path() == path))
+        && let WorkFolderNode::Folder(folder) = nodes.remove(index)
     {
-        if let WorkFolderNode::Folder(folder) = nodes.remove(index) {
-            return Some(folder);
-        }
+        return Some(folder);
     }
     for node in nodes.iter_mut() {
         if let WorkFolderNode::Folder(folder) = node
