@@ -1313,53 +1313,41 @@ def run_boundary_ime_step(module, env, config, swift_helper, process_holder, win
         if JAPANESE_SOURCE not in available:
             steps.append(make_step(name, "blocked", reason="このランナーに組み込みの日本語入力ソースが見つからない"))
             return steps
-
         reset = _move_to_neutral(swift_helper, pid, helper_timeout, "boundary_ime_input_reset_before")
         steps.append(reset)
         if reset["result"] != "pass":
             steps.append(make_step(name, "blocked", reason=reset.get("reason")))
             return steps
-
         capture = capture_named(module, env, config, window_id, run_dir, "boundary_ime_input")
         steps.append(capture)
         if capture["result"] != "pass":
             steps.append(make_step(name, "blocked", reason=capture.get("reason")))
             return steps
         screenshot = run_dir / "boundary_ime_input.png"
-
-        ok, _out, err = run_helper(
-            swift_helper, ["click-text", str(pid), str(screenshot), BOLD_ITALIC_OCR_RE, "start"], helper_timeout
-        )
+        ok, _out, err = run_helper(swift_helper, ["click-text", str(pid), str(screenshot), BOLD_ITALIC_OCR_RE, "start"], helper_timeout)
         if not ok:
             steps.append(make_step(name, "blocked", reason=f"IME 境界クリックに失敗した: {err}"))
             return steps
-
-        ok, _out, err = run_helper(
-            swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_ROMAJI, JAPANESE_SOURCE], helper_timeout
-        )
+        ok, _out, err = run_helper(swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_ROMAJI, JAPANESE_SOURCE], helper_timeout)
         if not ok:
-            steps.append(make_step(name, "blocked", reason=f"境界 IME 入力 helper に失敗した: {err}"))
+            steps.append(make_step(name, "blocked", reason=f"境界 IME 入力に失敗した: {err}"))
             return steps
-
         expected = insert_at_match(INLINE_FIXTURE_ORIGINAL, BOLD_ITALIC_OPEN_RE, IME_EXPECTED_TEXT, edge="end")
         matched, actual = wait_for_fixture_bytes(config.fixture_path, expected.encode("utf-8"), poll_timeout)
         detail = {"screenshot": str(screenshot), "expected_after_insert": expected, "actual_after_insert": _decode(actual)}
-        steps.append(make_step("boundary_ime_input_check", "pass" if matched else "fail",
-                               reason=None if matched else "境界 IME 入力後の内容が期待する日本語バイト列と一致しない",
-                               **detail))
         if not matched:
+            steps.append(make_step("boundary_ime_input_check", "fail", reason="境界 IME 入力後の内容が期待値と一致しない", **detail))
             steps.append(make_step(name, "fail", reason="境界 IME 入力後の内容が期待値と一致しない"))
             return steps
-
         ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
         if not ok:
             steps.append(make_step(name, "blocked", reason=f"境界 IME undo に失敗した: {err}"))
             return steps
-        undo_matched, undo_actual = wait_for_fixture_bytes(config.fixture_path, INLINE_FIXTURE_ORIGINAL.encode("utf-8"), poll_timeout)
-        undo_detail = {"expected_after_undo": INLINE_FIXTURE_ORIGINAL, "actual_after_undo": _decode(undo_actual)}
-        steps.append(make_step("boundary_ime_input_undo_check", "pass" if undo_matched else "fail",
-                               reason=None if undo_matched else "境界 IME undo 後に元の内容へ戻らない", **undo_detail))
-        if not undo_matched:
+        matched, actual = wait_for_fixture_bytes(config.fixture_path, INLINE_FIXTURE_ORIGINAL.encode("utf-8"), poll_timeout)
+        detail.update(expected_after_undo=INLINE_FIXTURE_ORIGINAL, actual_after_undo=_decode(actual))
+        steps.append(make_step("boundary_ime_input_check", "pass" if matched else "fail",
+                               reason=None if matched else "境界 IME undo 後に元の内容へ戻らない", **detail))
+        if not matched:
             steps.append(make_step(name, "fail", reason="境界 IME undo 後に元の内容へ戻らない"))
             return steps
         reset = _move_to_neutral(swift_helper, pid, helper_timeout, "boundary_ime_input_reset_after")
