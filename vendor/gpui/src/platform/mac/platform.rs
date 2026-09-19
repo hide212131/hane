@@ -68,6 +68,8 @@ const NSUTF8StringEncoding: NSUInteger = 4;
 const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
+#[cfg(test)]
+static TEST_KEY_WINDOW_OVERRIDE: OnceLock<Mutex<Option<Option<usize>>>> = OnceLock::new();
 
 #[ctor]
 unsafe fn build_classes() {
@@ -1441,6 +1443,87 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
             .lock()
             .on_keyboard_layout_change
             .get_or_insert(callback);
+    } else {
+        drop(lock);
+    }
+    reactivate_key_window_text_input_context();
+}
+
+// AppKit associates each NSResponder's NSTextInputContext with whichever input
+// source (keyboard layout or input method) was current the last time that
+// context was activated, which normally happens when the responder becomes
+// first responder. Switching to a different input method (e.g. a Japanese
+// Romaji source) while our window is already key and first responder does
+// not by itself refresh that association: Text Services Manager keeps
+// composing (or not composing) based on the stale source, so printable keys
+// fall straight through as literal, unconverted characters instead of
+// starting a composition.
+//
+// `NSTextInputContextKeyboardSelectionDidChangeNotification` fires for
+// exactly this kind of change. Deactivating and activating the key window's
+// current text input context here emulates the responder transition that
+// AppKit normally performs and forces TSM to bind the context to the new
+// input source immediately instead of waiting for the next focus change.
+fn reactivate_key_window_text_input_context() {
+    let key_window = current_key_window();
+    reactivate_text_input_context_for_window(key_window);
+}
+
+fn reactivate_text_input_context_for_window(key_window: id) {
+    unsafe {
+        if key_window.is_null() {
+            return;
+        }
+        let responder: id = msg_send![key_window, firstResponder];
+        if responder.is_null() {
+            return;
+        }
+        let responds_to_input_context: BOOL =
+            msg_send![responder, respondsToSelector: sel!(inputContext)];
+        if responds_to_input_context != YES {
+            return;
+        }
+        let input_context: id = msg_send![responder, inputContext];
+        if input_context.is_null() {
+            return;
+        }
+        if input_context_reactivation_in_progress() {
+            return;
+        }
+        let _guard = InputContextReactivationGuard;
+        let _: () = msg_send![input_context, deactivate];
+        let _: () = msg_send![input_context, activate];
+    }
+}
+
+fn current_key_window() -> id {
+    #[cfg(test)]
+    if let Some(key_window) = *TEST_KEY_WINDOW_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        return key_window.map_or(nil, |key_window| key_window as id);
+    }
+
+    unsafe {
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        msg_send![app, keyWindow]
+    }
+}
+
+thread_local! {
+    static INPUT_CONTEXT_REACTIVATION_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
+fn input_context_reactivation_in_progress() -> bool {
+    INPUT_CONTEXT_REACTIVATION_IN_PROGRESS.with(|in_progress| in_progress.replace(true))
+}
+
+struct InputContextReactivationGuard;
+
+impl Drop for InputContextReactivationGuard {
+    fn drop(&mut self) {
+        INPUT_CONTEXT_REACTIVATION_IN_PROGRESS.with(|in_progress| in_progress.set(false));
     }
 }
 
@@ -1661,9 +1744,348 @@ impl UTType {
 
 #[cfg(test)]
 mod tests {
-    use crate::ClipboardItem;
+    use std::{
+        ops::Range,
+        ptr,
+        sync::{
+            atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
+    use objc::{declare::ClassDecl, runtime::Class};
+    use parking_lot::Mutex;
+
+    use crate::{
+        App, Bounds, ClipboardItem, Empty, InputHandler, PlatformInputHandler, Point,
+        TestAppContext, UTF16Selection, Window,
+    };
+
+    use super::super::NSRange as GpuiNSRange;
+    use super::super::window::{insert_text, with_test_input_handler};
     use super::*;
+
+    const TEST_DOCUMENT: &str =
+        "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Gamma row\n";
+    const TEST_COMMIT_TEXT: &str = "日本語";
+    const TEST_COMMIT_OFFSET: usize = "# Normal List Editing Fixture\n\n3. Alpha row".len();
+
+    static TEST_ACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_DEACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_REENTER_ON_DEACTIVATE: AtomicBool = AtomicBool::new(false);
+    static TEST_NOTIFICATION_OBSERVER: AtomicPtr<Object> = AtomicPtr::new(ptr::null_mut());
+
+    #[derive(Debug)]
+    struct TestInputState {
+        document: String,
+        commit_count: usize,
+        commit_range: Option<Range<usize>>,
+        commit_text: String,
+    }
+
+    struct TestInputHandler {
+        state: Arc<Mutex<TestInputState>>,
+    }
+
+    impl InputHandler for TestInputHandler {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET,
+                reversed: false,
+            })
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            range_utf16: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            self.state.lock().document.get(range_utf16).map(str::to_owned)
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            replacement_range: Option<Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            let mut state = self.state.lock();
+            let range = replacement_range.unwrap_or(TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET);
+            state.document.replace_range(range.clone(), text);
+            state.commit_count += 1;
+            state.commit_range = Some(range);
+            state.commit_text = text.to_owned();
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            _: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<crate::Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<crate::Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
+    extern "C" fn test_key_window_first_responder(this: &Object, _: Sel) -> id {
+        unsafe { *this.get_ivar::<id>("firstResponder") }
+    }
+
+    extern "C" fn test_responder_input_context(this: &Object, _: Sel) -> id {
+        unsafe { *this.get_ivar::<id>("inputContext") }
+    }
+
+    extern "C" fn test_input_context_activate(this: &Object, _: Sel) {
+        TEST_ACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            let client = *this.get_ivar::<id>("client");
+            if !client.is_null() {
+                let text = *this.get_ivar::<id>("commitText");
+                let replacement_range = GpuiNSRange {
+                    location: *this.get_ivar::<NSUInteger>("commitOffset"),
+                    length: *this.get_ivar::<NSUInteger>("commitLength"),
+                };
+                let _: () = msg_send![client, insertText: text replacementRange: replacement_range];
+            }
+        }
+    }
+
+    extern "C" fn test_input_context_deactivate(_: &Object, _: Sel) {
+        TEST_DEACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+        if TEST_REENTER_ON_DEACTIVATE.swap(false, Ordering::SeqCst) {
+            let delegate = TEST_NOTIFICATION_OBSERVER.load(Ordering::SeqCst);
+            if !delegate.is_null() {
+                unsafe { post_keyboard_selection_change_notification() };
+            }
+        }
+    }
+
+    extern "C" fn test_responder_insert_text(
+        this: &Object,
+        selector: Sel,
+        text: id,
+        replacement_range: GpuiNSRange,
+    ) {
+        insert_text(this, selector, text, replacement_range);
+    }
+
+    fn test_classes() -> (*const Class, *const Class, *const Class) {
+        static CLASSES: OnceLock<(usize, usize, usize)> = OnceLock::new();
+        let (key_window, responder, input_context) = *CLASSES.get_or_init(|| unsafe {
+            let mut input_context = ClassDecl::new("HaneImeTestInputContext", class!(NSObject))
+                .unwrap();
+            input_context.add_ivar::<id>("client");
+            input_context.add_ivar::<id>("commitText");
+            input_context.add_ivar::<NSUInteger>("commitOffset");
+            input_context.add_ivar::<NSUInteger>("commitLength");
+            input_context.add_method(
+                sel!(activate),
+                test_input_context_activate as extern "C" fn(&Object, Sel),
+            );
+            input_context.add_method(
+                sel!(deactivate),
+                test_input_context_deactivate as extern "C" fn(&Object, Sel),
+            );
+            let input_context = input_context.register() as *const Class as usize;
+
+            let mut responder = ClassDecl::new("HaneImeTestResponder", class!(NSObject)).unwrap();
+            responder.add_ivar::<id>("inputContext");
+            responder.add_method(
+                sel!(inputContext),
+                test_responder_input_context as extern "C" fn(&Object, Sel) -> id,
+            );
+            responder.add_method(
+                sel!(insertText:replacementRange:),
+                test_responder_insert_text as extern "C" fn(&Object, Sel, id, GpuiNSRange),
+            );
+            let responder = responder.register() as *const Class as usize;
+
+            let mut key_window = ClassDecl::new("HaneImeTestKeyWindow", class!(NSObject)).unwrap();
+            key_window.add_ivar::<id>("firstResponder");
+            key_window.add_method(
+                sel!(firstResponder),
+                test_key_window_first_responder as extern "C" fn(&Object, Sel) -> id,
+            );
+            let key_window = key_window.register() as *const Class as usize;
+
+            (key_window, responder, input_context)
+        });
+
+        (
+            key_window as *const Class,
+            responder as *const Class,
+            input_context as *const Class,
+        )
+    }
+
+    unsafe fn new_test_object(class: *const Class) -> id {
+        msg_send![class, new]
+    }
+
+    unsafe fn post_keyboard_selection_change(delegate: id) {
+        let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = unsafe { ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification") };
+        let _: () = msg_send![notification_center, addObserver: delegate
+            selector: sel!(onKeyboardLayoutChange:)
+            name: name
+            object: nil
+        ];
+        unsafe { post_keyboard_selection_change_notification() };
+        let _: () = msg_send![notification_center, removeObserver: delegate name: name object: nil];
+    }
+
+    unsafe fn post_keyboard_selection_change_notification() {
+        let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = unsafe { ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification") };
+        let _: () = msg_send![notification_center, postNotificationName: name object: nil];
+    }
+
+    #[test]
+    fn keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders() {
+        let platform = MacPlatform::new(false);
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        platform.on_keyboard_layout_change(Box::new({
+            let callback_count = callback_count.clone();
+            move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let (key_window_class, responder_class, input_context_class) = test_classes();
+        let input_context = unsafe { new_test_object(input_context_class) };
+        TEST_ACTIVATE_COUNT.store(0, Ordering::SeqCst);
+        TEST_DEACTIVATE_COUNT.store(0, Ordering::SeqCst);
+        TEST_REENTER_ON_DEACTIVATE.store(true, Ordering::SeqCst);
+        let text_responder = unsafe { new_test_object(responder_class) };
+        unsafe {
+            (*text_responder).set_ivar("inputContext", input_context);
+            (*input_context).set_ivar("client", text_responder);
+            (*input_context).set_ivar("commitText", ns_string(TEST_COMMIT_TEXT));
+            (*input_context).set_ivar("commitOffset", TEST_COMMIT_OFFSET as NSUInteger);
+            (*input_context).set_ivar("commitLength", 0usize as NSUInteger);
+        }
+        let key_window = unsafe { new_test_object(key_window_class) };
+        unsafe {
+            (*key_window).set_ivar("firstResponder", text_responder);
+        }
+
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(Some(key_window as usize));
+        let delegate = unsafe {
+            let delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+            (*delegate).set_ivar(
+                MAC_PLATFORM_IVAR,
+                &platform as *const MacPlatform as *mut c_void,
+            );
+            delegate
+        };
+        TEST_NOTIFICATION_OBSERVER.store(delegate, Ordering::SeqCst);
+
+        let state = Arc::new(Mutex::new(TestInputState {
+            document: TEST_DOCUMENT.to_owned(),
+            commit_count: 0,
+            commit_range: None,
+            commit_text: String::new(),
+        }));
+        let mut test_app = TestAppContext::single();
+        let (_, test_window_cx) = test_app.add_window_view(|_, _| Empty);
+        let async_window_context = test_window_cx.update(|window, cx| window.to_async(cx));
+        let input_handler = PlatformInputHandler::new(
+            async_window_context,
+            Box::new(TestInputHandler {
+                state: state.clone(),
+            }),
+        );
+
+        with_test_input_handler(input_handler, || {
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                callback_count.load(Ordering::SeqCst),
+                2,
+                "the outer and reentrant notifications both reach the mapper callback"
+            );
+
+            let input_state = state.lock();
+            assert_eq!(input_state.commit_count, 1);
+            assert_eq!(
+                input_state.commit_range,
+                Some(TEST_COMMIT_OFFSET..TEST_COMMIT_OFFSET)
+            );
+            assert_eq!(input_state.commit_text, TEST_COMMIT_TEXT);
+            assert_eq!(
+                input_state.document,
+                "# Normal List Editing Fixture\n\n3. Alpha row日本語\n41. Beta row\n100. Gamma row\n"
+            );
+            drop(input_state);
+
+            *TEST_KEY_WINDOW_OVERRIDE
+                .get_or_init(|| Mutex::new(None))
+                .lock() = Some(None);
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            let non_text_responder: id = unsafe { msg_send![class!(NSObject), new] };
+            unsafe {
+                (*key_window).set_ivar("firstResponder", non_text_responder);
+            }
+            *TEST_KEY_WINDOW_OVERRIDE
+                .get_or_init(|| Mutex::new(None))
+                .lock() = Some(Some(key_window as usize));
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            let contextless_responder = unsafe { new_test_object(responder_class) };
+            unsafe {
+                (*contextless_responder).set_ivar("inputContext", nil);
+                (*key_window).set_ivar("firstResponder", contextless_responder);
+            }
+            unsafe { post_keyboard_selection_change(delegate) };
+
+            assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(state.lock().commit_count, 1);
+        });
+
+        TEST_NOTIFICATION_OBSERVER.store(ptr::null_mut(), Ordering::SeqCst);
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = None;
+    }
 
     #[test]
     fn test_clipboard() {

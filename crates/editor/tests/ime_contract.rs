@@ -65,6 +65,34 @@ fn ime_marked_range_selection_commit_and_undo_share_one_source_contract() {
 }
 
 #[test]
+fn ime_commit_on_ordered_list_row_inserts_once_at_expected_offset() {
+    let mut editor = Editor::new("3. Alpha row\n4. Beta row");
+    let caret = "3. Alpha row".len();
+    editor
+        .set_selection(Selection::caret(SourceOffset(caret)))
+        .unwrap();
+
+    editor.replace_and_mark_text(None, "nihongo", None).unwrap();
+    let ime = editor.ime().expect("composition must remain active");
+    assert_eq!(ime.marked_text, "nihongo");
+    assert_eq!(
+        ime.current_range,
+        SourceRange::new(caret, caret + "nihongo".len())
+    );
+
+    editor.commit_text(None, "日本語").unwrap();
+    assert!(editor.ime().is_none());
+    assert_eq!(
+        editor.document().full_text(),
+        "3. Alpha row日本語\n4. Beta row"
+    );
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(SourceOffset(caret + "日本語".len()))
+    );
+}
+
+#[test]
 fn extended_vertical_selection_remains_on_source_boundaries() {
     let mut editor = Editor::new("日本🙂\n短い\ne\u{301}nd");
     editor
