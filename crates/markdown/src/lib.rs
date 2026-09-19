@@ -557,6 +557,13 @@ impl LocalBlockIndex {
             revision: self.revision,
             confidence: Confidence::Provisional,
             line_count,
+            // This window is a bounded approximation (see the struct docs): its
+            // own first tiled block may start mid-block when the real block
+            // began above `LOCAL_BLOCK_LOOKBACK`, so a slice-first-line read
+            // here could report a fence shape that is not the block's real
+            // opening. Left unset; `present_block_with_list_projection` falls
+            // back to its own window-based check for these provisional blocks.
+            opening_fence: None,
         }
     }
 
@@ -617,7 +624,7 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()
-        .map(|(kind, length, lines)| {
+        .map(|(kind, length, lines, _)| {
             let range = SourceRange::new(offset, offset + length);
             offset += length;
             (kind, range, lines)

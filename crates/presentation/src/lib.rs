@@ -987,16 +987,21 @@ pub fn present_block_with_list_projection(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
-    // Only available when the block's own first physical line is loaded into
-    // `window.lines` (see [`BlockWindow::lines`]); a huge block scrolled past
-    // its opening line never reads it just to check this, so a closing-shaped
-    // last line without it stays literal content (see `fence_edge`) rather
-    // than guessing.
-    let opening_fence = window
-        .lines
-        .first()
-        .filter(|line| line.line == window.span.start)
-        .and_then(|line| fence_marker(line.text));
+    // `block.opening_fence` is read once from the block's own first physical
+    // line when the block is (re-)parsed (see [`IndexedBlock::opening_fence`]),
+    // so it stays available even once a huge block is scrolled past its own
+    // opening line. Blocks that carry no such cached shape — a bounded
+    // provisional window that itself begins mid-block (see
+    // [`hane_markdown::LocalBlockIndex`]) — fall back to reading the opening
+    // line straight out of `window.lines`, exactly as before, which only works
+    // when that line happens to be loaded into this window.
+    let opening_fence = block.opening_fence.or_else(|| {
+        window
+            .lines
+            .first()
+            .filter(|line| line.line == window.span.start)
+            .and_then(|line| fence_marker(line.text))
+    });
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
         if run_uses_shared_parse(run.len(), window.joined) {
@@ -2878,10 +2883,10 @@ fn present_fenced_code_line(
 /// same marker character and a run at least as long as the opening's, so a
 /// last physical line that merely looks fence-shaped never closes a longer or
 /// differently-marked opening; it stays literal code content instead.
-/// `opening` is `None` when the opening line itself is not loaded (a large
-/// block scrolled away from its own top), in which case the candidate
-/// closing line cannot be verified and is likewise left as content rather
-/// than guessed.
+/// `opening` is `None` when the opening line's shape is neither cached on the
+/// block (see [`IndexedBlock::opening_fence`]) nor loaded into the current
+/// window, in which case the candidate closing line cannot be verified and is
+/// likewise left as content rather than guessed.
 fn fence_edge(
     span_start: usize,
     content_end: usize,
@@ -4145,6 +4150,7 @@ mod tests {
                 revision: Revision(1),
                 confidence: Confidence::Formal,
                 line_count: lines.len(),
+                opening_fence: None,
             };
             let joined = parse_joined_block(&lines, Revision(1));
             let window = BlockWindow {
@@ -4763,6 +4769,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            opening_fence: None,
         };
         let joined = parse_joined_block(&lines, Revision(1));
         // Empty ranges represent carets; non-empty ranges also cover selection
@@ -4832,6 +4839,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            opening_fence: None,
         };
         let window = BlockWindow {
             span: 0..2,
@@ -4913,6 +4921,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 3,
+            opening_fence: None,
         };
         let window = BlockWindow {
             span: 0..3,
@@ -5003,6 +5012,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            opening_fence: None,
         };
         let joined = parse_joined_block(&lines, Revision(1));
 
@@ -5099,6 +5109,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: lines.len(),
+            opening_fence: None,
         };
         let window = BlockWindow {
             span: 0..lines.len(),
@@ -5453,5 +5464,81 @@ mod tests {
         assert_eq!(block.kind, BlockKind::CodeBlock);
         assert_eq!(block.visual_text, source);
         assert_eq!(block.disclosure, disclosure);
+    }
+
+    #[test]
+    fn closing_fence_stays_hidden_whether_the_window_holds_the_opening_line_or_only_the_tail() {
+        // Regression for a huge fenced block scrolled down until only its
+        // closing line remains in `window.lines`: the block's own opening
+        // fence shape must come from `IndexedBlock::opening_fence` (cached
+        // once at parse time) rather than requiring `window.lines.first()` to
+        // be the block's own first line, or the closing fence would render as
+        // literal code content purely because of where the viewport happens
+        // to sit.
+        let texts = ["```rust\n", "code one\n", "code two\n", "```\n"];
+        let mut ranges = Vec::new();
+        let mut cursor = 100;
+        for text in &texts {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let lines: Vec<BlockLine<'_>> = texts
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(line, (text, range))| BlockLine {
+                line,
+                range: *range,
+                text,
+                disclosure: None,
+            })
+            .collect();
+        let opening_fence = fence_marker(texts[0]);
+        assert_eq!(opening_fence, Some((b'`', 3)));
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::CodeBlock,
+            source_range: SourceRange::new(ranges[0].start.0, ranges[3].end.0),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: 4,
+            opening_fence,
+        };
+
+        let wide_window = BlockWindow {
+            span: 0..4,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..4,
+            joined: None,
+            block_disclosure: None,
+        };
+        let wide = present_block(&block, Revision(1), &wide_window, 26.0);
+        let wide_closing = wide.lines.last().expect("closing line is presented");
+        assert_eq!(wide_closing.kind, BlockKind::CodeFence);
+        assert_eq!(wide_closing.visual_text, "");
+
+        // Only the closing line is loaded — as if the opening line scrolled
+        // out of a huge block's viewport — but `span` still describes the
+        // block's real extent.
+        let narrow_lines = &lines[3..4];
+        let narrow_window = BlockWindow {
+            span: 0..4,
+            trailing_blank_lines: 0,
+            lines: narrow_lines,
+            render: 3..4,
+            joined: None,
+            block_disclosure: None,
+        };
+        let narrow = present_block(&block, Revision(1), &narrow_window, 26.0);
+        assert_eq!(narrow.lines.len(), 1);
+        assert_eq!(narrow.lines[0].kind, wide_closing.kind);
+        assert_eq!(narrow.lines[0].visual_text, wide_closing.visual_text);
+        assert_eq!(
+            narrow.lines[0].source_map.segments,
+            wide_closing.source_map.segments
+        );
     }
 }
