@@ -269,7 +269,7 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         )
         diagnostic_block = WORKFLOW.split(
             "      - name: Diagnose Claude execution failure\n", 1
-        )[1].split("\n      - name: Build untrusted worker patch", 1)[0]
+        )[1].split("\n  finalize:", 1)[0]
         self.assertIn("exit 1", diagnostic_block)
 
     def test_diagnostic_classifier_is_reacquired_after_claude(self):
