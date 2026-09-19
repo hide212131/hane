@@ -32,10 +32,11 @@ cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --l
 
 Hane 起動後（ウィンドウが既に key / first responder の状態）に日本語入力ソースへ切り替えても、AppKit は現在の first responder の `NSTextInputContext` を自動では再同期しない。Text Services Manager はそのコンテキストが最後に activate されたときの入力ソースのまま composing を続ける（または始めない）ため、Romaji 入力のような変換前提の IME に切り替えても preedit が始まらず、未変換のローマ字がそのまま `insertText:` 経由で確定してしまう。
 
-- `NSTextInputContextKeyboardSelectionDidChangeNotification`（GPUI が既に keyboard layout 変更検知のために監視している通知）のハンドラで、key window の現在の first responder が持つ `NSTextInputContext` に対して `activate` を呼び、TSM を新しい入力ソースへ即座に再同期させる。
+- `NSTextInputContextKeyboardSelectionDidChangeNotification`（GPUI が既に keyboard layout 変更検知のために監視している通知）のハンドラで、key window の現在の first responder が持つ `NSTextInputContext` を `deactivate` → `activate` し、AppKit の通常の responder 遷移を再現して TSM を新しい入力ソースへ即座に再同期させる。active な context に `activate` だけを直接呼んでも、既存の入力ソースとの紐付けは更新されない。
 - key window / first responder / input context が存在しない場合は何もしない。フォーカスが無いときや通常のフォーカス遷移時の動作は変更しない。
+- text input context の再入は抑止し、1回の入力ソース変更通知につき再同期を1回だけ行う。
 - キーバインド解決用の `MacKeyboardMapper` 再構築ロジックは変更しない。
 
 ### 検証
 
-この修正は実際の日本語 IME の composing 状態と OS のフォーカスに依存するため、通常の workspace テストでは検証できない。Hane 側の GUI 検証（`.agents/skills/hane-gui-test`）で、Hane 起動後に日本語入力ソースへ切り替えてから通常段落・リスト項目へ日本語を入力し、変換結果が一度だけ期待 source offset へ commit されることを確認する。
+macOS の `platform.rs` test は実際の keyboard-selection-change 通知を `APP_DELEGATE_CLASS` へ配送し、text responder の context に対する1回の `deactivate` → `activate` と、key windowなし・non-text responder・contextなしの安全な no-op を確認する。実際の日本語 IME の composing 状態と OS のフォーカスに依存するため、Hane 側の GUI 検証（`.agents/skills/hane-gui-test`）でも、Hane 起動後に日本語入力ソースへ切り替えてから通常段落・リスト項目へ日本語を入力し、変換結果が一度だけ期待 source offset へ commit されることを確認する。

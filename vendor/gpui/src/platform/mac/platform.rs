@@ -68,6 +68,8 @@ const NSUTF8StringEncoding: NSUInteger = 4;
 const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
+#[cfg(test)]
+static TEST_KEY_WINDOW_OVERRIDE: OnceLock<Mutex<Option<Option<usize>>>> = OnceLock::new();
 
 #[ctor]
 unsafe fn build_classes() {
@@ -1458,13 +1460,17 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
 // starting a composition.
 //
 // `NSTextInputContextKeyboardSelectionDidChangeNotification` fires for
-// exactly this kind of change, so re-activating the key window's current
-// text input context here forces TSM to resync immediately instead of
-// waiting for the next focus change.
+// exactly this kind of change. Deactivating and activating the key window's
+// current text input context here emulates the responder transition that
+// AppKit normally performs and forces TSM to bind the context to the new
+// input source immediately instead of waiting for the next focus change.
 fn reactivate_key_window_text_input_context() {
+    let key_window = current_key_window();
+    reactivate_text_input_context_for_window(key_window);
+}
+
+fn reactivate_text_input_context_for_window(key_window: id) {
     unsafe {
-        let app: id = msg_send![APP_CLASS, sharedApplication];
-        let key_window: id = msg_send![app, keyWindow];
         if key_window.is_null() {
             return;
         }
@@ -1472,11 +1478,52 @@ fn reactivate_key_window_text_input_context() {
         if responder.is_null() {
             return;
         }
+        let responds_to_input_context: BOOL =
+            msg_send![responder, respondsToSelector: sel!(inputContext)];
+        if responds_to_input_context != YES {
+            return;
+        }
         let input_context: id = msg_send![responder, inputContext];
         if input_context.is_null() {
             return;
         }
+        if input_context_reactivation_in_progress() {
+            return;
+        }
+        let _guard = InputContextReactivationGuard;
+        let _: () = msg_send![input_context, deactivate];
         let _: () = msg_send![input_context, activate];
+    }
+}
+
+fn current_key_window() -> id {
+    #[cfg(test)]
+    if let Some(key_window) = *TEST_KEY_WINDOW_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        return key_window.map_or(nil, |key_window| key_window as id);
+    }
+
+    unsafe {
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        msg_send![app, keyWindow]
+    }
+}
+
+thread_local! {
+    static INPUT_CONTEXT_REACTIVATION_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
+fn input_context_reactivation_in_progress() -> bool {
+    INPUT_CONTEXT_REACTIVATION_IN_PROGRESS.with(|in_progress| in_progress.replace(true))
+}
+
+struct InputContextReactivationGuard;
+
+impl Drop for InputContextReactivationGuard {
+    fn drop(&mut self) {
+        INPUT_CONTEXT_REACTIVATION_IN_PROGRESS.with(|in_progress| in_progress.set(false));
     }
 }
 
@@ -1697,9 +1744,162 @@ impl UTType {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    use objc::{declare::ClassDecl, runtime::Class};
+
     use crate::ClipboardItem;
 
     use super::*;
+
+    static TEST_ACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_DEACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn test_key_window_first_responder(this: &Object, _: Sel) -> id {
+        unsafe { *this.get_ivar::<id>("firstResponder") }
+    }
+
+    extern "C" fn test_responder_input_context(this: &Object, _: Sel) -> id {
+        unsafe { *this.get_ivar::<id>("inputContext") }
+    }
+
+    extern "C" fn test_input_context_activate(this: &Object, _: Sel) {
+        let _ = this;
+        TEST_ACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn test_input_context_deactivate(this: &Object, _: Sel) {
+        let _ = this;
+        TEST_DEACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn test_classes() -> (*const Class, *const Class, *const Class) {
+        static CLASSES: OnceLock<(usize, usize, usize)> = OnceLock::new();
+        let (key_window, responder, input_context) = *CLASSES.get_or_init(|| unsafe {
+            let mut input_context = ClassDecl::new("HaneImeTestInputContext", class!(NSObject))
+                .unwrap();
+            input_context.add_method(
+                sel!(activate),
+                test_input_context_activate as extern "C" fn(&Object, Sel),
+            );
+            input_context.add_method(
+                sel!(deactivate),
+                test_input_context_deactivate as extern "C" fn(&Object, Sel),
+            );
+            let input_context = input_context.register() as *const Class as usize;
+
+            let mut responder = ClassDecl::new("HaneImeTestResponder", class!(NSObject)).unwrap();
+            responder.add_ivar::<id>("inputContext");
+            responder.add_method(
+                sel!(inputContext),
+                test_responder_input_context as extern "C" fn(&Object, Sel) -> id,
+            );
+            let responder = responder.register() as *const Class as usize;
+
+            let mut key_window = ClassDecl::new("HaneImeTestKeyWindow", class!(NSObject)).unwrap();
+            key_window.add_ivar::<id>("firstResponder");
+            key_window.add_method(
+                sel!(firstResponder),
+                test_key_window_first_responder as extern "C" fn(&Object, Sel) -> id,
+            );
+            let key_window = key_window.register() as *const Class as usize;
+
+            (key_window, responder, input_context)
+        });
+
+        (
+            key_window as *const Class,
+            responder as *const Class,
+            input_context as *const Class,
+        )
+    }
+
+    unsafe fn new_test_object(class: *const Class) -> id {
+        msg_send![class, new]
+    }
+
+    unsafe fn post_keyboard_selection_change(delegate: id) {
+        let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = unsafe { ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification") };
+        let _: () = msg_send![notification_center, addObserver: delegate
+            selector: sel!(onKeyboardLayoutChange:)
+            name: name
+            object: nil
+        ];
+        let _: () = msg_send![notification_center, postNotificationName: name object: nil];
+        let _: () = msg_send![notification_center, removeObserver: delegate name: name object: nil];
+    }
+
+    #[test]
+    fn keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders() {
+        let platform = MacPlatform::new(false);
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        platform.on_keyboard_layout_change(Box::new({
+            let callback_count = callback_count.clone();
+            move || {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let (key_window_class, responder_class, input_context_class) = test_classes();
+        let input_context = unsafe { new_test_object(input_context_class) };
+        TEST_ACTIVATE_COUNT.store(0, Ordering::SeqCst);
+        TEST_DEACTIVATE_COUNT.store(0, Ordering::SeqCst);
+        let text_responder = unsafe { new_test_object(responder_class) };
+        unsafe {
+            (*text_responder).set_ivar("inputContext", input_context);
+        }
+        let key_window = unsafe { new_test_object(key_window_class) };
+        unsafe {
+            (*key_window).set_ivar("firstResponder", text_responder);
+        }
+
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(Some(key_window as usize));
+        let delegate = unsafe {
+            let delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+            (*delegate).set_ivar(
+                MAC_PLATFORM_IVAR,
+                &platform as *const MacPlatform as *mut c_void,
+            );
+            delegate
+        };
+
+        unsafe { post_keyboard_selection_change(delegate) };
+
+        assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(None);
+        unsafe { post_keyboard_selection_change(delegate) };
+
+        let non_text_responder: id = unsafe { msg_send![class!(NSObject), new] };
+        unsafe {
+            (*key_window).set_ivar("firstResponder", non_text_responder);
+        }
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(Some(key_window as usize));
+        unsafe { post_keyboard_selection_change(delegate) };
+
+        let contextless_responder = unsafe { new_test_object(responder_class) };
+        unsafe {
+            (*contextless_responder).set_ivar("inputContext", nil);
+            (*key_window).set_ivar("firstResponder", contextless_responder);
+        }
+        unsafe { post_keyboard_selection_change(delegate) };
+
+        assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+
+        *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = None;
+    }
 
     #[test]
     fn test_clipboard() {
