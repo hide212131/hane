@@ -1,6 +1,7 @@
 use crate::view::EditorView;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::EditorCommand;
+use hane_presentation::ListCaretOrigin;
 
 macro_rules! command_actions {
     ($(
@@ -73,12 +74,12 @@ command_actions! {
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     Newline ("enter") => newline |view, _window, cx| {
         if view.editor().ime().is_none() {
-            view.dispatch(EditorCommand::Insert("\n"), cx);
+            view.insert_newline(ListCaretOrigin::Marker, cx);
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
         if view.editor().ime().is_none() {
-            view.dispatch(EditorCommand::Insert("\n"), cx);
+            view.insert_newline(ListCaretOrigin::Body, cx);
         }
     },
     Backspace ("backspace") => backspace |view, _window, cx| { view.dispatch(EditorCommand::Backspace, cx); },

@@ -395,6 +395,28 @@ func typeSave(_ pid: pid_t, _ text: String) {
     """)
 }
 
+func pressKey(_ pid: pid_t, _ key: String, shift: Bool, save: Bool) {
+    let keyCode: Int
+    switch key {
+    case "enter": keyCode = 36
+    case "backspace": keyCode = 51
+    default: fail("key must be enter or backspace")
+    }
+    let keyAction = shift ? "key code \(keyCode) using shift down" : "key code \(keyCode)"
+    let saveAction = save ? "keystroke \"s\" using command down\ndelay 0.3" : ""
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            \(keyAction)
+            delay 0.2
+            \(saveAction)
+        end tell
+    end tell
+    """)
+}
+
 func moveDocStart(_ pid: pid_t) {
     runAppleScript("""
     tell application "System Events"
@@ -497,7 +519,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -547,6 +569,16 @@ case "drag-select-text":
 case "type-save":
     guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("type-save requires PID and text") }
     typeSave(pid, arguments[2])
+case "press-key":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("press-key requires PID, key and save flag") }
+    let save = arguments[3] == "save"
+    guard save || arguments[3] == "nosave" else { fail("press-key save flag must be save or nosave") }
+    pressKey(pid, arguments[2], shift: false, save: save)
+case "press-shift-enter":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("press-shift-enter requires PID and save flag") }
+    let save = arguments[2] == "save"
+    guard save || arguments[2] == "nosave" else { fail("press-shift-enter save flag must be save or nosave") }
+    pressKey(pid, "enter", shift: true, save: save)
 case "move-doc-start":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("move-doc-start requires PID") }
     moveDocStart(pid)

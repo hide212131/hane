@@ -17,7 +17,7 @@
 //! with a fixed advance width, which is what makes the coordinate contract
 //! verifiable without a window.
 
-use crate::{ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
+use crate::{ListCaretOrigin, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::BlockId;
 use std::collections::{HashMap, HashSet};
@@ -612,7 +612,12 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let body_visual_start = list.body_visual_start.0;
+    let body_visual_start = match list.empty_caret_origin {
+        Some(ListCaretOrigin::Marker) => None,
+        Some(ListCaretOrigin::Body) => Some(0),
+        None => Some(list.body_visual_start.0),
+    };
+    let body_visual_start_offset = list.body_visual_start.0;
     let marker_visual_range = list.marker.as_ref().map(|marker| marker.visual_range);
     let expanded_prefix_width = line
         .source_map
@@ -620,8 +625,8 @@ fn line_geometry(
         .iter()
         .filter(|segment| {
             segment.visibility == crate::Visibility::ExpandedMarkup
-                && segment.visual_range.start.0 < body_visual_start
-                && segment.visual_range.end.0 <= body_visual_start
+                && segment.visual_range.start.0 < body_visual_start_offset
+                && segment.visual_range.end.0 <= body_visual_start_offset
                 && marker_visual_range.as_ref() != Some(&segment.visual_range)
         })
         .map(|segment| {
@@ -644,11 +649,17 @@ fn line_geometry(
     };
     let body_x = marker_x + expanded_prefix_width + marker_column_width;
     LineGeometry {
-        marker_x_origin: list.marker.as_ref().map(|_| marker_x),
+        marker_x_origin: if list.marker.is_some()
+            || list.empty_caret_origin == Some(ListCaretOrigin::Marker)
+        {
+            Some(marker_x)
+        } else {
+            None
+        },
         body_x_origin: body_x,
         expanded_prefix_width,
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
-        body_visual_start: Some(list.body_visual_start.0),
+        body_visual_start,
         marker_visual_range: list
             .marker
             .as_ref()
