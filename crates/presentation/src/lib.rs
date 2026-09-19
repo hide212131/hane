@@ -987,6 +987,12 @@ pub fn present_block_with_list_projection(
 ) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    // Block 0 folds any leading blank run before its own first construct into
+    // its own tiled span (see [`IndexedBlock::leading_blank_lines`]), so the
+    // block's real opening line — and, for a fenced code block, its actual
+    // opening fence — sits `leading_blank_lines` lines after `window.span.start`
+    // rather than at it.
+    let content_start = window.span.start + block.leading_blank_lines;
     // `block.opening_fence` is read once from the block's own first physical
     // line when the block is (re-)parsed (see [`IndexedBlock::opening_fence`]),
     // so it stays available even once a huge block is scrolled past its own
@@ -999,7 +1005,7 @@ pub fn present_block_with_list_projection(
         window
             .lines
             .first()
-            .filter(|line| line.line == window.span.start)
+            .filter(|line| line.line == content_start)
             .and_then(|line| fence_marker(line.text))
     });
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
@@ -1021,7 +1027,7 @@ pub fn present_block_with_list_projection(
         if !window.render.contains(&line.line) {
             continue;
         }
-        let line_context = if line.line < content_end {
+        let line_context = if line.line >= content_start && line.line < content_end {
             context
         } else {
             LineContext::Normal
@@ -1029,7 +1035,7 @@ pub fn present_block_with_list_projection(
         let edge = (line_context == LineContext::FencedCode)
             .then(|| {
                 fence_edge(
-                    window.span.start,
+                    content_start,
                     content_end,
                     line.line,
                     line.text,
@@ -1612,6 +1618,7 @@ fn present_markdown_from_parse(
             .filter_map(|id| parsed.tree.node(**id))
             .filter(|node| node.kind.is_block())
     };
+    let code_block_node = blocks().find(|node| node.kind == NodeKind::CodeBlock);
     let mut kind = blocks()
         .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
@@ -1659,6 +1666,30 @@ fn present_markdown_from_parse(
         });
     }
     let markers_on_line = projected_markers.as_slice();
+    // A fenced code block nested inside a quote or list is a descendant
+    // `CodeBlock` node, not the top-level indexed block itself, so it never
+    // reaches [`present_block_with_list_projection`]'s own fenced-code
+    // branch; this is the same Issue #16 contract applied from here instead.
+    // `derive_markers` pushes exactly one un-owned marker per fence delimiter
+    // line, fully inside the node's own range — the opening run (info string
+    // excluded, so it stays visible as the language label) and, only when a
+    // matching closing run was actually found, the closing run. Finding one
+    // on this physical line is what tells an opening/closing delimiter line
+    // apart from an ordinary content line, exactly like `fence_edge` does for
+    // the unnested, top-level case.
+    let nested_fence_edge = code_block_node.is_some_and(|node| {
+        markers_on_line.iter().any(|marker| {
+            marker.quote_owner.is_none()
+                && marker.list_owner.is_none()
+                && marker.list_prefix.is_none()
+                && marker.global_list_prefix.is_none()
+                && node.source_range.start <= marker.range.start
+                && marker.range.end <= node.source_range.end
+        })
+    });
+    if nested_fence_edge {
+        kind = BlockKind::CodeFence;
+    }
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
     for planned in markers_on_line {
@@ -1765,6 +1796,7 @@ fn present_markdown_from_parse(
         .filter(|node| {
             formal_code_block != Some(true)
                 && !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
+                && !(nested_fence_edge && node.kind == NodeKind::CodeBlock)
         })
         .filter(|node| has_delimiter_markers(node.kind))
         .filter_map(|span| {
@@ -4151,6 +4183,7 @@ mod tests {
                 confidence: Confidence::Formal,
                 line_count: lines.len(),
                 opening_fence: None,
+                leading_blank_lines: 0,
             };
             let joined = parse_joined_block(&lines, Revision(1));
             let window = BlockWindow {
@@ -4770,6 +4803,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: 2,
             opening_fence: None,
+            leading_blank_lines: 0,
         };
         let joined = parse_joined_block(&lines, Revision(1));
         // Empty ranges represent carets; non-empty ranges also cover selection
@@ -4840,6 +4874,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: 2,
             opening_fence: None,
+            leading_blank_lines: 0,
         };
         let window = BlockWindow {
             span: 0..2,
@@ -4922,6 +4957,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: 3,
             opening_fence: None,
+            leading_blank_lines: 0,
         };
         let window = BlockWindow {
             span: 0..3,
@@ -5013,6 +5049,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: 2,
             opening_fence: None,
+            leading_blank_lines: 0,
         };
         let joined = parse_joined_block(&lines, Revision(1));
 
@@ -5110,6 +5147,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: lines.len(),
             opening_fence: None,
+            leading_blank_lines: 0,
         };
         let window = BlockWindow {
             span: 0..lines.len(),
@@ -5505,6 +5543,7 @@ mod tests {
             confidence: Confidence::Formal,
             line_count: 4,
             opening_fence,
+            leading_blank_lines: 0,
         };
 
         let wide_window = BlockWindow {
@@ -5540,5 +5579,160 @@ mod tests {
             narrow.lines[0].source_map.segments,
             wide_closing.source_map.segments
         );
+    }
+
+    /// Regression for the Issue #16 P1 fix: `tiled_blocks` folds a
+    /// document's leading blank run into block 0 (see
+    /// `IndexedBlock::leading_blank_lines`), so the block's own tiled span
+    /// start is not necessarily the fenced code's own opening line. Before
+    /// the fix, the opening fence's own delimiters never collapsed —
+    /// `IndexedBlock::opening_fence` read the leading blank line instead of
+    /// the real opening line, and the fence-edge check compared physical
+    /// line numbers against the tiled span start instead of the block's own
+    /// content start.
+    #[test]
+    fn fenced_code_after_a_leading_blank_line_still_collapses_its_delimiters() {
+        let source = "\n```rust\ncode\n```\n";
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let block = index.block(0).expect("one block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert_eq!(block.leading_blank_lines, 1);
+
+        let texts = ["\n", "```rust\n", "code\n", "```\n"];
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        for text in &texts {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let lines: Vec<BlockLine<'_>> = texts
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(line, (text, range))| BlockLine {
+                line,
+                range: *range,
+                text,
+                disclosure: None,
+            })
+            .collect();
+        let window = BlockWindow {
+            span: 0..4,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..4,
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines[0].kind, BlockKind::Paragraph);
+        assert_eq!(visual.lines[0].visual_text, "");
+        assert_eq!(visual.lines[1].kind, BlockKind::CodeFence);
+        assert_eq!(visual.lines[1].visual_text, "rust");
+        assert_eq!(visual.lines[2].kind, BlockKind::CodeBlock);
+        assert_eq!(visual.lines[2].visual_text, "code");
+        assert_eq!(visual.lines[3].kind, BlockKind::CodeFence);
+        assert_eq!(visual.lines[3].visual_text, "");
+    }
+
+    /// Regression for the Issue #16 P1 fix: a fenced code block nested inside
+    /// a quote is a descendant `CodeBlock` node, not the top-level indexed
+    /// block (`Quote` here), so it never reaches
+    /// `present_block_with_list_projection`'s own fenced-code branch. The
+    /// same collapse contract must still apply from inside the quote's
+    /// shared-parse presentation, without losing the quote's own `> ` prefix.
+    #[test]
+    fn fenced_code_nested_in_a_quote_still_collapses_its_delimiters() {
+        let source = "> ```rust\n> code\n> ```\n";
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let block = index.block(0).expect("one block");
+        assert_eq!(block.kind, NodeKind::Quote);
+
+        let texts = ["> ```rust\n", "> code\n", "> ```\n"];
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        for text in &texts {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let lines: Vec<BlockLine<'_>> = texts
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(line, (text, range))| BlockLine {
+                line,
+                range: *range,
+                text,
+                disclosure: None,
+            })
+            .collect();
+        let window = BlockWindow {
+            span: 0..3,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..3,
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines[0].kind, BlockKind::CodeFence);
+        assert_eq!(visual.lines[0].visual_text, "rust");
+        assert_eq!(visual.lines[1].kind, BlockKind::CodeBlock);
+        assert_eq!(visual.lines[1].visual_text, "code");
+        assert_eq!(visual.lines[2].kind, BlockKind::CodeFence);
+        assert_eq!(visual.lines[2].visual_text, "");
+    }
+
+    /// Same contract as `fenced_code_nested_in_a_quote_still_collapses_its_delimiters`,
+    /// nested inside a list item instead: its own structural continuation
+    /// indentation, not a quote prefix, must stay intact on every line while
+    /// the fence delimiters still collapse.
+    #[test]
+    fn fenced_code_nested_in_a_list_item_still_collapses_its_delimiters() {
+        let source = "- ```rust\n  code\n  ```\n";
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let block = index.block(0).expect("one block");
+        assert!(matches!(block.kind, NodeKind::List { .. }));
+
+        let texts = ["- ```rust\n", "  code\n", "  ```\n"];
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        for text in &texts {
+            let range = SourceRange::new(cursor, cursor + text.len());
+            cursor = range.end.0;
+            ranges.push(range);
+        }
+        let lines: Vec<BlockLine<'_>> = texts
+            .iter()
+            .zip(ranges.iter())
+            .enumerate()
+            .map(|(line, (text, range))| BlockLine {
+                line,
+                range: *range,
+                text,
+                disclosure: None,
+            })
+            .collect();
+        let window = BlockWindow {
+            span: 0..3,
+            trailing_blank_lines: 0,
+            lines: &lines,
+            render: 0..3,
+            joined: None,
+            block_disclosure: None,
+        };
+        let visual = present_block(&block, Revision(1), &window, 26.0);
+        assert_eq!(visual.lines[0].kind, BlockKind::CodeFence);
+        assert!(!visual.lines[0].visual_text.contains('`'));
+        assert!(visual.lines[0].visual_text.contains("rust"));
+        assert_eq!(visual.lines[1].kind, BlockKind::CodeBlock);
+        assert_eq!(visual.lines[1].visual_text, "code");
+        assert_eq!(visual.lines[2].kind, BlockKind::CodeFence);
+        assert_eq!(visual.lines[2].visual_text, "");
     }
 }

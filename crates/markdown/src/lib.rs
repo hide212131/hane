@@ -564,6 +564,10 @@ impl LocalBlockIndex {
             // opening. Left unset; `present_block_with_list_projection` falls
             // back to its own window-based check for these provisional blocks.
             opening_fence: None,
+            // Same bounded-window caveat as `opening_fence` above: a mid-block
+            // start here is not a real leading blank run, so this is left at
+            // the default rather than guessed from `window`.
+            leading_blank_lines: 0,
         }
     }
 
@@ -624,7 +628,7 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()
-        .map(|(kind, length, lines, _)| {
+        .map(|(kind, length, lines, _, _)| {
             let range = SourceRange::new(offset, offset + length);
             offset += length;
             (kind, range, lines)
@@ -1131,26 +1135,52 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     .unwrap_or(tail);
                 if let Some(opening_delimiter) = fence_delimiter(body) {
                     let opening_end = body.find('\n').unwrap_or(body.len());
-                    let opening = body[..opening_end].trim_end_matches(['\r', '\n']).len();
-                    if opening > 0 {
+                    // Only the delimiter run itself (plus the fence's own
+                    // leading indentation, up to 3 spaces) is markup; a
+                    // container ancestor's own prefix on this opening line is
+                    // already excluded from `block.source_range.start` by the
+                    // parser. The info string after the run is the Issue #16
+                    // language label and must stay visible, not collapse with
+                    // the delimiter the way the whole opening line used to.
+                    let leading = body.len() - body.trim_start_matches(' ').len();
+                    let delimiter_len = leading + opening_delimiter.len;
+                    if delimiter_len > 0 {
                         markers.push(SourceRange::new(
                             block.source_range.start.0,
-                            block.source_range.start.0 + opening,
+                            block.source_range.start.0 + delimiter_len,
                         ));
                     }
                     let closed = body.trim_end_matches(['\r', '\n']);
                     if let Some(closing_start) = closed.rfind('\n').map(|line_end| line_end + 1)
                         && closing_start > opening_end
-                        && is_fence_close(
-                            &closed[closing_start..],
-                            opening_delimiter.marker,
-                            opening_delimiter.len,
-                        )
                     {
-                        markers.push(SourceRange::new(
-                            block.source_range.start.0 + closing_start,
-                            block.source_range.start.0 + closed.len(),
-                        ));
+                        let closing_line = &closed[closing_start..];
+                        // A closing fence nested inside a quote/list carries
+                        // that container's own per-line prefix first; only the
+                        // run past it is this block's own markup.
+                        // `ancestor_containers` resolves to no containers (a
+                        // zero-length prefix) when this block has no quote/list
+                        // ancestor, so this covers the unnested case unchanged.
+                        if let Some(prefix_len) = ancestor_containers(tree, id, range, source)
+                            .and_then(|containers| {
+                                consume_containers(
+                                    &containers,
+                                    relative + closing_start,
+                                    closing_line.as_bytes(),
+                                )
+                            })
+                            .map(|cursor| cursor.byte)
+                            && is_fence_close(
+                                &closing_line[prefix_len..],
+                                opening_delimiter.marker,
+                                opening_delimiter.len,
+                            )
+                        {
+                            markers.push(SourceRange::new(
+                                block.source_range.start.0 + closing_start + prefix_len,
+                                block.source_range.start.0 + closed.len(),
+                            ));
+                        }
                     }
                 }
             }
@@ -1658,7 +1688,9 @@ mod tests {
         assert!(parsed.tree.blocks().any(|(_, block)| block.kind
             == NodeKind::CodeBlock
             && block.source_range.end.0 == backtick_source.len()));
-        assert_eq!(parsed.markers, vec![SourceRange::new(0, 8)]);
+        // Only the four-backtick delimiter run is markup; `rust` is the
+        // Issue #16 language label and stays visible.
+        assert_eq!(parsed.markers, vec![SourceRange::new(0, 4)]);
 
         // A tilde opening is never closed by a backtick run, regardless of
         // length.

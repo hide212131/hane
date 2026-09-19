@@ -164,7 +164,9 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "multi-line fenced code",
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
-        markers: &["```rust", "```"],
+        // Only the backtick runs are markup; `rust` is the Issue #16
+        // language label and stays visible as ordinary source.
+        markers: &["```", "```"],
         // Inactive, the fence delimiters never render as body text: the
         // opening line collapses to its info string alone (the language
         // label), the closing line collapses to an empty boundary row, and
@@ -185,7 +187,7 @@ const FIXTURES: &[MarkdownFixture] = &[
         // including that line, stays literal code content.
         source: "````rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
-        markers: &["````rust"],
+        markers: &["````"],
         block_kinds: &[
             BlockKind::CodeFence,
             BlockKind::CodeBlock,
