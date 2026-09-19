@@ -54,14 +54,19 @@ SCOPE_NOTE = (
     "Issue #126 の normal list 表示(B: ネスト混在、C: 複数段落+子リスト+親リストへの復帰、"
     "D: 非1・非連番 ordered ソースの連番表示)だけを検証する focused GUI evidence。"
     "hosted-gui-interaction/7 や hosted-date-badge の包括的/専用 GUI 検証合格を意味しない。"
-    "product PR #189 でリスト内部レイアウトが変更され続けている間、幾何座標ではなく "
-    "OCR テキストベースの検証に限定し、内部レイアウト型には依存しない。"
-    "B/C/D の表示・marker disclosure/reclosure 検証に加えて、通常リスト固有の "
-    "source marker/本文の直接編集、ASCII 入力、日本語 IME 確定、選択置換、Undo/Redo、保存、"
-    "再起動後の再オープンを実ファイルの byte 列で検証する(E)。IME 工程は成功・失敗にかかわらず、"
-    "後続の ASCII 選択置換の前に元の入力ソースへ復元する。helper failure・入力ソース未提供・"
-    "OCR failure はいずれも pass として扱わない。OCR 行順序、nested な子リストの x 位置、"
-    "子リストの後で親リストの番号が復帰するかどうかはこの focused 手順の判定対象外とする。"
+    "product PR #189 でリスト内部レイアウトが変更され続けている間、固定ピクセル座標ではなく "
+    "OCR テキストと、同一 screenshot 内での click-text bounding box の相対位置に限定し、"
+    "内部レイアウト型には依存しない。B の各項目は OCR 行順序が期待した top-to-bottom の"
+    "項目順と一致することを確認し、nested ordered items が親 bullet の本文より右、"
+    "nested bullet items が親 ordered item の本文より右にあることを、同一 screenshot 内の"
+    "click-text bounding box の x 位置(親と子で比較した相対位置)から確認する。C は段落順の"
+    "OCR 行順序に加え、nested child list の後に親 ordered list の番号(2)が復帰することを"
+    "normal display 自体の番号表示で確認する。marker disclosure/reclosure 検証に加えて、"
+    "通常リスト固有の source marker/本文の直接編集、ASCII 入力、日本語 IME 確定、選択置換、"
+    "Undo/Redo、保存、再起動後の再オープンを実ファイルの byte 列で検証する(E)。IME 工程は"
+    "成功・失敗にかかわらず、後続の ASCII 選択置換の前に元の入力ソースへ復元する。"
+    "helper failure・入力ソース未提供・OCR/click-text failure はいずれも pass として扱わない。"
+    "テキストの存在だけでは順序・位置の証跡として扱わない。"
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -131,6 +136,61 @@ def find_line(lines: list, pattern: str) -> Optional[str]:
     return None
 
 
+def find_ordered_line_indices(lines: list, patterns: list) -> Optional[list]:
+    """patterns を先頭から順に、直前に一致した行より後ろの行だけを探して一致させる。
+
+    途中で一致しない pattern があれば None を返す(未検出と、後ろへ探しても
+    見つからない=期待順序で出現していない、の両方を区別しない fail-closed な
+    判定)。同じ行が複数 pattern に一致することは想定していない。
+    """
+    indices = []
+    cursor = 0
+    for pattern in patterns:
+        found = None
+        for idx in range(cursor, len(lines)):
+            if re.search(pattern, lines[idx]):
+                found = idx
+                break
+        if found is None:
+            return None
+        indices.append(found)
+        cursor = found + 1
+    return indices
+
+
+def evaluate_display_order(lines: list, patterns: list) -> dict:
+    indices = find_ordered_line_indices(lines, patterns)
+    if indices is None:
+        return step(
+            "initial_display_order", "fail",
+            "normal display の OCR 行順序が期待した top-to-bottom の項目順と一致しない"
+            "(項目が入れ替わっているか、いずれかの項目が確認できない)",
+            expected_patterns=list(patterns), ocr_lines=lines,
+        )
+    return step(
+        "initial_display_order", "pass",
+        expected_patterns=list(patterns), matched_line_indices=indices,
+    )
+
+
+def evaluate_nested_position(label: str, child_label: str, parent_evidence: dict, child_evidence: dict) -> dict:
+    """親項目本文と nested な子項目本文の click-text bounding box を、同一 screenshot 内の
+    相対 x 位置(minX)で比較する。固定ピクセル座標には依存しない。
+    """
+    name = f"nested_position_{label}_{child_label}"
+    parent_x = parent_evidence["bounding_box"]["minX"]
+    child_x = child_evidence["bounding_box"]["minX"]
+    detail = {"parent_x": parent_x, "child_x": child_x}
+    if child_x <= parent_x:
+        return step(
+            name, "fail",
+            f"nested な '{child_label}' の x 位置が親 '{label}' の本文以下で、"
+            "右側へインデントされたネストを確認できない",
+            **detail,
+        )
+    return step(name, "pass", **detail)
+
+
 def parse_click_evidence(stdout: str) -> dict:
     """click-text の stdout(JSON 1行)から OCR/クリック evidence を取り出す。
 
@@ -171,12 +231,20 @@ class MarkerCheck:
 
 
 @dataclass(frozen=True)
+class NestedPositionCheck:
+    label: str
+    parent_content_pattern: str
+    child_content_patterns: tuple
+
+
+@dataclass(frozen=True)
 class ScenarioSpec:
     name: str
     fixture_filename: str
     fixture_text: str
     initial_checks: tuple
     marker_check: MarkerCheck
+    nested_position_checks: tuple = ()
 
 
 def build_mixed_nested_list_fixture() -> str:
@@ -213,6 +281,16 @@ MIXED_NESTED_LIST_SPEC = ScenarioSpec(
         content_pattern=r"Beta lead item",
         raw_marker_pattern=r"-\s*Beta lead item",
     ),
+    nested_position_checks=(
+        NestedPositionCheck(
+            label="alpha", parent_content_pattern=r"Alpha lead item",
+            child_content_patterns=(r"Alpha nested one", r"Alpha nested two"),
+        ),
+        NestedPositionCheck(
+            label="gamma", parent_content_pattern=r"Gamma lead first",
+            child_content_patterns=(r"Gamma nested bullet", r"Gamma nested second"),
+        ),
+    ),
 )
 
 
@@ -240,7 +318,7 @@ PARAGRAPH_CHILD_LIST_SPEC = ScenarioSpec(
         InitialCheck("first_continued", r"First item continued paragraph\."),
         InitialCheck("child_bullet_one", r"Child bullet one"),
         InitialCheck("child_bullet_two", r"Child bullet two"),
-        InitialCheck("second_after_return", r"Second item after return"),
+        InitialCheck("second_after_return", r"Second item after return", expected_number=2),
     ),
     marker_check=MarkerCheck(
         content_pattern=r"Second item after return",
@@ -455,6 +533,41 @@ def click_content(interaction_module, helper, pid, screenshot: Path, pattern: st
     return True, evidence, ""
 
 
+def run_nested_position_checks(
+    interaction_module, helper, pid, screenshot: Path, checks: tuple, timeout: float,
+) -> list:
+    """checks の親/子の本文それぞれへ click-text し、同一 screenshot 内の bounding box
+    x 位置を比較する。helper failure・OCR failure はここでも pass にせず blocked にする。
+    """
+    steps: list = []
+    for check in checks:
+        clicked, parent_evidence, err = click_content(
+            interaction_module, helper, pid, screenshot, check.parent_content_pattern, "start", timeout,
+        )
+        if not clicked:
+            steps.append(step(
+                f"nested_position_{check.label}_parent_click", "blocked", err,
+                content_pattern=check.parent_content_pattern,
+            ))
+            for child_pattern in check.child_content_patterns:
+                steps.append(skipped_step(
+                    f"nested_position_{check.label}_{child_pattern}", "親項目へのクリックに失敗した",
+                ))
+            continue
+        for child_pattern in check.child_content_patterns:
+            clicked_child, child_evidence, err = click_content(
+                interaction_module, helper, pid, screenshot, child_pattern, "start", timeout,
+            )
+            if not clicked_child:
+                steps.append(step(
+                    f"nested_position_{check.label}_{child_pattern}", "blocked", err,
+                    content_pattern=child_pattern,
+                ))
+                continue
+            steps.append(evaluate_nested_position(check.label, child_pattern, parent_evidence, child_evidence))
+    return steps
+
+
 def run_scenario(
     gui_validate_module, interaction_module, env, target_dir: Path, swift_helper, base_run_dir: Path,
     binary_path: Path, expected_sha: str, request_id: str, startup_timeout: float, window_timeout: float,
@@ -489,6 +602,14 @@ def run_scenario(
                 steps.append(step("initial_display_ocr", "pass", ocr_lines=lines))
                 for check in spec.initial_checks:
                     steps.append(evaluate_initial_check(lines, check))
+                if spec.initial_checks:
+                    steps.append(evaluate_display_order(lines, [check.content_pattern for check in spec.initial_checks]))
+
+            if spec.nested_position_checks:
+                steps += run_nested_position_checks(
+                    interaction_module, swift_helper, pid, before_screenshot,
+                    spec.nested_position_checks, helper_timeout,
+                )
 
             marker_check = spec.marker_check
             clicked, evidence, err = click_content(

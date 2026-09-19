@@ -122,6 +122,131 @@ class InitialCheckEvaluationTests(unittest.TestCase):
         self.assertEqual(result["result"], "pass")
 
 
+class DisplayOrderEvaluationTests(unittest.TestCase):
+    def test_pass_when_patterns_appear_in_expected_top_to_bottom_order(self):
+        lines = ["Alpha lead item", "1. Alpha nested one", "2. Alpha nested two", "Beta lead item"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two", r"Beta lead item"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["matched_line_indices"], [0, 1, 2, 3])
+
+    def test_fail_closed_when_two_items_are_swapped(self):
+        # "Beta lead item" と "Alpha nested two" が入れ替わった、mixed fixture が
+        # 崩れた場合の再現(Issue #126 review discussion_r4051349760)。
+        lines = ["Alpha lead item", "1. Alpha nested one", "Beta lead item", "2. Alpha nested two"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two", r"Beta lead item"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "fail")
+
+    def test_fail_closed_when_a_pattern_is_entirely_missing(self):
+        lines = ["Alpha lead item", "1. Alpha nested one"]
+        patterns = [r"Alpha lead item", r"Alpha nested one", r"Alpha nested two"]
+        result = mod.evaluate_display_order(lines, patterns)
+        self.assertEqual(result["result"], "fail")
+
+    def test_find_ordered_line_indices_does_not_reuse_an_earlier_line(self):
+        # 同じ行を 2 つの pattern が両方とも指す(=実質的に一方が別の場所に無い)場合は
+        # 順序どおりに前進できず None になる。
+        lines = ["Alpha lead item Beta lead item"]
+        patterns = [r"Alpha lead item", r"Beta lead item"]
+        self.assertIsNone(mod.find_ordered_line_indices(lines, patterns))
+
+
+class NestedPositionEvaluationTests(unittest.TestCase):
+    def test_pass_when_child_bounding_box_is_right_of_parent(self):
+        parent = {"bounding_box": {"minX": 0.1}}
+        child = {"bounding_box": {"minX": 0.2}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", parent, child)
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["name"], "nested_position_alpha_Alpha nested one")
+
+    def test_fail_closed_when_child_is_not_right_of_parent(self):
+        parent = {"bounding_box": {"minX": 0.2}}
+        child = {"bounding_box": {"minX": 0.2}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", parent, child)
+        self.assertEqual(result["result"], "fail")
+
+    def test_fail_closed_when_child_is_left_of_parent(self):
+        # 子項目が親から外れて平坦化された場合、子の x 位置は親と同じか左に来る。
+        parent = {"bounding_box": {"minX": 0.2}}
+        child = {"bounding_box": {"minX": 0.05}}
+        result = mod.evaluate_nested_position("alpha", "Alpha nested one", parent, child)
+        self.assertEqual(result["result"], "fail")
+
+
+class MixedNestedListNestedPositionSpecTests(unittest.TestCase):
+    def test_mixed_nested_list_spec_declares_alpha_and_gamma_nested_position_checks(self):
+        labels = [check.label for check in mod.MIXED_NESTED_LIST_SPEC.nested_position_checks]
+        self.assertEqual(labels, ["alpha", "gamma"])
+        alpha = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[0]
+        self.assertEqual(alpha.child_content_patterns, (r"Alpha nested one", r"Alpha nested two"))
+        gamma = mod.MIXED_NESTED_LIST_SPEC.nested_position_checks[1]
+        self.assertEqual(gamma.parent_content_pattern, r"Gamma lead first")
+        self.assertEqual(gamma.child_content_patterns, (r"Gamma nested bullet", r"Gamma nested second"))
+
+    def test_paragraph_and_nonsequential_specs_have_no_nested_position_checks(self):
+        self.assertEqual(mod.PARAGRAPH_CHILD_LIST_SPEC.nested_position_checks, ())
+        self.assertEqual(mod.NONSEQUENTIAL_ORDERED_SPEC.nested_position_checks, ())
+
+
+class ParagraphChildListReturnsToParentNumberingTests(unittest.TestCase):
+    def test_second_after_return_check_requires_normal_display_number_2(self):
+        check = next(
+            c for c in mod.PARAGRAPH_CHILD_LIST_SPEC.initial_checks if c.label == "second_after_return"
+        )
+        self.assertEqual(check.expected_number, 2)
+
+    def test_second_after_return_check_passes_only_with_number_2(self):
+        check = next(
+            c for c in mod.PARAGRAPH_CHILD_LIST_SPEC.initial_checks if c.label == "second_after_return"
+        )
+        passing = mod.evaluate_initial_check(["2. Second item after return"], check)
+        self.assertEqual(passing["result"], "pass")
+        failing = mod.evaluate_initial_check(["3. Second item after return"], check)
+        self.assertEqual(failing["result"], "fail")
+
+
+class NestedPositionCheckRunnerTests(unittest.TestCase):
+    def test_blocked_when_parent_click_fails_and_children_are_skipped(self):
+        class FakeInteraction:
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                return False, "", "click helper failed"
+
+        check = mod.NestedPositionCheck(
+            label="alpha", parent_content_pattern=r"Alpha lead item",
+            child_content_patterns=(r"Alpha nested one",),
+        )
+        steps = mod.run_nested_position_checks(FakeInteraction(), object(), 123, Path("shot.png"), (check,), 1.0)
+        names_results = {s["name"]: s["result"] for s in steps}
+        self.assertEqual(names_results["nested_position_alpha_parent_click"], "blocked")
+        self.assertEqual(names_results["nested_position_alpha_Alpha nested one"], "skipped")
+
+    def test_pass_when_parent_and_child_clicks_succeed_with_child_to_the_right(self):
+        import json
+
+        class FakeInteraction:
+            call_count = 0
+
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                FakeInteraction.call_count += 1
+                min_x = 0.1 if FakeInteraction.call_count == 1 else 0.2
+                payload = json.dumps({
+                    "matched_text": "x", "bounding_box": {"minX": min_x}, "window_bounds": {},
+                    "click_point": {}, "edge": "start",
+                })
+                return True, payload, ""
+
+        check = mod.NestedPositionCheck(
+            label="alpha", parent_content_pattern=r"Alpha lead item",
+            child_content_patterns=(r"Alpha nested one",),
+        )
+        steps = mod.run_nested_position_checks(FakeInteraction(), object(), 123, Path("shot.png"), (check,), 1.0)
+        result = next(s for s in steps if s["name"] == "nested_position_alpha_Alpha nested one")
+        self.assertEqual(result["result"], "pass")
+
+
 class MarkerDisclosureEvaluationTests(unittest.TestCase):
     def test_marker_disclosure_pass_when_raw_marker_found_after_click(self):
         check = mod.MarkerCheck(content_pattern=r"Beta lead item", raw_marker_pattern=r"-\s*Beta lead item")
