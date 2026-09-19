@@ -3394,12 +3394,23 @@ impl EditorView {
     /// frame `render` computes it in.
     fn text_autoscroll_direction_for(&self, window_y: f32) -> Option<AutoscrollDirection> {
         let local_y = window_y - self.theme.header_height;
-        if local_y < TEXT_SELECTION_AUTOSCROLL_EDGE {
-            Some(AutoscrollDirection::Up)
-        } else if local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE {
-            Some(AutoscrollDirection::Down)
-        } else {
-            None
+        let near_top = local_y < TEXT_SELECTION_AUTOSCROLL_EDGE;
+        let near_bottom = local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE;
+        match (near_top, near_bottom) {
+            (true, true) => {
+                // On a very short viewport the two fixed-size edge zones
+                // overlap. Pick the nearer edge so a pointer near the bottom
+                // cannot be misread as an upward drag merely because the top
+                // check happens to run first.
+                if local_y < self.viewport_height / 2.0 {
+                    Some(AutoscrollDirection::Up)
+                } else {
+                    Some(AutoscrollDirection::Down)
+                }
+            }
+            (true, false) => Some(AutoscrollDirection::Up),
+            (false, true) => Some(AutoscrollDirection::Down),
+            (false, false) => None,
         }
     }
 
@@ -7427,6 +7438,27 @@ mod tests {
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn text_autoscroll_uses_the_nearest_edge_when_zones_overlap(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("text", "Untitled", cx));
+
+        view.update(cx, |view, _| {
+            // A short but valid viewport makes the fixed 24px top and bottom
+            // edge zones overlap. The pointer must still choose the edge it
+            // is actually closest to.
+            view.viewport_height = 26.0;
+            let header = view.theme.header_height;
+            assert_eq!(
+                view.text_autoscroll_direction_for(header + 6.0),
+                Some(AutoscrollDirection::Up)
+            );
+            assert_eq!(
+                view.text_autoscroll_direction_for(header + 20.0),
+                Some(AutoscrollDirection::Down)
+            );
+        });
     }
 
     // Issue #213: a text-selection drag held near the editor viewport's top
