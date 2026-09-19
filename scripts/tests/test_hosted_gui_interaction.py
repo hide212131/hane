@@ -786,6 +786,147 @@ class RestoreScenarioBaselineTests(unittest.TestCase):
             self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
 
 
+class RunBoundaryImeStepTests(unittest.TestCase):
+    """PR #208 review PRRT_kwDOUETGuM6j8CB_ (P1): currentSourceID() reporting the
+    Japanese source is not proof the IME session can actually convert keystrokes
+    yet (Issue #126 post-merge GUI run: currentSourceID() already matched, but
+    romaji was saved unconverted). Readiness must instead be judged from the
+    actual saved bytes, with a small bounded retry that restores a pristine
+    baseline (file + app state) and repositions the caret before each attempt."""
+
+    def _base_run_helper(self, fixture_path, type_romaji_effects, *, undo_save_ok=True,
+                         restore_undo_writes_baseline=True):
+        calls = {'type_romaji': 0, 'undo_save': 0, 'select_source': []}
+
+        def fake_run_helper(swift_helper, args, timeout):
+            command = args[0]
+            if command == 'current-source':
+                return True, 'com.apple.keylayout.ABC', ''
+            if command == 'list-sources':
+                return True, f'com.apple.keylayout.ABC\n{interaction.JAPANESE_SOURCE}', ''
+            if command == 'force-save':
+                return True, '', ''
+            if command == 'undo-save':
+                calls['undo_save'] += 1
+                if not undo_save_ok:
+                    return False, '', 'System Events を利用できない'
+                if restore_undo_writes_baseline:
+                    fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+                return True, '', ''
+            if command == 'move-doc-start':
+                return True, '', ''
+            if command == 'click-text':
+                return True, '', ''
+            if command == 'select-source':
+                calls['select_source'].append(args[1])
+                return True, '', ''
+            if command == 'type-romaji-at-caret-commit-save':
+                index = calls['type_romaji']
+                calls['type_romaji'] += 1
+                effect = type_romaji_effects[min(index, len(type_romaji_effects) - 1)]
+                return effect(fixture_path)
+            raise AssertionError(f'unexpected helper call: {args}')
+
+        return fake_run_helper, calls
+
+    def _run(self, fixture_path, type_romaji_effects, **kwargs):
+        fake_run_helper, calls = self._base_run_helper(fixture_path, type_romaji_effects, **kwargs)
+        with tempfile.TemporaryDirectory() as run_dir_str:
+            run_dir = Path(run_dir_str)
+            with patch.object(interaction, 'run_helper', side_effect=fake_run_helper), \
+                 patch.object(interaction, 'capture_named',
+                              return_value={'name': 'capture', 'result': 'pass', 'reason': None}):
+                config = SimpleNamespace(fixture_path=fixture_path)
+                steps = interaction.run_boundary_ime_step(
+                    None, {}, config, None, {'process': SimpleNamespace(pid=4321)}, 'window-1', run_dir,
+                    1.0, 0.0,
+                )
+        return steps, calls
+
+    def test_second_attempt_succeeds_after_pristine_baseline_restore(self):
+        fixture_path_holder = {}
+
+        def unconverted(fixture_path):
+            fixture_path.write_text(
+                interaction.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**nihongobold', 1), encoding='utf-8'
+            )
+            return True, '', ''
+
+        def converted(fixture_path):
+            expected = interaction.insert_at_match(
+                interaction.INLINE_FIXTURE_ORIGINAL, interaction.BOLD_ITALIC_OPEN_RE,
+                interaction.IME_EXPECTED_TEXT, edge='end',
+            )
+            fixture_path.write_text(expected, encoding='utf-8')
+            return True, '', ''
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            fixture_path_holder['path'] = fixture_path
+            steps, calls = self._run(fixture_path, [unconverted, converted])
+
+        self.assertEqual(calls['type_romaji'], 2)
+        overall = next(s for s in steps if s['name'] == 'boundary_ime_input')
+        self.assertEqual(overall['result'], 'pass')
+        check = next(s for s in steps if s['name'] == 'boundary_ime_input_check')
+        self.assertEqual(check['result'], 'pass')
+        self.assertEqual(len(check['attempts']), 2)
+        self.assertFalse(check['attempts'][0]['matched'])
+        self.assertTrue(check['attempts'][1]['matched'])
+        # The failed first attempt's unconverted text must not survive into the
+        # second attempt: a baseline restore must have run in between.
+        restore_steps = [s for s in steps if s['name'].endswith('_baseline_restore')]
+        self.assertEqual(len(restore_steps), 2)
+        self.assertTrue(all(s['result'] == 'pass' for s in restore_steps))
+        self.assertEqual(fixture_path.read_text(encoding='utf-8'), interaction.INLINE_FIXTURE_ORIGINAL)
+
+    def test_persistent_mismatch_across_all_attempts_is_a_fail_not_a_silent_pass(self):
+        def always_unconverted(fixture_path):
+            fixture_path.write_text(
+                interaction.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**nihongobold', 1), encoding='utf-8'
+            )
+            return True, '', ''
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            steps, calls = self._run(fixture_path, [always_unconverted])
+
+        self.assertEqual(calls['type_romaji'], interaction.BOUNDARY_IME_MAX_ATTEMPTS)
+        overall = next(s for s in steps if s['name'] == 'boundary_ime_input')
+        self.assertEqual(overall['result'], 'fail')
+        check = next(s for s in steps if s['name'] == 'boundary_ime_input_check')
+        self.assertEqual(check['result'], 'fail')
+        self.assertEqual(len(check['attempts']), interaction.BOUNDARY_IME_MAX_ATTEMPTS)
+        self.assertTrue(all(not a['matched'] for a in check['attempts']))
+
+    def test_baseline_restore_failure_mid_attempt_blocks_without_a_further_attempt(self):
+        def always_unconverted(fixture_path):
+            fixture_path.write_text(
+                interaction.INLINE_FIXTURE_ORIGINAL.replace('**bold', '**nihongobold', 1), encoding='utf-8'
+            )
+            return True, '', ''
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / 'fixture.md'
+            fixture_path.write_text(interaction.INLINE_FIXTURE_ORIGINAL, encoding='utf-8')
+            # undo-save (used both by the mid-attempt baseline restore and by the
+            # helper's own internal undo) never succeeds, so the second attempt's
+            # baseline restore cannot converge and must fail closed instead of
+            # silently reusing the first attempt's unconverted text.
+            steps, calls = self._run(fixture_path, [always_unconverted], undo_save_ok=False)
+
+        self.assertEqual(calls['type_romaji'], 1)
+        overall = next(s for s in steps if s['name'] == 'boundary_ime_input')
+        self.assertEqual(overall['result'], 'blocked')
+        self.assertIn('baseline 復元', overall['reason'])
+
+    def test_attempt_budget_is_small_and_fixed(self):
+        self.assertGreaterEqual(interaction.BOUNDARY_IME_MAX_ATTEMPTS, 2)
+        self.assertLessEqual(interaction.BOUNDARY_IME_MAX_ATTEMPTS, 5)
+
+
 class RunMutatingSubtestTests(unittest.TestCase):
     """Issue #136: the per-subtest orchestration wrapper around baseline restore."""
 
