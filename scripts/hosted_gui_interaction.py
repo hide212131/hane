@@ -1314,6 +1314,12 @@ def run_boundary_ime_step(module, env, config, swift_helper, process_holder, win
             steps.append(make_step(name, "blocked", reason="このランナーに組み込みの日本語入力ソースが見つからない"))
             return steps
 
+        reset = _move_to_neutral(swift_helper, pid, helper_timeout, "boundary_ime_input_reset_before")
+        steps.append(reset)
+        if reset["result"] != "pass":
+            steps.append(make_step(name, "blocked", reason=reset.get("reason")))
+            return steps
+
         capture = capture_named(module, env, config, window_id, run_dir, "boundary_ime_input")
         steps.append(capture)
         if capture["result"] != "pass":
