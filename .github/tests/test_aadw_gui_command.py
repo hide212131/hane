@@ -45,6 +45,8 @@ class ParseCommandTests(unittest.TestCase):
         self.assertIsNone(command.parse_command("/gui-validate date-badge merge"))
         self.assertIsNone(command.parse_command("/gui-validate sidebar-chrome head"))
         self.assertIsNone(command.parse_command("/gui-validate sidebar-chrome merge"))
+        self.assertIsNone(command.parse_command("/gui-validate code-block head"))
+        self.assertIsNone(command.parse_command("/gui-validate code-block merge"))
 
     def test_accepts_outer_whitespace_but_not_embedded_prose(self):
         self.assertEqual(command.parse_command(" \r\n/gui-validate merge\r\n "), "merge")
@@ -111,6 +113,24 @@ class ParseRouteTests(unittest.TestCase):
                     },
                 )
 
+    def test_routes_code_block_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                expected = {
+                    "validation_kind": "code-block",
+                    "execution_context": context,
+                    "workflow_file": "aadw-gui-validation.yml",
+                    "procedure_path": "scripts/hosted_code_block_gui.py",
+                }
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate code-block {context}"),
+                    expected,
+                )
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate\tcode-block\t{context}"),
+                    expected,
+                )
+
     def test_routes_sidebar_chrome_focused_commands(self):
         for context in ("head", "merge"):
             with self.subTest(context=context):
@@ -146,6 +166,10 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate sidebar-chrome merge extra",
             "このPRは /gui-validate sidebar-chrome merge してください",
             "/gui-validate sidebar-chrome\nmerge",
+            "/gui-validate code-block",
+            "/gui-validate code-block merge extra",
+            "このPRは /gui-validate code-block merge してください",
+            "/gui-validate code-block\nmerge",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
