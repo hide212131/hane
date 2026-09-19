@@ -16,10 +16,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-builds
-  cancel-in-progress: false
-
 jobs:
   prepare:
     name: Prepare release
