@@ -692,7 +692,7 @@ def run_scenario(
     )
     try:
         session_steps, window_id = interaction_module.open_session(
-            gui_validate_module, env, config, binary_path, process_holder, "before"
+            gui_validate_module, env, config, binary_path, process_holder, "before", swift_helper, helper_timeout
         )
         steps += session_steps
         pid = interaction_module.current_pid(process_holder)
@@ -1145,7 +1145,7 @@ def run_editing_scenario(
     )
     try:
         session_steps, window_id = interaction_module.open_session(
-            gui_validate_module, env, config, binary_path, process_holder, "before"
+            gui_validate_module, env, config, binary_path, process_holder, "before", swift_helper, helper_timeout
         )
         steps += session_steps
         pid = interaction_module.current_pid(process_holder)
@@ -1202,7 +1202,7 @@ def run_editing_scenario(
     )
     try:
         session_steps, _window_id = interaction_module.open_session(
-            gui_validate_module, env, reopen_config, binary_path, reopen_process_holder, "reopen"
+            gui_validate_module, env, reopen_config, binary_path, reopen_process_holder, "reopen", swift_helper, helper_timeout
         )
         steps += session_steps
         steps.append(interaction_module.verify_visible_text(

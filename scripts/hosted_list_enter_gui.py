@@ -28,6 +28,7 @@ PROCEDURE_VERSION = "hosted-list-enter/2"
 VERIFICATION_KIND = "list_enter_editing_focused"
 EXIT_PASS = 0
 EXIT_NONPASS = 1
+ASCII_INPUT_SOURCE = "com.apple.keylayout.ABC"
 
 
 @dataclass(frozen=True)
@@ -251,7 +252,7 @@ def run_case(
 
     try:
         session_steps, window_id = interaction_module.open_session(
-            gui_validate_module, env, config, binary_path, process_holder, "before"
+            gui_validate_module, env, config, binary_path, process_holder, "before", helper, helper_timeout
         )
         steps.extend(session_steps)
         pid = interaction_module.current_pid(process_holder)
@@ -384,6 +385,8 @@ def main() -> int:
     build_info: dict = {}
     helper_tmp = tempfile.TemporaryDirectory(prefix="hane-list-enter-helper-")
     started_at = env.clock.now_iso()
+    original_input_source: Optional[str] = None
+    input_source_ready = False
 
     try:
         env.acquire_execution()
@@ -415,12 +418,38 @@ def main() -> int:
                 top_steps.append(step("prepare_helper", "blocked", str(exc)))
 
             if helper is not None:
+                ok, source_id, error = interaction_module.run_helper(
+                    helper, ["current-source"], helper_timeout
+                )
+                if ok:
+                    original_input_source = source_id
+                    top_steps.append(step("query_input_source", "pass", source_id=source_id))
+                    ok, _output, error = interaction_module.run_helper(
+                        helper, ["select-source", ASCII_INPUT_SOURCE], helper_timeout
+                    )
+                    if ok:
+                        ok, selected_source, error = interaction_module.run_helper(
+                            helper, ["current-source"], helper_timeout
+                        )
+                        input_source_ready = ok and selected_source == ASCII_INPUT_SOURCE
+                    top_steps.append(
+                        step(
+                            "select_ascii_input_source",
+                            "pass" if input_source_ready else "blocked",
+                            None if input_source_ready else (error or "ABC入力ソースを選択できない"),
+                            source_id=ASCII_INPUT_SOURCE,
+                        )
+                    )
+                else:
+                    top_steps.append(step("query_input_source", "blocked", error))
+
+            if helper is not None:
                 build_step, binary_path, build_info = gui_validate_module.do_build(
                     env, preflight_config, target_info["actual_sha"]
                 )
                 top_steps.append(build_step)
 
-            if binary_path is not None and helper is not None:
+            if binary_path is not None and helper is not None and input_source_ready:
                 for spec in CASES:
                     try:
                         case_results.append(
@@ -448,6 +477,21 @@ def main() -> int:
                         )
                         if isinstance(exc, gui_validate_module.Aborted):
                             break
+            elif binary_path is not None and helper is not None:
+                top_steps.append(step("case_setup", "blocked", "入力ソースの初期化に失敗した"))
+
+        if helper is not None and original_input_source:
+            ok, _output, error = interaction_module.run_helper(
+                helper, ["select-source", original_input_source], helper_timeout
+            )
+            top_steps.append(
+                step(
+                    "restore_input_source",
+                    "pass" if ok else "blocked",
+                    None if ok else error,
+                    source_id=original_input_source,
+                )
+            )
 
         all_steps = top_steps + case_results
         overall = worst(all_steps, priority)

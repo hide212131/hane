@@ -324,9 +324,17 @@ func screenPoint(_ bounds: CGRect, _ normalized: CGRect, _ edge: String) -> CGPo
     return CGPoint(x: bounds.minX + xNorm * bounds.width, y: bounds.minY + yNormFromTop * bounds.height)
 }
 
-func focus(_ pid: pid_t) {
+func activateApplication(_ pid: pid_t) {
+    guard let application = NSRunningApplication(processIdentifier: pid) else {
+        fail("target application is not running: \(pid)")
+    }
+    _ = application.activate(options: [.activateAllWindows])
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.2)
+    Thread.sleep(forTimeInterval: 0.3)
+}
+
+func focus(_ pid: pid_t) {
+    activateApplication(pid)
 }
 
 func postClick(_ point: CGPoint) {
@@ -562,6 +570,9 @@ case "wheel":
     scrollEditor(pid, pixels)
 case "current-source":
     print(currentSourceID())
+case "activate":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("activate requires PID") }
+    activateApplication(pid)
 case "list-sources":
     for id in inputSources().compactMap({ sourceID($0) }) { print(id) }
 case "select-source":
