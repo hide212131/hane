@@ -181,16 +181,13 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
 }
 
 func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, commit: Bool, save: Bool) {
-    // Select the source before focusing Hane. When the requested source is
-    // already active, avoid TISSelectInputSource entirely: macOS can publish a
-    // redundant keyboard-source notification and GPUI will synchronously
-    // reactivate Hane's NSTextInputContext, which may block in Kotoeri's IME
-    // XPC service. The callers that switch sources explicitly do so while the
-    // target editor is unfocused.
-    if currentSourceID() != inputSource {
-        selectSource(inputSource)
-    }
     focus(pid)
+    // The caller selects the source while the editor is unfocused. Selecting it
+    // once more after focus is intentional: it binds the newly focused
+    // NSTextInputContext to Kotoeri so a cancel/commit operation is a real IME
+    // composition rather than a plain key sequence. The focused validator does
+    // this only after its explicit deactivate/select evidence step.
+    selectSource(inputSource)
     // A successful TISSelectInputSource/currentSourceID match does not by
     // itself guarantee the app's IME session is ready to convert keystrokes;
     // on a hosted runner the switch can still be settling. Re-check with a
