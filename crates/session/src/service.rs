@@ -283,8 +283,16 @@ fn same_filesystem_object_platform(from: &Path, to: &Path) -> io::Result<bool> {
     // fields only through unstable APIs. Canonicalizing both existing paths
     // uses the stable filesystem boundary and gives the same result needed
     // here: case aliases on a case-insensitive volume resolve to one spelling,
-    // while distinct entries on a case-sensitive volume do not.
-    Ok(fs::canonicalize(from)? == fs::canonicalize(to)?)
+    // while distinct entries on a case-sensitive volume do not. A normal
+    // rename target does not exist yet, so that is the non-alias case rather
+    // than an error from this predicate.
+    let source = fs::canonicalize(from)?;
+    let target = match fs::canonicalize(to) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(source == target)
 }
 
 /// Renames a directory using the platform's no-replace primitive. Plain

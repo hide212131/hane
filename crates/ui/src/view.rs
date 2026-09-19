@@ -8764,6 +8764,26 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sidebar_folder_f2_starts_inline_rename(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("inline-rename-folder-f2");
+        std::fs::create_dir_all(root.join("Project")).unwrap();
+        std::fs::write(root.join("Plain.md"), "plain").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let folder_point = cx.debug_bounds("sidebar-folder").unwrap().center();
+        cx.simulate_click(folder_point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.inline_rename.as_ref().map(|rename| rename.kind),
+                Some(InlineRenameKind::Folder)
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn clicking_inside_an_inline_rename_moves_the_caret_to_that_text_position(
         cx: &mut gpui::TestAppContext,
     ) {
