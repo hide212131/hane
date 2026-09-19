@@ -73,10 +73,12 @@ jobs:
           checkpoint_run_attempt=''
           if grep -qE '^AADW_CHECKPOINT_RUN_(ID|ATTEMPT):' <<< "$COMMENT_BODY"; then
             mapfile -t checkpoint_run_ids < <(
-              printf '%s\n' "$COMMENT_BODY"                 | sed -nE 's/^AADW_CHECKPOINT_RUN_ID:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p'
+              printf '%s\n' "$COMMENT_BODY" \
+                | sed -nE 's/^AADW_CHECKPOINT_RUN_ID:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p'
             )
             mapfile -t checkpoint_run_attempts < <(
-              printf '%s\n' "$COMMENT_BODY"                 | sed -nE 's/^AADW_CHECKPOINT_RUN_ATTEMPT:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p'
+              printf '%s\n' "$COMMENT_BODY" \
+                | sed -nE 's/^AADW_CHECKPOINT_RUN_ATTEMPT:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p'
             )
             if [[ "${#checkpoint_run_ids[@]}" -ne 1 || "${#checkpoint_run_attempts[@]}" -ne 1 ]]; then
               echo '::error::Checkpoint restore requires exactly one numeric AADW_CHECKPOINT_RUN_ID and AADW_CHECKPOINT_RUN_ATTEMPT.'
@@ -178,7 +180,13 @@ jobs:
             exit 1
           fi
 
-          if ! jq -e             --arg repository "$REPOSITORY"             --arg pr_number "$PR_NUMBER"             --arg target_sha "$EXPECTED_SHA"             --arg run_id "$CHECKPOINT_RUN_ID"             --arg run_attempt "$CHECKPOINT_RUN_ATTEMPT"             '
+          if ! jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg target_sha "$EXPECTED_SHA" \
+            --arg run_id "$CHECKPOINT_RUN_ID" \
+            --arg run_attempt "$CHECKPOINT_RUN_ATTEMPT" \
+            '
               .schema == 1
               and .repository == $repository
               and .pr_number == $pr_number
@@ -298,7 +306,12 @@ jobs:
 
           rsync -a --delete --exclude='.git/' pr-head/ patch-base/
           git -C patch-base add -N -- .
-          git -C patch-base diff             --binary             --full-index             --no-ext-diff             --no-textconv             HEAD -- > "$GITHUB_WORKSPACE/aadw-worker.patch"
+          git -C patch-base diff \
+            --binary \
+            --full-index \
+            --no-ext-diff \
+            --no-textconv \
+            HEAD -- > "$GITHUB_WORKSPACE/aadw-worker.patch"
 
       - name: Upload completed worker patch
         if: ${{ steps.claude.outcome == 'success' }}
@@ -334,7 +347,16 @@ jobs:
             : > "$checkpoint_dir/checkpoint.patch"
           fi
 
-          jq -n             --arg repository "$GITHUB_REPOSITORY"             --arg pr_number "$PR_NUMBER"             --arg target_sha "$TARGET_SHA"             --arg run_id "$GITHUB_RUN_ID"             --arg run_attempt "$GITHUB_RUN_ATTEMPT"             --arg claude_outcome "$CLAUDE_OUTCOME"             --argjson capture_ok "$capture_ok"             --argjson has_changes "$has_changes"             '{
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg target_sha "$TARGET_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg claude_outcome "$CLAUDE_OUTCOME" \
+            --argjson capture_ok "$capture_ok" \
+            --argjson has_changes "$has_changes" \
+            '{
               schema: 1,
               repository: $repository,
               pr_number: $pr_number,
