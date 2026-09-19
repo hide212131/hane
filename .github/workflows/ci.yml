@@ -32,6 +32,9 @@ jobs:
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
+      - name: Test release version policy
+        run: python3 .github/tests/test_release_version.py
+
       - name: Detect Rust CI inputs
         id: filter
         shell: bash
