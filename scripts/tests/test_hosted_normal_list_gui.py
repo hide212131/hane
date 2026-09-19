@@ -14,7 +14,7 @@ spec.loader.exec_module(mod)
 
 class ProcedureIdentityTests(unittest.TestCase):
     def test_procedure_identity_is_focused_and_distinct(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/2")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-normal-list/3")
         self.assertEqual(mod.VERIFICATION_KIND, "normal_list_focused")
         self.assertIn("#126", mod.SCOPE_NOTE)
         self.assertIn("hosted-gui-interaction/7", mod.SCOPE_NOTE)
@@ -227,6 +227,69 @@ class OcrHelperFailClosedTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(evidence)
         self.assertIn("JSON", error)
+
+
+class SingleLineReplacementTests(unittest.TestCase):
+    def test_replaces_the_unique_occurrence(self):
+        self.assertEqual(
+            mod.single_line_replacement("a\nb\nc\n", "b", "B"), "a\nB\nc\n",
+        )
+
+    def test_rejects_missing_occurrence(self):
+        with self.assertRaises(ValueError):
+            mod.single_line_replacement("a\nb\nc\n", "z", "Z")
+
+    def test_rejects_ambiguous_occurrence(self):
+        with self.assertRaises(ValueError):
+            mod.single_line_replacement("a\na\n", "a", "A")
+
+
+class EditingFixtureTests(unittest.TestCase):
+    def test_editing_fixture_contains_source_marker_and_body_targets(self):
+        self.assertIn("3. Alpha row", mod.EDITING_FIXTURE_ORIGINAL)
+        self.assertIn("41. Beta row", mod.EDITING_FIXTURE_ORIGINAL)
+        self.assertIn("100. Gamma row", mod.EDITING_FIXTURE_ORIGINAL)
+
+    def test_body_direct_edit_only_changes_its_own_line(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_BODY_DIRECT_EDIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("41. Beta row", "41. Beta row Z", 1),
+        )
+
+    def test_marker_direct_edit_only_changes_its_own_marker(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_MARKER_DIRECT_EDIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("41. Beta row", "941. Beta row", 1),
+        )
+
+    def test_ime_commit_appends_expected_japanese_text_to_its_own_line(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_IME_COMMIT,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("3. Alpha row", "3. Alpha row" + mod.IME_COMMIT_EXPECTED_TEXT, 1),
+        )
+
+    def test_selection_replace_only_changes_its_own_word(self):
+        self.assertEqual(
+            mod.EDITING_AFTER_SELECTION_REPLACE,
+            mod.EDITING_FIXTURE_ORIGINAL.replace("100. Gamma row", "100. Delta row", 1),
+        )
+
+    def test_every_editing_expectation_differs_from_baseline_in_exactly_one_line(self):
+        baseline_lines = mod.EDITING_FIXTURE_ORIGINAL.splitlines()
+        for expected in (
+            mod.EDITING_AFTER_BODY_DIRECT_EDIT,
+            mod.EDITING_AFTER_MARKER_DIRECT_EDIT,
+            mod.EDITING_AFTER_IME_COMMIT,
+            mod.EDITING_AFTER_SELECTION_REPLACE,
+        ):
+            with self.subTest(expected=expected):
+                expected_lines = expected.splitlines()
+                self.assertEqual(len(expected_lines), len(baseline_lines))
+                differing = [
+                    index for index, (before, after) in enumerate(zip(baseline_lines, expected_lines))
+                    if before != after
+                ]
+                self.assertEqual(len(differing), 1)
 
 
 class ClickEvidenceParsingTests(unittest.TestCase):
