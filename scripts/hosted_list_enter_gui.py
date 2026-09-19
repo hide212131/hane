@@ -429,7 +429,6 @@ def main() -> int:
         top_steps.append(preflight)
         binary_path = None
         helper = None
-        capture_helper = None
         if preflight["result"] == "pass":
             try:
                 helper = interaction_module.prepare_helper(
@@ -438,14 +437,6 @@ def main() -> int:
                 top_steps.append(step("prepare_helper", "pass", sha256=helper.digest))
             except (OSError, subprocess.SubprocessError) as exc:
                 top_steps.append(step("prepare_helper", "blocked", str(exc)))
-
-            try:
-                capture_helper = interaction_module.prepare_capture_helper(
-                    control_dir / "scripts" / "window_capture_dlsym.swift", Path(helper_tmp.name)
-                )
-                top_steps.append(step("prepare_capture_helper", "pass", sha256=capture_helper.digest))
-            except (OSError, subprocess.SubprocessError) as exc:
-                top_steps.append(step("prepare_capture_helper", "blocked", str(exc)))
 
             if helper is not None:
                 ok, source_id, error = interaction_module.run_helper(
@@ -476,7 +467,7 @@ def main() -> int:
                 )
                 top_steps.append(build_step)
 
-            if binary_path is not None and helper is not None and capture_helper is not None and input_source_ready:
+            if binary_path is not None and helper is not None and input_source_ready:
                 for spec in CASES:
                     try:
                         case_results.append(
@@ -486,7 +477,7 @@ def main() -> int:
                                 env,
                                 target_dir,
                                 helper,
-                                capture_helper,
+                                None,
                                 binary_path,
                                 expected_sha,
                                 request_id,
