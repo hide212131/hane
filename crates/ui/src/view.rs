@@ -66,6 +66,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 const METRICS_CAPACITY: usize = 4_096;
 /// Bound whole-block CPU work across all blocks and document switches in this
@@ -291,26 +292,23 @@ pub(crate) struct InlineRenameRenderState {
     pub(crate) marked_range: Option<Range<usize>>,
 }
 
-fn inline_rename_parts(path: &Path, kind: InlineRenameKind) -> (String, Option<String>) {
-    let name = path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
+fn inline_rename_parts(path: &Path, kind: InlineRenameKind) -> Option<(String, Option<String>)> {
+    // The inline field is UTF-8 text. Refuse names that cannot be represented
+    // losslessly instead of letting `to_string_lossy` silently replace bytes
+    // and turning an unchanged Enter into a destructive rename.
+    let name = path.file_name()?.to_str()?.to_owned();
     if kind == InlineRenameKind::File
         && let Some(extension) = path.extension().and_then(|extension| extension.to_str())
         && extension.eq_ignore_ascii_case("md")
     {
         let fixed_extension = format!(".{extension}");
-        let stem = name.strip_suffix(&fixed_extension).map_or_else(
-            || {
-                path.file_stem()
-                    .map_or(name.clone(), |stem| stem.to_string_lossy().into_owned())
-            },
-            ToOwned::to_owned,
-        );
-        return (stem, Some(fixed_extension));
+        let stem = name
+            .strip_suffix(&fixed_extension)
+            .unwrap_or(&name)
+            .to_owned();
+        return Some((stem, Some(fixed_extension)));
     }
-    (name, None)
+    Some((name, None))
 }
 
 fn valid_inline_rename_name(name: &str) -> bool {
@@ -373,16 +371,16 @@ fn range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
 
 fn previous_inline_rename_boundary(text: &str, offset: usize) -> usize {
     text[..offset]
-        .char_indices()
+        .grapheme_indices(true)
         .next_back()
         .map_or(0, |(index, _)| index)
 }
 
 fn next_inline_rename_boundary(text: &str, offset: usize) -> usize {
     text[offset..]
-        .chars()
-        .next()
-        .map_or(text.len(), |character| offset + character.len_utf8())
+        .grapheme_indices(true)
+        .nth(1)
+        .map_or(text.len(), |(index, _)| offset + index)
 }
 
 fn inline_rename_cursor(rename: &InlineRename) -> usize {
@@ -1213,7 +1211,11 @@ impl EditorView {
             cx.notify();
             return;
         }
-        let (text, fixed_extension) = inline_rename_parts(&path, kind);
+        let Some((text, fixed_extension)) = inline_rename_parts(&path, kind) else {
+            self.status = Some("Rename failed: file or folder name is not valid UTF-8".to_owned());
+            cx.notify();
+            return;
+        };
         let text_len = text.len();
         self.inline_rename = Some(InlineRename {
             kind,
@@ -5626,16 +5628,46 @@ mod tests {
     fn inline_rename_keeps_markdown_extensions_out_of_the_editable_text() {
         assert_eq!(
             inline_rename_parts(Path::new("Meeting 2026-09-19.md"), InlineRenameKind::File),
-            ("Meeting 2026-09-19".to_owned(), Some(".md".to_owned()))
+            Some(("Meeting 2026-09-19".to_owned(), Some(".md".to_owned())))
         );
         assert_eq!(
             inline_rename_parts(Path::new("Upper.MD"), InlineRenameKind::File),
-            ("Upper".to_owned(), Some(".MD".to_owned()))
+            Some(("Upper".to_owned(), Some(".MD".to_owned())))
         );
         assert_eq!(
             inline_rename_parts(Path::new("folder"), InlineRenameKind::Folder),
-            ("folder".to_owned(), None)
+            Some(("folder".to_owned(), None))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn inline_rename_refuses_non_utf8_names_instead_of_replacing_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let name = std::ffi::OsString::from_vec(vec![b'B', 0x80, b'.', b'm', b'd']);
+        let path = PathBuf::from(name);
+        assert_eq!(
+            inline_rename_parts(&path, InlineRenameKind::File),
+            None,
+            "non-UTF-8 names must not enter a lossy text field"
+        );
+    }
+
+    #[test]
+    fn inline_rename_movement_uses_grapheme_boundaries() {
+        let text = "a\u{301}👩‍💻z";
+        let combining_end = "a\u{301}".len();
+        let emoji_end = "a\u{301}👩‍💻".len();
+
+        assert_eq!(next_inline_rename_boundary(text, 0), combining_end);
+        assert_eq!(previous_inline_rename_boundary(text, combining_end), 0);
+        assert_eq!(next_inline_rename_boundary(text, combining_end), emoji_end);
+        assert_eq!(
+            previous_inline_rename_boundary(text, emoji_end),
+            combining_end
+        );
+        assert_eq!(next_inline_rename_boundary(text, emoji_end), text.len());
     }
 
     #[test]
