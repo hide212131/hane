@@ -1441,6 +1441,42 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
             .lock()
             .on_keyboard_layout_change
             .get_or_insert(callback);
+    } else {
+        drop(lock);
+    }
+    reactivate_key_window_text_input_context();
+}
+
+// AppKit associates each NSResponder's NSTextInputContext with whichever input
+// source (keyboard layout or input method) was current the last time that
+// context was activated, which normally happens when the responder becomes
+// first responder. Switching to a different input method (e.g. a Japanese
+// Romaji source) while our window is already key and first responder does
+// not by itself refresh that association: Text Services Manager keeps
+// composing (or not composing) based on the stale source, so printable keys
+// fall straight through as literal, unconverted characters instead of
+// starting a composition.
+//
+// `NSTextInputContextKeyboardSelectionDidChangeNotification` fires for
+// exactly this kind of change, so re-activating the key window's current
+// text input context here forces TSM to resync immediately instead of
+// waiting for the next focus change.
+fn reactivate_key_window_text_input_context() {
+    unsafe {
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        let key_window: id = msg_send![app, keyWindow];
+        if key_window.is_null() {
+            return;
+        }
+        let responder: id = msg_send![key_window, firstResponder];
+        if responder.is_null() {
+            return;
+        }
+        let input_context: id = msg_send![responder, inputContext];
+        if input_context.is_null() {
+            return;
+        }
+        let _: () = msg_send![input_context, activate];
     }
 }
 
