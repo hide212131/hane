@@ -833,13 +833,14 @@ class ImeCommitSubtestTests(unittest.TestCase):
     FIXTURE_PATH = Path("editing-fixture.md")
 
     def _make_interaction(self, *, japanese_available=True, commit_effects=None,
-                          restore_ok_until=None, move_caret_ok=True, current_source_ok=True):
+                          restore_ok_until=None, move_caret_ok=True, current_source_ok=True,
+                          current_source_id="com.apple.keylayout.ABC"):
         commit_effects = commit_effects or ["ok_matched"]
         calls = {
             "commit": 0, "restore": [], "capture": [], "move_caret": [],
             "deactivate": 0, "source_select": [],
         }
-        current_source = {"id": "com.apple.keylayout.ABC"}
+        current_source = {"id": current_source_id}
 
         class FakeInteraction:
             JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
@@ -930,6 +931,24 @@ class ImeCommitSubtestTests(unittest.TestCase):
         self.assertEqual(len(calls["restore"]), 1)
         self.assertEqual(calls["deactivate"], 1)
         self.assertEqual(calls["source_select"], [interaction.JAPANESE_SOURCE])
+
+    def test_preselected_source_path_does_not_switch_input_source_while_hane_is_running(self):
+        interaction, calls = self._make_interaction(
+            commit_effects=["ok_matched"],
+            current_source_id="com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese",
+        )
+        steps, original_source = mod._ime_commit_subtest(
+            object(), interaction, object(), object(), "window-1", object(), 4321,
+            self.FIXTURE_PATH, Path("run"), 1.0, 0.0,
+            original_source="com.apple.keylayout.ABC",
+        )
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        ready_step = next(s for s in steps if s["name"] == "ime_commit_attempt_1_source_ready_before_commit")
+        self.assertEqual(original_source, "com.apple.keylayout.ABC")
+        self.assertEqual(commit_step["result"], "pass")
+        self.assertEqual(ready_step["result"], "pass")
+        self.assertEqual(calls["deactivate"], 0)
+        self.assertEqual(calls["source_select"], [])
 
     def test_second_attempt_succeeds_after_pristine_baseline_restore(self):
         interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])

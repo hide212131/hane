@@ -319,37 +319,26 @@ def run_case(
 
             for index, action in enumerate(spec.actions, start=1):
                 if action[0].startswith("type-romaji-at-caret-"):
-                    ok, _output, error = interaction_module.run_helper(
-                        helper, ["deactivate"], helper_timeout,
+                    ok, observed_source, error = interaction_module.run_helper(
+                        helper, ["current-source"], helper_timeout,
                     )
                     steps.append(
                         step(
-                            f"ime_action_{index}_deactivate_target_before_source_switch",
-                            "pass" if ok else "blocked",
-                            None if ok else error,
+                            f"ime_action_{index}_source_ready",
+                            "pass" if ok and observed_source == action[2] else "blocked",
+                            None if ok and observed_source == action[2] else (
+                                error
+                                or f"入力ソースが期待値と一致しない: {observed_source!r} != {action[2]!r}"
+                            ),
+                            source_id=action[2],
+                            observed_source=observed_source,
                         )
                     )
-                    if ok:
-                        selected, observed_source, select_error, attempts = interaction_module.select_input_source(
-                            helper, action[2], helper_timeout,
-                        )
-                        steps.append(
-                            step(
-                                f"ime_action_{index}_select_source_while_unfocused",
-                                "pass" if selected else "blocked",
-                                None if selected else select_error,
-                                source_id=action[2],
-                                observed_source=observed_source,
-                                attempts=attempts,
-                            )
-                        )
-                        ok = selected
-                        error = select_error
-                    if not ok:
+                    if not ok or observed_source != action[2]:
                         steps.append(
                             step(
                                 f"action_{index}", "blocked",
-                                error or "IME 入力ソースを対象 editor 非アクティブ時に選択できなかった",
+                                error or "Hane 起動後の入力ソースが期待値と一致しない",
                                 command=[action[0], str(pid), *action[1:]],
                             )
                         )
@@ -444,6 +433,7 @@ def main() -> int:
     started_at = env.clock.now_iso()
     original_input_source: Optional[str] = None
     input_source_ready = False
+    ime_source_ready = False
 
     try:
         env.acquire_execution()
@@ -506,6 +496,39 @@ def main() -> int:
             if binary_path is not None and helper is not None and input_source_ready:
                 for spec in CASES:
                     try:
+                        needs_ime_source = any(
+                            action[0].startswith("type-romaji-at-caret-") for action in spec.actions
+                        )
+                        if needs_ime_source and not ime_source_ready:
+                            selected, selected_source, select_error, source_attempts = (
+                                interaction_module.select_input_source(
+                                    helper,
+                                    interaction_module.JAPANESE_SOURCE,
+                                    helper_timeout,
+                                )
+                            )
+                            top_steps.append(
+                                step(
+                                    "select_japanese_before_ime_session",
+                                    "pass" if selected else "blocked",
+                                    None if selected else select_error,
+                                    source_id=interaction_module.JAPANESE_SOURCE,
+                                    observed_source=selected_source,
+                                    attempts=source_attempts,
+                                    note="Hane の IME session を起動する前に入力ソースを選択した",
+                                )
+                            )
+                            ime_source_ready = selected
+                        if needs_ime_source and not ime_source_ready:
+                            case_results.append(
+                                {
+                                    "name": spec.name,
+                                    "purpose": spec.purpose,
+                                    "result": "blocked",
+                                    "reason": "Hane 起動前の日本語入力ソース選択に失敗した",
+                                }
+                            )
+                            continue
                         case_results.append(
                             run_case(
                                 gui_validate_module,

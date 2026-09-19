@@ -874,6 +874,7 @@ def _marker_direct_edit_subtest(
 def _ime_commit_subtest(
     gui_validate_module, interaction_module, env, config, window_id, swift_helper, pid,
     fixture_path, run_dir: Path, helper_timeout: float, poll_timeout: float,
+    original_source: Optional[str] = None,
 ) -> tuple:
     """caret 位置での日本語 IME 確定を実ファイル byte 列で検証する。
 
@@ -881,11 +882,18 @@ def _ime_commit_subtest(
     IME 工程の成功・失敗にかかわらず元の入力ソースへ復元できるよう、ここで確認できた
     original source id (未確認なら None)を合わせて返す。
 
-    対象 editor を非アクティブ化した状態で source を選択・settle・再確認してから、
-    Hane を focus して romaji 入力・変換/確定・保存を行う。source 選択だけを先に
-    pass と扱っても IME の変換成功を意味しないため、最終的な成否は実際に変換・
-    確定・保存された source bytes からのみ判定する(Issue #126 post-merge GUI run
-    35410838091: source 選択直後でも保存値が未変換だった)。
+    通常の実GUI経路では呼び出し側がHaneを起動する前に入力ソースを選択し、
+    `original_source` として復元先を渡す。Haneのkey windowが動作中にsourceを
+    切り替えないことで、GPUIのkeyboard-layout callbackがmacOSのIME XPC待ちへ
+    入る経路を避ける。後続の各attemptではcurrent-sourceの一致だけを確認し、
+    Haneをfocusしてromaji入力・変換/確定・保存を行う。source選択だけを先に
+    passと扱ってもIMEの変換成功を意味しないため、最終的な成否は実際に変換・
+    確定・保存されたsource bytesからのみ判定する(Issue #126 post-merge GUI run
+    35410838091: source選択直後でも保存値が未変換だった)。
+
+    `original_source` が省略された場合は、既存のunit testと後方互換のため、
+    従来どおりこの関数内で元sourceを取得し、対象editorを非アクティブ化して
+    日本語sourceを選択する経路を使う。
 
     currentSourceID() が日本語ソースへの切り替わりを報告しても、Hane 側の IME session が
     実際に変換可能とは限らない(PR #208 review PRRT_kwDOUETGuM6j8CB_)。readiness の証拠は
@@ -900,12 +908,24 @@ def _ime_commit_subtest(
     PRRT_kwDOUETGuM6j8L1G)。前回の未変換テキストが次の attempt へ持ち越されることはない。
     """
     steps: list = []
-    ok, out, err = interaction_module.run_helper(swift_helper, ["current-source"], helper_timeout)
-    if not ok:
-        steps.append(step("ime_commit_query_current_source", "blocked", err))
-        return steps, None
-    original_source = out
-    steps.append(step("ime_commit_query_current_source", "pass", source_id=original_source))
+    if original_source is None:
+        ok, out, err = interaction_module.run_helper(swift_helper, ["current-source"], helper_timeout)
+        if not ok:
+            steps.append(step("ime_commit_query_current_source", "blocked", err))
+            return steps, None
+        original_source = out
+        steps.append(step("ime_commit_query_current_source", "pass", source_id=original_source))
+        source_preselected = False
+    else:
+        steps.append(
+            step(
+                "ime_commit_original_source_supplied",
+                "pass",
+                source_id=original_source,
+                note="Hane起動前に取得した復元先の入力ソースを使用",
+            )
+        )
+        source_preselected = True
     ok, out, err = interaction_module.run_helper(swift_helper, ["list-sources"], helper_timeout)
     if not ok:
         steps.append(step("ime_commit_list_input_sources", "blocked", err))
@@ -961,45 +981,69 @@ def _ime_commit_subtest(
                 ))
                 return steps, original_source
 
-        # Hane が key application のまま入力ソースを切り替えると、GPUI の
-        # keyboard-layout callback が Kotoeri の NSTextInputContext を同期的に
-        # 再活性化し、macOS の IME XPC 待ちへ入ることがある。対象 editor を
-        # 一度 Finder へ切り替えてから source を選び、source が settle した後に
-        # Hane を再度 focus する。実際の変換・確定・保存結果は引き続き fixture の
-        # source bytes で判定するため、source 選択だけを成功扱いにはしない。
-        ok, _out, err = interaction_module.run_helper(
-            swift_helper, ["deactivate"], helper_timeout,
-        )
-        steps.append(step(
-            f"{label}_deactivate_target_before_source_switch", "pass" if ok else "blocked",
-            reason=None if ok else err,
-        ))
-        if not ok:
+        if source_preselected:
+            ok, current_source, err = interaction_module.run_helper(
+                swift_helper, ["current-source"], helper_timeout,
+            )
+            steps.append(
+                step(
+                    f"{label}_source_ready_before_commit",
+                    "pass" if ok and current_source == japanese_source else "blocked",
+                    reason=None if ok and current_source == japanese_source else (
+                        err or f"日本語入力ソースが有効でない: {current_source!r} != {japanese_source!r}"
+                    ),
+                    source_id=japanese_source,
+                    observed_source=current_source,
+                    note="Hane起動後は入力ソースを切り替えず、現在値だけを確認",
+                )
+            )
+            if not ok or current_source != japanese_source:
+                steps.append(
+                    step(
+                        "direct_ime_commit_at_caret", "blocked",
+                        f"attempt {attempt} のHane起動後に日本語入力ソースを確認できなかった: {err or current_source}",
+                        attempts=attempts_evidence,
+                    )
+                )
+                return steps, original_source
+        else:
+            # Hane が key application のまま入力ソースを切り替えると、GPUI の
+            # keyboard-layout callback が Kotoeri の NSTextInputContext を同期的に
+            # 再活性化し、macOS の IME XPC 待ちへ入ることがある。既存のunit testと
+            # 旧runner経路のために残すが、実GUIの新経路では呼び出し側で先に済ませる。
+            ok, _out, err = interaction_module.run_helper(
+                swift_helper, ["deactivate"], helper_timeout,
+            )
             steps.append(step(
-                "direct_ime_commit_at_caret", "blocked",
-                f"attempt {attempt} の入力ソース切替前に対象 editor を非アクティブ化できなかった: {err}",
-                attempts=attempts_evidence,
+                f"{label}_deactivate_target_before_source_switch", "pass" if ok else "blocked",
+                reason=None if ok else err,
             ))
-            return steps, original_source
+            if not ok:
+                steps.append(step(
+                    "direct_ime_commit_at_caret", "blocked",
+                    f"attempt {attempt} の入力ソース切替前に対象editorを非アクティブ化できなかった: {err}",
+                    attempts=attempts_evidence,
+                ))
+                return steps, original_source
 
-        selected, selected_source, select_error, source_attempts = interaction_module.select_input_source(
-            swift_helper, japanese_source, helper_timeout,
-        )
-        steps.append(step(
-            f"{label}_select_japanese_source_while_unfocused",
-            "pass" if selected else "blocked",
-            reason=None if selected else select_error,
-            source_id=japanese_source,
-            observed_source=selected_source,
-            attempts=source_attempts,
-        ))
-        if not selected:
+            selected, selected_source, select_error, source_attempts = interaction_module.select_input_source(
+                swift_helper, japanese_source, helper_timeout,
+            )
             steps.append(step(
-                "direct_ime_commit_at_caret", "blocked",
-                f"attempt {attempt} の対象 editor 非アクティブ時の日本語入力ソース選択に失敗した: {select_error}",
-                attempts=attempts_evidence,
+                f"{label}_select_japanese_source_while_unfocused",
+                "pass" if selected else "blocked",
+                reason=None if selected else select_error,
+                source_id=japanese_source,
+                observed_source=selected_source,
+                attempts=source_attempts,
             ))
-            return steps, original_source
+            if not selected:
+                steps.append(step(
+                    "direct_ime_commit_at_caret", "blocked",
+                    f"attempt {attempt} の対象editor非アクティブ時の日本語入力ソース選択に失敗した: {select_error}",
+                    attempts=attempts_evidence,
+                ))
+                return steps, original_source
 
         # Hane へ focus してからの変換・確定・保存は単一の helper invocation
         # で実施する。source は直前に選択済みなので、ここで同じ source を
@@ -1180,6 +1224,7 @@ def run_editing_scenario(
     base_run_dir: Path,
     binary_path: Path, expected_sha: str, request_id: str, startup_timeout: float, window_timeout: float,
     helper_timeout: float, poll_timeout: float, priority: dict,
+    original_input_source: Optional[str],
 ) -> dict:
     """#126 E (hosted-normal-list/3): 通常リスト固有の source marker/本文の直接編集、
     ASCII 入力、日本語 IME 確定、選択置換、Undo/Redo、保存、再起動後の再オープンを
@@ -1226,33 +1271,102 @@ def run_editing_scenario(
                 fixture_path, run_dir, helper_timeout, poll_timeout,
             )
 
-            ime_steps, original_source = _ime_commit_subtest(
-                gui_validate_module, interaction_module, env, config, window_id, swift_helper, pid,
-                fixture_path, run_dir, helper_timeout, poll_timeout,
-            )
-            steps += ime_steps
-            # IME が選択した日本語 source を ABC へ戻す通知も、Hane の key
-            # window が生きたままだと macOS の IME XPC 待ちを再発させる。
-            # IME の実バイト列判定が終わったらいったん session を閉じ、source と
-            # fixture を復元してから ASCII の selection/undo/redo を別 session で
-            # 続ける。これにより GUI の IME 検証を省略せず、入力ソース復元も
-            # 実際の editor process に対する危険な切替にならない。
-            ime_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
-            ime_cleanup["name"] = "close_session_after_ime_before_source_restore"
-            steps.append(ime_cleanup)
+            # A keyboard-layout notification while Hane owns the key window can
+            # synchronously reactivate NSTextInputContext and block in Kotoeri's
+            # XPC service. Close the ABC session before selecting Japanese, then
+            # start a fresh Hane process with Japanese already active.
+            ascii_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
+            ascii_cleanup["name"] = "close_session_before_ime_source_switch"
+            steps.append(ascii_cleanup)
             process_holder["process"] = None
-            restore_steps = _restore_ime_side_effects(
-                interaction_module, swift_helper, fixture_path, original_source, helper_timeout,
-            )
-            steps += restore_steps
 
-            restore_passed = ime_cleanup["result"] == "pass" and all(
-                item["result"] == "pass" for item in restore_steps
+            ime_cleanup = {"name": "close_session_after_ime_before_source_restore", "result": "blocked"}
+            restore_steps: list = []
+            ime_passed = False
+            ime_session_ready = False
+            if ascii_cleanup["result"] != "pass":
+                steps.append(skipped_step(
+                    "direct_ime_commit_at_caret",
+                    "ASCII session の終了に失敗したためIME sessionを起動しない",
+                ))
+            elif not original_input_source:
+                steps.append(skipped_step(
+                    "direct_ime_commit_at_caret",
+                    "元の入力ソースを取得できなかったためIME sessionを起動しない",
+                ))
+            else:
+                selected, selected_source, select_error, source_attempts = interaction_module.select_input_source(
+                    swift_helper, interaction_module.JAPANESE_SOURCE, helper_timeout,
+                )
+                steps.append(step(
+                    "select_japanese_before_ime_session",
+                    "pass" if selected else "blocked",
+                    reason=None if selected else select_error,
+                    source_id=interaction_module.JAPANESE_SOURCE,
+                    observed_source=selected_source,
+                    attempts=source_attempts,
+                    note="Hane sessionを起動する前に日本語入力ソースを選択した",
+                ))
+                if not selected:
+                    steps.append(skipped_step(
+                        "direct_ime_commit_at_caret",
+                        "Hane 起動前の日本語入力ソース選択に失敗した",
+                    ))
+                else:
+                    ime_run_dir = run_dir / "ime_session"
+                    ime_run_dir.mkdir(parents=True, exist_ok=True)
+                    ime_config = interaction_module.make_config(
+                        gui_validate_module, workspace_dir=target_dir,
+                        scenario="normal-list-editing-ime",
+                        expected_sha=expected_sha, request_id=request_id, generation="2",
+                        run_dir=ime_run_dir, fixture_path=fixture_path,
+                        features=["timing-probe"], extra_env={},
+                        startup_timeout=startup_timeout, window_timeout=window_timeout,
+                        capture_helper=capture_helper,
+                    )
+                    ime_session_steps, ime_window_id = interaction_module.open_session(
+                        gui_validate_module, env, ime_config, binary_path,
+                        process_holder, "ime_before", swift_helper, helper_timeout,
+                    )
+                    steps += ime_session_steps
+                    ime_pid = interaction_module.current_pid(process_holder)
+                    ime_session_ready = ime_pid is not None and ime_window_id is not None
+                    if not ime_session_ready:
+                        steps.append(skipped_step(
+                            "direct_ime_commit_at_caret",
+                            "IME session の起動またはwindow discoveryがpassしなかった",
+                        ))
+                    else:
+                        ime_steps, _restoration_source = _ime_commit_subtest(
+                            gui_validate_module, interaction_module, env, ime_config, ime_window_id,
+                            swift_helper, ime_pid, fixture_path, ime_run_dir, helper_timeout, poll_timeout,
+                            original_source=original_input_source,
+                        )
+                        steps += ime_steps
+                        ime_passed = any(
+                            item.get("name") == "direct_ime_commit_at_caret" and item.get("result") == "pass"
+                            for item in ime_steps
+                        )
+
+                    ime_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
+                    ime_cleanup["name"] = "close_session_after_ime_before_source_restore"
+                    steps.append(ime_cleanup)
+                    process_holder["process"] = None
+                    restore_steps = _restore_ime_side_effects(
+                        interaction_module, swift_helper, fixture_path, original_input_source, helper_timeout,
+                    )
+                    steps += restore_steps
+
+            restore_passed = (
+                ime_session_ready
+                and ime_passed
+                and ime_cleanup["result"] == "pass"
+                and all(item["result"] == "pass" for item in restore_steps)
             )
             if not restore_passed:
                 steps.append(skipped_step(
                     "selection_replace_ascii_undo_redo",
-                    "IME session の終了または source/fixture baseline 復元が pass しなかった",
+                    "IME session の終了、IME確定、またはsource/fixture baseline復元がpassしなかった",
                 ))
             else:
                 selection_run_dir = run_dir / "selection_replace_session"
@@ -1260,7 +1374,7 @@ def run_editing_scenario(
                 selection_config = interaction_module.make_config(
                     gui_validate_module, workspace_dir=target_dir,
                     scenario="normal-list-editing-selection-replace",
-                    expected_sha=expected_sha, request_id=request_id, generation="2",
+                    expected_sha=expected_sha, request_id=request_id, generation="3",
                     run_dir=selection_run_dir, fixture_path=fixture_path,
                     features=["timing-probe"], extra_env={},
                     startup_timeout=startup_timeout, window_timeout=window_timeout,
@@ -1275,7 +1389,7 @@ def run_editing_scenario(
                 if selection_pid is None or selection_window_id is None:
                     steps.append(skipped_step(
                         "selection_replace_ascii_undo_redo",
-                        "IME 後の selection 用 session の起動または window discovery が pass しなかった",
+                        "IME 後の selection 用 session の起動またはwindow discoveryがpassしなかった",
                     ))
                 else:
                     steps += _selection_replace_subtest(
@@ -1299,7 +1413,7 @@ def run_editing_scenario(
     reopen_process_holder: dict = {"process": None}
     reopen_config = interaction_module.make_config(
         gui_validate_module, workspace_dir=target_dir, scenario="normal-list-editing-reopen",
-        expected_sha=expected_sha, request_id=request_id, generation="3", run_dir=reopen_dir,
+        expected_sha=expected_sha, request_id=request_id, generation="4", run_dir=reopen_dir,
         fixture_path=fixture_path, features=["timing-probe"], extra_env={},
         startup_timeout=startup_timeout, window_timeout=window_timeout,
         capture_helper=capture_helper,
@@ -1446,6 +1560,7 @@ def main() -> int:
                         gui_validate_module, interaction_module, env, target_dir, swift_helper, None,
                         run_dir, binary_path, expected_sha, request_id,
                         startup_timeout, window_timeout, helper_timeout, poll_timeout, priority,
+                        original_input_source,
                     ))
                 except (gui_validate_module.Aborted, Exception) as exc:
                     scenarios.append({
