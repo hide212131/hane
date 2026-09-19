@@ -93,6 +93,7 @@ SCOPE_NOTE = (
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
+ASCII_INPUT_SOURCE = "com.apple.keylayout.ABC"
 
 def load_module(control_dir: Path, relative: str, name: str):
     sys.dont_write_bytecode = True
@@ -1272,6 +1273,7 @@ def main() -> int:
     build_info: dict = {}
     started_at = env.clock.now_iso()
     helper_tmp = tempfile.TemporaryDirectory(prefix="hane-normal-list-helper-")
+    original_input_source: Optional[str] = None
 
     try:
         env.acquire_execution()
@@ -1315,7 +1317,31 @@ def main() -> int:
                 if build_step["result"] != "pass":
                     binary_path = None
 
-            if binary_path is not None and swift_helper is not None and capture_helper is not None:
+            input_source_ready = False
+            if swift_helper is not None:
+                ok, source_id, error = interaction_module.run_helper(
+                    swift_helper, ["current-source"], helper_timeout
+                )
+                if ok:
+                    original_input_source = source_id
+                    ok, _output, error = interaction_module.run_helper(
+                        swift_helper, ["select-source", ASCII_INPUT_SOURCE], helper_timeout
+                    )
+                    if ok:
+                        ok, selected_source, error = interaction_module.run_helper(
+                            swift_helper, ["current-source"], helper_timeout
+                        )
+                        input_source_ready = ok and selected_source == ASCII_INPUT_SOURCE
+                top_steps.append(
+                    step(
+                        "select_ascii_input_source",
+                        "pass" if input_source_ready else "blocked",
+                        None if input_source_ready else (error or "ABC入力ソースを選択できない"),
+                        source_id=ASCII_INPUT_SOURCE,
+                    )
+                )
+
+            if binary_path is not None and swift_helper is not None and capture_helper is not None and input_source_ready:
                 for spec in ALL_SCENARIO_SPECS:
                     try:
                         scenarios.append(run_scenario(
@@ -1339,6 +1365,24 @@ def main() -> int:
                     scenarios.append({
                         "name": "list_source_marker_body_editing", "result": "blocked", "reason": str(exc), "steps": [],
                     })
+            elif binary_path is not None and swift_helper is not None and capture_helper is not None:
+                scenarios.append({
+                    "name": "normal_list_gui_setup", "result": "blocked",
+                    "reason": "ASCII入力ソースの初期化に失敗した", "steps": [],
+                })
+
+            if swift_helper is not None and original_input_source:
+                ok, _output, error = interaction_module.run_helper(
+                    swift_helper, ["select-source", original_input_source], helper_timeout
+                )
+                top_steps.append(
+                    step(
+                        "restore_input_source",
+                        "pass" if ok else "blocked",
+                        None if ok else error,
+                        source_id=original_input_source,
+                    )
+                )
 
         all_results = [s["result"] for s in top_steps if s["result"] in priority] + [
             s["result"] for s in scenarios if s["result"] in priority
