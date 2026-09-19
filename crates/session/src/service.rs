@@ -197,11 +197,17 @@ fn is_case_only_name(from: &Path, to: &Path) -> bool {
 /// the original spelling before returning the error.
 #[cfg(any(target_os = "macos", windows))]
 fn rename_case_only_file(from: &Path, to: &Path) -> io::Result<()> {
-    let temporary = temporary_rename_path(to);
-    fs::rename(from, &temporary)?;
+    let temporary = loop {
+        let candidate = temporary_rename_path(to);
+        match rename_file_without_replace(from, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
     match rename_file_without_replace(&temporary, to) {
         Ok(()) => Ok(()),
-        Err(error) => match fs::rename(&temporary, from) {
+        Err(error) => match rename_file_without_replace(&temporary, from) {
             Ok(()) => Err(error),
             Err(restore_error) => Err(io::Error::new(
                 error.kind(),
@@ -213,11 +219,17 @@ fn rename_case_only_file(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn rename_case_only_folder(from: &Path, to: &Path) -> io::Result<()> {
-    let temporary = temporary_rename_path(to);
-    fs::rename(from, &temporary)?;
+    let temporary = loop {
+        let candidate = temporary_rename_path(to);
+        match rename_directory_without_replace(from, &candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
     match rename_directory_without_replace(&temporary, to) {
         Ok(()) => Ok(()),
-        Err(error) => match fs::rename(&temporary, from) {
+        Err(error) => match rename_directory_without_replace(&temporary, from) {
             Ok(()) => Err(error),
             Err(restore_error) => Err(io::Error::new(
                 error.kind(),
@@ -482,6 +494,32 @@ mod tests {
         OsFileService.rename(&from, &to).unwrap();
         assert!(!from.exists());
         assert_eq!(fs::read_to_string(&to).unwrap(), "hello\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_case_only_file_rename_works_on_case_insensitive_filesystems() {
+        let root = temporary_directory("rename-case-only-file");
+        fs::create_dir_all(&root).unwrap();
+        let from = root.join("Plain.md");
+        let to = root.join("plain.md");
+        fs::write(&from, "plain\n").unwrap();
+
+        // A case-sensitive filesystem has two distinct names here, so this
+        // platform does not exercise the case-alias path.
+        if !to.exists() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        OsFileService.rename(&from, &to).unwrap();
+        assert_eq!(fs::read_to_string(&to).unwrap(), "plain\n");
+        let names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().any(|name| name == "plain.md"));
+        assert!(!names.iter().any(|name| name == "Plain.md"));
         fs::remove_dir_all(root).unwrap();
     }
 
