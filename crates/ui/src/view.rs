@@ -113,6 +113,23 @@ struct ScrollbarDrag {
     content_height: f32,
 }
 
+/// Which edge of the editor viewport a text-selection drag is currently held
+/// against, and therefore which way `step_text_autoscroll` extends the
+/// selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoscrollDirection {
+    Up,
+    Down,
+}
+
+/// How close to the editor viewport's top or bottom edge a text-selection
+/// drag's pointer has to be to start autoscrolling (issue #213).
+const TEXT_SELECTION_AUTOSCROLL_EDGE: f32 = 24.0;
+/// How often a held text-selection drag extends the selection by one more
+/// row and lets `scroll_cursor_into_view` follow it while the pointer stays
+/// inside `TEXT_SELECTION_AUTOSCROLL_EDGE`, without needing to move.
+const TEXT_SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+
 /// Blocks kept presented on each side of the viewport, so scrolling back a
 /// screen does not re-present what was just drawn.
 const BLOCK_CACHE_MARGIN: usize = 64;
@@ -295,6 +312,20 @@ pub struct EditorView {
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
     editor_scrollbar_drag: Option<ScrollbarDrag>,
+    /// Set while a left-button drag started by `on_row_mouse_down` is still
+    /// held, so `on_panel_mouse_move` can tell a text-selection drag apart
+    /// from a sidebar-resize or scrollbar drag once the pointer leaves every
+    /// row (e.g. above the top row or below the bottom one) and keep
+    /// autoscrolling it (issue #213).
+    text_selection_drag: bool,
+    /// Which edge of the editor viewport the current text-selection drag is
+    /// held against, if any. `None` means no autoscroll is currently ticking.
+    text_autoscroll: Option<AutoscrollDirection>,
+    /// Bumped every time `text_autoscroll` changes, so a running autoscroll
+    /// timer loop can tell it has been superseded (pointer left the edge
+    /// zone, the drag ended, or reversed direction) and stop rescheduling
+    /// itself instead of ticking a drag it no longer belongs to.
+    text_autoscroll_activity: u64,
     /// Whether the sidebar's overlay scrollbar thumb is currently shown. Set
     /// on a wheel/trackpad scroll or thumb drag and cleared by the delayed
     /// hide task armed in `show_sidebar_scrollbar_briefly` once
@@ -676,6 +707,9 @@ impl EditorView {
             sidebar_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
+            text_selection_drag: false,
+            text_autoscroll: None,
+            text_autoscroll_activity: 0,
             sidebar_scrollbar_visible: false,
             sidebar_scrollbar_activity: 0,
             sidebar_date_badge_today: local_today(),
@@ -2218,6 +2252,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        self.text_selection_drag = true;
         let Some(offset) =
             self.offset_at_row_x(line, fragment, f32::from(event.position.x), window)
         else {
@@ -3303,10 +3338,98 @@ impl EditorView {
             self.sidebar_scroll.set_offset(point(px(0.0), px(-next)));
             changed = true;
         }
+        // Sidebar resize / scrollbar drags above already claimed this move;
+        // a text-selection drag never sets those, so this only fires for the
+        // drag `on_row_mouse_down` started (issue #213).
+        if self.text_selection_drag && event.dragging() {
+            let direction = self.text_autoscroll_direction_for(f32::from(event.position.y));
+            self.set_text_autoscroll(direction, cx);
+        }
         if changed {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    /// Which edge of the editor viewport `window_y` (window-space, matching
+    /// `MouseMoveEvent::position`) sits inside, if any. The viewport begins
+    /// right below the header and is `self.viewport_height` tall, the same
+    /// frame `render` computes it in.
+    fn text_autoscroll_direction_for(&self, window_y: f32) -> Option<AutoscrollDirection> {
+        let local_y = window_y - self.theme.header_height;
+        if local_y < TEXT_SELECTION_AUTOSCROLL_EDGE {
+            Some(AutoscrollDirection::Up)
+        } else if local_y > self.viewport_height - TEXT_SELECTION_AUTOSCROLL_EDGE {
+            Some(AutoscrollDirection::Down)
+        } else {
+            None
+        }
+    }
+
+    /// Starts, stops, or redirects the text-selection autoscroll loop to
+    /// match `direction`, doing nothing when it already matches what is
+    /// currently running.
+    fn set_text_autoscroll(
+        &mut self,
+        direction: Option<AutoscrollDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.text_autoscroll == direction {
+            return;
+        }
+        self.text_autoscroll = direction;
+        self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
+        if let Some(direction) = direction {
+            self.spawn_text_autoscroll(direction, self.text_autoscroll_activity, cx);
+        }
+    }
+
+    /// Repeatedly extends the selection by one row toward `direction` and
+    /// lets `after_input`'s `scroll_cursor_into_view` follow it, every
+    /// `TEXT_SELECTION_AUTOSCROLL_INTERVAL`, so a held pointer near an edge
+    /// keeps scrolling without needing to move (issue #213). Stops as soon
+    /// as `activity` is stale (a newer call to `set_text_autoscroll` ran) or
+    /// a tick reaches the start/end of the document and stops moving, rather
+    /// than ticking forever once there is nothing left to extend.
+    fn spawn_text_autoscroll(
+        &mut self,
+        direction: AutoscrollDirection,
+        activity: u64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |view, cx| {
+            loop {
+                gpui::Timer::after(TEXT_SELECTION_AUTOSCROLL_INTERVAL).await;
+                let Ok(should_continue) = view
+                    .update(cx, |view, cx| view.step_text_autoscroll(direction, activity, cx))
+                else {
+                    return;
+                };
+                if !should_continue {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One autoscroll tick. Returns whether the loop driving it should keep
+    /// ticking.
+    fn step_text_autoscroll(
+        &mut self,
+        direction: AutoscrollDirection,
+        activity: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.text_autoscroll_activity != activity || self.text_autoscroll != Some(direction) {
+            return false;
+        }
+        let before = self.editor().selection().active;
+        match direction {
+            AutoscrollDirection::Up => self.dispatch(EditorCommand::MoveUp { extend: true }, cx),
+            AutoscrollDirection::Down => self.dispatch(EditorCommand::MoveDown { extend: true }, cx),
+        }
+        self.editor().selection().active != before
     }
 
     fn finish_panel_drag(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -3314,6 +3437,8 @@ impl EditorView {
         let was_dragging = self.sidebar_resize_drag.take().is_some()
             || was_sidebar_scrollbar_drag
             || self.editor_scrollbar_drag.take().is_some();
+        self.text_selection_drag = false;
+        self.set_text_autoscroll(None, cx);
         if was_dragging {
             cx.stop_propagation();
             cx.notify();
@@ -7255,5 +7380,108 @@ mod tests {
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    // Issue #213: a text-selection drag held near the editor viewport's top
+    // or bottom edge did not autoscroll at all, because `on_row_mouse_move`
+    // only fires while the pointer sits over a rendered row and stops firing
+    // the instant the drag reaches the edge of what is currently visible.
+
+    #[gpui::test]
+    fn drag_selection_autoscrolls_down_while_held_near_the_bottom_edge_and_stops_on_mouse_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..60)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        let (down_point, anchor) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let (header_height, viewport_height) =
+            view.read_with(cx, |view, _| (view.theme.header_height, view.viewport_height));
+        let edge_point = point(down_point.x, px(header_height + viewport_height - 4.0));
+        cx.simulate_mouse_move(edge_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.text_autoscroll, Some(AutoscrollDirection::Down));
+            assert_eq!(view.editor().selection().anchor, anchor);
+        });
+        let (active_after_move, scroll_after_move) =
+            view.read_with(cx, |view, _| (view.editor().selection().active, view.scroll_y));
+
+        // The autoscroll loop ticks on a real `gpui::Timer`, the same way the
+        // debounce timers `settle_debounce` waits on do: real time has to
+        // pass for it to extend the selection and scroll further without the
+        // pointer moving again.
+        std::thread::sleep(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
+        cx.run_until_parked();
+
+        let (active_after_ticks, scroll_after_ticks) =
+            view.read_with(cx, |view, _| (view.editor().selection().active, view.scroll_y));
+        assert!(active_after_ticks > active_after_move);
+        assert!(scroll_after_ticks > scroll_after_move);
+
+        cx.simulate_mouse_up(edge_point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.text_autoscroll, None);
+            assert!(!view.text_selection_drag);
+        });
+
+        let active_after_stop = view.read_with(cx, |view, _| view.editor().selection().active);
+        std::thread::sleep(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection().active, active_after_stop);
+        });
+    }
+
+    #[gpui::test]
+    fn drag_selection_autoscrolls_up_toward_the_document_start_and_then_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "line 0\n\nline 1\n\nline 2\n\nline 3";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+
+        let (down_point, anchor) = row_click(&view, cx, "row-4-0", 4, 0, 0);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let header_height = view.read_with(cx, |view, _| view.theme.header_height);
+        let edge_point = point(down_point.x, px(header_height + 2.0));
+        cx.simulate_mouse_move(edge_point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.text_autoscroll, Some(AutoscrollDirection::Up));
+        });
+
+        // Ticks the autoscroll loop's own per-tick logic directly instead of
+        // waiting on the real timer that drives it in production: this
+        // covers the tick behaviour deterministically without real-time
+        // waits — it moves the active edge up one row at a time, keeps the
+        // anchor fixed, and stops for good once it reaches the document
+        // start instead of spinning uselessly while the pointer stays held
+        // past it.
+        let activity = view.read_with(cx, |view, _| view.text_autoscroll_activity);
+        let mut ticks = 0;
+        loop {
+            let continued = view.update(cx, |view, cx| {
+                view.step_text_autoscroll(AutoscrollDirection::Up, activity, cx)
+            });
+            ticks += 1;
+            if !continued {
+                break;
+            }
+            assert!(ticks < 20, "should reach the document start well within 20 ticks");
+        }
+        assert!(ticks > 1);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection().active, SourceOffset(0));
+            assert_eq!(view.editor().selection().anchor, anchor);
+        });
     }
 }
