@@ -1744,16 +1744,30 @@ impl UTType {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::{
+        ptr,
+        sync::{
+            atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use objc::{declare::ClassDecl, runtime::Class};
 
     use crate::ClipboardItem;
 
+    use super::super::NSRange as GpuiNSRange;
     use super::*;
+
+    const TEST_COMMIT_OFFSET: usize = "3. Alpha row".len();
 
     static TEST_ACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
     static TEST_DEACTIVATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_COMMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_COMMIT_OFFSET_SEEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static TEST_COMMIT_TEXT_MATCH: AtomicBool = AtomicBool::new(false);
+    static TEST_REENTER_ON_DEACTIVATE: AtomicBool = AtomicBool::new(false);
+    static TEST_NOTIFICATION_OBSERVER: AtomicPtr<Object> = AtomicPtr::new(ptr::null_mut());
 
     extern "C" fn test_key_window_first_responder(this: &Object, _: Sel) -> id {
         unsafe { *this.get_ivar::<id>("firstResponder") }
@@ -1764,13 +1778,41 @@ mod tests {
     }
 
     extern "C" fn test_input_context_activate(this: &Object, _: Sel) {
-        let _ = this;
         TEST_ACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+        unsafe {
+            let client = *this.get_ivar::<id>("client");
+            if !client.is_null() {
+                let text = ns_string("日本語");
+                let replacement_range = GpuiNSRange {
+                    location: TEST_COMMIT_OFFSET as NSUInteger,
+                    length: 0,
+                };
+                let _: () = msg_send![client, insertText: text replacementRange: replacement_range];
+            }
+        }
     }
 
-    extern "C" fn test_input_context_deactivate(this: &Object, _: Sel) {
-        let _ = this;
+    extern "C" fn test_input_context_deactivate(_: &Object, _: Sel) {
         TEST_DEACTIVATE_COUNT.fetch_add(1, Ordering::SeqCst);
+        if TEST_REENTER_ON_DEACTIVATE.swap(false, Ordering::SeqCst) {
+            let delegate = TEST_NOTIFICATION_OBSERVER.load(Ordering::SeqCst);
+            if !delegate.is_null() {
+                unsafe { post_keyboard_selection_change_notification() };
+            }
+        }
+    }
+
+    extern "C" fn test_responder_insert_text(
+        _: &Object,
+        _: Sel,
+        text: id,
+        replacement_range: GpuiNSRange,
+    ) {
+        TEST_COMMIT_COUNT.fetch_add(1, Ordering::SeqCst);
+        TEST_COMMIT_OFFSET_SEEN.store(replacement_range.location as usize, Ordering::SeqCst);
+        let expected_text = unsafe { ns_string("日本語") };
+        let text_matches: BOOL = unsafe { msg_send![text, isEqualToString: expected_text] };
+        TEST_COMMIT_TEXT_MATCH.store(text_matches == YES, Ordering::SeqCst);
     }
 
     fn test_classes() -> (*const Class, *const Class, *const Class) {
@@ -1778,6 +1820,7 @@ mod tests {
         let (key_window, responder, input_context) = *CLASSES.get_or_init(|| unsafe {
             let mut input_context = ClassDecl::new("HaneImeTestInputContext", class!(NSObject))
                 .unwrap();
+            input_context.add_ivar::<id>("client");
             input_context.add_method(
                 sel!(activate),
                 test_input_context_activate as extern "C" fn(&Object, Sel),
@@ -1793,6 +1836,10 @@ mod tests {
             responder.add_method(
                 sel!(inputContext),
                 test_responder_input_context as extern "C" fn(&Object, Sel) -> id,
+            );
+            responder.add_method(
+                sel!(insertText:replacementRange:),
+                test_responder_insert_text as extern "C" fn(&Object, Sel, id, GpuiNSRange),
             );
             let responder = responder.register() as *const Class as usize;
 
@@ -1826,8 +1873,14 @@ mod tests {
             name: name
             object: nil
         ];
-        let _: () = msg_send![notification_center, postNotificationName: name object: nil];
+        unsafe { post_keyboard_selection_change_notification() };
         let _: () = msg_send![notification_center, removeObserver: delegate name: name object: nil];
+    }
+
+    unsafe fn post_keyboard_selection_change_notification() {
+        let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = unsafe { ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification") };
+        let _: () = msg_send![notification_center, postNotificationName: name object: nil];
     }
 
     #[test]
@@ -1845,9 +1898,14 @@ mod tests {
         let input_context = unsafe { new_test_object(input_context_class) };
         TEST_ACTIVATE_COUNT.store(0, Ordering::SeqCst);
         TEST_DEACTIVATE_COUNT.store(0, Ordering::SeqCst);
+        TEST_COMMIT_COUNT.store(0, Ordering::SeqCst);
+        TEST_COMMIT_OFFSET_SEEN.store(usize::MAX, Ordering::SeqCst);
+        TEST_COMMIT_TEXT_MATCH.store(false, Ordering::SeqCst);
+        TEST_REENTER_ON_DEACTIVATE.store(true, Ordering::SeqCst);
         let text_responder = unsafe { new_test_object(responder_class) };
         unsafe {
             (*text_responder).set_ivar("inputContext", input_context);
+            (*input_context).set_ivar("client", text_responder);
         }
         let key_window = unsafe { new_test_object(key_window_class) };
         unsafe {
@@ -1865,12 +1923,23 @@ mod tests {
             );
             delegate
         };
+        TEST_NOTIFICATION_OBSERVER.store(delegate, Ordering::SeqCst);
 
         unsafe { post_keyboard_selection_change(delegate) };
 
         assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            2,
+            "the outer and reentrant notifications both reach the mapper callback"
+        );
+        assert_eq!(TEST_COMMIT_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            TEST_COMMIT_OFFSET_SEEN.load(Ordering::SeqCst),
+            TEST_COMMIT_OFFSET
+        );
+        assert!(TEST_COMMIT_TEXT_MATCH.load(Ordering::SeqCst));
 
         *TEST_KEY_WINDOW_OVERRIDE
             .get_or_init(|| Mutex::new(None))
@@ -1895,7 +1964,9 @@ mod tests {
 
         assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_COMMIT_COUNT.load(Ordering::SeqCst), 1);
 
+        TEST_NOTIFICATION_OBSERVER.store(ptr::null_mut(), Ordering::SeqCst);
         *TEST_KEY_WINDOW_OVERRIDE
             .get_or_init(|| Mutex::new(None))
             .lock() = None;
