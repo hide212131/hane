@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -275,28 +276,46 @@ def run_case(
         if marker < 0:
             steps.append(step("caret_position", "blocked", "fixture 内に caret 用の本文がない"))
         else:
-            move_start, _, move_start_error = interaction_module.run_helper(
-                helper, ["move-doc-start", str(pid)], helper_timeout
-            )
-            move_right, _, move_right_error = interaction_module.run_helper(
-                helper, ["move-caret", str(pid), "right", str(caret_offset)], helper_timeout
-            ) if move_start else (False, "", move_start_error)
+            move_right = False
+            move_start_error = ""
+            move_right_error = ""
+            attempts = 0
+            for attempts in range(1, 4):
+                move_start, _, move_start_error = interaction_module.run_helper(
+                    helper, ["move-doc-start", str(pid)], helper_timeout
+                )
+                move_right, _, move_right_error = interaction_module.run_helper(
+                    helper, ["move-caret", str(pid), "right", str(caret_offset)], helper_timeout
+                ) if move_start else (False, "", move_start_error)
+                if move_right:
+                    break
+                time.sleep(0.4)
             steps.append(
                 step(
                     "caret_position",
                     "pass" if move_right else "blocked",
                     None if move_right else (move_right_error or move_start_error),
+                    attempts=attempts,
                     source_byte_offset=caret_offset,
                     source_pattern=spec.click_pattern,
                     screenshot=str(before_screenshot),
                 )
             )
-            if move_right:
-                steps.append(
-                    interaction_module.capture_named(
-                        gui_validate_module, env, config, window_id, run_dir, "caret"
-                    )
+            if not move_right:
+                return {
+                    "name": spec.name,
+                    "purpose": spec.purpose,
+                    "steps": steps,
+                    "result": worst(steps, priority),
+                    "reason": reasons(steps),
+                    "evidence": {"fixture_path": str(fixture_path), "run_dir": str(run_dir)},
+                }
+
+            steps.append(
+                interaction_module.capture_named(
+                    gui_validate_module, env, config, window_id, run_dir, "caret"
                 )
+            )
 
             for index, action in enumerate(spec.actions, start=1):
                 command = [action[0], str(pid), *action[1:]]
