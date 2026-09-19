@@ -164,19 +164,37 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "multi-line fenced code",
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
-        markers: &["```rust", "```"],
-        // Inside a fence every line is literal, including the delimiters.
+        // Only the backtick runs are markup; `rust` is the Issue #16
+        // language label and stays visible as ordinary source.
+        markers: &["```", "```"],
+        // Inactive, the fence delimiters never render as body text: the
+        // opening line collapses to its info string alone (the language
+        // label), the closing line collapses to an empty boundary row, and
+        // only the content line stays literal.
         block_kinds: &[
+            BlockKind::CodeFence,
             BlockKind::CodeBlock,
+            BlockKind::CodeFence,
+        ],
+        visual_lines: &["rust", "let answer = 42;", ""],
+        style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[]],
+    },
+    MarkdownFixture {
+        name: "unclosed fenced code with a shorter look-alike last line",
+        // The opening fence is four backticks; CommonMark only closes it with
+        // a run of four or more of the same marker, so the three-backtick
+        // last line never closes it — the whole rest of the document,
+        // including that line, stays literal code content.
+        source: "````rust\nlet answer = 42;\n```",
+        tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
+        markers: &["````"],
+        block_kinds: &[
+            BlockKind::CodeFence,
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
         ],
-        visual_lines: &["```rust", "let answer = 42;", "```"],
-        style_runs: &[
-            &[style(CodeBlock, 0, 7)],
-            &[style(CodeBlock, 0, 16)],
-            &[style(CodeBlock, 0, 3)],
-        ],
+        visual_lines: &["rust", "let answer = 42;", "```"],
+        style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[style(CodeBlock, 0, 3)]],
     },
     MarkdownFixture {
         name: "image",

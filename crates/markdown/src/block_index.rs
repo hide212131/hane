@@ -25,7 +25,7 @@
 use crate::block_store::BlockStore;
 use crate::{
     ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, parse_document,
+    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, fence_marker, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
@@ -81,6 +81,24 @@ pub struct IndexedBlock {
     /// that ends in a line ending belongs to no block, which is what
     /// `hane_presentation::block_heights` accounts for.
     pub line_count: usize,
+    /// The block's own opening fence delimiter shape — `(marker byte, run
+    /// length)`, see [`crate::fence_marker`] — when the block is a fenced code
+    /// block. Read once from the block's own first physical line at parse time
+    /// (this is already available where blocks are tiled) so a viewport
+    /// scrolled past that line can still tell a real closing fence from
+    /// literal content without loading or re-parsing the block's opening line.
+    /// `None` for an indented code block or any other kind.
+    pub opening_fence: Option<(u8, usize)>,
+    /// Physical lines of leading blank content, if any, that sit before this
+    /// block's own parsed node starts. Only ever nonzero for block 0: tiling
+    /// folds the document's leading bytes into the first block (see
+    /// [`tiled_blocks`]), so a document that opens with one or more blank
+    /// lines before its first construct reports that gap here instead of
+    /// leaving callers to mistake the block's own tiled span start for the
+    /// construct's real first physical line — which for a fenced code block
+    /// is exactly the line [`crate::fence_marker`]/opening-fence detection
+    /// must key off of.
+    pub leading_blank_lines: usize,
 }
 
 impl IndexedBlock {
@@ -101,6 +119,8 @@ impl IndexedBlock {
             revision,
             confidence: Confidence::Provisional,
             line_count,
+            opening_fence: None,
+            leading_blank_lines: 0,
         }
     }
 }
@@ -111,6 +131,8 @@ struct Entry {
     kind: NodeKind,
     revision: Revision,
     lines: usize,
+    opening_fence: Option<(u8, usize)>,
+    leading_blank_lines: usize,
 }
 
 /// What one incremental update did. Reported so the caller can measure update
@@ -133,8 +155,11 @@ pub struct BlockIndexUpdate {
     pub elapsed: Duration,
 }
 
-/// One tiled block: its kind, its byte length, and the physical lines it covers.
-pub(crate) type TiledBlock = (NodeKind, usize, usize);
+/// One tiled block: its kind, its byte length, the physical lines it covers,
+/// its own opening fence delimiter shape (see [`IndexedBlock::opening_fence`])
+/// when it is a fenced code block, and its own leading blank line count (see
+/// [`IndexedBlock::leading_blank_lines`]).
+pub(crate) type TiledBlock = (NodeKind, usize, usize, Option<(u8, usize)>, usize);
 
 /// Counts CommonMark 0.31.2 source line endings in `slice`: `\n`, `\r\n` and a
 /// bare `\r` each count once. A block boundary always falls at the start of a
@@ -238,7 +263,7 @@ fn build_list_projections(
 ) -> Vec<Option<ListProjection>> {
     let block_ranges = blocks
         .iter()
-        .scan(range.start.0, |start, (_, length, _)| {
+        .scan(range.start.0, |start, (_, length, _, _, _)| {
             let block = SourceRange::new(*start, *start + *length);
             *start = block.end.0;
             Some(block)
@@ -400,7 +425,22 @@ pub(crate) fn tiled_blocks(
             let endings = count_line_endings(slice);
             let ends_with_line_ending = slice.ends_with(['\n', '\r']);
             let lines = endings + usize::from(!ends_with_line_ending);
-            (*kind, end - start, lines)
+            // The node's own bytes, skipping any leading blank run folded into
+            // block 0 (see this function's own doc comment): reading the fence
+            // shape from `slice`'s first physical line would instead see that
+            // leading blank line for a document that opens with one, which is
+            // never the block's own opening fence line.
+            let node_offset = *block_start - start;
+            let node_slice = &slice[node_offset..];
+            // Read here for the same reason as `lines`: this is the one place
+            // that already holds the block's own first physical line, so a
+            // later viewport scrolled past it never has to load or re-parse
+            // the whole block just to learn its fence shape.
+            let opening_fence = matches!(kind, NodeKind::CodeBlock)
+                .then(|| fence_marker(node_slice.split(['\n', '\r']).next().unwrap_or(node_slice)))
+                .flatten();
+            let leading_blank_lines = count_line_endings(&slice[..node_offset]);
+            (*kind, end - start, lines, opening_fence, leading_blank_lines)
         })
         .collect()
 }
@@ -429,13 +469,15 @@ impl BlockIndex {
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
-            |(index, (kind, length, lines))| {
+            |(index, (kind, length, lines, opening_fence, leading_blank_lines))| {
                 (
                     Entry {
                         id: BlockId(index as u64),
                         kind,
                         revision,
                         lines,
+                        opening_fence,
+                        leading_blank_lines,
                     },
                     length,
                 )
@@ -507,6 +549,8 @@ impl BlockIndex {
             revision: entry.revision,
             confidence: self.confidence(ordinal),
             line_count: entry.lines,
+            opening_fence: entry.opening_fence,
+            leading_blank_lines: entry.leading_blank_lines,
         }
     }
 
@@ -646,7 +690,7 @@ impl BlockIndex {
             let tail_start = self.span(window_last).start.0;
             let tail_kind = self.store.get(window_last).map(|(entry, _)| entry.kind);
             let resynchronized = window.end.0 == buffer.len_bytes().0
-                || blocks.last().is_some_and(|(kind, length, _)| {
+                || blocks.last().is_some_and(|(kind, length, _, _, _)| {
                     Some(*kind) == tail_kind && window.end.0 - *length == tail_start
                 });
             let can_grow = window_last + 1 < self.len()
@@ -783,7 +827,7 @@ impl BlockIndex {
             .collect::<Vec<_>>();
         let new_offsets = blocks
             .iter()
-            .scan(0, |start, (_, length, _)| {
+            .scan(0, |start, (_, length, _, _, _)| {
                 let span = (*start, *start + length);
                 *start = span.1;
                 Some(span)
@@ -811,7 +855,7 @@ impl BlockIndex {
         let entries = blocks
             .iter()
             .zip(&ids)
-            .map(|((kind, _, lines), id)| Entry {
+            .map(|((kind, _, lines, opening_fence, leading_blank_lines), id)| Entry {
                 id: id.unwrap_or_else(|| {
                     let id = BlockId(self.next_id);
                     self.next_id += 1;
@@ -820,6 +864,8 @@ impl BlockIndex {
                 kind: *kind,
                 revision,
                 lines: *lines,
+                opening_fence: *opening_fence,
+                leading_blank_lines: *leading_blank_lines,
             })
             .collect::<Vec<_>>();
         if blocks.is_empty() {
@@ -841,14 +887,14 @@ impl BlockIndex {
         } else if blocks.len() == window.len() {
             // Same block count: rewrite the slots in place, so an edit that does
             // not change the window's structure never re-chunks the store.
-            for (offset, (entry, (_, length, _))) in entries.iter().zip(blocks).enumerate() {
+            for (offset, (entry, (_, length, _, _))) in entries.iter().zip(blocks).enumerate() {
                 self.store.set_payload(window.start + offset, *entry);
                 self.store.set_length(window.start + offset, *length);
             }
         } else {
             let items = entries
                 .into_iter()
-                .zip(blocks.iter().map(|(_, length, _)| *length))
+                .zip(blocks.iter().map(|(_, length, _, _)| *length))
                 .collect::<Vec<_>>();
             self.store.splice(window.clone(), &items);
         }
