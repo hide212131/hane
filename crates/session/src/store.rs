@@ -102,6 +102,22 @@ impl RecentFiles {
         }
     }
 
+    /// Follows a folder rename, moving every entry at or under `from` to the
+    /// same relative position under `to` in place. An entry outside `from` is
+    /// left untouched.
+    pub fn rename_folder(&mut self, from: &Path, to: &Path) {
+        for entry in &mut self.entries {
+            if let Ok(relative) = entry.strip_prefix(from) {
+                let moved = if relative.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(relative)
+                };
+                *entry = moved;
+            }
+        }
+    }
+
     pub fn entries(&self) -> &[PathBuf] {
         &self.entries
     }
@@ -365,6 +381,25 @@ mod tests {
         assert_eq!(recent.entries()[1], Path::new("/c.md"));
         recent.forget(Path::new("/a.md"));
         assert_eq!(recent.entries(), [PathBuf::from("/c.md")]);
+    }
+
+    #[test]
+    fn recent_files_follow_a_folder_rename_for_descendants_only() {
+        let mut recent = RecentFiles::default();
+        recent.remember(Path::new("/notes/dev/nested/b.md"));
+        recent.remember(Path::new("/notes/dev/a.md"));
+        recent.remember(Path::new("/notes/other.md"));
+
+        recent.rename_folder(Path::new("/notes/dev"), Path::new("/notes/work"));
+
+        assert_eq!(
+            recent.entries(),
+            [
+                PathBuf::from("/notes/other.md"),
+                PathBuf::from("/notes/work/a.md"),
+                PathBuf::from("/notes/work/nested/b.md"),
+            ]
+        );
     }
 
     #[test]

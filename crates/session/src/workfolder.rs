@@ -194,6 +194,31 @@ impl WorkFolder {
         }
     }
 
+    /// Follows a folder rename this app itself just performed: `from` moves to
+    /// `to`, and every descendant path (files and subfolders alike) moves with
+    /// it, keeping the same structure relative to the new parent so the tree
+    /// resorts under the folder's new name and position. A `from` the folder
+    /// was not scanned with (already renamed, or never present) is a no-op.
+    pub fn rename_folder(&mut self, from: &Path, to: &Path) {
+        let Some(folder) = remove_folder(&mut self.children, from) else {
+            return;
+        };
+        let renamed = rebase_folder(folder, from, to);
+        let Some(parent) = to.parent() else {
+            return;
+        };
+        if parent == self.root {
+            self.children.push(WorkFolderNode::Folder(renamed));
+            sort_nodes(&mut self.children);
+        } else if let Some(parent_folder) = find_folder_mut(&mut self.children, parent) {
+            parent_folder.children.push(WorkFolderNode::Folder(renamed));
+            sort_nodes(&mut parent_folder.children);
+        }
+        // A `to` whose parent is not itself in the tree drops the folder
+        // rather than reinserting it at the wrong place; a real rename never
+        // moves a folder under a parent the tree does not know about.
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -251,6 +276,80 @@ fn find_folder<'a>(nodes: &'a [WorkFolderNode], path: &Path) -> Option<&'a WorkF
         }
     }
     None
+}
+
+fn find_folder_mut<'a>(
+    nodes: &'a mut [WorkFolderNode],
+    path: &Path,
+) -> Option<&'a mut WorkFolderFolder> {
+    for node in nodes {
+        match node {
+            WorkFolderNode::Folder(folder) if folder.path() == path => return Some(folder),
+            WorkFolderNode::Folder(folder) => {
+                if let Some(found) = find_folder_mut(&mut folder.children, path) {
+                    return Some(found);
+                }
+            }
+            WorkFolderNode::File(_) => {}
+        }
+    }
+    None
+}
+
+/// Removes and returns the folder node at `path`, searching the whole tree
+/// (not just `nodes` itself), the folder-shaped counterpart to `remove_file`.
+fn remove_folder(nodes: &mut Vec<WorkFolderNode>, path: &Path) -> Option<WorkFolderFolder> {
+    if let Some(index) = nodes
+        .iter()
+        .position(|node| matches!(node, WorkFolderNode::Folder(folder) if folder.path() == path))
+    {
+        if let WorkFolderNode::Folder(folder) = nodes.remove(index) {
+            return Some(folder);
+        }
+    }
+    for node in nodes.iter_mut() {
+        if let WorkFolderNode::Folder(folder) = node
+            && let Some(found) = remove_folder(&mut folder.children, path)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Rebuilds `folder` and every node beneath it with paths moved from under
+/// `from` to under `to`, preserving each node's position relative to the
+/// folder root that moved.
+fn rebase_folder(folder: WorkFolderFolder, from: &Path, to: &Path) -> WorkFolderFolder {
+    let path = rebase_path(folder.path(), from, to);
+    let children = folder
+        .children
+        .into_iter()
+        .map(|child| rebase_node(child, from, to))
+        .collect();
+    WorkFolderFolder::new(path, children)
+}
+
+fn rebase_node(node: WorkFolderNode, from: &Path, to: &Path) -> WorkFolderNode {
+    match node {
+        WorkFolderNode::File(entry) => {
+            WorkFolderNode::File(WorkFolderEntry::new(rebase_path(entry.path(), from, to)))
+        }
+        WorkFolderNode::Folder(folder) => WorkFolderNode::Folder(rebase_folder(folder, from, to)),
+    }
+}
+
+/// `path` with its `from` prefix replaced by `to`, or `path` unchanged when it
+/// is not under `from`.
+fn rebase_path(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    let Ok(relative) = path.strip_prefix(from) else {
+        return path.to_path_buf();
+    };
+    if relative.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(relative)
+    }
 }
 
 fn sort_nodes(nodes: &mut [WorkFolderNode]) {
@@ -504,6 +603,57 @@ mod tests {
         assert!(
             folder
                 .entry_for_path(Path::new("/notes/Omega.md"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renaming_a_folder_moves_its_descendant_paths_and_resorts_the_tree() {
+        let mut folder = WorkFolder::new(PathBuf::from("/notes"), Vec::new());
+        folder.insert_folder(PathBuf::from("/notes/dev/archive"));
+        folder.insert(PathBuf::from("/notes/dev/GPUI.md"));
+        folder.insert(PathBuf::from("/notes/dev/archive/Old.md"));
+        folder.insert(PathBuf::from("/notes/Zeta.md"));
+
+        folder.rename_folder(Path::new("/notes/dev"), Path::new("/notes/Projects"));
+
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/dev/GPUI.md"))
+                .is_none()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Projects/GPUI.md"))
+                .is_some()
+        );
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Projects/archive/Old.md"))
+                .is_some()
+        );
+        let names: Vec<String> = folder
+            .children()
+            .iter()
+            .map(|node| match node {
+                WorkFolderNode::File(entry) => entry.name().to_owned(),
+                WorkFolderNode::Folder(folder) => folder.name().to_owned(),
+            })
+            .collect();
+        assert_eq!(names, ["Projects", "Zeta"]);
+    }
+
+    #[test]
+    fn renaming_a_folder_the_tree_was_not_scanned_with_is_a_no_op() {
+        let mut folder = WorkFolder::new(
+            PathBuf::from("/notes"),
+            vec![WorkFolderEntry::new(PathBuf::from("/notes/Alpha.md"))],
+        );
+        folder.rename_folder(Path::new("/notes/missing"), Path::new("/notes/renamed"));
+        assert_eq!(folder.len(), 1);
+        assert!(
+            folder
+                .entry_for_path(Path::new("/notes/Alpha.md"))
                 .is_some()
         );
     }
