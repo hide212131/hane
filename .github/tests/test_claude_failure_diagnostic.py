@@ -297,7 +297,7 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
             "aadw-worker-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}",
             WORKFLOW,
         )
-        self.assertIn('"target_sha":', WORKFLOW.replace("target_sha:", '"target_sha":') if False else "target_sha")
+        self.assertIn("target_sha: $target_sha", WORKFLOW)
         self.assertIn("capture_ok", WORKFLOW)
         self.assertIn("has_changes", WORKFLOW)
         completed_patch_block = WORKFLOW.split(
