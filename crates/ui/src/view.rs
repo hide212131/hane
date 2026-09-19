@@ -322,9 +322,10 @@ pub struct EditorView {
     /// Which edge of the editor viewport the current text-selection drag is
     /// held against, if any. `None` means no autoscroll is currently ticking.
     text_autoscroll: Option<AutoscrollDirection>,
-    /// Bumped every time `text_autoscroll` changes, so a running autoscroll
-    /// timer loop can tell it has been superseded (pointer left the edge
-    /// zone, the drag ended, or reversed direction) and stop rescheduling
+    /// Bumped every time `text_autoscroll` changes or the document is
+    /// replaced, so a running autoscroll timer loop can tell it has been
+    /// superseded (pointer left the edge zone, the drag ended, reversed
+    /// direction, or the drag's document disappeared) and stop rescheduling
     /// itself instead of ticking a drag it no longer belongs to.
     text_autoscroll_activity: u64,
     /// Whether the sidebar's overlay scrollbar thumb is currently shown. Set
@@ -965,8 +966,19 @@ impl EditorView {
         }
     }
 
+    /// Cancels a selection drag before the state for another document is
+    /// installed. The timer may already be sleeping, so bump its activity as
+    /// well; its next tick will observe the stale activity and exit without
+    /// touching the replacement document.
+    fn cancel_text_selection_autoscroll(&mut self) {
+        self.text_selection_drag = false;
+        self.text_autoscroll = None;
+        self.text_autoscroll_activity = self.text_autoscroll_activity.wrapping_add(1);
+    }
+
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        self.cancel_text_selection_autoscroll();
         // Whatever the sidebar had highlighted before, the document on
         // screen just changed to a specific file or draft, so that is what
         // should be highlighted now instead.
@@ -2394,7 +2406,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !event.dragging() {
+        if !self.text_selection_drag || !event.dragging() {
             return;
         }
         let Some(offset) =
@@ -8011,6 +8023,63 @@ mod tests {
             assert_eq!(view.editor().selection(), selection_before);
             assert!(!view.text_selection_drag);
             assert_eq!(view.text_autoscroll, None);
+        });
+    }
+
+    #[gpui::test]
+    fn document_replacement_cancels_text_selection_autoscroll(cx: &mut gpui::TestAppContext) {
+        let text = (0..60)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        let (down_point, _) = row_click(&view, cx, "row-0-0", 0, 0, 0);
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        let (header_height, viewport_height) = view.read_with(cx, |view, _| {
+            (view.theme.header_height, view.viewport_height)
+        });
+        let edge_point = point(down_point.x, px(header_height + viewport_height - 4.0));
+        cx.simulate_mouse_move(edge_point, MouseButton::Left, gpui::Modifiers::none());
+
+        let activity = view.read_with(cx, |view, _| {
+            assert!(view.text_selection_drag);
+            assert_eq!(view.text_autoscroll, Some(AutoscrollDirection::Down));
+            view.text_autoscroll_activity
+        });
+
+        view.update(cx, |view, cx| {
+            view.sessions.open_untitled("replacement", "Replacement");
+            view.on_document_replaced();
+            cx.notify();
+        });
+
+        cx.run_until_parked();
+        let (replacement_move, _) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        cx.simulate_mouse_move(
+            replacement_move,
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.text_autoscroll, None);
+            assert_ne!(view.text_autoscroll_activity, activity);
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+
+        // A timer tick that was already queued for the old document must be
+        // rejected after the replacement, rather than extending the new one.
+        let continued = cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.step_text_autoscroll(AutoscrollDirection::Down, activity, window, cx)
+            })
+        });
+        assert!(!continued);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
         });
     }
 }
