@@ -1273,10 +1273,8 @@ def run_editing_scenario(
 
             # A keyboard-layout notification while Hane owns the key window can
             # synchronously reactivate NSTextInputContext and block in Kotoeri's
-            # XPC service. Close the edited ABC session first, then start a
-            # fresh Hane process while ABC is still active. The IME helper
-            # switches to Japanese only after it has explicitly deactivated
-            # that fresh editor session, matching the focused validator path.
+            # XPC service. Close the ABC session before selecting Japanese, then
+            # start a fresh Hane process with Japanese already active.
             ascii_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
             ascii_cleanup["name"] = "close_session_before_ime_source_switch"
             steps.append(ascii_cleanup)
@@ -1297,52 +1295,67 @@ def run_editing_scenario(
                     "元の入力ソースを取得できなかったためIME sessionを起動しない",
                 ))
             else:
-                ime_run_dir = run_dir / "ime_session"
-                ime_run_dir.mkdir(parents=True, exist_ok=True)
-                ime_config = interaction_module.make_config(
-                    gui_validate_module, workspace_dir=target_dir,
-                    scenario="normal-list-editing-ime",
-                    expected_sha=expected_sha, request_id=request_id, generation="2",
-                    run_dir=ime_run_dir, fixture_path=fixture_path,
-                    features=["timing-probe"], extra_env={},
-                    startup_timeout=startup_timeout, window_timeout=window_timeout,
-                    capture_helper=capture_helper,
+                selected, selected_source, select_error, source_attempts = interaction_module.select_input_source(
+                    swift_helper, interaction_module.JAPANESE_SOURCE, helper_timeout,
                 )
-                ime_session_steps, ime_window_id = interaction_module.open_session(
-                    gui_validate_module, env, ime_config, binary_path,
-                    process_holder, "ime_before", swift_helper, helper_timeout,
-                )
-                steps += ime_session_steps
-                ime_pid = interaction_module.current_pid(process_holder)
-                ime_session_ready = ime_pid is not None and ime_window_id is not None
-                if not ime_session_ready:
+                steps.append(step(
+                    "select_japanese_before_ime_session",
+                    "pass" if selected else "blocked",
+                    reason=None if selected else select_error,
+                    source_id=interaction_module.JAPANESE_SOURCE,
+                    observed_source=selected_source,
+                    attempts=source_attempts,
+                    note="Hane sessionを起動する前に日本語入力ソースを選択した",
+                ))
+                if not selected:
                     steps.append(skipped_step(
                         "direct_ime_commit_at_caret",
-                        "IME session の起動またはwindow discoveryがpassしなかった",
+                        "Hane 起動前の日本語入力ソース選択に失敗した",
                     ))
                 else:
-                    # No source is switched before this session starts. The
-                    # legacy form intentionally performs deactivate/select per
-                    # attempt, then the Swift helper rebinds the focused IME
-                    # context before typing.
-                    ime_steps, _restoration_source = _ime_commit_subtest(
-                        gui_validate_module, interaction_module, env, ime_config, ime_window_id,
-                        swift_helper, ime_pid, fixture_path, ime_run_dir, helper_timeout, poll_timeout,
+                    ime_run_dir = run_dir / "ime_session"
+                    ime_run_dir.mkdir(parents=True, exist_ok=True)
+                    ime_config = interaction_module.make_config(
+                        gui_validate_module, workspace_dir=target_dir,
+                        scenario="normal-list-editing-ime",
+                        expected_sha=expected_sha, request_id=request_id, generation="2",
+                        run_dir=ime_run_dir, fixture_path=fixture_path,
+                        features=["timing-probe"], extra_env={},
+                        startup_timeout=startup_timeout, window_timeout=window_timeout,
+                        capture_helper=capture_helper,
                     )
-                    steps += ime_steps
-                    ime_passed = any(
-                        item.get("name") == "direct_ime_commit_at_caret" and item.get("result") == "pass"
-                        for item in ime_steps
+                    ime_session_steps, ime_window_id = interaction_module.open_session(
+                        gui_validate_module, env, ime_config, binary_path,
+                        process_holder, "ime_before", swift_helper, helper_timeout,
                     )
+                    steps += ime_session_steps
+                    ime_pid = interaction_module.current_pid(process_holder)
+                    ime_session_ready = ime_pid is not None and ime_window_id is not None
+                    if not ime_session_ready:
+                        steps.append(skipped_step(
+                            "direct_ime_commit_at_caret",
+                            "IME session の起動またはwindow discoveryがpassしなかった",
+                        ))
+                    else:
+                        ime_steps, _restoration_source = _ime_commit_subtest(
+                            gui_validate_module, interaction_module, env, ime_config, ime_window_id,
+                            swift_helper, ime_pid, fixture_path, ime_run_dir, helper_timeout, poll_timeout,
+                            original_source=original_input_source,
+                        )
+                        steps += ime_steps
+                        ime_passed = any(
+                            item.get("name") == "direct_ime_commit_at_caret" and item.get("result") == "pass"
+                            for item in ime_steps
+                        )
 
-                ime_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
-                ime_cleanup["name"] = "close_session_after_ime_before_source_restore"
-                steps.append(ime_cleanup)
-                process_holder["process"] = None
-                restore_steps = _restore_ime_side_effects(
-                    interaction_module, swift_helper, fixture_path, original_input_source, helper_timeout,
-                )
-                steps += restore_steps
+                    ime_cleanup = interaction_module.close_session(gui_validate_module, env, process_holder)
+                    ime_cleanup["name"] = "close_session_after_ime_before_source_restore"
+                    steps.append(ime_cleanup)
+                    process_holder["process"] = None
+                    restore_steps = _restore_ime_side_effects(
+                        interaction_module, swift_helper, fixture_path, original_input_source, helper_timeout,
+                    )
+                    steps += restore_steps
 
             restore_passed = (
                 ime_session_ready
