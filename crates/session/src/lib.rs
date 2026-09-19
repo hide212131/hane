@@ -40,8 +40,8 @@ pub mod testing;
 mod workfolder;
 
 pub use date_badge::{
-    CalendarDate, FileNameDateBadge, format_relative_date_label, local_today,
-    split_file_name_for_badge,
+    CalendarDate, DateBadgeCategory, FileNameDateBadge, classify_date_badge,
+    format_relative_date_label, local_today, split_file_name_for_badge,
 };
 pub use draft::{DraftId, DraftStore, OsDraftStore, RecoveredDraft, RecoveredDrafts};
 pub use identity::{ExternalChange, FileIdentity, FilePresence, FileStamp, FileState};

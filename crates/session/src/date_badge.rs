@@ -273,6 +273,63 @@ pub fn format_relative_date_label(date: CalendarDate, today: CalendarDate) -> St
     }
 }
 
+/// How a badge-worthy date relates to `today`'s calendar, from nearest to
+/// farthest: used to pick the badge's background color so nearby dates read
+/// as more prominent than older ones (issue #211). Order matters for
+/// [`classify_date_badge`], which checks each variant's condition in this
+/// order and returns the first (nearest) one that matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DateBadgeCategory {
+    /// Same calendar day as `today`.
+    Today,
+    /// Falls in the same Monday-to-Sunday week as `today`, but is not
+    /// `today` itself. A week can span a month or year boundary, in which
+    /// case this takes priority over [`Self::ThisMonth`] and
+    /// [`Self::ThisYear`].
+    ThisWeek,
+    /// Same year and month as `today`, outside the current week.
+    ThisMonth,
+    /// Same year as `today`, outside the current week and month.
+    ThisYear,
+    /// A different year than `today`, and outside the current week.
+    Other,
+}
+
+/// The number of days after the most recent Monday on or before `date`
+/// (`0` for Monday .. `6` for Sunday), derived from [`CalendarDate::weekday_index`]
+/// (`0` for Sunday .. `6` for Saturday).
+fn days_since_monday(date: CalendarDate) -> i64 {
+    i64::try_from((date.weekday_index() + 6) % 7).unwrap_or(0)
+}
+
+/// Whether `date` falls in the same Monday-to-Sunday week as `today`.
+fn is_same_calendar_week(date: CalendarDate, today: CalendarDate) -> bool {
+    let today_days = days_from_civil(today.year, today.month, today.day);
+    let monday_days = today_days - days_since_monday(today);
+    let date_days = days_from_civil(date.year, date.month, date.day);
+    (monday_days..monday_days + 7).contains(&date_days)
+}
+
+/// Classifies `date` relative to `today` for the sidebar's date-badge color
+/// (issue #211): `today` itself first, then the current Monday-to-Sunday
+/// week (which may cross a month or year boundary), then the current month,
+/// then the current year, and finally anything further away. Future dates
+/// use the same calendar rules as past ones.
+#[must_use]
+pub fn classify_date_badge(date: CalendarDate, today: CalendarDate) -> DateBadgeCategory {
+    if date == today {
+        DateBadgeCategory::Today
+    } else if is_same_calendar_week(date, today) {
+        DateBadgeCategory::ThisWeek
+    } else if date.year == today.year && date.month == today.month {
+        DateBadgeCategory::ThisMonth
+    } else if date.year == today.year {
+        DateBadgeCategory::ThisYear
+    } else {
+        DateBadgeCategory::Other
+    }
+}
+
 /// Today's calendar date in the machine's local timezone. The one boundary
 /// in this module that reads the system clock; every other function takes
 /// "today" as a plain argument so the display rules stay deterministic and
@@ -580,5 +637,131 @@ mod tests {
         let today = CalendarDate::new(2026, 9, 20).unwrap();
         let date = CalendarDate::new(2025, 10, 3).unwrap();
         assert_eq!(format_relative_date_label(date, today), "2025/10/3(金)");
+    }
+
+    #[test]
+    fn todays_date_is_classified_as_today_even_though_it_would_also_match_this_week() {
+        let today = CalendarDate::new(2024, 3, 6).unwrap();
+        assert_eq!(classify_date_badge(today, today), DateBadgeCategory::Today);
+    }
+
+    #[test]
+    fn the_monday_start_and_sunday_end_of_the_current_week_are_both_this_week() {
+        // 2024-03-04 is a Monday and 2024-03-10 is the following Sunday, all
+        // within the same Monday-to-Sunday week as 2024-03-06 (Wednesday).
+        let today = CalendarDate::new(2024, 3, 6).unwrap();
+        let monday = CalendarDate::new(2024, 3, 4).unwrap();
+        let sunday = CalendarDate::new(2024, 3, 10).unwrap();
+        assert_eq!(
+            classify_date_badge(monday, today),
+            DateBadgeCategory::ThisWeek
+        );
+        assert_eq!(
+            classify_date_badge(sunday, today),
+            DateBadgeCategory::ThisWeek
+        );
+    }
+
+    #[test]
+    fn the_sunday_before_and_the_monday_after_the_current_week_are_not_this_week() {
+        // The week before 2024-03-04 (Monday) ends on 2024-03-03 (Sunday);
+        // the week after starts on 2024-03-11 (Monday). Both are outside the
+        // current week but still within the same month as 2024-03-06.
+        let today = CalendarDate::new(2024, 3, 6).unwrap();
+        let previous_sunday = CalendarDate::new(2024, 3, 3).unwrap();
+        let next_monday = CalendarDate::new(2024, 3, 11).unwrap();
+        assert_eq!(
+            classify_date_badge(previous_sunday, today),
+            DateBadgeCategory::ThisMonth
+        );
+        assert_eq!(
+            classify_date_badge(next_monday, today),
+            DateBadgeCategory::ThisMonth
+        );
+    }
+
+    #[test]
+    fn a_week_spanning_a_month_boundary_still_classifies_as_this_week_on_both_sides() {
+        // The Monday-to-Sunday week of 2024-02-26 (Monday) through
+        // 2024-03-03 (Sunday) crosses from February into March.
+        let today = CalendarDate::new(2024, 3, 3).unwrap();
+        let monday_in_previous_month = CalendarDate::new(2024, 2, 26).unwrap();
+        assert_eq!(
+            classify_date_badge(monday_in_previous_month, today),
+            DateBadgeCategory::ThisWeek
+        );
+    }
+
+    #[test]
+    fn just_outside_a_month_spanning_week_falls_back_to_month_or_year() {
+        let today = CalendarDate::new(2024, 3, 3).unwrap();
+        // The Sunday just before that week, still in February: same year,
+        // different month from today's March.
+        let previous_sunday = CalendarDate::new(2024, 2, 25).unwrap();
+        assert_eq!(
+            classify_date_badge(previous_sunday, today),
+            DateBadgeCategory::ThisYear
+        );
+        // The Monday just after that week, in March: same month as today.
+        let next_monday = CalendarDate::new(2024, 3, 4).unwrap();
+        assert_eq!(
+            classify_date_badge(next_monday, today),
+            DateBadgeCategory::ThisMonth
+        );
+    }
+
+    #[test]
+    fn a_week_spanning_a_year_boundary_still_classifies_as_this_week_on_both_sides() {
+        // The Monday-to-Sunday week of 2024-12-30 (Monday) through
+        // 2025-01-05 (Sunday) crosses from 2024 into 2025.
+        let today = CalendarDate::new(2025, 1, 1).unwrap();
+        let monday_in_previous_year = CalendarDate::new(2024, 12, 30).unwrap();
+        let sunday_in_this_year = CalendarDate::new(2025, 1, 5).unwrap();
+        assert_eq!(
+            classify_date_badge(monday_in_previous_year, today),
+            DateBadgeCategory::ThisWeek
+        );
+        assert_eq!(
+            classify_date_badge(sunday_in_this_year, today),
+            DateBadgeCategory::ThisWeek
+        );
+    }
+
+    #[test]
+    fn just_outside_a_year_spanning_week_falls_back_to_other_or_month() {
+        let today = CalendarDate::new(2025, 1, 1).unwrap();
+        // The Sunday just before that week, still in 2024: a different year
+        // and a different month from today's January 2025.
+        let previous_sunday = CalendarDate::new(2024, 12, 29).unwrap();
+        assert_eq!(
+            classify_date_badge(previous_sunday, today),
+            DateBadgeCategory::Other
+        );
+        // The Monday just after that week, in January 2025: same month.
+        let next_monday = CalendarDate::new(2025, 1, 6).unwrap();
+        assert_eq!(
+            classify_date_badge(next_monday, today),
+            DateBadgeCategory::ThisMonth
+        );
+    }
+
+    #[test]
+    fn a_future_date_uses_the_same_calendar_rules_as_a_past_one() {
+        let today = CalendarDate::new(2024, 3, 6).unwrap();
+        let next_week = CalendarDate::new(2024, 3, 11).unwrap();
+        let next_month = CalendarDate::new(2024, 4, 1).unwrap();
+        let next_year = CalendarDate::new(2025, 1, 1).unwrap();
+        assert_eq!(
+            classify_date_badge(next_week, today),
+            DateBadgeCategory::ThisMonth
+        );
+        assert_eq!(
+            classify_date_badge(next_month, today),
+            DateBadgeCategory::ThisYear
+        );
+        assert_eq!(
+            classify_date_badge(next_year, today),
+            DateBadgeCategory::Other
+        );
     }
 }

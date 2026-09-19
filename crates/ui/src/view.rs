@@ -27,7 +27,9 @@ use crate::line::{
     presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
-use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
+use crate::theme::{
+    DATE_BADGE_FOREGROUND, DEFAULT_THEME, Theme, date_badge_background, resolve_theme,
+};
 use gpui::{
     App, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
@@ -56,9 +58,9 @@ use hane_session::{
     LoadedFile, OpenDecision, OpenPolicy, OsDraftStore, OsFileService, OsWorkFolderScanner,
     RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure, SaveIntent, SaveOutcome, SaveTicket,
     SavedFile, SessionId, SessionSet, SessionViewState, Settings, StateStores, TitleSyncAction,
-    WorkFolder, WorkFolderNode, WorkFolderScanner, decide_title_sync, extract_h1_title,
-    format_relative_date_label, local_today, run_save_job, split_file_name_for_badge,
-    unique_folder_name, unique_markdown_filename,
+    WorkFolder, WorkFolderNode, WorkFolderScanner, classify_date_badge, decide_title_sync,
+    extract_h1_title, format_relative_date_label, local_today, run_save_job,
+    split_file_name_for_badge, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -3976,7 +3978,6 @@ impl EditorView {
                                     .child(file_name_label(
                                         entry.file_name(),
                                         today,
-                                        &self.theme,
                                         DateBadgePosition::Right,
                                     )),
                             )
@@ -4145,7 +4146,6 @@ fn badge_renders_before_remainder(position: DateBadgePosition) -> bool {
 fn file_name_label(
     file_name: &str,
     today: CalendarDate,
-    theme: &Theme,
     badge_position: DateBadgePosition,
 ) -> gpui::Div {
     // Lets this label shrink below its content width inside the sidebar's
@@ -4161,7 +4161,7 @@ fn file_name_label(
         return row.child(file_name.to_owned());
     };
     let remainder = badge.remainder();
-    let chip = date_badge_chip(badge.date, today, theme);
+    let chip = date_badge_chip(badge.date, today);
     let remainder_child =
         (!remainder.is_empty()).then(|| div().flex_1().min_w(px(0.0)).truncate().child(remainder));
     if badge_renders_before_remainder(badge_position) {
@@ -4171,16 +4171,16 @@ fn file_name_label(
     }
 }
 
-/// A small rounded chip for one badge-worthy date, styled like the header's
-/// recent-file chips (`self.theme.code_background`) so it reads as a
+/// A small rounded chip for one badge-worthy date, colored by how close
+/// `date` is to `today` (see [`date_badge_background`]) so it reads as a
 /// decoration rather than more filename text.
-fn date_badge_chip(date: CalendarDate, today: CalendarDate, theme: &Theme) -> gpui::Div {
+fn date_badge_chip(date: CalendarDate, today: CalendarDate) -> gpui::Div {
     div()
         .flex_none()
         .px(px(4.0))
         .rounded_sm()
-        .bg(rgb(theme.code_background))
-        .text_color(rgb(theme.quote_foreground))
+        .bg(rgb(date_badge_background(classify_date_badge(date, today))))
+        .text_color(rgb(DATE_BADGE_FOREGROUND))
         .text_size(px(10.0))
         .child(format_relative_date_label(date, today))
 }

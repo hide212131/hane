@@ -4,7 +4,7 @@
 )]
 
 use gpui::WindowAppearance;
-use hane_session::ThemePreference;
+use hane_session::{DateBadgeCategory, ThemePreference};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Theme {
@@ -72,6 +72,26 @@ pub(crate) const DARK_THEME: Theme = Theme {
     sidebar_foreground: 0xe8e5df,
     sidebar_active_background: 0x2c2d30,
 };
+
+/// Background for the sidebar's file-name date badge, by how close the
+/// badged date is to today (see [`DateBadgeCategory`]): darkens from "today"
+/// down to "other" through the Hane logo's blue family, the same across both
+/// light and dark themes, so nearby dates stand out in the file list
+/// regardless of the active theme (issue #211).
+pub(crate) fn date_badge_background(category: DateBadgeCategory) -> u32 {
+    match category {
+        DateBadgeCategory::Today => 0x467ba2,
+        DateBadgeCategory::ThisWeek => 0x3e7398,
+        DateBadgeCategory::ThisMonth => 0x376b8f,
+        DateBadgeCategory::ThisYear => 0x306386,
+        DateBadgeCategory::Other => 0x285b7c,
+    }
+}
+
+/// Date-badge text color: a fixed light tone that stays readable against
+/// every [`date_badge_background`] shade, rather than following the active
+/// `Theme`.
+pub(crate) const DATE_BADGE_FOREGROUND: u32 = 0xf5f5f5;
 
 pub(crate) fn resolve_theme(preference: ThemePreference, appearance: WindowAppearance) -> Theme {
     match preference {
