@@ -248,7 +248,7 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
             WORKFLOW,
         )
         self.assertIn(
-            "if: steps.claude.outcome == 'failure'",
+            "always() && !cancelled() && steps.claude.outcome == 'failure'",
             WORKFLOW,
         )
         self.assertIn(
