@@ -44,6 +44,8 @@ class ReleaseVersionTests(unittest.TestCase):
             'release_tag="$manifest_tag"',
             "must be newer than latest tag",
             "should_release",
+            "group: release-builds",
+            "cancel-in-progress: false",
         ):
             self.assertIn(expected, workflow)
 
