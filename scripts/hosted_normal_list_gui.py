@@ -1287,7 +1287,6 @@ def main() -> int:
         top_steps.append(preflight)
         binary_path = None
         swift_helper = None
-        capture_helper = None
         if preflight["result"] != "pass":
             top_steps.append(skipped_step("build", "preflight が pass しなかった"))
         else:
@@ -1299,15 +1298,6 @@ def main() -> int:
             except (OSError, subprocess.SubprocessError) as exc:
                 swift_helper = None
                 top_steps.append(step("prepare_helper", "blocked", str(exc)))
-
-            try:
-                capture_helper = interaction_module.prepare_capture_helper(
-                    control_dir / "scripts" / "window_capture_dlsym.swift", Path(helper_tmp.name)
-                )
-                top_steps.append(step("prepare_capture_helper", "pass", sha256=capture_helper.digest))
-            except (OSError, subprocess.SubprocessError) as exc:
-                capture_helper = None
-                top_steps.append(step("prepare_capture_helper", "blocked", str(exc)))
 
             if swift_helper is None:
                 top_steps.append(skipped_step("build", "trusted helper が利用できない"))
@@ -1339,11 +1329,11 @@ def main() -> int:
                     )
                 )
 
-            if binary_path is not None and swift_helper is not None and capture_helper is not None and input_source_ready:
+            if binary_path is not None and swift_helper is not None and input_source_ready:
                 for spec in ALL_SCENARIO_SPECS:
                     try:
                         scenarios.append(run_scenario(
-                            gui_validate_module, interaction_module, env, target_dir, swift_helper, capture_helper,
+                            gui_validate_module, interaction_module, env, target_dir, swift_helper, None,
                             run_dir, binary_path, expected_sha, request_id,
                             startup_timeout, window_timeout, helper_timeout,
                             priority, spec,
@@ -1355,7 +1345,7 @@ def main() -> int:
 
                 try:
                     scenarios.append(run_editing_scenario(
-                        gui_validate_module, interaction_module, env, target_dir, swift_helper, capture_helper,
+                        gui_validate_module, interaction_module, env, target_dir, swift_helper, None,
                         run_dir, binary_path, expected_sha, request_id,
                         startup_timeout, window_timeout, helper_timeout, poll_timeout, priority,
                     ))
@@ -1363,7 +1353,7 @@ def main() -> int:
                     scenarios.append({
                         "name": "list_source_marker_body_editing", "result": "blocked", "reason": str(exc), "steps": [],
                     })
-            elif binary_path is not None and swift_helper is not None and capture_helper is not None:
+            elif binary_path is not None and swift_helper is not None:
                 scenarios.append({
                     "name": "normal_list_gui_setup", "result": "blocked",
                     "reason": "ASCII入力ソースの初期化に失敗した", "steps": [],
