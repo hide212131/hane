@@ -56,6 +56,7 @@ OCR_REQUIRED = (
     "literal markdown",
     "Tail anchor",
 )
+MAX_LABEL_CODE_X_DELTA = 0.015
 
 
 def load_module(control_dir: Path, relative: str, name: str):
@@ -106,6 +107,38 @@ def evaluate_initial_ocr(text: str) -> dict:
         required=list(OCR_REQUIRED),
         missing=missing,
         recognized_text=text,
+    )
+
+
+def parse_click_evidence(stdout: str) -> dict:
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"click-text evidence is not valid JSON: {stdout!r}") from exc
+    required = {"matched_text", "bounding_box", "window_bounds", "click_point", "edge"}
+    missing = required - payload.keys()
+    if missing:
+        raise ValueError(f"click-text evidence is missing fields: {sorted(missing)}")
+    return payload
+
+
+def evaluate_fence_alignment(label_evidence: dict, code_evidence: dict) -> dict:
+    label_x = float(label_evidence["bounding_box"]["minX"])
+    code_x = float(code_evidence["bounding_box"]["minX"])
+    delta = abs(label_x - code_x)
+    return step(
+        "inactive_fence_alignment",
+        "pass" if delta <= MAX_LABEL_CODE_X_DELTA else "fail",
+        None if delta <= MAX_LABEL_CODE_X_DELTA else (
+            "language label がコード本文より大きく右へずれており、"
+            "raw opening fence が前置表示されている可能性がある"
+        ),
+        language_label_min_x=label_x,
+        code_content_min_x=code_x,
+        absolute_delta=delta,
+        maximum_delta=MAX_LABEL_CODE_X_DELTA,
+        label_evidence=label_evidence,
+        code_evidence=code_evidence,
     )
 
 
@@ -165,6 +198,37 @@ def run_focused_scenario(
                 if ok
                 else step("inactive_code_block_text", "blocked", error)
             )
+
+            alignment_evidence = []
+            for pattern in (r"rust", r"let answer = 42"):
+                ok_click, click_out, click_error = interaction.run_helper(
+                    helper,
+                    ["click-text", str(pid), str(inactive_png), pattern, "start"],
+                    helper_timeout,
+                )
+                if not ok_click:
+                    steps.append(step(
+                        "inactive_fence_alignment", "blocked",
+                        f"相対位置 evidence を取得できない: {click_error}",
+                        pattern=pattern,
+                    ))
+                    alignment_evidence = []
+                    break
+                try:
+                    alignment_evidence.append(parse_click_evidence(click_out))
+                except ValueError as exc:
+                    steps.append(step(
+                        "inactive_fence_alignment", "blocked", str(exc), pattern=pattern
+                    ))
+                    alignment_evidence = []
+                    break
+                interaction.run_helper(
+                    helper, ["move-doc-start", str(pid)], helper_timeout
+                )
+            if len(alignment_evidence) == 2:
+                steps.append(evaluate_fence_alignment(
+                    alignment_evidence[0], alignment_evidence[1]
+                ))
 
             ok, _out, error = interaction.run_helper(
                 helper, ["move-doc-start", str(pid)], helper_timeout

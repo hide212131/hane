@@ -35,6 +35,34 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(mod.VERIFICATION_KIND, "code_block_focused")
 
 
+class AlignmentTests(unittest.TestCase):
+    @staticmethod
+    def evidence(min_x):
+        return {
+            "matched_text": "x",
+            "bounding_box": {"minX": min_x, "maxX": min_x + 0.05},
+            "window_bounds": {},
+            "click_point": {},
+            "edge": "start",
+        }
+
+    def test_accepts_language_label_aligned_with_code_content(self):
+        result = mod.evaluate_fence_alignment(
+            self.evidence(0.25), self.evidence(0.255)
+        )
+        self.assertEqual(result["result"], "pass")
+
+    def test_rejects_large_prefix_like_horizontal_shift(self):
+        result = mod.evaluate_fence_alignment(
+            self.evidence(0.25), self.evidence(0.28)
+        )
+        self.assertEqual(result["result"], "fail")
+
+    def test_parse_click_evidence_rejects_missing_fields(self):
+        with self.assertRaises(ValueError):
+            mod.parse_click_evidence('{"matched_text":"rust"}')
+
+
 class OcrEvaluationTests(unittest.TestCase):
     def test_accepts_required_visible_text(self):
         text = (
