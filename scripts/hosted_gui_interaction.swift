@@ -430,7 +430,22 @@ func pressKey(_ pid: pid_t, _ key: String, shift: Bool, save: Bool) {
     """)
 }
 
+func focusEditor(_ pid: pid_t) {
+    let bounds = windowBounds(pid)
+    // Hane's input capture is focused by an editor-body mouse event. The
+    // point is derived from the live window bounds rather than a fixed screen
+    // coordinate; moveDocStart immediately relocates the caret by source
+    // offset afterward, so this click is only a focus operation.
+    let point = CGPoint(
+        x: bounds.midX,
+        y: bounds.minY + bounds.height * 0.5
+    )
+    focus(pid)
+    postClick(point)
+}
+
 func moveDocStart(_ pid: pid_t) {
+    focusEditor(pid)
     runAppleScript("""
     tell application "System Events"
         tell first process whose unix id is \(pid)
