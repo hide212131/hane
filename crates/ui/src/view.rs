@@ -2186,6 +2186,7 @@ impl EditorView {
         let document = self.editor().document();
         let line = document.line_for_offset(caret).ok()?;
         let content_range = document.line_content_range(line).ok()?;
+        let line_range = document.line_range(line).ok()?;
         if caret != content_range.end {
             return None;
         }
@@ -2219,6 +2220,7 @@ impl EditorView {
             offset: SourceOffset(caret.0.checked_add(1)?),
             owner: list.owner.clone(),
             caret_origin,
+            line_ending_len: line_range.end.0.saturating_sub(content_range.end.0),
             indentation,
         })
     }
@@ -5788,6 +5790,74 @@ mod tests {
             view.dispatch(EditorCommand::Redo, cx);
             assert_eq!(view.editor().document().full_text(), after);
         });
+    }
+
+    #[gpui::test]
+    fn list_enter_preserves_caret_geometry_when_the_new_row_owns_an_existing_line_ending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for (source, line_ending_len) in [
+            ("- first\n- abc\n- last", 1),
+            ("- abc\n", 1),
+            ("- abc\r\n", 2),
+            ("- abc\r", 1),
+        ] {
+            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+            view.update(cx, |view, cx| {
+                let caret = source
+                    .find("- abc")
+                    .map(|offset| offset + "- abc".len())
+                    .unwrap_or_else(|| source.trim_end_matches('\n').len());
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(caret)))
+                    .unwrap();
+                view.insert_newline(ListCaretOrigin::Marker, cx);
+
+                let pending = view
+                    .pending_list_editing
+                    .clone()
+                    .expect("list newline keeps transient context");
+                assert_eq!(pending.line_ending_len, line_ending_len);
+                let indexed = view.block_at_offset(pending.offset).unwrap();
+                let line = view
+                    .editor()
+                    .document()
+                    .line_for_offset(pending.offset)
+                    .unwrap();
+                let mut visual = presented_block_with_list_projection(
+                    view.editor(),
+                    &indexed,
+                    &(line.0..line.0 + 1),
+                    None,
+                    None,
+                )
+                .expect("existing line ending row presents");
+                assert!(apply_list_editing_context(&mut visual, &pending));
+
+                for (origin, expected_x) in [
+                    (ListCaretOrigin::Marker, 0.0),
+                    (ListCaretOrigin::Body, 16.0),
+                ] {
+                    let mut context = pending.clone();
+                    context.caret_origin = origin;
+                    assert!(apply_list_editing_context(&mut visual, &context));
+                    let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
+                    let point = layout
+                        .point_for_source(&visual, pending.offset, &FixedAdvanceShaper::default())
+                        .expect("line ending row owns the caret");
+                    assert_eq!(point.x, expected_x);
+                    assert_eq!(
+                        layout.source_for_point(
+                            &visual,
+                            point.x,
+                            point.y,
+                            &FixedAdvanceShaper::default(),
+                        ),
+                        Some(pending.offset)
+                    );
+                }
+            });
+        }
     }
 
     #[test]

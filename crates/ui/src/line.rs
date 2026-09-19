@@ -387,7 +387,7 @@ pub(crate) fn row_element(
     let selected_visual = layout.visual_range_on_row(block, row_index, editor.selection().range());
     let marked_visual = editor
         .ime()
-        .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.current_range));
+        .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
     let segments = line_segments(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),

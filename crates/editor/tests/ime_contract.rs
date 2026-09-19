@@ -93,6 +93,85 @@ fn ime_commit_on_ordered_list_row_inserts_once_at_expected_offset() {
 }
 
 #[test]
+fn deferred_list_indentation_commits_and_undoes_with_nested_ime_text() {
+    for (source, prefix) in [
+        ("- abc\n  - xyz\n", "  "),
+        ("10. abc\n    1. xyz\n", "    "),
+    ] {
+        let mut editor = Editor::new(source);
+        let caret = source.trim_end_matches('\n').len();
+        editor
+            .set_selection(Selection::caret(SourceOffset(caret)))
+            .unwrap();
+        editor.dispatch(EditorCommand::Insert("\n")).unwrap();
+        let empty_line = editor.selection().active;
+
+        editor
+            .replace_and_mark_text_with_prefix(None, prefix, "ni", Some(2..2))
+            .unwrap();
+        editor
+            .replace_and_mark_text_with_prefix(None, "", "nihongo", Some(7..7))
+            .unwrap();
+        let content = source.trim_end_matches('\n');
+        assert_eq!(
+            editor.document().full_text(),
+            format!("{content}\n{prefix}nihongo\n")
+        );
+        let ime = editor.ime().expect("composition must remain active");
+        assert_eq!(
+            ime.current_range,
+            SourceRange::new(empty_line.0, empty_line.0 + prefix.len() + "nihongo".len())
+        );
+        assert_eq!(
+            ime.marked_range,
+            SourceRange::new(
+                empty_line.0 + prefix.len(),
+                empty_line.0 + prefix.len() + "nihongo".len()
+            )
+        );
+
+        let marked_range = editor
+            .ime()
+            .and_then(|ime| editor.source_range_to_utf16(ime.marked_range).ok())
+            .expect("marked text has a UTF-16 range");
+        editor.commit_text(Some(marked_range), "日本語").unwrap();
+        let committed = format!("{content}\n{prefix}日本語\n");
+        assert_eq!(editor.document().full_text(), committed);
+        editor.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(editor.document().full_text(), format!("{source}\n"));
+        assert_eq!(editor.selection(), Selection::caret(empty_line));
+        editor.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(editor.document().full_text(), committed);
+    }
+}
+
+#[test]
+fn deferred_list_indentation_is_removed_when_nested_ime_composition_is_cancelled() {
+    for (source, prefix) in [
+        ("- abc\n  - xyz\n", "  "),
+        ("10. abc\n    1. xyz\n", "    "),
+    ] {
+        let mut editor = Editor::new(source);
+        let caret = source.trim_end_matches('\n').len();
+        editor
+            .set_selection(Selection::caret(SourceOffset(caret)))
+            .unwrap();
+        editor.dispatch(EditorCommand::Insert("\n")).unwrap();
+        let empty_line = editor.selection().active;
+        editor
+            .replace_and_mark_text_with_prefix(None, prefix, "nihongo", None)
+            .unwrap();
+
+        assert_eq!(
+            editor.cancel_composition().unwrap(),
+            hane_editor::ImeCancelOutcome::Restored
+        );
+        assert_eq!(editor.document().full_text(), format!("{source}\n"));
+        assert_eq!(editor.selection(), Selection::caret(empty_line));
+    }
+}
+
+#[test]
 fn extended_vertical_selection_remains_on_source_boundaries() {
     let mut editor = Editor::new("日本🙂\n短い\ne\u{301}nd");
     editor

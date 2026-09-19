@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-list-enter/1"
+PROCEDURE_VERSION = "hosted-list-enter/2"
 VERIFICATION_KIND = "list_enter_editing_focused"
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -124,6 +124,53 @@ CASES = (
         (("press-key", "enter", "nosave"), ("type-save", "- def")),
         "10. abc\n    1. xyz\n    - def",
         "nested ordered / unordered の組み合わせで sibling を入力",
+    ),
+    Case(
+        "trailing_newline_sibling",
+        "- abc\n",
+        "abc",
+        (("press-key", "enter", "nosave"), ("type-save", "- def")),
+        "- abc\n- def\n",
+        "trailing newline を保持したまま marker caret から sibling を入力",
+    ),
+    Case(
+        "trailing_newline_nested_body",
+        "- abc\n  - xyz\n",
+        "xyz",
+        (("press-shift-enter", "nosave"), ("type-save", "more")),
+        "- abc\n  - xyz\n  more\n",
+        "trailing newline を保持した nested item の body caret を確認",
+    ),
+    Case(
+        "nested_ime_commit_undo",
+        "- abc\n  - xyz",
+        "xyz",
+        (
+            ("press-key", "enter", "nosave"),
+            (
+                "type-romaji-at-caret-commit-save",
+                "nihongo",
+                "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese",
+            ),
+            ("undo-save",),
+        ),
+        "- abc\n  - xyz\n",
+        "nested item の IME commit 後に Undo 1回で空行へ戻る",
+    ),
+    Case(
+        "nested_ime_cancel",
+        "- abc\n  - xyz",
+        "xyz",
+        (
+            ("press-key", "enter", "nosave"),
+            (
+                "type-romaji-at-caret-cancel-save",
+                "nihongo",
+                "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese",
+            ),
+        ),
+        "- abc\n  - xyz\n",
+        "nested item の IME composition cancel 後に indentation を残さない",
     ),
 )
 

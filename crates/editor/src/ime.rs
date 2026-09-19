@@ -13,12 +13,20 @@ pub struct ImeState {
     pub original_range: SourceRange,
     pub original_text: String,
     pub current_range: SourceRange,
+    /// The range containing only the marked text. `current_range` may also
+    /// include a deferred list indentation that belongs to the same IME
+    /// transaction but must not be reported as marked text to the platform.
+    pub marked_range: SourceRange,
     pub marked_text: String,
     pub selected_utf16_range: Range<usize>,
     pub cursor_affinity: Bias,
     pub start_anchor: Anchor,
     pub end_anchor: Anchor,
     pub original_selection: Selection,
+    /// Source text inserted before the marked text as part of this IME
+    /// transaction. List indentation uses this so commit, undo and cancel all
+    /// restore the empty line as one user-visible operation.
+    prefix: String,
     expected_revision: Revision,
 }
 
@@ -27,6 +35,7 @@ impl ImeState {
         editor: &Editor,
         transaction_id: TransactionId,
         range: SourceRange,
+        prefix: &str,
     ) -> Result<Self, BufferError> {
         Ok(Self {
             base_revision: editor.document.revision(),
@@ -34,18 +43,30 @@ impl ImeState {
             original_range: range,
             original_text: editor.document.text(range)?,
             current_range: range,
+            marked_range: range,
             marked_text: String::new(),
             selected_utf16_range: 0..0,
             cursor_affinity: Bias::After,
             start_anchor: editor.document.anchor(range.start, Bias::Before)?,
             end_anchor: editor.document.anchor(range.end, Bias::After)?,
             original_selection: editor.selection,
+            prefix: prefix.to_owned(),
             expected_revision: editor.document.revision(),
         })
     }
 
-    fn update(&mut self, summary: &EditSummary, text: &str, selected_utf16: Range<usize>) {
+    fn update(
+        &mut self,
+        summary: &EditSummary,
+        prefix_len: usize,
+        text: &str,
+        selected_utf16: Range<usize>,
+    ) {
         self.current_range = summary.range_after;
+        self.marked_range = SourceRange::new(
+            summary.range_after.start.0 + prefix_len,
+            summary.range_after.end.0,
+        );
         self.marked_text = text.to_owned();
         self.selected_utf16_range = selected_utf16;
         self.expected_revision = summary.revision_after;
@@ -66,10 +87,25 @@ impl Editor {
         text: &str,
         selected_utf16: Option<Range<usize>>,
     ) -> Result<EditSummary, BufferError> {
+        self.replace_and_mark_text_with_prefix(replacement_utf16, "", text, selected_utf16)
+    }
+
+    /// Replaces the current IME range while keeping `prefix` inside the same
+    /// composition transaction. The prefix is used only when a new
+    /// composition starts; subsequent updates reuse the prefix already stored
+    /// in [`ImeState`]. This lets deferred list indentation be committed,
+    /// undone, or cancelled together with the IME text.
+    pub fn replace_and_mark_text_with_prefix(
+        &mut self,
+        replacement_utf16: Option<Range<usize>>,
+        prefix: &str,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+    ) -> Result<EditSummary, BufferError> {
         let received = Instant::now();
         self.preferred_grapheme_column = None;
-        let current = if let Some(ime) = &self.ime {
-            ime.current_range
+        let (current, composition_prefix) = if let Some(ime) = &self.ime {
+            (ime.current_range, ime.prefix.clone())
         } else {
             let original_range = if let Some(range) = replacement_utf16 {
                 self.utf16_range_to_source(range)?
@@ -78,21 +114,29 @@ impl Editor {
             };
             let transaction_id = TransactionId(self.next_transaction);
             self.next_transaction += 1;
-            self.ime = Some(ImeState::begin(self, transaction_id, original_range)?);
-            original_range
+            self.ime = Some(ImeState::begin(
+                self,
+                transaction_id,
+                original_range,
+                prefix,
+            )?);
+            (original_range, prefix.to_owned())
         };
-        let summary = self.document.edit(current, text)?;
+        let mut replacement = composition_prefix.clone();
+        replacement.push_str(text);
+        let summary = self.document.edit(current, &replacement)?;
         let selected = selected_utf16.unwrap_or_else(|| {
             let end = text.encode_utf16().count();
             end..end
         });
         let relative = utf16_range_to_byte(text, selected.clone());
+        let prefix_len = composition_prefix.len();
         if let Some(ime) = &mut self.ime {
-            ime.update(&summary, text, selected);
+            ime.update(&summary, prefix_len, text, selected);
         }
         self.selection = Selection {
-            anchor: SourceOffset(summary.range_after.start.0 + relative.start),
-            active: SourceOffset(summary.range_after.start.0 + relative.end),
+            anchor: SourceOffset(summary.range_after.start.0 + prefix_len + relative.start),
+            active: SourceOffset(summary.range_after.start.0 + prefix_len + relative.end),
         };
         self.record_model_update(received, InputMeasurementKind::ImeComposition);
         Ok(summary)
@@ -105,23 +149,30 @@ impl Editor {
     ) -> Result<EditSummary, BufferError> {
         let received = Instant::now();
         self.preferred_grapheme_column = None;
-        let range = if let Some(range) = replacement_utf16 {
+        let range = if let Some(ime) = &self.ime {
+            // The active range includes a deferred prefix. The platform may
+            // report only the marked-text range, so never let that replace
+            // leave the prefix outside the committed IME transaction.
+            ime.current_range
+        } else if let Some(range) = replacement_utf16 {
             self.utf16_range_to_source(range)?
         } else {
-            self.ime
-                .as_ref()
-                .map(|ime| ime.current_range)
-                .unwrap_or(self.selection.range())
+            self.selection.range()
         };
         let ime = self.ime.take();
         let selection_before = self.selection;
-        let summary = self.document.edit(range, text)?;
+        let mut replacement = ime
+            .as_ref()
+            .map(|ime| ime.prefix.clone())
+            .unwrap_or_default();
+        replacement.push_str(text);
+        let summary = self.document.edit(range, &replacement)?;
         self.selection = Selection::caret(summary.range_after.end);
         if let Some(ime) = ime {
             self.history.record_replacement(
                 ime.original_range.start.0,
                 ime.original_text,
-                text.to_owned(),
+                replacement,
                 ime.original_selection,
                 self.selection,
                 crate::history::EditKind::Ime,
@@ -134,7 +185,7 @@ impl Editor {
             };
             self.history.record(
                 &summary,
-                text,
+                &replacement,
                 selection_before,
                 self.selection,
                 kind,
@@ -152,7 +203,11 @@ impl Editor {
         self.history.record_replacement(
             ime.original_range.start.0,
             ime.original_text,
-            ime.marked_text,
+            {
+                let mut inserted = ime.prefix;
+                inserted.push_str(&ime.marked_text);
+                inserted
+            },
             ime.original_selection,
             self.selection,
             crate::history::EditKind::Ime,

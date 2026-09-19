@@ -180,7 +180,7 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
     """)
 }
 
-func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, commit: Bool, save: Bool) {
     focus(pid)
     selectSource(inputSource)
     // TISSelectInputSource() making currentSourceID() report the Japanese source
@@ -212,13 +212,24 @@ func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: 
             delay 0.5
             key code 49
             delay 0.5
-            key code 36
+            (commit ? "key code 36" : "key code 53")
             delay 0.3
-            keystroke "s" using command down
-            delay 0.3
+            (save ? "keystroke \"s\" using command down\ndelay 0.3" : "")
         end tell
     end tell
     """)
+}
+
+func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: true, save: true)
+}
+
+func typeRomajiAtCaretCommit(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: true, save: false)
+}
+
+func typeRomajiAtCaretCancelSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: false, save: true)
 }
 
 func recognizeText(_ path: String) {
@@ -519,7 +530,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -560,6 +571,12 @@ case "type-romaji-commit-save":
 case "type-romaji-at-caret-commit-save":
     guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-commit-save requires PID, romaji text and source ID") }
     typeRomajiAtCaretCommitSave(pid, arguments[2], arguments[3])
+case "type-romaji-at-caret-commit":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-commit requires PID, romaji text and source ID") }
+    typeRomajiAtCaretCommit(pid, arguments[2], arguments[3])
+case "type-romaji-at-caret-cancel-save":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-cancel-save requires PID, romaji text and source ID") }
+    typeRomajiAtCaretCancelSave(pid, arguments[2], arguments[3])
 case "click-text":
     guard arguments.count == 5, let pid = pid_t(arguments[1]) else { fail("click-text requires PID, screenshot path, regex pattern and edge") }
     clickText(pid, arguments[2], arguments[3], arguments[4])

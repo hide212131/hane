@@ -34,7 +34,7 @@ impl EntityInputHandler for EditorView {
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.editor()
             .ime()
-            .and_then(|ime| self.editor().source_range_to_utf16(ime.current_range).ok())
+            .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok())
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -53,10 +53,13 @@ impl EntityInputHandler for EditorView {
             self.insert_text(new_text, cx);
             return;
         }
+        let indentation = self.pending_list_indentation();
         self.clear_pending_list_editing();
+        let mut replacement = indentation;
+        replacement.push_str(new_text);
         let result = self
             .editor_mut()
-            .commit_text(range_utf16, new_text)
+            .commit_text(range_utf16, &replacement)
             .map(|_| ());
         if let Err(error) = result {
             self.report_error("text input", error);
@@ -74,22 +77,9 @@ impl EntityInputHandler for EditorView {
     ) {
         let indentation = self.pending_list_indentation();
         self.clear_pending_list_editing();
-        let prefix_utf16 = indentation.encode_utf16().count();
-        let adjusted_range = if indentation.is_empty() {
-            range_utf16
-        } else {
-            let result = self.editor_mut().insert_text(&indentation);
-            if let Err(error) = result {
-                self.report_error("IME prefix input", error);
-                self.after_input(cx);
-                return;
-            }
-            range_utf16.map(|range| {
-                range.start.saturating_add(prefix_utf16)..range.end.saturating_add(prefix_utf16)
-            })
-        };
-        if let Err(error) = self.editor_mut().replace_and_mark_text(
-            adjusted_range,
+        if let Err(error) = self.editor_mut().replace_and_mark_text_with_prefix(
+            range_utf16,
+            &indentation,
             new_text,
             new_selected_range_utf16,
         ) {
