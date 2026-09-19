@@ -50,6 +50,8 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
+#[cfg(test)]
+use std::cell::RefCell;
 use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -2231,7 +2233,7 @@ fn get_frame(this: &Object) -> NSRect {
     }
 }
 
-extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NSRange) {
+pub(super) extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NSRange) {
     unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
@@ -2471,10 +2473,33 @@ fn drag_event_position(window_state: &Mutex<MacWindowState>, dragging_info: id) 
     convert_mouse_position(drag_location, window_state.lock().content_size().height)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_INPUT_HANDLER: RefCell<Option<PlatformInputHandler>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_input_handler<R>(input_handler: PlatformInputHandler, f: impl FnOnce() -> R) -> R {
+    let previous = TEST_INPUT_HANDLER.with(|slot| slot.replace(Some(input_handler)));
+    assert!(previous.is_none(), "test input handler must not be nested");
+    let result = f();
+    TEST_INPUT_HANDLER.with(|slot| {
+        assert!(slot.replace(None).is_some(), "test input handler was consumed");
+    });
+    result
+}
+
 fn with_input_handler<F, R>(window: &Object, f: F) -> Option<R>
 where
     F: FnOnce(&mut PlatformInputHandler) -> R,
 {
+    #[cfg(test)]
+    if let Some(mut input_handler) = TEST_INPUT_HANDLER.with(|slot| slot.borrow_mut().take()) {
+        let result = f(&mut input_handler);
+        TEST_INPUT_HANDLER.with(|slot| slot.replace(Some(input_handler)));
+        return Some(result);
+    }
+
     let window_state = unsafe { get_window_state(window) };
     let mut lock = window_state.as_ref().lock();
     if let Some(mut input_handler) = lock.input_handler.take() {
