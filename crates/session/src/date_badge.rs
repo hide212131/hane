@@ -24,6 +24,19 @@ pub struct CalendarDate {
     pub day: u32,
 }
 
+/// Calendar bucket used to give sidebar date badges stronger visual weight
+/// for dates close to today. "This week" is Monday through Sunday; the
+/// buckets are calendar-based rather than past-only, so future dates in the
+/// same week/month/year use the same color tier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DateBadgeRange {
+    Today,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+    Other,
+}
+
 impl CalendarDate {
     /// `None` when `year`/`month`/`day` is not a real proleptic-Gregorian
     /// calendar date (bad month, or a day past the end of its month —
@@ -252,6 +265,31 @@ pub fn split_file_name_for_badge(file_name: &str) -> Option<FileNameDateBadge> {
 }
 
 const WEEKDAY_KANJI: [char; 7] = ['日', '月', '火', '水', '木', '金', '土'];
+
+fn monday_week_start(date: CalendarDate) -> i64 {
+    let weekday = i64::try_from(date.weekday_index()).unwrap_or(0);
+    let days_since_monday = (weekday + 6) % 7;
+    days_from_civil(date.year, date.month, date.day) - days_since_monday
+}
+
+/// Classifies a badge date by calendar proximity to `today`.
+///
+/// The order is intentional: a week may cross a month or year boundary, so
+/// same-week dates are recognized before month/year comparisons.
+#[must_use]
+pub fn date_badge_range(date: CalendarDate, today: CalendarDate) -> DateBadgeRange {
+    if date == today {
+        DateBadgeRange::Today
+    } else if monday_week_start(date) == monday_week_start(today) {
+        DateBadgeRange::ThisWeek
+    } else if date.year == today.year && date.month == today.month {
+        DateBadgeRange::ThisMonth
+    } else if date.year == today.year {
+        DateBadgeRange::ThisYear
+    } else {
+        DateBadgeRange::Other
+    }
+}
 
 /// The short badge label for `date` relative to `today`: `本日` when they
 /// are the same day, otherwise the shortest form that still disambiguates —
@@ -553,6 +591,53 @@ mod tests {
     fn the_remainder_of_a_leading_date_is_just_the_rest_of_the_name() {
         let badge = split_file_name_for_badge("2026-09-17_ABC.md").unwrap();
         assert_eq!(badge.remainder(), "ABC.md");
+    }
+
+    #[test]
+    fn date_badge_range_uses_monday_to_sunday_week() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap(); // Sunday
+        let monday = CalendarDate::new(2026, 9, 14).unwrap();
+        let previous_sunday = CalendarDate::new(2026, 9, 13).unwrap();
+        let next_monday = CalendarDate::new(2026, 9, 21).unwrap();
+
+        assert_eq!(date_badge_range(today, today), DateBadgeRange::Today);
+        assert_eq!(date_badge_range(monday, today), DateBadgeRange::ThisWeek);
+        assert_eq!(
+            date_badge_range(previous_sunday, today),
+            DateBadgeRange::ThisMonth
+        );
+        assert_eq!(date_badge_range(next_monday, today), DateBadgeRange::ThisMonth);
+    }
+
+    #[test]
+    fn date_badge_range_handles_month_year_and_other_buckets() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        let same_month = CalendarDate::new(2026, 9, 1).unwrap();
+        let same_year = CalendarDate::new(2026, 2, 1).unwrap();
+        let other_year = CalendarDate::new(2025, 12, 1).unwrap();
+
+        assert_eq!(
+            date_badge_range(same_month, today),
+            DateBadgeRange::ThisMonth
+        );
+        assert_eq!(date_badge_range(same_year, today), DateBadgeRange::ThisYear);
+        assert_eq!(date_badge_range(other_year, today), DateBadgeRange::Other);
+    }
+
+    #[test]
+    fn date_badge_range_keeps_a_cross_month_calendar_week_together() {
+        let today = CalendarDate::new(2026, 10, 1).unwrap(); // Thursday
+        let monday = CalendarDate::new(2026, 9, 28).unwrap();
+
+        assert_eq!(date_badge_range(monday, today), DateBadgeRange::ThisWeek);
+    }
+
+    #[test]
+    fn date_badge_range_keeps_a_cross_year_calendar_week_together() {
+        let today = CalendarDate::new(2026, 1, 1).unwrap(); // Thursday
+        let monday = CalendarDate::new(2025, 12, 29).unwrap();
+
+        assert_eq!(date_badge_range(monday, today), DateBadgeRange::ThisWeek);
     }
 
     #[test]
