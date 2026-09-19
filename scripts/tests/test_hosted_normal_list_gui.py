@@ -835,7 +835,11 @@ class ImeCommitSubtestTests(unittest.TestCase):
     def _make_interaction(self, *, japanese_available=True, commit_effects=None,
                           restore_ok_until=None, move_caret_ok=True, current_source_ok=True):
         commit_effects = commit_effects or ["ok_matched"]
-        calls = {"commit": 0, "restore": [], "capture": [], "move_caret": []}
+        calls = {
+            "commit": 0, "restore": [], "capture": [], "move_caret": [],
+            "deactivate": 0, "source_select": [],
+        }
+        current_source = {"id": "com.apple.keylayout.ABC"}
 
         class FakeInteraction:
             JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
@@ -846,12 +850,19 @@ class ImeCommitSubtestTests(unittest.TestCase):
                 if command == "current-source":
                     if not current_source_ok:
                         return False, "", "current-source failed"
-                    return True, "com.apple.keylayout.ABC", ""
+                    return True, current_source["id"], ""
                 if command == "list-sources":
                     sources = "com.apple.keylayout.ABC"
                     if japanese_available:
                         sources += f"\n{FakeInteraction.JAPANESE_SOURCE}"
                     return True, sources, ""
+                if command == "deactivate":
+                    calls["deactivate"] += 1
+                    return True, "", ""
+                if command == "select-source":
+                    current_source["id"] = args[1]
+                    calls["source_select"].append(args[1])
+                    return True, "", ""
                 if command == "click-text":
                     # PR #208 review PRRT_kwDOUETGuM6j8L1G: IME caret positioning must never
                     # use click-text/OCR. If production code calls it, the fixture regressed.
@@ -869,6 +880,15 @@ class ImeCommitSubtestTests(unittest.TestCase):
                         return False, "", "commit helper failed"
                     return True, "", ""
                 raise AssertionError(f"unexpected helper call: {args}")
+
+            @staticmethod
+            def select_input_source(helper, source_id, timeout):
+                ok, _out, error = FakeInteraction.run_helper(
+                    helper, ["select-source", source_id], timeout
+                )
+                if not ok:
+                    return False, current_source["id"], error, 1
+                return True, current_source["id"], "", 1
 
             @staticmethod
             def wait_for_fixture_bytes(fixture_path, expected, timeout):
@@ -908,6 +928,8 @@ class ImeCommitSubtestTests(unittest.TestCase):
         self.assertEqual(len(commit_step["attempts"]), 1)
         self.assertEqual(calls["commit"], 1)
         self.assertEqual(len(calls["restore"]), 1)
+        self.assertEqual(calls["deactivate"], 1)
+        self.assertEqual(calls["source_select"], [interaction.JAPANESE_SOURCE])
 
     def test_second_attempt_succeeds_after_pristine_baseline_restore(self):
         interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])

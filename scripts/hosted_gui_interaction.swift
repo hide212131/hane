@@ -333,6 +333,15 @@ func activateApplication(_ pid: pid_t) {
     Thread.sleep(forTimeInterval: 0.3)
 }
 
+func deactivateApplication() {
+    // Change the global input source while the target editor is not the key
+    // application. GPUI reactivates the key window's NSTextInputContext when
+    // macOS publishes a keyboard-source change; doing that while Kotoeri is
+    // being selected can block the target editor in AppKit's IME XPC path.
+    runAppleScript("tell application \"Finder\" to activate")
+    Thread.sleep(forTimeInterval: 0.3)
+}
+
 func focus(_ pid: pid_t) {
     activateApplication(pid)
 }
@@ -555,7 +564,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -573,6 +582,9 @@ case "current-source":
 case "activate":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("activate requires PID") }
     activateApplication(pid)
+case "deactivate":
+    guard arguments.count == 1 else { fail("deactivate takes no arguments") }
+    deactivateApplication()
 case "list-sources":
     for id in inputSources().compactMap({ sourceID($0) }) { print(id) }
 case "select-source":
