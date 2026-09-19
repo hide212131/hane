@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -428,6 +429,73 @@ class RealEnvironment(Environment):
         window_id = out.stdout.strip()
         return window_id or None
 
+    @staticmethod
+    def _run_screencapture_with_tty(args: list[str], timeout_seconds: float) -> subprocess.CompletedProcess:
+        """Run macOS screencapture with a real controlling tty.
+
+        On the local macOS host, screencapture can wait indefinitely when it is
+        launched by Python without a controlling terminal, even with stdout
+        and stderr redirected. The command works when launched from the shell
+        because that shell supplies a controlling tty. Allocate the same
+        session shape here while retaining a bounded timeout and draining the
+        pty so a diagnostic cannot deadlock the child.
+        """
+        import fcntl
+        import pty
+        import select
+        import termios
+
+        master, slave = pty.openpty()
+
+        def attach_controlling_tty() -> None:
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen(
+            args,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            preexec_fn=attach_controlling_tty,
+        )
+        os.close(slave)
+        os.set_blocking(master, False)
+        output = bytearray()
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while True:
+                try:
+                    output.extend(os.read(master, 4096))
+                except BlockingIOError:
+                    pass
+                except OSError as exc:
+                    # Darwin reports EIO after the pty slave closes. Any data
+                    # already drained is still sufficient for diagnostics.
+                    if getattr(exc, "errno", None) != 5:
+                        raise
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise subprocess.TimeoutExpired(args, timeout_seconds, output=bytes(output))
+                select.select([master], [], [], min(remaining, 0.05))
+            # Drain bytes written just before process exit.
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except (BlockingIOError, OSError):
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+        finally:
+            os.close(master)
+        return subprocess.CompletedProcess(args, process.returncode, bytes(output), bytes(output))
+
     def capture(self, window_id: str, image_path: Path, config: Config) -> bool:
         try:
             image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -440,26 +508,54 @@ class RealEnvironment(Environment):
             # kCGWindowBounds used by the hosted OS-input helper.
             args = ["screencapture", "-x", "-o", "-l", window_id, str(image_path)]
         try:
-            out = subprocess.run(
-                args, capture_output=True, text=True, timeout=config.capture_timeout_seconds
-            )
+            if config.capture_cmd is None:
+                out = self._run_screencapture_with_tty(args, config.capture_timeout_seconds)
+            else:
+                out = subprocess.run(
+                    args, capture_output=True, text=True, timeout=config.capture_timeout_seconds
+                )
         except subprocess.TimeoutExpired as exc:
             raise EnvError(f"撮影コマンドがタイムアウトした: {exc}") from exc
         except OSError as exc:
             raise EnvError(str(exc)) from exc
-        if out.returncode != 0:
-            return False
-        # Decode the complete image, rather than accepting a file/header left
-        # by a custom command that exited successfully without a screenshot.
-        try:
+
+        def valid_image() -> bool:
             if not image_path.is_file() or image_path.stat().st_size == 0:
                 return False
             with tempfile.TemporaryDirectory(prefix='hane-image-check-') as directory:
                 decoded = Path(directory) / 'decoded.png'
-                checked = subprocess.run(['/usr/bin/sips', '-s', 'format', 'png', str(image_path),
-                                          '--out', str(decoded)], capture_output=True, text=True,
-                                         timeout=config.capture_timeout_seconds)
+                checked = subprocess.run(
+                    ['/usr/bin/sips', '-s', 'format', 'png', str(image_path), '--out', str(decoded)],
+                    capture_output=True, text=True, timeout=config.capture_timeout_seconds,
+                )
                 return checked.returncode == 0 and decoded.is_file() and decoded.stat().st_size > 0
+
+        # Some local macOS sessions reject `screencapture -l` for a native
+        # window even though the same window is visible and its bounds are
+        # available through CGWindowList. Retry with a screen rectangle derived
+        # from that live window, rather than accepting a missing/zero image or
+        # falling back to a fixed coordinate.
+        if out.returncode == 0 and valid_image():
+            return True
+        if config.capture_cmd is not None:
+            # A caller-provided capture command owns its own failure semantics;
+            # do not replace its invalid output with an unrelated native-window
+            # fallback that may capture the wrong target.
+            return False
+        try:
+            bounds_script = Path(__file__).resolve().parent / "window_bounds.swift"
+            bounds = subprocess.run(
+                ["swift", str(bounds_script), window_id],
+                capture_output=True, text=True, timeout=config.capture_timeout_seconds,
+            )
+            rectangle = bounds.stdout.strip()
+            if bounds.returncode != 0 or not re.fullmatch(r"-?\d+,-?\d+,\d+,\d+", rectangle):
+                return False
+            fallback_args = ["screencapture", "-x", "-R", rectangle, str(image_path)]
+            fallback = self._run_screencapture_with_tty(
+                fallback_args, config.capture_timeout_seconds
+            )
+            return fallback.returncode == 0 and valid_image()
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise EnvError(f"撮影画像を検証できない: {exc}") from exc
 

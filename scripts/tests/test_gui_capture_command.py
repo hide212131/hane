@@ -39,7 +39,13 @@ class CaptureCommandTests(unittest.TestCase):
                 Path(argv[-1]).write_bytes(b"decoded image")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
-        with patch.object(gv.subprocess, "run", side_effect=command):
+        def tty_command(argv, timeout):
+            calls.append(argv)
+            config.image_path.write_bytes(b"captured image")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with patch.object(gv.subprocess, "run", side_effect=command), \
+                patch.object(gv.RealEnvironment, "_run_screencapture_with_tty", side_effect=tty_command):
             result = gv.RealEnvironment().capture("42", config.image_path, config)
         self.assertTrue(result)
         return calls
