@@ -173,6 +173,25 @@ impl FileService for OsFileService {
 /// file rename. If a platform cannot provide an atomic no-replace directory
 /// rename, fail closed rather than risking data loss.
 fn paths_refer_to_same_entry(from: &Path, to: &Path) -> bool {
+    if from.parent() != to.parent() {
+        return false;
+    }
+    let (Some(from_name), Some(to_name)) = (
+        from.file_name().and_then(|name| name.to_str()),
+        to.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return false;
+    };
+    if from_name == to_name || !from_name.eq_ignore_ascii_case(to_name) {
+        return false;
+    }
+    if fs::symlink_metadata(from)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        || fs::symlink_metadata(to)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return false;
+    }
     match (fs::canonicalize(from), fs::canonicalize(to)) {
         (Ok(from), Ok(to)) => from == to,
         _ => false,
@@ -488,8 +507,8 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert!(names.iter().any(|name| name == "plain.md"));
-        assert!(!names.iter().any(|name| name == "Plain.md"));
+        assert!(names.iter().any(|name| name.to_string_lossy() == "plain.md"));
+        assert!(!names.iter().any(|name| name.to_string_lossy() == "Plain.md"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -561,8 +580,8 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert!(names.iter().any(|name| name == "project"));
-        assert!(!names.iter().any(|name| name == "Project"));
+        assert!(names.iter().any(|name| name.to_string_lossy() == "project"));
+        assert!(!names.iter().any(|name| name.to_string_lossy() == "Project"));
         fs::remove_dir_all(root).unwrap();
     }
 
