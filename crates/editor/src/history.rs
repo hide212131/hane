@@ -59,9 +59,13 @@ impl HistoryEntry {
             return false;
         }
         match self.kind {
+            // A selection replacement starts as an Insert entry whose
+            // `deleted` text is the selected range. Subsequent characters
+            // typed at the resulting caret are still part of that same user
+            // transaction, so keep appending them even though the first
+            // entry was not an insertion into an empty range.
             EditKind::Insert
-                if self.deleted.is_empty()
-                    && next.deleted.is_empty()
+                if next.deleted.is_empty()
                     && next.start == self.start + self.inserted.len()
                     && !self.inserted.ends_with(is_line_ending)
                     && !next.inserted.contains(is_line_ending) =>

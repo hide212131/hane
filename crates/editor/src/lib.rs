@@ -463,6 +463,41 @@ mod tests {
     }
 
     #[test]
+    fn characterwise_selection_replacement_is_one_undo_transaction() {
+        let original_text =
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Gamma row\n";
+        let mut e = Editor::new(original_text);
+        let start = original_text.find("Gamma").unwrap();
+        let original = Selection {
+            anchor: SourceOffset(start),
+            active: SourceOffset(start + "Gamma".len()),
+        };
+        e.set_selection(original).unwrap();
+
+        for character in ["D", "e", "l", "t", "a"] {
+            e.dispatch(EditorCommand::Insert(character)).unwrap();
+        }
+        assert_eq!(
+            e.document().full_text(),
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Delta row\n"
+        );
+
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), original_text);
+        assert_eq!(e.selection(), original);
+
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(
+            e.document().full_text(),
+            "# Normal List Editing Fixture\n\n3. Alpha row\n41. Beta row\n100. Delta row\n"
+        );
+        assert_eq!(
+            e.selection(),
+            Selection::caret(SourceOffset(start + "Delta".len()))
+        );
+    }
+
+    #[test]
     fn new_edit_after_undo_discards_redo() {
         let mut e = Editor::new("");
         e.dispatch(EditorCommand::Insert("a")).unwrap();
