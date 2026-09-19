@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-gui-interaction/8"
+PROCEDURE_VERSION = "hosted-gui-interaction/7"
 VERIFICATION_KIND = "interactive_input_smoke"
 SCOPE_NOTE = (
     "この結果はキーボード入力・保存・undo/redo・再オープン・日本語 IME 入力・"
@@ -314,16 +314,6 @@ AMBIGUOUS_LANDING_CLASSIFICATIONS = frozenset({"far_miss", "boundary_ambiguous_n
 # baseline 復元はこの上限に余裕を持たせた回数だけ undo-save を試み、それでも一致
 # しなければ復元失敗として fail-closed にする。
 BASELINE_RESTORE_MAX_UNDOS = 8
-
-# TISSelectInputSource() が currentSourceID() に日本語ソースを反映させたことは、Hane 側の
-# IME session が実際に変換可能な状態になったことを証明しない(Issue #126 post-merge GUI
-# run: currentSourceID() は既に日本語ソースを報告していたのに romaji が変換されず未変換の
-# ままだった、PR #208 review PRRT_kwDOUETGuM6j8CB_)。readiness の観測値は「保存された実
-# バイトが期待する日本語へ変換・確定されたか」に置き換え、それが揃うまで pristine baseline
-# 復元・caret 再配置・source 再選択・変換・確定・保存を最初からやり直す。無条件リトライや
-# 固定 sleep だけで pass にしないよう、この上限までにどの attempt でも実バイトが一致しなけ
-# れば fail とする。
-BOUNDARY_IME_MAX_ATTEMPTS = 3
 
 # Hane の save_session は書き込みを background executor へ投入して非同期に完了する
 # ため、force-save/undo-save のキー送信が返った直後に読んだ fixture バイト列は、
@@ -1324,78 +1314,36 @@ def run_boundary_ime_step(module, env, config, swift_helper, process_holder, win
             steps.append(make_step(name, "blocked", reason="このランナーに組み込みの日本語入力ソースが見つからない"))
             return steps
 
+        capture = capture_named(module, env, config, window_id, run_dir, "boundary_ime_input")
+        steps.append(capture)
+        if capture["result"] != "pass":
+            steps.append(make_step(name, "blocked", reason=capture.get("reason")))
+            return steps
+        screenshot = run_dir / "boundary_ime_input.png"
+
+        ok, _out, err = run_helper(
+            swift_helper, ["click-text", str(pid), str(screenshot), BOLD_ITALIC_OCR_RE, "start"], helper_timeout
+        )
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"IME 境界クリックに失敗した: {err}"))
+            return steps
+
+        ok, _out, err = run_helper(
+            swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_ROMAJI, JAPANESE_SOURCE], helper_timeout
+        )
+        if not ok:
+            steps.append(make_step(name, "blocked", reason=f"境界 IME 入力 helper に失敗した: {err}"))
+            return steps
+
         expected = insert_at_match(INLINE_FIXTURE_ORIGINAL, BOLD_ITALIC_OPEN_RE, IME_EXPECTED_TEXT, edge="end")
-        matched = False
-        actual = b""
-        attempts_evidence: list[dict] = []
-        # currentSourceID() が日本語ソースへの切り替わりを報告しても、Hane 側の IME
-        # session が実際に変換可能とは限らない(PR #208 review PRRT_kwDOUETGuM6j8CB_)。
-        # readiness の証拠は「保存された実バイトが期待する日本語へ変換・確定された」ことに
-        # 限定し、それが揃わない attempt では次へ進む前に必ず pristine baseline(実ファイル
-        # とアプリ内状態の両方)まで巻き戻し、caret を再配置してからやり直す。前回の未変換
-        # テキストが次の attempt へ持ち越されることはない。
-        for attempt in range(1, BOUNDARY_IME_MAX_ATTEMPTS + 1):
-            label = f"boundary_ime_input_attempt_{attempt}"
-            restore = restore_scenario_baseline(
-                swift_helper, pid, config.fixture_path, INLINE_FIXTURE_ORIGINAL,
-                helper_timeout, poll_timeout, f"{label}_baseline_restore",
-            )
-            steps.append(restore)
-            if restore["result"] != "pass":
-                steps.append(make_step(name, "blocked",
-                                        reason=f"attempt {attempt} の pristine baseline 復元に失敗した: {restore.get('reason')}",
-                                        attempts=attempts_evidence))
-                return steps
-
-            capture = capture_named(module, env, config, window_id, run_dir, label)
-            steps.append(capture)
-            if capture["result"] != "pass":
-                steps.append(make_step(name, "blocked", reason=capture.get("reason"), attempts=attempts_evidence))
-                return steps
-            screenshot = run_dir / f"{label}.png"
-
-            ok, _out, err = run_helper(
-                swift_helper, ["click-text", str(pid), str(screenshot), BOLD_ITALIC_OCR_RE, "start"], helper_timeout
-            )
-            if not ok:
-                steps.append(make_step(name, "blocked",
-                                        reason=f"attempt {attempt} の IME 境界クリックに失敗した: {err}",
-                                        attempts=attempts_evidence))
-                return steps
-
-            ok, _out, err = run_helper(
-                swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_ROMAJI, JAPANESE_SOURCE], helper_timeout
-            )
-            if not ok:
-                attempts_evidence.append({
-                    "attempt": attempt, "screenshot": str(screenshot),
-                    "helper_result": "blocked", "helper_error": err,
-                })
-                steps.append(make_step(name, "blocked",
-                                        reason=f"attempt {attempt} の境界 IME 入力 helper に失敗した: {err}",
-                                        attempts=attempts_evidence))
-                return steps
-
-            matched, actual = wait_for_fixture_bytes(config.fixture_path, expected.encode("utf-8"), poll_timeout)
-            attempts_evidence.append({
-                "attempt": attempt, "screenshot": str(screenshot),
-                "helper_result": "pass", "matched": matched, "actual_bytes": _decode(actual),
-            })
-            if matched:
-                break
-
-        detail = {
-            "expected_after_insert": expected,
-            "actual_after_insert": _decode(actual),
-            "attempts": attempts_evidence,
-        }
+        matched, actual = wait_for_fixture_bytes(config.fixture_path, expected.encode("utf-8"), poll_timeout)
+        detail = {"screenshot": str(screenshot), "expected_after_insert": expected, "actual_after_insert": _decode(actual)}
+        steps.append(make_step("boundary_ime_input_check", "pass" if matched else "fail",
+                               reason=None if matched else "境界 IME 入力後の内容が期待する日本語バイト列と一致しない",
+                               **detail))
         if not matched:
-            steps.append(make_step("boundary_ime_input_check", "fail",
-                                    reason=f"{BOUNDARY_IME_MAX_ATTEMPTS} 回試行しても境界 IME 入力後の内容が"
-                                           "期待する日本語バイト列と一致しない", **detail))
             steps.append(make_step(name, "fail", reason="境界 IME 入力後の内容が期待値と一致しない"))
             return steps
-        steps.append(make_step("boundary_ime_input_check", "pass", **detail))
 
         ok, _out, err = run_helper(swift_helper, ["undo-save", str(pid)], helper_timeout)
         if not ok:

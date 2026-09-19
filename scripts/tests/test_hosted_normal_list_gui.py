@@ -655,5 +655,144 @@ class ClickEvidenceParsingTests(unittest.TestCase):
             mod.parse_click_evidence(json.dumps({"matched_text": "x"}))
 
 
+class ImeCommitSubtestTests(unittest.TestCase):
+    """Issue #126 focused GUI (PR #208 review PRRT_kwDOUETGuM6j8CB_, P1):
+    currentSourceID() reporting the Japanese source is not proof that Hane's IME
+    session can actually convert keystrokes yet. _ime_commit_subtest must retry
+    with a small, bounded upper limit, restoring a pristine baseline (file + app
+    state) and repositioning the caret before every attempt, rather than trusting
+    a single conversion attempt or an unconditional retry."""
+
+    FIXTURE_PATH = Path("editing-fixture.md")
+
+    def _make_interaction(self, *, japanese_available=True, commit_effects=None,
+                          restore_ok_until=None, click_text_ok=True, current_source_ok=True):
+        commit_effects = commit_effects or ["ok_matched"]
+        calls = {"commit": 0, "restore": [], "capture": []}
+
+        class FakeInteraction:
+            JAPANESE_SOURCE = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
+
+            @staticmethod
+            def run_helper(helper, args, timeout):
+                command = args[0]
+                if command == "current-source":
+                    if not current_source_ok:
+                        return False, "", "current-source failed"
+                    return True, "com.apple.keylayout.ABC", ""
+                if command == "list-sources":
+                    sources = "com.apple.keylayout.ABC"
+                    if japanese_available:
+                        sources += f"\n{FakeInteraction.JAPANESE_SOURCE}"
+                    return True, sources, ""
+                if command == "click-text":
+                    return (True, "", "") if click_text_ok else (False, "", "click failed")
+                if command == "type-romaji-at-caret-commit-save":
+                    index = calls["commit"]
+                    calls["commit"] += 1
+                    outcome = commit_effects[min(index, len(commit_effects) - 1)]
+                    if outcome == "helper_fail":
+                        return False, "", "commit helper failed"
+                    return True, "", ""
+                raise AssertionError(f"unexpected helper call: {args}")
+
+            @staticmethod
+            def wait_for_fixture_bytes(fixture_path, expected, timeout):
+                index = calls["commit"] - 1
+                outcome = commit_effects[min(index, len(commit_effects) - 1)]
+                if outcome == "ok_matched":
+                    return True, expected
+                return False, b"unconverted"
+
+            @staticmethod
+            def restore_scenario_baseline(helper, pid, fixture_path, baseline, helper_timeout, poll_timeout, name):
+                calls["restore"].append(name)
+                attempt = len(calls["restore"])
+                result = "pass" if restore_ok_until is None or attempt <= restore_ok_until else "blocked"
+                return {"name": name, "result": result,
+                       "reason": None if result == "pass" else "baseline undo に失敗した"}
+
+            @staticmethod
+            def capture_named(gui_validate_module, env, config, window_id, run_dir, label):
+                calls["capture"].append(label)
+                return {"name": f"capture_{label}", "result": "pass", "reason": None}
+
+        return FakeInteraction(), calls
+
+    def _run(self, interaction):
+        return mod._ime_commit_subtest(
+            object(), interaction, object(), object(), "window-1", object(), 4321,
+            self.FIXTURE_PATH, Path("run"), 1.0, 0.0,
+        )
+
+    def test_pass_on_first_attempt(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_matched"])
+        steps, original_source = self._run(interaction)
+        self.assertEqual(original_source, "com.apple.keylayout.ABC")
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "pass")
+        self.assertEqual(len(commit_step["attempts"]), 1)
+        self.assertEqual(calls["commit"], 1)
+        self.assertEqual(len(calls["restore"]), 1)
+
+    def test_second_attempt_succeeds_after_pristine_baseline_restore(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "pass")
+        attempts = commit_step["attempts"]
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0]["matched"])
+        self.assertTrue(attempts[1]["matched"])
+        # The failed first attempt's unconverted text must not survive into the
+        # second attempt: a pristine baseline restore must have run in between.
+        self.assertEqual(len(calls["restore"]), 2)
+
+    def test_persistent_mismatch_across_all_attempts_is_a_fail_not_a_silent_pass(self):
+        interaction, calls = self._make_interaction(
+            commit_effects=["ok_mismatch"] * mod.IME_COMMIT_MAX_ATTEMPTS
+        )
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "fail")
+        self.assertEqual(len(commit_step["attempts"]), mod.IME_COMMIT_MAX_ATTEMPTS)
+        self.assertTrue(all(not a["matched"] for a in commit_step["attempts"]))
+        self.assertEqual(calls["commit"], mod.IME_COMMIT_MAX_ATTEMPTS)
+
+    def test_no_japanese_source_is_blocked_without_any_attempt(self):
+        interaction, calls = self._make_interaction(japanese_available=False)
+        steps, _original_source = self._run(interaction)
+        identify_step = next(s for s in steps if s["name"] == "ime_commit_identify_japanese_source")
+        self.assertEqual(identify_step["result"], "blocked")
+        self.assertEqual(calls["commit"], 0)
+
+    def test_baseline_restore_failure_blocks_without_a_further_attempt(self):
+        interaction, calls = self._make_interaction(
+            commit_effects=["ok_mismatch", "ok_matched"], restore_ok_until=1,
+        )
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "blocked")
+        self.assertIn("baseline", commit_step["reason"])
+        self.assertEqual(calls["commit"], 1)
+
+    def test_commit_helper_failure_is_blocked_not_failed(self):
+        interaction, calls = self._make_interaction(commit_effects=["helper_fail"])
+        steps, _original_source = self._run(interaction)
+        commit_step = next(s for s in steps if s["name"] == "direct_ime_commit_at_caret")
+        self.assertEqual(commit_step["result"], "blocked")
+        self.assertEqual(len(commit_step["attempts"]), 1)
+        self.assertEqual(commit_step["attempts"][0]["helper_result"], "blocked")
+
+    def test_each_attempt_captures_its_own_screenshot(self):
+        interaction, calls = self._make_interaction(commit_effects=["ok_mismatch", "ok_matched"])
+        self._run(interaction)
+        self.assertEqual(calls["capture"], ["ime_commit_attempt_1", "ime_commit_attempt_2"])
+
+    def test_attempt_budget_is_small_and_fixed(self):
+        self.assertGreaterEqual(mod.IME_COMMIT_MAX_ATTEMPTS, 2)
+        self.assertLessEqual(mod.IME_COMMIT_MAX_ATTEMPTS, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

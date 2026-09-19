@@ -490,6 +490,16 @@ EDITING_AFTER_IME_COMMIT = single_line_replacement(
     EDITING_FIXTURE_ORIGINAL, "3. Alpha row", "3. Alpha row日本語"
 )
 
+# TISSelectInputSource() が currentSourceID() に日本語ソースを反映させたことは、Hane 側の
+# IME session が実際に変換可能な状態になったことを証明しない(Issue #126 post-merge GUI
+# run: currentSourceID() は既に日本語ソースを報告していたのに romaji が変換されず未変換の
+# ままだった、PR #208 review PRRT_kwDOUETGuM6j8CB_)。readiness の観測値は「保存された実
+# バイトが期待する日本語へ変換・確定されたか」に置き換え、それが揃うまで pristine baseline
+# (実ファイルとアプリ内状態の両方)への復元・caret 再配置・単一 helper invocation での
+# source選択・変換・確定・保存を最初からやり直す。無条件リトライや固定 sleep だけで pass に
+# しないよう、この小さな固定上限までにどの attempt でも実バイトが一致しなければ fail とする。
+IME_COMMIT_MAX_ATTEMPTS = 3
+
 # 選択置換(ASCII) + Undo/Redo: "Gamma" の先頭へ click した後、Shift+→ で正確に
 # SELECTION_REPLACE_WORD_LENGTH 文字だけキーボード選択して "Delta" で置換する。OCR
 # bounding box の start→end drag は文字境界の真値ではなく、末尾の文字を取りこぼすことが
@@ -815,20 +825,16 @@ def _ime_commit_subtest(
     ままになってしまう(Issue #126 post-merge GUI run 35410838091: helper が選択 pass と
     した直後でも保存値は "Alpha rownihongo \\n\\n" のように未変換だった)。そのため選択の
     成否は、実際に変換・確定・保存まで行った結果からのみ判定する。
+
+    currentSourceID() が日本語ソースへの切り替わりを報告しても、Hane 側の IME session が
+    実際に変換可能とは限らない(PR #208 review PRRT_kwDOUETGuM6j8CB_)。readiness の証拠は
+    「保存された実バイトが期待する日本語へ変換・確定された」ことに限定し、それが揃わない
+    attempt では次へ進む前に必ず pristine baseline(実ファイル・アプリ内状態の両方)まで
+    restore_scenario_baseline で巻き戻し、attempt 固有の screenshot を撮影し、"Alpha row" の
+    末尾へ click-text で caret を再配置してからやり直す。前回の未変換テキストが次の attempt
+    へ持ち越されることはない。
     """
     steps: list = []
-    capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, "ime_commit_before")
-    steps.append(capture)
-    if capture["result"] != "pass":
-        steps.append(step("direct_ime_commit_at_caret", "blocked", capture.get("reason")))
-        return steps, None
-    screenshot = run_dir / "ime_commit_before.png"
-    ok, _out, err = interaction_module.run_helper(
-        swift_helper, ["click-text", str(pid), str(screenshot), IME_COMMIT_OCR_PATTERN, "end"], helper_timeout
-    )
-    if not ok:
-        steps.append(step("direct_ime_commit_at_caret", "blocked", f"caret 配置クリックに失敗した: {err}"))
-        return steps, None
     ok, out, err = interaction_module.run_helper(swift_helper, ["current-source"], helper_timeout)
     if not ok:
         steps.append(step("ime_commit_query_current_source", "blocked", err))
@@ -848,22 +854,77 @@ def _ime_commit_subtest(
         ))
         return steps, original_source
     steps.append(step("ime_commit_identify_japanese_source", "pass", identified_source=japanese_source))
-    # source 選択・settle・current-source 再確認・romaji 入力・変換/確定・保存を単一の
-    # helper invocation の中で行う。ここで select-source を別途呼ばない(上の docstring 参照)。
-    ok, _out, err = interaction_module.run_helper(
-        swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_COMMIT_ROMAJI, japanese_source], helper_timeout
-    )
-    if not ok:
-        steps.append(step(
-            "direct_ime_commit_at_caret", "blocked",
-            f"source 選択・settle・変換・確定・保存を行う単一 helper invocation が失敗した: {err}",
-        ))
-        return steps, original_source
-    matched, actual = interaction_module.wait_for_fixture_bytes(fixture_path, EDITING_AFTER_IME_COMMIT.encode("utf-8"), poll_timeout)
+
+    matched = False
+    actual = b""
+    attempts_evidence: list = []
+    for attempt in range(1, IME_COMMIT_MAX_ATTEMPTS + 1):
+        label = f"ime_commit_attempt_{attempt}"
+        restore = interaction_module.restore_scenario_baseline(
+            swift_helper, pid, fixture_path, EDITING_FIXTURE_ORIGINAL,
+            helper_timeout, poll_timeout, f"{label}_baseline_restore",
+        )
+        steps.append(restore)
+        if restore["result"] != "pass":
+            steps.append(step(
+                "direct_ime_commit_at_caret", "blocked",
+                f"attempt {attempt} の pristine baseline 復元に失敗した: {restore.get('reason')}",
+                attempts=attempts_evidence,
+            ))
+            return steps, original_source
+
+        capture = interaction_module.capture_named(gui_validate_module, env, config, window_id, run_dir, label)
+        steps.append(capture)
+        if capture["result"] != "pass":
+            steps.append(step(
+                "direct_ime_commit_at_caret", "blocked", capture.get("reason"), attempts=attempts_evidence,
+            ))
+            return steps, original_source
+        screenshot = run_dir / f"{label}.png"
+
+        ok, _out, err = interaction_module.run_helper(
+            swift_helper, ["click-text", str(pid), str(screenshot), IME_COMMIT_OCR_PATTERN, "end"], helper_timeout
+        )
+        if not ok:
+            steps.append(step(
+                "direct_ime_commit_at_caret", "blocked",
+                f"attempt {attempt} の caret 配置クリックに失敗した: {err}", attempts=attempts_evidence,
+            ))
+            return steps, original_source
+
+        # source 選択・settle・current-source 再確認・romaji 入力・変換/確定・保存を単一の
+        # helper invocation の中で行う。ここで select-source を別途呼ばない(上の docstring 参照)。
+        ok, _out, err = interaction_module.run_helper(
+            swift_helper, ["type-romaji-at-caret-commit-save", str(pid), IME_COMMIT_ROMAJI, japanese_source], helper_timeout
+        )
+        if not ok:
+            attempts_evidence.append({
+                "attempt": attempt, "screenshot": str(screenshot),
+                "helper_result": "blocked", "helper_error": err,
+            })
+            steps.append(step(
+                "direct_ime_commit_at_caret", "blocked",
+                f"attempt {attempt} の source 選択・settle・変換・確定・保存を行う単一 helper invocation が失敗した: {err}",
+                attempts=attempts_evidence,
+            ))
+            return steps, original_source
+
+        matched, actual = interaction_module.wait_for_fixture_bytes(fixture_path, EDITING_AFTER_IME_COMMIT.encode("utf-8"), poll_timeout)
+        attempts_evidence.append({
+            "attempt": attempt, "screenshot": str(screenshot),
+            "helper_result": "pass", "matched": matched, "actual_bytes": actual.decode("utf-8", errors="replace"),
+        })
+        if matched:
+            break
+
     steps.append(step(
         "direct_ime_commit_at_caret", "pass" if matched else "fail",
-        reason=None if matched else "caret 位置での日本語 IME 確定後の内容が期待した文字列と一致しない",
+        reason=None if matched else (
+            f"{IME_COMMIT_MAX_ATTEMPTS} 回試行しても caret 位置での日本語 IME 確定後の内容が"
+            "期待した文字列と一致しない"
+        ),
         expected=EDITING_AFTER_IME_COMMIT, actual=actual.decode("utf-8", errors="replace"),
+        attempts=attempts_evidence,
     ))
     return steps, original_source
 
