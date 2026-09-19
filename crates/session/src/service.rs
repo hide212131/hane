@@ -261,30 +261,30 @@ fn same_filesystem_object(from: &Path, to: &Path) -> io::Result<bool> {
     {
         return Ok(false);
     }
+    same_filesystem_object_platform(from, to)
+}
+
+#[cfg(target_os = "macos")]
+fn same_filesystem_object_platform(from: &Path, to: &Path) -> io::Result<bool> {
     let source = fs::metadata(from)?;
     let target = match fs::metadata(to) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    use std::os::unix::fs::MetadataExt;
 
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::fs::MetadataExt;
+    Ok(source.dev() == target.dev() && source.ino() == target.ino())
+}
 
-        Ok(source.dev() == target.dev() && source.ino() == target.ino())
-    }
-
-    #[cfg(windows)]
-    {
-        // `std::os::windows::fs::MetadataExt` exposes the native file-index
-        // fields only through unstable APIs. Canonicalizing both existing
-        // paths uses the stable filesystem boundary and gives the same result
-        // needed here: case aliases on a case-insensitive volume resolve to
-        // one spelling, while distinct entries on a case-sensitive volume do
-        // not.
-        Ok(fs::canonicalize(from)? == fs::canonicalize(to)?)
-    }
+#[cfg(windows)]
+fn same_filesystem_object_platform(from: &Path, to: &Path) -> io::Result<bool> {
+    // `std::os::windows::fs::MetadataExt` exposes the native file-index
+    // fields only through unstable APIs. Canonicalizing both existing paths
+    // uses the stable filesystem boundary and gives the same result needed
+    // here: case aliases on a case-insensitive volume resolve to one spelling,
+    // while distinct entries on a case-sensitive volume do not.
+    Ok(fs::canonicalize(from)? == fs::canonicalize(to)?)
 }
 
 /// Renames a directory using the platform's no-replace primitive. Plain
