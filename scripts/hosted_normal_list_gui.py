@@ -57,9 +57,14 @@ SCOPE_NOTE = (
     "product PR #189 でリスト内部レイアウトが変更され続けている間、固定ピクセル座標ではなく "
     "OCR テキストと、同一 screenshot 内での click-text bounding box の相対位置に限定し、"
     "内部レイアウト型には依存しない。B の各項目は OCR 行順序が期待した top-to-bottom の"
-    "項目順と一致することを確認し、nested ordered items が親 bullet の本文より右、"
-    "nested bullet items が親 ordered item の本文より右にあることを、同一 screenshot 内の"
-    "click-text bounding box の x 位置(親と子で比較した相対位置)から確認する。C は段落順の"
+    "項目順と一致することを確認し、nested ordered items・nested bullet items がそれぞれ"
+    "実際に右へインデントされていることを、同一 screenshot 内で同種 marker のトップレベル行"
+    "(baseline)と比較した本文 x 位置から確認する。marker 種別が異なる親の本文 x をそのまま"
+    "基準にすると、bullet と ordered の marker 幅の差だけで child_x が親より右になり得るため、"
+    "child と同じ marker 種別を持つトップレベル行を baseline として使い、marker 幅の差を"
+    "打ち消したうえで実際の構造上の横オフセットだけを判定する。Alpha 側(bullet 親 → ordered"
+    "子)・Gamma 側(ordered 親 → bullet 子)は独立に検証し、いずれか一方だけが正しくても"
+    "pass にしない。C は段落順の"
     "OCR 行順序に加え、nested child list の後に親 ordered list の番号(2)が復帰することを"
     "normal display 自体の番号表示で確認する。marker disclosure/reclosure 検証に加えて、"
     "通常リスト固有の source marker/本文の直接編集、ASCII 入力、日本語 IME 確定、選択置換、"
@@ -173,18 +178,25 @@ def evaluate_display_order(lines: list, patterns: list) -> dict:
     )
 
 
-def evaluate_nested_position(label: str, child_label: str, parent_evidence: dict, child_evidence: dict) -> dict:
-    """親項目本文と nested な子項目本文の click-text bounding box を、同一 screenshot 内の
-    相対 x 位置(minX)で比較する。固定ピクセル座標には依存しない。
+def evaluate_nested_position(label: str, child_label: str, baseline_evidence: dict, child_evidence: dict) -> dict:
+    """nested な子項目本文の click-text bounding box x 位置(minX)を、同一 screenshot 内に
+    ある「子と同じ marker 種別を持つトップレベル行」(baseline)の x 位置と比較する。
+
+    bullet marker(例: "-")と ordered marker(例: "1.")は marker glyph 自体の幅が異なるため、
+    marker 種別が異なる親の本文 x をそのまま基準にすると、実際には平坦(非ネスト)でも
+    marker 幅の差だけで child_x が親より右に出て、ネスト崩れを誤って pass にできてしまう
+    (Issue #126 review, discussion_r4051650816)。baseline は child と同じ marker 種別の
+    トップレベル行なので、marker 幅の差はキャンセルされ、x の差は実際の構造上のネスト
+    オフセットだけを反映する。固定ピクセル座標には依存しない。
     """
     name = f"nested_position_{label}_{child_label}"
-    parent_x = parent_evidence["bounding_box"]["minX"]
+    baseline_x = baseline_evidence["bounding_box"]["minX"]
     child_x = child_evidence["bounding_box"]["minX"]
-    detail = {"parent_x": parent_x, "child_x": child_x}
-    if child_x <= parent_x:
+    detail = {"baseline_x": baseline_x, "child_x": child_x}
+    if child_x <= baseline_x:
         return step(
             name, "fail",
-            f"nested な '{child_label}' の x 位置が親 '{label}' の本文以下で、"
+            f"nested な '{child_label}' の x 位置が同種 marker のトップレベル基準行以下で、"
             "右側へインデントされたネストを確認できない",
             **detail,
         )
@@ -233,7 +245,7 @@ class MarkerCheck:
 @dataclass(frozen=True)
 class NestedPositionCheck:
     label: str
-    parent_content_pattern: str
+    baseline_content_pattern: str
     child_content_patterns: tuple
 
 
@@ -281,13 +293,18 @@ MIXED_NESTED_LIST_SPEC = ScenarioSpec(
         content_pattern=r"Beta lead item",
         raw_marker_pattern=r"-\s*Beta lead item",
     ),
+    # baseline_content_pattern は各 check の子と同じ marker 種別を持つトップレベル行を選ぶ。
+    # Alpha の子は ordered marker("1."/"2.")なので、同じ ordered marker のトップレベル行
+    # "Gamma lead first" を baseline にする(bullet の "Alpha lead item" 自身を基準にすると
+    # marker 幅の差で誤判定しうる)。Gamma の子は bullet marker("-")なので、同じ bullet
+    # marker のトップレベル行 "Beta lead item" を baseline にする。
     nested_position_checks=(
         NestedPositionCheck(
-            label="alpha", parent_content_pattern=r"Alpha lead item",
+            label="alpha", baseline_content_pattern=r"Gamma lead first",
             child_content_patterns=(r"Alpha nested one", r"Alpha nested two"),
         ),
         NestedPositionCheck(
-            label="gamma", parent_content_pattern=r"Gamma lead first",
+            label="gamma", baseline_content_pattern=r"Beta lead item",
             child_content_patterns=(r"Gamma nested bullet", r"Gamma nested second"),
         ),
     ),
@@ -543,22 +560,23 @@ def click_content(interaction_module, helper, pid, screenshot: Path, pattern: st
 def run_nested_position_checks(
     interaction_module, helper, pid, screenshot: Path, checks: tuple, timeout: float,
 ) -> list:
-    """checks の親/子の本文それぞれへ click-text し、同一 screenshot 内の bounding box
-    x 位置を比較する。helper failure・OCR failure はここでも pass にせず blocked にする。
+    """checks の baseline(child と同じ marker 種別のトップレベル行)/子の本文それぞれへ
+    click-text し、同一 screenshot 内の bounding box x 位置を比較する。helper failure・
+    OCR failure はここでも pass にせず blocked にする。
     """
     steps: list = []
     for check in checks:
-        clicked, parent_evidence, err = click_content(
-            interaction_module, helper, pid, screenshot, check.parent_content_pattern, "start", timeout,
+        clicked, baseline_evidence, err = click_content(
+            interaction_module, helper, pid, screenshot, check.baseline_content_pattern, "start", timeout,
         )
         if not clicked:
             steps.append(step(
-                f"nested_position_{check.label}_parent_click", "blocked", err,
-                content_pattern=check.parent_content_pattern,
+                f"nested_position_{check.label}_baseline_click", "blocked", err,
+                content_pattern=check.baseline_content_pattern,
             ))
             for child_pattern in check.child_content_patterns:
                 steps.append(skipped_step(
-                    f"nested_position_{check.label}_{child_pattern}", "親項目へのクリックに失敗した",
+                    f"nested_position_{check.label}_{child_pattern}", "baseline 行へのクリックに失敗した",
                 ))
             continue
         for child_pattern in check.child_content_patterns:
@@ -571,7 +589,7 @@ def run_nested_position_checks(
                     content_pattern=child_pattern,
                 ))
                 continue
-            steps.append(evaluate_nested_position(check.label, child_pattern, parent_evidence, child_evidence))
+            steps.append(evaluate_nested_position(check.label, child_pattern, baseline_evidence, child_evidence))
     return steps
 
 
