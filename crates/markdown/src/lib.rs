@@ -446,6 +446,55 @@ fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
     (len >= 3).then_some(FenceDelimiter { marker, len })
 }
 
+/// Parsed shape of a fenced code block's opening delimiter line, if `source`
+/// (one physical line's own text) is one: the byte length of the leading
+/// indentation plus the fence run itself, and the info string's own trimmed
+/// byte range after it, if the line carries one. `None` for an indented code
+/// block's first line, which has no delimiter of its own — the same
+/// distinction [`fence_delimiter`] already draws for marker derivation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FenceOpen {
+    pub delimiter_len: usize,
+    pub info_string: Option<std::ops::Range<usize>>,
+}
+
+pub fn fence_open(source: &str) -> Option<FenceOpen> {
+    let delimiter = fence_delimiter(source)?;
+    let leading = source.len() - source.trim_start_matches(' ').len();
+    let delimiter_len = leading + delimiter.len;
+    let line_end = source[delimiter_len..]
+        .find(['\r', '\n'])
+        .map_or(source.len(), |at| delimiter_len + at);
+    let rest = &source[delimiter_len..line_end];
+    let trimmed = rest.trim();
+    let info_string = (!trimmed.is_empty()).then(|| {
+        let start = delimiter_len + (rest.len() - rest.trim_start().len());
+        start..start + trimmed.len()
+    });
+    Some(FenceOpen {
+        delimiter_len,
+        info_string,
+    })
+}
+
+/// Whether `source` (one physical line's own text) is a fenced code block's
+/// closing delimiter: [`fence_delimiter`]'s run-of-3+ shape, with nothing but
+/// trailing whitespace after it. An unclosed fence's own last physical line
+/// can itself start with a look-alike run of backticks or tildes as ordinary
+/// content (for example prose about Markdown fences); requiring the rest of
+/// the line to be blank is what tells the two apart without re-parsing the
+/// whole block.
+pub fn is_fence_close(source: &str) -> bool {
+    let Some(delimiter) = fence_delimiter(source) else {
+        return false;
+    };
+    let leading = source.len() - source.trim_start_matches(' ').len();
+    source[leading + delimiter.len..]
+        .trim_end_matches(['\r', '\n'])
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t'))
+}
+
 pub fn is_table_delimiter(source: &str) -> bool {
     let content = source.trim_end_matches(['\r', '\n']).trim();
     let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
@@ -1432,6 +1481,53 @@ pub fn parse_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fence_open_recovers_the_delimiter_length_and_info_string() {
+        assert_eq!(
+            fence_open("```rust\n"),
+            Some(FenceOpen {
+                delimiter_len: 3,
+                info_string: Some(3..7),
+            })
+        );
+        assert_eq!(
+            fence_open("```\n"),
+            Some(FenceOpen {
+                delimiter_len: 3,
+                info_string: None,
+            })
+        );
+        assert_eq!(
+            fence_open("  ~~~~  js  \n"),
+            Some(FenceOpen {
+                delimiter_len: 6,
+                info_string: Some(8..10),
+            })
+        );
+        assert_eq!(
+            fence_open("```"),
+            Some(FenceOpen {
+                delimiter_len: 3,
+                info_string: None,
+            })
+        );
+        // Four columns of indentation makes it an indented code block instead.
+        assert_eq!(fence_open("    ```rust\n"), None);
+        assert_eq!(fence_open("plain text\n"), None);
+    }
+
+    #[test]
+    fn is_fence_close_requires_a_blank_rest_of_line() {
+        assert!(is_fence_close("```\n"));
+        assert!(is_fence_close("```"));
+        assert!(is_fence_close("   ~~~~~  \n"));
+        // Trailing content past the run means the line never actually closed
+        // the fence, so the parser would have kept treating it as content.
+        assert!(!is_fence_close("```rust\n"));
+        assert!(!is_fence_close("``` more code\n"));
+        assert!(!is_fence_close("plain text\n"));
+    }
 
     #[test]
     fn code_padding_tracks_semantic_spaces_instead_of_container_bytes() {

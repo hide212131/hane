@@ -48,9 +48,9 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, IndexedBlock, ListProjection, ListProjectionItem,
+    BlockId, BlockIndex, Confidence, FenceOpen, IndexedBlock, ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
-    has_delimiter_markers, is_table_delimiter, parse_document,
+    fence_open, has_delimiter_markers, is_fence_close, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -415,6 +415,13 @@ pub enum BlockKind {
     Paragraph,
     Heading(u8),
     CodeBlock,
+    /// A fenced code block's own opening or closing delimiter line, inactive.
+    /// Collapses to its info string alone (the opening line's language
+    /// label) or, for the closing line, to an empty boundary row — see
+    /// [`present_fenced_code_edge_line`]. Disclosed, either line presents as
+    /// [`Self::CodeBlock`] instead, literally, the same as the block's
+    /// content lines.
+    CodeFence,
     Quote,
     ListItem,
     Rule,
@@ -610,6 +617,17 @@ impl BlockKind {
             Self::Heading(_) => heading(16.0 / 14.0),
             Self::CodeBlock => BlockDisplay {
                 surface: BlockSurface::Code,
+                monospace: true,
+                ..BlockDisplay::default()
+            },
+            // Same surface as the block's content lines, so the collapsed
+            // delimiter rows never break the code block's continuous
+            // background; muted and slightly smaller so the opening line's
+            // language label reads as a light annotation, not body code.
+            Self::CodeFence => BlockDisplay {
+                font_scale: 12.0 / 14.0,
+                surface: BlockSurface::Code,
+                tint: BlockTint::Muted,
                 monospace: true,
                 ..BlockDisplay::default()
             },
@@ -992,16 +1010,31 @@ pub fn present_block_with_list_projection(
         } else {
             LineContext::Normal
         };
-        let mut presented = present_polished_line_with_list_projection(
-            line.line as u64,
-            revision,
-            line.range,
-            line.text,
-            line_height,
-            line.disclosure,
-            line_context,
-            list_projection,
-        );
+        let edge = (line_context == LineContext::FencedCode)
+            .then(|| fence_edge(window.span.start, content_end, line.line, line.text))
+            .flatten();
+        let mut presented = if let Some(edge) = edge {
+            present_fenced_code_edge_line(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                edge,
+            )
+        } else {
+            present_polished_line_with_list_projection(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                line_context,
+                list_projection,
+            )
+        };
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
         }
@@ -1165,6 +1198,7 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
         BlockKind::Heading(3) => line_height * 1.25,
         BlockKind::Heading(_) => line_height * 1.1,
         BlockKind::CodeBlock => line_height * 1.15,
+        BlockKind::CodeFence => line_height * 0.7,
         BlockKind::Image => 190.0,
         BlockKind::TableDelimiter => 8.0,
         _ => line_height,
@@ -2789,6 +2823,8 @@ fn present_polished_line_with_list_projection(
 
 /// Presents one line that the context index reports is inside a fenced code
 /// block. The source is shown verbatim (no marker hiding) and styled as code.
+/// Every content line always presents this way; [`present_fenced_code_edge_line`]
+/// also reuses it for the opening/closing delimiter line itself once disclosed.
 fn present_fenced_code_line(
     line_id: u64,
     revision: Revision,
@@ -2809,6 +2845,123 @@ fn present_fenced_code_line(
         }];
     }
     block
+}
+
+/// Which edge of a fenced code block's own delimiter lines `line` is, if
+/// any. Only the block's first physical line (`span_start`) can ever open
+/// it, and only its last content line (`content_end - 1`) can ever close it;
+/// an indented code block's lines match neither shape, since
+/// [`fence_open`]/[`is_fence_close`] already draw that distinction the same
+/// way marker derivation does.
+fn fence_edge(span_start: usize, content_end: usize, line: usize, text: &str) -> Option<FenceEdge> {
+    if line == span_start {
+        return fence_open(text).map(FenceEdge::Opening);
+    }
+    if line + 1 == content_end && is_fence_close(text) {
+        return Some(FenceEdge::Closing);
+    }
+    None
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FenceEdge {
+    Opening(FenceOpen),
+    Closing,
+}
+
+/// Presents the opening or closing delimiter line of a fenced code block.
+///
+/// Inactive, the fence characters never render as body text: the opening
+/// line collapses to its info string alone — the language label Issue #16
+/// asks for — and the closing line collapses to an empty boundary row, both
+/// [`BlockKind::CodeFence`]. Touched by disclosure, either line reverts to
+/// the literal source through [`present_fenced_code_line`] instead, exactly
+/// like the block's content lines, so the fence syntax itself stays directly
+/// editable. Built directly from the one physical line rather than through
+/// the general marker/disclosure machinery, because a lone line of fence
+/// syntax is not valid Markdown to reparse on its own.
+fn present_fenced_code_edge_line(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    edge: FenceEdge,
+) -> VisualLine {
+    if disclosure.is_some() {
+        let mut block = present_fenced_code_line(line_id, revision, range, source, line_height);
+        block.context = LineContext::FencedCode;
+        block.disclosure = disclosure;
+        return block;
+    }
+    let base = range.start.0;
+    let mut visual = String::new();
+    let mut segments = Vec::new();
+    let info_string = match edge {
+        FenceEdge::Opening(open) => open.info_string,
+        FenceEdge::Closing => None,
+    };
+    match info_string {
+        Some(info) => {
+            if info.start > 0 {
+                append_segment(
+                    &mut visual,
+                    &mut segments,
+                    source,
+                    range,
+                    SourceRange::new(base, base + info.start),
+                    Visibility::HiddenMarkup,
+                    None,
+                );
+            }
+            append_segment(
+                &mut visual,
+                &mut segments,
+                source,
+                range,
+                SourceRange::new(base + info.start, base + info.end),
+                Visibility::Visible,
+                None,
+            );
+            if info.end < source.len() {
+                append_segment(
+                    &mut visual,
+                    &mut segments,
+                    source,
+                    range,
+                    SourceRange::new(base + info.end, base + source.len()),
+                    Visibility::HiddenMarkup,
+                    None,
+                );
+            }
+        }
+        None => append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            range,
+            Visibility::HiddenMarkup,
+            None,
+        ),
+    }
+    VisualLine {
+        line_id,
+        source_range: range,
+        revision,
+        visual_text: visual,
+        style_runs: Vec::new(),
+        kind: BlockKind::CodeFence,
+        source_map: SourceMap { segments },
+        estimated_height: estimated_height(BlockKind::CodeFence, line_height),
+        measured_height: None,
+        invalid: false,
+        context: LineContext::FencedCode,
+        disclosure,
+        image: None,
+        list: None,
+    }
 }
 
 struct StandaloneImage<'a> {
@@ -5152,5 +5305,90 @@ mod tests {
                 .iter()
                 .all(|segment| segment.visibility == Visibility::Visible)
         );
+    }
+
+    #[test]
+    fn fence_edge_recognizes_only_the_blocks_own_first_and_last_lines() {
+        // span_start = 10, content ends at 13 (lines 10, 11, 12), so only line
+        // 10 can open and only line 12 can close.
+        assert_eq!(
+            fence_edge(10, 13, 10, "```rust\n"),
+            Some(FenceEdge::Opening(fence_open("```rust\n").unwrap()))
+        );
+        assert_eq!(fence_edge(10, 13, 11, "let x = 1;\n"), None);
+        assert_eq!(fence_edge(10, 13, 12, "```\n"), Some(FenceEdge::Closing));
+        // An unclosed fence's own last line can look like a fence without
+        // actually closing one; trailing content after the run keeps it a
+        // content line instead.
+        assert_eq!(fence_edge(10, 13, 12, "``` still typing\n"), None);
+        // An indented code block's first line is never a fence line.
+        assert_eq!(fence_edge(10, 13, 10, "    plain code\n"), None);
+    }
+
+    #[test]
+    fn present_fenced_code_edge_line_collapses_the_opening_line_to_its_info_string() {
+        let source = "```rust\n";
+        let range = SourceRange::new(40, 40 + source.len());
+        let edge = FenceEdge::Opening(fence_open(source).unwrap());
+        let block =
+            present_fenced_code_edge_line(3, Revision(1), range, source, 26.0, None, edge);
+        assert_eq!(block.kind, BlockKind::CodeFence);
+        assert_eq!(block.visual_text, "rust");
+        assert_eq!(block.disclosure, None);
+        // Every source byte is still accounted for, just hidden, so a save
+        // reproduces the fence exactly and the caret can still land in it.
+        let saved: String = block
+            .source_map
+            .segments
+            .iter()
+            .filter(|segment| !segment.source_range.is_empty())
+            .map(|segment| {
+                &source[segment.source_range.start.0 - 40..segment.source_range.end.0 - 40]
+            })
+            .collect();
+        assert_eq!(saved, source);
+        let visible = block
+            .source_map
+            .segments
+            .iter()
+            .find(|segment| segment.visibility == Visibility::Visible)
+            .expect("the info string is a visible segment");
+        assert_eq!(visible.source_range, SourceRange::new(43, 47));
+    }
+
+    #[test]
+    fn present_fenced_code_edge_line_collapses_the_closing_line_to_an_empty_row() {
+        let source = "```\n";
+        let range = SourceRange::new(40, 40 + source.len());
+        let block = present_fenced_code_edge_line(
+            4,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            None,
+            FenceEdge::Closing,
+        );
+        assert_eq!(block.kind, BlockKind::CodeFence);
+        assert_eq!(block.visual_text, "");
+        assert_eq!(block.source_map.segments.len(), 1);
+        assert_eq!(
+            block.source_map.segments[0].visibility,
+            Visibility::HiddenMarkup
+        );
+        assert_eq!(block.source_map.segments[0].source_range, range);
+    }
+
+    #[test]
+    fn present_fenced_code_edge_line_discloses_the_raw_fence_when_touched() {
+        let source = "```rust\n";
+        let range = SourceRange::new(40, 40 + source.len());
+        let edge = FenceEdge::Opening(fence_open(source).unwrap());
+        let disclosure = Some(SourceRange::empty(41));
+        let block =
+            present_fenced_code_edge_line(3, Revision(1), range, source, 26.0, disclosure, edge);
+        assert_eq!(block.kind, BlockKind::CodeBlock);
+        assert_eq!(block.visual_text, source);
+        assert_eq!(block.disclosure, disclosure);
     }
 }

@@ -110,20 +110,24 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
             source: "    # indented\n\n```\n## fenced ###\n```",
             tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
             markers: &["```", "```"],
+            // The indented block has no delimiter line of its own, so it
+            // stays literal on its one line; the fenced block's own opening
+            // and closing lines collapse (no info string here, so both are
+            // empty), and only its content line stays literal.
             block_kinds: &[
                 BlockKind::CodeBlock,
                 BlockKind::Paragraph,
+                BlockKind::CodeFence,
                 BlockKind::CodeBlock,
-                BlockKind::CodeBlock,
-                BlockKind::CodeBlock,
+                BlockKind::CodeFence,
             ],
-            visual_lines: &["    # indented", "", "```", "## fenced ###", "```"],
+            visual_lines: &["    # indented", "", "", "## fenced ###", ""],
             style_runs: &[
                 &[style(CodeBlock, 0, 14)],
                 &[],
-                &[style(CodeBlock, 0, 3)],
+                &[],
                 &[style(CodeBlock, 0, 13)],
-                &[style(CodeBlock, 0, 3)],
+                &[],
             ],
         },
     ];

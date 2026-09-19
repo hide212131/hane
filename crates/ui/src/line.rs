@@ -836,8 +836,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fenced_block_presents_every_line_as_literal_code() {
-        let editor = Editor::new("```rust\nlet x = **1**;\n```\n\nafter\n");
+    fn a_fenced_block_keeps_one_continuous_surface_while_its_content_stays_literal() {
+        let mut editor = Editor::new("```rust\nlet x = **1**;\n```\n\nafter\n");
+        // Move the caret off the fence entirely so the block presents inactive;
+        // `Editor::new` otherwise starts it at offset 0, on the opening line.
+        let after = editor.document().len_bytes().0;
+        editor
+            .set_selection(hane_editor::Selection::caret(SourceOffset(after)))
+            .unwrap();
         let lines = presented_lines(&editor);
         for (line, visual) in lines.iter().enumerate().take(3) {
             assert_eq!(
@@ -846,12 +852,50 @@ mod tests {
                 "line {line} is inside the fence"
             );
         }
+        // Inactive, the opening and closing fence lines never show their
+        // backtick delimiters as body text: the opening line collapses to
+        // its info string alone, and the closing line collapses to an empty
+        // boundary row.
+        assert_eq!(lines[0].visual_text, "rust");
+        assert_eq!(
+            lines[0].kind,
+            hane_presentation::BlockKind::CodeFence,
+            "the opening delimiter line collapses to its language label"
+        );
         // The literal `**1**` keeps its asterisks: nothing inside a fence is
         // read as inline markup.
         assert_eq!(lines[1].visual_text, "let x = **1**;");
+        assert_eq!(lines[2].visual_text, "");
+        assert_eq!(
+            lines[2].kind,
+            hane_presentation::BlockKind::CodeFence,
+            "the closing delimiter line collapses to an empty boundary row"
+        );
         // The blank line tiling folded into the code block is not code.
         assert_eq!(lines[3].display().surface, BlockSurface::Default);
         assert_eq!(lines[4].visual_text, "after");
+    }
+
+    #[test]
+    fn a_caret_on_the_opening_fence_line_discloses_it_for_direct_editing() {
+        // `Editor::new` starts the caret at offset 0, on the opening fence line.
+        let editor = Editor::new("```rust\nlet x = 1;\n```\n");
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one code block");
+        let visual =
+            presented_block(&editor, &block, &(0..usize::MAX), None).expect("block presents");
+        assert_eq!(
+            visual.lines[0].visual_text, "```rust",
+            "the caret on the opening line discloses the raw fence for editing"
+        );
+        assert_eq!(
+            visual.lines[0].kind,
+            hane_presentation::BlockKind::CodeBlock
+        );
+        assert_eq!(
+            visual.lines[2].visual_text, "",
+            "the closing line, untouched by the caret, stays collapsed"
+        );
     }
 
     #[test]
