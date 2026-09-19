@@ -1318,26 +1318,24 @@ def main() -> int:
                     binary_path = None
 
             input_source_ready = False
+            source_attempts = 0
             if swift_helper is not None:
                 ok, source_id, error = interaction_module.run_helper(
                     swift_helper, ["current-source"], helper_timeout
                 )
                 if ok:
                     original_input_source = source_id
-                    ok, _output, error = interaction_module.run_helper(
-                        swift_helper, ["select-source", ASCII_INPUT_SOURCE], helper_timeout
+                    ok, selected_source, error, source_attempts = interaction_module.select_input_source(
+                        swift_helper, ASCII_INPUT_SOURCE, helper_timeout
                     )
-                    if ok:
-                        ok, selected_source, error = interaction_module.run_helper(
-                            swift_helper, ["current-source"], helper_timeout
-                        )
-                        input_source_ready = ok and selected_source == ASCII_INPUT_SOURCE
+                    input_source_ready = ok and selected_source == ASCII_INPUT_SOURCE
                 top_steps.append(
                     step(
                         "select_ascii_input_source",
                         "pass" if input_source_ready else "blocked",
                         None if input_source_ready else (error or "ABC入力ソースを選択できない"),
                         source_id=ASCII_INPUT_SOURCE,
+                        attempts=source_attempts,
                     )
                 )
 

@@ -445,6 +445,31 @@ def run_helper(swift_helper: PreparedHelper, args: list[str], timeout: float) ->
     return True, proc.stdout.strip(), ""
 
 
+def select_input_source(
+    swift_helper: PreparedHelper, source_id: str, timeout: float, attempts: int = 10
+) -> tuple[bool, str, str, int]:
+    """Select an input source and wait for macOS to publish the new source.
+
+    TISSelectInputSource can return success before currentSourceID reflects the
+    selection. Keep the retry bounded and report the observed source so GUI
+    validators fail closed instead of typing with a stale IME layout.
+    """
+    last_error = ""
+    selected = ""
+    for attempt in range(1, attempts + 1):
+        ok, _output, error = run_helper(swift_helper, ["select-source", source_id], timeout)
+        if not ok:
+            last_error = error
+        else:
+            ok, selected, error = run_helper(swift_helper, ["current-source"], timeout)
+            if not ok:
+                last_error = error
+            elif selected == source_id:
+                return True, selected, "", attempt
+        time.sleep(0.2)
+    return False, selected, last_error or f"input source did not become active: {source_id}", attempts
+
+
 def wait_for_fixture_bytes(
     fixture_path: Path, expected: bytes, timeout: float, interval: float = 0.2
 ) -> tuple[bool, bytes]:
