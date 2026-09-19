@@ -281,6 +281,60 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         self.assertLess(claude_index, checkout_index)
         self.assertLess(checkout_index, diagnose_index)
 
+    def test_failure_checkpoint_is_saved_before_diagnostic_failure(self):
+        build_index = WORKFLOW.index(
+            "Build untrusted worker patch from a fresh expected-head checkout"
+        )
+        checkpoint_index = WORKFLOW.index("Upload checkpoint after Claude failure")
+        diagnose_index = WORKFLOW.index("Diagnose Claude execution failure")
+        self.assertLess(build_index, checkpoint_index)
+        self.assertLess(checkpoint_index, diagnose_index)
+        self.assertIn(
+            "always() && !cancelled() && steps.claude.outcome != 'skipped'",
+            WORKFLOW,
+        )
+        self.assertIn(
+            "aadw-worker-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}",
+            WORKFLOW,
+        )
+        self.assertIn('"target_sha":', WORKFLOW.replace("target_sha:", '"target_sha":') if False else "target_sha")
+        self.assertIn("capture_ok", WORKFLOW)
+        self.assertIn("has_changes", WORKFLOW)
+        completed_patch_block = WORKFLOW.split(
+            "      - name: Upload completed worker patch\n", 1
+        )[1].split("\n      - name: Build checkpoint metadata after Claude failure", 1)[0]
+        self.assertIn("steps.claude.outcome == 'success'", completed_patch_block)
+
+    def test_checkpoint_restore_is_explicit_and_exact_head_bound(self):
+        self.assertIn("AADW_CHECKPOINT_RUN_ID:", WORKFLOW)
+        self.assertIn("AADW_CHECKPOINT_RUN_ATTEMPT:", WORKFLOW)
+        self.assertIn("actions: read", WORKFLOW)
+        self.assertIn(
+            "run-id: ${{ needs.prepare.outputs.checkpoint_run_id }}",
+            WORKFLOW,
+        )
+        self.assertIn("and .target_sha == $target_sha", WORKFLOW)
+        self.assertIn('and .claude_outcome == "failure"', WORKFLOW)
+        self.assertIn("and .capture_ok == true", WORKFLOW)
+        self.assertIn("and .has_changes == true", WORKFLOW)
+        self.assertIn(
+            "git -C pr-head apply --index --whitespace=nowarn",
+            WORKFLOW,
+        )
+        self.assertIn(
+            "Checkpoint attempted to restore trusted authority or workflow path",
+            WORKFLOW,
+        )
+        restore_index = WORKFLOW.index("Restore compatible worker checkpoint")
+        strip_git_index = WORKFLOW.index(
+            "Remove target checkout Git metadata from worker reach"
+        )
+        self.assertLess(restore_index, strip_git_index)
+        self.assertIn(
+            "Treat those edits as untrusted work in progress",
+            WORKFLOW,
+        )
+
     def test_full_output_is_not_enabled(self):
         self.assertNotIn("show_full_output: true", WORKFLOW)
 
