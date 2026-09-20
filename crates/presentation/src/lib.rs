@@ -1718,6 +1718,7 @@ fn present_markdown_from_parse(
     }
     if formal_code_block == Some(true) {
         if let Some(projection) = shared.list_projection {
+            let formal_item = projection.item_for_range(range).copied();
             for (range, edge) in projection.fence_markers_in(range) {
                 let edge = match edge {
                     FenceMarkerEdge::Opening => MarkerEdge::Opening,
@@ -1743,21 +1744,26 @@ fn present_markdown_from_parse(
                     });
                 }
             }
-            for container_range in projection.container_markers_in(range) {
+            for (container_range, quote_owner) in projection.container_markers_in(range) {
+                let global_list_item = projection
+                    .item_for_marker(container_range)
+                    .copied()
+                    .filter(|item| formal_item == Some(*item));
                 if let Some(marker) = projected_markers
                     .iter_mut()
                     .find(|marker| marker.range == container_range)
                 {
                     marker.formal_container = true;
-                    marker.global_list_item = projection.item_for_marker(container_range).copied();
+                    marker.quote_owner = quote_owner;
+                    marker.global_list_item = global_list_item;
                 } else {
                     projected_markers.push(ProjectedMarker {
                         range: container_range,
                         fence: false,
                         fence_edge: None,
                         formal_container: true,
-                        global_list_item: projection.item_for_marker(container_range).copied(),
-                        quote_owner: None,
+                        global_list_item,
+                        quote_owner,
                         list_owner: None,
                         list_prefix: None,
                         global_list_prefix: None,
@@ -2630,7 +2636,7 @@ fn list_row_metadata(
     }
     let opening = markers_on_line.iter().find(|planned| {
         (item.is_some_and(|item| planned.list_owner == Some(item))
-            || planned.global_list_item.is_some())
+            || projected.is_some_and(|projected| planned.global_list_item == Some(*projected)))
             && planned.range.start >= range.start
             && planned.range.start < range.end
     });
@@ -2698,6 +2704,7 @@ fn list_row_metadata(
                 || planned.list_prefix.is_some()
                 || planned.global_list_prefix.is_some()
                 || planned.global_list_item.is_some()
+                || planned.formal_container
         })
         .flat_map(|planned| {
             source_map.segments.iter().filter_map(|segment| {

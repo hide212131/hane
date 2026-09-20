@@ -350,17 +350,22 @@ fn build_list_projections(
     let mut container_markers = parsed
         .quote_markers
         .iter()
-        .map(|(marker, _)| *marker)
-        .chain(parsed.list_item_markers.iter().map(|(marker, _)| *marker))
+        .map(|(marker, owner)| (*marker, Some(*owner)))
+        .chain(
+            parsed
+                .list_item_markers
+                .iter()
+                .map(|(marker, _)| (*marker, None)),
+        )
         .chain(
             parsed
                 .list_structural_prefixes
                 .iter()
-                .map(|(marker, _, _)| *marker),
+                .map(|(marker, _, _)| (*marker, None)),
         )
         .collect::<Vec<_>>();
-    container_markers.sort_by_key(|marker| (marker.start, marker.end));
-    container_markers.dedup();
+    container_markers.sort_by_key(|(marker, _)| (marker.start, marker.end));
+    container_markers.dedup_by_key(|(marker, _)| (marker.start, marker.end));
     blocks
         .iter()
         .enumerate()
@@ -385,10 +390,10 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
-            let container_start = container_markers
-                .partition_point(|marker| marker.end <= block_range.start);
-            let container_end = container_markers
-                .partition_point(|marker| marker.start < block_range.end);
+            let container_start =
+                container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
+            let container_end =
+                container_markers.partition_point(|(marker, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
             if block_items.is_empty() && rows.is_empty() && block_fence_markers.is_empty() {

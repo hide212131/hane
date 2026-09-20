@@ -310,7 +310,10 @@ pub struct ListProjection {
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-    container_markers: Vec<SourceRange>,
+    /// Formal quote/list prefix ranges paired with the owning quote, when the
+    /// marker belongs to a quote. List marker ownership is resolved through
+    /// `items` by range so nested list items retain their own metadata.
+    container_markers: Vec<(SourceRange, Option<NodeId>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,7 +363,7 @@ impl ListProjection {
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-        container_markers: Vec<SourceRange>,
+        container_markers: Vec<(SourceRange, Option<NodeId>)>,
     ) -> Self {
         Self {
             items,
@@ -408,17 +411,17 @@ impl ListProjection {
     pub fn container_markers_in(
         &self,
         range: SourceRange,
-    ) -> impl Iterator<Item = SourceRange> + '_ {
+    ) -> impl Iterator<Item = (SourceRange, Option<NodeId>)> + '_ {
         let start = self
             .container_markers
-            .partition_point(|marker| marker.end <= range.start);
+            .partition_point(|(marker, _)| marker.end <= range.start);
         let end = self
             .container_markers
-            .partition_point(|marker| marker.start < range.end);
+            .partition_point(|(marker, _)| marker.start < range.end);
         self.container_markers[start..end]
             .iter()
             .copied()
-            .filter(move |marker| marker.intersects(range))
+            .filter(move |(marker, _)| marker.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
