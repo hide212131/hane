@@ -22,6 +22,8 @@ use crate::input::{InlineRenameInput, shape_inline_rename_line};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
+use crate::line::DEFAULT_LINE_HEIGHT;
+#[cfg(test)]
 use crate::line::presented_block;
 use crate::line::{
     BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
@@ -31,9 +33,10 @@ use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PathPromptOptions, Pixels, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, point, prelude::FluentBuilder, px, rgb,
+    IntoElement, MagnifyEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathPromptOptions, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, point,
+    prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
@@ -89,6 +92,17 @@ const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 /// each tick is a cheap local-time read, not a redraw unless the date
 /// actually changed.
 const DATE_BADGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Lower bound of the continuous zoom range (issue #228).
+pub(crate) const MIN_ZOOM: f32 = 0.5;
+/// Upper bound of the continuous zoom range (issue #228).
+pub(crate) const MAX_ZOOM: f32 = 3.0;
+/// Band around 100% zoom snaps to it. Narrow enough that a deliberate zoom
+/// step lands past it on the very next step (Ctrl/Cmd+wheel steps by roughly
+/// 8% per line), so the snap does not trap a continuing gesture at 100%.
+const ZOOM_SNAP_RANGE: (f32, f32) = (0.98, 1.02);
+/// Multiplicative zoom change per wheel "line" of Ctrl/Cmd+wheel input, i.e.
+/// `zoom *= 2f32.powf(ZOOM_STEP_PER_LINE)` per line of scroll.
+const ZOOM_STEP_PER_LINE: f32 = 0.08;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -224,8 +238,57 @@ fn text_column_width(viewport_width: f32, sidebar_width: f32, padding: f32) -> f
     (viewport_width - sidebar_width - 2.0 * padding).max(1.0)
 }
 
+/// Clamps a zoom level to Hane's supported 50%-300% range and snaps it to
+/// exactly 100% inside `ZOOM_SNAP_RANGE`. Snapping to the exact value (rather
+/// than just narrowing the range) means the next step away from 100% is a
+/// full `ZOOM_STEP_PER_LINE`-sized step outside the band, so a continuing
+/// gesture always breaks free instead of hovering near 100% indefinitely.
+fn clamp_and_snap_zoom(zoom: f32) -> f32 {
+    let clamped = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+    let (low, high) = ZOOM_SNAP_RANGE;
+    if (low..=high).contains(&clamped) {
+        1.0
+    } else {
+        clamped
+    }
+}
+
+/// Multiplicative zoom change for one Ctrl/Cmd+wheel event, matching the
+/// convention that scrolling "up" (the direction that also moves
+/// `scroll_y` toward the document start) zooms in.
+fn zoom_factor_for_wheel(delta: ScrollDelta, line_height: f32) -> f32 {
+    let lines = match delta {
+        ScrollDelta::Lines(delta) => delta.y,
+        ScrollDelta::Pixels(delta) => f32::from(delta.y) / line_height.max(1.0),
+    };
+    2f32.powf(lines * ZOOM_STEP_PER_LINE)
+}
+
+fn height_snapshot_matches_line_height(current: f32, snapshot: f32) -> bool {
+    current.to_bits() == snapshot.to_bits()
+}
+
 fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
     current == candidate
+}
+
+/// Captured when a zoom-changing gesture (Ctrl/Cmd+wheel, trackpad pinch, or
+/// the Ctrl/Cmd+0 reset) fires, so that once the new zoom's heights are
+/// installed later in the same frame, `render` can put the same document
+/// position back at the same window position instead of letting the resize
+/// of every item above it shift what is on screen.
+#[derive(Clone, Copy, Debug)]
+struct PendingZoomAnchor {
+    /// Item ordinal (block, or physical line before a `BlockIndex` exists) in
+    /// `self.heights` the gesture's position fell on.
+    ordinal: usize,
+    /// Fraction (0.0-1.0) of the way down that item's height the gesture's
+    /// position fell, so the anchor tracks a point inside the item and not
+    /// just its top edge.
+    fraction: f32,
+    /// The gesture's position, in content-local window coordinates (window
+    /// y minus the header height), that `fraction` should keep resolving to.
+    window_offset: f32,
 }
 
 /// Identifies the document a background job was started for. A result that
@@ -583,10 +646,23 @@ pub struct EditorView {
     /// otherwise. Row mouse events report window-space coordinates, so this
     /// has to be subtracted before it is used to hit-test text.
     main_column_left: f32,
-    /// Hash of the window font properties used by `WindowShaper`. Width and
-    /// document revision live in each cache entry; this is the remaining global
-    /// invalidation generation.
+    /// Hash of the window font properties `WindowShaper` used, including the
+    /// zoom level folded into every font size (see
+    /// `WindowShaper::font_revision`). Width and document revision live in
+    /// each cache entry; this is the remaining global invalidation generation.
     layout_font_revision: u64,
+    /// Document zoom level; 1.0 is 100%. Scales body font size, row height
+    /// and soft-wrap width (issue #228). Clamped to `MIN_ZOOM..=MAX_ZOOM` and
+    /// snapped to exactly 1.0 near it by `clamp_and_snap_zoom`.
+    zoom: f32,
+    /// The unsnapped zoom level accumulated from the current gesture stream.
+    /// `zoom` is the effective display value and may stay at 1.0 while this
+    /// crosses the snap band; keeping the raw value prevents small deltas from
+    /// being discarded one event at a time.
+    raw_zoom: f32,
+    /// Set by a zoom-changing gesture, consumed after the visible blocks have
+    /// been remeasured for the new zoom. See `PendingZoomAnchor`.
+    pending_zoom_anchor: Option<PendingZoomAnchor>,
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
@@ -1594,6 +1670,9 @@ impl EditorView {
             content_width: 0.0,
             main_column_left: 0.0,
             layout_font_revision: 0,
+            zoom: 1.0,
+            raw_zoom: 1.0,
+            pending_zoom_anchor: None,
             caret_geometry: None,
             pending_list_editing: None,
             block_index: BlockIndexState::new(),
@@ -1835,7 +1914,7 @@ impl EditorView {
         self.sidebar_focus = SidebarFocus::ActiveSession;
         let lines = self.sessions.active().editor().document().line_count();
         self.granularity = Granularity::Lines;
-        self.heights = HeightIndex::new(std::iter::repeat_n(self.theme.line_height, lines));
+        self.heights = HeightIndex::new(std::iter::repeat_n(self.line_height(), lines));
         self.height_blocks.clear();
         self.scroll_y = self.sessions.active().view_state().scroll_y;
         self.block_cache.clear();
@@ -2934,7 +3013,8 @@ impl EditorView {
         self.document_parse_job_running = true;
         let key = self.document_key();
         let revision = self.sessions.active().editor().document().revision();
-        let line_height = self.theme.line_height;
+        let line_height = self.line_height();
+        let line_height_bits = line_height.to_bits();
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -2944,6 +3024,10 @@ impl EditorView {
                         && block_context_revision_is_current(
                             view.editor().document().revision(),
                             revision,
+                        )
+                        && height_snapshot_matches_line_height(
+                            view.line_height(),
+                            f32::from_bits(line_height_bits),
                         )
                 })
                 .unwrap_or(false);
@@ -2968,7 +3052,16 @@ impl EditorView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.document_parse_job_running = false;
-                if view.document_key() != key {
+                if view.document_key() != key
+                    || !height_snapshot_matches_line_height(
+                        view.line_height(),
+                        f32::from_bits(line_height_bits),
+                    )
+                {
+                    // The index itself may still be current, but these
+                    // heights were measured for an older zoom/theme. Keep the
+                    // stale snapshot out of the visible height tree and rerun
+                    // the job with the current line height.
                     view.schedule_document_parse(cx);
                     return;
                 }
@@ -3153,6 +3246,7 @@ impl EditorView {
             &visible,
             joined.map(|cached| &cached.parse),
             list_projection,
+            self.line_height(),
         )?;
         let visual_line = visual
             .lines
@@ -3222,14 +3316,96 @@ impl EditorView {
         self.after_input(cx);
     }
 
+    /// The item (block, or physical line before a `BlockIndex` exists) and
+    /// fractional position under `window_offset` (content-local window y: the
+    /// mouse/gesture position's window y minus the header height), for a zoom
+    /// gesture to anchor to. `None` when there is nothing laid out yet.
+    fn zoom_anchor_at(&self, window_offset: f32) -> Option<PendingZoomAnchor> {
+        if self.heights.is_empty() {
+            return None;
+        }
+        let content_y = (self.scroll_y + window_offset).clamp(0.0, self.heights.total_height());
+        let ordinal = self.heights.block_at_y(content_y);
+        let top = self.heights.prefix_sum(ordinal);
+        let height = self.heights.height(ordinal).unwrap_or(0.0);
+        let fraction = if height > 0.0 {
+            ((content_y - top) / height).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Some(PendingZoomAnchor {
+            ordinal,
+            fraction,
+            window_offset,
+        })
+    }
+
+    /// Changes the zoom level, anchoring the document position under
+    /// `window_offset` (see `zoom_anchor_at`) so it stays at the same window
+    /// position once `render` installs the new zoom's heights.
+    fn set_zoom_from_raw(&mut self, raw: f32, window_offset: f32, cx: &mut Context<Self>) {
+        let raw = raw.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.raw_zoom = raw;
+        let next = clamp_and_snap_zoom(raw);
+        if next == self.zoom {
+            return;
+        }
+        self.pending_zoom_anchor = self.zoom_anchor_at(window_offset);
+        self.zoom = next;
+        cx.notify();
+    }
+
+    fn set_zoom(&mut self, next: f32, window_offset: f32, cx: &mut Context<Self>) {
+        self.set_zoom_from_raw(next, window_offset, cx);
+    }
+
+    fn apply_zoom_factor(&mut self, factor: f32, window_offset: f32, cx: &mut Context<Self>) {
+        self.set_zoom_from_raw(self.raw_zoom * factor, window_offset, cx);
+    }
+
+    /// Resets zoom to 100%, anchored at the viewport's vertical center since
+    /// (unlike a wheel or pinch gesture) this has no pointer position of its
+    /// own.
+    pub(crate) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(1.0, self.viewport_height / 2.0, cx);
+    }
+
+    /// Resolves a `PendingZoomAnchor` captured before a zoom-driven height
+    /// change back to the `scroll_y` that keeps the anchored item and
+    /// fraction at the same `window_offset` now that `self.heights` reflects
+    /// the new zoom level. Callers must check `self.heights` is non-empty.
+    fn scroll_y_for_zoom_anchor(&self, anchor: PendingZoomAnchor) -> f32 {
+        let ordinal = anchor.ordinal.min(self.heights.len() - 1);
+        let top = self.heights.prefix_sum(ordinal);
+        let height = self.heights.height(ordinal).unwrap_or(0.0);
+        let content_y = top + anchor.fraction * height;
+        content_y - anchor.window_offset
+    }
+
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let delta = event.delta.pixel_delta(px(self.theme.line_height));
+        if event.modifiers.secondary() {
+            let factor = zoom_factor_for_wheel(event.delta, self.line_height());
+            let window_offset = f32::from(event.position.y) - self.theme.header_height;
+            self.apply_zoom_factor(factor, window_offset, cx);
+            return;
+        }
+        let delta = event.delta.pixel_delta(px(self.line_height()));
         self.scroll_y = clamp_scroll_y(
             self.scroll_y - f32::from(delta.y),
             self.heights.total_height(),
             self.viewport_height,
         );
         cx.notify();
+    }
+
+    /// macOS trackpad pinch. `event.magnification` is the incremental scale
+    /// change since the previous event in the same gesture (see
+    /// `gpui::MagnifyEvent`), so it is applied directly as a multiplicative
+    /// factor rather than accumulated first.
+    fn on_magnify(&mut self, event: &MagnifyEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let factor = (1.0 + event.magnification).max(0.1);
+        let window_offset = f32::from(event.position.y) - self.theme.header_height;
+        self.apply_zoom_factor(factor, window_offset, cx);
     }
 
     /// The presented line under a mouse event, from the mapping the last frame
@@ -3259,7 +3435,7 @@ impl EditorView {
             .iter()
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.zoom);
         let visual_offset = layout.visual_at_x(visual, row_index, x, &shaper)?;
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
@@ -3349,7 +3525,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.clear_pending_list_editing();
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.zoom);
         if self.move_vertical_by_layout(down, extend, &shaper) {
             self.after_input(cx);
         } else if down {
@@ -3438,6 +3614,7 @@ impl EditorView {
             &window,
             joined.map(|cached| &cached.parse),
             list_projection,
+            self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
         Some((visual, layout))
@@ -3479,6 +3656,7 @@ impl EditorView {
             shaper,
             joined.map(|cached| &cached.parse),
             list_projection,
+            self.line_height(),
         )
     }
 
@@ -3537,7 +3715,7 @@ impl EditorView {
                                 .map(|candidate| candidate.y)?;
                             Some((line_top + row.y - line_row_top, row.height))
                         });
-                visual_row.unwrap_or((line_top, self.theme.line_height))
+                visual_row.unwrap_or((line_top, self.line_height()))
             }
             Granularity::Blocks => {
                 let Some(block) = self
@@ -3563,8 +3741,9 @@ impl EditorView {
                     None => {
                         let first = block_line_span(editor.document(), &block)
                             .map_or(line.0, |span| span.start);
-                        let inside = line.0.saturating_sub(first) as f32 * self.theme.line_height;
-                        (block_top + inside, self.theme.line_height)
+                        let line_height = self.line_height();
+                        let inside = line.0.saturating_sub(first) as f32 * line_height;
+                        (block_top + inside, line_height)
                     }
                 }
             }
@@ -3590,10 +3769,18 @@ impl EditorView {
         )
     }
 
+    /// The theme's base row height scaled by the current zoom level. Every
+    /// content row height and body font size (see `crate::line::block_font_size`)
+    /// derives from this or from `zoom` directly, so zooming moves them together.
+    /// Sidebar and header sizing intentionally do not use this.
+    pub(crate) fn line_height(&self) -> f32 {
+        self.theme.line_height * self.zoom
+    }
+
     /// Initial height of every entry, from the line height alone. Measured
     /// heights replace these as blocks are drawn; R4C keeps them across rebuilds.
     fn item_heights(&self) -> Vec<f32> {
-        let line_height = self.theme.line_height;
+        let line_height = self.line_height();
         let (granularity, len) = self.desired_layout();
         match granularity {
             Granularity::Lines => vec![line_height; len],
@@ -3693,10 +3880,11 @@ impl EditorView {
             let intra = self.scroll_y - self.heights.prefix_sum(ordinal);
             (id, ordinal, intra)
         });
+        let line_height = self.line_height();
         self.heights.splice(
             first..old_end,
             next.iter()
-                .map(|block| self.theme.line_height * block.line_count as f32),
+                .map(|block| line_height * block.line_count as f32),
         );
         self.height_blocks.splice(first..old_end, &next);
 
@@ -3857,7 +4045,7 @@ impl EditorView {
                     && entry.font_revision == self.layout_font_revision
             })
             .and_then(|entry| entry.layout.average_line_height())
-            .unwrap_or(self.theme.line_height)
+            .unwrap_or(self.line_height())
             .max(1.0)
     }
 
@@ -3917,6 +4105,7 @@ impl EditorView {
             visible,
             joined.map(|cached| &cached.parse),
             list_projection,
+            self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
         if let Some(context) = &self.pending_list_editing
@@ -4048,9 +4237,16 @@ fn target_in_neighbor(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    line_height: f32,
 ) -> Option<SourceOffset> {
-    let visual =
-        presented_block_with_list_projection(editor, indexed, &window, joined, list_projection)?;
+    let visual = presented_block_with_list_projection(
+        editor,
+        indexed,
+        &window,
+        joined,
+        list_projection,
+        line_height,
+    )?;
     let layout = layout_block(&visual, width, shaper);
     let row = if down {
         0
@@ -4085,7 +4281,16 @@ fn neighbor_row_target(
 ) -> Option<SourceOffset> {
     let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
     target_in_neighbor(
-        editor, &indexed, window, down, x, width, shaper, joined, None,
+        editor,
+        &indexed,
+        window,
+        down,
+        x,
+        width,
+        shaper,
+        joined,
+        None,
+        DEFAULT_LINE_HEIGHT,
     )
 }
 
@@ -4726,7 +4931,7 @@ impl Render for EditorView {
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height)
-            .max(self.theme.line_height);
+            .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
         // read once per frame and every layout is keyed by it. A sidebar takes
@@ -4744,10 +4949,15 @@ impl Render for EditorView {
             sidebar_width,
             self.theme.line_horizontal_padding,
         );
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.zoom);
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
             self.layout_font_revision = font_revision;
+            // `VisualLine::estimated_height` is part of the presentation, not
+            // just the shaped layout. Reusing it across zoom generations
+            // leaves the new glyphs with the old row height until a later
+            // cache miss, which can clip or overlap text.
+            self.block_cache.clear();
             self.layout_cache.clear();
             let (granularity, _) = self.desired_layout();
             let heights = HeightIndex::new(self.item_heights());
@@ -4825,10 +5035,31 @@ impl Render for EditorView {
                     .insert(line.line_id as usize, (visual.id, at));
             }
         }
+        // A zoom gesture is anchored after these visible blocks have been
+        // remeasured. Resolving it earlier against estimated heights is wrong
+        // for a soft-wrapped paragraph: the measured block height can differ by
+        // several rows in the same frame. The next frame is notified below if
+        // the corrected anchor changed which blocks should be visible.
+        let zoom_anchor_applied = self
+            .pending_zoom_anchor
+            .take()
+            .filter(|_| !self.heights.is_empty())
+            .map(|anchor| {
+                self.scroll_y = self.scroll_y_for_zoom_anchor(anchor);
+                true
+            })
+            .unwrap_or(false);
+        if zoom_anchor_applied {
+            // The visible block set was selected before measured heights were
+            // installed. Ask GPUI for one more frame so virtualization and
+            // spacers are recomputed from the corrected anchor position.
+            cx.notify();
+        }
         // Measuring wrapped rows can correct blocks above the viewport. Keep the
         // same block and the same position inside it at the top instead of
-        // letting those corrections visibly move the document.
-        if let Some((old_ordinal, intra)) = height_anchor {
+        // letting those corrections visibly move the document, unless the
+        // zoom gesture has a more specific pointer/pinch anchor.
+        if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
             let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
             let inside = self
                 .heights
@@ -4931,6 +5162,7 @@ impl Render for EditorView {
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
+                .on_magnify(cx.listener(Self::on_magnify))
                 .child(InputCapture { input: cx.entity() })
                 .child(
                     div()
@@ -4952,7 +5184,8 @@ impl Render for EditorView {
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
                                     row_element(
-                                        editor, &visual, &layout, row_index, self.theme, &resolver,
+                                        editor, &visual, &layout, row_index, self.theme, self.zoom,
+                                        &resolver,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
@@ -6067,6 +6300,7 @@ mod tests {
                     &(0..usize::MAX),
                     None,
                     index.list_projection(&block),
+                    DEFAULT_LINE_HEIGHT,
                 )
                 .expect("block presents")
                 .lines
@@ -6431,6 +6665,111 @@ mod tests {
         assert_eq!(clamp_scroll_y(600.0, 600.0, 300.0), 300.0);
     }
 
+    // Issue #228: continuous 50%-300% zoom.
+    #[test]
+    fn clamp_and_snap_zoom_clamps_to_the_supported_range_and_snaps_the_100_percent_band() {
+        assert_eq!(clamp_and_snap_zoom(0.1), MIN_ZOOM);
+        assert_eq!(clamp_and_snap_zoom(MIN_ZOOM), MIN_ZOOM);
+        assert_eq!(clamp_and_snap_zoom(10.0), MAX_ZOOM);
+        assert_eq!(clamp_and_snap_zoom(MAX_ZOOM), MAX_ZOOM);
+
+        // The band around 100% snaps to exactly 1.0, at both edges...
+        assert_eq!(clamp_and_snap_zoom(0.98), 1.0);
+        assert_eq!(clamp_and_snap_zoom(1.0), 1.0);
+        assert_eq!(clamp_and_snap_zoom(1.02), 1.0);
+        // ...but a step past either edge is a real, un-snapped level, so a
+        // continuing gesture always breaks free of the snap.
+        assert_eq!(clamp_and_snap_zoom(0.97), 0.97);
+        assert_eq!(clamp_and_snap_zoom(1.03), 1.03);
+    }
+
+    #[test]
+    fn background_height_snapshot_must_match_the_current_line_height() {
+        assert!(height_snapshot_matches_line_height(26.0, 26.0));
+        assert!(!height_snapshot_matches_line_height(52.0, 26.0));
+    }
+
+    #[test]
+    fn zoom_factor_for_wheel_zooms_in_toward_the_document_start_and_out_the_other_way() {
+        let line_height = 26.0;
+        // Positive `Lines` delta is the same direction `on_scroll` subtracts
+        // from `scroll_y` to move toward the document start, so it must zoom
+        // in; the opposite delta must zoom out by the exact inverse factor.
+        let zoom_in = zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 1.0)), line_height);
+        let zoom_out = zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, -1.0)), line_height);
+        assert!(zoom_in > 1.0, "{zoom_in}");
+        assert!(zoom_out < 1.0, "{zoom_out}");
+        assert!((zoom_in * zoom_out - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_factor_for_wheel_treats_pixel_deltas_as_lines_scaled_by_line_height() {
+        let line_height = 26.0;
+        let one_line_in_lines =
+            zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 1.0)), line_height);
+        let one_line_in_pixels = zoom_factor_for_wheel(
+            ScrollDelta::Pixels(point(px(0.0), px(line_height))),
+            line_height,
+        );
+        assert!((one_line_in_lines - one_line_in_pixels).abs() < 1e-4);
+    }
+
+    #[gpui::test]
+    fn set_zoom_clamps_snaps_and_reset_zoom_restores_100_percent(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            view.set_zoom(1.5, 0.0, cx);
+            assert_eq!(view.zoom, 1.5);
+
+            // Out-of-range levels clamp instead of overshooting.
+            view.set_zoom(50.0, 0.0, cx);
+            assert_eq!(view.zoom, MAX_ZOOM);
+            view.set_zoom(-1.0, 0.0, cx);
+            assert_eq!(view.zoom, MIN_ZOOM);
+
+            // A level inside the 100% snap band lands on exactly 1.0, and
+            // `reset_zoom` (the Ctrl/Cmd+0 action) returns there from any
+            // other level too.
+            view.set_zoom(1.01, 0.0, cx);
+            assert_eq!(view.zoom, 1.0);
+            view.set_zoom(2.0, 0.0, cx);
+            assert_eq!(view.zoom, 2.0);
+            view.reset_zoom(cx);
+            assert_eq!(view.zoom, 1.0);
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_y_for_zoom_anchor_keeps_the_anchored_point_at_the_same_window_offset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            // Ten 26px items; the viewport is scrolled so item 5 (top at
+            // 130px) sits 20px above the middle of the window.
+            view.heights = HeightIndex::new(std::iter::repeat_n(26.0, 10));
+            view.scroll_y = 100.0;
+            let window_offset = 50.0;
+
+            let anchor = view
+                .zoom_anchor_at(window_offset)
+                .expect("heights are populated");
+            assert_eq!(anchor.ordinal, 5);
+            assert!((anchor.fraction - 20.0 / 26.0).abs() < 1e-6);
+
+            // Zooming to 200% doubles every item's height; the same ordinal
+            // and fraction must resolve to a `scroll_y` that keeps the
+            // anchor at the same `window_offset`.
+            view.heights = HeightIndex::new(std::iter::repeat_n(52.0, 10));
+            let scroll_y = view.scroll_y_for_zoom_anchor(anchor);
+            let content_y = view.heights.prefix_sum(anchor.ordinal)
+                + anchor.fraction * view.heights.height(anchor.ordinal).unwrap();
+            assert!((content_y - (scroll_y + window_offset)).abs() < 1e-3);
+        });
+    }
+
     #[test]
     fn cache_invalidation_only_marks_intersecting_lines() {
         let range = SourceRange::new(10, 20);
@@ -6506,9 +6845,15 @@ mod tests {
         // The nested item is rendered from a one-line viewport parse. Its
         // parent list is outside that parse, so the formal depth must come
         // from the projection retained by BlockIndex.
-        let nested =
-            presented_block_with_list_projection(&editor, &block, &(1..2), None, Some(projection))
-                .expect("nested item presents");
+        let nested = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(1..2),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("nested item presents");
         assert_eq!(nested.lines[0].visual_text, "1. nested");
         assert_eq!(nested.lines[0].list.as_ref().unwrap().owner.depth, 2);
 
@@ -6523,6 +6868,7 @@ mod tests {
             &(late_line..late_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late item presents");
         assert_eq!(late.lines[0].visual_text, "3000. item");
@@ -6550,6 +6896,7 @@ mod tests {
             &(late_line..late_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late continuation presents");
         let line = &late.lines[0];
@@ -6584,6 +6931,7 @@ mod tests {
             &(code_line..code_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late code row presents");
         let line = &code.lines[0];
@@ -6621,6 +6969,7 @@ mod tests {
             &(continuation_line..continuation_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("formal continuation presents");
         assert_eq!(late.lines[0].visual_text, "continued");
@@ -7085,6 +7434,7 @@ mod tests {
                     &(line.0..line.0 + 1),
                     None,
                     None,
+                    view.line_height(),
                 )
                 .expect("the empty line presents");
                 assert!(apply_list_editing_context(&mut visual, &pending));
@@ -7146,6 +7496,7 @@ mod tests {
                 &(line.0..line.0 + 1),
                 None,
                 None,
+                view.line_height(),
             )
             .unwrap();
             assert!(apply_list_editing_context(&mut visual, context));
@@ -7232,6 +7583,7 @@ mod tests {
                     &(line.0..line.0 + 1),
                     None,
                     None,
+                    view.line_height(),
                 )
                 .expect("existing line ending row presents");
                 assert!(apply_list_editing_context(&mut visual, &pending));
@@ -8708,7 +9060,7 @@ mod tests {
         cx.update(|window, app| {
             view.read_with(app, |editor_view, _| {
                 let visual = editor_view.rendered_line(line).expect("line rendered");
-                let shaper = WindowShaper::new(window);
+                let shaper = WindowShaper::new(window, editor_view.zoom);
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
@@ -8805,6 +9157,171 @@ mod tests {
             None
         };
         (view, cx, root)
+    }
+
+    fn secondary_scroll_modifiers() -> gpui::Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            gpui::Modifiers {
+                platform: true,
+                ..gpui::Modifiers::none()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            }
+        }
+    }
+
+    // Issue #228: continuous 50%-300% zoom via Ctrl/Cmd+wheel, trackpad
+    // pinch, and Ctrl/Cmd+0 reset.
+
+    #[gpui::test]
+    fn ctrl_wheel_zooms_while_plain_wheel_only_scrolls(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // A plain wheel scrolls the document without touching zoom.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let (zoom, scroll_y) = view.read_with(cx, |view, _| (view.zoom, view.scroll_y));
+        assert_eq!(zoom, 1.0);
+        assert!(scroll_y > 0.0, "{scroll_y}");
+
+        // Ctrl+wheel at the same position zooms in instead of scrolling
+        // further.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 5.0)),
+            modifiers: secondary_scroll_modifiers(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let zoomed = view.read_with(cx, |view, _| view.zoom);
+        assert!(zoomed > 1.0, "{zoomed}");
+    }
+
+    #[gpui::test]
+    fn trackpad_pinch_changes_zoom_and_clamps_extreme_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let position = point(px(480.0), px(400.0));
+
+        cx.simulate_event(gpui::MagnifyEvent {
+            position,
+            magnification: 0.2,
+            modifiers: gpui::Modifiers::none(),
+            phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let zoomed_in = view.read_with(cx, |view, _| view.zoom);
+        assert!((zoomed_in - 1.2).abs() < 1e-4, "{zoomed_in}");
+
+        // A pinch collapsing past zero must clamp instead of going negative
+        // or producing a zero/degenerate zoom level.
+        cx.simulate_event(gpui::MagnifyEvent {
+            position,
+            magnification: -5.0,
+            modifiers: gpui::Modifiers::none(),
+            phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let zoomed_out = view.read_with(cx, |view, _| view.zoom);
+        assert_eq!(zoomed_out, MIN_ZOOM);
+    }
+
+    #[gpui::test]
+    fn small_pinch_deltas_accumulate_before_the_100_percent_snap(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let position = point(px(480.0), px(400.0));
+
+        for _ in 0..3 {
+            cx.simulate_event(gpui::MagnifyEvent {
+                position,
+                magnification: 0.01,
+                modifiers: gpui::Modifiers::none(),
+                phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        let (zoom, raw_zoom) = view.read_with(cx, |view, _| (view.zoom, view.raw_zoom));
+        assert!(
+            raw_zoom > 1.02,
+            "raw zoom must cross the snap band: {raw_zoom}"
+        );
+        assert!(
+            zoom > 1.0,
+            "effective zoom must eventually leave the snap: {zoom}"
+        );
+    }
+
+    #[gpui::test]
+    fn reset_zoom_keystroke_restores_100_percent_after_zooming(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+
+        // A click focuses the editor's "HaneEditor" key context (see
+        // `on_row_mouse_down`), which the Ctrl/Cmd+0 binding is scoped to.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+
+        view.update(cx, |view, cx| {
+            view.set_zoom(2.0, view.viewport_height / 2.0, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.zoom), 2.0);
+
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-0");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-0");
+        cx.run_until_parked();
+
+        assert_eq!(view.read_with(cx, |view, _| view.zoom), 1.0);
+    }
+
+    #[gpui::test]
+    fn zoom_scales_the_painted_row_height(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let height_at = |cx: &mut gpui::VisualTestContext, zoom: f32| -> f32 {
+            view.update(cx, |view, gpui_cx| view.set_zoom(zoom, 0.0, gpui_cx));
+            cx.run_until_parked();
+            f32::from(
+                cx.debug_bounds("row-0-0")
+                    .expect("first row painted")
+                    .size
+                    .height,
+            )
+        };
+
+        let height_at_100 = height_at(cx, 1.0);
+        let height_at_50 = height_at(cx, MIN_ZOOM);
+        let height_at_200 = height_at(cx, 2.0);
+
+        assert!(
+            height_at_50 < height_at_100,
+            "{height_at_50} < {height_at_100}"
+        );
+        assert!(
+            height_at_200 > height_at_100,
+            "{height_at_200} > {height_at_100}"
+        );
     }
 
     #[gpui::test]

@@ -16,22 +16,32 @@ use std::sync::Arc;
 pub(crate) struct WindowShaper {
     text_system: Arc<WindowTextSystem>,
     style: TextStyle,
+    /// The document zoom level (1.0 = 100%), folded into every font size this
+    /// shaper reports. Kept here rather than in `line.rs` alone so wrap
+    /// boundaries and glyph x positions — not just the painted glyph size —
+    /// move with zoom.
+    zoom: f32,
 }
 
 impl WindowShaper {
-    pub(crate) fn new(window: &Window) -> Self {
+    pub(crate) fn new(window: &Window, zoom: f32) -> Self {
         Self {
             text_system: window.text_system().clone(),
             style: window.text_style(),
+            zoom,
         }
     }
 
     /// Stable key for every font property that can change wrapping or glyph x
     /// positions. Color and other paint-only text style fields are deliberately
-    /// excluded, so a palette change does not discard valid geometry.
+    /// excluded, so a palette change does not discard valid geometry. Zoom is
+    /// included because it scales the font size passed to every shape call
+    /// below, which changes both wrap boundaries and glyph x positions exactly
+    /// like a font family change would.
     pub(crate) fn font_revision(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.style.font().hash(&mut hasher);
+        self.zoom.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -82,7 +92,7 @@ impl WindowShaper {
         let runs = self.runs(line, fragment);
         self.text_system.shape_line(
             line.visual_text[fragment.clone()].to_owned().into(),
-            px(block_font_size(line)),
+            px(block_font_size(line, self.zoom)),
             &runs,
             None,
         )
@@ -97,7 +107,7 @@ impl LineShaper for WindowShaper {
         let runs = self.runs(line, &fragment);
         let Ok(wrapped) = self.text_system.shape_text(
             line.visual_text[fragment.clone()].to_owned().into(),
-            px(block_font_size(line)),
+            px(block_font_size(line, self.zoom)),
             &runs,
             Some(px(width)),
             None,
@@ -161,7 +171,7 @@ impl LineShaper for WindowShaper {
             self.text_system
                 .shape_line(
                     text.to_owned().into(),
-                    px(block_font_size(line)),
+                    px(block_font_size(line, self.zoom)),
                     &[run],
                     None,
                 )
@@ -194,7 +204,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
 
         cx.update(|window, _| {
-            let shaper = WindowShaper::new(window);
+            let shaper = WindowShaper::new(window, 1.0);
             let editor = Editor::new("*漢字ひらがな* *ascii* **太字** **bold**");
             let index = BlockIndex::from_buffer(editor.document());
             let block = index.blocks().next().expect("one paragraph block");

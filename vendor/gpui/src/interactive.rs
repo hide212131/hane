@@ -465,6 +465,33 @@ impl ScrollDelta {
     }
 }
 
+/// A trackpad pinch (magnify) gesture event from the platform. Only the macOS
+/// backend currently synthesizes this event, from `NSEventTypeMagnify`;
+/// Windows and Linux zoom instead goes through `ScrollWheelEvent` with the
+/// control modifier held.
+#[derive(Clone, Debug, Default)]
+pub struct MagnifyEvent {
+    /// The position of the pointer on the window when the gesture updated.
+    pub position: Point<Pixels>,
+    /// The incremental scale change since the previous event in the same
+    /// gesture, mirroring `NSEvent.magnification`: e.g. 0.02 means the pinch
+    /// grew the content by 2% since the last event in the gesture, not since
+    /// the gesture began.
+    pub magnification: f32,
+    /// The modifiers held down during the gesture.
+    pub modifiers: Modifiers,
+    /// The phase of the gesture.
+    pub phase: TouchPhase,
+}
+
+impl Sealed for MagnifyEvent {}
+impl InputEvent for MagnifyEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::Magnify(self)
+    }
+}
+impl MouseEvent for MagnifyEvent {}
+
 /// A mouse exit event from the platform, generated when the mouse leaves the window.
 #[derive(Clone, Debug, Default)]
 pub struct MouseExitEvent {
@@ -561,6 +588,8 @@ pub enum PlatformInput {
     MouseExited(MouseExitEvent),
     /// The scroll wheel was used.
     ScrollWheel(ScrollWheelEvent),
+    /// A trackpad pinch (magnify) gesture was used.
+    Magnify(MagnifyEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
 }
@@ -576,6 +605,7 @@ impl PlatformInput {
             PlatformInput::MouseMove(event) => Some(event),
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
+            PlatformInput::Magnify(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
         }
     }
@@ -590,6 +620,7 @@ impl PlatformInput {
             PlatformInput::MouseMove(_) => None,
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
+            PlatformInput::Magnify(_) => None,
             PlatformInput::FileDrop(_) => None,
         }
     }
