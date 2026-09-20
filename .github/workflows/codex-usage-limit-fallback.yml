@@ -173,6 +173,7 @@ jobs:
     runs-on: [self-hosted, macOS, hane-codex]
     timeout-minutes: 90
     permissions:
+      actions: read
       contents: write
       pull-requests: read
     env:
@@ -187,7 +188,8 @@ jobs:
       HANDOFF_FILE: ${{ runner.temp }}/hane-codex-handoff-${{ github.run_id }}-${{ github.run_attempt }}/commander-handoff.txt
       CONTEXT_DIR: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}
       CONTEXT_FILE: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/pr-context.json
-      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/gitconfig
+      CODEX_PATCH_FILE: ${{ runner.temp }}/hane-codex-patch-${{ github.run_id }}-${{ github.run_attempt }}.patch
+      PUSH_WORKTREE: ${{ runner.temp }}/hane-codex-push-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Check out trusted fallback instructions
@@ -264,6 +266,16 @@ jobs:
             exit 1
           fi
 
+          checkpoint_patch="$HANDOFF_DIR/checkpoint.patch"
+          if [[ ! -f "$checkpoint_patch" ]]; then
+            echo '::error::The Claude checkpoint patch is missing.'
+            exit 1
+          fi
+          if [[ -s "$checkpoint_patch" ]]; then
+            git -C "$WORKTREE" apply --index --whitespace=nowarn "$checkpoint_patch"
+            git -C "$WORKTREE" diff --cached --check
+          fi
+
           gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" \
             --jq '{number,title,body,head,base}' > "$CONTEXT_FILE"
 
@@ -303,6 +315,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_URL: ''
           GH_CONFIG_DIR: ${{ runner.temp }}/hane-codex-gh-config-${{ github.run_id }}-${{ github.run_attempt }}
+          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/gitconfig
           GIT_CONFIG_SYSTEM: /dev/null
         run: |
           set -euo pipefail
@@ -369,6 +382,31 @@ jobs:
           fi
           git -C "$WORKTREE" diff --cached --check
 
+          if [[ -e "$PUSH_WORKTREE" || -e "$CODEX_PATCH_FILE" ]]; then
+            echo '::error::Refusing to reuse the clean Codex push workspace or patch file.'
+            exit 1
+          fi
+          git -C "$WORKTREE" diff --cached \
+            --binary \
+            --full-index \
+            --no-ext-diff \
+            --no-textconv \
+            HEAD -- > "$CODEX_PATCH_FILE"
+          if [[ ! -s "$CODEX_PATCH_FILE" ]]; then
+            echo '::error::Codex fallback produced an empty transfer patch.'
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$PUSH_WORKTREE")"
+          git clone --no-checkout --filter=blob:none "https://github.com/${REPOSITORY}.git" "$PUSH_WORKTREE"
+          git -C "$PUSH_WORKTREE" fetch --depth=1 origin "$TARGET_SHA"
+          git -C "$PUSH_WORKTREE" checkout --detach "$TARGET_SHA"
+          if [[ "$(git -C "$PUSH_WORKTREE" rev-parse HEAD)" != "$TARGET_SHA" ]]; then
+            echo '::error::Clean push checkout does not match the exact target head.'
+            exit 1
+          fi
+          git -C "$PUSH_WORKTREE" apply --index --whitespace=nowarn "$CODEX_PATCH_FILE"
+
           pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
           state="$(jq -r '.state // ""' <<< "$pr_json")"
           head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$pr_json")"
@@ -379,9 +417,25 @@ jobs:
             exit 1
           fi
 
-          git -C "$WORKTREE" config user.name 'codex[bot]'
-          git -C "$WORKTREE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git -C "$WORKTREE" commit --no-verify -m "fix: continue after Claude usage limit (#${PR_NUMBER})"
+          clean_changed=false
+          while IFS= read -r -d '' path; do
+            clean_changed=true
+            case "$path" in
+              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
+                echo "::error::Transferred Codex patch contains a trusted authority or workflow path: $path"
+                exit 1
+                ;;
+            esac
+          done < <(git -C "$PUSH_WORKTREE" diff --cached --no-renames --name-only -z)
+          if [[ "$clean_changed" != 'true' ]]; then
+            echo '::error::Transferred Codex patch has no staged repository change.'
+            exit 1
+          fi
+          git -C "$PUSH_WORKTREE" diff --cached --check
+
+          git -C "$PUSH_WORKTREE" config user.name 'codex[bot]'
+          git -C "$PUSH_WORKTREE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$PUSH_WORKTREE" commit --no-verify -m "fix: continue after Claude usage limit (#${PR_NUMBER})"
 
           # Repeat the API guard immediately before the only remote mutation.
           current_sha="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha // ""')"
@@ -390,6 +444,6 @@ jobs:
             exit 1
           fi
 
-          git -C "$WORKTREE" remote set-url origin "https://github.com/${REPOSITORY}.git"
+          git -C "$PUSH_WORKTREE" remote set-url origin "https://github.com/${REPOSITORY}.git"
           gh auth setup-git
-          git -C "$WORKTREE" -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${HEAD_REF}"
+          git -C "$PUSH_WORKTREE" -c core.hooksPath=/dev/null push origin "HEAD:refs/heads/${HEAD_REF}"

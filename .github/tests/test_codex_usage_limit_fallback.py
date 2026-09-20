@@ -32,6 +32,7 @@ def test_non_usage_categories_do_not_start_the_codex_job():
 
 def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "runs-on: [self-hosted, macOS, hane-codex]" in WORKFLOW
+    assert "actions: read" in WORKFLOW
     assert "--model gpt-5.6-luna" in WORKFLOW
     assert "--config model_reasoning_effort=xhigh" in WORKFLOW
     assert "--profile hane-codex-fallback" in WORKFLOW
@@ -47,6 +48,8 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "--add-dir \"$HANDOFF_DIR\"" in WORKFLOW
     assert "--add-dir \"$CONTEXT_DIR\"" in WORKFLOW
     assert "Do not commit or push." in WORKFLOW
+    assert 'checkpoint_patch="$HANDOFF_DIR/checkpoint.patch"' in WORKFLOW
+    assert 'git -C "$WORKTREE" apply --index' in WORKFLOW
 
 
 def test_mutation_guards_cover_start_scope_and_push():
@@ -55,8 +58,11 @@ def test_mutation_guards_cover_start_scope_and_push():
     assert ".github/*|AGENTS.md" in WORKFLOW
     assert "Codex attempted to modify trusted authority or workflow path" in WORKFLOW
     assert "Codex created an untrusted commit" in WORKFLOW
+    assert "Clean push checkout does not match the exact target head" in WORKFLOW
+    assert 'git -C "$PUSH_WORKTREE" apply --index' in WORKFLOW
+    assert "Transferred Codex patch contains a trusted authority or workflow path" in WORKFLOW
+    assert 'git -C "$PUSH_WORKTREE" -c core.hooksPath=/dev/null push' in WORKFLOW
     assert "Target Pull Request moved before Codex push" in WORKFLOW
-    assert 'push origin "HEAD:refs/heads/${HEAD_REF}"' in WORKFLOW
 
 
 if __name__ == "__main__":

@@ -30,9 +30,11 @@ fallback は次の条件をすべて満たす場合だけ self-hosted `macOS` + 
 - handoff actor が repository の `admin`、`maintain`、または `write` 権限を持つ。
 - 対象 PR が open、base/head とも同一 repository、current head が checkpoint の target SHA と一致する。
 - self-hosted 実行直前にも actor と exact head を再確認する。
+- Claude worker が保存した `checkpoint.patch` を exact target SHA の clean checkout に適用してから Codex を起動する。
 - Codex 実行時に GitHub token や repository write credential を環境へ渡さない。
 - Codex は runner に事前配置した hash 固定の専用 permission profile を使う。profile は workspace と明示した handoff/context directory 以外の読み取りを拒否し、`~/.codex/auth.json` などのローカル認証を worker の shell から読めないようにする。
 - fallback の変更は `.github/`、agent instructions、Commander Policy、MCP / hook 設定などの保護パスを拒否する。
+- Codex 実行後の変更は staged patch として取り出し、別の clean checkout に適用する。Codex が触れた `.git` metadata を認証済み push に再利用しない。
 - commit 後、push 直前に current head をもう一度確認する。
 
 Codex は commit / push / 次工程の判断を行わず、trusted finalizer が変更パスと exact head を検査して push する。`authentication`、`max_turns`、`model_or_provider`、`unknown`、診断不能な failure は fallback 対象外とする。
