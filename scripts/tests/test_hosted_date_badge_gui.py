@@ -35,15 +35,31 @@ VALID_PREPROCESSING_EVIDENCE = {
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/5")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/6")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
         today = dt.date(2026, 9, 17)
         self.assertEqual(mod.relative_label(today, today), "本日")
         self.assertEqual(mod.relative_label(dt.date(2026, 9, 1), today), "1日(火)")
-        self.assertEqual(mod.relative_label(dt.date(2026, 10, 3), today), "10/3(土)")
-        self.assertEqual(mod.relative_label(dt.date(2025, 10, 3), today), "2025/10/3(金)")
+        self.assertEqual(mod.relative_label(dt.date(2026, 10, 3), today), "10/3")
+        self.assertEqual(mod.relative_label(dt.date(2025, 10, 3), today), "'25/10/3")
+        self.assertEqual(mod.relative_label(dt.date(2026, 8, 17), today), "8/17(月)")
+        self.assertEqual(mod.relative_label(dt.date(2026, 8, 16), today), "8/16")
+
+    def test_relative_label_clamps_a_month_end_boundary(self):
+        self.assertEqual(
+            mod.relative_label(dt.date(2026, 2, 28), dt.date(2026, 3, 31)),
+            "2/28(土)",
+        )
+        self.assertEqual(
+            mod.relative_label(dt.date(2026, 2, 27), dt.date(2026, 3, 31)),
+            "2/27",
+        )
+        self.assertEqual(
+            mod.relative_label(dt.date(2024, 2, 29), dt.date(2024, 3, 31)),
+            "2/29(木)",
+        )
 
     def test_date_token_pattern_tolerates_ocr_spacing(self):
         pattern = mod.date_token_pattern("2026-9-1")
@@ -843,9 +859,9 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(by_name["date_in_middle"]["date_token"], "2026-09-01")
         self.assertEqual(by_name["date_in_middle"]["badge_label"], "1日(火)")
         self.assertEqual(by_name["one_digit_month_day"]["date_token"], "2026-1-2")
-        self.assertEqual(by_name["one_digit_month_day"]["badge_label"], "1/2(金)")
+        self.assertEqual(by_name["one_digit_month_day"]["badge_label"], "1/2")
         self.assertEqual(by_name["date_at_end"]["date_token"], "2025-09-02")
-        self.assertEqual(by_name["date_at_end"]["badge_label"], "2025/9/2(火)")
+        self.assertEqual(by_name["date_at_end"]["badge_label"], "'25/9/2")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["date_token"], "2026-09-17")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["badge_label"], "本日")
 
@@ -854,11 +870,11 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         for label in labels:
             if label == "本日":
                 shapes.add("today")
-            elif re.fullmatch(r"\d+日\(.\)", label):
+            elif re.fullmatch(r"\d+日(?:\(.\))?", label):
                 shapes.add("same_year_same_month")
-            elif re.fullmatch(r"\d+/\d+\(.\)", label):
+            elif re.fullmatch(r"\d+/\d+(?:\(.\))?", label):
                 shapes.add("same_year_other_month")
-            elif re.fullmatch(r"\d+/\d+/\d+\(.\)", label):
+            elif re.fullmatch(r"'\d{2}/\d+/\d+(?:\(.\))?", label):
                 shapes.add("other_year")
         self.assertEqual(
             shapes,

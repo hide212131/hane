@@ -82,7 +82,7 @@ fn is_valid_calendar_date(year: i32, month: u32, day: u32) -> bool {
 /// civil-calendar / day-count conversion (see
 /// <http://howardhinnant.github.io/date_algorithms.html>).
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let y = i64::from(if month <= 2 { year - 1 } else { year });
+    let y = i64::from(year) - if month <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let year_of_era = y - era * 400;
     let month_index = (i64::from(month) + 9) % 12;
@@ -291,23 +291,59 @@ pub fn date_badge_range(date: CalendarDate, today: CalendarDate) -> DateBadgeRan
     }
 }
 
+fn one_calendar_month_before(date: CalendarDate) -> CalendarDate {
+    let (year, month) = if date.month == 1 {
+        (date.year.saturating_sub(1), 12)
+    } else {
+        (date.year, date.month - 1)
+    };
+    CalendarDate {
+        year,
+        month,
+        day: date.day.min(days_in_month(year, month)),
+    }
+}
+
+fn is_recent_past_date(date: CalendarDate, today: CalendarDate) -> bool {
+    let date_days = days_from_civil(date.year, date.month, date.day);
+    let today_days = days_from_civil(today.year, today.month, today.day);
+    let boundary = one_calendar_month_before(today);
+    let boundary_days = days_from_civil(boundary.year, boundary.month, boundary.day);
+    boundary_days <= date_days && date_days < today_days
+}
+
+fn append_weekday(label: String, weekday: Option<char>) -> String {
+    match weekday {
+        Some(weekday) => format!("{label}({weekday})"),
+        None => label,
+    }
+}
+
 /// The short badge label for `date` relative to `today`: `本日` when they
 /// are the same day, otherwise the shortest form that still disambiguates —
 /// day-only within the current month, month/day within the current year,
-/// and year/month/day otherwise — each followed by the single-character
-/// weekday.
+/// and a two-digit year/month/day otherwise. A weekday is appended only for
+/// dates strictly before today and no more than one calendar month old.
 #[must_use]
 pub fn format_relative_date_label(date: CalendarDate, today: CalendarDate) -> String {
     if date == today {
         return "本日".to_owned();
     }
-    let weekday = WEEKDAY_KANJI[date.weekday_index()];
+    let weekday = is_recent_past_date(date, today).then(|| WEEKDAY_KANJI[date.weekday_index()]);
     if date.year != today.year {
-        format!("{}/{}/{}({weekday})", date.year, date.month, date.day)
+        let label = format!(
+            "'{:02}/{}/{}",
+            date.year.rem_euclid(100),
+            date.month,
+            date.day
+        );
+        append_weekday(label, weekday)
     } else if date.month != today.month {
-        format!("{}/{}({weekday})", date.month, date.day)
+        let label = format!("{}/{}", date.month, date.day);
+        append_weekday(label, weekday)
     } else {
-        format!("{}日({weekday})", date.day)
+        let label = format!("{}日", date.day);
+        append_weekday(label, weekday)
     }
 }
 
@@ -660,13 +696,73 @@ mod tests {
     fn a_different_month_in_the_current_year_shows_month_slash_day() {
         let today = CalendarDate::new(2026, 9, 20).unwrap();
         let date = CalendarDate::new(2026, 10, 3).unwrap();
-        assert_eq!(format_relative_date_label(date, today), "10/3(土)");
+        assert_eq!(format_relative_date_label(date, today), "10/3");
     }
 
     #[test]
-    fn a_different_year_shows_year_slash_month_slash_day() {
+    fn a_recent_past_date_in_the_previous_month_shows_month_slash_day_and_weekday() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        let date = CalendarDate::new(2026, 8, 20).unwrap();
+        assert_eq!(format_relative_date_label(date, today), "8/20(木)");
+    }
+
+    #[test]
+    fn the_one_calendar_month_boundary_is_inclusive() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        let boundary = CalendarDate::new(2026, 8, 20).unwrap();
+        let older = CalendarDate::new(2026, 8, 19).unwrap();
+
+        assert_eq!(format_relative_date_label(boundary, today), "8/20(木)");
+        assert_eq!(format_relative_date_label(older, today), "8/19");
+    }
+
+    #[test]
+    fn month_end_boundary_clamps_to_the_previous_month_end() {
+        let non_leap_today = CalendarDate::new(2026, 3, 31).unwrap();
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2026, 2, 28).unwrap(), non_leap_today),
+            "2/28(土)"
+        );
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2026, 2, 27).unwrap(), non_leap_today),
+            "2/27"
+        );
+
+        let leap_today = CalendarDate::new(2024, 3, 31).unwrap();
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2024, 2, 29).unwrap(), leap_today),
+            "2/29(木)"
+        );
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2024, 2, 28).unwrap(), leap_today),
+            "2/28"
+        );
+    }
+
+    #[test]
+    fn a_recent_past_date_across_the_year_boundary_shows_a_short_year_and_weekday() {
+        let today = CalendarDate::new(2026, 1, 15).unwrap();
+        let date = CalendarDate::new(2025, 12, 31).unwrap();
+        assert_eq!(format_relative_date_label(date, today), "'25/12/31(水)");
+    }
+
+    #[test]
+    fn an_old_date_in_another_year_uses_a_short_year_without_a_weekday() {
         let today = CalendarDate::new(2026, 9, 20).unwrap();
         let date = CalendarDate::new(2025, 10, 3).unwrap();
-        assert_eq!(format_relative_date_label(date, today), "2025/10/3(金)");
+        assert_eq!(format_relative_date_label(date, today), "'25/10/3");
+    }
+
+    #[test]
+    fn future_dates_never_show_a_weekday() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2026, 9, 21).unwrap(), today),
+            "21日"
+        );
+        assert_eq!(
+            format_relative_date_label(CalendarDate::new(2026, 10, 3).unwrap(), today),
+            "10/3"
+        );
     }
 }
