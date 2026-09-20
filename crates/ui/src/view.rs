@@ -7044,6 +7044,57 @@ mod tests {
     }
 
     #[test]
+    fn a_late_quote_code_row_uses_formal_code_projection() {
+        let mut source = String::from("> ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("> **literal**\n");
+        }
+        source.push_str("> ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one quote block");
+        let projection = index
+            .list_projection(&block)
+            .expect("formal quote code projection");
+        let code_line = source[..source.find("> **literal**").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late quote code row presents");
+        let line = &code.lines[0];
+        assert_eq!(line.visual_text, "**literal**");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        assert!(line
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock));
+
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line - 1..code_line),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late quote code opening presents");
+        assert_eq!(opening.lines[0].visual_text, "> rust");
+        assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.marker_edge == Some(MarkerEdge::Opening)
+        }));
+    }
+
+    #[test]
     fn a_sibling_boundary_does_not_disclose_the_previous_formal_prefix() {
         let mut source = String::from("- first\n");
         for _ in 0..5_000 {

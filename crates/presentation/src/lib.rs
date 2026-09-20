@@ -1386,9 +1386,11 @@ fn marker_is_disclosed(
     }
     nodes.intersecting(marker).into_iter().any(|id| {
         let span = parsed.tree.node(*id).expect("indexed node");
-        let owns_marker = if has_delimiter_markers(span.kind) {
+        let owns_marker = if has_delimiter_markers(span.kind)
+            && !matches!(span.kind, NodeKind::CodeBlock)
+        {
             span.source_range.start <= marker.start && marker.end <= span.source_range.end
-        } else if matches!(span.kind, NodeKind::Heading(_) | NodeKind::CodeBlock) {
+        } else if matches!(span.kind, NodeKind::Heading(_)) {
             (marker.start == span.source_range.start
                 || (matches!(span.kind, NodeKind::Heading(_))
                     && span
@@ -5208,6 +5210,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn code_fence_disclosure_only_expands_the_touched_fence_marker() {
+        let source = "- item\n  ```rust\n  code\n  ```";
+        let base = 0;
+        let mut line_start = base;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let start = line_start;
+                line_start += text.len();
+                BlockLine {
+                    line,
+                    range: SourceRange::new(start, start + text.len()),
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let joined = parse_joined_block(&lines, Revision(1));
+        let code_start = base + source.find("code").expect("code content");
+        let mut presented = Vec::new();
+
+        present_joined_run_with_list_projection(
+            &lines,
+            Revision(1),
+            26.0,
+            &(0..lines.len()),
+            Some(&joined),
+            Some(SourceRange::new(code_start, code_start + 4)),
+            Some(projection),
+            &mut presented,
+        );
+
+        let opening = presented.get(1).expect("opening fence");
+        assert!(!opening.visual_text.contains("```"));
+        assert!(opening.source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.marker_edge == Some(MarkerEdge::Opening)
+        }));
+        let fence_start = source.find("```").expect("opening fence") + base;
+        let fence = opening
+            .source_map
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.source_range == SourceRange::new(fence_start, fence_start + 3)
+            })
+            .expect("fence mapping");
+        assert_eq!(fence.visibility, Visibility::HiddenMarkup);
+        assert_ne!(fence.visibility, Visibility::ExpandedMarkup);
     }
 
     #[test]

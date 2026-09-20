@@ -220,18 +220,19 @@ fn build_list_rows(
             next_item += 1;
         }
         active.retain(|index| items[*index].item_range.end > source_range.start);
-        if let Some(item_index) = active
+        let item_index = active
             .iter()
             .copied()
-            .max_by_key(|index| items[*index].depth)
-        {
-            let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
+            .max_by_key(|index| items[*index].depth);
+        let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
+        let is_code_block = code_blocks
+            .get(code_block)
+            .is_some_and(|code| code.intersects(source_range));
+        if item_index.is_some() || is_code_block {
             rows.push(ListProjectionRow {
                 source_range,
                 item_index,
-                is_code_block: code_blocks
-                    .get(code_block)
-                    .is_some_and(|code| code.intersects(source_range)),
+                is_code_block,
             });
         }
     }
@@ -350,34 +351,37 @@ fn build_list_projections(
         .iter()
         .enumerate()
         .map(|(block, _)| {
-            (!items[block].is_empty()).then(|| {
-                let block_range = block_ranges[block];
-                let block_items = std::mem::take(&mut items[block]);
-                let block_prefixes = std::mem::take(&mut prefixes[block]);
-                let block_lists = lists
-                    .iter()
-                    .filter(|list| {
-                        block_items
-                            .iter()
-                            .any(|item| item.list_range == list.source_range)
-                    })
-                    .cloned()
-                    .collect();
-                let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
-                let fence_start = parsed
-                    .fence_marker_edges
-                    .partition_point(|(marker, _)| marker.end <= block_range.start);
-                let fence_end = parsed
-                    .fence_marker_edges
-                    .partition_point(|(marker, _)| marker.start < block_range.end);
-                ListProjection::new(
+            let block_range = block_ranges[block];
+            let block_items = std::mem::take(&mut items[block]);
+            let block_prefixes = std::mem::take(&mut prefixes[block]);
+            let block_lists = lists
+                .iter()
+                .filter(|list| {
+                    block_items
+                        .iter()
+                        .any(|item| item.list_range == list.source_range)
+                })
+                .cloned()
+                .collect();
+            let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
+            let fence_start = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.end <= block_range.start);
+            let fence_end = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.start < block_range.end);
+            let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
+            if block_items.is_empty() && rows.is_empty() && block_fence_markers.is_empty() {
+                None
+            } else {
+                Some(ListProjection::new(
                     block_items,
                     block_prefixes,
                     block_lists,
                     rows,
-                    parsed.fence_marker_edges[fence_start..fence_end].to_vec(),
-                )
-            })
+                    block_fence_markers,
+                ))
+            }
         })
         .collect()
 }

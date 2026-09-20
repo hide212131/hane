@@ -343,7 +343,12 @@ pub struct ListProjectionList {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListProjectionRow {
     pub source_range: SourceRange,
-    item_index: usize,
+    /// The deepest formal list item owning this row, when the row is inside a
+    /// list. A row can be present without an item when it is a nested code
+    /// line in another container such as a block quote; keeping those rows in
+    /// the same projection lets viewport-only presentation recover the formal
+    /// code-block kind without duplicating a second document-wide index.
+    item_index: Option<usize>,
     is_code_block: bool,
 }
 
@@ -418,13 +423,14 @@ impl ListProjection {
     /// have to scan every item in a large list to recover its owner.
     pub fn item_for_range(&self, range: SourceRange) -> Option<&ListProjectionItem> {
         let row = self.row_for_range(range)?;
-        self.items.get(row.item_index)
+        self.items.get(row.item_index?)
     }
 
-    /// Reports whether the formal parse presents the physical list row as code.
-    /// A bounded viewport parse can mistake a four-column list continuation for
-    /// an indented code block; callers use this bit only to restore the formal
-    /// display kind while preserving genuine code nested in the list.
+    /// Reports whether the formal parse presents the physical row as code.
+    /// A bounded viewport parse can mistake a container continuation for an
+    /// indented code block, or fail to see code nested in a large quote;
+    /// callers use this bit only to restore the formal display kind while
+    /// preserving genuine literal code.
     pub fn is_code_block_for_range(&self, range: SourceRange) -> Option<bool> {
         Some(self.row_for_range(range)?.is_code_block)
     }
