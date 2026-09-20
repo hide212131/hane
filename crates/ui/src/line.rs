@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn inactive_bare_fence_rows_have_zero_height_and_editing_restores_it() {
-        let source = "```\\ncode\\n```\\n";
+        let source = "```\ncode\n```\n";
         let code_offset = source.find("code").unwrap() + 1;
         let closing_offset = source.rfind("```").unwrap() + 1;
         let mut editor = Editor::new(source);
@@ -997,7 +997,7 @@ mod tests {
             .set_selection(Selection::caret(SourceOffset(code_offset)))
             .unwrap();
         let inactive = presented_lines(&editor);
-        assert_eq!(inactive[0].visual_text, "\\n");
+        assert_eq!(inactive[0].visual_text, "\n");
         assert_eq!(inactive[0].height(), 0.0);
         assert_eq!(inactive[2].visual_text, "");
         assert_eq!(inactive[2].height(), 0.0);
