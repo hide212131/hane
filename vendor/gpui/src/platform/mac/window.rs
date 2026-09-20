@@ -171,6 +171,18 @@ unsafe fn build_classes() {
                     sel!(swipeWithEvent:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
+                // Hane issue #228: a macOS trackpad pinch is its own AppKit
+                // gesture (`-[NSResponder magnifyWithEvent:]`), never routed
+                // through `scrollWheel:`. Registering it onto the same
+                // `handle_view_event` dispatch that already turns
+                // `NSScrollWheel` into `PlatformInput::ScrollWheel` is what
+                // lets `events.rs`'s `NSEventTypeMagnify` handling reach the
+                // window's event callback at all; see
+                // `vendor/gpui/HANE-PATCH.md`.
+                decl.add_method(
+                    sel!(magnifyWithEvent:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
                 decl.add_method(
                     sel!(flagsChanged:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),

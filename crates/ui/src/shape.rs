@@ -16,13 +16,18 @@ use std::sync::Arc;
 pub(crate) struct WindowShaper {
     text_system: Arc<WindowTextSystem>,
     style: TextStyle,
+    /// The main panel's current continuous zoom level (issue #228), applied
+    /// on top of `block_font_size` so wrapping, glyph x-offsets and hit
+    /// testing all measure text at the same size `line.rs` paints it at.
+    zoom: f32,
 }
 
 impl WindowShaper {
-    pub(crate) fn new(window: &Window) -> Self {
+    pub(crate) fn new(window: &Window, zoom: f32) -> Self {
         Self {
             text_system: window.text_system().clone(),
             style: window.text_style(),
+            zoom,
         }
     }
 
@@ -82,7 +87,7 @@ impl WindowShaper {
         let runs = self.runs(line, fragment);
         self.text_system.shape_line(
             line.visual_text[fragment.clone()].to_owned().into(),
-            px(block_font_size(line)),
+            px(block_font_size(line) * self.zoom),
             &runs,
             None,
         )
@@ -97,7 +102,7 @@ impl LineShaper for WindowShaper {
         let runs = self.runs(line, &fragment);
         let Ok(wrapped) = self.text_system.shape_text(
             line.visual_text[fragment.clone()].to_owned().into(),
-            px(block_font_size(line)),
+            px(block_font_size(line) * self.zoom),
             &runs,
             Some(px(width)),
             None,
@@ -161,7 +166,7 @@ impl LineShaper for WindowShaper {
             self.text_system
                 .shape_line(
                     text.to_owned().into(),
-                    px(block_font_size(line)),
+                    px(block_font_size(line) * self.zoom),
                     &[run],
                     None,
                 )
@@ -194,7 +199,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
 
         cx.update(|window, _| {
-            let shaper = WindowShaper::new(window);
+            let shaper = WindowShaper::new(window, 1.0);
             let editor = Editor::new("*漢字ひらがな* *ascii* **太字** **bold**");
             let index = BlockIndex::from_buffer(editor.document());
             let block = index.blocks().next().expect("one paragraph block");

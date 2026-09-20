@@ -119,4 +119,5 @@ command_actions! {
         }
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| { view.perform_cancel_composition(cx); },
+    ResetZoom ("secondary-0") => reset_zoom_action |view, _window, cx| { view.reset_zoom(cx); },
 }

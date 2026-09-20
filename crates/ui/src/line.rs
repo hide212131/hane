@@ -292,7 +292,7 @@ fn surface_color(surface: BlockSurface, theme: Theme) -> Option<u32> {
 /// it a `BlockDisplay` in `hane-presentation`; nothing here changes.
 fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
     element
-        .text_size(px(BODY_FONT_SIZE * display.font_scale))
+        .text_size(px(BODY_FONT_SIZE * display.font_scale * theme.zoom))
         .when(display.weight == BlockWeight::Semibold, |element| {
             element.font_weight(FontWeight::SEMIBOLD)
         })
@@ -367,7 +367,7 @@ pub(crate) fn row_element(
         )
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(px(12.0 * theme.zoom))
                 .text_color(rgb(theme.quote_foreground))
                 .child(image.alt.clone()),
         );

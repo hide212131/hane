@@ -1,10 +1,11 @@
-# Hane の限定パッチ（Issue #101, #126）
+# Hane の限定パッチ（Issue #101, #126, #228）
 
 crates.io の GPUI 0.2.2 を同梱。Apache-2.0 ライセンスは `LICENSE-APACHE` に保持。
 配布 crate の SHA-256: `979b45cfa6ec723b6f42330915a1b3769b930d02b2d505f9697f8ca602bee707`。
-製品コードの変更は `src/platform/mac/text_system.rs`（Issue #101）と
-`src/platform/mac/platform.rs`（Issue #126）のみ。それぞれ独立した理由による
-パッチで、互いに依存しない。
+製品コードの変更は `src/platform/mac/text_system.rs`（Issue #101）、
+`src/platform/mac/platform.rs`（Issue #126）、`src/platform/mac/window.rs` と
+`src/platform/mac/events.rs`（Issue #228、macOS のトラックパッド pinch）のみ。
+それぞれ独立した理由によるパッチで、互いに依存しない。
 
 ## Issue #101: 合成斜体フォールバック
 
@@ -40,3 +41,15 @@ Hane 起動後（ウィンドウが既に key / first responder の状態）に�
 ### 検証
 
 macOS の `platform.rs` test は実際の keyboard-selection-change 通知を `APP_DELEGATE_CLASS` へ配送し、text responder の context に対する1回の `deactivate` → `activate` と、key windowなし・non-text responder・contextなしの安全な no-op を確認する。実際の日本語 IME の composing 状態と OS のフォーカスに依存するため、Hane 側の GUI 検証（`.agents/skills/hane-gui-test`）でも、Hane 起動後に日本語入力ソースへ切り替えてから通常段落・リスト項目へ日本語を入力し、変換結果が一度だけ期待 source offset へ commit されることを確認する。
+
+## Issue #228: macOS トラックパッド pinch のズーム統合
+
+GPUI 0.2.2 はマウスホイール（`NSScrollWheel`）だけを `PlatformInput::ScrollWheel` へ変換しており、トラックパッドの pinch（`-[NSResponder magnifyWithEvent:]`、`NSEventTypeMagnify`）は `NSView` のどのセレクタにも束縛されていない。上流にも独自の pinch 表現は存在しない。Hane のメインパネルを Ctrl/Cmd+wheel と pinch の両方で連続的にズームできるようにするため（Issue #228）、新しい cross-platform `PlatformInput` variant を追加して Windows/Linux/テスト backend にも空の match アームを増やす代わりに、pinch を既存の `ScrollWheelEvent` ストリームへ最小限の変更で合流させる。
+
+- `window.rs`: `NSView` サブクラスに `magnifyWithEvent:` を追加登録し、既存の `scrollWheel:` などと同じ `handle_view_event` へ配送する。
+- `events.rs`: `NSEventTypeMagnify` を、`modifiers.control` を強制的に立てた `ScrollWheelEvent` として組み立てる。`-[NSEvent magnification]`（`cocoa` 0.26 の `NSEvent` トレイトには無いため直接 `msg_send!` で読む）はその1イベント分の相対倍率の増分で、Apple 自身のサンプルコードも `scale += event.magnification` という加算前提の量である。これを `PINCH_ZOOM_SCROLL_PIXELS_PER_UNIT`（600px = 倍率1.0分）で合成 `ScrollDelta::Pixels` に変換し、Hane 側の `crates/ui/src/view.rs` の `EditorView::on_scroll` が `ZOOM_WHEEL_SENSITIVITY_PX`（同じ 600px）で割り戻して元の倍率増分に復元する。2つの定数は対になっており、どちらかを変えるときはもう一方も合わせる。
+- 通常のマウス/トラックパッド `NSScrollWheel` は変更しない。`modifiers.control` を合成する pinch イベントは、実際に Ctrl キーが押された `NSScrollWheel` と全く同じ経路（`EditorView::on_scroll` の ctrl 分岐）を通る。
+
+### 検証
+
+`cocoa`/AppKit の実イベントは Rust 単体テストから送れないため、macOS 実機での GUI 検証（`.agents/skills/hane-gui-test`）で、トラックパッドの pinch アウト/インでメインパネルが連続的に拡大縮小し、指を離した位置の文書内容が画面上で大きくずれないことを確認する。`crates/ui/src/view.rs` 側の倍率計算・スナップ・アンカー・再レイアウトのロジックは、実際の `ScrollWheelEvent`（`modifiers.control = true`）を合成して駆動する通常の cargo test で検証する。

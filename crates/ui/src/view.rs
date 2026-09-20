@@ -99,6 +99,24 @@ const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 /// recent wheel/trackpad scroll or thumb drag before it fades back out.
 const SIDEBAR_SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(600);
 
+/// Issue #228: continuous main-panel zoom. Lower bound of 50%.
+const ZOOM_MIN: f32 = 0.5;
+/// Upper bound of 300%.
+const ZOOM_MAX: f32 = 3.0;
+/// `zoom_raw` within this distance of `1.0` (98%-102%) renders and lays out
+/// at exactly `1.0`. `zoom_raw` itself keeps accumulating every input delta
+/// unsnapped, so continuing to scroll/pinch in the same direction still
+/// carries it out of the band and un-snaps on the next frame, rather than
+/// getting stuck at 100%.
+const ZOOM_SNAP_EPSILON: f32 = 0.02;
+/// Pixels of normalized wheel delta that change `zoom_raw` by a full 1.0
+/// (100 percentage points). Also the synthetic-wheel-pixels-per-1.0-of-
+/// magnification convention `vendor/gpui/src/platform/mac/events.rs` uses to
+/// fold a trackpad pinch gesture into the same `ScrollWheelEvent` stream —
+/// keep the two in sync so a pinch and an equivalent ctrl/cmd+wheel scroll
+/// feel the same speed.
+const ZOOM_WHEEL_SENSITIVITY_PX: f32 = 600.0;
+
 #[derive(Clone, Copy, Debug)]
 struct SidebarResizeDrag {
     pointer_x: f32,
@@ -389,6 +407,20 @@ pub struct EditorView {
     heights: HeightIndex,
     scroll_y: f32,
     viewport_height: f32,
+    /// Issue #228: the main panel's continuous zoom accumulator, clamped to
+    /// `ZOOM_MIN..=ZOOM_MAX` but otherwise unsnapped. `self.theme.zoom` (and
+    /// the `line_height`/`line_horizontal_padding` it derives) is the
+    /// 100%-snapped value actually rendered and laid out with each frame;
+    /// keeping this raw value separate is what lets scrolling past the snap
+    /// band un-snap smoothly instead of sticking at 100%.
+    zoom_raw: f32,
+    /// Content-local y (relative to the top of the viewport, i.e. already
+    /// excluding the header) of the pointer or pinch center that drove the
+    /// zoom change queued for the next `render`, so that frame can keep the
+    /// document position under it from jumping as rows reflow. Consumed
+    /// (taken) by `render`; `None` means the next reflow anchors on the
+    /// viewport top instead, as it already did before zooming existed.
+    pending_zoom_anchor: Option<f32>,
     pub(crate) metrics: FrameMetrics,
     status: Option<String>,
     theme: Theme,
@@ -727,6 +759,8 @@ impl EditorView {
             heights,
             scroll_y: 0.0,
             viewport_height: theme.line_height,
+            zoom_raw: 1.0,
+            pending_zoom_anchor: None,
             metrics: FrameMetrics::new(METRICS_CAPACITY),
             status: None,
             theme,
@@ -2001,11 +2035,67 @@ impl EditorView {
 
     pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.settings.theme = self.settings.theme.next();
-        self.theme = resolve_theme(self.settings.theme, window.appearance());
+        self.theme = self.resolved_theme_for_zoom(window.appearance());
         self.block_cache.clear();
         self.layout_cache.clear();
         self.heights = HeightIndex::new(self.item_heights());
         self.store_settings();
+        cx.notify();
+    }
+
+    /// The 98%-102% snap band collapses `zoom_raw` to exactly `1.0`; outside
+    /// it the continuous value renders as-is. `zoom_raw` itself is never
+    /// snapped, so an ongoing scroll/pinch still carries it out of the band
+    /// on the next input instead of sticking at 100%.
+    fn effective_zoom(zoom_raw: f32) -> f32 {
+        if (zoom_raw - 1.0).abs() <= ZOOM_SNAP_EPSILON {
+            1.0
+        } else {
+            zoom_raw
+        }
+    }
+
+    /// The color/appearance theme with the current effective zoom baked into
+    /// `line_height`/`line_horizontal_padding`/`zoom`. Used by both `render`
+    /// (every frame) and `cycle_theme` (an explicit palette switch), so a
+    /// palette change never transiently resets the active zoom back to
+    /// 100%, and the frame right after it does not redundantly re-run the
+    /// cache invalidation `render`'s own zoom-aware comparison already
+    /// triggers.
+    fn resolved_theme_for_zoom(&self, appearance: gpui::WindowAppearance) -> Theme {
+        let mut theme = resolve_theme(self.settings.theme, appearance);
+        let zoom = Self::effective_zoom(self.zoom_raw);
+        theme.line_height *= zoom;
+        theme.line_horizontal_padding *= zoom;
+        theme.zoom = zoom;
+        theme
+    }
+
+    /// Applies one continuous zoom step from a ctrl/cmd+wheel scroll or a
+    /// trackpad pinch. `zoom_ratio` is added to the raw accumulator (an
+    /// AppKit pinch's own `magnification` is already this shape: the
+    /// relative change to add, not a multiplier), then clamped to
+    /// `ZOOM_MIN..=ZOOM_MAX`. `anchor_viewport_y` is the content-local y of
+    /// the pointer/pinch center driving the change, kept near its current
+    /// screen position across the reflow `render` performs next.
+    fn apply_zoom_delta(&mut self, zoom_delta: f32, anchor_viewport_y: f32, cx: &mut Context<Self>) {
+        let next = (self.zoom_raw + zoom_delta).clamp(ZOOM_MIN, ZOOM_MAX);
+        if next == self.zoom_raw {
+            return;
+        }
+        self.zoom_raw = next;
+        self.pending_zoom_anchor = Some(anchor_viewport_y.clamp(0.0, self.viewport_height.max(0.0)));
+        cx.notify();
+    }
+
+    /// Ctrl/Cmd+0: back to exactly 100%, anchored on the viewport top like
+    /// any other reflow that is not a pointer-driven zoom.
+    pub(crate) fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        if self.zoom_raw == 1.0 {
+            return;
+        }
+        self.zoom_raw = 1.0;
+        self.pending_zoom_anchor = None;
         cx.notify();
     }
 
@@ -2212,6 +2302,19 @@ impl EditorView {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Windows/Linux ctrl+wheel and a macOS trackpad pinch (synthesized as
+        // a ctrl-flagged `ScrollWheelEvent`; see `vendor/gpui/src/platform/
+        // mac/events.rs`'s `NSEventTypeMagnify` handling) both zoom instead
+        // of scrolling (issue #228). A fixed reference line height, not the
+        // current (possibly already zoomed) one, keeps the wheel's zoom
+        // speed independent of the zoom level already reached.
+        if event.modifiers.control {
+            let delta = event.delta.pixel_delta(px(DEFAULT_THEME.line_height));
+            let zoom_delta = f32::from(delta.y) / ZOOM_WHEEL_SENSITIVITY_PX;
+            let anchor_y = f32::from(event.position.y) - self.theme.header_height;
+            self.apply_zoom_delta(zoom_delta, anchor_y, cx);
+            return;
+        }
         let delta = event.delta.pixel_delta(px(self.theme.line_height));
         self.scroll_y = clamp_scroll_y(
             self.scroll_y - f32::from(delta.y),
@@ -2248,7 +2351,7 @@ impl EditorView {
             .iter()
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.theme.zoom);
         let visual_offset = layout.visual_at_x(visual, row_index, x, &shaper)?;
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
@@ -2328,7 +2431,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.theme.zoom);
         if self.move_vertical_by_layout(down, extend, &shaper) {
             self.after_input(cx);
         } else if down {
@@ -3683,7 +3786,28 @@ mod panel_layout_tests {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
-        let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
+        // Issue #228: capture which block and offset currently sit at the
+        // pointer/pinch center that drove a queued zoom change, against
+        // *this* frame's still-old-scale heights and scroll position. A
+        // zoom rescales every block's height by roughly the same ratio, so
+        // this has to run before `self.heights` is rebuilt for the new zoom
+        // below — reading `self.scroll_y` (still in the old scale) against
+        // heights already rebuilt at the new scale would land on the wrong
+        // block, off by close to the zoom ratio itself.
+        let zoom_reflow_anchor = self.pending_zoom_anchor.take().and_then(|anchor_viewport_offset| {
+            (self.granularity == Granularity::Blocks && !self.heights.is_empty()).then(|| {
+                let anchor_viewport_offset =
+                    anchor_viewport_offset.clamp(0.0, self.viewport_height.max(0.0));
+                let target_y = self.scroll_y + anchor_viewport_offset;
+                let ordinal = self.heights.block_at_y(target_y);
+                (
+                    ordinal,
+                    target_y - self.heights.prefix_sum(ordinal),
+                    anchor_viewport_offset,
+                )
+            })
+        });
+        let resolved_theme = self.resolved_theme_for_zoom(window.appearance());
         if resolved_theme != self.theme {
             self.theme = resolved_theme;
             self.block_cache.clear();
@@ -3713,7 +3837,7 @@ impl Render for EditorView {
             sidebar_width,
             self.theme.line_horizontal_padding,
         );
-        let shaper = WindowShaper::new(window);
+        let shaper = WindowShaper::new(window, self.theme.zoom);
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
             self.layout_font_revision = font_revision;
@@ -3763,11 +3887,24 @@ impl Render for EditorView {
         // room its rows actually need.
         let mut first_item = usize::MAX;
         let mut last_item = 0;
-        let height_anchor = (self.granularity == Granularity::Blocks && !self.heights.is_empty())
-            .then(|| {
+        // A queued zoom anchor (captured above, before the reflow) takes the
+        // block/offset it already resolved; any other reflow (edit, resize,
+        // sidebar toggle, palette switch) anchors on the viewport top, using
+        // this frame's already-rebuilt heights, exactly as before zooming
+        // existed.
+        let height_anchor = if let Some(anchor) = zoom_reflow_anchor {
+            // Only trust the pre-reflow anchor if this same frame did not
+            // also flip line/block granularity out from under it — the
+            // ordinal it names would otherwise mean two different things
+            // before and after.
+            (self.granularity == Granularity::Blocks && !self.heights.is_empty())
+                .then_some(anchor)
+        } else {
+            (self.granularity == Granularity::Blocks && !self.heights.is_empty()).then(|| {
                 let ordinal = self.heights.block_at_y(self.scroll_y);
-                (ordinal, self.scroll_y - self.heights.prefix_sum(ordinal))
-            });
+                (ordinal, self.scroll_y - self.heights.prefix_sum(ordinal), 0.0)
+            })
+        };
         self.line_owners.clear();
         for (ordinal, visual, layout) in &rendered {
             match self.granularity {
@@ -3797,13 +3934,13 @@ impl Render for EditorView {
         // Measuring wrapped rows can correct blocks above the viewport. Keep the
         // same block and the same position inside it at the top instead of
         // letting those corrections visibly move the document.
-        if let Some((old_ordinal, intra)) = height_anchor {
+        if let Some((old_ordinal, intra, anchor_viewport_offset)) = height_anchor {
             let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
             let inside = self
                 .heights
                 .height(ordinal)
                 .map_or(0.0, |height| intra.clamp(0.0, height));
-            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+            self.scroll_y = self.heights.prefix_sum(ordinal) + inside - anchor_viewport_offset;
         }
         // A newly measured block can shrink at the old bottom. Anchoring
         // preserves its block-relative position, which can now sit below the
@@ -7144,7 +7281,7 @@ mod tests {
         cx.update(|window, app| {
             view.read_with(app, |editor_view, _| {
                 let visual = editor_view.rendered_line(line).expect("line rendered");
-                let shaper = WindowShaper::new(window);
+                let shaper = WindowShaper::new(window, editor_view.theme.zoom);
                 let expected = source_offset_for_visual_position(
                     editor_view.editor(),
                     line,
@@ -7723,6 +7860,291 @@ mod tests {
         assert!(!continued);
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+        });
+    }
+
+    // Issue #228: continuous main-panel zoom.
+
+    #[test]
+    fn effective_zoom_snaps_within_98_to_102_percent_but_stays_continuous_outside_it() {
+        assert_eq!(EditorView::effective_zoom(1.0), 1.0);
+        assert_eq!(EditorView::effective_zoom(0.98), 1.0);
+        assert_eq!(EditorView::effective_zoom(1.02), 1.0);
+        assert_eq!(EditorView::effective_zoom(0.97), 0.97);
+        assert_eq!(EditorView::effective_zoom(1.03), 1.03);
+        assert_eq!(EditorView::effective_zoom(2.5), 2.5);
+    }
+
+    #[gpui::test]
+    fn apply_zoom_delta_clamps_to_50_to_300_percent(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("text", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.apply_zoom_delta(-10.0, 0.0, cx);
+            assert_eq!(view.zoom_raw, ZOOM_MIN);
+            view.apply_zoom_delta(10.0, 0.0, cx);
+            assert_eq!(view.zoom_raw, ZOOM_MAX);
+        });
+    }
+
+    #[gpui::test]
+    fn reset_zoom_returns_to_exactly_100_percent(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("text", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.apply_zoom_delta(1.0, 0.0, cx);
+            assert!(view.zoom_raw > 1.0);
+            view.reset_zoom(cx);
+            assert_eq!(view.zoom_raw, 1.0);
+            assert_eq!(view.pending_zoom_anchor, None);
+        });
+    }
+
+    #[gpui::test]
+    fn zoom_un_snaps_from_100_percent_when_input_continues_in_the_same_direction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("text", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            // Land `zoom_raw` inside the 98%-102% snap band by a clearly
+            // non-boundary margin. It renders at exactly 100%, but must not
+            // itself have been rewritten to exactly 1.0: `apply_zoom_delta`
+            // always accumulates onto `zoom_raw`, never onto the snapped
+            // value, which is what lets zooming the same way keep going
+            // instead of sticking at 100% forever.
+            view.zoom_raw = 1.01;
+            assert_eq!(EditorView::effective_zoom(view.zoom_raw), 1.0);
+
+            view.apply_zoom_delta(0.05, 0.0, cx);
+            assert!(
+                EditorView::effective_zoom(view.zoom_raw) > 1.02,
+                "continuing to zoom the same way must un-snap, not stay pinned at 100%"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn zoom_does_not_affect_sidebar_or_header_geometry(cx: &mut gpui::TestAppContext) {
+        let (view, cx, root) = open_view_for_mouse_tests(cx, "text", false);
+        assert!(root.is_none());
+        let (header_before, sidebar_before) = view.read_with(cx, |view, _| {
+            (view.theme.header_height, view.theme.sidebar_width)
+        });
+
+        view.update(cx, |view, cx| view.apply_zoom_delta(1.0, 0.0, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.theme.zoom - 2.0).abs() < 1e-4,
+                "zoom must have changed for this test to be meaningful"
+            );
+            assert_eq!(view.theme.header_height, header_before);
+            assert_eq!(view.theme.sidebar_width, sidebar_before);
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_wheel_zooms_instead_of_scrolling_and_plain_wheel_only_scrolls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..60)
+            .map(|n| format!("paragraph {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        let (header_height, zoom_before) =
+            view.read_with(cx, |view, _| (view.theme.header_height, view.zoom_raw));
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(100.0), px(header_height + 50.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(900.0))),
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            },
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let (scroll_after_ctrl, zoom_after_ctrl) =
+            view.read_with(cx, |view, _| (view.scroll_y, view.zoom_raw));
+        assert!(
+            zoom_after_ctrl > zoom_before,
+            "ctrl+wheel must zoom in, not leave the zoom level unchanged"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(100.0), px(header_height + 50.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let (scroll_after_plain, zoom_after_plain) =
+            view.read_with(cx, |view, _| (view.scroll_y, view.zoom_raw));
+        assert_eq!(
+            zoom_after_plain, zoom_after_ctrl,
+            "a plain wheel scroll must not change the zoom level"
+        );
+        assert!(
+            scroll_after_plain > scroll_after_ctrl,
+            "a plain wheel scroll must still move the document"
+        );
+    }
+
+    #[gpui::test]
+    fn zoom_reflows_wrapping_in_real_time_not_just_a_visual_scale(cx: &mut gpui::TestAppContext) {
+        let text = "wrap word wrap word wrap word wrap word wrap word wrap word";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        assert!(root.is_none());
+        assert!(
+            cx.debug_bounds("row-0-1").is_none(),
+            "the line must fit on a single row at 100% zoom for this test to be meaningful"
+        );
+
+        view.update(cx, |view, cx| view.apply_zoom_delta(1.5, 0.0, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.theme.zoom - 2.5).abs() < 1e-4,
+                "zoom must have reached 250% for this test to be meaningful"
+            );
+        });
+        assert!(
+            cx.debug_bounds("row-0-1").is_some(),
+            "zooming in must re-wrap the line into a second row, not just scale the glyphs"
+        );
+
+        view.update(cx, |view, cx| view.apply_zoom_delta(-1.5, 0.0, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("row-0-1").is_none(),
+            "zooming back out must un-wrap the line, not leave a stale extra row behind"
+        );
+    }
+
+    #[gpui::test]
+    fn zoom_keeps_the_pointer_anchored_document_position_from_jumping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..60)
+            .map(|n| format!("paragraph {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        // Scroll partway into the document first, so the anchor under test
+        // is not the trivial top-of-document case.
+        view.update(cx, |view, cx| {
+            view.scroll_y = 400.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let (header_height, viewport_height, scroll_before) = view.read_with(cx, |view, _| {
+            (view.theme.header_height, view.viewport_height, view.scroll_y)
+        });
+        let anchor_offset = (viewport_height / 2.0).min(200.0);
+        let ordinal_before = view.read_with(cx, |view, _| {
+            view.heights.block_at_y(scroll_before + anchor_offset)
+        });
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(100.0), px(header_height + anchor_offset)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(900.0))),
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            },
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.theme.zoom - 2.5).abs() < 1e-4,
+                "ctrl+wheel must have zoomed in for this test to be meaningful"
+            );
+            let ordinal_after = view.heights.block_at_y(view.scroll_y + anchor_offset);
+            assert_eq!(
+                ordinal_after, ordinal_before,
+                "the paragraph under the pointer must stay under it across the zoom reflow"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn zoom_reflows_correctly_with_the_sidebar_open(cx: &mut gpui::TestAppContext) {
+        let text = "wrap word wrap word wrap word wrap word wrap word wrap word";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, true);
+        assert!(root.is_some());
+        assert!(
+            cx.debug_bounds("row-0-1").is_none(),
+            "the line must fit on a single row at 100% zoom with the sidebar open, \
+             for this test to be meaningful"
+        );
+        let sidebar_before = view.read_with(cx, |view, _| view.theme.sidebar_width);
+
+        view.update(cx, |view, cx| view.apply_zoom_delta(1.5, 0.0, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.theme.zoom - 2.5).abs() < 1e-4,
+                "zoom must have reached 250% for this test to be meaningful"
+            );
+            assert_eq!(
+                view.theme.sidebar_width, sidebar_before,
+                "the sidebar must stay its own fixed width while the main panel zooms"
+            );
+        });
+        assert!(
+            cx.debug_bounds("row-0-1").is_some(),
+            "zooming in must re-wrap against the sidebar-narrowed column, not just scale the glyphs"
+        );
+    }
+
+    #[gpui::test]
+    fn zoom_keeps_virtualization_bounded_in_a_long_document(cx: &mut gpui::TestAppContext) {
+        let paragraph_count = 4_000;
+        let text = (0..paragraph_count)
+            .map(|n| format!("paragraph {n}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, root) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(root.is_none());
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.granularity,
+                Granularity::Blocks,
+                "the block index must be ready for this test to be meaningful"
+            );
+            assert_eq!(view.heights.len(), paragraph_count);
+        });
+
+        view.update(cx, |view, cx| view.apply_zoom_delta(1.5, 0.0, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                (view.theme.zoom - 2.5).abs() < 1e-4,
+                "zoom must have reached 250% for this test to be meaningful"
+            );
+            assert_eq!(
+                view.heights.len(),
+                paragraph_count,
+                "the height index still tracks every block after a zoom-driven reflow"
+            );
+            assert!(
+                view.block_cache.len() < paragraph_count / 10,
+                "a zoom-driven reflow must not eagerly materialize every block in a long \
+                 document, only the ones near the viewport"
+            );
         });
     }
 }

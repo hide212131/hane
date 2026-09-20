@@ -8,7 +8,16 @@ use hane_session::ThemePreference;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Theme {
+    /// Row height for one physical/wrapped line of the main document panel.
+    /// `EditorView::render` bakes the panel's current continuous zoom level
+    /// (issue #228) into this value every frame, so the existing
+    /// theme-changed comparison in `render` also invalidates the block and
+    /// layout caches on a zoom change, the same way it already does on a
+    /// light/dark switch. The sidebar and header use their own fixed
+    /// constants and never read this field, so they are never zoomed.
     pub line_height: f32,
+    /// Horizontal margin of the main document column. Zoomed the same way
+    /// as `line_height` above; see its doc comment.
     pub line_horizontal_padding: f32,
     pub header_height: f32,
     pub overscan: f32,
@@ -27,6 +36,14 @@ pub(crate) struct Theme {
     pub sidebar_background: u32,
     pub sidebar_foreground: u32,
     pub sidebar_active_background: u32,
+    /// The main panel's current continuous zoom level (issue #228), where
+    /// `1.0` is 100%, already snapped to exactly `1.0` near the 98%-102%
+    /// band. Threaded through `Theme` — rather than as a separate parameter
+    /// — so every call already taking a `Theme`, in particular `line.rs`'s
+    /// block/row text sizing, scales its glyphs by the same factor
+    /// `line_height`/`line_horizontal_padding` above were scaled by,
+    /// without those call sites' own signatures changing.
+    pub zoom: f32,
 }
 
 pub(crate) const DEFAULT_THEME: Theme = Theme {
@@ -49,6 +66,7 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     sidebar_background: 0xf0ede7,
     sidebar_foreground: 0x262626,
     sidebar_active_background: 0xe0dcd3,
+    zoom: 1.0,
 };
 
 pub(crate) const DARK_THEME: Theme = Theme {
@@ -71,6 +89,7 @@ pub(crate) const DARK_THEME: Theme = Theme {
     sidebar_background: 0x18191b,
     sidebar_foreground: 0xe8e5df,
     sidebar_active_background: 0x2c2d30,
+    zoom: 1.0,
 };
 
 pub(crate) fn resolve_theme(preference: ThemePreference, appearance: WindowAppearance) -> Theme {

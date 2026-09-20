@@ -243,6 +243,64 @@ impl PlatformInput {
                         modifiers: read_modifiers(native_event),
                     })
                 }),
+                // Hane issue #228: a macOS trackpad pinch is delivered as its
+                // own AppKit gesture, `-[NSResponder magnifyWithEvent:]`,
+                // never as an `NSScrollWheel`. Adding a dedicated
+                // cross-platform `PlatformInput` variant for one gesture
+                // that only exists on this one backend would make every
+                // other platform's `PlatformInput` match arms (and the
+                // Windows/Linux/test backends) responsible for a case that
+                // can never fire there. Folding it into the same
+                // `ScrollWheelEvent` a Ctrl/Cmd+wheel zoom already produces,
+                // with `control` forced on, is the minimal change that
+                // reaches Hane's existing zoom handling (`EditorView::
+                // on_scroll` in `crates/ui/src/view.rs`) without widening
+                // any cross-platform surface.
+                NSEventType::NSEventTypeMagnify => window_height.map(|window_height| {
+                    let phase = match native_event.phase() {
+                        NSEventPhase::NSEventPhaseMayBegin | NSEventPhase::NSEventPhaseBegan => {
+                            TouchPhase::Started
+                        }
+                        NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                        _ => TouchPhase::Moved,
+                    };
+
+                    // `-[NSEvent magnification]` is AppKit's own convention
+                    // for one increment of a pinch: the relative scale to
+                    // *add* this event, not a multiplier (Apple's own sample
+                    // code is literally `scale += event.magnification`).
+                    // `cocoa` 0.26's `NSEvent` trait does not expose it, so
+                    // it is read directly.
+                    let magnification: f64 = msg_send![native_event, magnification];
+
+                    // `PINCH_ZOOM_SCROLL_PIXELS_PER_UNIT` synthetic pixels of
+                    // delta stand for one full 1.0 (100 percentage points)
+                    // of magnification. Keep this in sync with
+                    // `ZOOM_WHEEL_SENSITIVITY_PX` in `crates/ui/src/view.rs`,
+                    // which divides a `ScrollWheelEvent`'s delta by the same
+                    // constant to recover a zoom fraction — so a pinch and
+                    // an equivalent Ctrl/Cmd+wheel scroll feel the same
+                    // speed, and `magnification` round-trips back out
+                    // exactly.
+                    const PINCH_ZOOM_SCROLL_PIXELS_PER_UNIT: f32 = 600.0;
+                    let delta = ScrollDelta::Pixels(point(
+                        px(0.0),
+                        px(magnification as f32 * PINCH_ZOOM_SCROLL_PIXELS_PER_UNIT),
+                    ));
+
+                    Self::ScrollWheel(ScrollWheelEvent {
+                        position: point(
+                            px(native_event.locationInWindow().x as f32),
+                            window_height - px(native_event.locationInWindow().y as f32),
+                        ),
+                        delta,
+                        touch_phase: phase,
+                        modifiers: Modifiers {
+                            control: true,
+                            ..read_modifiers(native_event)
+                        },
+                    })
+                }),
                 NSEventType::NSLeftMouseDragged
                 | NSEventType::NSRightMouseDragged
                 | NSEventType::NSOtherMouseDragged => {
