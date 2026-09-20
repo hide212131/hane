@@ -133,6 +133,32 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
 
+    def test_helper_find_colors_accepts_bounded_expected_regions(self):
+        expected = mod.DATE_BADGE_BACKGROUND_BY_RANGE["this_week"]
+        payload = json.dumps({
+            "matches": [{
+                "bounding_box": {"minX": 0.1, "maxX": 0.2, "minY": 0.5, "maxY": 0.53},
+                "rgb": [0x35, 0x6D, 0x94],
+                "pixel_count": 120,
+            }],
+            "rgb": [0x35, 0x6D, 0x94],
+            "tolerance": 3,
+            "source_size": {"width": 960, "height": 680},
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "helper"
+            helper.write_bytes(b"trusted")
+            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            with patch.object(
+                mod.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, payload, ""),
+            ):
+                matches = mod.helper_find_colors(
+                    helper, digest, Path(directory) / "shot.png", expected
+                )
+        self.assertEqual(matches[0]["pixel_count"], 120)
+
     def test_validate_preprocessing_evidence_accepts_valid_evidence(self):
         # Should not raise, and unknown extra fields are forward-compatible.
         mod.validate_preprocessing_evidence({

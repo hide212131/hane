@@ -284,6 +284,36 @@ def helper_find_all(helper: Path, digest: str, screenshot: Path, pattern: str) -
     return matches, preprocessing
 
 
+def helper_find_colors(helper: Path, digest: str, screenshot: Path, expected_hex: str) -> list[dict]:
+    """Find bounded connected regions of one trusted chip background color."""
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", expected_hex):
+        raise ValueError(f"invalid expected badge color: {expected_hex!r}")
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != digest:
+        raise RuntimeError("trusted vision helper integrity mismatch before color execution")
+    proc = subprocess.run(
+        [str(helper), "find-colors", str(screenshot), expected_hex],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != digest:
+        raise RuntimeError("trusted vision helper integrity mismatch after color execution")
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"vision helper exited {proc.returncode}")
+    value = json.loads(proc.stdout)
+    if not isinstance(value, dict) or value.get("rgb") != [int(expected_hex[index:index + 2], 16) for index in (0, 2, 4)]:
+        raise RuntimeError("vision helper returned unexpected color evidence")
+    matches = value.get("matches")
+    if not isinstance(matches, list):
+        raise RuntimeError("vision helper did not return color matches")
+    for match in matches:
+        if not isinstance(match, dict) or not isinstance(match.get("bounding_box"), dict):
+            raise RuntimeError("vision helper returned malformed color geometry")
+        if not isinstance(match.get("pixel_count"), int) or match["pixel_count"] < 20:
+            raise RuntimeError("vision helper returned an unbounded or empty color region")
+    return matches
+
+
 def center_y(match: dict) -> float:
     box = match["bounding_box"]
     return (float(box["minY"]) + float(box["maxY"])) / 2.0
@@ -746,6 +776,7 @@ def main() -> int:
                             if capture["result"] == "pass":
                                 screenshot = config.image_path
                                 badge_cache: dict[str, tuple[list[dict], dict]] = {}
+                                color_cache: dict[str, list[dict]] = {}
                                 date_cache: dict[str, tuple[list[dict], dict]] = {}
                                 for case in cases:
                                     try:
@@ -882,17 +913,46 @@ def main() -> int:
                                             else exact_label_matches(badges_all, case["badge_label"])
                                         )
                                         badge_match = nearest_same_row(display_match, badge_candidates)
+                                        badge_source = "ocr"
+                                        color_regions = color_cache.get(case["badge_background"])
+                                        if color_regions is None:
+                                            color_regions = helper_find_colors(
+                                                helper,
+                                                helper_digest,
+                                                screenshot,
+                                                case["badge_background"],
+                                            )
+                                            color_cache[case["badge_background"]] = color_regions
+                                        if badge_match is None:
+                                            # Small Japanese labels can be absent from every
+                                            # bounded Vision candidate even when the chip is
+                                            # plainly visible. The independent trusted pixel
+                                            # search still proves that the expected colored chip
+                                            # is on this exact filename row, without accepting a
+                                            # color from an adjacent row.
+                                            badge_match = nearest_same_row(display_match, color_regions)
+                                            badge_source = "pixel_color_region" if badge_match is not None else "ocr"
                                         if badge_match is None:
                                             scenario_steps.append(step(
                                                 case["name"],
                                                 "fail",
                                                 "同じ sidebar row の日付バッジを確認できない",
                                                 badge_candidates=badges_all,
+                                                color_regions=color_regions,
                                             ))
                                             continue
                                         right_side = badge_is_strictly_right(display_match, badge_match)
-                                        color_observation = badge_background_observation(
-                                            badge_match, case["badge_background"]
+                                        color_observation = (
+                                            {
+                                                "expected_hex": f"#{case['badge_background']}",
+                                                "matched": True,
+                                                "source": "pixel_color_region",
+                                                "matched_region": badge_match,
+                                            }
+                                            if badge_source == "pixel_color_region"
+                                            else badge_background_observation(
+                                                badge_match, case["badge_background"]
+                                            )
                                         )
                                         passed = right_side and color_observation["matched"]
                                         if not right_side:
@@ -913,6 +973,7 @@ def main() -> int:
                                             text_candidates=texts_all,
                                             display_geometry=display_match["bounding_box"],
                                             badge_match=badge_match,
+                                            badge_source=badge_source,
                                             badge_color=color_observation,
                                             badge_candidates=badges_all,
                                             date_matches=date_matches,

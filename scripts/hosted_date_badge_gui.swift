@@ -165,21 +165,24 @@ func loadCGImage(_ path: String) -> CGImage {
 // expose the chip's interior without treating a full-row average as color
 // evidence. The result is bounded and diagnostic only: the Python validator
 // decides whether the observed color matches the trusted palette.
+func renderedRGBAContext(_ image: CGImage) -> CGContext? {
+    let context = CGContext(
+        data: nil,
+        width: image.width,
+        height: image.height,
+        bitsPerComponent: 8,
+        bytesPerRow: image.width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+    )
+    context?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return context
+}
+
 func sampledColors(_ image: CGImage, rect: CGRect) -> [[String: Any]] {
     let width = image.width
     let height = image.height
-    guard let context = CGContext(
-        data: nil,
-        width: width,
-        height: height,
-        bitsPerComponent: 8,
-        bytesPerRow: width * 4,
-        space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
-    ) else {
-        return []
-    }
-    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    guard let context = renderedRGBAContext(image) else { return [] }
     guard let rawData = context.data else {
         return []
     }
@@ -213,6 +216,95 @@ func sampledColors(_ image: CGImage, rect: CGRect) -> [[String: Any]] {
         .sorted { lhs, rhs in lhs.count > rhs.count }
         .prefix(8)
         .map { ["rgb": $0.rgb, "count": $0.count] }
+}
+
+func findColors(_ path: String, _ hex: String) {
+    guard hex.count == 6, let expected = Int(hex, radix: 16) else {
+        fail("invalid RGB hex color: \(hex)")
+    }
+    let expectedRGB = [
+        (expected >> 16) & 0xff,
+        (expected >> 8) & 0xff,
+        expected & 0xff,
+    ]
+    let image = loadCGImage(path)
+    guard let context = renderedRGBAContext(image), let rawData = context.data else {
+        fail("could not prepare screenshot pixels for color search")
+    }
+    let bytes = rawData.assumingMemoryBound(to: UInt8.self)
+    let width = image.width
+    let height = image.height
+    let tolerance = 3
+    var visited = Array(repeating: false, count: width * height)
+    var components: [[String: Any]] = []
+
+    func matches(_ x: Int, _ y: Int) -> Bool {
+        let offset = y * context.bytesPerRow + x * 4
+        return abs(Int(bytes[offset]) - expectedRGB[0]) <= tolerance
+            && abs(Int(bytes[offset + 1]) - expectedRGB[1]) <= tolerance
+            && abs(Int(bytes[offset + 2]) - expectedRGB[2]) <= tolerance
+    }
+
+    for y in 0..<height {
+        for x in 0..<width {
+            let index = y * width + x
+            if visited[index] || !matches(x, y) {
+                continue
+            }
+            visited[index] = true
+            var pending = [(x, y)]
+            var minX = x
+            var maxX = x
+            var minY = y
+            var maxY = y
+            var count = 0
+            while let (currentX, currentY) = pending.popLast() {
+                count += 1
+                minX = min(minX, currentX)
+                maxX = max(maxX, currentX)
+                minY = min(minY, currentY)
+                maxY = max(maxY, currentY)
+                for (nextX, nextY) in [
+                    (currentX - 1, currentY),
+                    (currentX + 1, currentY),
+                    (currentX, currentY - 1),
+                    (currentX, currentY + 1),
+                ] where nextX >= 0 && nextX < width && nextY >= 0 && nextY < height {
+                    let nextIndex = nextY * width + nextX
+                    if !visited[nextIndex] && matches(nextX, nextY) {
+                        visited[nextIndex] = true
+                        pending.append((nextX, nextY))
+                    }
+                }
+            }
+            // Tiny antialiased fragments are not chip evidence. A real badge
+            // interior is a much larger connected component.
+            if count >= 20 {
+                components.append([
+                    "bounding_box": [
+                        "minX": Double(minX) / Double(width),
+                        "maxX": Double(maxX + 1) / Double(width),
+                        "minY": 1.0 - Double(maxY + 1) / Double(height),
+                        "maxY": 1.0 - Double(minY) / Double(height),
+                    ],
+                    "rgb": expectedRGB,
+                    "pixel_count": count,
+                ])
+            }
+        }
+    }
+    let payload: [String: Any] = [
+        "matches": components,
+        "rgb": expectedRGB,
+        "tolerance": tolerance,
+        "source_size": ["width": width, "height": height],
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        fail("could not encode screenshot color evidence as JSON")
+    }
+    print(json)
 }
 
 func findAllText(_ path: String, _ pattern: String) {
@@ -317,7 +409,10 @@ func findAllText(_ path: String, _ pattern: String) {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-guard arguments.count == 3, arguments[0] == "find-all" else {
-    fail("usage: hosted_date_badge_gui.swift find-all <screenshot> <regex>")
+if arguments.count == 3, arguments[0] == "find-all" {
+    findAllText(arguments[1], arguments[2])
+} else if arguments.count == 3, arguments[0] == "find-colors" {
+    findColors(arguments[1], arguments[2])
+} else {
+    fail("usage: hosted_date_badge_gui.swift find-all <screenshot> <regex> | find-colors <screenshot> <rrggbb>")
 }
-findAllText(arguments[1], arguments[2])
