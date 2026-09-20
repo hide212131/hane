@@ -6362,11 +6362,11 @@ fn file_name_label(
     }
 }
 
-const DATE_BADGE_TODAY_BACKGROUND: u32 = 0x467ba2;
-const DATE_BADGE_THIS_WEEK_BACKGROUND: u32 = 0x3e7398;
-const DATE_BADGE_THIS_MONTH_BACKGROUND: u32 = 0x376b8f;
-const DATE_BADGE_THIS_YEAR_BACKGROUND: u32 = 0x306386;
-const DATE_BADGE_OTHER_BACKGROUND: u32 = 0x285b7c;
+const DATE_BADGE_TODAY_BACKGROUND: u32 = 0x44779e;
+const DATE_BADGE_THIS_WEEK_BACKGROUND: u32 = 0x356d94;
+const DATE_BADGE_THIS_MONTH_BACKGROUND: u32 = 0x2e6287;
+const DATE_BADGE_THIS_YEAR_BACKGROUND: u32 = 0x285878;
+const DATE_BADGE_OTHER_BACKGROUND: u32 = 0x214c68;
 const DATE_BADGE_FOREGROUND: u32 = 0xf7fbff;
 
 fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
@@ -6381,7 +6381,10 @@ fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
 
 /// A small rounded chip for one badge-worthy date. Its background follows
 /// Hane's feather blues: today is the brightest tier, then the same week,
-/// month, year, and finally all other dates become progressively darker.
+/// month, year, and finally all other dates become progressively darker. The
+/// luminance steps are intentionally wider than the original palette so the
+/// order remains legible on a small sidebar chip while the light foreground
+/// still has sufficient contrast on every tier.
 fn date_badge_chip(date: CalendarDate, today: CalendarDate, _theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
@@ -6588,6 +6591,56 @@ mod tests {
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
+
+    fn relative_luminance(color: u32) -> f32 {
+        fn linear_channel(channel: u32) -> f32 {
+            let srgb = ((channel & 0xff) as f32) / 255.0;
+            if srgb <= 0.04045 {
+                srgb / 12.92
+            } else {
+                ((srgb + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        0.2126 * linear_channel(color >> 16)
+            + 0.7152 * linear_channel(color >> 8)
+            + 0.0722 * linear_channel(color)
+    }
+
+    #[test]
+    fn date_badge_palette_has_visible_steps_and_readable_light_text() {
+        let backgrounds = [
+            DATE_BADGE_TODAY_BACKGROUND,
+            DATE_BADGE_THIS_WEEK_BACKGROUND,
+            DATE_BADGE_THIS_MONTH_BACKGROUND,
+            DATE_BADGE_THIS_YEAR_BACKGROUND,
+            DATE_BADGE_OTHER_BACKGROUND,
+        ];
+        let luminances: Vec<_> = backgrounds
+            .iter()
+            .map(|&background| relative_luminance(background))
+            .collect();
+
+        for pair in luminances.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "date badge palette must darken in proximity order: {pair:?}"
+            );
+            assert!(
+                pair[0] - pair[1] >= 0.02,
+                "adjacent date badge colors are too close: {pair:?}"
+            );
+        }
+
+        let foreground_luminance = relative_luminance(DATE_BADGE_FOREGROUND);
+        for (&background, &background_luminance) in backgrounds.iter().zip(&luminances) {
+            let contrast = (foreground_luminance + 0.05) / (background_luminance + 0.05);
+            assert!(
+                contrast >= 4.5,
+                "date badge foreground contrast is too low for {background:#08x}: {contrast:.2}"
+            );
+        }
+    }
 
     #[test]
     fn layout_cache_key_rejects_each_geometry_input_independently() {

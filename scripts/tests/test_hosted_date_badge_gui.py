@@ -35,7 +35,7 @@ VALID_PREPROCESSING_EVIDENCE = {
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/6")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/7")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -819,6 +819,21 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertTrue(mod.badge_is_strictly_right(text, separated))
         self.assertFalse(mod.badge_is_strictly_right(text, overlapping))
 
+    def test_badge_background_requires_the_expected_palette_color(self):
+        expected = mod.DATE_BADGE_BACKGROUND_BY_RANGE["this_week"]
+        observed = {
+            "sampled_colors": [
+                {"rgb": [0x35, 0x6D, 0x94], "count": 18},
+                {"rgb": [0xF7, 0xFB, 0xFF], "count": 5},
+            ]
+        }
+        result = mod.badge_background_observation(observed, expected)
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["matched_sample"]["rgb"], [0x35, 0x6D, 0x94])
+
+        wrong = dict(observed, sampled_colors=[{"rgb": [0x3E, 0x73, 0x98], "count": 18}])
+        self.assertFalse(mod.badge_background_observation(wrong, expected)["matched"])
+
     def test_fixture_names_cover_required_shapes(self):
         with tempfile.TemporaryDirectory() as tmp:
             before, cases = mod.make_fixtures(Path(tmp) / "work-folder")
@@ -827,6 +842,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 names,
                 {
                     "date_at_start",
+                    "date_in_week",
                     "date_in_middle",
                     "date_at_end",
                     "one_digit_month_day",
@@ -856,6 +872,8 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
 
         self.assertEqual(by_name["date_at_start"]["date_token"], "2026-09-17")
         self.assertEqual(by_name["date_at_start"]["badge_label"], "本日")
+        self.assertEqual(by_name["date_in_week"]["date_token"], "2026-09-16")
+        self.assertEqual(by_name["date_in_week"]["badge_label"], "16日(水)")
         self.assertEqual(by_name["date_in_middle"]["date_token"], "2026-09-01")
         self.assertEqual(by_name["date_in_middle"]["badge_label"], "1日(火)")
         self.assertEqual(by_name["one_digit_month_day"]["date_token"], "2026-1-2")
@@ -864,6 +882,10 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(by_name["date_at_end"]["badge_label"], "'25/9/2")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["date_token"], "2026-09-17")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["badge_label"], "本日")
+        self.assertEqual(
+            {case["badge_range"] for case in cases},
+            {"today", "this_week", "this_month", "this_year", "other"},
+        )
 
         labels = [case["badge_label"] for case in cases]
         shapes = set()

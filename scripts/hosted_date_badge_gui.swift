@@ -159,6 +159,62 @@ func loadCGImage(_ path: String) -> CGImage {
     return image
 }
 
+// Sample a padded region around an OCR match in the raw screenshot. The
+// Vision box is text-tight, while the product chip has horizontal padding and
+// rounded corners; the most frequent RGB values in this small region therefore
+// expose the chip's interior without treating a full-row average as color
+// evidence. The result is bounded and diagnostic only: the Python validator
+// decides whether the observed color matches the trusted palette.
+func sampledColors(_ image: CGImage, rect: CGRect) -> [[String: Any]] {
+    let width = image.width
+    let height = image.height
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        return []
+    }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    guard let rawData = context.data else {
+        return []
+    }
+
+    let padding = 4
+    let minX = max(0, Int(floor(rect.minX * CGFloat(width))) - padding)
+    let maxX = min(width, Int(ceil(rect.maxX * CGFloat(width))) + padding)
+    // Vision uses a bottom-left normalized origin; the screenshot pixels use
+    // the top-left origin used by CGImage's display coordinates.
+    let minY = max(0, Int(floor((1.0 - rect.maxY) * CGFloat(height))) - padding)
+    let maxY = min(height, Int(ceil((1.0 - rect.minY) * CGFloat(height))) + padding)
+    guard minX < maxX, minY < maxY else {
+        return []
+    }
+
+    let bytes = rawData.assumingMemoryBound(to: UInt8.self)
+    var counts: [String: (rgb: [Int], count: Int)] = [:]
+    for y in minY..<maxY {
+        for x in minX..<maxX {
+            let offset = y * context.bytesPerRow + x * 4
+            let rgb = [Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2])]
+            let key = "\(rgb[0]),\(rgb[1]),\(rgb[2])"
+            if let current = counts[key] {
+                counts[key] = (rgb: current.rgb, count: current.count + 1)
+            } else {
+                counts[key] = (rgb: rgb, count: 1)
+            }
+        }
+    }
+    return counts.values
+        .sorted { lhs, rhs in lhs.count > rhs.count }
+        .prefix(8)
+        .map { ["rgb": $0.rgb, "count": $0.count] }
+}
+
 func findAllText(_ path: String, _ pattern: String) {
     // The raw screenshot on disk (`path`) remains the authoritative visual
     // evidence untouched by this helper; only an in-memory crop of it is
@@ -226,6 +282,7 @@ func findAllText(_ path: String, _ pattern: String) {
                     "observation_index": observationIndex,
                     "candidate_rank": rank,
                     "confidence": Double(candidate.confidence),
+                    "sampled_colors": sampledColors(sourceImage, rect: rect),
                 ])
             }
         }

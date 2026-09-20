@@ -25,10 +25,11 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/6"
+PROCEDURE_VERSION = "hosted-date-badge/7"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
-    "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
+    "Issue #248 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
+    "5段階の色差、明るさ順、文字の視認性、配置を実画面で確認する。"
     "hosted-gui-interaction/7 の包括的 GUI 検証合格を意味しない。"
 )
 EXIT_PASS = 0
@@ -37,6 +38,19 @@ EXIT_NONPASS = 1
 # or ~0.032 in Vision-normalized coordinates. Keep this below half a row so a
 # same-label badge on an adjacent row can never satisfy the same-row match.
 SAME_ROW_CENTER_Y_TOLERANCE = 0.014
+# These values are a trusted copy of the product palette in
+# `crates/ui/src/view.rs`. Keeping them fixed here makes the GUI check detect
+# an accidental loss of the intended five visible tiers instead of merely
+# proving that every row has some colored rectangle behind its text.
+DATE_BADGE_BACKGROUND_BY_RANGE = {
+    "today": "44779e",
+    "this_week": "356d94",
+    "this_month": "2e6287",
+    "this_year": "285878",
+    "other": "214c68",
+}
+DATE_BADGE_COLOR_TOLERANCE = 8
+DATE_BADGE_MIN_MATCHING_PIXELS = 4
 
 
 def load_gui_validate(control_dir: Path):
@@ -454,6 +468,50 @@ def badge_is_strictly_right(text_match: dict, badge_match: dict) -> bool:
     return float(badge_box["minX"]) >= float(text_box["maxX"])
 
 
+def badge_background_observation(match: dict, expected_hex: str) -> dict:
+    """Check the rendered chip background around a Vision badge match.
+
+    The trusted Swift helper samples a small padded area around each OCR match
+    and returns its most frequent RGB colors. A chip's interior should contain
+    several pixels close to the exact product background even though its text
+    and rounded corners introduce antialiased pixels. The check is deliberately
+    based on bounded pixel evidence rather than an average, so white glyphs or
+    the sidebar background cannot hide a wrong badge color.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", expected_hex):
+        raise ValueError(f"invalid expected badge color: {expected_hex!r}")
+    expected = tuple(int(expected_hex[index:index + 2], 16) for index in (0, 2, 4))
+    observed = match.get("sampled_colors", [])
+    matching_sample = None
+    if isinstance(observed, list):
+        for sample in observed:
+            if not isinstance(sample, dict):
+                continue
+            rgb = sample.get("rgb")
+            count = sample.get("count")
+            if (
+                not isinstance(rgb, list)
+                or len(rgb) != 3
+                or not all(isinstance(channel, int) and not isinstance(channel, bool) for channel in rgb)
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+            ):
+                continue
+            if (
+                count >= DATE_BADGE_MIN_MATCHING_PIXELS
+                and max(abs(channel - target) for channel, target in zip(rgb, expected))
+                <= DATE_BADGE_COLOR_TOLERANCE
+            ):
+                matching_sample = {"rgb": rgb, "count": count}
+                break
+    return {
+        "expected_hex": f"#{expected_hex.lower()}",
+        "matched": matching_sample is not None,
+        "matched_sample": matching_sample,
+        "observed_samples": observed[:8] if isinstance(observed, list) else observed,
+    }
+
+
 def japanese_weekday(value: dt.date) -> str:
     return "月火水木金土日"[value.weekday()]
 
@@ -506,20 +564,32 @@ def make_config(module, target_dir: Path, run_dir: Path, fixture: Path, expected
 
 
 def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[str], list[dict]]:
-    """Build sidebar fixtures whose badges cover all four `relative_label` shapes.
+    """Build sidebar fixtures that show every date-badge range at once.
 
     Each non-`本日` fixture date is derived from `today` so that, regardless
-    of which real day the hosted GUI run executes on, the five fixtures still
-    exercise 本日 / same-month-different-day / same-year-different-month /
-    previous-year once each.
+    of which real day the hosted GUI run executes on, the screenshot contains
+    本日 / 今週 / 今月 / 当年 / その他 once each, plus a long 本日 row for
+    the existing truncation and non-overlap check.
     """
     folder.mkdir(parents=True, exist_ok=False)
     if today is None:
         today = dt.date.today()
     today_token = today.strftime("%Y-%m-%d")
 
-    middle_day = 1 if today.day != 1 else 2
-    date_in_middle = dt.date(today.year, today.month, middle_day)
+    week_offset = -1 if today.weekday() != 0 else 1
+    date_in_week = today + dt.timedelta(days=week_offset)
+    date_in_week_token = date_in_week.strftime("%Y-%m-%d")
+
+    month_days = calendar.monthrange(today.year, today.month)[1]
+    current_week_start = today - dt.timedelta(days=today.weekday())
+    date_in_middle = next(
+        dt.date(today.year, today.month, day)
+        for day in range(1, month_days + 1)
+        if dt.date(today.year, today.month, day) != today
+        and dt.date(today.year, today.month, day)
+        - dt.timedelta(days=dt.date(today.year, today.month, day).weekday())
+        != current_week_start
+    )
     date_in_middle_token = date_in_middle.strftime("%Y-%m-%d")
 
     one_digit_month = 1 if today.month != 1 else 2
@@ -537,6 +607,18 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
             "expected_display": "Alpha.md",
             "date_token": today_token,
             "badge_label": "本日",
+            "badge_range": "today",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["today"],
+        },
+        {
+            "name": "date_in_week",
+            "filename": f"Echo_{date_in_week_token}_Week.md",
+            "text_pattern": r"^\s*Echo\s+Week\.md",
+            "expected_display": "Echo Week.md",
+            "date_token": date_in_week_token,
+            "badge_label": relative_label(date_in_week, today),
+            "badge_range": "this_week",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["this_week"],
         },
         {
             "name": "date_in_middle",
@@ -545,6 +627,8 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
             "expected_display": "Bravo Note.md",
             "date_token": date_in_middle_token,
             "badge_label": relative_label(date_in_middle, today),
+            "badge_range": "this_month",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["this_month"],
         },
         {
             "name": "date_at_end",
@@ -553,6 +637,8 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
             "expected_display": "Charlie.md",
             "date_token": date_at_end_token,
             "badge_label": relative_label(date_at_end, today),
+            "badge_range": "other",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["other"],
         },
         {
             "name": "one_digit_month_day",
@@ -561,6 +647,8 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
             "expected_display": "Delta.md",
             "date_token": one_digit_token,
             "badge_label": relative_label(one_digit, today),
+            "badge_range": "this_year",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["this_year"],
         },
         {
             "name": "long_name_keeps_badge_visible",
@@ -581,6 +669,8 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
             "expected_display": None,
             "date_token": today_token,
             "badge_label": "本日",
+            "badge_range": "today",
+            "badge_background": DATE_BADGE_BACKGROUND_BY_RANGE["today"],
         },
     ]
     for case in cases:
@@ -801,17 +891,29 @@ def main() -> int:
                                             ))
                                             continue
                                         right_side = badge_is_strictly_right(display_match, badge_match)
+                                        color_observation = badge_background_observation(
+                                            badge_match, case["badge_background"]
+                                        )
+                                        passed = right_side and color_observation["matched"]
+                                        if not right_side:
+                                            failure_reason = "日付バッジが省略後の表示ファイル名全体と重ならず右側にない"
+                                        elif not color_observation["matched"]:
+                                            failure_reason = "日付バッジの背景色が期待する5段階の色として検出できない"
+                                        else:
+                                            failure_reason = None
                                         scenario_steps.append(step(
                                             case["name"],
-                                            "pass" if right_side else "fail",
-                                            None if right_side else "日付バッジが省略後の表示ファイル名全体と重ならず右側にない",
+                                            "pass" if passed else "fail",
+                                            failure_reason,
                                             filename=case["filename"],
                                             expected_badge=case["badge_label"],
+                                            badge_range=case["badge_range"],
                                             date_token=case["date_token"],
                                             text_match=text_match,
                                             text_candidates=texts_all,
                                             display_geometry=display_match["bounding_box"],
                                             badge_match=badge_match,
+                                            badge_color=color_observation,
                                             badge_candidates=badges_all,
                                             date_matches=date_matches,
                                             date_candidates=date_matches_all,
@@ -841,7 +943,7 @@ def main() -> int:
         considered = [item for item in top_steps + scenario_steps if item.get("result") in priority]
         overall = min((item["result"] for item in considered), key=lambda value: priority[value]) if considered else "blocked"
         reasons = [item.get("reason") for item in considered if item.get("result") != "pass" and item.get("reason")]
-        reason = "; ".join(reasons) if reasons else "Issue #174 focused GUI checks passed"
+        reason = "; ".join(reasons) if reasons else "Issue #248 focused GUI checks passed"
         control_sha = env.git_head(control_dir)
         result = {
             "schema_version": SCHEMA_VERSION,
