@@ -10131,6 +10131,24 @@ mod tests {
             );
             assert!(folder_name_rows.is_empty());
         });
+
+        let document_before_undo =
+            view.read_with(cx, |view, _| view.editor().document().full_text());
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "target note");
+            assert_eq!(view.editor().document().full_text(), document_before_undo);
+        });
+
         assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
         assert!(cx.debug_bounds("sidebar-folder").is_some());
         assert!(cx.debug_bounds("sidebar-file").is_some());

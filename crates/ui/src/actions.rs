@@ -176,11 +176,11 @@ command_actions! {
         view.dispatch(EditorCommand::MoveToEnd { extend: true }, cx);
     },
     Undo ("secondary-z") => undo |view, _window, cx| {
-        if view.inline_rename_active() { return; }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Undo, cx);
     },
     Redo ("secondary-shift-z") => redo |view, _window, cx| {
-        if view.inline_rename_active() { return; }
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() { return; }
         view.dispatch(EditorCommand::Redo, cx);
     },
     Copy ("secondary-c") => copy |view, _window, cx| {
