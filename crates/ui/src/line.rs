@@ -997,7 +997,7 @@ mod tests {
             .set_selection(Selection::caret(SourceOffset(code_offset)))
             .unwrap();
         let inactive = presented_lines(&editor);
-        assert_eq!(inactive[0].visual_text, "\n");
+        assert_eq!(inactive[0].visual_text, "");
         assert_eq!(inactive[0].height(), 0.0);
         assert_eq!(inactive[2].visual_text, "");
         assert_eq!(inactive[2].height(), 0.0);
