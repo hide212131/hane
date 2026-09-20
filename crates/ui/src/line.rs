@@ -364,6 +364,9 @@ pub(crate) fn row_element(
     let display = line.display();
     if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
+        let media_padding = theme.line_horizontal_padding * zoom;
+        let image_max_width = layout.width.min(640.0) * zoom;
+        let image_inner_height = (row.height - 32.0 * zoom).max(1.0);
         return styled_block(
             div()
                 .h(px(row.height))
@@ -372,20 +375,20 @@ pub(crate) fn row_element(
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .px(px(theme.line_horizontal_padding)),
+                .px(px(media_padding)),
             display,
             theme,
             zoom,
         )
         .child(
             img(resolved)
-                .max_w(px(layout.width.min(640.0)))
-                .h(px((row.height - 32.0).max(1.0)))
+                .max_w(px(image_max_width))
+                .h(px(image_inner_height))
                 .object_fit(ObjectFit::Contain),
         )
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(px(12.0 * zoom))
                 .text_color(rgb(theme.quote_foreground))
                 .child(image.alt.clone()),
         );
