@@ -113,15 +113,27 @@ pub(crate) fn presented_block(
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
-    presented_block_with_list_projection(editor, block, visible, joined, None)
+    presented_block_with_list_projection(
+        editor,
+        block,
+        visible,
+        joined,
+        None,
+        DEFAULT_LINE_HEIGHT,
+    )
 }
 
+/// `line_height` is the caller's zoomed row height (`EditorView::line_height`
+/// at runtime, or [`DEFAULT_LINE_HEIGHT`] for callers outside a view, such as
+/// tests). It seeds every presented line's `estimated_height`, so a block's
+/// height scales with zoom before `layout_block` ever measures it.
 pub(crate) fn presented_block_with_list_projection(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    line_height: f32,
 ) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
@@ -139,7 +151,7 @@ pub(crate) fn presented_block_with_list_projection(
             joined,
             block_disclosure: ctx.block_disclosure,
         },
-        DEFAULT_LINE_HEIGHT,
+        line_height,
         list_projection,
     ))
 }
@@ -268,14 +280,24 @@ pub(crate) fn disclosure_for_line(
     range_disclosure(editor, range, line + 1 == editor.document().line_count())
 }
 
-const DEFAULT_LINE_HEIGHT: f32 = 26.0;
+/// Row height and body font size at 100% zoom, used by tests and by callers
+/// that build a [`BlockWindow`] outside `EditorView` (which otherwise scales
+/// both by its own zoom level; see `EditorView::line_height` and
+/// `EditorView::zoom`).
+pub(crate) const DEFAULT_LINE_HEIGHT: f32 = 26.0;
 
 /// Body text size. Every block size is this scaled by the presentation-supplied
-/// [`BlockDisplay::font_scale`], so the UI never keys sizing off a Markdown kind.
+/// [`BlockDisplay::font_scale`] and the caller's zoom level, so the UI never
+/// keys sizing off a Markdown kind and the painted glyph size always matches
+/// what layout measured it at.
 pub(crate) const BODY_FONT_SIZE: f32 = 14.0;
 
-pub(crate) fn block_font_size(block: &VisualLine) -> f32 {
-    BODY_FONT_SIZE * block.display().font_scale
+fn font_size_for(display: BlockDisplay, zoom: f32) -> f32 {
+    BODY_FONT_SIZE * display.font_scale * zoom
+}
+
+pub(crate) fn block_font_size(block: &VisualLine, zoom: f32) -> f32 {
+    font_size_for(block.display(), zoom)
 }
 
 /// Resolves a presentation background role against the active theme.
@@ -290,9 +312,9 @@ fn surface_color(surface: BlockSurface, theme: Theme) -> Option<u32> {
 
 /// Applies a whole-block render policy. Adding a Markdown construct means giving
 /// it a `BlockDisplay` in `hane-presentation`; nothing here changes.
-fn styled_block(element: Div, display: BlockDisplay, theme: Theme) -> Div {
+fn styled_block(element: Div, display: BlockDisplay, theme: Theme, zoom: f32) -> Div {
     element
-        .text_size(px(BODY_FONT_SIZE * display.font_scale))
+        .text_size(px(font_size_for(display, zoom)))
         .when(display.weight == BlockWeight::Semibold, |element| {
             element.font_weight(FontWeight::SEMIBOLD)
         })
@@ -340,6 +362,7 @@ pub(crate) fn row_element(
     layout: &BlockLayout,
     row_index: usize,
     theme: Theme,
+    zoom: f32,
     resolver: &ResourceResolver,
 ) -> Div {
     let row = &layout.lines[row_index];
@@ -358,6 +381,7 @@ pub(crate) fn row_element(
                 .px(px(theme.line_horizontal_padding)),
             display,
             theme,
+            zoom,
         )
         .child(
             img(resolved)
@@ -465,6 +489,7 @@ pub(crate) fn row_element(
             .pr(px(theme.line_horizontal_padding)),
         display,
         theme,
+        zoom,
     )
     .children(elements)
 }
@@ -861,7 +886,7 @@ mod tests {
         assert_eq!(block.visual_text, "# bold and italic");
         assert_eq!(block.disclosure, Some(SourceRange::empty(0)));
         assert_eq!(block.display().weight, BlockWeight::Semibold);
-        assert_eq!(block_font_size(block), 24.0);
+        assert_eq!(block_font_size(block, 1.0), 24.0);
         // Asserted through the render policy, not the Markdown style kind: the UI
         // only ever sees `InlineDisplay`.
         let bold = block.visual_text.find("bold").unwrap();
