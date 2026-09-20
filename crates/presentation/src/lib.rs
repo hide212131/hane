@@ -40,8 +40,9 @@ mod layout;
 pub mod testing;
 
 pub use layout::{
-    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove,
-    layout_block, line_visual_start,
+    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap,
+    QUOTE_BAR_GAP, QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, VerticalMove, layout_block,
+    line_visual_start,
 };
 
 use hane_document::{
@@ -553,6 +554,16 @@ pub struct ListRowMetadata {
     pub source_prefix: Option<SourceRange>,
 }
 
+/// Formal quote context for one physical line. The depth comes from the
+/// parser tree or the document-wide projection, never from counting `>` in
+/// the source at render time. The UI uses it only for the quote inset/bar;
+/// quote marker bytes remain ordinary source-map segments so disclosure and
+/// editing can reveal them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuoteRowMetadata {
+    pub depth: usize,
+}
+
 impl ListRowMetadata {
     fn rebase(&mut self, deltas: &[RevisionDelta]) -> bool {
         if let Some(marker) = &mut self.marker {
@@ -719,6 +730,8 @@ pub struct VisualLine {
     /// line is not owned by a list item (or was deliberately rendered through
     /// a literal/raw fallback).
     pub list: Option<ListRowMetadata>,
+    /// Semantic quote context used by layout/UI to draw the inset and bar.
+    pub quote: Option<QuoteRowMetadata>,
 }
 
 impl VisualLine {
@@ -1148,6 +1161,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
     }
 }
 
@@ -1168,6 +1182,50 @@ fn present_raw_source(
     block.kind = BlockKind::Unsupported;
     block.estimated_height = estimated_height(BlockKind::Unsupported, line_height);
     block
+}
+
+/// Presents a parser-confirmed thematic break. Inactive rows become an empty
+/// source-mapped row for the UI to paint as a separator; touching the rule with
+/// a caret, selection or IME expands the exact source bytes for direct editing.
+fn present_rule_line(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    quote: Option<QuoteRowMetadata>,
+) -> VisualLine {
+    let expanded = disclosure.is_some_and(|active| range_touches(range, active));
+    let visual_text = expanded.then(|| source.to_owned()).unwrap_or_default();
+    VisualLine {
+        line_id,
+        source_range: range,
+        revision,
+        visual_text,
+        style_runs: Vec::new(),
+        kind: BlockKind::Rule,
+        source_map: SourceMap {
+            segments: vec![MappingSegment {
+                source_range: range,
+                visual_range: VisualRange::new(0, if expanded { source.len() } else { 0 }),
+                visibility: if expanded {
+                    Visibility::ExpandedMarkup
+                } else {
+                    Visibility::HiddenMarkup
+                },
+                marker_edge: None,
+            }],
+        },
+        estimated_height: estimated_height(BlockKind::Rule, line_height),
+        measured_height: None,
+        invalid: false,
+        context: LineContext::Normal,
+        disclosure,
+        image: None,
+        list: None,
+        quote,
+    }
 }
 
 /// Maps a parser syntax kind to the display kind for a block. Returning `None`
@@ -1686,6 +1744,7 @@ fn present_markdown_from_parse(
         .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             NodeKind::CodeBlock => Some(BlockKind::CodeBlock),
+            NodeKind::Rule => Some(BlockKind::Rule),
             _ => None,
         })
         .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
@@ -1718,6 +1777,7 @@ fn present_markdown_from_parse(
                     global_list_item: None,
                     formal_list_item: None,
                     formal_quote_owner: None,
+                    formal_quote_depth: None,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1750,6 +1810,7 @@ fn present_markdown_from_parse(
                         global_list_item: None,
                         formal_list_item: None,
                         formal_quote_owner: None,
+                        formal_quote_depth: None,
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1757,7 +1818,9 @@ fn present_markdown_from_parse(
                     });
                 }
             }
-            for (container_range, quote_owner) in projection.container_markers_in(range) {
+            for (container_range, quote_owner, quote_depth) in
+                projection.container_markers_in(range)
+            {
                 let global_list_item = projection
                     .item_for_marker(container_range)
                     .copied()
@@ -1769,6 +1832,7 @@ fn present_markdown_from_parse(
                 {
                     marker.formal_container = true;
                     marker.formal_quote_owner = quote_owner;
+                    marker.formal_quote_depth = (quote_owner.is_some()).then_some(quote_depth);
                     marker.global_list_item = global_list_item;
                     marker.formal_list_item = formal_list_item;
                 } else {
@@ -1780,6 +1844,7 @@ fn present_markdown_from_parse(
                         global_list_item,
                         formal_list_item,
                         formal_quote_owner: quote_owner,
+                        formal_quote_depth: (quote_owner.is_some()).then_some(quote_depth),
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1796,6 +1861,41 @@ fn present_markdown_from_parse(
                     .is_some_and(|projection| projection.fence_marker_edge(marker.range).is_some()))
                 || marker.formal_container
         });
+    }
+    let quote_depth = nodes
+        .iter()
+        .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| node.kind == NodeKind::Quote)
+        .count()
+        .max(
+            shared
+                .list_projection
+                .into_iter()
+                .flat_map(|projection| projection.quotes_in(range))
+                .map(|quote| quote.depth)
+                .max()
+                .unwrap_or(0),
+        )
+        .max(
+            projected_markers
+                .iter()
+                .filter_map(|marker| marker.formal_quote_depth)
+                .max()
+                .unwrap_or(0),
+        );
+    if quote_depth > 0 && kind == BlockKind::Paragraph {
+        kind = BlockKind::Quote;
+    }
+    if kind == BlockKind::Rule {
+        return present_rule_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+            (quote_depth > 0).then_some(QuoteRowMetadata { depth: quote_depth }),
+        );
     }
     let markers_on_line = projected_markers.as_slice();
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
@@ -1967,6 +2067,7 @@ fn present_markdown_from_parse(
         disclosure,
         image: None,
         list,
+        quote: (quote_depth > 0).then_some(QuoteRowMetadata { depth: quote_depth }),
     }
 }
 
@@ -2233,6 +2334,7 @@ struct ProjectedMarker {
     /// Unlike `quote_owner`, this remains valid when the viewport parse has a
     /// different `NodeId` allocation.
     formal_quote_owner: Option<SourceRange>,
+    formal_quote_depth: Option<usize>,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2509,6 +2611,7 @@ impl ProjectionIndex {
                 global_list_item: None,
                 formal_list_item: None,
                 formal_quote_owner: None,
+                formal_quote_depth: None,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
@@ -3207,6 +3310,7 @@ fn present_fenced_code_opening_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
     }
 }
 
@@ -3260,6 +3364,7 @@ fn present_fenced_code_closing_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
     }
 }
 
@@ -3367,6 +3472,7 @@ fn present_image(
             destination: image.destination.to_owned(),
         }),
         list: None,
+        quote: None,
     }
 }
 
@@ -3400,6 +3506,7 @@ fn present_table_line(
             disclosure: None,
             image: None,
             list: None,
+            quote: None,
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
@@ -3467,6 +3574,7 @@ fn present_table_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
     }
 }
 
@@ -3725,6 +3833,157 @@ pub fn anchored_scroll_y(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_depth_and_inline_style_come_from_the_shared_parse() {
+        let source = "> outer\n> > **inner**\n";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Quote,
+            source_range: SourceRange::new(0, source.len()),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: lines.len(),
+            leading_content_lines: 0,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+        let visual = present_block(
+            &block,
+            Revision(1),
+            &BlockWindow {
+                span: 0..lines.len(),
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 0..lines.len(),
+                joined: Some(&joined),
+                block_disclosure: None,
+            },
+            26.0,
+        );
+
+        assert_eq!(visual.lines[0].visual_text, "outer");
+        assert_eq!(visual.lines[1].visual_text, "inner");
+        assert_eq!(visual.lines[0].quote, Some(QuoteRowMetadata { depth: 1 }));
+        assert_eq!(visual.lines[1].quote, Some(QuoteRowMetadata { depth: 2 }));
+        assert!(visual.lines[1]
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::Bold));
+        assert!(visual.lines[1]
+            .source_map
+            .segments
+            .iter()
+            .any(|segment| segment.visibility == Visibility::HiddenMarkup));
+        let layout = layout_block(&visual, 400.0, &testing::FixedAdvanceShaper::default());
+        assert_eq!(layout.lines[0].text_x_origin, QUOTE_DEPTH_INDENT);
+        assert_eq!(layout.lines[1].text_x_origin, QUOTE_DEPTH_INDENT * 2.0);
+        assert!(layout.lines[1].quote_bar_x_origin.is_some());
+    }
+
+    #[test]
+    fn formal_quote_projection_carries_lazy_continuation_depth() {
+        let source = "> outer\ncontinuation\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("quote block");
+        let projection = index
+            .list_projection(&block)
+            .expect("formal quote projection");
+        let line_start = "> outer\n".len();
+        let line_range = SourceRange::new(line_start, source.len());
+        let lines = [BlockLine {
+            line: 1,
+            range: line_range,
+            text: &source[line_start..],
+            disclosure: None,
+        }];
+        let visual = present_block_with_list_projection(
+            &block,
+            Revision(1),
+            &BlockWindow {
+                span: 0..2,
+                trailing_blank_lines: 0,
+                lines: &lines,
+                render: 1..2,
+                joined: None,
+                block_disclosure: None,
+            },
+            26.0,
+            Some(projection),
+        );
+
+        assert_eq!(visual.lines[0].visual_text, "continuation");
+        assert_eq!(visual.lines[0].kind, BlockKind::Quote);
+        assert_eq!(visual.lines[0].quote, Some(QuoteRowMetadata { depth: 1 }));
+    }
+
+    #[test]
+    fn thematic_break_uses_parser_kind_and_discloses_its_source() {
+        let source = "---\n";
+        let range = SourceRange::new(0, source.len());
+        let inactive = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::Normal,
+        );
+        assert_eq!(inactive.kind, BlockKind::Rule);
+        assert!(inactive.visual_text.is_empty());
+        assert_eq!(inactive.source_map.segments[0].source_range, range);
+        assert_eq!(
+            inactive.source_map.segments[0].visibility,
+            Visibility::HiddenMarkup
+        );
+
+        let active = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(1)),
+            LineContext::Normal,
+        );
+        assert_eq!(active.kind, BlockKind::Rule);
+        assert_eq!(active.visual_text, source);
+        assert_eq!(
+            active.source_map.segments[0].visibility,
+            Visibility::ExpandedMarkup
+        );
+
+        for (source, is_rule) in [
+            ("---\n", true),
+            ("title\n---\n", false),
+            ("- item\n", false),
+            ("--- text\n", false),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            assert_eq!(
+                parsed.tree.iter().any(|(_, node)| node.kind == NodeKind::Rule),
+                is_rule,
+                "Rule must follow parser context for {source:?}"
+            );
+        }
+    }
+
     #[test]
     fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
         // A prefix-max-only index would scan all preceding spans because the

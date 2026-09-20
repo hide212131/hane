@@ -308,13 +308,17 @@ pub struct ListProjection {
     pub items: Vec<ListProjectionItem>,
     pub prefixes: Vec<ListProjectionPrefix>,
     pub lists: Vec<ListProjectionList>,
+    /// Formal quote containers intersecting the owning block. This keeps quote
+    /// depth available when a bounded viewport parse starts on a continuation
+    /// line and cannot recover the quote's ancestors from that line alone.
+    quotes: Vec<QuoteProjection>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
     /// Formal quote/list prefix ranges paired with the owning quote's source
     /// range, when the marker belongs to a quote. List marker ownership is
     /// resolved through `items` by range so nested list items retain their own
     /// metadata without leaking a `NodeId` across parse trees.
-    container_markers: Vec<(SourceRange, Option<SourceRange>)>,
+    container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +337,12 @@ pub struct ListProjectionPrefix {
     pub source_range: SourceRange,
     pub item_range: SourceRange,
     pub columns: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuoteProjection {
+    pub source_range: SourceRange,
+    pub depth: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,14 +372,16 @@ impl ListProjection {
         items: Vec<ListProjectionItem>,
         prefixes: Vec<ListProjectionPrefix>,
         lists: Vec<ListProjectionList>,
+        quotes: Vec<QuoteProjection>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-        container_markers: Vec<(SourceRange, Option<SourceRange>)>,
+        container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
     ) -> Self {
         Self {
             items,
             prefixes,
             lists,
+            quotes,
             rows,
             fence_markers,
             container_markers,
@@ -412,17 +424,27 @@ impl ListProjection {
     pub fn container_markers_in(
         &self,
         range: SourceRange,
-    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>)> + '_ {
+    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>, usize)> + '_ {
         let start = self
             .container_markers
-            .partition_point(|(marker, _)| marker.end <= range.start);
+            .partition_point(|(marker, _, _)| marker.end <= range.start);
         let end = self
             .container_markers
-            .partition_point(|(marker, _)| marker.start < range.end);
+            .partition_point(|(marker, _, _)| marker.start < range.end);
         self.container_markers[start..end]
             .iter()
             .copied()
-            .filter(move |(marker, _)| marker.intersects(range))
+            .filter(move |(marker, _, _)| marker.intersects(range))
+    }
+
+    /// Formal quote containers intersecting `range`, ordered by source range.
+    /// Presentation uses this for rows whose bounded parse sees only a lazy
+    /// continuation and therefore has no local quote marker or ancestor.
+    pub fn quotes_in(&self, range: SourceRange) -> impl Iterator<Item = QuoteProjection> + '_ {
+        self.quotes
+            .iter()
+            .copied()
+            .filter(move |quote| quote.source_range.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {

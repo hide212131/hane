@@ -17,9 +17,11 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{IndexedBlock, ListProjection};
 use hane_presentation::{
-    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock, VisualLine,
-    VisualOffset, block_is_joinable, block_line_context, block_line_span, expected_disclosures,
+    BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
+    BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
+    VisualLine,
+    VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
+    expected_disclosures,
     present_block_with_list_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
@@ -369,6 +371,18 @@ fn row_owns_visual(row: &LayoutLine, visual: usize) -> bool {
         && (visual < row.line_visual_range.end || row.wrap == LineWrap::Hard)
 }
 
+fn quote_bar(row: &LayoutLine, theme: Theme, zoom: f32) -> Option<Div> {
+    row.quote_bar_x_origin.map(|x| {
+        div()
+            .absolute()
+            .left(px(theme.line_horizontal_padding + x))
+            .top(px(4.0 * zoom))
+            .bottom(px(4.0 * zoom))
+            .w(px(QUOTE_BAR_WIDTH * zoom))
+            .bg(rgb(theme.quote_foreground))
+    })
+}
+
 /// One row of a block: the text that fits on it, with the caret, selection and
 /// IME underline that fall inside it.
 ///
@@ -396,6 +410,7 @@ pub(crate) fn row_element(
         let image_inner_height = (row.height - 32.0 * zoom).max(1.0);
         return styled_block(
             div()
+                .relative()
                 .h(px(row.height))
                 .w_full()
                 .flex()
@@ -407,6 +422,7 @@ pub(crate) fn row_element(
             theme,
             zoom,
         )
+        .children(quote_bar(row, theme, zoom))
         .child(
             img(resolved)
                 .max_w(px(image_max_width))
@@ -418,6 +434,29 @@ pub(crate) fn row_element(
                 .text_size(px(12.0 * zoom))
                 .text_color(rgb(theme.quote_foreground))
                 .child(image.alt.clone()),
+        );
+    }
+
+    if line.kind == BlockKind::Rule && line.visual_text.is_empty() {
+        return styled_block(
+            div()
+                .relative()
+                .h(px(row.height))
+                .w_full()
+                .flex()
+                .items_center()
+                .pl(px(theme.line_horizontal_padding + row.text_x_origin))
+                .pr(px(theme.line_horizontal_padding))
+                .children(quote_bar(row, theme, zoom))
+                .child(
+                    div()
+                        .h(px(1.0 * zoom))
+                        .flex_1()
+                        .bg(rgb(theme.quote_foreground)),
+                ),
+            display,
+            theme,
+            zoom,
         );
     }
 
@@ -502,6 +541,7 @@ pub(crate) fn row_element(
 
     styled_block(
         div()
+            .relative()
             .h(px(row.height))
             .w_full()
             .flex()
@@ -515,6 +555,7 @@ pub(crate) fn row_element(
         theme,
         zoom,
     )
+    .children(quote_bar(row, theme, zoom))
     .children(elements)
 }
 
@@ -795,6 +836,7 @@ mod tests {
             body_visual_start: None,
             marker_visual_range: None,
             marker_body_gap: 0.0,
+            quote_bar_x_origin: None,
         }
     }
 

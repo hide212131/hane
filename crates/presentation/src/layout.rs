@@ -27,6 +27,11 @@ use std::ops::Range;
 /// geometry, not a claim about how many source spaces a Markdown parser
 /// consumed.
 pub const LIST_DEPTH_INDENT: f32 = 24.0;
+/// Horizontal inset between nested quote bodies. This is semantic display
+/// geometry; it is independent of how many source spaces follow `>`.
+pub const QUOTE_DEPTH_INDENT: f32 = 24.0;
+pub const QUOTE_BAR_WIDTH: f32 = 2.0;
+pub const QUOTE_BAR_GAP: f32 = 8.0;
 const MIN_EFFECTIVE_WRAP_WIDTH: f32 = 1.0;
 
 /// How a row ends.
@@ -92,6 +97,8 @@ pub struct LayoutLine {
     /// column. It is zero for continuation rows and for a marker already as
     /// wide as the list's aggregate label.
     pub marker_body_gap: f32,
+    /// x of the quote bar in the block's text column, when this row is quoted.
+    pub quote_bar_x_origin: Option<f32>,
 }
 
 impl LayoutLine {
@@ -522,6 +529,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 body_visual_start: line_geometry.body_visual_start,
                 marker_visual_range: line_geometry.marker_visual_range.clone(),
                 marker_body_gap: line_geometry.marker_body_gap,
+                quote_bar_x_origin: line_geometry.quote_bar_x_origin,
             });
             y += height;
         }
@@ -545,6 +553,7 @@ struct LineGeometry {
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
     marker_body_gap: f32,
+    quote_bar_x_origin: Option<f32>,
 }
 
 fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
@@ -590,17 +599,26 @@ fn line_geometry(
     marker_widths: &HashMap<ListId, f32>,
 ) -> LineGeometry {
     let Some(list) = &line.list else {
+        let quote_x = line
+            .quote
+            .map_or(0.0, |quote| quote.depth as f32 * QUOTE_DEPTH_INDENT);
         return LineGeometry {
             marker_x_origin: None,
-            body_x_origin: 0.0,
+            body_x_origin: quote_x,
             expanded_prefix_width: 0.0,
             effective_width: width.max(0.0),
             body_visual_start: None,
             marker_visual_range: None,
             marker_body_gap: 0.0,
+            quote_bar_x_origin: (quote_x > 0.0).then_some(
+                quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
+            ),
         };
     };
-    let marker_x = list_depth_x(list.owner.depth);
+    let quote_x = line
+        .quote
+        .map_or(0.0, |quote| quote.depth as f32 * QUOTE_DEPTH_INDENT);
+    let marker_x = quote_x + list_depth_x(list.owner.depth);
     let aggregate_marker_width = marker_widths
         .get(&list.owner.list_id)
         .copied()
@@ -667,6 +685,9 @@ fn line_geometry(
         marker_body_gap: list.marker.as_ref().map_or(0.0, |_| {
             (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
         }),
+        quote_bar_x_origin: (quote_x > 0.0).then_some(
+            quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
+        ),
     }
 }
 
