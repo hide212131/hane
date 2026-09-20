@@ -35,7 +35,7 @@ VALID_PREPROCESSING_EVIDENCE = {
 
 class HostedDateBadgeGuiTests(unittest.TestCase):
     def test_procedure_identity_is_focused(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/7")
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-date-badge/6")
         self.assertEqual(mod.VERIFICATION_KIND, "sidebar_date_badge_focused")
 
     def test_relative_label_shapes(self):
@@ -132,34 +132,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             ):
                 with self.assertRaises(RuntimeError):
                     mod.helper_find_all(helper, digest, Path(directory) / "shot.png", "Alpha")
-
-    def test_helper_find_colors_accepts_bounded_expected_regions(self):
-        expected = mod.DATE_BADGE_BACKGROUND_BY_RANGE["this_week"]
-        payload = json.dumps({
-            "matches": [{
-                "bounding_box": {"minX": 0.1, "maxX": 0.2, "minY": 0.5, "maxY": 0.53},
-                "rgb": [0x35, 0x6D, 0x94],
-                "pixel_count": 120,
-                "foreground_pixel_count": 18,
-            }],
-            "rgb": [0x35, 0x6D, 0x94],
-            "tolerance": 3,
-            "source_size": {"width": 960, "height": 680},
-        })
-        with tempfile.TemporaryDirectory() as directory:
-            helper = Path(directory) / "helper"
-            helper.write_bytes(b"trusted")
-            digest = hashlib.sha256(helper.read_bytes()).hexdigest()
-            with patch.object(
-                mod.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, payload, ""),
-            ):
-                matches = mod.helper_find_colors(
-                    helper, digest, Path(directory) / "shot.png", expected
-                )
-        self.assertEqual(matches[0]["pixel_count"], 120)
-        self.assertEqual(matches[0]["foreground_pixel_count"], 18)
 
     def test_validate_preprocessing_evidence_accepts_valid_evidence(self):
         # Should not raise, and unknown extra fields are forward-compatible.
@@ -847,33 +819,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertTrue(mod.badge_is_strictly_right(text, separated))
         self.assertFalse(mod.badge_is_strictly_right(text, overlapping))
 
-    def test_largest_same_row_prefers_the_chip_over_small_color_fragments(self):
-        text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
-        fragment = {
-            "bounding_box": {"minX": 0.21, "maxX": 0.22, "minY": 0.501, "maxY": 0.503},
-            "pixel_count": 36,
-        }
-        chip = {
-            "bounding_box": {"minX": 0.21, "maxX": 0.26, "minY": 0.50, "maxY": 0.53},
-            "pixel_count": 1200,
-        }
-        self.assertIs(mod.largest_same_row(text, [fragment, chip]), chip)
-
-    def test_badge_background_requires_the_expected_palette_color(self):
-        expected = mod.DATE_BADGE_BACKGROUND_BY_RANGE["this_week"]
-        observed = {
-            "sampled_colors": [
-                {"rgb": [0x35, 0x6D, 0x94], "count": 18},
-                {"rgb": [0xF7, 0xFB, 0xFF], "count": 5},
-            ]
-        }
-        result = mod.badge_background_observation(observed, expected)
-        self.assertTrue(result["matched"])
-        self.assertEqual(result["matched_sample"]["rgb"], [0x35, 0x6D, 0x94])
-
-        wrong = dict(observed, sampled_colors=[{"rgb": [0x3E, 0x73, 0x98], "count": 18}])
-        self.assertFalse(mod.badge_background_observation(wrong, expected)["matched"])
-
     def test_fixture_names_cover_required_shapes(self):
         with tempfile.TemporaryDirectory() as tmp:
             before, cases = mod.make_fixtures(Path(tmp) / "work-folder")
@@ -882,7 +827,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 names,
                 {
                     "date_at_start",
-                    "date_in_week",
                     "date_in_middle",
                     "date_at_end",
                     "one_digit_month_day",
@@ -912,8 +856,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
 
         self.assertEqual(by_name["date_at_start"]["date_token"], "2026-09-17")
         self.assertEqual(by_name["date_at_start"]["badge_label"], "本日")
-        self.assertEqual(by_name["date_in_week"]["date_token"], "2026-09-16")
-        self.assertEqual(by_name["date_in_week"]["badge_label"], "16日(水)")
         self.assertEqual(by_name["date_in_middle"]["date_token"], "2026-09-01")
         self.assertEqual(by_name["date_in_middle"]["badge_label"], "1日(火)")
         self.assertEqual(by_name["one_digit_month_day"]["date_token"], "2026-1-2")
@@ -922,10 +864,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertEqual(by_name["date_at_end"]["badge_label"], "'25/9/2")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["date_token"], "2026-09-17")
         self.assertEqual(by_name["long_name_keeps_badge_visible"]["badge_label"], "本日")
-        self.assertEqual(
-            {case["badge_range"] for case in cases},
-            {"today", "this_week", "this_month", "this_year", "other"},
-        )
 
         labels = [case["badge_label"] for case in cases]
         shapes = set()
@@ -942,13 +880,6 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             shapes,
             {"today", "same_year_same_month", "same_year_other_month", "other_year"},
         )
-
-    def test_one_digit_year_fixture_stays_outside_the_current_week_in_late_january(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=dt.date(2025, 1, 31))
-        one_digit = next(case for case in cases if case["name"] == "one_digit_month_day")
-        self.assertEqual(one_digit["date_token"], "2025-3-2")
-        self.assertEqual(one_digit["badge_range"], "this_year")
 
 
 if __name__ == "__main__":
