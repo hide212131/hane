@@ -235,11 +235,11 @@ Review の正本は GitHub Review / Review Thread とする。
 
 ### Fix
 
-必要なら ChatGPT が修正 scope を決め、既存の Claude 実行手段へ指示する。
+必要なら ChatGPT が修正 scope を決め、既存の Claude 実行手段へ指示する。Claude の実行が trusted な失敗分類器によって `usage_or_rate_limit` と判定された場合だけ、同じ exact head に対する限定的な Codex CLI fallback を利用できる。これは provider の利用上限からの実装継続であり、Codex が次の工程を判断する仕組みではない。
 
-Claude は judge ではない。
+Claude と Codex の実装 worker は judge ではない。Codex fallback は self-hosted Mac の専用 runner でのみ実行し、trusted Commander handoff、same-repository PR、current head、push 直前の exact-head guard を再確認する。Codex のローカル実行には GitHub の認証情報を渡さない。
 
-開始時と push 直前に current head を確認し、不一致なら push しない。
+実装 worker は開始時と push 直前に current head を確認し、不一致なら push しない。`authentication`、`max_turns`、`model_or_provider`、`unknown`、診断不能な失敗では fallback を起動しない。
 
 ### GUI validation
 
@@ -305,9 +305,9 @@ ChatGPT は Commander Policy に従い、不明な状態を pass として扱わ
 
 Claude / Codex / GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
 
-初期 v2 では quota timer、自動 multi-provider fallback、retry reconcile を作らない。
+通常は利用者が ChatGPT に戻し、current facts と Commander Policy から次の一つの action を判断する。ただし Claude の失敗分類が `usage_or_rate_limit` の場合だけ、既存の GitHub Actions と self-hosted `hane-codex` runner による限定的な Codex CLI fallback を許可する。これは一般的な provider routing、quota timer、retry state machine ではない。
 
-利用者が ChatGPT に戻し、current facts と Commander Policy から次の一つの action を判断する。
+fallback は checkpoint artifact の分類結果を読み、分類以外の意味判断を行わない。artifact がない、分類が不明、actor / repository / head の guard が満たせない場合は fail closed で停止する。
 
 ---
 
@@ -315,8 +315,8 @@ Claude / Codex / GUI runner などが provider / infrastructure 理由で失敗�
 
 - Issue / PR body / review text / source code は untrusted data として扱う。
 - Commander Policy は trusted な default branch 上の文書を正本とする。
-- Claude だけが trusted same-repository PR branch のコードを変更できる。
-- Codex と GUI Validator は product code を変更しない。
+- Claude が通常の trusted same-repository PR branch のコードを変更する。Claude の `usage_or_rate_limit` fallback に限り、Codex CLI も専用 self-hosted runner から同じ trusted branch を変更できる。
+- Codex review と GUI Validator は product code を変更しない。Codex fallback の repository mutation は、trusted actor、same-repository、exact head、保護パス拒否、push 直前の再確認を満たす場合だけ許可する。
 - optional な collector / wrapper / Gate を導入する場合も、必要最小限の権限だけを与える。
 
 ---
@@ -334,7 +334,7 @@ ChatGPT           = Commander
 Existing tools    = Codex / Claude / CI / GUI / GitHub merge
 ```
 
-AADW 専用の collector / wrapper / workflow / status / receipt / Gate は、必要性が実運用で確認された場合だけ追加する。
+AADW 専用の collector / wrapper / status / receipt / Gate は、必要性が実運用で確認された場合だけ追加する。Issue #241 の fallback は、既存の Claude failure checkpoint と GitHub `workflow_run` を使う限定的な provider failure 継続経路であり、別の検索 index や汎用 routing state を追加しない。
 
 ---
 

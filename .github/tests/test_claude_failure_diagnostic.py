@@ -240,6 +240,33 @@ class ClaudeFailureClassifierTests(unittest.TestCase):
         self.assertIn("category=authentication", text)
         self.assertNotIn("secret-value-123", text)
 
+    def test_json_mode_emits_only_safe_classification_fields(self):
+        payload = [
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "result": "usage limit reset secret-value-456",
+                "num_turns": 4,
+                "total_cost_usd": 0.2,
+                "modelUsage": {"claude": {}},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "execution.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(
+                    classifier.main(["classifier", "--json", str(path)]), 0
+                )
+        info = json.loads(out.getvalue())
+        self.assertEqual(info["category"], classifier.CATEGORY_USAGE)
+        self.assertEqual(
+            set(info), {"category", "model_usage", "num_turns", "total_cost_usd"}
+        )
+        self.assertNotIn("secret-value-456", out.getvalue())
+
 
 class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
     def test_failure_is_diagnosed_then_preserved_as_job_failure(self):
@@ -263,6 +290,9 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
             "python trusted-diagnostic/.github/scripts/classify_claude_failure.py",
             WORKFLOW,
         )
+        self.assertIn("--json \"$candidate\"", WORKFLOW)
+        self.assertIn("failure_category", WORKFLOW)
+        self.assertIn("usage_or_rate_limit", WORKFLOW)
         self.assertIn(
             'candidate="$RUNNER_TEMP/claude-execution-output.json"',
             WORKFLOW,
@@ -288,7 +318,7 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         checkpoint_index = WORKFLOW.index("Upload checkpoint after Claude failure")
         diagnose_index = WORKFLOW.index("Diagnose Claude execution failure")
         self.assertLess(build_index, checkpoint_index)
-        self.assertLess(checkpoint_index, diagnose_index)
+        self.assertLess(diagnose_index, checkpoint_index)
         self.assertIn(
             "always() && !cancelled() && steps.claude.outcome != 'skipped'",
             WORKFLOW,
@@ -300,6 +330,10 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         self.assertIn("target_sha: $target_sha", WORKFLOW)
         self.assertIn("capture_ok", WORKFLOW)
         self.assertIn("has_changes", WORKFLOW)
+        self.assertIn("trigger_actor", WORKFLOW)
+        self.assertIn("workflow_sha", WORKFLOW)
+        self.assertIn("HANDOFF_BODY: ${{ github.event.comment.body }}", WORKFLOW)
+        self.assertIn("commander-handoff.txt", WORKFLOW)
         completed_patch_block = WORKFLOW.split(
             "      - name: Upload completed worker patch\n", 1
         )[1].split("\n      - name: Build checkpoint metadata after Claude failure", 1)[0]

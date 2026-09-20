@@ -257,7 +257,9 @@ Claude、Codex、GUI runner などが provider / infrastructure 理由で失敗�
 
 必要な evidence が得られなければ停止する。
 
-自動 multi-provider fallback や複雑な retry state machine を前提にしない。
+Claude の failure diagnostic が `usage_or_rate_limit` の場合だけ、既存の Claude checkpoint artifact と trusted `workflow_run` を使った Codex CLI fallback を許可する。この fallback は利用上限からの実装継続に限定し、一般的な provider routing や retry state machine にはしない。
+
+fallback worker を起動するには、分類結果が current source run に結び付いていること、trusted handoff actor が repository write 権限を持つこと、対象 PR が open same-repository で current head が一致することを確認する。self-hosted runner では GitHub 認証情報を Codex に渡さず、保護パスの変更を拒否し、push 直前に exact-head を再確認する。条件を一つでも確認できない場合は fail closed とする。
 
 ---
 

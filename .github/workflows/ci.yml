@@ -35,6 +35,9 @@ jobs:
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
+      - name: Test Codex usage-limit fallback wiring
+        run: python3 .github/tests/test_codex_usage_limit_fallback.py
+
       - name: Test release version policy
         run: python3 .github/tests/test_release_version.py
 

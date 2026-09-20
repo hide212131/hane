@@ -322,6 +322,51 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Check out trusted diagnostic source after Claude failure
+        if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-diagnostic
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Diagnose Claude execution failure
+        id: diagnose
+        if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
+        shell: bash
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+
+          candidate="${EXECUTION_FILE:-}"
+          if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+            candidate="$RUNNER_TEMP/claude-execution-output.json"
+          fi
+
+          python trusted-diagnostic/.github/scripts/classify_claude_failure.py "$candidate"
+          diagnostic_json="$(
+            python trusted-diagnostic/.github/scripts/classify_claude_failure.py \
+              --json "$candidate"
+          )"
+          category="$(jq -r '.category // empty' <<< "$diagnostic_json")"
+          case "$category" in
+            usage_or_rate_limit|authentication|max_turns|model_or_provider|zero_cost_provider_or_sdk_failure|unknown|diagnostic_unavailable) ;;
+            *)
+              echo "::error::Trusted Claude diagnostic returned an unsupported category: ${category:-empty}."
+              category='diagnostic_unavailable'
+              diagnostic_json='{"category":"diagnostic_unavailable","model_usage":"unknown","num_turns":null,"total_cost_usd":null}'
+              ;;
+          esac
+
+          printf '%s\n' "$diagnostic_json" > "$RUNNER_TEMP/aadw-claude-failure.json"
+          echo "category=$category" >> "$GITHUB_OUTPUT"
+
+          # Preserve the original Claude failure so no downstream finalizer runs.
+          exit 1
+
       - name: Build checkpoint metadata after Claude failure
         if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
         shell: bash
@@ -329,6 +374,9 @@ jobs:
           TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
           PR_NUMBER: ${{ github.event.issue.number }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          FAILURE_CATEGORY: ${{ steps.diagnose.outputs.category || 'diagnostic_unavailable' }}
+          HANDOFF_BODY: ${{ github.event.comment.body }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
 
@@ -347,6 +395,12 @@ jobs:
             : > "$checkpoint_dir/checkpoint.patch"
           fi
 
+          if [[ -z "$HANDOFF_BODY" ]]; then
+            echo '::error::The trusted Commander handoff is missing from the failure checkpoint.'
+            exit 1
+          fi
+          printf '%s\n' "$HANDOFF_BODY" > "$checkpoint_dir/commander-handoff.txt"
+
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg pr_number "$PR_NUMBER" \
@@ -354,6 +408,9 @@ jobs:
             --arg run_id "$GITHUB_RUN_ID" \
             --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg claude_outcome "$CLAUDE_OUTCOME" \
+            --arg failure_category "$FAILURE_CATEGORY" \
+            --arg trigger_actor "${{ github.event.comment.user.login }}" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
             --argjson capture_ok "$capture_ok" \
             --argjson has_changes "$has_changes" \
             '{
@@ -364,6 +421,9 @@ jobs:
               run_id: $run_id,
               run_attempt: $run_attempt,
               claude_outcome: $claude_outcome,
+              failure_category: $failure_category,
+              trigger_actor: $trigger_actor,
+              workflow_sha: $workflow_sha,
               capture_ok: $capture_ok,
               has_changes: $has_changes
             }' > "$checkpoint_dir/checkpoint.json"
@@ -376,34 +436,6 @@ jobs:
           path: aadw-checkpoint
           if-no-files-found: error
           retention-days: 3
-
-      - name: Check out trusted diagnostic source after Claude failure
-        if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: trusted-diagnostic
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Diagnose Claude execution failure
-        if: ${{ always() && !cancelled() && steps.claude.outcome == 'failure' }}
-        shell: bash
-        env:
-          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
-        run: |
-          set -euo pipefail
-
-          candidate="${EXECUTION_FILE:-}"
-          if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-            candidate="$RUNNER_TEMP/claude-execution-output.json"
-          fi
-
-          python trusted-diagnostic/.github/scripts/classify_claude_failure.py "$candidate"
-
-          # The classifier only adds safe diagnostics. Preserve the original
-          # Claude failure so no downstream finalizer step can run.
-          exit 1
 
   finalize:
     needs: [prepare, worker]
