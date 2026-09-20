@@ -1283,7 +1283,7 @@ fn fenced_line_height(
     has_hidden_fence: bool,
     line_height: f32,
 ) -> f32 {
-    if has_hidden_fence && visual_text.trim_end_matches(['\r', '\n']).is_empty() {
+    if has_hidden_fence && visual_text.trim().is_empty() {
         0.0
     } else {
         estimated_height(BlockKind::CodeBlock, line_height)
