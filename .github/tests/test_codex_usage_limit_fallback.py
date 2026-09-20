@@ -76,6 +76,9 @@ def test_mutation_guards_cover_start_scope_and_push():
     assert "Codex created an untrusted commit" in WORKFLOW
     assert "Clean push checkout does not match the exact target head" in WORKFLOW
     assert "untrusted Codex or MCP configuration path" in WORKFLOW
+    assert "for blocked_path in .codex .mcp.json; do" in WORKFLOW
+    assert "for blocked_path in .codex .mcp.json .claude .claude.json; do" not in WORKFLOW
+    assert ".claude/*|*/.claude/*|.claude.json|*/.claude.json" in WORKFLOW
     assert 'git -C "$PUSH_WORKTREE" apply --index' in WORKFLOW
     assert "Transferred Codex patch contains a trusted authority or workflow path" in WORKFLOW
     assert 'git -C "$PUSH_WORKTREE" -c core.hooksPath=/dev/null push' in WORKFLOW
