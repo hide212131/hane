@@ -201,6 +201,11 @@ struct BlockContext {
     /// `None` for any other block kind, or once this line is already covered
     /// by `context` and would otherwise be read twice.
     opening_fence_line: Option<(usize, SourceRange, String)>,
+    /// The block's final construct line when it is outside `context`. For a
+    /// closed fenced block this is the only possible closing delimiter, so
+    /// presentation can account for its zero-height inactive row even while
+    /// it is clipped outside the viewport.
+    closing_fence_line: Option<(usize, SourceRange, String)>,
 }
 
 fn block_context(
@@ -247,28 +252,51 @@ fn block_context(
         block.source_range,
         span.end == document.line_count(),
     );
-    let opening_fence_line = (block_line_context(block.kind) == LineContext::FencedCode)
+    let trailing_blank_lines = trailing_blank_lines(document, span);
+    let fenced = block_line_context(block.kind) == LineContext::FencedCode;
+    let opening_fence_line_number = fenced
         .then(|| span.start.saturating_add(block.leading_content_lines))
-        .filter(|opening| *opening < span.end)
+        .filter(|opening| *opening < span.end);
+    let opening_fence_line = opening_fence_line_number
         .filter(|opening| !context.contains(opening))
         .and_then(|opening| {
             let range = clip_to_block(document.line_range(LineId(opening)).ok()?);
             let text = document.text(range).unwrap_or_default();
             Some((opening, range, text))
         });
+    let content_end = span.end.saturating_sub(trailing_blank_lines);
+    let closing_fence_line = fenced
+        .then(|| content_end.checked_sub(1))
+        .flatten()
+        .filter(|closing| *closing >= span.start && *closing < span.end)
+        .filter(|closing| Some(*closing) != opening_fence_line_number)
+        .filter(|closing| !context.contains(closing))
+        .and_then(|closing| {
+            let range = clip_to_block(document.line_range(LineId(closing)).ok()?);
+            let text = document.text(range).unwrap_or_default();
+            Some((closing, range, text))
+        });
     Some(BlockContext {
-        trailing_blank_lines: trailing_blank_lines(document, span),
+        trailing_blank_lines,
         context,
         ranges,
         texts,
         block_disclosure,
         opening_fence_line,
+        closing_fence_line,
     })
 }
 
 fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
-    let mut lines = Vec::with_capacity(ctx.context.len() + usize::from(ctx.opening_fence_line.is_some()));
-    if let Some((line, range, text)) = &ctx.opening_fence_line {
+    let mut lines = Vec::with_capacity(
+        ctx.context.len()
+            + usize::from(ctx.opening_fence_line.is_some())
+            + usize::from(ctx.closing_fence_line.is_some()),
+    );
+    for (line, range, text) in [&ctx.opening_fence_line, &ctx.closing_fence_line]
+        .into_iter()
+        .flatten()
+    {
         lines.push(BlockLine {
             line: *line,
             range: *range,
@@ -284,6 +312,7 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             disclosure: disclosure_for_line(editor, line, *range),
         },
     ));
+    lines.sort_by_key(|line| line.line);
     lines
 }
 
