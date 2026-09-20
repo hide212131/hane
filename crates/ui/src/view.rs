@@ -958,13 +958,24 @@ impl EditorView {
     }
 
     pub(crate) fn text_input_render_state(&self) -> Option<InlineRenameRenderState> {
-        self.inline_rename_render_state().or_else(|| {
-            (!self.inline_rename_active()).then(|| InlineRenameRenderState {
-                text: self.sidebar_filter.clone(),
-                selected_range: self.sidebar_filter_selected_range.clone(),
-                selection_reversed: self.sidebar_filter_selection_reversed,
-                marked_range: self.sidebar_filter_marked_range.clone(),
-            })
+        if let Some(state) = self.inline_rename_render_state() {
+            return Some(state);
+        }
+        if self.inline_rename_active() {
+            return None;
+        }
+        Some(InlineRenameRenderState {
+            text: self.sidebar_filter.clone(),
+            selected_range: if self.sidebar_filter_focused {
+                self.sidebar_filter_selected_range.clone()
+            } else {
+                0..0
+            },
+            selection_reversed: self.sidebar_filter_selection_reversed,
+            marked_range: self
+                .sidebar_filter_focused
+                .then(|| self.sidebar_filter_marked_range.clone())
+                .flatten(),
         })
     }
 
@@ -10161,6 +10172,19 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), document_before_undo);
         });
 
+        view.update(cx, |view, _| {
+            let text = view.sidebar_filter.clone();
+            view.sidebar_filter_composition = Some(SidebarFilterComposition {
+                text,
+                selected_range: view.sidebar_filter_selected_range.clone(),
+                selection_reversed: view.sidebar_filter_selection_reversed,
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_has_composition());
+        });
+
         assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
         assert!(cx.debug_bounds("sidebar-folder").is_some());
         assert!(cx.debug_bounds("sidebar-file").is_some());
@@ -10246,6 +10270,11 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.active_session().path(), Some(target.as_path()));
             assert_eq!(view.sidebar_filter, "MEETING");
+            assert!(!view.sidebar_filter_is_focused());
+            let input = view.text_input_render_state().unwrap();
+            assert_eq!(input.text, "MEETING");
+            assert!(input.selected_range.is_empty());
+            assert!(input.marked_range.is_none());
         });
 
         std::fs::remove_dir_all(root).unwrap();

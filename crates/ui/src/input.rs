@@ -183,7 +183,12 @@ impl Element for InlineRenameInput {
             line.paint(bounds.origin, window.line_height(), window, cx)
                 .unwrap();
         }
+        let input_is_focused = {
+            let input = self.input.read(cx);
+            input.inline_rename_active() || input.sidebar_filter_is_focused()
+        };
         if focus_handle.is_focused(window)
+            && input_is_focused
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);

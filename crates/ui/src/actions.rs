@@ -84,6 +84,9 @@ command_actions! {
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, _window, cx| {
         if view.sidebar_filter_is_focused() {
+            if view.sidebar_filter_has_composition() {
+                view.commit_sidebar_filter_composition(cx);
+            }
             return;
         } else if view.inline_rename_active() {
             if view.inline_rename_has_composition() {
@@ -97,6 +100,9 @@ command_actions! {
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
         if view.sidebar_filter_is_focused() {
+            if view.sidebar_filter_has_composition() {
+                view.commit_sidebar_filter_composition(cx);
+            }
             return;
         } else if view.inline_rename_active() {
             if view.inline_rename_has_composition() {
