@@ -49,7 +49,7 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
-use hane_presentation::{BlockKind, StyleKind, VisualOffset};
+use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
     MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
@@ -7126,6 +7126,39 @@ mod tests {
             .style_runs
             .iter()
             .any(|run| run.kind == StyleKind::CodeBlock));
+    }
+
+    #[test]
+    fn a_same_line_nested_list_fence_keeps_the_formal_child_marker() {
+        let mut source = String::from("- outer\n  - nested\n    - ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("      literal\n");
+        }
+        source.push_str("      ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one nested list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let opening_line = source[..source.find("    - ````rust").expect("opening row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("same-line nested fence presents");
+        let line = &opening.lines[0];
+        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        let list = line.list.as_ref().expect("formal child list metadata");
+        assert_eq!(list.role, ListRowRole::Opening);
+        assert!(list.marker.as_ref().is_some_and(|marker| marker.synthesized));
     }
 
     #[test]

@@ -1349,6 +1349,11 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
+    if let Some(item) = marker.global_list_item {
+        return list_projection.is_some_and(|projection| {
+            projected_list_item_range_touches(projection, &item, disclosure)
+        });
+    }
     // A list item's own bullet/number marker discloses whenever the caret,
     // selection or IME touches any of the item's own source range — its
     // opening line, its own paragraphs, and any nested child list or item it
@@ -1435,6 +1440,7 @@ fn marker_edge(
         || planned.list_owner.is_some()
         || planned.list_prefix.is_some()
         || planned.global_list_prefix.is_some()
+        || planned.global_list_item.is_some()
     {
         return Some(MarkerEdge::Opening);
     }
@@ -1700,6 +1706,7 @@ fn present_markdown_from_parse(
                     fence: false,
                     fence_edge: None,
                     formal_container: true,
+                    global_list_item: None,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1728,6 +1735,7 @@ fn present_markdown_from_parse(
                         fence: true,
                         fence_edge: Some(edge),
                         formal_container: false,
+                        global_list_item: None,
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1741,12 +1749,14 @@ fn present_markdown_from_parse(
                     .find(|marker| marker.range == container_range)
                 {
                     marker.formal_container = true;
+                    marker.global_list_item = projection.item_for_marker(container_range).copied();
                 } else {
                     projected_markers.push(ProjectedMarker {
                         range: container_range,
                         fence: false,
                         fence_edge: None,
                         formal_container: true,
+                        global_list_item: projection.item_for_marker(container_range).copied(),
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1809,16 +1819,20 @@ fn present_markdown_from_parse(
         // `list_item_label`). Disclosing the marker (`expanded` above) shows
         // its real source bytes directly instead, so the two never render
         // together.
-        if !expanded
-            && let Some(owner) = planned.list_owner
-            && let Some(label) = list_item_label_with_projection(
+        let label = if let Some(owner) = planned.list_owner {
+            list_item_label_with_projection(
                 parsed,
                 &shared.projection.list_item_ordinals,
                 owner,
                 shared.list_projection,
                 planned.range,
             )
-        {
+        } else {
+            planned
+                .global_list_item
+                .map(|item| list_label(item.start, item.ordinal))
+        };
+        if !expanded && let Some(label) = label {
             let visual_start = visual.len();
             visual.push_str(&label);
             segments.push(MappingSegment {
@@ -2187,6 +2201,7 @@ struct ProjectedMarker {
     fence: bool,
     fence_edge: Option<MarkerEdge>,
     formal_container: bool,
+    global_list_item: Option<ListProjectionItem>,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2460,6 +2475,7 @@ impl ProjectionIndex {
                         FenceMarkerEdge::Closing => MarkerEdge::Closing,
                     }),
                 formal_container: false,
+                global_list_item: None,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
@@ -2504,8 +2520,9 @@ fn list_marker_metadata(
     visual: &str,
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
 ) -> Option<ListMarkerMetadata> {
-    let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure, None);
+    let expanded = marker_is_disclosed(planned, parsed, nodes, disclosure, list_projection);
     let visual_range = if expanded {
         source_map
             .segments
@@ -2611,12 +2628,11 @@ fn list_row_metadata(
     if item_projection.is_none() && projected.is_none() {
         return None;
     }
-    let opening = item.and_then(|item| {
-        markers_on_line.iter().find(|planned| {
-            planned.list_owner == Some(item)
-                && planned.range.start >= range.start
-                && planned.range.start < range.end
-        })
+    let opening = markers_on_line.iter().find(|planned| {
+        (item.is_some_and(|item| planned.list_owner == Some(item))
+            || planned.global_list_item.is_some())
+            && planned.range.start >= range.start
+            && planned.range.start < range.end
     });
     let role = if opening.is_some() {
         ListRowRole::Opening
@@ -2645,6 +2661,7 @@ fn list_row_metadata(
             visual,
             source_map,
             disclosure,
+            list_projection,
         )
     });
     let structural_prefixes = markers_on_line
@@ -2680,6 +2697,7 @@ fn list_row_metadata(
             planned.list_owner.is_some()
                 || planned.list_prefix.is_some()
                 || planned.global_list_prefix.is_some()
+                || planned.global_list_item.is_some()
         })
         .flat_map(|planned| {
             source_map.segments.iter().filter_map(|segment| {
