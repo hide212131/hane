@@ -1274,6 +1274,22 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
     }
 }
 
+/// A fence-only source row is structural markup, not an empty code row. Once
+/// its delimiter is collapsed and no visible label/content remains, it must
+/// consume no vertical space. As soon as the delimiter is disclosed for
+/// editing, the ordinary code-row height comes back.
+fn fenced_line_height(
+    visual_text: &str,
+    has_hidden_fence: bool,
+    line_height: f32,
+) -> f32 {
+    if has_hidden_fence && visual_text.trim_end_matches(['\r', '\n']).is_empty() {
+        0.0
+    } else {
+        estimated_height(BlockKind::CodeBlock, line_height)
+    }
+}
+
 fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     if disclosure.is_empty() {
         range.start <= disclosure.start && disclosure.start <= range.end
@@ -1952,6 +1968,18 @@ fn present_markdown_from_parse(
         disclosure,
         shared.list_projection,
     );
+    let has_hidden_fence = kind == BlockKind::CodeBlock
+        && markers_on_line.iter().filter(|marker| marker.fence).any(|marker| {
+            source_map.segments.iter().any(|segment| {
+                segment.source_range == marker.range
+                    && segment.visibility == Visibility::HiddenMarkup
+            })
+        });
+    let line_estimated_height = if kind == BlockKind::CodeBlock {
+        fenced_line_height(&visual, has_hidden_fence, line_height)
+    } else {
+        estimated_height(kind, line_height)
+    };
     VisualLine {
         line_id,
         source_range: range,
@@ -1959,7 +1987,7 @@ fn present_markdown_from_parse(
         visual_text: visual,
         style_runs,
         source_map,
-        estimated_height: estimated_height(kind, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         kind,
@@ -3200,7 +3228,7 @@ fn present_fenced_code_opening_line(
         style_runs,
         kind: BlockKind::CodeBlock,
         source_map: SourceMap { segments },
-        estimated_height: estimated_height(BlockKind::CodeBlock, line_height),
+        estimated_height: fenced_line_height(&visual, !expanded, line_height),
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
@@ -3253,7 +3281,7 @@ fn present_fenced_code_closing_line(
                 marker_edge: Some(MarkerEdge::Closing),
             }],
         },
-        estimated_height: estimated_height(BlockKind::CodeBlock, line_height),
+        estimated_height: fenced_line_height(&visual_text, !expanded, line_height),
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
