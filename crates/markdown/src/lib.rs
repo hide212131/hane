@@ -261,6 +261,9 @@ pub struct MarkdownParse {
     /// formal list projection can preserve them while filtering unrelated
     /// inline markers from literal code content.
     pub fence_markers: Vec<SourceRange>,
+    /// The formal opening/closing role for each fence marker. Kept separate
+    /// from `fence_markers` so range-only consumers remain unchanged.
+    pub fence_marker_edges: Vec<(SourceRange, FenceMarkerEdge)>,
     /// Quote prefixes paired with their owning quote node. Continuation-line
     /// prefixes cannot be associated with an owner by comparing source starts.
     /// Kept before range merging so nested, adjacent prefixes retain ownership.
@@ -306,7 +309,7 @@ pub struct ListProjection {
     pub prefixes: Vec<ListProjectionPrefix>,
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
-    fence_markers: Vec<SourceRange>,
+    fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,7 +353,7 @@ impl ListProjection {
         prefixes: Vec<ListProjectionPrefix>,
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
-        fence_markers: Vec<SourceRange>,
+        fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
     ) -> Self {
         Self {
             items,
@@ -361,16 +364,33 @@ impl ListProjection {
         }
     }
 
-    /// Whether `range` is a fence delimiter in the formal document parse.
+    /// The formal opening/closing role for `range`, if it is a fence delimiter.
     /// Viewport-only parses may mistake literal fence-shaped code content for
     /// an opening fence; this lets presentation keep only delimiters confirmed
     /// by the document-wide parse when it projects a list-contained code row.
-    pub fn is_fence_marker(&self, range: SourceRange) -> bool {
+    pub fn fence_marker_edge(&self, range: SourceRange) -> Option<FenceMarkerEdge> {
         self.fence_markers
             .binary_search_by_key(&(range.start, range.end), |marker| {
-                (marker.start, marker.end)
+                (marker.0.start, marker.0.end)
             })
-            .is_ok()
+            .ok()
+            .map(|index| self.fence_markers[index].1)
+    }
+
+    pub fn fence_markers_in(
+        &self,
+        range: SourceRange,
+    ) -> impl Iterator<Item = (SourceRange, FenceMarkerEdge)> + '_ {
+        let start = self
+            .fence_markers
+            .partition_point(|(marker, _)| marker.end <= range.start);
+        let end = self
+            .fence_markers
+            .partition_point(|(marker, _)| marker.start < range.end);
+        self.fence_markers[start..end]
+            .iter()
+            .copied()
+            .filter(move |(marker, _)| marker.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
@@ -452,6 +472,12 @@ impl ListProjection {
 pub struct FenceDelimiter {
     pub marker: u8,
     pub len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceMarkerEdge {
+    Opening,
+    Closing,
 }
 
 /// Opening or closing fence of a fenced code block, if this line is one. Used by
@@ -1023,6 +1049,7 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
     fence_markers: Vec<SourceRange>,
+    fence_marker_edges: Vec<(SourceRange, FenceMarkerEdge)>,
     quote_markers: Vec<(SourceRange, NodeId)>,
     list_item_markers: Vec<(SourceRange, NodeId)>,
 }
@@ -1034,6 +1061,7 @@ struct DerivedMarkers {
 fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
     let mut fence_markers = Vec::new();
+    let mut fence_marker_edges = Vec::new();
     let mut quote_owners = Vec::new();
     let mut list_item_owners = Vec::new();
     for (id, block) in tree.blocks() {
@@ -1131,6 +1159,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                         );
                         markers.push(marker);
                         fence_markers.push(marker);
+                        fence_marker_edges.push((marker, FenceMarkerEdge::Opening));
                     }
                     // A quote or list item nested fence still carries its
                     // container's own prefix on every continuation line,
@@ -1170,6 +1199,7 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                         );
                         markers.push(marker);
                         fence_markers.push(marker);
+                        fence_marker_edges.push((marker, FenceMarkerEdge::Closing));
                     }
                 }
             }
@@ -1245,9 +1275,12 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
     }
     fence_markers.sort_by_key(|marker| (marker.start, marker.end));
     fence_markers.dedup();
+    fence_marker_edges.sort_by_key(|(marker, _)| (marker.start, marker.end));
+    fence_marker_edges.dedup_by_key(|(marker, _)| (marker.start, marker.end));
     DerivedMarkers {
         markers: merged,
         fence_markers,
+        fence_marker_edges,
         quote_markers: quote_owners,
         list_item_markers: list_item_owners,
     }
@@ -1520,6 +1553,7 @@ pub fn parse_document(
         tree,
         markers: markers.markers,
         fence_markers: markers.fence_markers,
+        fence_marker_edges: markers.fence_marker_edges,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
         list_structural_prefixes,

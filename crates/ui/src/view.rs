@@ -6643,6 +6643,55 @@ mod tests {
     }
 
     #[test]
+    fn a_late_nested_list_fence_uses_formal_markers_when_viewport_parse_misses_it() {
+        let mut source = String::from("- outer\n  - nested\n    ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("    literal\n");
+        }
+        source.push_str("    ```oops\n    ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one nested list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let lookalike_line = source[..source.find("    ```oops").expect("lookalike row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let presented = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(lookalike_line..lookalike_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late nested code row presents");
+        assert_eq!(presented.lines[0].visual_text, "```oops");
+        assert!(presented.lines[0]
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock));
+
+        let closing_line = source[..source.rfind("    ````").expect("closing fence")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let closing = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(closing_line..closing_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late nested closing fence presents");
+        assert_eq!(closing.lines[0].visual_text, "");
+        assert_eq!(
+            closing.lines[0].source_map.segments.last().unwrap().marker_edge,
+            Some(MarkerEdge::Closing)
+        );
+    }
+
+    #[test]
     fn a_sibling_boundary_does_not_disclose_the_previous_formal_prefix() {
         let mut source = String::from("- first\n");
         for _ in 0..5_000 {

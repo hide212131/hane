@@ -48,7 +48,7 @@ use hane_document::{
     Bias, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer,
 };
 use hane_markdown::{
-    BlockId, BlockIndex, Confidence, FenceDelimiter, IndexedBlock, ListProjection,
+    BlockId, BlockIndex, Confidence, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection,
     ListProjectionItem, ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId,
     NodeKind, fence_closes, fence_closing_delimiter, fence_delimiter, has_delimiter_markers,
     is_table_delimiter,
@@ -1423,6 +1423,9 @@ fn marker_edge(
     parsed: &MarkdownParse,
     nodes: &SourceIndex<NodeId>,
 ) -> Option<MarkerEdge> {
+    if let Some(edge) = planned.fence_edge {
+        return Some(edge);
+    }
     if planned.quote_owner.is_some()
         || planned.list_owner.is_some()
         || planned.list_prefix.is_some()
@@ -1690,6 +1693,7 @@ fn present_markdown_from_parse(
                 projected_markers.push(ProjectedMarker {
                     range: prefix.source_range,
                     fence: false,
+                    fence_edge: None,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1700,11 +1704,37 @@ fn present_markdown_from_parse(
         projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
     }
     if formal_code_block == Some(true) {
+        if let Some(projection) = shared.list_projection {
+            for (range, edge) in projection.fence_markers_in(range) {
+                let edge = match edge {
+                    FenceMarkerEdge::Opening => MarkerEdge::Opening,
+                    FenceMarkerEdge::Closing => MarkerEdge::Closing,
+                };
+                if let Some(marker) = projected_markers
+                    .iter_mut()
+                    .find(|marker| marker.range == range)
+                {
+                    marker.fence = true;
+                    marker.fence_edge = Some(edge);
+                } else {
+                    projected_markers.push(ProjectedMarker {
+                        range,
+                        fence: true,
+                        fence_edge: Some(edge),
+                        quote_owner: None,
+                        list_owner: None,
+                        list_prefix: None,
+                        global_list_prefix: None,
+                    });
+                }
+            }
+            projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
+        }
         projected_markers.retain(|marker| {
             (marker.fence
                 && shared
                     .list_projection
-                    .is_some_and(|projection| projection.is_fence_marker(marker.range)))
+                    .is_some_and(|projection| projection.fence_marker_edge(marker.range).is_some()))
                 || marker.quote_owner.is_some()
                 || marker.list_owner.is_some()
                 || marker.list_prefix.is_some()
@@ -2132,6 +2162,7 @@ impl<T> SourceIndex<T> {
 struct ProjectedMarker {
     range: SourceRange,
     fence: bool,
+    fence_edge: Option<MarkerEdge>,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2394,6 +2425,16 @@ impl ProjectionIndex {
                         (marker.start, marker.end)
                     })
                     .is_ok(),
+                fence_edge: parsed
+                    .fence_marker_edges
+                    .binary_search_by_key(&(range.start, range.end), |(marker, _)| {
+                        (marker.start, marker.end)
+                    })
+                    .ok()
+                    .map(|index| match parsed.fence_marker_edges[index].1 {
+                        FenceMarkerEdge::Opening => MarkerEdge::Opening,
+                        FenceMarkerEdge::Closing => MarkerEdge::Closing,
+                    }),
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),

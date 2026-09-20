@@ -364,12 +364,18 @@ fn build_list_projections(
                     .cloned()
                     .collect();
                 let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
+                let fence_start = parsed
+                    .fence_marker_edges
+                    .partition_point(|(marker, _)| marker.end <= block_range.start);
+                let fence_end = parsed
+                    .fence_marker_edges
+                    .partition_point(|(marker, _)| marker.start < block_range.end);
                 ListProjection::new(
                     block_items,
                     block_prefixes,
                     block_lists,
                     rows,
-                    parsed.fence_markers.clone(),
+                    parsed.fence_marker_edges[fence_start..fence_end].to_vec(),
                 )
             })
         })
