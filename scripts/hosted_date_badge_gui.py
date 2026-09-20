@@ -391,6 +391,16 @@ def nearest_same_row(text_match: dict, badge_matches: list[dict]) -> dict | None
     )
 
 
+def largest_same_row(text_match: dict, regions: list[dict]) -> dict | None:
+    """Choose the largest bounded color region on the filename's row."""
+    same_row = [
+        region
+        for region in regions
+        if abs(center_y(region) - center_y(text_match)) <= SAME_ROW_CENTER_Y_TOLERANCE
+    ]
+    return max(same_row, key=lambda region: region.get("pixel_count", 0), default=None)
+
+
 def normalized_ocr_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -930,7 +940,7 @@ def main() -> int:
                                             # search still proves that the expected colored chip
                                             # is on this exact filename row, without accepting a
                                             # color from an adjacent row.
-                                            badge_match = nearest_same_row(display_match, color_regions)
+                                            badge_match = largest_same_row(display_match, color_regions)
                                             badge_source = "pixel_color_region" if badge_match is not None else "ocr"
                                         if badge_match is None:
                                             scenario_steps.append(step(

@@ -845,6 +845,18 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
         self.assertTrue(mod.badge_is_strictly_right(text, separated))
         self.assertFalse(mod.badge_is_strictly_right(text, overlapping))
 
+    def test_largest_same_row_prefers_the_chip_over_small_color_fragments(self):
+        text = {"bounding_box": {"minX": 0.10, "maxX": 0.20, "minY": 0.50, "maxY": 0.52}}
+        fragment = {
+            "bounding_box": {"minX": 0.21, "maxX": 0.22, "minY": 0.501, "maxY": 0.503},
+            "pixel_count": 36,
+        }
+        chip = {
+            "bounding_box": {"minX": 0.21, "maxX": 0.26, "minY": 0.50, "maxY": 0.53},
+            "pixel_count": 1200,
+        }
+        self.assertIs(mod.largest_same_row(text, [fragment, chip]), chip)
+
     def test_badge_background_requires_the_expected_palette_color(self):
         expected = mod.DATE_BADGE_BACKGROUND_BY_RANGE["this_week"]
         observed = {
