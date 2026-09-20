@@ -109,9 +109,9 @@ impl Element for InlineRenameInput {
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.input
-            .update(cx, |view, _| view.set_inline_rename_input_bounds(bounds));
+            .update(cx, |view, _| view.set_text_input_bounds(bounds));
         let input = self.input.read(cx);
-        let Some(state) = input.inline_rename_render_state() else {
+        let Some(state) = input.text_input_render_state() else {
             return InlineRenamePrepaintState {
                 line: None,
                 cursor: None,
@@ -204,6 +204,11 @@ impl EntityInputHandler for EditorView {
             actual_range.replace(actual);
             return Some(text);
         }
+        if self.sidebar_filter_is_focused() {
+            let (text, actual) = self.sidebar_filter_text_for_range(range_utf16)?;
+            actual_range.replace(actual);
+            return Some(text);
+        }
         let (text, actual) = self.editor().text_for_utf16_range(range_utf16).ok()?;
         actual_range.replace(actual);
         Some(text)
@@ -216,6 +221,9 @@ impl EntityInputHandler for EditorView {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         if let Some((range, reversed)) = self.inline_rename_selection() {
+            return Some(UTF16Selection { range, reversed });
+        }
+        if let Some((range, reversed)) = self.sidebar_filter_selection() {
             return Some(UTF16Selection { range, reversed });
         }
         Some(UTF16Selection {
@@ -231,6 +239,9 @@ impl EntityInputHandler for EditorView {
         if self.inline_rename_active() {
             return self.inline_rename_marked_range();
         }
+        if self.sidebar_filter_is_focused() {
+            return self.sidebar_filter_marked_range();
+        }
         self.editor()
             .ime()
             .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok())
@@ -239,6 +250,8 @@ impl EntityInputHandler for EditorView {
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if self.inline_rename_active() {
             self.commit_inline_rename_composition(cx);
+        } else if self.sidebar_filter_is_focused() {
+            self.commit_sidebar_filter_composition(cx);
         } else {
             self.clear_pending_list_editing();
             self.editor_mut().commit_composition();
@@ -254,6 +267,10 @@ impl EntityInputHandler for EditorView {
     ) {
         if self.inline_rename_active() {
             self.replace_inline_rename_text(range_utf16, new_text, cx);
+            return;
+        }
+        if self.sidebar_filter_is_focused() {
+            self.replace_sidebar_filter_text(range_utf16, new_text, cx);
             return;
         }
         if range_utf16.is_none() && self.editor().ime().is_none() {
@@ -284,6 +301,15 @@ impl EntityInputHandler for EditorView {
     ) {
         if self.inline_rename_active() {
             self.replace_and_mark_inline_rename_text(
+                range_utf16,
+                new_text,
+                new_selected_range_utf16,
+                cx,
+            );
+            return;
+        }
+        if self.sidebar_filter_is_focused() {
+            self.replace_and_mark_sidebar_filter_text(
                 range_utf16,
                 new_text,
                 new_selected_range_utf16,
@@ -330,6 +356,22 @@ impl EntityInputHandler for EditorView {
                 },
             });
         }
+        if self.sidebar_filter_is_focused() {
+            let state = self.text_input_render_state()?;
+            let line = shape_inline_rename_line(&state, window);
+            let caret = if state.selection_reversed {
+                state.selected_range.start
+            } else {
+                state.selected_range.end
+            };
+            return Some(Bounds {
+                origin: point(bounds.left() + line.x_for_index(caret), bounds.top()),
+                size: Size {
+                    width: px(1.0),
+                    height: bounds.size.height,
+                },
+            });
+        }
         let Some(caret) = self.caret_geometry() else {
             return Some(bounds);
         };
@@ -350,6 +392,9 @@ impl EntityInputHandler for EditorView {
     ) -> Option<usize> {
         if self.inline_rename_active() {
             return self.inline_rename_character_index_for_point(point, window);
+        }
+        if self.sidebar_filter_is_focused() {
+            return self.sidebar_filter_character_index_for_point(point, window);
         }
         self.editor()
             .source_range_to_utf16(SourceRange::empty(self.editor().selection().active.0))

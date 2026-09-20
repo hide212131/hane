@@ -63,7 +63,9 @@ impl Element for InputCapture {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if !self.input.read(cx).inline_rename_active() {
+        if !self.input.read(cx).inline_rename_active()
+            && !self.input.read(cx).sidebar_filter_is_focused()
+        {
             let focus = self.input.read(cx).focus_handle.clone();
             window.handle_input(
                 &focus,
