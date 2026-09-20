@@ -180,17 +180,22 @@ func selectAllTypeRomajiCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource
     """)
 }
 
-func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+func typeRomajiAtCaret(_ pid: pid_t, _ romaji: String, _ inputSource: String, commit: Bool, save: Bool) {
     focus(pid)
+    // The caller selects the source while the editor is unfocused. Selecting it
+    // once more after focus is intentional: it binds the newly focused
+    // NSTextInputContext to Kotoeri so a cancel/commit operation is a real IME
+    // composition rather than a plain key sequence. The focused validator does
+    // this only after its explicit deactivate/select evidence step.
     selectSource(inputSource)
-    // TISSelectInputSource() making currentSourceID() report the Japanese source
-    // does not by itself guarantee the app's IME session is actually ready to
-    // convert keystrokes yet; on a hosted runner the switch can still be
-    // settling. Re-check with a bounded, deterministic poll instead of a single
-    // immediate check, and require the match to still hold after an explicit
-    // settle delay before typing (Issue #126 post-merge GUI run 35410838091:
-    // currentSourceID() already reported the Japanese source, yet the romaji
-    // was saved unconverted).
+    // A successful TISSelectInputSource/currentSourceID match does not by
+    // itself guarantee the app's IME session is ready to convert keystrokes;
+    // on a hosted runner the switch can still be settling. Re-check with a
+    // bounded, deterministic poll instead of a single immediate check, and
+    // require the match to still hold after an explicit settle delay before
+    // typing (Issue #126 post-merge GUI run 35410838091: currentSourceID()
+    // already reported the Japanese source, yet the romaji was saved
+    // unconverted).
     let settleDeadline = Date().addingTimeInterval(3.0)
     while currentSourceID() != inputSource && Date() < settleDeadline {
         Thread.sleep(forTimeInterval: 0.1)
@@ -203,6 +208,10 @@ func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: 
         fail("input source became inactive again before typing: \(inputSource)")
     }
     let escaped = escapeForAppleScript(romaji)
+    let finishAction = commit
+        ? "key code 49\ndelay 0.5\nkey code 36"
+        : "key code 53"
+    let saveAction = save ? "keystroke \"s\" using command down\ndelay 0.3" : ""
     runAppleScript("""
     tell application "System Events"
         tell first process whose unix id is \(pid)
@@ -210,15 +219,24 @@ func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: 
             delay 0.3
             keystroke "\(escaped)"
             delay 0.5
-            key code 49
-            delay 0.5
-            key code 36
+            \(finishAction)
             delay 0.3
-            keystroke "s" using command down
-            delay 0.3
+            \(saveAction)
         end tell
     end tell
     """)
+}
+
+func typeRomajiAtCaretCommitSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: true, save: true)
+}
+
+func typeRomajiAtCaretCommit(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: true, save: false)
+}
+
+func typeRomajiAtCaretCancelSave(_ pid: pid_t, _ romaji: String, _ inputSource: String) {
+    typeRomajiAtCaret(pid, romaji, inputSource, commit: false, save: true)
 }
 
 func recognizeText(_ path: String) {
@@ -311,9 +329,26 @@ func screenPoint(_ bounds: CGRect, _ normalized: CGRect, _ edge: String) -> CGPo
     return CGPoint(x: bounds.minX + xNorm * bounds.width, y: bounds.minY + yNormFromTop * bounds.height)
 }
 
-func focus(_ pid: pid_t) {
+func activateApplication(_ pid: pid_t) {
+    guard let application = NSRunningApplication(processIdentifier: pid) else {
+        fail("target application is not running: \(pid)")
+    }
+    _ = application.activate(options: [.activateAllWindows])
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.2)
+    Thread.sleep(forTimeInterval: 0.3)
+}
+
+func deactivateApplication() {
+    // Change the global input source while the target editor is not the key
+    // application. GPUI reactivates the key window's NSTextInputContext when
+    // macOS publishes a keyboard-source change; doing that while Kotoeri is
+    // being selected can block the target editor in AppKit's IME XPC path.
+    runAppleScript("tell application \"Finder\" to activate")
+    Thread.sleep(forTimeInterval: 0.3)
+}
+
+func focus(_ pid: pid_t) {
+    activateApplication(pid)
 }
 
 func postClick(_ point: CGPoint) {
@@ -395,7 +430,44 @@ func typeSave(_ pid: pid_t, _ text: String) {
     """)
 }
 
+func pressKey(_ pid: pid_t, _ key: String, shift: Bool, save: Bool) {
+    let keyCode: Int
+    switch key {
+    case "enter": keyCode = 36
+    case "backspace": keyCode = 51
+    default: fail("key must be enter or backspace")
+    }
+    let keyAction = shift ? "key code \(keyCode) using shift down" : "key code \(keyCode)"
+    let saveAction = save ? "keystroke \"s\" using command down\ndelay 0.3" : ""
+    runAppleScript("""
+    tell application "System Events"
+        tell first process whose unix id is \(pid)
+            set frontmost to true
+            delay 0.1
+            \(keyAction)
+            delay 0.2
+            \(saveAction)
+        end tell
+    end tell
+    """)
+}
+
+func focusEditor(_ pid: pid_t) {
+    let bounds = windowBounds(pid)
+    // Hane's input capture is focused by an editor-body mouse event. The
+    // point is derived from the live window bounds rather than a fixed screen
+    // coordinate; moveDocStart immediately relocates the caret by source
+    // offset afterward, so this click is only a focus operation.
+    let point = CGPoint(
+        x: bounds.midX,
+        y: bounds.minY + bounds.height * 0.5
+    )
+    focus(pid)
+    postClick(point)
+}
+
 func moveDocStart(_ pid: pid_t) {
+    focusEditor(pid)
     runAppleScript("""
     tell application "System Events"
         tell first process whose unix id is \(pid)
@@ -497,7 +569,7 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|click-text|drag-select-text|type-save|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -512,6 +584,12 @@ case "wheel":
     scrollEditor(pid, pixels)
 case "current-source":
     print(currentSourceID())
+case "activate":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("activate requires PID") }
+    activateApplication(pid)
+case "deactivate":
+    guard arguments.count == 1 else { fail("deactivate takes no arguments") }
+    deactivateApplication()
 case "list-sources":
     for id in inputSources().compactMap({ sourceID($0) }) { print(id) }
 case "select-source":
@@ -538,6 +616,12 @@ case "type-romaji-commit-save":
 case "type-romaji-at-caret-commit-save":
     guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-commit-save requires PID, romaji text and source ID") }
     typeRomajiAtCaretCommitSave(pid, arguments[2], arguments[3])
+case "type-romaji-at-caret-commit":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-commit requires PID, romaji text and source ID") }
+    typeRomajiAtCaretCommit(pid, arguments[2], arguments[3])
+case "type-romaji-at-caret-cancel-save":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("type-romaji-at-caret-cancel-save requires PID, romaji text and source ID") }
+    typeRomajiAtCaretCancelSave(pid, arguments[2], arguments[3])
 case "click-text":
     guard arguments.count == 5, let pid = pid_t(arguments[1]) else { fail("click-text requires PID, screenshot path, regex pattern and edge") }
     clickText(pid, arguments[2], arguments[3], arguments[4])
@@ -547,6 +631,16 @@ case "drag-select-text":
 case "type-save":
     guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("type-save requires PID and text") }
     typeSave(pid, arguments[2])
+case "press-key":
+    guard arguments.count == 4, let pid = pid_t(arguments[1]) else { fail("press-key requires PID, key and save flag") }
+    let save = arguments[3] == "save"
+    guard save || arguments[3] == "nosave" else { fail("press-key save flag must be save or nosave") }
+    pressKey(pid, arguments[2], shift: false, save: save)
+case "press-shift-enter":
+    guard arguments.count == 3, let pid = pid_t(arguments[1]) else { fail("press-shift-enter requires PID and save flag") }
+    let save = arguments[2] == "save"
+    guard save || arguments[2] == "nosave" else { fail("press-shift-enter save flag must be save or nosave") }
+    pressKey(pid, "enter", shift: true, save: save)
 case "move-doc-start":
     guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("move-doc-start requires PID") }
     moveDocStart(pid)

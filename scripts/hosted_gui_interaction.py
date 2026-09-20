@@ -414,6 +414,19 @@ def prepare_helper(source: Path, directory: Path) -> PreparedHelper:
     return PreparedHelper(binary, hashlib.sha256(binary.read_bytes()).hexdigest())
 
 
+def prepare_capture_helper(source: Path, directory: Path) -> PreparedHelper:
+    binary = directory / "window-capture-helper"
+    subprocess.run(
+        ["/usr/bin/swiftc", str(source), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    binary.chmod(0o500)
+    return PreparedHelper(binary, hashlib.sha256(binary.read_bytes()).hexdigest())
+
+
 def run_helper(swift_helper: PreparedHelper, args: list[str], timeout: float) -> tuple[bool, str, str]:
     try:
         if hashlib.sha256(swift_helper.binary.read_bytes()).hexdigest() != swift_helper.digest:
@@ -430,6 +443,31 @@ def run_helper(swift_helper: PreparedHelper, args: list[str], timeout: float) ->
     if proc.returncode != 0:
         return False, proc.stdout, proc.stderr.strip() or f"swift helper exited {proc.returncode}"
     return True, proc.stdout.strip(), ""
+
+
+def select_input_source(
+    swift_helper: PreparedHelper, source_id: str, timeout: float, attempts: int = 10
+) -> tuple[bool, str, str, int]:
+    """Select an input source and wait for macOS to publish the new source.
+
+    TISSelectInputSource can return success before currentSourceID reflects the
+    selection. Keep the retry bounded and report the observed source so GUI
+    validators fail closed instead of typing with a stale IME layout.
+    """
+    last_error = ""
+    selected = ""
+    for attempt in range(1, attempts + 1):
+        ok, _output, error = run_helper(swift_helper, ["select-source", source_id], timeout)
+        if not ok:
+            last_error = error
+        else:
+            ok, selected, error = run_helper(swift_helper, ["current-source"], timeout)
+            if not ok:
+                last_error = error
+            elif selected == source_id:
+                return True, selected, "", attempt
+        time.sleep(0.2)
+    return False, selected, last_error or f"input source did not become active: {source_id}", attempts
 
 
 def wait_for_fixture_bytes(
@@ -483,7 +521,8 @@ def wait_for_fixture_settled_bytes(
 
 
 def make_config(module, *, workspace_dir, scenario, expected_sha, request_id, generation, run_dir,
-                 fixture_path, features, extra_env, startup_timeout, window_timeout):
+                 fixture_path, features, extra_env, startup_timeout, window_timeout,
+                 capture_helper: Optional[PreparedHelper] = None):
     state_dir = run_dir / "state"
     run_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -502,6 +541,7 @@ def make_config(module, *, workspace_dir, scenario, expected_sha, request_id, ge
         extra_env=extra_env,
         startup_timeout_seconds=startup_timeout,
         window_timeout_seconds=window_timeout,
+        capture_cmd=[str(capture_helper.binary)] if capture_helper is not None else None,
     )
 
 
@@ -511,7 +551,10 @@ def capture_named(module, env, config, window_id: str, run_dir: Path, label: str
     return {**capture_step, "name": f"capture_{label}"}
 
 
-def open_session(module, env, config, binary_path, process_holder, capture_label: str) -> tuple[list[dict], Optional[str]]:
+def open_session(
+    module, env, config, binary_path, process_holder, capture_label: str,
+    swift_helper: Optional[PreparedHelper] = None, helper_timeout: float = 20.0,
+) -> tuple[list[dict], Optional[str]]:
     steps = []
     launch_step = module.do_launch(env, config, binary_path, process_holder)
     steps.append(launch_step)
@@ -524,6 +567,13 @@ def open_session(module, env, config, binary_path, process_holder, capture_label
     if window_step["result"] != "pass":
         steps.append(skipped_step(f"capture_{capture_label}", "window_discovery が pass しなかった"))
         return steps, None
+    if swift_helper is not None:
+        pid = current_pid(process_holder)
+        if pid is None:
+            steps.append(make_step("activate", "blocked", reason="対象プロセスのPIDを取得できない"))
+        else:
+            ok, _output, error = run_helper(swift_helper, ["activate", str(pid)], helper_timeout)
+            steps.append(make_step("activate", "pass" if ok else "blocked", reason=None if ok else error))
     steps.append(capture_named(module, env, config, window_id, config.run_dir, capture_label))
     return steps, window_id
 
@@ -575,7 +625,9 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
         startup_timeout=startup_timeout, window_timeout=window_timeout,
     )
     try:
-        session_steps, window_id = open_session(module, env, config, binary_path, process_holder, "before")
+        session_steps, window_id = open_session(
+            module, env, config, binary_path, process_holder, "before", swift_helper, helper_timeout
+        )
         steps += session_steps
         pid = current_pid(process_holder)
         if pid is not None and window_id is not None:
@@ -633,7 +685,9 @@ def run_ascii_scenario(module, env, target_dir, swift_helper, base_run_dir, bina
         startup_timeout=startup_timeout, window_timeout=window_timeout,
     )
     try:
-        session_steps, _window_id = open_session(module, env, reopen_config, binary_path, reopen_process_holder, "reopen")
+        session_steps, _window_id = open_session(
+            module, env, reopen_config, binary_path, reopen_process_holder, "reopen", swift_helper, helper_timeout
+        )
         steps += session_steps
         steps.append(verify_visible_text(swift_helper, reopen_dir / "reopen.png", ASCII_AFTER_APPEND, helper_timeout))
         matched, actual = wait_for_fixture_bytes(fixture_path, ASCII_AFTER_APPEND.encode("utf-8"), 1.0)
@@ -693,7 +747,9 @@ def run_ime_scenario(module, env, target_dir, swift_helper, base_run_dir, binary
             fixture_path=fixture_path, features=["timing-probe"], extra_env={},
             startup_timeout=startup_timeout, window_timeout=window_timeout,
         )
-        session_steps, window_id = open_session(module, env, config, binary_path, process_holder, "before")
+        session_steps, window_id = open_session(
+            module, env, config, binary_path, process_holder, "before", swift_helper, helper_timeout
+        )
         steps += session_steps
         pid = current_pid(process_holder)
         if pid is not None and window_id is not None:
@@ -735,7 +791,9 @@ def run_scroll_scenario(module, env, target_dir, swift_helper, base_run_dir, bin
     holder = {"process": None}
     steps = []
     try:
-        initial, window_id = open_session(module, env, config, binary_path, holder, "before")
+        initial, window_id = open_session(
+            module, env, config, binary_path, holder, "before", swift_helper, helper_timeout
+        )
         steps.extend(initial)
         if window_id is not None:
             before_ok, before_text, before_error = run_helper(swift_helper, ["ocr", str(run_dir / "before.png")], helper_timeout)
@@ -1691,7 +1749,9 @@ def run_inline_syntax_scenario(module, env, target_dir, swift_helper, base_run_d
         startup_timeout=startup_timeout, window_timeout=window_timeout,
     )
     try:
-        session_steps, window_id = open_session(module, env, config, binary_path, process_holder, "before")
+        session_steps, window_id = open_session(
+            module, env, config, binary_path, process_holder, "before", swift_helper, helper_timeout
+        )
         steps += session_steps
 
         boundary_click_checks = (

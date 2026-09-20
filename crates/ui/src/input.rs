@@ -233,13 +233,14 @@ impl EntityInputHandler for EditorView {
         }
         self.editor()
             .ime()
-            .and_then(|ime| self.editor().source_range_to_utf16(ime.current_range).ok())
+            .and_then(|ime| self.editor().source_range_to_utf16(ime.marked_range).ok())
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if self.inline_rename_active() {
             self.commit_inline_rename_composition(cx);
         } else {
+            self.clear_pending_list_editing();
             self.editor_mut().commit_composition();
         }
     }
@@ -255,13 +256,18 @@ impl EntityInputHandler for EditorView {
             self.replace_inline_rename_text(range_utf16, new_text, cx);
             return;
         }
-        let result = if range_utf16.is_none() && self.editor().ime().is_none() {
-            self.editor_mut().insert_text(new_text).map(|_| ())
-        } else {
-            self.editor_mut()
-                .commit_text(range_utf16, new_text)
-                .map(|_| ())
-        };
+        if range_utf16.is_none() && self.editor().ime().is_none() {
+            self.insert_text(new_text, cx);
+            return;
+        }
+        let indentation = self.pending_list_indentation();
+        self.clear_pending_list_editing();
+        let mut replacement = indentation;
+        replacement.push_str(new_text);
+        let result = self
+            .editor_mut()
+            .commit_text(range_utf16, &replacement)
+            .map(|_| ());
         if let Err(error) = result {
             self.report_error("text input", error);
         }
@@ -285,10 +291,14 @@ impl EntityInputHandler for EditorView {
             );
             return;
         }
-        if let Err(error) =
-            self.editor_mut()
-                .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
-        {
+        let indentation = self.pending_list_indentation();
+        self.clear_pending_list_editing();
+        if let Err(error) = self.editor_mut().replace_and_mark_text_with_prefix(
+            range_utf16,
+            &indentation,
+            new_text,
+            new_selected_range_utf16,
+        ) {
             self.report_error("IME update", error);
         }
         self.after_input(cx);

@@ -1,6 +1,7 @@
 use crate::view::EditorView;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::EditorCommand;
+use hane_presentation::ListCaretOrigin;
 
 macro_rules! command_actions {
     ($(
@@ -88,7 +89,7 @@ command_actions! {
                 view.confirm_inline_rename(cx);
             }
         } else if view.editor().ime().is_none() {
-            view.dispatch(EditorCommand::Insert("\n"), cx);
+            view.insert_newline(ListCaretOrigin::Marker, cx);
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
@@ -99,7 +100,7 @@ command_actions! {
                 view.confirm_inline_rename(cx);
             }
         } else if view.editor().ime().is_none() {
-            view.dispatch(EditorCommand::Insert("\n"), cx);
+            view.insert_newline(ListCaretOrigin::Body, cx);
         }
     },
     Backspace ("backspace") => backspace |view, _window, cx| {
