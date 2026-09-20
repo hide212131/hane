@@ -83,6 +83,8 @@ const SIDEBAR_RESIZER_WIDTH: f32 = 5.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
+const SIDEBAR_FILTER_HEIGHT: f32 = 28.0;
+const SIDEBAR_FILTER_GAP: f32 = 4.0;
 const SIDEBAR_PADDING: f32 = 8.0;
 const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 /// How often `_date_badge_refresh_task` re-observes the local calendar date
@@ -223,11 +225,21 @@ fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: 
     (start_width + pointer_delta).clamp(minimum, maximum)
 }
 
-fn sidebar_content_height(tree_rows: usize, draft_rows: usize) -> f32 {
+fn sidebar_content_height(
+    tree_rows: usize,
+    draft_rows: usize,
+    empty_filter_row: bool,
+    show_filter: bool,
+) -> f32 {
     2.0 * SIDEBAR_PADDING
         + SIDEBAR_TOOLBAR_HEIGHT
         + SIDEBAR_TOOLBAR_GAP
-        + (1 + tree_rows + draft_rows) as f32 * SIDEBAR_ROW_HEIGHT
+        + if show_filter {
+            SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
+        } else {
+            0.0
+        }
+        + (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
 /// The width layout wraps against: the window viewport, minus whatever the
@@ -356,6 +368,13 @@ pub(crate) struct InlineRenameRenderState {
     pub(crate) marked_range: Option<Range<usize>>,
 }
 
+#[derive(Clone, Debug)]
+struct SidebarFilterComposition {
+    text: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
 fn inline_rename_parts(path: &Path, kind: InlineRenameKind) -> Option<(String, Option<String>)> {
     // The inline field is UTF-8 text. Refuse names that cannot be represented
     // losslessly instead of letting `to_string_lossy` silently replace bytes
@@ -456,14 +475,26 @@ fn inline_rename_cursor(rename: &InlineRename) -> usize {
 }
 
 fn select_inline_rename_to(rename: &mut InlineRename, offset: usize) {
-    if rename.selection_reversed {
-        rename.selected_range.start = offset;
+    select_inline_rename_to_fields(
+        &mut rename.selected_range,
+        &mut rename.selection_reversed,
+        offset,
+    );
+}
+
+fn select_inline_rename_to_fields(
+    selected_range: &mut Range<usize>,
+    selection_reversed: &mut bool,
+    offset: usize,
+) {
+    if *selection_reversed {
+        selected_range.start = offset;
     } else {
-        rename.selected_range.end = offset;
+        selected_range.end = offset;
     }
-    if rename.selected_range.end < rename.selected_range.start {
-        rename.selection_reversed = !rename.selection_reversed;
-        rename.selected_range = rename.selected_range.end..rename.selected_range.start;
+    if selected_range.end < selected_range.start {
+        *selection_reversed = !*selection_reversed;
+        *selected_range = selected_range.end..selected_range.start;
     }
 }
 
@@ -515,6 +546,18 @@ pub struct EditorView {
     /// Folders the sidebar tree currently shows expanded. The work folder
     /// root itself is always shown expanded and is not tracked here.
     expanded_folders: HashSet<PathBuf>,
+    /// The current file-name-only sidebar filter. It is deliberately kept as
+    /// view state rather than in `WorkFolder`, because filtering is a display
+    /// concern and must not change the discovered tree.
+    sidebar_filter: String,
+    sidebar_filter_selected_range: Range<usize>,
+    sidebar_filter_selection_reversed: bool,
+    sidebar_filter_marked_range: Option<Range<usize>>,
+    sidebar_filter_composition: Option<SidebarFilterComposition>,
+    /// The shared view focus handle is used by both the editor and sidebar
+    /// inputs, so this bit identifies which text field currently owns it.
+    sidebar_filter_focused: bool,
+    sidebar_filter_input_bounds: Option<Bounds<Pixels>>,
     /// Whether the most recent keyboard focus came from the sidebar. The
     /// editor and sidebar share one view focus handle, so this explicit bit
     /// prevents an F2 pressed while editing document text from renaming the
@@ -899,6 +942,10 @@ impl EditorView {
         self.inline_rename.is_some()
     }
 
+    pub(crate) fn sidebar_filter_is_focused(&self) -> bool {
+        self.sidebar_filter_focused
+    }
+
     pub(crate) fn inline_rename_render_state(&self) -> Option<InlineRenameRenderState> {
         self.inline_rename
             .as_ref()
@@ -910,8 +957,38 @@ impl EditorView {
             })
     }
 
+    pub(crate) fn text_input_render_state(&self) -> Option<InlineRenameRenderState> {
+        if let Some(state) = self.inline_rename_render_state() {
+            return Some(state);
+        }
+        if self.inline_rename_active() {
+            return None;
+        }
+        Some(InlineRenameRenderState {
+            text: self.sidebar_filter.clone(),
+            selected_range: if self.sidebar_filter_focused {
+                self.sidebar_filter_selected_range.clone()
+            } else {
+                0..0
+            },
+            selection_reversed: self.sidebar_filter_selection_reversed,
+            marked_range: self
+                .sidebar_filter_focused
+                .then(|| self.sidebar_filter_marked_range.clone())
+                .flatten(),
+        })
+    }
+
     pub(crate) fn set_inline_rename_input_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.inline_rename_input_bounds = Some(bounds);
+    }
+
+    pub(crate) fn set_text_input_bounds(&mut self, bounds: Bounds<Pixels>) {
+        if self.inline_rename_active() {
+            self.set_inline_rename_input_bounds(bounds);
+        } else if !self.inline_rename_active() {
+            self.sidebar_filter_input_bounds = Some(bounds);
+        }
     }
 
     /// Converts a native mouse position into the UTF-16 offset expected by the
@@ -924,6 +1001,23 @@ impl EditorView {
     ) -> Option<usize> {
         let bounds = self.inline_rename_input_bounds?;
         let state = self.inline_rename_render_state()?;
+        let line = shape_inline_rename_line(&state, window);
+        let x = if position.x <= bounds.left() {
+            px(0.0)
+        } else {
+            position.x - bounds.left()
+        };
+        let byte = line.closest_index_for_x(x).min(state.text.len());
+        Some(utf16_offset_from_byte(&state.text, byte))
+    }
+
+    pub(crate) fn sidebar_filter_character_index_for_point(
+        &self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<usize> {
+        let bounds = self.sidebar_filter_input_bounds?;
+        let state = self.text_input_render_state()?;
         let line = shape_inline_rename_line(&state, window);
         let x = if position.x <= bounds.left() {
             px(0.0)
@@ -961,6 +1055,10 @@ impl EditorView {
             .is_some_and(|rename| rename.composition.is_some())
     }
 
+    pub(crate) fn sidebar_filter_has_composition(&self) -> bool {
+        self.sidebar_filter_composition.is_some()
+    }
+
     pub(crate) fn inline_rename_text_for_range(
         &self,
         range_utf16: Range<usize>,
@@ -988,6 +1086,33 @@ impl EditorView {
             .marked_range
             .as_ref()
             .map(|range| range_to_utf16(&rename.text, range))
+    }
+
+    pub(crate) fn sidebar_filter_text_for_range(
+        &self,
+        range_utf16: Range<usize>,
+    ) -> Option<(String, Range<usize>)> {
+        let range = byte_range_from_utf16(&self.sidebar_filter, &range_utf16);
+        Some((
+            self.sidebar_filter[range.clone()].to_owned(),
+            range_to_utf16(&self.sidebar_filter, &range),
+        ))
+    }
+
+    pub(crate) fn sidebar_filter_selection(&self) -> Option<(Range<usize>, bool)> {
+        if !self.sidebar_filter_focused {
+            return None;
+        }
+        Some((
+            range_to_utf16(&self.sidebar_filter, &self.sidebar_filter_selected_range),
+            self.sidebar_filter_selection_reversed,
+        ))
+    }
+
+    pub(crate) fn sidebar_filter_marked_range(&self) -> Option<Range<usize>> {
+        self.sidebar_filter_marked_range
+            .as_ref()
+            .map(|range| range_to_utf16(&self.sidebar_filter, range))
     }
 
     pub(crate) fn replace_inline_rename_text(
@@ -1086,6 +1211,303 @@ impl EditorView {
         rename.selection_reversed = composition.selection_reversed;
         rename.marked_range = None;
         cx.notify();
+    }
+
+    pub(crate) fn replace_sidebar_filter_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.sidebar_filter_focused {
+            return false;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|range| byte_range_from_utf16(&self.sidebar_filter, range))
+            .or_else(|| self.sidebar_filter_marked_range.clone())
+            .unwrap_or_else(|| self.sidebar_filter_selected_range.clone());
+        let replacement: String = new_text
+            .chars()
+            .filter(|character| *character != '\n' && *character != '\r')
+            .collect();
+        self.sidebar_filter
+            .replace_range(range.clone(), &replacement);
+        let next = range.start + replacement.len();
+        self.sidebar_filter_selected_range = next..next;
+        self.sidebar_filter_selection_reversed = false;
+        self.sidebar_filter_marked_range = None;
+        self.sidebar_filter_composition = None;
+        self.sidebar_filter_changed(cx);
+        true
+    }
+
+    pub(crate) fn replace_and_mark_sidebar_filter_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.sidebar_filter_focused {
+            return false;
+        }
+        if self.sidebar_filter_composition.is_none() {
+            self.sidebar_filter_composition = Some(SidebarFilterComposition {
+                text: self.sidebar_filter.clone(),
+                selected_range: self.sidebar_filter_selected_range.clone(),
+                selection_reversed: self.sidebar_filter_selection_reversed,
+            });
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|range| byte_range_from_utf16(&self.sidebar_filter, range))
+            .or_else(|| self.sidebar_filter_marked_range.clone())
+            .unwrap_or_else(|| self.sidebar_filter_selected_range.clone());
+        let replacement: String = new_text
+            .chars()
+            .filter(|character| *character != '\n' && *character != '\r')
+            .collect();
+        self.sidebar_filter
+            .replace_range(range.clone(), &replacement);
+        let marked_end = range.start + replacement.len();
+        self.sidebar_filter_marked_range =
+            (!replacement.is_empty()).then_some(range.start..marked_end);
+        self.sidebar_filter_selected_range = inline_rename_selected_range(
+            range.start,
+            &replacement,
+            new_selected_range_utf16,
+            marked_end..marked_end,
+        );
+        self.sidebar_filter_selection_reversed = false;
+        self.sidebar_filter_changed(cx);
+        true
+    }
+
+    pub(crate) fn commit_sidebar_filter_composition(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter_composition.take().is_some() {
+            self.sidebar_filter_marked_range = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn cancel_sidebar_filter_composition(&mut self, cx: &mut Context<Self>) {
+        let Some(composition) = self.sidebar_filter_composition.take() else {
+            return;
+        };
+        self.sidebar_filter = composition.text;
+        self.sidebar_filter_selected_range = composition.selected_range;
+        self.sidebar_filter_selection_reversed = composition.selection_reversed;
+        self.sidebar_filter_marked_range = None;
+        self.sidebar_filter_changed(cx);
+    }
+
+    pub(crate) fn selected_sidebar_filter_text(&self) -> Option<String> {
+        (!self.sidebar_filter_selected_range.is_empty())
+            .then(|| self.sidebar_filter[self.sidebar_filter_selected_range.clone()].to_owned())
+    }
+
+    pub(crate) fn move_sidebar_filter_left(&mut self, extend: bool, cx: &mut Context<Self>) {
+        self.move_sidebar_filter_horizontal(false, extend, cx);
+    }
+
+    pub(crate) fn move_sidebar_filter_right(&mut self, extend: bool, cx: &mut Context<Self>) {
+        self.move_sidebar_filter_horizontal(true, extend, cx);
+    }
+
+    fn move_sidebar_filter_horizontal(
+        &mut self,
+        right: bool,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_filter_focused {
+            return;
+        }
+        let cursor = if self.sidebar_filter_selection_reversed {
+            self.sidebar_filter_selected_range.start
+        } else {
+            self.sidebar_filter_selected_range.end
+        };
+        let target = if right {
+            next_inline_rename_boundary(&self.sidebar_filter, cursor)
+        } else {
+            previous_inline_rename_boundary(&self.sidebar_filter, cursor)
+        };
+        if extend {
+            select_inline_rename_to_fields(
+                &mut self.sidebar_filter_selected_range,
+                &mut self.sidebar_filter_selection_reversed,
+                target,
+            );
+        } else if self.sidebar_filter_selected_range.is_empty() {
+            self.sidebar_filter_selected_range = target..target;
+            self.sidebar_filter_selection_reversed = false;
+        } else {
+            let target = if right {
+                self.sidebar_filter_selected_range.end
+            } else {
+                self.sidebar_filter_selected_range.start
+            };
+            self.sidebar_filter_selected_range = target..target;
+            self.sidebar_filter_selection_reversed = false;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_sidebar_filter_left(&mut self, cx: &mut Context<Self>) {
+        self.select_sidebar_filter_to(false, cx);
+    }
+
+    pub(crate) fn select_sidebar_filter_right(&mut self, cx: &mut Context<Self>) {
+        self.select_sidebar_filter_to(true, cx);
+    }
+
+    fn select_sidebar_filter_to(&mut self, right: bool, cx: &mut Context<Self>) {
+        if !self.sidebar_filter_focused {
+            return;
+        }
+        let cursor = if self.sidebar_filter_selection_reversed {
+            self.sidebar_filter_selected_range.start
+        } else {
+            self.sidebar_filter_selected_range.end
+        };
+        let target = if right {
+            next_inline_rename_boundary(&self.sidebar_filter, cursor)
+        } else {
+            previous_inline_rename_boundary(&self.sidebar_filter, cursor)
+        };
+        select_inline_rename_to_fields(
+            &mut self.sidebar_filter_selected_range,
+            &mut self.sidebar_filter_selection_reversed,
+            target,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn select_all_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter_focused {
+            self.sidebar_filter_selected_range = 0..self.sidebar_filter.len();
+            self.sidebar_filter_selection_reversed = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_sidebar_filter_home(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter_focused {
+            select_inline_rename_to_fields(
+                &mut self.sidebar_filter_selected_range,
+                &mut self.sidebar_filter_selection_reversed,
+                0,
+            );
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_sidebar_filter_end(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter_focused {
+            let target = self.sidebar_filter.len();
+            select_inline_rename_to_fields(
+                &mut self.sidebar_filter_selected_range,
+                &mut self.sidebar_filter_selection_reversed,
+                target,
+            );
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn move_sidebar_filter_home(&mut self, cx: &mut Context<Self>) {
+        self.move_sidebar_filter_to(0, cx);
+    }
+
+    pub(crate) fn move_sidebar_filter_end(&mut self, cx: &mut Context<Self>) {
+        let target = self.sidebar_filter.len();
+        self.move_sidebar_filter_to(target, cx);
+    }
+
+    fn move_sidebar_filter_to(&mut self, target: usize, cx: &mut Context<Self>) {
+        if self.sidebar_filter_focused {
+            self.sidebar_filter_selected_range = target..target;
+            self.sidebar_filter_selection_reversed = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn backspace_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        self.delete_sidebar_filter_with_direction(true, cx);
+    }
+
+    pub(crate) fn delete_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        self.delete_sidebar_filter_with_direction(false, cx);
+    }
+
+    fn delete_sidebar_filter_with_direction(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        if !self.sidebar_filter_focused {
+            return;
+        }
+        let range = if self.sidebar_filter_selected_range.is_empty() {
+            let cursor = if self.sidebar_filter_selection_reversed {
+                self.sidebar_filter_selected_range.start
+            } else {
+                self.sidebar_filter_selected_range.end
+            };
+            if backwards {
+                previous_inline_rename_boundary(&self.sidebar_filter, cursor)..cursor
+            } else {
+                cursor..next_inline_rename_boundary(&self.sidebar_filter, cursor)
+            }
+        } else {
+            self.sidebar_filter_selected_range.clone()
+        };
+        self.sidebar_filter.replace_range(range.clone(), "");
+        self.sidebar_filter_selected_range = range.start..range.start;
+        self.sidebar_filter_selection_reversed = false;
+        self.sidebar_filter_marked_range = None;
+        self.sidebar_filter_composition = None;
+        self.sidebar_filter_changed(cx);
+    }
+
+    fn sidebar_filter_changed(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_scroll.set_offset(point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    fn focus_sidebar_filter(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        let was_focused = self.sidebar_filter_focused;
+        self.sidebar_filter_focused = true;
+        self.sidebar_keyboard_focus = true;
+        window.focus(&self.focus_handle);
+        if was_focused {
+            if let Some(index) =
+                self.sidebar_filter_character_index_for_point(event.position, window)
+            {
+                let byte = byte_offset_from_utf16(&self.sidebar_filter, index);
+                self.sidebar_filter_selected_range = byte..byte;
+                self.sidebar_filter_selection_reversed = false;
+            }
+        } else {
+            self.sidebar_filter_selected_range = 0..self.sidebar_filter.len();
+            self.sidebar_filter_selection_reversed = false;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn blur_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_filter_focused {
+            self.sidebar_filter_focused = false;
+            self.sidebar_filter_marked_range = None;
+            self.sidebar_filter_composition = None;
+            self.sidebar_keyboard_focus = false;
+            cx.notify();
+        }
     }
 
     pub(crate) fn selected_inline_rename_text(&self) -> Option<String> {
@@ -1253,7 +1675,10 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.sidebar_keyboard_focus || self.inline_rename.is_some() {
+        if !self.sidebar_keyboard_focus
+            || self.sidebar_filter_focused
+            || self.inline_rename.is_some()
+        {
             return;
         }
         let selected = match self.sidebar_focus {
@@ -1629,6 +2054,13 @@ impl EditorView {
             selected_folder: None,
             sidebar_focus: SidebarFocus::ActiveSession,
             expanded_folders: HashSet::new(),
+            sidebar_filter: String::new(),
+            sidebar_filter_selected_range: 0..0,
+            sidebar_filter_selection_reversed: false,
+            sidebar_filter_marked_range: None,
+            sidebar_filter_composition: None,
+            sidebar_filter_focused: false,
+            sidebar_filter_input_bounds: None,
             sidebar_keyboard_focus: false,
             inline_rename: None,
             sidebar_width: theme.sidebar_width,
@@ -2336,6 +2768,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
         let Some(target_directory) = self.target_directory_for_new_entry() else {
             return;
@@ -2365,6 +2798,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = true;
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
@@ -2384,6 +2818,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = true;
         self.selected_folder = None;
         self.sidebar_focus = SidebarFocus::Folder;
@@ -2401,6 +2836,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
         let Some(work_folder) = self.work_folder.as_ref() else {
             return;
@@ -2815,6 +3251,13 @@ impl EditorView {
         self.work_folder_drafts.clear();
         self.selected_folder = None;
         self.expanded_folders.clear();
+        self.sidebar_filter.clear();
+        self.sidebar_filter_selected_range = 0..0;
+        self.sidebar_filter_selection_reversed = false;
+        self.sidebar_filter_marked_range = None;
+        self.sidebar_filter_composition = None;
+        self.sidebar_filter_focused = false;
+        self.sidebar_filter_input_bounds = None;
         self.pending_new_folders.clear();
         self.draft_recovery_warning = None;
         self.title_sync_pending.clear();
@@ -2839,6 +3282,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
         self.open_with_policy(path, OpenPolicy::ReuseActive, cx);
     }
@@ -2850,6 +3294,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = true;
         self.open_with_policy(path, OpenPolicy::NewSession, cx);
     }
@@ -3446,6 +3891,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        self.blur_sidebar_filter(cx);
         self.sidebar_keyboard_focus = false;
     }
 
@@ -5254,6 +5700,43 @@ fn flatten_work_folder_tree<'a>(
     }
 }
 
+/// Builds the rows shown while the sidebar filter is non-empty. A folder is
+/// retained only when one of its descendants matches; retained folders are
+/// always descended into so a match is reachable regardless of the user's
+/// normal expansion state. The original `expanded_folders` is never touched.
+fn flatten_filtered_work_folder_tree<'a>(
+    nodes: &'a [WorkFolderNode],
+    depth: usize,
+    query: &str,
+    out: &mut Vec<WorkFolderRow<'a>>,
+) -> bool {
+    let mut found = false;
+    for node in nodes {
+        match node {
+            WorkFolderNode::File(entry) => {
+                if entry.file_name().to_lowercase().contains(query) {
+                    out.push(WorkFolderRow { depth, node });
+                    found = true;
+                }
+            }
+            WorkFolderNode::Folder(folder) => {
+                let mut descendants = Vec::new();
+                if flatten_filtered_work_folder_tree(
+                    folder.children(),
+                    depth + 1,
+                    query,
+                    &mut descendants,
+                ) {
+                    out.push(WorkFolderRow { depth, node });
+                    out.extend(descendants);
+                    found = true;
+                }
+            }
+        }
+    }
+    found
+}
+
 impl EditorView {
     /// Re-observes the local calendar date for the sidebar's file-name
     /// badges and redraws the view when it has moved on. Driven by
@@ -5394,6 +5877,35 @@ impl EditorView {
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
             );
+        let mut filter_input = div().relative().flex_1().min_w(px(0.0)).h_full();
+        if self.sidebar_filter.is_empty() {
+            filter_input = filter_input.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(self.theme.quote_foreground))
+                    .child("Filter files…"),
+            );
+        }
+        filter_input = filter_input.child(InlineRenameInput { input: cx.entity() });
+        let filter = (!self.inline_rename_active()).then(|| {
+            div()
+                .id("work-folder-file-filter")
+                .debug_selector(|| "sidebar-filter".to_owned())
+                .h(px(SIDEBAR_FILTER_HEIGHT))
+                .flex_none()
+                .mb(px(SIDEBAR_FILTER_GAP))
+                .px(px(6.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(self.theme.sidebar_foreground))
+                .bg(rgb(self.theme.code_background))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_sidebar_filter))
+                .child(filter_input)
+        });
         let root_is_selected = (self.sidebar_focus == SidebarFocus::Folder
             && self.selected_folder.is_none())
             || (self.sidebar_focus == SidebarFocus::ActiveSession
@@ -5426,9 +5938,16 @@ impl EditorView {
                 window.focus(&view.focus_handle);
                 view.select_work_folder_root(cx);
             }));
+        let query = self.sidebar_filter.to_lowercase();
+        let filtering = !query.is_empty();
         let mut rows = Vec::new();
-        flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
+        if filtering {
+            flatten_filtered_work_folder_tree(work_folder.children(), 1, &query, &mut rows);
+        } else {
+            flatten_work_folder_tree(work_folder.children(), 1, &self.expanded_folders, &mut rows);
+        }
         let tree_row_count = rows.len();
+        let empty_filter_row = filtering && tree_row_count == 0;
         let today = local_today();
         let tree = rows
             .into_iter()
@@ -5569,14 +6088,31 @@ impl EditorView {
                                     if let Some(position) = event.mouse_position() {
                                         view.move_inline_rename_to_point(position, window, cx);
                                     }
-                                } else {
+                                } else if view.sidebar_filter.is_empty() {
                                     view.toggle_and_select_work_folder_folder(path.clone(), cx);
+                                } else if view.cancel_inline_rename(cx) {
+                                    view.blur_sidebar_filter(cx);
+                                    view.sidebar_keyboard_focus = true;
+                                    view.selected_folder = Some(path.clone());
+                                    view.sidebar_focus = SidebarFocus::Folder;
+                                    cx.notify();
                                 }
                             }))
                     }
                 }
             })
             .collect::<Vec<_>>();
+        let empty_filter = empty_filter_row.then(|| {
+            div()
+                .id("work-folder-filter-empty")
+                .debug_selector(|| "sidebar-filter-empty".to_owned())
+                .h(px(SIDEBAR_ROW_HEIGHT))
+                .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                .flex()
+                .items_center()
+                .text_color(rgb(self.theme.quote_foreground))
+                .child("No matching files")
+        });
         let mut draft_ids: Vec<SessionId> = self.work_folder_drafts.keys().copied().collect();
         draft_ids.sort_by_key(|id| id.0);
         let draft_row_count = draft_ids
@@ -5617,12 +6153,18 @@ impl EditorView {
                         if !view.cancel_inline_rename(cx) {
                             return;
                         }
+                        view.blur_sidebar_filter(cx);
                         view.sidebar_keyboard_focus = true;
                         view.activate_session(id, cx);
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height = sidebar_content_height(tree_row_count, draft_row_count);
+        let content_height = sidebar_content_height(
+            tree_row_count,
+            draft_row_count,
+            empty_filter_row,
+            !self.inline_rename_active(),
+        );
         let scrollbar = self.sidebar_scrollbar(sidebar_viewport_height, content_height, cx);
         Some(
             div()
@@ -5652,8 +6194,10 @@ impl EditorView {
                         .text_color(rgb(self.theme.sidebar_foreground))
                         .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
+                        .children(filter)
                         .child(root_row)
                         .children(tree)
+                        .children(empty_filter)
                         .children(drafts),
                 )
                 .children(scrollbar),
@@ -9875,6 +10419,186 @@ mod tests {
         });
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn sidebar_file_filter_reveals_matches_without_changing_normal_expansion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("file-filter-tree");
+        let project = root.join("Project");
+        let archive = root.join("Archive");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&archive).unwrap();
+        let target = project.join("Target Note.md");
+        std::fs::write(&target, "# Target Note\n").unwrap();
+        std::fs::write(project.join("Other.md"), "# Other\n").unwrap();
+        std::fs::write(archive.join("Old.md"), "# Old\n").unwrap();
+        std::fs::write(root.join("Loose.md"), "# Loose\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, _| {
+            view.expanded_folders.insert(archive.clone());
+            view.sidebar_scroll.set_offset(point(px(0.0), px(-120.0)));
+        });
+        cx.run_until_parked();
+        let sessions_before = view.read_with(cx, |view, _| view.sessions().count());
+
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.simulate_input("target note");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "target note");
+            assert_eq!(view.sidebar_scroll.offset().y, px(0.0));
+            assert_eq!(view.sessions().count(), sessions_before);
+            assert!(view.expanded_folders.contains(&archive));
+            assert!(!view.expanded_folders.contains(&project));
+
+            let mut rows = Vec::new();
+            flatten_filtered_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.sidebar_filter,
+                &mut rows,
+            );
+            let paths: Vec<&Path> = rows.iter().map(|row| row.node.path()).collect();
+            assert_eq!(paths, vec![project.as_path(), target.as_path()]);
+
+            let mut folder_name_rows = Vec::new();
+            flatten_filtered_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                "project",
+                &mut folder_name_rows,
+            );
+            assert!(folder_name_rows.is_empty());
+        });
+
+        let document_before_undo =
+            view.read_with(cx, |view, _| view.editor().document().full_text());
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-shift-z"
+        } else {
+            "ctrl-shift-z"
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "target note");
+            assert_eq!(view.editor().document().full_text(), document_before_undo);
+        });
+
+        view.update(cx, |view, _| {
+            let text = view.sidebar_filter.clone();
+            view.sidebar_filter_composition = Some(SidebarFilterComposition {
+                text,
+                selected_range: view.sidebar_filter_selected_range.clone(),
+                selection_reversed: view.sidebar_filter_selection_reversed,
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_filter_has_composition());
+        });
+
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_none());
+        assert!(cx.debug_bounds("sidebar-folder").is_some());
+        assert!(cx.debug_bounds("sidebar-file").is_some());
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_filter.is_empty());
+            assert!(view.expanded_folders.contains(&archive));
+            assert!(!view.expanded_folders.contains(&project));
+            let mut rows = Vec::new();
+            flatten_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.expanded_folders,
+                &mut rows,
+            );
+            let paths: Vec<&Path> = rows.iter().map(|row| row.node.path()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    archive.as_path(),
+                    archive.join("Old.md").as_path(),
+                    root.join("Loose.md").as_path(),
+                    project.as_path(),
+                ]
+            );
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn sidebar_file_filter_keeps_drafts_and_opens_a_visible_match(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("file-filter-open");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Meeting Notes.md");
+        std::fs::write(&target, "# Meeting Notes\n").unwrap();
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let filter_point = cx.debug_bounds("sidebar-filter").unwrap().center();
+        cx.simulate_click(filter_point, gpui::Modifiers::none());
+        cx.simulate_input("no such note");
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("sidebar-filter-empty").is_some());
+        assert!(cx.debug_bounds("sidebar-draft").is_some());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions().count(), 2);
+            assert!(view.loading_paths.is_empty());
+        });
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input("MEETING");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_filter, "MEETING");
+            let mut rows = Vec::new();
+            flatten_filtered_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.sidebar_filter.to_lowercase(),
+                &mut rows,
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.node.path()).collect::<Vec<_>>(),
+                vec![target.as_path()]
+            );
+        });
+        view.update(cx, |view, cx| view.open_work_folder_entry(&target, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(target.as_path()));
+            assert_eq!(view.sidebar_filter, "MEETING");
+            assert!(!view.sidebar_filter_is_focused());
+            let input = view.text_input_render_state().unwrap();
+            assert_eq!(input.text, "MEETING");
+            assert!(input.selected_range.is_empty());
+            assert!(input.marked_range.is_none());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn simulate_double_click(cx: &mut gpui::VisualTestContext, point: gpui::Point<gpui::Pixels>) {
