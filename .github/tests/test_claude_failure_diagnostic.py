@@ -332,6 +332,8 @@ class ClaudeFailureWorkflowWiringTests(unittest.TestCase):
         self.assertIn("has_changes", WORKFLOW)
         self.assertIn("trigger_actor", WORKFLOW)
         self.assertIn("workflow_sha", WORKFLOW)
+        self.assertIn("HANDOFF_BODY: ${{ github.event.comment.body }}", WORKFLOW)
+        self.assertIn("commander-handoff.txt", WORKFLOW)
         completed_patch_block = WORKFLOW.split(
             "      - name: Upload completed worker patch\n", 1
         )[1].split("\n      - name: Build checkpoint metadata after Claude failure", 1)[0]

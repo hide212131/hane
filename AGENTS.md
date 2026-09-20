@@ -44,8 +44,8 @@ AADW の開発運用機能は、通常経路で Issue の目的・受入条件�
 ## 役割と Trust Boundary
 
 - **ChatGPT / Commander**: Commander Policy と current facts / evidence から次の一つの action を決める。GitHub の Issue / Pull Request / review / checks / workflow runs / mergeability などを観測し、必要な GitHub 操作を行う。製品コードの変更担当にはならない。
-- **Claude Code**: trusted same-repository PR branch の製品コードを変更できる実装担当。開始時と push 直前に対象 head を確認し、不一致なら push しない。次工程は決めない。
-- **Codex**: current PR context をレビューする。製品コードを変更せず、次工程を決めない。base の変更が review の主張に影響する場合は Commander の判断で current base context に対して再レビューする。
+- **Claude Code**: trusted same-repository PR branch の製品コードを変更できる通常の実装担当。開始時と push 直前に対象 head を確認し、不一致なら push しない。次工程は決めない。
+- **Codex**: current PR context をレビューする。通常のコードレビューでは製品コードを変更せず、次工程を決めない。Claude Code が `usage_or_rate_limit` と分類された場合に限り、同じ trust boundary と exact-head guard の下で専用 self-hosted runner 上のローカル Codex CLI が実装を継続できる。このフォールバックも次工程を決めない。base の変更が review の主張に影響する場合は Commander の判断で current base context に対して再レビューする。
 - **GUI Validator**: focused scenario を実行して観測事実と evidence を残す。製品コードを変更せず、結果の意味判断や次工程を決めない。
 - **CI**: 客観的な build / test / lint 結果を GitHub に残す。AADW の状態遷移や次工程を決めない。
 

@@ -16,12 +16,16 @@ def test_fallback_is_completed_claude_run_only_and_uses_exact_checkpoint():
     assert "run-id: ${{ github.event.workflow_run.id }}" in WORKFLOW
     assert '.failure_category == "usage_or_rate_limit"' in WORKFLOW
     assert ".run_attempt == $run_attempt" in WORKFLOW
+    assert ".workflow_sha == $workflow_sha" in WORKFLOW
+    assert "AADW_COMMANDER_HANDOFF_V2" in WORKFLOW
+    assert "Download the exact Claude Commander handoff" in WORKFLOW
 
 
 def test_non_usage_categories_do_not_start_the_codex_job():
     assert "Codex fallback is not eligible." in WORKFLOW
     assert "echo 'ready=false'" in WORKFLOW
     assert "needs.prepare.outputs.ready == 'true'" in WORKFLOW
+    assert 'refs/heads/${DEFAULT_BRANCH}' in WORKFLOW
     assert "authentication|max_turns|model_or_provider" not in WORKFLOW
     assert "usage_or_rate_limit" in CLAUDE_WORKFLOW
 
@@ -38,6 +42,8 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN" in WORKFLOW
     assert "--sandbox workspace-write" in WORKFLOW
     assert "--ignore-rules" in WORKFLOW
+    assert "--add-dir \"$HANDOFF_DIR\"" in WORKFLOW
+    assert "--add-dir \"$CONTEXT_DIR\"" in WORKFLOW
     assert "Do not commit or push." in WORKFLOW
 
 

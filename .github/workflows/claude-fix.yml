@@ -375,6 +375,7 @@ jobs:
           PR_NUMBER: ${{ github.event.issue.number }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           FAILURE_CATEGORY: ${{ steps.diagnose.outputs.category || 'diagnostic_unavailable' }}
+          HANDOFF_BODY: ${{ github.event.comment.body }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
@@ -393,6 +394,12 @@ jobs:
           else
             : > "$checkpoint_dir/checkpoint.patch"
           fi
+
+          if [[ -z "$HANDOFF_BODY" ]]; then
+            echo '::error::The trusted Commander handoff is missing from the failure checkpoint.'
+            exit 1
+          fi
+          printf '%s\n' "$HANDOFF_BODY" > "$checkpoint_dir/commander-handoff.txt"
 
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
