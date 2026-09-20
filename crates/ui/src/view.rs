@@ -4978,7 +4978,7 @@ impl EditorView {
     }
 }
 
-/// The header's status line, combining a persistent `draft_recovery_warning`
+/// The footer's status line, combining a persistent `draft_recovery_warning`
 /// with whatever transient `status` is current. Neither may swallow the
 /// other: the warning has to survive `open_path` cycling `status` through
 /// "Opening…"/"Opened" right after the scan that raised it, but a later
@@ -4987,7 +4987,7 @@ impl EditorView {
 /// startup and an unconditional priority for the warning would otherwise
 /// hide every status for the rest of the session. `None` when neither is
 /// set, so the caller can fall back to its own default line.
-fn header_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
+fn footer_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
     match (warning, status) {
         (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
         (Some(warning), None) => Some(warning.to_owned()),
@@ -5452,7 +5452,8 @@ impl Render for EditorView {
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
-            - self.theme.header_height)
+            - self.theme.header_height
+            - self.theme.footer_height)
             .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
@@ -5646,7 +5647,7 @@ impl Render for EditorView {
         } else {
             ""
         };
-        let status = header_status_line(
+        let status = footer_status_line(
             self.draft_recovery_warning.as_deref(),
             self.status.as_deref(),
         )
@@ -5680,7 +5681,7 @@ impl Render for EditorView {
             .min_w(px(0.0))
             .flex()
             .flex_col()
-            .child(self.header_element(status, cx));
+            .child(self.header_element(cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
@@ -5688,6 +5689,7 @@ impl Render for EditorView {
         let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
             div()
+                .debug_selector(|| "main-panel-editor".to_owned())
                 .relative()
                 .flex_1()
                 .overflow_hidden()
@@ -5759,6 +5761,7 @@ impl Render for EditorView {
                 )
                 .children(editor_scrollbar),
         );
+        let main_column = main_column.child(self.footer_element(status, cx));
         let rendered = root.child(main_column);
         self.metrics.record_layout(layout_started.elapsed());
         rendered
@@ -6409,7 +6412,28 @@ fn draft_preview(session: &DocumentSession) -> String {
 }
 
 impl EditorView {
-    fn header_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
+    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .debug_selector(|| "main-panel-header".to_owned())
+            .h(px(self.theme.header_height))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px_3()
+            .bg(rgb(self.theme.header_background))
+            .text_color(rgb(self.theme.header_foreground))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
+            .child(
+                div()
+                    .debug_selector(|| "file-tab".to_owned())
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(self.sessions.active().label()),
+            )
+    }
+
+    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
         let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
@@ -6442,7 +6466,8 @@ impl EditorView {
             })
             .collect::<Vec<_>>();
         div()
-            .h(px(self.theme.header_height))
+            .debug_selector(|| "main-panel-footer".to_owned())
+            .h(px(self.theme.footer_height))
             .flex_none()
             .flex()
             .flex_col()
@@ -6454,9 +6479,7 @@ impl EditorView {
                     .h(px(38.0))
                     .flex()
                     .items_center()
-                    .justify_between()
                     .px_3()
-                    .child(self.sessions.active().label())
                     .child(status),
             )
             .child(
@@ -9491,14 +9514,14 @@ mod tests {
     }
 
     #[test]
-    fn header_status_line_combines_warning_and_status_without_dropping_either() {
-        assert_eq!(header_status_line(None, None), None);
+    fn footer_status_line_combines_warning_and_status_without_dropping_either() {
+        assert_eq!(footer_status_line(None, None), None);
         assert_eq!(
-            header_status_line(Some("2 drafts could not be recovered"), None),
+            footer_status_line(Some("2 drafts could not be recovered"), None),
             Some("2 drafts could not be recovered".to_owned())
         );
         assert_eq!(
-            header_status_line(None, Some("Opened")),
+            footer_status_line(None, Some("Opened")),
             Some("Opened".to_owned())
         );
         // Regression for the P1 review finding: an unconditional priority for
@@ -9507,7 +9530,7 @@ mod tests {
         // recovery warning, since this view only re-scans a work folder once
         // at startup. Both must show.
         assert_eq!(
-            header_status_line(
+            footer_status_line(
                 Some("2 drafts could not be recovered"),
                 Some("Save failed: disk full")
             ),
@@ -9515,7 +9538,7 @@ mod tests {
         );
     }
 
-    // Regression test for the P1 review finding on the header status line: a
+    // Regression test for the P1 review finding on the footer status line: a
     // save failure that happens after a draft-recovery warning was raised
     // must still reach the user, not be hidden behind the warning for the
     // rest of the session.
@@ -9547,7 +9570,7 @@ mod tests {
         });
 
         view.read_with(cx, |view, _| {
-            let combined = header_status_line(
+            let combined = footer_status_line(
                 view.draft_recovery_warning.as_deref(),
                 view.status.as_deref(),
             );
@@ -9566,6 +9589,45 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn main_panel_footer_reserves_space_below_the_editor_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, root) = open_view_for_mouse_tests(cx, "body", false);
+        assert!(root.is_none());
+        cx.simulate_resize(gpui::size(px(640.0), px(480.0)));
+        cx.run_until_parked();
+
+        let header = cx
+            .debug_bounds("main-panel-header")
+            .expect("main-panel header is rendered");
+        let tab = cx.debug_bounds("file-tab").expect("file tab is rendered");
+        let editor = cx
+            .debug_bounds("main-panel-editor")
+            .expect("editor viewport is rendered");
+        let footer = cx
+            .debug_bounds("main-panel-footer")
+            .expect("main-panel footer is rendered");
+        let bottom = |bounds: &Bounds<Pixels>| {
+            f32::from(bounds.origin.y) + f32::from(bounds.size.height)
+        };
+
+        assert!(bottom(&header) <= f32::from(editor.origin.y));
+        assert!(bottom(&editor) <= f32::from(footer.origin.y));
+        assert!(f32::from(tab.origin.y) >= f32::from(header.origin.y));
+        assert!(bottom(&tab) <= bottom(&header));
+        assert!((bottom(&footer) - 480.0).abs() < 0.01);
+
+        view.read_with(cx, |view, _| {
+            let available = 480.0 - view.theme.header_height - view.theme.footer_height;
+            assert_eq!(
+                view.viewport_height,
+                available.max(view.line_height()),
+                "the editor viewport must exclude both fixed chrome regions"
+            );
+        });
     }
 
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
