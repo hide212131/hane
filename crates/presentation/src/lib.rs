@@ -2930,33 +2930,6 @@ fn fence_line_role(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "line presentation keeps the existing public dispatch inputs plus list context"
-)]
-fn present_polished_line_with_list_projection(
-    line_id: u64,
-    revision: Revision,
-    range: SourceRange,
-    source: &str,
-    line_height: f32,
-    disclosure: Option<SourceRange>,
-    context: LineContext,
-    list_projection: Option<&ListProjection>,
-) -> VisualLine {
-    present_polished_line_with_fence(
-        line_id,
-        revision,
-        range,
-        source,
-        line_height,
-        disclosure,
-        context,
-        list_projection,
-        None,
-    )
-}
-
-#[allow(
-    clippy::too_many_arguments,
     reason = "line presentation keeps the existing public dispatch inputs plus list context and fence role"
 )]
 fn present_polished_line_with_fence(
