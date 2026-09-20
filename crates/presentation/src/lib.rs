@@ -792,26 +792,36 @@ pub struct VisualBlock {
     /// Lines of `span` clipped above and below the presented run.
     pub lines_before: usize,
     pub lines_after: usize,
-    /// Height a clipped line stands in for.
+    /// Clipped structural rows whose inactive presentation has zero height.
+    /// These remain part of the physical-line counts above so coverage and
+    /// source-line mapping stay exact while their layout footprint disappears.
+    pub zero_height_lines_before: usize,
+    pub zero_height_lines_after: usize,
+    /// Height a non-collapsed clipped line stands in for.
     pub line_height: f32,
 }
 
 impl VisualBlock {
-    /// Height of the whole block: what was presented, plus line height for what
-    /// was clipped.
+    /// Height of the whole block: what was presented, plus the non-collapsed
+    /// clipped lines standing in above and below it.
     pub fn height(&self) -> f32 {
-        let clipped = (self.lines_before + self.lines_after) as f32 * self.line_height;
-        clipped + self.lines.iter().map(VisualLine::height).sum::<f32>()
+        self.leading_space()
+            + self.trailing_space()
+            + self.lines.iter().map(VisualLine::height).sum::<f32>()
     }
 
     /// Space to leave above the presented lines, inside the block.
     pub fn leading_space(&self) -> f32 {
-        self.lines_before as f32 * self.line_height
+        self.lines_before
+            .saturating_sub(self.zero_height_lines_before) as f32
+            * self.line_height
     }
 
     /// Space to leave below the presented lines, inside the block.
     pub fn trailing_space(&self) -> f32 {
-        self.lines_after as f32 * self.line_height
+        self.lines_after
+            .saturating_sub(self.zero_height_lines_after) as f32
+            * self.line_height
     }
 
     /// Render policy for the block. As with a line, the UI applies this and never
@@ -1111,6 +1121,38 @@ pub fn present_block_with_list_projection(
         (line.line_id as usize).saturating_sub(window.span.start)
     });
     let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
+    let first_presented_line = window.span.start.saturating_add(lines_before);
+    let presented_end = first_presented_line.saturating_add(lines.len());
+    let mut zero_height_lines_before = 0;
+    let mut zero_height_lines_after = 0;
+    if context == LineContext::FencedCode {
+        for line in window.lines {
+            let Some(fence_role) =
+                fence_line_role(line.line, content_end, line.text, fence_opening)
+            else {
+                continue;
+            };
+            let collapsed = present_fenced_code_line(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                Some(fence_role),
+            )
+            .height()
+                == 0.0;
+            if !collapsed {
+                continue;
+            }
+            if line.line < first_presented_line {
+                zero_height_lines_before += 1;
+            } else if line.line >= presented_end {
+                zero_height_lines_after += 1;
+            }
+        }
+    }
     VisualBlock {
         id: block.id,
         kind: block_display_kind(block.kind),
@@ -1121,6 +1163,8 @@ pub fn present_block_with_list_projection(
         lines,
         lines_before,
         lines_after,
+        zero_height_lines_before,
+        zero_height_lines_after,
         line_height,
     }
 }
@@ -1281,9 +1325,10 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
 fn fenced_line_height(
     visual_text: &str,
     has_hidden_fence: bool,
+    is_editing: bool,
     line_height: f32,
 ) -> f32 {
-    if has_hidden_fence && visual_text.trim().is_empty() {
+    if has_hidden_fence && !is_editing && visual_text.trim().is_empty() {
         0.0
     } else {
         estimated_height(BlockKind::CodeBlock, line_height)
@@ -1976,7 +2021,7 @@ fn present_markdown_from_parse(
             })
         });
     let line_estimated_height = if kind == BlockKind::CodeBlock {
-        fenced_line_height(&visual, has_hidden_fence, line_height)
+        fenced_line_height(&visual, has_hidden_fence, disclosure.is_some(), line_height)
     } else {
         estimated_height(kind, line_height)
     };
@@ -3220,7 +3265,8 @@ fn present_fenced_code_opening_line(
     } else {
         Vec::new()
     };
-    let line_estimated_height = fenced_line_height(&visual, !expanded, line_height);
+    let line_estimated_height =
+        fenced_line_height(&visual, !expanded, disclosure.is_some(), line_height);
     VisualLine {
         line_id,
         source_range: range,
@@ -3267,7 +3313,8 @@ fn present_fenced_code_closing_line(
     } else {
         Vec::new()
     };
-    let line_estimated_height = fenced_line_height(&visual_text, !expanded, line_height);
+    let line_estimated_height =
+        fenced_line_height(&visual_text, !expanded, disclosure.is_some(), line_height);
     VisualLine {
         line_id,
         source_range: range,
@@ -4825,6 +4872,8 @@ mod tests {
             lines: vec![opening, empty],
             lines_before: 0,
             lines_after: 0,
+            zero_height_lines_before: 0,
+            zero_height_lines_after: 0,
             line_height: 26.0,
         };
         let context = ListEditingContext {
