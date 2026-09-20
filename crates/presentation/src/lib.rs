@@ -1357,6 +1357,11 @@ fn marker_is_disclosed(
             projected_list_item_range_touches(projection, &item, disclosure)
         });
     }
+    if let Some(item) = marker.formal_list_item {
+        return list_projection.is_some_and(|projection| {
+            projected_list_item_range_touches(projection, &item, disclosure)
+        });
+    }
     // A list item's own bullet/number marker discloses whenever the caret,
     // selection or IME touches any of the item's own source range — its
     // opening line, its own paragraphs, and any nested child list or item it
@@ -1711,6 +1716,7 @@ fn present_markdown_from_parse(
                     fence_edge: None,
                     formal_container: true,
                     global_list_item: None,
+                    formal_list_item: None,
                     formal_quote_owner: None,
                     quote_owner: None,
                     list_owner: None,
@@ -1742,6 +1748,7 @@ fn present_markdown_from_parse(
                         fence_edge: Some(edge),
                         formal_container: false,
                         global_list_item: None,
+                        formal_list_item: None,
                         formal_quote_owner: None,
                         quote_owner: None,
                         list_owner: None,
@@ -1755,6 +1762,7 @@ fn present_markdown_from_parse(
                     .item_for_marker(container_range)
                     .copied()
                     .filter(|item| formal_item == Some(*item));
+                let formal_list_item = projection.item_for_marker(container_range).copied();
                 if let Some(marker) = projected_markers
                     .iter_mut()
                     .find(|marker| marker.range == container_range)
@@ -1762,6 +1770,7 @@ fn present_markdown_from_parse(
                     marker.formal_container = true;
                     marker.formal_quote_owner = quote_owner;
                     marker.global_list_item = global_list_item;
+                    marker.formal_list_item = formal_list_item;
                 } else {
                     projected_markers.push(ProjectedMarker {
                         range: container_range,
@@ -1769,6 +1778,7 @@ fn present_markdown_from_parse(
                         fence_edge: None,
                         formal_container: true,
                         global_list_item,
+                        formal_list_item,
                         formal_quote_owner: quote_owner,
                         quote_owner: None,
                         list_owner: None,
@@ -2215,6 +2225,10 @@ struct ProjectedMarker {
     fence_edge: Option<MarkerEdge>,
     formal_container: bool,
     global_list_item: Option<ListProjectionItem>,
+    /// Formal list-item owner used only for disclosure. This intentionally
+    /// keeps every ancestor marker's owner, while `global_list_item` below is
+    /// restricted to the deepest item for one row's list metadata and label.
+    formal_list_item: Option<ListProjectionItem>,
     /// Source-range owner for a quote marker recovered from the formal parse.
     /// Unlike `quote_owner`, this remains valid when the viewport parse has a
     /// different `NodeId` allocation.
@@ -2493,6 +2507,7 @@ impl ProjectionIndex {
                     }),
                 formal_container: false,
                 global_list_item: None,
+                formal_list_item: None,
                 formal_quote_owner: None,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),

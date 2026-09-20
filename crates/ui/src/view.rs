@@ -7214,11 +7214,12 @@ mod tests {
             source.push_str("          literal\n");
         }
         source.push_str("          ````");
-        let editor = Editor::new(&source);
+        let mut editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one nested list block");
         let projection = index.list_projection(&block).expect("list projection");
-        let opening_line = source[..source.find("    - - ````rust").expect("opening row")]
+        let opening_start = source.find("    - - ````rust").expect("opening row");
+        let opening_line = source[..opening_start]
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
@@ -7240,7 +7241,30 @@ mod tests {
         assert_eq!(list.role, ListRowRole::Opening);
         let marker = list.marker.as_ref().expect("deepest marker metadata");
         assert!(marker.synthesized);
-        assert_eq!(marker.source_range.start.0, source.find("    - -").unwrap() + 6);
+        assert_eq!(marker.source_range.start.0, opening_start + 6);
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                opening_start + "    - - ````rust".find("rust").unwrap(),
+            )))
+            .unwrap();
+        let disclosed = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("disclosed same-line multi-level fence presents");
+        let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
+        let inner_marker = SourceRange::new(opening_start + 6, opening_start + 8);
+        for marker_range in [outer_marker, inner_marker] {
+            assert!(disclosed.lines[0].source_map.segments.iter().any(|segment| {
+                segment.source_range == marker_range
+                    && segment.visibility == Visibility::ExpandedMarkup
+            }));
+        }
     }
 
     #[test]
