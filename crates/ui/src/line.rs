@@ -365,7 +365,7 @@ pub(crate) fn row_element(
     if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
         let media_padding = theme.line_horizontal_padding * zoom;
-        let image_max_width = layout.width.min(640.0) * zoom;
+        let image_max_width = (640.0 * zoom).min(layout.width);
         let image_inner_height = (row.height - 32.0 * zoom).max(1.0);
         return styled_block(
             div()
