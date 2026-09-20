@@ -508,14 +508,14 @@ const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
 pub struct LocalBlockIndex {
     revision: Revision,
     window: SourceRange,
-    /// Block kinds with their absolute source ranges and line counts, tiling
-    /// `window`.
-    blocks: Vec<(NodeKind, SourceRange, usize)>,
+    /// Block kinds with their absolute source ranges, line counts, and leading
+    /// blank-line offsets, tiling `window`.
+    blocks: Vec<(NodeKind, SourceRange, usize, usize)>,
 }
 
 impl LocalBlockIndex {
     fn indexed(&self, ordinal: usize) -> IndexedBlock {
-        let (kind, source_range, line_count) = self.blocks[ordinal];
+        let (kind, source_range, line_count, leading_content_lines) = self.blocks[ordinal];
         IndexedBlock {
             ordinal,
             // Keyed by start offset rather than a counter: the window is
@@ -527,7 +527,7 @@ impl LocalBlockIndex {
             revision: self.revision,
             confidence: Confidence::Provisional,
             line_count,
-            leading_content_lines: 0,
+            leading_content_lines,
         }
     }
 
@@ -535,7 +535,7 @@ impl LocalBlockIndex {
     pub fn block_at(&self, offset: SourceOffset) -> Option<IndexedBlock> {
         let ordinal = self
             .blocks
-            .partition_point(|(_, range, _)| range.end.0 <= offset.0)
+            .partition_point(|(_, range, _, _)| range.end.0 <= offset.0)
             .min(self.blocks.len().checked_sub(1)?);
         let block = self.indexed(ordinal);
         (block.source_range.start <= offset && offset <= block.source_range.end).then_some(block)
@@ -545,7 +545,7 @@ impl LocalBlockIndex {
     pub fn blocks_in(&self, range: SourceRange) -> impl Iterator<Item = IndexedBlock> + '_ {
         let first = self
             .blocks
-            .partition_point(|(_, span, _)| span.end.0 <= range.start.0);
+            .partition_point(|(_, span, _, _)| span.end.0 <= range.start.0);
         (first..self.blocks.len())
             .take_while(move |ordinal| {
                 *ordinal == first || self.blocks[*ordinal].1.start.0 < range.end.0
@@ -588,10 +588,10 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()
-        .map(|(kind, length, lines, _)| {
+        .map(|(kind, length, lines, leading_content_lines)| {
             let range = SourceRange::new(offset, offset + length);
             offset += length;
-            (kind, range, lines)
+            (kind, range, lines, leading_content_lines)
         })
         .collect();
     LocalBlockIndex {
@@ -1731,6 +1731,17 @@ mod tests {
                 .is_some_and(|block| block.confidence == Confidence::Provisional),
             "every locally parsed block is provisional"
         );
+    }
+
+    #[test]
+    fn local_index_remembers_leading_blank_lines_for_the_first_fenced_block() {
+        let buffer = RopeBuffer::from_text("\n\n```rust\ncode\n```\n");
+        let local = local_block_index(&buffer, 2..3);
+        let block = local
+            .block_at(buffer.line_range(LineId(2)).unwrap().start)
+            .expect("fenced block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert_eq!(block.leading_content_lines, 2);
     }
 
     #[test]
