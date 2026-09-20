@@ -1701,7 +1701,10 @@ fn present_markdown_from_parse(
     }
     if formal_code_block == Some(true) {
         projected_markers.retain(|marker| {
-            marker.fence
+            (marker.fence
+                && shared
+                    .list_projection
+                    .is_some_and(|projection| projection.is_fence_marker(marker.range)))
                 || marker.quote_owner.is_some()
                 || marker.list_owner.is_some()
                 || marker.list_prefix.is_some()

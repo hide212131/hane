@@ -306,6 +306,7 @@ pub struct ListProjection {
     pub prefixes: Vec<ListProjectionPrefix>,
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
+    fence_markers: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -349,13 +350,27 @@ impl ListProjection {
         prefixes: Vec<ListProjectionPrefix>,
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
+        fence_markers: Vec<SourceRange>,
     ) -> Self {
         Self {
             items,
             prefixes,
             lists,
             rows,
+            fence_markers,
         }
+    }
+
+    /// Whether `range` is a fence delimiter in the formal document parse.
+    /// Viewport-only parses may mistake literal fence-shaped code content for
+    /// an opening fence; this lets presentation keep only delimiters confirmed
+    /// by the document-wide parse when it projects a list-contained code row.
+    pub fn is_fence_marker(&self, range: SourceRange) -> bool {
+        self.fence_markers
+            .binary_search_by_key(&(range.start, range.end), |marker| {
+                (marker.start, marker.end)
+            })
+            .is_ok()
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {

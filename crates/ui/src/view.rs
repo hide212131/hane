@@ -6614,6 +6614,35 @@ mod tests {
     }
 
     #[test]
+    fn a_late_list_code_row_keeps_literal_shorter_fence_visible() {
+        let mut source = String::from("- opening\n  ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("  literal\n");
+        }
+        source.push_str("  ```oops\n  ````\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let lookalike_line = source[..source.find("  ```oops").expect("lookalike row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let presented = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(lookalike_line..lookalike_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late code row presents");
+        let line = &presented.lines[0];
+        assert_eq!(line.visual_text, "```oops");
+        assert!(line.style_runs.iter().any(|run| run.kind == StyleKind::CodeBlock));
+    }
+
+    #[test]
     fn a_sibling_boundary_does_not_disclose_the_previous_formal_prefix() {
         let mut source = String::from("- first\n");
         for _ in 0..5_000 {

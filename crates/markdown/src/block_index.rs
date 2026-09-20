@@ -364,7 +364,13 @@ fn build_list_projections(
                     .cloned()
                     .collect();
                 let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
-                ListProjection::new(block_items, block_prefixes, block_lists, rows)
+                ListProjection::new(
+                    block_items,
+                    block_prefixes,
+                    block_lists,
+                    rows,
+                    parsed.fence_markers.clone(),
+                )
             })
         })
         .collect()
