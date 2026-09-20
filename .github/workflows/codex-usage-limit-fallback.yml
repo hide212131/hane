@@ -313,15 +313,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
-          profile_path="$codex_home_path/hane-codex-fallback.config.toml"
-          expected_profile_sha256='a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d'
+          codex_source_home="${CODEX_HOME:-${HOME}/.codex}"
+          profile_path="$codex_source_home/hane-codex-fallback.config.toml"
+          expected_profile_sha256='2919edc01f1020390bc39c280623b5cc594aa590ba6432f7a61a867aa187c909'
           if [[ ! -f "$profile_path" ]]; then
             echo "::error::The trusted hane-codex-fallback Codex profile is not installed at ${profile_path}."
             exit 1
           fi
-          if [[ -e "$codex_home_path/config.toml" ]]; then
-            echo '::error::The dedicated Codex HOME must not contain an additional config.toml.'
+          if [[ ! -f "$codex_source_home/auth.json" ]]; then
+            echo "::error::The dedicated Codex HOME is missing auth.json: ${codex_source_home}/auth.json"
+            exit 1
+          fi
+          if [[ -e "$codex_source_home/config.toml" ]]; then
+            echo '::error::The persistent Codex source HOME must not contain an additional config.toml.'
             exit 1
           fi
           actual_profile_sha256="$(shasum -a 256 "$profile_path" | awk '{print $1}')"
@@ -345,6 +349,26 @@ jobs:
           set -euo pipefail
           unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           mkdir -m 700 "$GH_CONFIG_DIR"
+
+          codex_source_home="${CODEX_HOME:-${HOME}/.codex}"
+          codex_runtime_home="$RUNNER_TEMP/hane-codex-home-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$codex_runtime_home" ]]; then
+            echo '::error::Refusing to reuse the per-run Codex HOME.'
+            exit 1
+          fi
+          mkdir -m 700 "$codex_runtime_home"
+          cp "$codex_source_home/auth.json" "$codex_runtime_home/auth.json"
+          cp "$codex_source_home/hane-codex-fallback.config.toml" "$codex_runtime_home/hane-codex-fallback.config.toml"
+          chmod 600 "$codex_runtime_home/auth.json" "$codex_runtime_home/hane-codex-fallback.config.toml"
+          export CODEX_HOME="$codex_runtime_home"
+
+          cleanup_codex_home() {
+            case "$codex_runtime_home" in
+              "$RUNNER_TEMP"/hane-codex-home-*) /bin/rm -rf "$codex_runtime_home" ;;
+              *) echo '::error::Refusing to clean an unexpected Codex HOME path.' >&2; return 1 ;;
+            esac
+          }
+          trap cleanup_codex_home EXIT
 
           prompt_file="$RUNNER_TEMP/hane-codex-prompt-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.txt"
           cat > "$prompt_file" <<EOF
