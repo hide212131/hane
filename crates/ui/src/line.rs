@@ -1063,6 +1063,42 @@ mod tests {
             0.0,
             "whitespace after an inactive opening fence is not a visible label"
         );
+
+        whitespace_only
+            .set_selection(Selection::caret(SourceOffset(4)))
+            .unwrap();
+        let editing_whitespace = presented_lines(&whitespace_only);
+        assert!(
+            editing_whitespace[0].height() > 0.0,
+            "editing whitespace after the opening delimiter restores the row height"
+        );
+    }
+
+    #[test]
+    fn clipped_inactive_fences_do_not_reserve_virtual_space() {
+        let source = "```\nfirst\nsecond\n```";
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("first").unwrap() + 1,
+            )))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one fenced block");
+
+        let full = presented_block(&editor, &block, &(0..4), None).expect("full block presents");
+        let clipped =
+            presented_block(&editor, &block, &(1..3), None).expect("middle code rows present");
+
+        assert_eq!(clipped.lines_before, 1);
+        assert_eq!(clipped.lines_after, 1);
+        assert_eq!(clipped.leading_space(), 0.0);
+        assert_eq!(clipped.trailing_space(), 0.0);
+        assert_eq!(
+            clipped.height(),
+            full.height(),
+            "clipping the hidden fence rows must not change the block's visual height"
+        );
     }
 
     #[test]
