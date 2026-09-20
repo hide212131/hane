@@ -205,7 +205,7 @@ impl<'a, T: 'static> Context<'a, T> {
 
     /// Register a callback to be invoked when the active keyboard input source
     /// changes, including a change between an IME's own modes (see
-    /// [`crate::active_keyboard_input_is_ascii_capable`]).
+    /// [`crate::active_keyboard_input_mode`]).
     pub fn on_keyboard_layout_change(
         &self,
         mut on_change: impl FnMut(&mut T, &mut Context<T>) + 'static,

@@ -624,15 +624,16 @@ pub struct EditorView {
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
-    /// Whether the active keyboard input source currently types alphanumeric
-    /// text directly rather than composing it through an IME (see
-    /// [`gpui::active_keyboard_input_is_ascii_capable`]). Drives the caret's
-    /// small input-mode badge; refreshed by `_input_mode_subscription` so it
-    /// updates without polling.
-    caret_input_is_ascii_capable: bool,
-    /// Keeps the input-source change hook (see `caret_input_is_ascii_capable`)
+    /// The active keyboard input mode, when the platform can determine it.
+    /// Drives the caret's small input-mode badge; refreshed by
+    /// `_input_mode_subscription` so it updates without polling.
+    caret_input_mode: Option<gpui::KeyboardInputMode>,
+    /// Keeps the input-source change hook (see `caret_input_mode`)
     /// alive for the life of the view; dropping it would cancel the hook.
     _input_mode_subscription: Subscription,
+    /// Refreshes the input mode when the editor receives focus, covering a
+    /// pre-existing IME state before any mode-change notification arrives.
+    _input_mode_focus_subscription: Option<Subscription>,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -2036,13 +2037,13 @@ impl EditorView {
             view.flush_pending_drafts();
             std::future::ready(())
         });
-        // The caret's mode badge (see `caret_input_is_ascii_capable`) has to
+        // The caret's mode badge (see `caret_input_mode`) has to
         // update the moment the user switches IME mode, even if nothing else
         // about the document changes, so this reuses the same platform event
         // GPUI already refreshes its keyboard mapper from — no separate
         // polling.
         let input_mode_subscription = cx.on_keyboard_layout_change(|view: &mut Self, cx| {
-            view.caret_input_is_ascii_capable = gpui::active_keyboard_input_is_ascii_capable();
+            view.caret_input_mode = gpui::active_keyboard_input_mode();
             cx.notify();
         });
         // Re-observes the local date on a timer so the sidebar's `本日`
@@ -2096,8 +2097,9 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
-            caret_input_is_ascii_capable: gpui::active_keyboard_input_is_ascii_capable(),
+            caret_input_mode: gpui::active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
+            _input_mode_focus_subscription: None,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
@@ -5389,6 +5391,32 @@ mod panel_layout_tests {
     }
 
     #[test]
+    fn editor_scrollbar_drag_preserves_document_end_badge_clearance() {
+        let document_height = 400.0;
+        let viewport_height = 100.0;
+        let content_height = document_height + CARET_MODE_BADGE_HEIGHT;
+
+        let (_, thumb_height) =
+            scrollbar_thumb_geometry(viewport_height, content_height, 0.0).unwrap();
+        let end_scroll =
+            scroll_y_for_thumb_drag(0.0, viewport_height, viewport_height, content_height);
+
+        assert_eq!(end_scroll, content_height - viewport_height);
+        let (thumb_top, _) =
+            scrollbar_thumb_geometry(viewport_height, content_height, end_scroll).unwrap();
+        assert!((thumb_top + thumb_height - viewport_height).abs() < f32::EPSILON);
+
+        // The last document row ends before the viewport by exactly the
+        // badge footprint, even when the position was reached by dragging the
+        // editor scrollbar rather than by caret tracking or wheel scrolling.
+        let document_bottom_in_viewport = document_height - end_scroll;
+        assert_eq!(
+            document_bottom_in_viewport + CARET_MODE_BADGE_HEIGHT,
+            viewport_height
+        );
+    }
+
+    #[test]
     fn scrollbar_is_hidden_when_content_fits() {
         assert_eq!(scrollbar_thumb_geometry(100.0, 100.0, 0.0), None);
         assert_eq!(scrollbar_thumb_geometry(100.0, 80.0, 0.0), None);
@@ -5405,6 +5433,14 @@ mod panel_layout_tests {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
+        if self._input_mode_focus_subscription.is_none() {
+            let focus_handle = self.focus_handle.clone();
+            self._input_mode_focus_subscription =
+                Some(cx.on_focus(&focus_handle, window, |view, _, cx| {
+                    view.caret_input_mode = gpui::active_keyboard_input_mode();
+                    cx.notify();
+                }));
+        }
         let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
         if resolved_theme != self.theme {
             self.theme = resolved_theme;
@@ -5649,7 +5685,7 @@ impl Render for EditorView {
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
         let editor = self.sessions.active().editor();
-        let editor_scrollbar = self.editor_scrollbar(self.heights.total_height(), cx);
+        let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
             div()
                 .relative()
@@ -5686,7 +5722,7 @@ impl Render for EditorView {
                                         self.theme,
                                         self.zoom,
                                         &resolver,
-                                        self.caret_input_is_ascii_capable,
+                                        self.caret_input_mode,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`

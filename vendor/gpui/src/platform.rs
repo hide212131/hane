@@ -90,21 +90,40 @@ pub fn background_executor() -> BackgroundExecutor {
     current_platform(true).background_executor()
 }
 
-/// Whether the platform's active keyboard input source currently produces
-/// text directly, as opposed to composing it through an IME (for example,
-/// macOS's Kotoeri switching from its 英数 mode into かな). Reread this after
-/// `Context::on_keyboard_layout_change` fires, since that is the same
-/// platform event that changes it.
-///
-/// Platforms without this concept always report `true`.
-#[cfg(target_os = "macos")]
-pub fn active_keyboard_input_is_ascii_capable() -> bool {
-    mac_active_input_source_is_ascii_capable()
+/// The known mode of the active keyboard input source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardInputMode {
+    /// The input source produces alphanumeric text directly.
+    Ascii,
+    /// The input source composes native text through an IME.
+    Native,
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn active_keyboard_input_is_ascii_capable() -> bool {
-    true
+/// Returns the active keyboard input mode when the platform can determine it.
+///
+/// Reread this after [`Context::on_keyboard_layout_change`] fires, since that
+/// is the platform event used for both input-source changes and IME mode
+/// changes. Platforms without a supported input-mode API return `None`.
+#[cfg(target_os = "macos")]
+pub fn active_keyboard_input_mode() -> Option<KeyboardInputMode> {
+    Some(if mac_active_input_source_is_ascii_capable() {
+        KeyboardInputMode::Ascii
+    } else {
+        KeyboardInputMode::Native
+    })
+}
+
+#[cfg(target_os = "windows")]
+/// Returns the active keyboard input mode when the platform can determine it.
+pub fn active_keyboard_input_mode() -> Option<KeyboardInputMode> {
+    windows_active_keyboard_input_mode()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Returns `None` because this platform does not expose a supported input-mode
+/// query to GPUI.
+pub fn active_keyboard_input_mode() -> Option<KeyboardInputMode> {
+    None
 }
 
 #[cfg(target_os = "macos")]
