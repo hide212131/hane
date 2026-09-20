@@ -6952,6 +6952,7 @@ mod tests {
             &(opening_line..opening_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late code opening presents");
         assert_eq!(opening.lines[0].visual_text, "rust");
@@ -6983,6 +6984,7 @@ mod tests {
             &(lookalike_line..lookalike_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late code row presents");
         let line = &presented.lines[0];
@@ -7012,6 +7014,7 @@ mod tests {
             &(lookalike_line..lookalike_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
@@ -7030,6 +7033,7 @@ mod tests {
             &(closing_line..closing_line + 1),
             None,
             Some(projection),
+            DEFAULT_LINE_HEIGHT,
         )
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
