@@ -1699,6 +1699,7 @@ fn present_markdown_from_parse(
                     range: prefix.source_range,
                     fence: false,
                     fence_edge: None,
+                    formal_container: true,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1726,6 +1727,26 @@ fn present_markdown_from_parse(
                         range,
                         fence: true,
                         fence_edge: Some(edge),
+                        formal_container: false,
+                        quote_owner: None,
+                        list_owner: None,
+                        list_prefix: None,
+                        global_list_prefix: None,
+                    });
+                }
+            }
+            for container_range in projection.container_markers_in(range) {
+                if let Some(marker) = projected_markers
+                    .iter_mut()
+                    .find(|marker| marker.range == container_range)
+                {
+                    marker.formal_container = true;
+                } else {
+                    projected_markers.push(ProjectedMarker {
+                        range: container_range,
+                        fence: false,
+                        fence_edge: None,
+                        formal_container: true,
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1740,10 +1761,7 @@ fn present_markdown_from_parse(
                 && shared
                     .list_projection
                     .is_some_and(|projection| projection.fence_marker_edge(marker.range).is_some()))
-                || marker.quote_owner.is_some()
-                || marker.list_owner.is_some()
-                || marker.list_prefix.is_some()
-                || marker.global_list_prefix.is_some()
+                || marker.formal_container
         });
     }
     let markers_on_line = projected_markers.as_slice();
@@ -2168,6 +2186,7 @@ struct ProjectedMarker {
     range: SourceRange,
     fence: bool,
     fence_edge: Option<MarkerEdge>,
+    formal_container: bool,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2440,6 +2459,7 @@ impl ProjectionIndex {
                         FenceMarkerEdge::Opening => MarkerEdge::Opening,
                         FenceMarkerEdge::Closing => MarkerEdge::Closing,
                     }),
+                formal_container: false,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),

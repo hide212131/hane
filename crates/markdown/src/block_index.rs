@@ -347,6 +347,20 @@ fn build_list_projections(
     for block_prefixes in &mut prefixes {
         block_prefixes.sort_by_key(|prefix| (prefix.source_range.start, prefix.source_range.end));
     }
+    let mut container_markers = parsed
+        .quote_markers
+        .iter()
+        .map(|(marker, _)| *marker)
+        .chain(parsed.list_item_markers.iter().map(|(marker, _)| *marker))
+        .chain(
+            parsed
+                .list_structural_prefixes
+                .iter()
+                .map(|(marker, _, _)| *marker),
+        )
+        .collect::<Vec<_>>();
+    container_markers.sort_by_key(|marker| (marker.start, marker.end));
+    container_markers.dedup();
     blocks
         .iter()
         .enumerate()
@@ -371,6 +385,12 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
+            let container_start = container_markers
+                .partition_point(|marker| marker.end <= block_range.start);
+            let container_end = container_markers
+                .partition_point(|marker| marker.start < block_range.end);
+            let block_container_markers =
+                container_markers[container_start..container_end].to_vec();
             if block_items.is_empty() && rows.is_empty() && block_fence_markers.is_empty() {
                 None
             } else {
@@ -380,6 +400,7 @@ fn build_list_projections(
                     block_lists,
                     rows,
                     block_fence_markers,
+                    block_container_markers,
                 ))
             }
         })

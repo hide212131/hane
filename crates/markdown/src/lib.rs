@@ -310,6 +310,7 @@ pub struct ListProjection {
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+    container_markers: Vec<SourceRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,6 +360,7 @@ impl ListProjection {
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+        container_markers: Vec<SourceRange>,
     ) -> Self {
         Self {
             items,
@@ -366,6 +368,7 @@ impl ListProjection {
             lists,
             rows,
             fence_markers,
+            container_markers,
         }
     }
 
@@ -396,6 +399,26 @@ impl ListProjection {
             .iter()
             .copied()
             .filter(move |(marker, _)| marker.intersects(range))
+    }
+
+    /// Formal quote/list prefix ranges in `range`. Viewport-only parses can
+    /// mistake literal `>` or `-` at the start of a code line for a nested
+    /// container; presentation keeps only these document-wide-confirmed
+    /// ranges when projecting a code row.
+    pub fn container_markers_in(
+        &self,
+        range: SourceRange,
+    ) -> impl Iterator<Item = SourceRange> + '_ {
+        let start = self
+            .container_markers
+            .partition_point(|marker| marker.end <= range.start);
+        let end = self
+            .container_markers
+            .partition_point(|marker| marker.start < range.end);
+        self.container_markers[start..end]
+            .iter()
+            .copied()
+            .filter(move |marker| marker.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
