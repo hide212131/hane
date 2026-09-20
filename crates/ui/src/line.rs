@@ -113,14 +113,7 @@ pub(crate) fn presented_block(
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
-    presented_block_with_list_projection(
-        editor,
-        block,
-        visible,
-        joined,
-        None,
-        DEFAULT_LINE_HEIGHT,
-    )
+    presented_block_with_list_projection(editor, block, visible, joined, None, DEFAULT_LINE_HEIGHT)
 }
 
 /// `line_height` is the caller's zoomed row height (`EditorView::line_height`
@@ -284,6 +277,7 @@ pub(crate) fn disclosure_for_line(
 /// that build a [`BlockWindow`] outside `EditorView` (which otherwise scales
 /// both by its own zoom level; see `EditorView::line_height` and
 /// `EditorView::zoom`).
+#[cfg(test)]
 pub(crate) const DEFAULT_LINE_HEIGHT: f32 = 26.0;
 
 /// Body text size. Every block size is this scaled by the presentation-supplied

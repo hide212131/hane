@@ -22,10 +22,12 @@ use crate::input::{InlineRenameInput, shape_inline_rename_line};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
+use crate::line::DEFAULT_LINE_HEIGHT;
+#[cfg(test)]
 use crate::line::presented_block;
 use crate::line::{
-    BODY_FONT_SIZE, DEFAULT_LINE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_list_projection, row_element,
+    BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
+    presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -260,6 +262,10 @@ fn zoom_factor_for_wheel(delta: ScrollDelta, line_height: f32) -> f32 {
         ScrollDelta::Pixels(delta) => f32::from(delta.y) / line_height.max(1.0),
     };
     2f32.powf(lines * ZOOM_STEP_PER_LINE)
+}
+
+fn height_snapshot_matches_line_height(current: f32, snapshot: f32) -> bool {
+    current.to_bits() == snapshot.to_bits()
 }
 
 fn block_context_revision_is_current(current: Revision, candidate: Revision) -> bool {
@@ -649,8 +655,13 @@ pub struct EditorView {
     /// and soft-wrap width (issue #228). Clamped to `MIN_ZOOM..=MAX_ZOOM` and
     /// snapped to exactly 1.0 near it by `clamp_and_snap_zoom`.
     zoom: f32,
-    /// Set by a zoom-changing gesture, consumed once `render` has installed
-    /// the new zoom's heights for this frame. See `PendingZoomAnchor`.
+    /// The unsnapped zoom level accumulated from the current gesture stream.
+    /// `zoom` is the effective display value and may stay at 1.0 while this
+    /// crosses the snap band; keeping the raw value prevents small deltas from
+    /// being discarded one event at a time.
+    raw_zoom: f32,
+    /// Set by a zoom-changing gesture, consumed after the visible blocks have
+    /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
@@ -1660,6 +1671,7 @@ impl EditorView {
             main_column_left: 0.0,
             layout_font_revision: 0,
             zoom: 1.0,
+            raw_zoom: 1.0,
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_list_editing: None,
@@ -3002,6 +3014,7 @@ impl EditorView {
         let key = self.document_key();
         let revision = self.sessions.active().editor().document().revision();
         let line_height = self.line_height();
+        let line_height_bits = line_height.to_bits();
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -3011,6 +3024,10 @@ impl EditorView {
                         && block_context_revision_is_current(
                             view.editor().document().revision(),
                             revision,
+                        )
+                        && height_snapshot_matches_line_height(
+                            view.line_height(),
+                            f32::from_bits(line_height_bits),
                         )
                 })
                 .unwrap_or(false);
@@ -3035,7 +3052,16 @@ impl EditorView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.document_parse_job_running = false;
-                if view.document_key() != key {
+                if view.document_key() != key
+                    || !height_snapshot_matches_line_height(
+                        view.line_height(),
+                        f32::from_bits(line_height_bits),
+                    )
+                {
+                    // The index itself may still be current, but these
+                    // heights were measured for an older zoom/theme. Keep the
+                    // stale snapshot out of the visible height tree and rerun
+                    // the job with the current line height.
                     view.schedule_document_parse(cx);
                     return;
                 }
@@ -3317,14 +3343,24 @@ impl EditorView {
     /// Changes the zoom level, anchoring the document position under
     /// `window_offset` (see `zoom_anchor_at`) so it stays at the same window
     /// position once `render` installs the new zoom's heights.
-    fn set_zoom(&mut self, next: f32, window_offset: f32, cx: &mut Context<Self>) {
-        let next = clamp_and_snap_zoom(next);
+    fn set_zoom_from_raw(&mut self, raw: f32, window_offset: f32, cx: &mut Context<Self>) {
+        let raw = raw.clamp(MIN_ZOOM, MAX_ZOOM);
+        self.raw_zoom = raw;
+        let next = clamp_and_snap_zoom(raw);
         if next == self.zoom {
             return;
         }
         self.pending_zoom_anchor = self.zoom_anchor_at(window_offset);
         self.zoom = next;
         cx.notify();
+    }
+
+    fn set_zoom(&mut self, next: f32, window_offset: f32, cx: &mut Context<Self>) {
+        self.set_zoom_from_raw(next, window_offset, cx);
+    }
+
+    fn apply_zoom_factor(&mut self, factor: f32, window_offset: f32, cx: &mut Context<Self>) {
+        self.set_zoom_from_raw(self.raw_zoom * factor, window_offset, cx);
     }
 
     /// Resets zoom to 100%, anchored at the viewport's vertical center since
@@ -3347,10 +3383,10 @@ impl EditorView {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if event.modifiers.control {
+        if event.modifiers.secondary() {
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
             let window_offset = f32::from(event.position.y) - self.theme.header_height;
-            self.set_zoom(self.zoom * factor, window_offset, cx);
+            self.apply_zoom_factor(factor, window_offset, cx);
             return;
         }
         let delta = event.delta.pixel_delta(px(self.line_height()));
@@ -3369,7 +3405,7 @@ impl EditorView {
     fn on_magnify(&mut self, event: &MagnifyEvent, _: &mut Window, cx: &mut Context<Self>) {
         let factor = (1.0 + event.magnification).max(0.1);
         let window_offset = f32::from(event.position.y) - self.theme.header_height;
-        self.set_zoom(self.zoom * factor, window_offset, cx);
+        self.apply_zoom_factor(factor, window_offset, cx);
     }
 
     /// The presented line under a mouse event, from the mapping the last frame
@@ -4245,7 +4281,16 @@ fn neighbor_row_target(
 ) -> Option<SourceOffset> {
     let (indexed, window) = neighbor_block_window(editor, index, block, down)?;
     target_in_neighbor(
-        editor, &indexed, window, down, x, width, shaper, joined, None,
+        editor,
+        &indexed,
+        window,
+        down,
+        x,
+        width,
+        shaper,
+        joined,
+        None,
+        DEFAULT_LINE_HEIGHT,
     )
 }
 
@@ -4908,19 +4953,15 @@ impl Render for EditorView {
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
             self.layout_font_revision = font_revision;
+            // `VisualLine::estimated_height` is part of the presentation, not
+            // just the shaped layout. Reusing it across zoom generations
+            // leaves the new glyphs with the old row height until a later
+            // cache miss, which can clip or overlap text.
+            self.block_cache.clear();
             self.layout_cache.clear();
             let (granularity, _) = self.desired_layout();
             let heights = HeightIndex::new(self.item_heights());
             self.install_heights(granularity, heights);
-            // `install_heights` already re-anchored on the source offset at the
-            // old top of the viewport; a zoom gesture instead wants the point
-            // under the pointer/pinch center to stay put, so recompute
-            // `scroll_y` from the anchor `set_zoom` captured before the resize.
-            if let Some(anchor) = self.pending_zoom_anchor.take()
-                && !self.heights.is_empty()
-            {
-                self.scroll_y = self.scroll_y_for_zoom_anchor(anchor);
-            }
         }
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
@@ -4994,10 +5035,31 @@ impl Render for EditorView {
                     .insert(line.line_id as usize, (visual.id, at));
             }
         }
+        // A zoom gesture is anchored after these visible blocks have been
+        // remeasured. Resolving it earlier against estimated heights is wrong
+        // for a soft-wrapped paragraph: the measured block height can differ by
+        // several rows in the same frame. The next frame is notified below if
+        // the corrected anchor changed which blocks should be visible.
+        let zoom_anchor_applied = self
+            .pending_zoom_anchor
+            .take()
+            .filter(|_| !self.heights.is_empty())
+            .map(|anchor| {
+                self.scroll_y = self.scroll_y_for_zoom_anchor(anchor);
+                true
+            })
+            .unwrap_or(false);
+        if zoom_anchor_applied {
+            // The visible block set was selected before measured heights were
+            // installed. Ask GPUI for one more frame so virtualization and
+            // spacers are recomputed from the corrected anchor position.
+            cx.notify();
+        }
         // Measuring wrapped rows can correct blocks above the viewport. Keep the
         // same block and the same position inside it at the top instead of
-        // letting those corrections visibly move the document.
-        if let Some((old_ordinal, intra)) = height_anchor {
+        // letting those corrections visibly move the document, unless the
+        // zoom gesture has a more specific pointer/pinch anchor.
+        if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
             let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
             let inside = self
                 .heights
@@ -5122,12 +5184,7 @@ impl Render for EditorView {
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
                                     row_element(
-                                        editor,
-                                        &visual,
-                                        &layout,
-                                        row_index,
-                                        self.theme,
-                                        self.zoom,
+                                        editor, &visual, &layout, row_index, self.theme, self.zoom,
                                         &resolver,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
@@ -6624,6 +6681,12 @@ mod tests {
         // continuing gesture always breaks free of the snap.
         assert_eq!(clamp_and_snap_zoom(0.97), 0.97);
         assert_eq!(clamp_and_snap_zoom(1.03), 1.03);
+    }
+
+    #[test]
+    fn background_height_snapshot_must_match_the_current_line_height() {
+        assert!(height_snapshot_matches_line_height(26.0, 26.0));
+        assert!(!height_snapshot_matches_line_height(52.0, 26.0));
     }
 
     #[test]
@@ -9096,6 +9159,23 @@ mod tests {
         (view, cx, root)
     }
 
+    fn secondary_scroll_modifiers() -> gpui::Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            gpui::Modifiers {
+                platform: true,
+                ..gpui::Modifiers::none()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::none()
+            }
+        }
+    }
+
     // Issue #228: continuous 50%-300% zoom via Ctrl/Cmd+wheel, trackpad
     // pinch, and Ctrl/Cmd+0 reset.
 
@@ -9125,10 +9205,7 @@ mod tests {
         cx.simulate_event(gpui::ScrollWheelEvent {
             position,
             delta: ScrollDelta::Lines(point(0.0, 5.0)),
-            modifiers: gpui::Modifiers {
-                control: true,
-                ..gpui::Modifiers::none()
-            },
+            modifiers: secondary_scroll_modifiers(),
             touch_phase: gpui::TouchPhase::Moved,
         });
         cx.run_until_parked();
@@ -9165,13 +9242,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn small_pinch_deltas_accumulate_before_the_100_percent_snap(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let position = point(px(480.0), px(400.0));
+
+        for _ in 0..3 {
+            cx.simulate_event(gpui::MagnifyEvent {
+                position,
+                magnification: 0.01,
+                modifiers: gpui::Modifiers::none(),
+                phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        let (zoom, raw_zoom) = view.read_with(cx, |view, _| (view.zoom, view.raw_zoom));
+        assert!(
+            raw_zoom > 1.02,
+            "raw zoom must cross the snap band: {raw_zoom}"
+        );
+        assert!(
+            zoom > 1.0,
+            "effective zoom must eventually leave the snap: {zoom}"
+        );
+    }
+
+    #[gpui::test]
     fn reset_zoom_keystroke_restores_100_percent_after_zooming(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
 
         // A click focuses the editor's "HaneEditor" key context (see
         // `on_row_mouse_down`), which the Ctrl/Cmd+0 binding is scoped to.
-        let point = cx.debug_bounds("row-0-0").expect("first row painted").center();
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
         cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
 
