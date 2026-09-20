@@ -182,14 +182,7 @@ jobs:
       TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
       HEAD_REF: ${{ needs.prepare.outputs.head_ref }}
       TRIGGER_ACTOR: ${{ needs.prepare.outputs.trigger_actor }}
-      WORKTREE: ${{ runner.temp }}/hane-codex-${{ github.run_id }}-${{ github.run_attempt }}
       CONTROL_DIR: ${{ github.workspace }}/control
-      HANDOFF_DIR: ${{ runner.temp }}/hane-codex-handoff-${{ github.run_id }}-${{ github.run_attempt }}
-      HANDOFF_FILE: ${{ runner.temp }}/hane-codex-handoff-${{ github.run_id }}-${{ github.run_attempt }}/commander-handoff.txt
-      CONTEXT_DIR: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}
-      CONTEXT_FILE: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/pr-context.json
-      CODEX_PATCH_FILE: ${{ runner.temp }}/hane-codex-patch-${{ github.run_id }}-${{ github.run_attempt }}.patch
-      PUSH_WORKTREE: ${{ runner.temp }}/hane-codex-push-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Check out trusted fallback instructions
@@ -199,6 +192,26 @@ jobs:
           path: control
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Initialize isolated runner paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          worktree="$RUNNER_TEMP/hane-codex-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          handoff_dir="$RUNNER_TEMP/hane-codex-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          context_dir="$RUNNER_TEMP/hane-codex-context-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          patch_file="$RUNNER_TEMP/hane-codex-patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.patch"
+          push_worktree="$RUNNER_TEMP/hane-codex-push-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'WORKTREE=%s\n' "$worktree"
+            printf 'HANDOFF_DIR=%s\n' "$handoff_dir"
+            printf 'HANDOFF_FILE=%s/commander-handoff.txt\n' "$handoff_dir"
+            printf 'CONTEXT_DIR=%s\n' "$context_dir"
+            printf 'CONTEXT_FILE=%s/pr-context.json\n' "$context_dir"
+            printf 'CODEX_PATCH_FILE=%s\n' "$patch_file"
+            printf 'PUSH_WORKTREE=%s\n' "$push_worktree"
+          } >> "$GITHUB_ENV"
 
       - name: Revalidate trusted actor and exact target head before Codex
         shell: bash

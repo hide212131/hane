@@ -32,6 +32,8 @@ def test_non_usage_categories_do_not_start_the_codex_job():
 
 def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "runs-on: [self-hosted, macOS, hane-codex]" in WORKFLOW
+    assert "Initialize isolated runner paths" in WORKFLOW
+    assert 'printf \'WORKTREE=%s\\n\'' in WORKFLOW
     assert "actions: read" in WORKFLOW
     assert "--model gpt-5.6-luna" in WORKFLOW
     assert "--config model_reasoning_effort=xhigh" in WORKFLOW
