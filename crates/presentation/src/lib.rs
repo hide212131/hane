@@ -3220,6 +3220,7 @@ fn present_fenced_code_opening_line(
     } else {
         Vec::new()
     };
+    let line_estimated_height = fenced_line_height(&visual, !expanded, line_height);
     VisualLine {
         line_id,
         source_range: range,
@@ -3228,7 +3229,7 @@ fn present_fenced_code_opening_line(
         style_runs,
         kind: BlockKind::CodeBlock,
         source_map: SourceMap { segments },
-        estimated_height: fenced_line_height(&visual, !expanded, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
@@ -3266,6 +3267,7 @@ fn present_fenced_code_closing_line(
     } else {
         Vec::new()
     };
+    let line_estimated_height = fenced_line_height(&visual_text, !expanded, line_height);
     VisualLine {
         line_id,
         source_range: range,
@@ -3281,7 +3283,7 @@ fn present_fenced_code_closing_line(
                 marker_edge: Some(MarkerEdge::Closing),
             }],
         },
-        estimated_height: fenced_line_height(&visual_text, !expanded, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
