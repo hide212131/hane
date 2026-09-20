@@ -140,6 +140,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                 "bounding_box": {"minX": 0.1, "maxX": 0.2, "minY": 0.5, "maxY": 0.53},
                 "rgb": [0x35, 0x6D, 0x94],
                 "pixel_count": 120,
+                "foreground_pixel_count": 18,
             }],
             "rgb": [0x35, 0x6D, 0x94],
             "tolerance": 3,
@@ -158,6 +159,7 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
                     helper, digest, Path(directory) / "shot.png", expected
                 )
         self.assertEqual(matches[0]["pixel_count"], 120)
+        self.assertEqual(matches[0]["foreground_pixel_count"], 18)
 
     def test_validate_preprocessing_evidence_accepts_valid_evidence(self):
         # Should not raise, and unknown extra fields are forward-compatible.
@@ -940,6 +942,13 @@ class HostedDateBadgeGuiTests(unittest.TestCase):
             shapes,
             {"today", "same_year_same_month", "same_year_other_month", "other_year"},
         )
+
+    def test_one_digit_year_fixture_stays_outside_the_current_week_in_late_january(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, cases = mod.make_fixtures(Path(tmp) / "work-folder", today=dt.date(2025, 1, 31))
+        one_digit = next(case for case in cases if case["name"] == "one_digit_month_day")
+        self.assertEqual(one_digit["date_token"], "2025-3-2")
+        self.assertEqual(one_digit["badge_range"], "this_year")
 
 
 if __name__ == "__main__":

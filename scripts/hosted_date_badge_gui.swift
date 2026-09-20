@@ -277,6 +277,18 @@ func findColors(_ path: String, _ hex: String) {
                     }
                 }
             }
+            let foregroundRGB = [247, 251, 255]
+            var foregroundPixelCount = 0
+            for foregroundY in minY...maxY {
+                for foregroundX in minX...maxX {
+                    let offset = foregroundY * context.bytesPerRow + foregroundX * 4
+                    if abs(Int(bytes[offset]) - foregroundRGB[0]) <= tolerance
+                        && abs(Int(bytes[offset + 1]) - foregroundRGB[1]) <= tolerance
+                        && abs(Int(bytes[offset + 2]) - foregroundRGB[2]) <= tolerance {
+                        foregroundPixelCount += 1
+                    }
+                }
+            }
             // Tiny antialiased fragments are not chip evidence. A real badge
             // interior is a much larger connected component.
             if count >= 20 {
@@ -289,6 +301,7 @@ func findColors(_ path: String, _ hex: String) {
                     ],
                     "rgb": expectedRGB,
                     "pixel_count": count,
+                    "foreground_pixel_count": foregroundPixelCount,
                 ])
             }
         }

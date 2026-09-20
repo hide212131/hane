@@ -51,6 +51,7 @@ DATE_BADGE_BACKGROUND_BY_RANGE = {
 }
 DATE_BADGE_COLOR_TOLERANCE = 8
 DATE_BADGE_MIN_MATCHING_PIXELS = 4
+DATE_BADGE_MIN_FOREGROUND_PIXELS = 3
 
 
 def load_gui_validate(control_dir: Path):
@@ -311,6 +312,11 @@ def helper_find_colors(helper: Path, digest: str, screenshot: Path, expected_hex
             raise RuntimeError("vision helper returned malformed color geometry")
         if not isinstance(match.get("pixel_count"), int) or match["pixel_count"] < 20:
             raise RuntimeError("vision helper returned an unbounded or empty color region")
+        if (
+            not isinstance(match.get("foreground_pixel_count"), int)
+            or match["foreground_pixel_count"] < 0
+        ):
+            raise RuntimeError("vision helper returned malformed foreground evidence")
     return matches
 
 
@@ -632,8 +638,13 @@ def make_fixtures(folder: Path, *, today: dt.date | None = None) -> tuple[list[s
     )
     date_in_middle_token = date_in_middle.strftime("%Y-%m-%d")
 
-    one_digit_month = 1 if today.month != 1 else 2
-    one_digit = dt.date(today.year, one_digit_month, 2)
+    one_digit = next(
+        dt.date(today.year, month, 2)
+        for month in range(1, 13)
+        if month != today.month
+        and dt.date(today.year, month, 2) - dt.timedelta(days=dt.date(today.year, month, 2).weekday())
+        != current_week_start
+    )
     one_digit_token = f"{one_digit.year}-{one_digit.month}-{one_digit.day}"
 
     date_at_end = dt.date(today.year - 1, today.month, 2)
@@ -940,7 +951,15 @@ def main() -> int:
                                             # search still proves that the expected colored chip
                                             # is on this exact filename row, without accepting a
                                             # color from an adjacent row.
-                                            badge_match = largest_same_row(display_match, color_regions)
+                                            badge_match = largest_same_row(
+                                                display_match,
+                                                [
+                                                    region
+                                                    for region in color_regions
+                                                    if region.get("foreground_pixel_count", 0)
+                                                    >= DATE_BADGE_MIN_FOREGROUND_PIXELS
+                                                ],
+                                            )
                                             badge_source = "pixel_color_region" if badge_match is not None else "ocr"
                                         if badge_match is None:
                                             scenario_steps.append(step(
