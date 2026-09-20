@@ -38,6 +38,7 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "--model gpt-5.6-luna" in WORKFLOW
     assert "--config model_reasoning_effort=xhigh" in WORKFLOW
     assert "--profile hane-codex-fallback" in WORKFLOW
+    assert "codex --ask-for-approval never exec" in WORKFLOW
     assert "expected_profile_sha256=" in WORKFLOW
     assert "a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d" in WORKFLOW
     assert "dedicated Codex HOME must not contain an additional config.toml" in WORKFLOW

@@ -357,7 +357,7 @@ jobs:
           Implement only the focused root-cause change already requested for this Pull Request. Preserve useful incomplete edits if present, verify them against the current code, and add or update directly relevant tests. Do not modify .github/, AGENTS.md, CLAUDE.md, docs/aadw-command-policy.md, .claude/, .mcp.json, .gitmodules, or hook/configuration authority files. Run the narrowest relevant tests when practical. Leave the working tree with the intended source/test edits only.
           EOF
 
-          codex exec \
+          codex --ask-for-approval never exec \
             --model gpt-5.6-luna \
             --config model_reasoning_effort=xhigh \
             --profile hane-codex-fallback \
@@ -365,7 +365,6 @@ jobs:
             --add-dir "$CONTROL_DIR" \
             --add-dir "$HANDOFF_DIR" \
             --add-dir "$CONTEXT_DIR" \
-            --ask-for-approval never \
             --ignore-rules \
             --ephemeral \
             --color never \
