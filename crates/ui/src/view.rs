@@ -26,8 +26,8 @@ use crate::line::DEFAULT_LINE_HEIGHT;
 #[cfg(test)]
 use crate::line::presented_block;
 use crate::line::{
-    BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
-    presented_block_with_list_projection, row_element,
+    BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
+    expected_block_disclosures, presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -624,6 +624,16 @@ pub struct EditorView {
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
+    /// The active keyboard input mode, when the platform can determine it.
+    /// Drives the caret's small input-mode badge; refreshed by
+    /// `_input_mode_subscription` so it updates without polling.
+    caret_input_mode: Option<gpui::KeyboardInputMode>,
+    /// Keeps the input-source change hook (see `caret_input_mode`)
+    /// alive for the life of the view; dropping it would cancel the hook.
+    _input_mode_subscription: Subscription,
+    /// Refreshes the input mode when the editor receives focus, covering a
+    /// pre-existing IME state before any mode-change notification arrives.
+    _input_mode_focus_subscription: Option<Subscription>,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -2027,6 +2037,15 @@ impl EditorView {
             view.flush_pending_drafts();
             std::future::ready(())
         });
+        // The caret's mode badge (see `caret_input_mode`) has to
+        // update the moment the user switches IME mode, even if nothing else
+        // about the document changes, so this reuses the same platform event
+        // GPUI already refreshes its keyboard mapper from — no separate
+        // polling.
+        let input_mode_subscription = cx.on_keyboard_layout_change(|view: &mut Self, cx| {
+            view.caret_input_mode = gpui::active_keyboard_input_mode();
+            cx.notify();
+        });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
         // untouched across local midnight; `view.update` failing (the view
@@ -2078,6 +2097,9 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
+            caret_input_mode: gpui::active_keyboard_input_mode(),
+            _input_mode_subscription: input_mode_subscription,
+            _input_mode_focus_subscription: None,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
@@ -3761,6 +3783,16 @@ impl EditorView {
         self.after_input(cx);
     }
 
+    /// The content height scroll position is actually bounded to:
+    /// `self.heights.total_height()` extended by `CARET_MODE_BADGE_HEIGHT`.
+    /// Clamping to the bare content height at the document's end would put
+    /// the input-mode badge drawn under the last line's caret back under the
+    /// viewport's `overflow_hidden`, undoing the clearance
+    /// `scroll_cursor_into_view` reserved for it (issue #240).
+    fn scrollable_content_height(&self) -> f32 {
+        self.heights.total_height() + CARET_MODE_BADGE_HEIGHT
+    }
+
     /// The item (block, or physical line before a `BlockIndex` exists) and
     /// fractional position under `window_offset` (content-local window y: the
     /// mouse/gesture position's window y minus the header height), for a zoom
@@ -3837,7 +3869,7 @@ impl EditorView {
         let delta = event.delta.pixel_delta(px(self.line_height()));
         self.scroll_y = clamp_scroll_y(
             self.scroll_y - f32::from(delta.y),
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         cx.notify();
@@ -4125,6 +4157,11 @@ impl EditorView {
     /// while moving around. Right after an edit the layout is a revision behind,
     /// and the caret's physical line stands in for its row — the same thing
     /// wherever nothing wraps.
+    ///
+    /// When the row would land flush against the viewport's bottom edge, the
+    /// scroll target keeps [`CARET_MODE_BADGE_HEIGHT`] of extra clearance
+    /// below it, so the input-mode badge drawn under the caret is not clipped
+    /// by the viewport's `overflow_hidden` (issue #240).
     fn scroll_cursor_into_view(&mut self) {
         let editor = self.sessions.active().editor();
         let cursor = editor.selection().active;
@@ -4194,7 +4231,12 @@ impl EditorView {
                 }
             }
         };
-        self.scroll_y = scroll_y_for_cursor(self.scroll_y, top, height, self.viewport_height);
+        self.scroll_y = scroll_y_for_cursor(
+            self.scroll_y,
+            top,
+            height + CARET_MODE_BADGE_HEIGHT,
+            self.viewport_height,
+        );
     }
 
     /// The published index, but only while it describes the current revision.
@@ -5349,6 +5391,32 @@ mod panel_layout_tests {
     }
 
     #[test]
+    fn editor_scrollbar_drag_preserves_document_end_badge_clearance() {
+        let document_height = 400.0;
+        let viewport_height = 100.0;
+        let content_height = document_height + CARET_MODE_BADGE_HEIGHT;
+
+        let (_, thumb_height) =
+            scrollbar_thumb_geometry(viewport_height, content_height, 0.0).unwrap();
+        let end_scroll =
+            scroll_y_for_thumb_drag(0.0, viewport_height, viewport_height, content_height);
+
+        assert_eq!(end_scroll, content_height - viewport_height);
+        let (thumb_top, _) =
+            scrollbar_thumb_geometry(viewport_height, content_height, end_scroll).unwrap();
+        assert!((thumb_top + thumb_height - viewport_height).abs() < f32::EPSILON);
+
+        // The last document row ends before the viewport by exactly the
+        // badge footprint, even when the position was reached by dragging the
+        // editor scrollbar rather than by caret tracking or wheel scrolling.
+        let document_bottom_in_viewport = document_height - end_scroll;
+        assert_eq!(
+            document_bottom_in_viewport + CARET_MODE_BADGE_HEIGHT,
+            viewport_height
+        );
+    }
+
+    #[test]
     fn scrollbar_is_hidden_when_content_fits() {
         assert_eq!(scrollbar_thumb_geometry(100.0, 100.0, 0.0), None);
         assert_eq!(scrollbar_thumb_geometry(100.0, 80.0, 0.0), None);
@@ -5365,6 +5433,14 @@ mod panel_layout_tests {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout_started = Instant::now();
+        if self._input_mode_focus_subscription.is_none() {
+            let focus_handle = self.focus_handle.clone();
+            self._input_mode_focus_subscription =
+                Some(cx.on_focus(&focus_handle, window, |view, _, cx| {
+                    view.caret_input_mode = gpui::active_keyboard_input_mode();
+                    cx.notify();
+                }));
+        }
         let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
         if resolved_theme != self.theme {
             self.theme = resolved_theme;
@@ -5411,7 +5487,7 @@ impl Render for EditorView {
         }
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         let visible =
@@ -5507,10 +5583,19 @@ impl Render for EditorView {
         // zoom gesture has a more specific pointer/pinch anchor.
         if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
             let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
-            let inside = self
-                .heights
-                .height(ordinal)
-                .map_or(0.0, |height| intra.clamp(0.0, height));
+            let inside = if ordinal + 1 == self.heights.len() {
+                // At the document's last item, `intra` can already be
+                // carrying the `CARET_MODE_BADGE_HEIGHT` clearance
+                // `scroll_cursor_into_view` reserved past its bottom.
+                // Clamping it to the item's own height would throw that
+                // clearance away before the badge is ever drawn (issue
+                // #240); the clamp below still bounds the result.
+                intra.max(0.0)
+            } else {
+                self.heights
+                    .height(ordinal)
+                    .map_or(0.0, |height| intra.clamp(0.0, height))
+            };
             self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
         }
         // A newly measured block can shrink at the old bottom. Anchoring
@@ -5518,7 +5603,7 @@ impl Render for EditorView {
         // new scroll limit and move all content above the viewport.
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         // Where the caret was drawn, for the IME candidate window. Only the
@@ -5600,7 +5685,7 @@ impl Render for EditorView {
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
         let editor = self.sessions.active().editor();
-        let editor_scrollbar = self.editor_scrollbar(self.heights.total_height(), cx);
+        let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
             div()
                 .relative()
@@ -5630,8 +5715,14 @@ impl Render for EditorView {
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
                                     row_element(
-                                        editor, &visual, &layout, row_index, self.theme, self.zoom,
+                                        editor,
+                                        &visual,
+                                        &layout,
+                                        row_index,
+                                        self.theme,
+                                        self.zoom,
                                         &resolver,
+                                        self.caret_input_mode,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
@@ -7200,6 +7291,80 @@ mod tests {
         assert_eq!(scroll_y, 136.0);
         assert_eq!(content_top_for_scroll(scroll_y), -136.0);
         assert_eq!(cursor_top - scroll_y, 696.0);
+    }
+
+    // Issue #240: the caret's input-mode badge is drawn below its row, so
+    // parking that row flush against the viewport's bottom edge (as the test
+    // above does for the raw geometry) would clip the badge under the
+    // viewport's `overflow_hidden`. `scroll_cursor_into_view` asks for
+    // `CARET_MODE_BADGE_HEIGHT` of extra clearance to prevent that.
+    #[test]
+    fn moving_down_through_forty_lines_leaves_room_for_the_caret_mode_badge() {
+        let text = (1..=40)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&text);
+
+        for _ in 0..32 {
+            editor
+                .dispatch(EditorCommand::MoveDown { extend: false })
+                .unwrap();
+        }
+
+        let line = editor
+            .document()
+            .line_for_offset(editor.selection().active)
+            .unwrap();
+        let heights = HeightIndex::new(std::iter::repeat_n(DEFAULT_THEME.line_height, 40));
+        let viewport_height = 722.0;
+        let cursor_top = heights.prefix_sum(line.0);
+        let scroll_y = scroll_y_for_cursor(
+            0.0,
+            cursor_top,
+            DEFAULT_THEME.line_height + CARET_MODE_BADGE_HEIGHT,
+            viewport_height,
+        );
+
+        let row_bottom_in_viewport = cursor_top - scroll_y + DEFAULT_THEME.line_height;
+        assert!(
+            row_bottom_in_viewport + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            "badge would be clipped: row bottom {row_bottom_in_viewport}, viewport {viewport_height}"
+        );
+    }
+
+    // Issue #240 follow-up: the test above only exercises the pure
+    // `scroll_y_for_cursor` math. In the real render path, the height-anchor
+    // restore and the final `clamp_scroll_y` call both used to bound
+    // `scroll_y` to the bare `self.heights.total_height()`, which does not
+    // include the badge's footprint past the last line, so an actual render
+    // pass at the document's end clamped the clearance away again and
+    // clipped the badge under the viewport's `overflow_hidden`.
+    #[gpui::test]
+    fn moving_to_document_end_leaves_room_for_the_caret_mode_badge_after_render(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=200)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (caret, viewport_height) = view.read_with(cx, |view, _| {
+            (view.caret_geometry(), view.viewport_height)
+        });
+        let caret = caret.expect("caret is on screen at the document end");
+
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            "badge would be clipped: caret bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
+        );
     }
 
     #[test]

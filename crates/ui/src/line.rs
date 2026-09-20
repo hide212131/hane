@@ -10,8 +10,8 @@
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
-    Div, FontWeight, IntoElement, ObjectFit, ParentElement, Styled, StyledImage, div, img,
-    prelude::FluentBuilder, px, rgb,
+    Div, FontWeight, IntoElement, KeyboardInputMode, ObjectFit, ParentElement, Styled, StyledImage,
+    div, img, prelude::FluentBuilder, px, relative, rgb,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
@@ -375,6 +375,7 @@ fn row_owns_visual(row: &LayoutLine, visual: usize) -> bool {
 /// Rows, not source lines, are what is painted. Which stretch of the line's
 /// visual text this row holds, and which source bytes it stands for, are the
 /// layout's answers; this only applies them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn row_element(
     editor: &Editor,
     block: &VisualBlock,
@@ -383,6 +384,7 @@ pub(crate) fn row_element(
     theme: Theme,
     zoom: f32,
     resolver: &ResourceResolver,
+    caret_input_mode: Option<KeyboardInputMode>,
 ) -> Div {
     let row = &layout.lines[row_index];
     let line = &block.lines[row.line];
@@ -454,7 +456,7 @@ pub(crate) fn row_element(
             );
         }
         if segment.cursor_before {
-            elements.push(cursor_overlay(theme).into_any_element());
+            elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
         }
         if !segment.visual_range.is_empty() {
             elements.push(
@@ -495,7 +497,7 @@ pub(crate) fn row_element(
         );
     }
     if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
-        elements.push(cursor_overlay(theme).into_any_element());
+        elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
     }
 
     styled_block(
@@ -601,8 +603,19 @@ fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option
         .flatten()
 }
 
-fn cursor_overlay(theme: Theme) -> Div {
-    div().relative().flex_none().w(px(0.)).h_full().child(
+/// Vertical footprint of the caret's input-mode badge below the row it is
+/// anchored to. `EditorView::scroll_cursor_into_view` keeps this much
+/// clearance under the caret's row so the badge, which is drawn outside the
+/// row's own height, is not clipped by the editor viewport's bottom edge
+/// (issue #240).
+pub(crate) const CARET_MODE_BADGE_HEIGHT: f32 = 11.0;
+
+/// The caret bar itself, plus a small badge just below its active edge
+/// showing the current input mode (see `caret_mode_glyph`). Both are
+/// absolutely positioned inside a zero-width anchor, so neither affects the
+/// row's own layout width or height.
+fn cursor_overlay(theme: Theme, caret_input_mode: Option<KeyboardInputMode>) -> Div {
+    let mut overlay = div().relative().flex_none().w(px(0.)).h_full().child(
         div()
             .absolute()
             .top(px(3.))
@@ -610,7 +623,35 @@ fn cursor_overlay(theme: Theme) -> Div {
             .w(px(1.))
             .bottom(px(3.))
             .bg(rgb(theme.foreground)),
-    )
+    );
+    if let Some(glyph) = caret_mode_glyph(caret_input_mode) {
+        overlay = overlay.child(
+            div()
+                .absolute()
+                .top(relative(1.0))
+                .left(px(-3.))
+                .px(px(3.))
+                .rounded_sm()
+                .whitespace_nowrap()
+                .bg(rgb(theme.code_background))
+                .text_color(rgb(theme.quote_foreground))
+                .text_size(px(9.))
+                .line_height(px(CARET_MODE_BADGE_HEIGHT))
+                .child(glyph),
+        );
+    }
+    overlay
+}
+
+/// Maps the platform's known input mode to the small glyph shown below the
+/// caret. Unknown platform state deliberately hides the badge instead of
+/// claiming that direct ASCII input is active.
+fn caret_mode_glyph(caret_input_mode: Option<KeyboardInputMode>) -> Option<&'static str> {
+    match caret_input_mode {
+        Some(KeyboardInputMode::Ascii) => Some("A"),
+        Some(KeyboardInputMode::Native) => Some("あ"),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +686,16 @@ mod tests {
     #[test]
     fn an_unselected_code_segment_keeps_its_code_background() {
         assert!(segment_shows_code_background(&code_segment(false)));
+    }
+
+    #[test]
+    fn caret_mode_glyph_maps_known_modes_and_hides_unknown_state() {
+        assert_eq!(caret_mode_glyph(Some(KeyboardInputMode::Ascii)), Some("A"));
+        assert_eq!(
+            caret_mode_glyph(Some(KeyboardInputMode::Native)),
+            Some("あ")
+        );
+        assert_eq!(caret_mode_glyph(None), None);
     }
 
     #[test]

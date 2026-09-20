@@ -101,6 +101,7 @@ impl WindowsWindowInner {
             WM_DEADCHAR => self.handle_dead_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
+            WM_IME_NOTIFY => self.handle_ime_notify(wparam),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
@@ -748,6 +749,12 @@ impl WindowsWindowInner {
 
     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
+        if activated {
+            // Refresh the shared keyboard-layout callback when the Hane
+            // window becomes active, so an IME that was already enabled
+            // before launch/focus is reflected without waiting for a key.
+            let _ = self.handle_input_language_changed();
+        }
         let this = self.clone();
         self.executor
             .spawn(async move {
@@ -1177,6 +1184,14 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    fn handle_ime_notify(&self, wparam: WPARAM) -> Option<isize> {
+        if ime_notification_changes_keyboard_input_mode(wparam.0 as u32) {
+            self.handle_input_language_changed()
+        } else {
+            None
+        }
+    }
+
     fn handle_window_visibility_changed(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
         if wparam.0 == 1 {
             self.draw_window(handle, false);
@@ -1559,5 +1574,25 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+fn ime_notification_changes_keyboard_input_mode(notification: u32) -> bool {
+    matches!(notification, IMN_SETOPENSTATUS | IMN_SETCONVERSIONMODE)
+}
+
+#[cfg(test)]
+mod input_mode_notification_tests {
+    use super::*;
+
+    #[test]
+    fn open_status_and_conversion_mode_notifications_refresh_input_mode() {
+        assert!(ime_notification_changes_keyboard_input_mode(IMN_SETOPENSTATUS));
+        assert!(ime_notification_changes_keyboard_input_mode(IMN_SETCONVERSIONMODE));
+    }
+
+    #[test]
+    fn unrelated_ime_notifications_do_not_refresh_input_mode() {
+        assert!(!ime_notification_changes_keyboard_input_mode(0));
     }
 }

@@ -6,7 +6,8 @@ use objc::{msg_send, runtime::Object, sel, sel_impl};
 use crate::{KeybindingKeystroke, Keystroke, PlatformKeyboardLayout, PlatformKeyboardMapper};
 
 use super::{
-    TISCopyCurrentKeyboardLayoutInputSource, TISGetInputSourceProperty, kTISPropertyInputSourceID,
+    TISCopyCurrentKeyboardInputSource, TISCopyCurrentKeyboardLayoutInputSource,
+    TISGetInputSourceProperty, kTISPropertyInputSourceID, kTISPropertyInputSourceIsASCIICapable,
     kTISPropertyLocalizedName,
 };
 
@@ -71,6 +72,27 @@ impl MacKeyboardLayout {
 
             Self { id, name }
         }
+    }
+}
+
+// Whether the input source actually producing text right now types ASCII
+// directly, as opposed to composing it through an IME. This is what macOS
+// itself uses to decide whether a key equivalent can be typed without first
+// switching input sources, so it also tells apart an IME's own modes (e.g.
+// Kotoeri's かな vs its 英数 mode) without hard-coding any specific source
+// ID: it stays correct as Apple adds or renames IME modes.
+pub(crate) fn mac_active_input_source_is_ascii_capable() -> bool {
+    unsafe {
+        let source = TISCopyCurrentKeyboardInputSource();
+        let is_ascii_capable: *mut Object = TISGetInputSourceProperty(
+            source,
+            kTISPropertyInputSourceIsASCIICapable as *const c_void,
+        );
+        if is_ascii_capable.is_null() {
+            return true;
+        }
+        let value: bool = msg_send![is_ascii_capable, boolValue];
+        value
     }
 }
 

@@ -203,6 +203,22 @@ impl<'a, T: 'static> Context<'a, T> {
         })
     }
 
+    /// Register a callback to be invoked when the active keyboard input source
+    /// changes, including a change between an IME's own modes (see
+    /// [`crate::active_keyboard_input_mode`]).
+    pub fn on_keyboard_layout_change(
+        &self,
+        mut on_change: impl FnMut(&mut T, &mut Context<T>) + 'static,
+    ) -> Subscription
+    where
+        T: 'static,
+    {
+        let handle = self.weak_entity();
+        self.app.on_keyboard_layout_change(move |cx| {
+            handle.update(cx, |entity, cx| on_change(entity, cx)).ok();
+        })
+    }
+
     /// Arrange for the given function to be invoked whenever the application is quit.
     /// The future returned from this callback will be polled for up to [crate::SHUTDOWN_TIMEOUT] until the app fully quits.
     pub fn on_app_quit<Fut>(

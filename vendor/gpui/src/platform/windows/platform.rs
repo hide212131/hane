@@ -21,12 +21,106 @@ use windows::{
         Graphics::{Direct3D11::ID3D11Device, Gdi::*},
         Security::Credentials::*,
         System::{Com::*, LibraryLoader::*, Ole::*, SystemInformation::*},
-        UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+        UI::{Input::{Ime::*, KeyboardAndMouse::*}, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
 };
 
 use crate::*;
+
+pub(crate) fn windows_active_keyboard_input_mode() -> Option<KeyboardInputMode> {
+    let window = unsafe { GetActiveWindow() };
+    if window.is_invalid() {
+        return None;
+    }
+
+    let context = unsafe { ImmGetContext(window) };
+    if context.is_invalid() {
+        return None;
+    }
+
+    let mode = unsafe {
+        let is_open = ImmGetOpenStatus(context).as_bool();
+        if !is_open {
+            Some(KeyboardInputMode::Ascii)
+        } else {
+            let mut conversion_mode = IME_CONVERSION_MODE::default();
+            let mut sentence_mode = IME_SENTENCE_MODE::default();
+            ImmGetConversionStatus(
+                context,
+                Some(&mut conversion_mode),
+                Some(&mut sentence_mode),
+            )
+            .as_bool()
+            .then(|| keyboard_input_mode_from_ime_state(true, Some(conversion_mode.0)))
+            .flatten()
+        }
+    };
+    unsafe {
+        ImmReleaseContext(window, context).ok().log_err();
+    }
+    mode
+}
+
+fn keyboard_input_mode_from_ime_state(
+    is_open: bool,
+    conversion_mode: Option<u32>,
+) -> Option<KeyboardInputMode> {
+    if !is_open {
+        return Some(KeyboardInputMode::Ascii);
+    }
+
+    conversion_mode.map(|conversion_mode| {
+        let native_mode = IME_CMODE_NATIVE.0 | IME_CMODE_NATIVESYMBOL.0;
+        if conversion_mode & native_mode != 0 {
+            KeyboardInputMode::Native
+        } else {
+            KeyboardInputMode::Ascii
+        }
+    })
+}
+
+#[cfg(test)]
+mod keyboard_input_mode_tests {
+    use super::*;
+
+    #[test]
+    fn closed_ime_is_direct_ascii_input() {
+        assert_eq!(
+            keyboard_input_mode_from_ime_state(false, None),
+            Some(KeyboardInputMode::Ascii)
+        );
+    }
+
+    #[test]
+    fn open_alphanumeric_conversion_is_direct_ascii_input() {
+        assert_eq!(
+            keyboard_input_mode_from_ime_state(true, Some(IME_CMODE_ALPHANUMERIC.0)),
+            Some(KeyboardInputMode::Ascii)
+        );
+    }
+
+    #[test]
+    fn open_native_conversion_is_native_input() {
+        assert_eq!(
+            keyboard_input_mode_from_ime_state(true, Some(IME_CMODE_NATIVE.0)),
+            Some(KeyboardInputMode::Native)
+        );
+    }
+
+    #[test]
+    fn open_native_symbol_conversion_is_native_input() {
+        assert_eq!(
+            keyboard_input_mode_from_ime_state(true, Some(IME_CMODE_NATIVESYMBOL.0)),
+            Some(KeyboardInputMode::Native)
+        );
+    }
+
+    #[test]
+    fn failed_open_ime_conversion_query_is_unknown() {
+        assert_eq!(keyboard_input_mode_from_ime_state(true, None), None);
+    }
+}
 
 pub(crate) struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
