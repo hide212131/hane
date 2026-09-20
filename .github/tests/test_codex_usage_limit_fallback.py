@@ -34,13 +34,15 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "runs-on: [self-hosted, macOS, hane-codex]" in WORKFLOW
     assert "--model gpt-5.6-luna" in WORKFLOW
     assert "--config model_reasoning_effort=xhigh" in WORKFLOW
+    assert "--profile hane-codex-fallback" in WORKFLOW
+    assert "expected_profile_sha256=" in WORKFLOW
+    assert "--ignore-user-config" in WORKFLOW
     assert "GH_TOKEN: ''" in WORKFLOW
     assert "GITHUB_TOKEN: ''" in WORKFLOW
     assert "ACTIONS_RUNTIME_TOKEN: ''" in WORKFLOW
     assert "GH_CONFIG_DIR:" in WORKFLOW
     assert "GIT_CONFIG_GLOBAL:" in WORKFLOW
     assert "unset GH_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN" in WORKFLOW
-    assert "--sandbox workspace-write" in WORKFLOW
     assert "--ignore-rules" in WORKFLOW
     assert "--add-dir \"$HANDOFF_DIR\"" in WORKFLOW
     assert "--add-dir \"$CONTEXT_DIR\"" in WORKFLOW

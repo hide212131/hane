@@ -187,6 +187,7 @@ jobs:
       HANDOFF_FILE: ${{ runner.temp }}/hane-codex-handoff-${{ github.run_id }}-${{ github.run_attempt }}/commander-handoff.txt
       CONTEXT_DIR: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}
       CONTEXT_FILE: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/pr-context.json
+      GIT_CONFIG_GLOBAL: ${{ runner.temp }}/hane-codex-context-${{ github.run_id }}-${{ github.run_attempt }}/gitconfig
 
     steps:
       - name: Check out trusted fallback instructions
@@ -275,6 +276,24 @@ jobs:
 
           chmod -R a-w "$HANDOFF_DIR" "$CONTEXT_DIR"
 
+      - name: Check the dedicated Codex sandbox profile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
+          profile_path="$codex_home_path/hane-codex-fallback.config.toml"
+          expected_profile_sha256='e6dd2b9bb9f2d975fe003e558063aebaf9b9828a5b55ed3537be6b2ce1a4ee15'
+          if [[ ! -f "$profile_path" ]]; then
+            echo "::error::The trusted hane-codex-fallback Codex profile is not installed at ${profile_path}."
+            exit 1
+          fi
+          actual_profile_sha256="$(shasum -a 256 "$profile_path" | awk '{print $1}')"
+          if [[ "$actual_profile_sha256" != "$expected_profile_sha256" ]]; then
+            echo '::error::The hane-codex-fallback Codex profile does not match the trusted restricted profile.'
+            exit 1
+          fi
+
       - name: Run local Codex fallback without GitHub credentials
         shell: bash
         env:
@@ -284,7 +303,6 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
           ACTIONS_ID_TOKEN_REQUEST_URL: ''
           GH_CONFIG_DIR: ${{ runner.temp }}/hane-codex-gh-config-${{ github.run_id }}-${{ github.run_attempt }}
-          GIT_CONFIG_GLOBAL: ${{ runner.temp }}/hane-codex-git-config-${{ github.run_id }}-${{ github.run_attempt }}
           GIT_CONFIG_SYSTEM: /dev/null
         run: |
           set -euo pipefail
@@ -305,11 +323,12 @@ jobs:
           codex exec \
             --model gpt-5.6-luna \
             --config model_reasoning_effort=xhigh \
+            --profile hane-codex-fallback \
             --cd "$WORKTREE" \
             --add-dir "$CONTROL_DIR" \
             --add-dir "$HANDOFF_DIR" \
             --add-dir "$CONTEXT_DIR" \
-            --sandbox workspace-write \
+            --ignore-user-config \
             --ask-for-approval never \
             --ignore-rules \
             --ephemeral \
