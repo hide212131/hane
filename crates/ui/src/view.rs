@@ -26,8 +26,8 @@ use crate::line::DEFAULT_LINE_HEIGHT;
 #[cfg(test)]
 use crate::line::presented_block;
 use crate::line::{
-    BODY_FONT_SIZE, block_element, block_fits_sync_join_budget, expected_block_disclosures,
-    presented_block_with_list_projection, row_element,
+    BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
+    expected_block_disclosures, presented_block_with_list_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -4145,6 +4145,11 @@ impl EditorView {
     /// while moving around. Right after an edit the layout is a revision behind,
     /// and the caret's physical line stands in for its row — the same thing
     /// wherever nothing wraps.
+    ///
+    /// When the row would land flush against the viewport's bottom edge, the
+    /// scroll target keeps [`CARET_MODE_BADGE_HEIGHT`] of extra clearance
+    /// below it, so the input-mode badge drawn under the caret is not clipped
+    /// by the viewport's `overflow_hidden` (issue #240).
     fn scroll_cursor_into_view(&mut self) {
         let editor = self.sessions.active().editor();
         let cursor = editor.selection().active;
@@ -4214,7 +4219,12 @@ impl EditorView {
                 }
             }
         };
-        self.scroll_y = scroll_y_for_cursor(self.scroll_y, top, height, self.viewport_height);
+        self.scroll_y = scroll_y_for_cursor(
+            self.scroll_y,
+            top,
+            height + CARET_MODE_BADGE_HEIGHT,
+            self.viewport_height,
+        );
     }
 
     /// The published index, but only while it describes the current revision.
@@ -7226,6 +7236,46 @@ mod tests {
         assert_eq!(scroll_y, 136.0);
         assert_eq!(content_top_for_scroll(scroll_y), -136.0);
         assert_eq!(cursor_top - scroll_y, 696.0);
+    }
+
+    // Issue #240: the caret's input-mode badge is drawn below its row, so
+    // parking that row flush against the viewport's bottom edge (as the test
+    // above does for the raw geometry) would clip the badge under the
+    // viewport's `overflow_hidden`. `scroll_cursor_into_view` asks for
+    // `CARET_MODE_BADGE_HEIGHT` of extra clearance to prevent that.
+    #[test]
+    fn moving_down_through_forty_lines_leaves_room_for_the_caret_mode_badge() {
+        let text = (1..=40)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = Editor::new(&text);
+
+        for _ in 0..32 {
+            editor
+                .dispatch(EditorCommand::MoveDown { extend: false })
+                .unwrap();
+        }
+
+        let line = editor
+            .document()
+            .line_for_offset(editor.selection().active)
+            .unwrap();
+        let heights = HeightIndex::new(std::iter::repeat_n(DEFAULT_THEME.line_height, 40));
+        let viewport_height = 722.0;
+        let cursor_top = heights.prefix_sum(line.0);
+        let scroll_y = scroll_y_for_cursor(
+            0.0,
+            cursor_top,
+            DEFAULT_THEME.line_height + CARET_MODE_BADGE_HEIGHT,
+            viewport_height,
+        );
+
+        let row_bottom_in_viewport = cursor_top - scroll_y + DEFAULT_THEME.line_height;
+        assert!(
+            row_bottom_in_viewport + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            "badge would be clipped: row bottom {row_bottom_in_viewport}, viewport {viewport_height}"
+        );
     }
 
     #[test]

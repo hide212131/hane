@@ -603,6 +603,13 @@ fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option
         .flatten()
 }
 
+/// Vertical footprint of the caret's input-mode badge below the row it is
+/// anchored to. `EditorView::scroll_cursor_into_view` keeps this much
+/// clearance under the caret's row so the badge, which is drawn outside the
+/// row's own height, is not clipped by the editor viewport's bottom edge
+/// (issue #240).
+pub(crate) const CARET_MODE_BADGE_HEIGHT: f32 = 11.0;
+
 /// The caret bar itself, plus a small badge just below its active edge
 /// showing the current input mode (see `caret_mode_glyph`). Both are
 /// absolutely positioned inside a zero-width anchor, so neither affects the
@@ -633,7 +640,7 @@ fn cursor_overlay(theme: Theme, caret_input_is_ascii_capable: bool) -> Div {
                 .bg(rgb(theme.code_background))
                 .text_color(rgb(theme.quote_foreground))
                 .text_size(px(9.))
-                .line_height(px(11.))
+                .line_height(px(CARET_MODE_BADGE_HEIGHT))
                 .child(caret_mode_glyph(caret_input_is_ascii_capable)),
         )
 }
