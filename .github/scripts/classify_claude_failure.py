@@ -188,53 +188,41 @@ def format_summary(info: dict[str, Any], *, execution_file: str) -> str:
     )
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(
-            format_summary(
-                {
-                    "category": CATEGORY_UNAVAILABLE,
-                    "num_turns": None,
-                    "total_cost_usd": None,
-                    "model_usage": "unknown",
-                },
-                execution_file="missing",
-            )
-        )
-        return 0
+def _unavailable_info() -> dict[str, Any]:
+    return {
+        "category": CATEGORY_UNAVAILABLE,
+        "num_turns": None,
+        "total_cost_usd": None,
+        "model_usage": "unknown",
+    }
 
-    path = Path(argv[1])
+
+def _diagnose_path(path: Path) -> tuple[dict[str, Any], str]:
     if not path.is_file():
-        print(
-            format_summary(
-                {
-                    "category": CATEGORY_UNAVAILABLE,
-                    "num_turns": None,
-                    "total_cost_usd": None,
-                    "model_usage": "unknown",
-                },
-                execution_file="missing",
-            )
-        )
-        return 0
+        return _unavailable_info(), "missing"
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        print(
-            format_summary(
-                {
-                    "category": CATEGORY_UNAVAILABLE,
-                    "num_turns": None,
-                    "total_cost_usd": None,
-                    "model_usage": "unknown",
-                },
-                execution_file="unreadable",
-            )
-        )
-        return 0
+        return _unavailable_info(), "unreadable"
 
-    print(format_summary(diagnostic(payload), execution_file="present"))
+    return diagnostic(payload), "present"
+
+
+def main(argv: list[str]) -> int:
+    json_output = len(argv) == 3 and argv[1] == "--json"
+    if json_output:
+        path = Path(argv[2])
+    elif len(argv) == 2:
+        path = Path(argv[1])
+    else:
+        path = Path("/does/not/exist")
+
+    info, execution_file = _diagnose_path(path)
+    if json_output:
+        print(json.dumps(info, sort_keys=True))
+    else:
+        print(format_summary(info, execution_file=execution_file))
     return 0
 
 
