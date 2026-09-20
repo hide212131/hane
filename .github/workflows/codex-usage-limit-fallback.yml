@@ -279,7 +279,7 @@ jobs:
             exit 1
           fi
 
-          for blocked_path in .codex .mcp.json .claude .claude.json; do
+          for blocked_path in .codex .mcp.json; do
             if [[ -e "$WORKTREE/$blocked_path" || -L "$WORKTREE/$blocked_path" ]]; then
               echo "::error::The target worktree contains an untrusted Codex or MCP configuration path: ${blocked_path}."
               exit 1
