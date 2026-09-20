@@ -8,6 +8,7 @@ replace the comprehensive interactive-input procedure.
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import hashlib
 import importlib.util
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-date-badge/5"
+PROCEDURE_VERSION = "hosted-date-badge/6"
 VERIFICATION_KIND = "sidebar_date_badge_focused"
 SCOPE_NOTE = (
     "Issue #174 の sidebar date-badge 表示だけを検証する focused GUI evidence。"
@@ -458,14 +459,21 @@ def japanese_weekday(value: dt.date) -> str:
 
 
 def relative_label(value: dt.date, today: dt.date) -> str:
-    weekday = japanese_weekday(value)
     if value == today:
         return "本日"
+    previous_month = today.month - 1 or 12
+    previous_month_year = today.year if today.month > 1 else today.year - 1
+    boundary = dt.date(
+        previous_month_year,
+        previous_month,
+        min(today.day, calendar.monthrange(previous_month_year, previous_month)[1]),
+    )
+    weekday = f"({japanese_weekday(value)})" if boundary <= value < today else ""
     if value.year == today.year and value.month == today.month:
-        return f"{value.day}日({weekday})"
+        return f"{value.day}日{weekday}"
     if value.year == today.year:
-        return f"{value.month}/{value.day}({weekday})"
-    return f"{value.year}/{value.month}/{value.day}({weekday})"
+        return f"{value.month}/{value.day}{weekday}"
+    return f"'{value.year % 100:02d}/{value.month}/{value.day}{weekday}"
 
 
 def date_token_pattern(token: str) -> str:
