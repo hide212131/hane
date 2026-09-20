@@ -1023,6 +1023,17 @@ mod tests {
             editing_closing[2].height() > 0.0,
             "editing the closing fence restores its row height"
         );
+
+        let mut whitespace_only = Editor::new("~~~   \ncode\n~~~\n");
+        whitespace_only
+            .set_selection(Selection::caret(SourceOffset(7)))
+            .unwrap();
+        let inactive_whitespace = presented_lines(&whitespace_only);
+        assert_eq!(
+            inactive_whitespace[0].height(),
+            0.0,
+            "whitespace after an inactive opening fence is not a visible label"
+        );
     }
 
     #[test]
