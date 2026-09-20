@@ -279,6 +279,13 @@ jobs:
             exit 1
           fi
 
+          for blocked_path in .codex .mcp.json .claude .claude.json; do
+            if [[ -e "$WORKTREE/$blocked_path" || -L "$WORKTREE/$blocked_path" ]]; then
+              echo "::error::The target worktree contains an untrusted Codex or MCP configuration path: ${blocked_path}."
+              exit 1
+            fi
+          done
+
           checkpoint_patch="$HANDOFF_DIR/checkpoint.patch"
           if [[ ! -f "$checkpoint_patch" ]]; then
             echo '::error::The Claude checkpoint patch is missing.'
@@ -308,9 +315,13 @@ jobs:
 
           codex_home_path="${CODEX_HOME:-${HOME}/.codex}"
           profile_path="$codex_home_path/hane-codex-fallback.config.toml"
-          expected_profile_sha256='e6dd2b9bb9f2d975fe003e558063aebaf9b9828a5b55ed3537be6b2ce1a4ee15'
+          expected_profile_sha256='a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d'
           if [[ ! -f "$profile_path" ]]; then
             echo "::error::The trusted hane-codex-fallback Codex profile is not installed at ${profile_path}."
+            exit 1
+          fi
+          if [[ -e "$codex_home_path/config.toml" ]]; then
+            echo '::error::The dedicated Codex HOME must not contain an additional config.toml.'
             exit 1
           fi
           actual_profile_sha256="$(shasum -a 256 "$profile_path" | awk '{print $1}')"
@@ -354,7 +365,6 @@ jobs:
             --add-dir "$CONTROL_DIR" \
             --add-dir "$HANDOFF_DIR" \
             --add-dir "$CONTEXT_DIR" \
-            --ignore-user-config \
             --ask-for-approval never \
             --ignore-rules \
             --ephemeral \
@@ -382,7 +392,7 @@ jobs:
           while IFS= read -r -d '' path; do
             changed=true
             case "$path" in
-              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
+              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.codex/*|*/.codex/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Codex attempted to modify trusted authority or workflow path: $path"
                 exit 1
                 ;;
@@ -434,7 +444,7 @@ jobs:
           while IFS= read -r -d '' path; do
             clean_changed=true
             case "$path" in
-              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
+              .github/*|AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|CLAUDE.local.md|*/CLAUDE.local.md|docs/aadw-command-policy.md|.codex/*|*/.codex/*|.claude/*|*/.claude/*|.claude.json|*/.claude.json|.mcp.json|*/.mcp.json|.gitmodules|*/.gitmodules|.ripgreprc|*/.ripgreprc|.husky/*|*/.husky/*)
                 echo "::error::Transferred Codex patch contains a trusted authority or workflow path: $path"
                 exit 1
                 ;;

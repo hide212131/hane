@@ -39,7 +39,9 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "--config model_reasoning_effort=xhigh" in WORKFLOW
     assert "--profile hane-codex-fallback" in WORKFLOW
     assert "expected_profile_sha256=" in WORKFLOW
-    assert "--ignore-user-config" in WORKFLOW
+    assert "a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d" in WORKFLOW
+    assert "dedicated Codex HOME must not contain an additional config.toml" in WORKFLOW
+    assert "--ignore-user-config" not in WORKFLOW
     assert "GH_TOKEN: ''" in WORKFLOW
     assert "GITHUB_TOKEN: ''" in WORKFLOW
     assert "ACTIONS_RUNTIME_TOKEN: ''" in WORKFLOW
@@ -61,6 +63,7 @@ def test_mutation_guards_cover_start_scope_and_push():
     assert "Codex attempted to modify trusted authority or workflow path" in WORKFLOW
     assert "Codex created an untrusted commit" in WORKFLOW
     assert "Clean push checkout does not match the exact target head" in WORKFLOW
+    assert "untrusted Codex or MCP configuration path" in WORKFLOW
     assert 'git -C "$PUSH_WORKTREE" apply --index' in WORKFLOW
     assert "Transferred Codex patch contains a trusted authority or workflow path" in WORKFLOW
     assert 'git -C "$PUSH_WORKTREE" -c core.hooksPath=/dev/null push' in WORKFLOW
