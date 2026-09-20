@@ -90,6 +90,23 @@ pub fn background_executor() -> BackgroundExecutor {
     current_platform(true).background_executor()
 }
 
+/// Whether the platform's active keyboard input source currently produces
+/// text directly, as opposed to composing it through an IME (for example,
+/// macOS's Kotoeri switching from its 英数 mode into かな). Reread this after
+/// `Context::on_keyboard_layout_change` fires, since that is the same
+/// platform event that changes it.
+///
+/// Platforms without this concept always report `true`.
+#[cfg(target_os = "macos")]
+pub fn active_keyboard_input_is_ascii_capable() -> bool {
+    mac_active_input_source_is_ascii_capable()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn active_keyboard_input_is_ascii_capable() -> bool {
+    true
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     Rc::new(MacPlatform::new(headless))

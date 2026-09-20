@@ -1632,6 +1632,12 @@ unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     pub(super) fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut Object;
+    // Unlike `TISCopyCurrentKeyboardLayoutInputSource`, which reports the
+    // underlying ASCII-capable layout used for key-equivalent shortcuts, this
+    // reports the input source actually producing text right now — the one
+    // that changes when an IME like Kotoeri switches between its own modes
+    // (e.g. かな vs 英数).
+    pub(super) fn TISCopyCurrentKeyboardInputSource() -> *mut Object;
     pub(super) fn TISGetInputSourceProperty(
         inputSource: *mut Object,
         propertyKey: *const c_void,
@@ -1653,6 +1659,7 @@ unsafe extern "C" {
     pub(super) static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
     pub(super) static kTISPropertyInputSourceID: CFStringRef;
     pub(super) static kTISPropertyLocalizedName: CFStringRef;
+    pub(super) static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
 }
 
 mod security {

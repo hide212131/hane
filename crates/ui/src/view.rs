@@ -624,6 +624,15 @@ pub struct EditorView {
     /// Keeps the app-quit draft flush (see `flush_pending_drafts`) alive for
     /// the life of the view; dropping it would cancel the hook.
     _quit_subscription: Subscription,
+    /// Whether the active keyboard input source currently types alphanumeric
+    /// text directly rather than composing it through an IME (see
+    /// [`gpui::active_keyboard_input_is_ascii_capable`]). Drives the caret's
+    /// small input-mode badge; refreshed by `_input_mode_subscription` so it
+    /// updates without polling.
+    caret_input_is_ascii_capable: bool,
+    /// Keeps the input-source change hook (see `caret_input_is_ascii_capable`)
+    /// alive for the life of the view; dropping it would cancel the hook.
+    _input_mode_subscription: Subscription,
     /// A draft-recovery failure from the last work-folder scan, if any. Kept
     /// apart from `status`: opening the work folder's first note runs right
     /// after the scan and drives `status` through "Opening…" and "Opened" in
@@ -2027,6 +2036,15 @@ impl EditorView {
             view.flush_pending_drafts();
             std::future::ready(())
         });
+        // The caret's mode badge (see `caret_input_is_ascii_capable`) has to
+        // update the moment the user switches IME mode, even if nothing else
+        // about the document changes, so this reuses the same platform event
+        // GPUI already refreshes its keyboard mapper from — no separate
+        // polling.
+        let input_mode_subscription = cx.on_keyboard_layout_change(|view: &mut Self, cx| {
+            view.caret_input_is_ascii_capable = gpui::active_keyboard_input_is_ascii_capable();
+            cx.notify();
+        });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
         // untouched across local midnight; `view.update` failing (the view
@@ -2078,6 +2096,8 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
+            caret_input_is_ascii_capable: gpui::active_keyboard_input_is_ascii_capable(),
+            _input_mode_subscription: input_mode_subscription,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
             title_sync_in_flight: HashSet::new(),
@@ -5630,8 +5650,14 @@ impl Render for EditorView {
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
                                     row_element(
-                                        editor, &visual, &layout, row_index, self.theme, self.zoom,
+                                        editor,
+                                        &visual,
+                                        &layout,
+                                        row_index,
+                                        self.theme,
+                                        self.zoom,
                                         &resolver,
+                                        self.caret_input_is_ascii_capable,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`
