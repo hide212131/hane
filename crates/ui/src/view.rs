@@ -3781,6 +3781,16 @@ impl EditorView {
         self.after_input(cx);
     }
 
+    /// The content height scroll position is actually bounded to:
+    /// `self.heights.total_height()` extended by `CARET_MODE_BADGE_HEIGHT`.
+    /// Clamping to the bare content height at the document's end would put
+    /// the input-mode badge drawn under the last line's caret back under the
+    /// viewport's `overflow_hidden`, undoing the clearance
+    /// `scroll_cursor_into_view` reserved for it (issue #240).
+    fn scrollable_content_height(&self) -> f32 {
+        self.heights.total_height() + CARET_MODE_BADGE_HEIGHT
+    }
+
     /// The item (block, or physical line before a `BlockIndex` exists) and
     /// fractional position under `window_offset` (content-local window y: the
     /// mouse/gesture position's window y minus the header height), for a zoom
@@ -3857,7 +3867,7 @@ impl EditorView {
         let delta = event.delta.pixel_delta(px(self.line_height()));
         self.scroll_y = clamp_scroll_y(
             self.scroll_y - f32::from(delta.y),
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         cx.notify();
@@ -5441,7 +5451,7 @@ impl Render for EditorView {
         }
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         let visible =
@@ -5537,10 +5547,19 @@ impl Render for EditorView {
         // zoom gesture has a more specific pointer/pinch anchor.
         if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
             let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
-            let inside = self
-                .heights
-                .height(ordinal)
-                .map_or(0.0, |height| intra.clamp(0.0, height));
+            let inside = if ordinal + 1 == self.heights.len() {
+                // At the document's last item, `intra` can already be
+                // carrying the `CARET_MODE_BADGE_HEIGHT` clearance
+                // `scroll_cursor_into_view` reserved past its bottom.
+                // Clamping it to the item's own height would throw that
+                // clearance away before the badge is ever drawn (issue
+                // #240); the clamp below still bounds the result.
+                intra.max(0.0)
+            } else {
+                self.heights
+                    .height(ordinal)
+                    .map_or(0.0, |height| intra.clamp(0.0, height))
+            };
             self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
         }
         // A newly measured block can shrink at the old bottom. Anchoring
@@ -5548,7 +5567,7 @@ impl Render for EditorView {
         // new scroll limit and move all content above the viewport.
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
-            self.heights.total_height(),
+            self.scrollable_content_height(),
             self.viewport_height,
         );
         // Where the caret was drawn, for the IME candidate window. Only the
@@ -7275,6 +7294,40 @@ mod tests {
         assert!(
             row_bottom_in_viewport + CARET_MODE_BADGE_HEIGHT <= viewport_height,
             "badge would be clipped: row bottom {row_bottom_in_viewport}, viewport {viewport_height}"
+        );
+    }
+
+    // Issue #240 follow-up: the test above only exercises the pure
+    // `scroll_y_for_cursor` math. In the real render path, the height-anchor
+    // restore and the final `clamp_scroll_y` call both used to bound
+    // `scroll_y` to the bare `self.heights.total_height()`, which does not
+    // include the badge's footprint past the last line, so an actual render
+    // pass at the document's end clamped the clearance away again and
+    // clipped the badge under the viewport's `overflow_hidden`.
+    #[gpui::test]
+    fn moving_to_document_end_leaves_room_for_the_caret_mode_badge_after_render(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=200)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveToEnd { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (caret, viewport_height) = view.read_with(cx, |view, _| {
+            (view.caret_geometry(), view.viewport_height)
+        });
+        let caret = caret.expect("caret is on screen at the document end");
+
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            "badge would be clipped: caret bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
         );
     }
 
