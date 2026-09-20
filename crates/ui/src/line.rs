@@ -594,6 +594,7 @@ fn cursor_overlay(theme: Theme) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hane_editor::Selection;
     use hane_markdown::BlockIndex;
     use hane_presentation::Visibility;
 
@@ -882,7 +883,15 @@ mod tests {
 
     #[test]
     fn a_fenced_block_hides_its_delimiters_and_keeps_the_language_label() {
-        let editor = Editor::new("```rust\nlet answer = 42;\n```\n");
+        let mut editor = Editor::new("```rust\nlet answer = 42;\n```\n");
+        // `Editor::new` always places the caret at offset 0, and the disclosure
+        // policy keeps a marker visible when the caret touches it (see
+        // `cjk_emphasis_is_italic_through_the_same_render_policy_as_ascii`); the
+        // opening fence starts at offset 0 here, so the caret must move off it to
+        // exercise the construct's inactive (hidden-delimiter) presentation.
+        editor
+            .set_selection(Selection::caret(SourceOffset(12)))
+            .unwrap();
         let lines = presented_lines(&editor);
         assert_eq!(
             lines[0].visual_text, "rust",

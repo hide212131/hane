@@ -1066,10 +1066,21 @@ pub fn present_block_with_list_projection(
     // `window.render` (see `BlockWindow::lines`'s own "parsing context only"
     // contract) so a closing-fence candidate deep in a large block can be
     // validated without the caller ever materializing lines between the two.
-    // `None` for an indented code block (no fence to derive at all) or when the
-    // caller could not supply that line.
+    // The lowest-numbered line in `window.lines` is not always that line: block
+    // ordinal 0's tiled span absorbs any blank run before the document's first
+    // block (see `leading_content_line`), so a blank line can sit in `window.lines`
+    // ahead of the real opening fence. Skipping blank lines here mirrors
+    // `leading_content_line` without re-reading the document. `None` for an
+    // indented code block (no fence to derive at all) or when the caller could
+    // not supply that line.
     let fence_opening = (context == LineContext::FencedCode)
-        .then(|| window.lines.iter().min_by_key(|line| line.line))
+        .then(|| {
+            window
+                .lines
+                .iter()
+                .filter(|line| !line.text.trim().is_empty())
+                .min_by_key(|line| line.line)
+        })
         .flatten()
         .and_then(|line| fence_delimiter(line.text).map(|delimiter| (line.line, delimiter)));
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
