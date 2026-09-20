@@ -527,6 +527,7 @@ impl LocalBlockIndex {
             revision: self.revision,
             confidence: Confidence::Provisional,
             line_count,
+            leading_content_lines: 0,
         }
     }
 
@@ -587,7 +588,7 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()
-        .map(|(kind, length, lines)| {
+        .map(|(kind, length, lines, _)| {
             let range = SourceRange::new(offset, offset + length);
             offset += length;
             (kind, range, lines)
@@ -763,7 +764,7 @@ fn markdown_line_start(source: &str, mut at: usize) -> usize {
     source[..at].rfind(['\r', '\n']).map_or(0, |at| at + 1)
 }
 
-fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         if source.is_empty() {
             return None;

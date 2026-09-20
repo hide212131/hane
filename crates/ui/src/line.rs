@@ -20,7 +20,7 @@ use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
     InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock, VisualLine,
     VisualOffset, block_is_joinable, block_line_context, block_line_span, expected_disclosures,
-    leading_content_line, present_block_with_list_projection, trailing_blank_lines,
+    present_block_with_list_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -243,8 +243,8 @@ fn block_context(
         span.end == document.line_count(),
     );
     let opening_fence_line = (block_line_context(block.kind) == LineContext::FencedCode)
-        .then(|| leading_content_line(document, span))
-        .flatten()
+        .then(|| span.start.saturating_add(block.leading_content_lines))
+        .filter(|opening| *opening < span.end)
         .filter(|opening| !context.contains(opening))
         .and_then(|opening| {
             let range = clip_to_block(document.line_range(LineId(opening)).ok()?);

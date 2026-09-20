@@ -925,26 +925,6 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
         .count()
 }
 
-/// The first physical line in `span` whose text is not blank.
-///
-/// Mirrors [`trailing_blank_lines`] for the opposite end of a block: block
-/// ordinal 0's own tiled span absorbs any blank lines that precede the
-/// document's very first block (see `hane_markdown`'s block tiling), so
-/// `span.start` alone is not always where that block's construct actually
-/// begins. A caller that needs a block's true first content line — a fenced
-/// code block's own opening fence, in particular — reads this instead of
-/// assuming `span.start`. Returns `None` only when every line in `span` is
-/// blank, which does not happen for a real block.
-pub fn leading_content_line(document: &RopeBuffer, span: &Range<usize>) -> Option<usize> {
-    span.clone().find(|line| {
-        document
-            .line_range(hane_document::LineId(*line))
-            .ok()
-            .and_then(|range| document.text(range).ok())
-            .is_some_and(|text| !text.trim().is_empty())
-    })
-}
-
 /// Initial height of every block in the index, from the line height alone.
 ///
 /// Seeds the [`HeightIndex`] at block granularity, and is re-run whenever the
@@ -1069,9 +1049,9 @@ pub fn present_block_with_list_projection(
     // validated without the caller ever materializing lines between the two.
     // The lowest-numbered line in `window.lines` is not always that line: block
     // ordinal 0's tiled span absorbs any blank run before the document's first
-    // block (see `leading_content_line`), so a blank line can sit in `window.lines`
-    // ahead of the real opening fence. Skipping blank lines here mirrors
-    // `leading_content_line` without re-reading the document. `None` for an
+    // block, so a blank line can sit in `window.lines` ahead of the real
+    // opening fence. Skipping blank lines here protects the opening metadata
+    // from that prefix without re-reading the document. `None` for an
     // indented code block (no fence to derive at all) or when the caller could
     // not supply that line.
     let fence_opening = (context == LineContext::FencedCode)
@@ -4309,6 +4289,7 @@ mod tests {
                 revision: Revision(1),
                 confidence: Confidence::Formal,
                 line_count: lines.len(),
+                leading_content_lines: 0,
             };
             let joined = parse_joined_block(&lines, Revision(1));
             let window = BlockWindow {
@@ -5146,6 +5127,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            leading_content_lines: 0,
         };
         let joined = parse_joined_block(&lines, Revision(1));
         // Empty ranges represent carets; non-empty ranges also cover selection
@@ -5215,6 +5197,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            leading_content_lines: 0,
         };
         let window = BlockWindow {
             span: 0..2,
@@ -5296,6 +5279,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 3,
+            leading_content_lines: 0,
         };
         let window = BlockWindow {
             span: 0..3,
@@ -5386,6 +5370,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: 2,
+            leading_content_lines: 0,
         };
         let joined = parse_joined_block(&lines, Revision(1));
 
@@ -5482,6 +5467,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: lines.len(),
+            leading_content_lines: 0,
         };
         let window = BlockWindow {
             span: 0..lines.len(),
@@ -5748,6 +5734,7 @@ mod tests {
             revision: Revision(1),
             confidence: Confidence::Formal,
             line_count: lines.len(),
+            leading_content_lines: 0,
         };
         (block, lines)
     }
