@@ -972,12 +972,56 @@ mod tests {
         );
         assert_eq!(lines[1].visual_text, "let answer = 42;");
         assert_eq!(lines[2].visual_text, "", "the closing fence collapses");
+        assert_eq!(
+            lines[2].height(),
+            0.0,
+            "a fully hidden closing fence must not reserve an empty row"
+        );
         assert!(
             lines[0]
                 .source_map
                 .segments
                 .iter()
                 .any(|segment| segment.visibility == Visibility::HiddenMarkup)
+        );
+    }
+
+    #[test]
+    fn inactive_bare_fence_rows_have_zero_height_and_editing_restores_it() {
+        let source = "```\\ncode\\n```\\n";
+        let code_offset = source.find("code").unwrap() + 1;
+        let closing_offset = source.rfind("```").unwrap() + 1;
+        let mut editor = Editor::new(source);
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(code_offset)))
+            .unwrap();
+        let inactive = presented_lines(&editor);
+        assert_eq!(inactive[0].visual_text, "\\n");
+        assert_eq!(inactive[0].height(), 0.0);
+        assert_eq!(inactive[2].visual_text, "");
+        assert_eq!(inactive[2].height(), 0.0);
+        assert!(
+            inactive[1].height() > 0.0,
+            "an empty structural fence row must not collapse code content"
+        );
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(1)))
+            .unwrap();
+        let editing_opening = presented_lines(&editor);
+        assert!(
+            editing_opening[0].height() > 0.0,
+            "editing the opening fence restores its row height"
+        );
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(closing_offset)))
+            .unwrap();
+        let editing_closing = presented_lines(&editor);
+        assert!(
+            editing_closing[2].height() > 0.0,
+            "editing the closing fence restores its row height"
         );
     }
 
