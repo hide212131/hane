@@ -48,7 +48,7 @@ Codex は commit / push / 次工程の判断を行わず、trusted finalizer が
 
 ### self-hosted runner の事前設定
 
-専用 OS ユーザーの `$CODEX_HOME`（未設定なら `~/.codex`）に、次の内容を `hane-codex-fallback.config.toml` として配置する。workflow は SHA-256 `a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d` と一致しない profile を fail closed で拒否する。
+専用 OS ユーザーの `$CODEX_HOME`（未設定なら `~/.codex`）に、次の内容を `hane-codex-fallback.config.toml` として配置する。workflow は SHA-256 `2919edc01f1020390bc39c280623b5cc594aa590ba6432f7a61a867aa187c909` と一致しない profile を fail closed で拒否する。
 
 ```toml
 approval_policy = "never"
@@ -60,6 +60,11 @@ extends = ":workspace"
 [permissions.hane-codex-fallback.filesystem]
 ":root" = "deny"
 ":minimal" = "read"
+# The local runner installs Codex under ~/.local/bin and keeps the binary
+# payload under ~/.codex/packages. These paths contain the executable only;
+# ~/.codex/auth.json remains denied by the :root rule.
+"~/.local/bin" = "read"
+"~/.codex/packages" = "read"
 ":tmpdir" = "deny"
 ":slash_tmp" = "deny"
 
@@ -67,7 +72,7 @@ extends = ":workspace"
 enabled = false
 ```
 
-この profile は Codex 本体がローカルの ChatGPT login を使うことを妨げず、Codex が起動する worker command からは認証ファイルを見えなくする。permission profile と旧 `sandbox_mode` は併用しない。専用 `CODEX_HOME` にはこの profile とローカル login の `auth.json` だけを置き、追加の `config.toml` は置かない。runner は専用 OS ユーザーで運用し、profile と auth の所有者・権限を runner 管理者だけに限定する。
+この profile は Codex 本体がローカルの ChatGPT login を使うことを妨げず、Codex が起動する worker command からは認証ファイルを見えなくする。permission profile と旧 `sandbox_mode` は併用しない。runner の永続的な source `CODEX_HOME` にはこの profile とローカル login の `auth.json` だけを置き、追加の `config.toml` は置かない。workflow は実行ごとに一時 `CODEX_HOME` を作り、auth/profile をコピーして Codex を起動する。Codex が生成する runtime state や `config.toml` はその一時 home とともに終了時に削除する。runner は専用 OS ユーザーで運用し、profile と auth の所有者・権限を runner 管理者だけに限定する。
 
 ## 正本
 

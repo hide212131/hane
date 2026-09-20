@@ -1,9 +1,12 @@
+import hashlib
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / "workflows/codex-usage-limit-fallback.yml").read_text()
 CLAUDE_WORKFLOW = (ROOT / "workflows/claude-fix.yml").read_text()
+ADR = (ROOT.parent / "docs/adr/0028-claude-usage-limit-codex-fallback.md").read_text()
 
 
 def test_fallback_is_completed_claude_run_only_and_uses_exact_checkpoint():
@@ -40,8 +43,16 @@ def test_self_hosted_codex_execution_is_pinned_and_uncredentialed():
     assert "--profile hane-codex-fallback" in WORKFLOW
     assert "codex --ask-for-approval never exec" in WORKFLOW
     assert "expected_profile_sha256=" in WORKFLOW
-    assert "a89a2e5abacc2e13c653d8174d030d5e77fad2062c2e23ad78106dbfe893796d" in WORKFLOW
-    assert "dedicated Codex HOME must not contain an additional config.toml" in WORKFLOW
+    assert "2919edc01f1020390bc39c280623b5cc594aa590ba6432f7a61a867aa187c909" in WORKFLOW
+    assert "persistent Codex source HOME must not contain an additional config.toml" in WORKFLOW
+    assert 'codex_source_home="${CODEX_HOME:-${HOME}/.codex}"' in WORKFLOW
+    assert 'The dedicated Codex HOME is missing auth.json' in WORKFLOW
+    assert 'codex_runtime_home="$RUNNER_TEMP/hane-codex-home-' in WORKFLOW
+    assert 'cp "$codex_source_home/auth.json" "$codex_runtime_home/auth.json"' in WORKFLOW
+    assert 'chmod 600 "$codex_runtime_home/auth.json" "$codex_runtime_home/hane-codex-fallback.config.toml"' in WORKFLOW
+    assert 'export CODEX_HOME="$codex_runtime_home"' in WORKFLOW
+    assert 'trap cleanup_codex_home EXIT' in WORKFLOW
+    assert 'Refusing to clean an unexpected Codex HOME path.' in WORKFLOW
     assert "--ignore-user-config" not in WORKFLOW
     assert "GH_TOKEN: ''" in WORKFLOW
     assert "GITHUB_TOKEN: ''" in WORKFLOW
@@ -71,8 +82,18 @@ def test_mutation_guards_cover_start_scope_and_push():
     assert "Target Pull Request moved before Codex push" in WORKFLOW
 
 
+def test_workflow_hash_matches_documented_profile():
+    expected = re.search(r"expected_profile_sha256='([0-9a-f]{64})'", WORKFLOW)
+    assert expected
+    profile = ADR.split("```toml\n", 1)[1].split("\n```", 1)[0] + "\n"
+    assert "~/.local/bin" in profile
+    assert "~/.codex/packages" in profile
+    assert hashlib.sha256(profile.encode()).hexdigest() == expected.group(1)
+
+
 if __name__ == "__main__":
     test_fallback_is_completed_claude_run_only_and_uses_exact_checkpoint()
     test_non_usage_categories_do_not_start_the_codex_job()
     test_self_hosted_codex_execution_is_pinned_and_uncredentialed()
     test_mutation_guards_cover_start_scope_and_push()
+    test_workflow_hash_matches_documented_profile()
