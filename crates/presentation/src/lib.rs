@@ -1259,13 +1259,16 @@ const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
 }
 
 fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
+    const BASE_LINE_HEIGHT: f32 = 26.0;
+    const IMAGE_ROW_HEIGHT_AT_BASE_ZOOM: f32 = 190.0;
+
     match kind {
         BlockKind::Heading(1) => line_height * 1.65,
         BlockKind::Heading(2) => line_height * 1.45,
         BlockKind::Heading(3) => line_height * 1.25,
         BlockKind::Heading(_) => line_height * 1.1,
         BlockKind::CodeBlock => line_height * 1.15,
-        BlockKind::Image => 190.0,
+        BlockKind::Image => IMAGE_ROW_HEIGHT_AT_BASE_ZOOM * line_height / BASE_LINE_HEIGHT,
         BlockKind::TableDelimiter => 8.0,
         _ => line_height,
     }
@@ -5644,6 +5647,33 @@ mod tests {
         assert_eq!(active.kind, BlockKind::Paragraph);
         assert!(active.image.is_none());
         assert!(active.visual_text.contains("assets/phase4-feather.svg"));
+    }
+
+    #[test]
+    fn image_estimated_height_scales_with_the_zoomed_line_height() {
+        let source = "![alt](dest)";
+        let range = SourceRange::new(0, source.len());
+        let normal = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::Normal,
+        );
+        let zoomed = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            52.0,
+            None,
+            LineContext::Normal,
+        );
+
+        assert_eq!(normal.estimated_height, 190.0);
+        assert_eq!(zoomed.estimated_height, 380.0);
     }
 
     #[test]

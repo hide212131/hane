@@ -80,6 +80,7 @@ command_actions! {
         if !view.inline_rename_active() { view.prompt_save_as(cx); }
     },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
+    ResetZoom ("secondary-0") => reset_zoom_action |view, _window, cx| { view.reset_zoom(cx); },
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, _window, cx| {
         if view.inline_rename_active() {
