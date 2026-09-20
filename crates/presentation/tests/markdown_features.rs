@@ -164,18 +164,20 @@ const FIXTURES: &[MarkdownFixture] = &[
         name: "multi-line fenced code",
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
-        markers: &["```rust", "```"],
-        // Inside a fence every line is literal, including the delimiters.
+        markers: &["```", "```"],
+        // The fence delimiters hide; the opening line's info string stays as
+        // a visible language label and the closing line collapses to empty.
+        // Code content in between stays fully literal.
         block_kinds: &[
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
         ],
-        visual_lines: &["```rust", "let answer = 42;", "```"],
+        visual_lines: &["rust", "let answer = 42;", ""],
         style_runs: &[
-            &[style(CodeBlock, 0, 7)],
+            &[style(CodeBlock, 0, 4)],
             &[style(CodeBlock, 0, 16)],
-            &[style(CodeBlock, 0, 3)],
+            &[],
         ],
     },
     MarkdownFixture {

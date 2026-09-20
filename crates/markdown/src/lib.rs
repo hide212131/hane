@@ -421,15 +421,23 @@ impl ListProjection {
     }
 }
 
+/// A single physical line's fence delimiter shape: which byte repeats
+/// (`` ` `` or `~`) and how many times. Exposed so a caller presenting one
+/// physical line at a time (`hane_presentation`) can classify a candidate
+/// fence line without re-parsing the block it belongs to; only whether *this*
+/// line closes a *specific* opening (same [`Self::marker`], [`Self::len`] at
+/// least as long, per [`fence_closes`]) is Markdown-semantic, and that stays
+/// the caller's own decision since only the caller knows which line is the
+/// block's actual opening.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FenceDelimiter {
-    marker: u8,
-    len: usize,
+pub struct FenceDelimiter {
+    pub marker: u8,
+    pub len: usize,
 }
 
 /// Opening or closing fence of a fenced code block, if this line is one. Used by
 /// marker derivation to bound the fence delimiters it hides.
-fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
+pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
     let trimmed = source.trim_start_matches(' ');
     if source.len() - trimmed.len() > 3 {
         return None;
@@ -444,6 +452,15 @@ fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
         .take_while(|byte| **byte == marker)
         .count();
     (len >= 3).then_some(FenceDelimiter { marker, len })
+}
+
+/// Whether a line shaped like `candidate` legally closes a fence that opened
+/// with `opening`: CommonMark requires the same marker character and a run at
+/// least as long as the opening's. A closing-shaped line with the wrong
+/// character or a shorter run is not a fence at all — it is literal code
+/// content, and must stay visible rather than being hidden as markup.
+pub const fn fence_closes(opening: FenceDelimiter, candidate: FenceDelimiter) -> bool {
+    opening.marker == candidate.marker && candidate.len >= opening.len
 }
 
 pub fn is_table_delimiter(source: &str) -> bool {
@@ -1052,28 +1069,66 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             }
             NodeKind::CodeBlock => {
                 // Only the fence delimiter lines are markup; the code between
-                // them is literal content and must stay visible. `tail` runs to
-                // the end of the parsed slice, so clip it to the block first.
-                let body = tail
-                    .get(..block.source_range.end.0 - block.source_range.start.0)
-                    .unwrap_or(tail);
-                if fence_delimiter(body).is_some() {
-                    let opening_end = body.find('\n').unwrap_or(body.len());
-                    let opening = body[..opening_end].trim_end_matches(['\r', '\n']).len();
+                // them is literal content and must stay visible.
+                let node_start = block.source_range.start.0 - range.start.0;
+                let node_end = block.source_range.end.0 - range.start.0;
+                let opening_line = markdown_lines(&source[node_start..node_end])
+                    .next()
+                    .unwrap_or("");
+                if let Some(opening_fence) = fence_delimiter(opening_line) {
+                    let opening_content_len = opening_line.trim_end_matches(['\r', '\n']).len();
+                    // Only the delimiter run itself (leading indentation plus
+                    // the repeated `` ` `` or `~` bytes) is markup. An info
+                    // string after it — a language identifier such as `rust`
+                    // — is not fence syntax and must stay a visible, editable
+                    // part of the line rather than disappearing into the same
+                    // hidden marker.
+                    let indent = opening_content_len
+                        - opening_line[..opening_content_len]
+                            .trim_start_matches(' ')
+                            .len();
+                    let opening = indent + opening_fence.len;
                     if opening > 0 {
                         markers.push(SourceRange::new(
                             block.source_range.start.0,
                             block.source_range.start.0 + opening,
                         ));
                     }
-                    let closed = body.trim_end_matches(['\r', '\n']);
-                    if let Some(closing_start) = closed.rfind('\n').map(|line_end| line_end + 1)
-                        && closing_start > opening_end
-                        && fence_delimiter(&closed[closing_start..]).is_some()
+                    // A quote or list item nested fence still carries its
+                    // container's own prefix on every continuation line,
+                    // inside this block's own raw source range (the parser
+                    // reports the node's range in the original, un-stripped
+                    // source, the same reason `quote_markers`/`code_padding`
+                    // exist). Skip exactly that prefix on each physical line
+                    // so the block's real last logical line — not a
+                    // prefix-contaminated lookalike such as `"> ```"` — is
+                    // what gets checked against the opening fence.
+                    let containers = ancestor_containers(tree, id, range, source).unwrap_or_default();
+                    let mut line_start = node_start + opening_line.len();
+                    let mut last_logical: Option<(usize, &str)> = None;
+                    for line in markdown_lines(&source[line_start..node_end]) {
+                        let this_line_start = line_start;
+                        line_start += line.len();
+                        let logical_start =
+                            consume_containers(&containers, this_line_start, line.as_bytes())
+                                .map_or(this_line_start, |cursor| this_line_start + cursor.byte);
+                        last_logical =
+                            Some((logical_start, &source[logical_start..this_line_start + line.len()]));
+                    }
+                    // A closing-shaped last line only really closes the fence
+                    // when it repeats the opening's own marker character at
+                    // least as many times (CommonMark's closing-fence rule);
+                    // otherwise it is an unterminated fence and this line is
+                    // literal code content, not markup, however much it may
+                    // look like a shorter or differently-charactered fence.
+                    if let Some((closing_start, closing_line)) = last_logical
+                        && let Some(closing_fence) = fence_delimiter(closing_line)
+                        && fence_closes(opening_fence, closing_fence)
                     {
+                        let closing_len = closing_line.trim_end_matches(['\r', '\n']).len();
                         markers.push(SourceRange::new(
-                            block.source_range.start.0 + closing_start,
-                            block.source_range.start.0 + closed.len(),
+                            range.start.0 + closing_start,
+                            range.start.0 + closing_start + closing_len,
                         ));
                     }
                 }
@@ -1464,6 +1519,64 @@ mod tests {
                         .all(|marker| !padding.intersects(*marker))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nested_fence_markers_skip_the_quotes_own_prefix_on_every_line() {
+        // The parser reports a nested block's own range in the original,
+        // un-stripped source, so the raw bytes between a nested fence's
+        // opening and closing line still contain the quote's "> " prefix.
+        // Marker derivation must skip exactly that prefix per line to find
+        // the fence's real closing line, not a prefix-contaminated
+        // lookalike such as "> ```".
+        let source = "> ```rust\n> code\n> ```\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let covered = parsed
+            .markers
+            .iter()
+            .map(|marker| &source[marker.start.0..marker.end.0])
+            .collect::<Vec<_>>();
+        assert_eq!(covered, vec!["> ", "```", "> ", "> ", "```"]);
+    }
+
+    #[test]
+    fn an_unterminated_fences_closing_lookalike_last_line_stays_unhidden() {
+        for source in [
+            // The closing run is shorter than the opening's: CommonMark
+            // leaves the fence open, so the whole document is one code
+            // block and its last physical line — even though it is shaped
+            // like a fence — is literal content, not markup.
+            "````rust\ncode\n```\n",
+            // The closing line's marker character differs from the
+            // opening's: same rule, different reason.
+            "```rust\ncode\n~~~\n",
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let code_block = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| node.kind == NodeKind::CodeBlock)
+                .unwrap_or_else(|| panic!("expected a code block in {source:?}"));
+            assert_eq!(
+                code_block.1.source_range,
+                SourceRange::new(0, source.len()),
+                "the unterminated fence should swallow the rest of the document: {source:?}"
+            );
+            let trimmed = source.trim_end_matches('\n');
+            let last_line_start = trimmed.rfind('\n').map_or(0, |at| at + 1);
+            assert!(
+                parsed
+                    .markers
+                    .iter()
+                    .all(|marker| marker.start.0 < last_line_start),
+                "the closing-lookalike last line must not be derived as markup for {source:?}: {:?}",
+                parsed.markers
+            );
+            assert!(
+                parsed.markers.iter().any(|marker| marker.start.0 == 0),
+                "the real opening fence should still be derived as markup for {source:?}"
+            );
         }
     }
 

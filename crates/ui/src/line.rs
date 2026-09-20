@@ -18,9 +18,9 @@ use hane_editor::Editor;
 use hane_markdown::{IndexedBlock, ListProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, JoinedParse, LayoutLine, LineWrap, VisualBlock, VisualLine, VisualOffset,
-    block_is_joinable, block_line_span, expected_disclosures, present_block_with_list_projection,
-    trailing_blank_lines,
+    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock, VisualLine,
+    VisualOffset, block_is_joinable, block_line_context, block_line_span, expected_disclosures,
+    leading_content_line, present_block_with_list_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -188,6 +188,14 @@ struct BlockContext {
     ranges: Vec<SourceRange>,
     texts: Vec<String>,
     block_disclosure: Option<SourceRange>,
+    /// A fenced code block's own true opening physical line, its range and
+    /// text — read even when `context`/`render` do not reach it — so a
+    /// closing-fence candidate anywhere in a large block can be validated
+    /// against the real opening delimiter without ever reading the lines
+    /// between the two (see `hane_presentation::present_block_with_list_projection`).
+    /// `None` for any other block kind, or once this line is already covered
+    /// by `context` and would otherwise be read twice.
+    opening_fence_line: Option<(usize, SourceRange, String)>,
 }
 
 fn block_context(
@@ -209,15 +217,15 @@ fn block_context(
     // canonical line endings, so in the ordinary case a line's range already
     // sits inside its owning block's range and this clip changes nothing.
     let block_range = block.source_range;
+    let clip_to_block = |line_range: SourceRange| {
+        SourceRange::new(
+            line_range.start.0.max(block_range.start.0),
+            line_range.end.0.min(block_range.end.0),
+        )
+    };
     let ranges = context
         .clone()
-        .map(|line| {
-            let line_range = document.line_range(LineId(line)).ok()?;
-            Some(SourceRange::new(
-                line_range.start.0.max(block_range.start.0),
-                line_range.end.0.min(block_range.end.0),
-            ))
-        })
+        .map(|line| Some(clip_to_block(document.line_range(LineId(line)).ok()?)))
         .collect::<Option<Vec<_>>>()?;
     let texts = ranges
         .iter()
@@ -234,27 +242,44 @@ fn block_context(
         block.source_range,
         span.end == document.line_count(),
     );
+    let opening_fence_line = (block_line_context(block.kind) == LineContext::FencedCode)
+        .then(|| leading_content_line(document, span))
+        .flatten()
+        .filter(|opening| !context.contains(opening))
+        .and_then(|opening| {
+            let range = clip_to_block(document.line_range(LineId(opening)).ok()?);
+            let text = document.text(range).unwrap_or_default();
+            Some((opening, range, text))
+        });
     Some(BlockContext {
         trailing_blank_lines: trailing_blank_lines(document, span),
         context,
         ranges,
         texts,
         block_disclosure,
+        opening_fence_line,
     })
 }
 
 fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
-    ctx.context
-        .clone()
-        .zip(&ctx.ranges)
-        .zip(&ctx.texts)
-        .map(|((line, range), text)| BlockLine {
+    let mut lines = Vec::with_capacity(ctx.context.len() + usize::from(ctx.opening_fence_line.is_some()));
+    if let Some((line, range, text)) = &ctx.opening_fence_line {
+        lines.push(BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: disclosure_for_line(editor, *line, *range),
+        });
+    }
+    lines.extend(ctx.context.clone().zip(&ctx.ranges).zip(&ctx.texts).map(
+        |((line, range), text)| BlockLine {
             line,
             range: *range,
             text,
             disclosure: disclosure_for_line(editor, line, *range),
-        })
-        .collect()
+        },
+    ));
+    lines
 }
 
 /// Source range whose Markdown markers this line discloses: the caret's own
@@ -570,6 +595,7 @@ fn cursor_overlay(theme: Theme) -> Div {
 mod tests {
     use super::*;
     use hane_markdown::BlockIndex;
+    use hane_presentation::Visibility;
 
     fn code_segment(selected: bool) -> LineSegment {
         LineSegment {
@@ -852,6 +878,70 @@ mod tests {
         // The blank line tiling folded into the code block is not code.
         assert_eq!(lines[3].display().surface, BlockSurface::Default);
         assert_eq!(lines[4].visual_text, "after");
+    }
+
+    #[test]
+    fn a_fenced_block_hides_its_delimiters_and_keeps_the_language_label() {
+        let editor = Editor::new("```rust\nlet answer = 42;\n```\n");
+        let lines = presented_lines(&editor);
+        assert_eq!(
+            lines[0].visual_text, "rust",
+            "the opening delimiter hides; the info string reads as a label"
+        );
+        assert_eq!(lines[1].visual_text, "let answer = 42;");
+        assert_eq!(lines[2].visual_text, "", "the closing fence collapses");
+        assert!(
+            lines[0]
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::HiddenMarkup)
+        );
+    }
+
+    #[test]
+    fn a_leading_blank_line_before_the_first_block_does_not_misidentify_the_opening_fence() {
+        // Block ordinal 0's tiled span absorbs a leading blank line (tiling
+        // rule: leading bytes before the first block belong to block 0), so
+        // its own `span.start` is the blank line, not the fence. Fence
+        // detection must still find the block's real first content line.
+        let editor = Editor::new("\n```rust\nlet answer = 42;\n```");
+        let lines = presented_lines(&editor);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].visual_text, "");
+        assert_eq!(
+            lines[1].visual_text, "rust",
+            "the real opening fence hides, not the leading blank line"
+        );
+        assert_eq!(lines[2].visual_text, "let answer = 42;");
+        assert_eq!(lines[3].visual_text, "", "the closing fence collapses");
+    }
+
+    #[test]
+    fn a_deeply_scrolled_huge_fenced_block_still_validates_its_closing_fence() {
+        // The opening fence sits thousands of lines above the render window.
+        // Presenting only a window near the end must still resolve the
+        // closing fence correctly without reading the lines in between.
+        let mut source = String::from("```rust\n");
+        for i in 0..5_000 {
+            source.push_str(&format!("let x{i} = {i};\n"));
+        }
+        source.push_str("```\n");
+        let closing_line = source[..source.rfind("```\n").unwrap()]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        assert_eq!(index.len(), 1, "one fenced code block");
+        let block = index.block(0).unwrap();
+        let visual = presented_block(&editor, &block, &(closing_line..closing_line + 1), None)
+            .expect("closing fence line presents");
+        assert_eq!(visual.lines.len(), 1);
+        assert_eq!(
+            visual.lines[0].visual_text, "",
+            "the closing fence still collapses without reading the opening"
+        );
     }
 
     #[test]
