@@ -117,13 +117,16 @@ fn atx_headings_preserve_display_disclosure_positions_and_source() {
                 BlockKind::CodeBlock,
                 BlockKind::CodeBlock,
             ],
-            visual_lines: &["    # indented", "", "```", "## fenced ###", "```"],
+            // The indented block has no fence to hide, so it stays literal.
+            // The fenced block's own delimiters (no info string on either
+            // one) collapse to empty lines; its content stays literal.
+            visual_lines: &["    # indented", "", "", "## fenced ###", ""],
             style_runs: &[
                 &[style(CodeBlock, 0, 14)],
                 &[],
-                &[style(CodeBlock, 0, 3)],
+                &[],
                 &[style(CodeBlock, 0, 13)],
-                &[style(CodeBlock, 0, 3)],
+                &[],
             ],
         },
     ];

@@ -49,7 +49,7 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
-use hane_presentation::{BlockKind, StyleKind, VisualOffset};
+use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
     MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
@@ -6915,7 +6915,7 @@ mod tests {
         for _ in 0..5_000 {
             source.push_str("  continued\n");
         }
-        source.push_str("\n  ```\n  **literal**\n  ```\n");
+        source.push_str("\n  ```rust\n  **literal**\n  ```\n");
         let editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one list block");
@@ -6944,6 +6944,327 @@ mod tests {
         );
         assert_eq!(line.style_runs.len(), 1);
         assert_eq!(line.style_runs[0].kind, StyleKind::CodeBlock);
+
+        let opening_line = code_line - 1;
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late code opening presents");
+        assert_eq!(opening.lines[0].visual_text, "rust");
+        assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.source_range.end.0 > segment.source_range.start.0
+        }));
+    }
+
+    #[test]
+    fn a_late_list_code_row_keeps_literal_shorter_fence_visible() {
+        let mut source = String::from("- opening\n  ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("  literal\n");
+        }
+        source.push_str("  ```oops\n  ````\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let lookalike_line = source[..source.find("  ```oops").expect("lookalike row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let presented = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(lookalike_line..lookalike_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late code row presents");
+        let line = &presented.lines[0];
+        assert_eq!(line.visual_text, "```oops");
+        assert!(line.style_runs.iter().any(|run| run.kind == StyleKind::CodeBlock));
+    }
+
+    #[test]
+    fn a_late_nested_list_fence_uses_formal_markers_when_viewport_parse_misses_it() {
+        let mut source = String::from("- outer\n  - nested\n    ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("    literal\n");
+        }
+        source.push_str("    ```oops\n    ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one nested list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let lookalike_line = source[..source.find("    ```oops").expect("lookalike row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let presented = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(lookalike_line..lookalike_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late nested code row presents");
+        assert_eq!(presented.lines[0].visual_text, "```oops");
+        assert!(presented.lines[0]
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock));
+
+        let closing_line = source[..source.rfind("    ````").expect("closing fence")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let closing = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(closing_line..closing_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late nested closing fence presents");
+        assert_eq!(closing.lines[0].visual_text, "");
+        assert_eq!(
+            closing.lines[0].source_map.segments.last().unwrap().marker_edge,
+            Some(MarkerEdge::Closing)
+        );
+    }
+
+    #[test]
+    fn a_late_quote_code_row_uses_formal_code_projection() {
+        let mut source = String::from("> ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("> > **literal**\n");
+        }
+        source.push_str("> ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one quote block");
+        let projection = index
+            .list_projection(&block)
+            .expect("formal quote code projection");
+        let code_line = source[..source.find("> > **literal**").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late quote code row presents");
+        let line = &code.lines[0];
+        assert_eq!(line.visual_text, "> **literal**");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        assert!(line
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock));
+
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line - 1..code_line),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late quote code opening presents");
+        assert_eq!(opening.lines[0].visual_text, "> rust");
+        assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.marker_edge == Some(MarkerEdge::Opening)
+        }));
+    }
+
+    #[test]
+    fn a_late_list_quote_code_row_keeps_the_formal_quote_owner() {
+        let mut source = String::from("- outer\n    > ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("    > > literal\n");
+        }
+        source.push_str("    > ````");
+        let mut editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index
+            .list_projection(&block)
+            .expect("formal list quote code projection");
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("literal").expect("code content"),
+            )))
+            .unwrap();
+        let code_line = source[..source.find("    > > literal").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late list quote code row presents");
+        assert_eq!(code.lines[0].visual_text, "    > > literal");
+        assert_eq!(code.lines[0].kind, BlockKind::CodeBlock);
+        let line_start = source.find("    > > literal").expect("code row source");
+        let quote_marker = SourceRange::new(line_start + 4, line_start + 6);
+        assert!(code.lines[0].source_map.segments.iter().any(|segment| {
+            segment.source_range == quote_marker
+                && segment.marker_edge == Some(MarkerEdge::Opening)
+        }));
+        assert!(code.lines[0].source_map.segments.iter().any(|segment| {
+            segment.source_range == quote_marker
+                && segment.visibility == Visibility::ExpandedMarkup
+        }));
+    }
+
+    #[test]
+    fn a_late_list_code_row_keeps_literal_list_marker_visible() {
+        let mut source = String::from("- opening\n  ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("  - literal\n");
+        }
+        source.push_str("  ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let code_line = source[..source.find("  - literal").expect("code row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let code = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(code_line..code_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("late list code row presents");
+        let line = &code.lines[0];
+        assert_eq!(line.visual_text, "- literal");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        assert!(line
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::CodeBlock));
+    }
+
+    #[test]
+    fn a_same_line_nested_list_fence_keeps_the_formal_child_marker() {
+        let mut source = String::from("- outer\n  - nested\n    - ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("      literal\n");
+        }
+        source.push_str("      ````");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one nested list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let opening_line = source[..source.find("    - ````rust").expect("opening row")]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("same-line nested fence presents");
+        let line = &opening.lines[0];
+        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        let list = line.list.as_ref().expect("formal child list metadata");
+        assert_eq!(list.role, ListRowRole::Opening);
+        assert!(list.marker.as_ref().is_some_and(|marker| marker.synthesized));
+    }
+
+    #[test]
+    fn a_same_line_multi_level_list_fence_uses_the_deepest_formal_marker() {
+        let mut source = String::from("- outer\n    - - ````rust\n");
+        for _ in 0..5_000 {
+            source.push_str("          literal\n");
+        }
+        source.push_str("          ````");
+        let mut editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one nested list block");
+        let projection = index.list_projection(&block).expect("list projection");
+        let opening_start = source.find("    - - ````rust").expect("opening row");
+        let opening_line = source[..opening_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("same-line multi-level fence presents");
+        let line = &opening.lines[0];
+        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.kind, BlockKind::CodeBlock);
+        let list = line.list.as_ref().expect("formal child list metadata");
+        assert_eq!(list.owner.depth, 3);
+        assert_eq!(list.role, ListRowRole::Opening);
+        let marker = list.marker.as_ref().expect("deepest marker metadata");
+        assert!(marker.synthesized);
+        assert_eq!(marker.source_range.start.0, opening_start + 6);
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                opening_start + "    - - ````rust".find("rust").unwrap(),
+            )))
+            .unwrap();
+        let disclosed = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("disclosed same-line multi-level fence presents");
+        let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
+        let inner_marker = SourceRange::new(opening_start + 6, opening_start + 8);
+        for marker_range in [outer_marker, inner_marker] {
+            assert!(disclosed.lines[0].source_map.segments.iter().any(|segment| {
+                segment.source_range == marker_range
+                    && segment.visibility == Visibility::ExpandedMarkup
+            }));
+        }
     }
 
     #[test]

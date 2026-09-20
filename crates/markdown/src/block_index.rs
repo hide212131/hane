@@ -25,7 +25,7 @@
 use crate::block_store::BlockStore;
 use crate::{
     ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, parse_document,
+    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
@@ -81,6 +81,11 @@ pub struct IndexedBlock {
     /// that ends in a line ending belongs to no block, which is what
     /// `hane_presentation::block_heights` accounts for.
     pub line_count: usize,
+    /// Number of leading blank source lines included in the tiled span before
+    /// the block's first content line. Block zero may own this prefix because
+    /// tiling starts at byte zero; keeping the offset in the index lets the UI
+    /// locate a fenced block's opening line without rescanning those blanks.
+    pub leading_content_lines: usize,
 }
 
 impl IndexedBlock {
@@ -101,6 +106,7 @@ impl IndexedBlock {
             revision,
             confidence: Confidence::Provisional,
             line_count,
+            leading_content_lines: 0,
         }
     }
 }
@@ -111,6 +117,7 @@ struct Entry {
     kind: NodeKind,
     revision: Revision,
     lines: usize,
+    leading_content_lines: usize,
 }
 
 /// What one incremental update did. Reported so the caller can measure update
@@ -133,8 +140,9 @@ pub struct BlockIndexUpdate {
     pub elapsed: Duration,
 }
 
-/// One tiled block: its kind, its byte length, and the physical lines it covers.
-pub(crate) type TiledBlock = (NodeKind, usize, usize);
+/// One tiled block: its kind, byte length, physical line count, and the number
+/// of leading blank lines in its tiled span.
+pub(crate) type TiledBlock = (NodeKind, usize, usize, usize);
 
 /// Counts CommonMark 0.31.2 source line endings in `slice`: `\n`, `\r\n` and a
 /// bare `\r` each count once. A block boundary always falls at the start of a
@@ -212,18 +220,19 @@ fn build_list_rows(
             next_item += 1;
         }
         active.retain(|index| items[*index].item_range.end > source_range.start);
-        if let Some(item_index) = active
+        let item_index = active
             .iter()
             .copied()
-            .max_by_key(|index| items[*index].depth)
-        {
-            let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
+            .max_by_key(|index| items[*index].depth);
+        let code_block = code_blocks.partition_point(|code| code.end <= source_range.start);
+        let is_code_block = code_blocks
+            .get(code_block)
+            .is_some_and(|code| code.intersects(source_range));
+        if item_index.is_some() || is_code_block {
             rows.push(ListProjectionRow {
                 source_range,
                 item_index,
-                is_code_block: code_blocks
-                    .get(code_block)
-                    .is_some_and(|code| code.intersects(source_range)),
+                is_code_block,
             });
         }
     }
@@ -238,7 +247,7 @@ fn build_list_projections(
 ) -> Vec<Option<ListProjection>> {
     let block_ranges = blocks
         .iter()
-        .scan(range.start.0, |start, (_, length, _)| {
+        .scan(range.start.0, |start, (_, length, _, _)| {
             let block = SourceRange::new(*start, *start + *length);
             *start = block.end.0;
             Some(block)
@@ -249,8 +258,14 @@ fn build_list_projections(
     let mut code_blocks = parsed
         .tree
         .iter()
-        .filter_map(|(_, node)| {
-            matches!(node.kind, NodeKind::CodeBlock).then_some(node.source_range)
+        .filter_map(|(id, node)| {
+            let nested_in_container = parsed.tree.ancestors(id).any(|ancestor| {
+                parsed.tree.node(ancestor).is_some_and(|node| {
+                    matches!(node.kind, NodeKind::ListItem { .. } | NodeKind::Quote)
+                })
+            });
+            (matches!(node.kind, NodeKind::CodeBlock) && nested_in_container)
+                .then_some(node.source_range)
         })
         .collect::<Vec<_>>();
     code_blocks.sort_by_key(|range| (range.start, range.end));
@@ -338,26 +353,72 @@ fn build_list_projections(
     for block_prefixes in &mut prefixes {
         block_prefixes.sort_by_key(|prefix| (prefix.source_range.start, prefix.source_range.end));
     }
+    let mut container_markers = parsed
+        .quote_markers
+        .iter()
+        .map(|(marker, owner)| {
+            (
+                *marker,
+                parsed.tree.node(*owner).map(|quote| quote.source_range),
+            )
+        })
+        .chain(
+            parsed
+                .list_item_markers
+                .iter()
+                .map(|(marker, _)| (*marker, None)),
+        )
+        .chain(
+            parsed
+                .list_structural_prefixes
+                .iter()
+                .map(|(marker, _, _)| (*marker, None)),
+        )
+        .collect::<Vec<_>>();
+    container_markers.sort_by_key(|(marker, _)| (marker.start, marker.end));
+    container_markers.dedup_by_key(|(marker, _)| (marker.start, marker.end));
     blocks
         .iter()
         .enumerate()
         .map(|(block, _)| {
-            (!items[block].is_empty()).then(|| {
-                let block_range = block_ranges[block];
-                let block_items = std::mem::take(&mut items[block]);
-                let block_prefixes = std::mem::take(&mut prefixes[block]);
-                let block_lists = lists
-                    .iter()
-                    .filter(|list| {
-                        block_items
-                            .iter()
-                            .any(|item| item.list_range == list.source_range)
-                    })
-                    .cloned()
-                    .collect();
-                let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
-                ListProjection::new(block_items, block_prefixes, block_lists, rows)
-            })
+            let block_range = block_ranges[block];
+            let block_items = std::mem::take(&mut items[block]);
+            let block_prefixes = std::mem::take(&mut prefixes[block]);
+            let block_lists = lists
+                .iter()
+                .filter(|list| {
+                    block_items
+                        .iter()
+                        .any(|item| item.list_range == list.source_range)
+                })
+                .cloned()
+                .collect();
+            let rows = build_list_rows(block_range, source, &block_items, &code_blocks);
+            let fence_start = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.end <= block_range.start);
+            let fence_end = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.start < block_range.end);
+            let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
+            let container_start =
+                container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
+            let container_end =
+                container_markers.partition_point(|(marker, _)| marker.start < block_range.end);
+            let block_container_markers =
+                container_markers[container_start..container_end].to_vec();
+            if block_items.is_empty() && rows.is_empty() {
+                None
+            } else {
+                Some(ListProjection::new(
+                    block_items,
+                    block_prefixes,
+                    block_lists,
+                    rows,
+                    block_fence_markers,
+                    block_container_markers,
+                ))
+            }
         })
         .collect()
 }
@@ -400,7 +461,10 @@ pub(crate) fn tiled_blocks(
             let endings = count_line_endings(slice);
             let ends_with_line_ending = slice.ends_with(['\n', '\r']);
             let lines = endings + usize::from(!ends_with_line_ending);
-            (*kind, end - start, lines)
+            let leading_content_lines = markdown_lines(slice)
+                .take_while(|line| line.trim().is_empty())
+                .count();
+            (*kind, end - start, lines, leading_content_lines)
         })
         .collect()
 }
@@ -429,13 +493,14 @@ impl BlockIndex {
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
-            |(index, (kind, length, lines))| {
+            |(index, (kind, length, lines, leading_content_lines))| {
                 (
                     Entry {
                         id: BlockId(index as u64),
                         kind,
                         revision,
                         lines,
+                        leading_content_lines,
                     },
                     length,
                 )
@@ -507,6 +572,7 @@ impl BlockIndex {
             revision: entry.revision,
             confidence: self.confidence(ordinal),
             line_count: entry.lines,
+            leading_content_lines: entry.leading_content_lines,
         }
     }
 
@@ -646,7 +712,7 @@ impl BlockIndex {
             let tail_start = self.span(window_last).start.0;
             let tail_kind = self.store.get(window_last).map(|(entry, _)| entry.kind);
             let resynchronized = window.end.0 == buffer.len_bytes().0
-                || blocks.last().is_some_and(|(kind, length, _)| {
+                || blocks.last().is_some_and(|(kind, length, _, _)| {
                     Some(*kind) == tail_kind && window.end.0 - *length == tail_start
                 });
             let can_grow = window_last + 1 < self.len()
@@ -783,7 +849,7 @@ impl BlockIndex {
             .collect::<Vec<_>>();
         let new_offsets = blocks
             .iter()
-            .scan(0, |start, (_, length, _)| {
+            .scan(0, |start, (_, length, _, _)| {
                 let span = (*start, *start + length);
                 *start = span.1;
                 Some(span)
@@ -811,7 +877,7 @@ impl BlockIndex {
         let entries = blocks
             .iter()
             .zip(&ids)
-            .map(|((kind, _, lines), id)| Entry {
+            .map(|((kind, _, lines, leading_content_lines), id)| Entry {
                 id: id.unwrap_or_else(|| {
                     let id = BlockId(self.next_id);
                     self.next_id += 1;
@@ -820,6 +886,7 @@ impl BlockIndex {
                 kind: *kind,
                 revision,
                 lines: *lines,
+                leading_content_lines: *leading_content_lines,
             })
             .collect::<Vec<_>>();
         if blocks.is_empty() {
@@ -841,14 +908,14 @@ impl BlockIndex {
         } else if blocks.len() == window.len() {
             // Same block count: rewrite the slots in place, so an edit that does
             // not change the window's structure never re-chunks the store.
-            for (offset, (entry, (_, length, _))) in entries.iter().zip(blocks).enumerate() {
+            for (offset, (entry, (_, length, _, _))) in entries.iter().zip(blocks).enumerate() {
                 self.store.set_payload(window.start + offset, *entry);
                 self.store.set_length(window.start + offset, *length);
             }
         } else {
             let items = entries
                 .into_iter()
-                .zip(blocks.iter().map(|(_, length, _)| *length))
+                .zip(blocks.iter().map(|(_, length, _, _)| *length))
                 .collect::<Vec<_>>();
             self.store.splice(window.clone(), &items);
         }
@@ -1061,6 +1128,15 @@ mod tests {
     }
 
     #[test]
+    fn the_first_fenced_block_remembers_its_leading_blank_lines() {
+        let source = "\n\n```rust\ncode\n```\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("fenced block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert_eq!(block.leading_content_lines, 2);
+    }
+
+    #[test]
     fn typing_inside_a_block_reparses_only_its_neighborhood() {
         let mut source = String::new();
         for line in 0..20_000 {
@@ -1205,6 +1281,15 @@ mod tests {
         index.update(&buffer, &deltas);
         assert!(index.is_empty());
         assert_eq!(index.covered_bytes(), 0);
+    }
+
+    #[test]
+    fn top_level_fenced_code_does_not_build_a_list_projection() {
+        let source = "````rust\ncode\n````";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("top-level code block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert!(index.list_projection(&block).is_none());
     }
 
     #[test]

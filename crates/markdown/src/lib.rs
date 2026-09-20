@@ -257,6 +257,13 @@ pub struct MarkdownParse {
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
     pub markers: Vec<SourceRange>,
+    /// Fence delimiter ranges kept separately from the merged marker plan so a
+    /// formal list projection can preserve them while filtering unrelated
+    /// inline markers from literal code content.
+    pub fence_markers: Vec<SourceRange>,
+    /// The formal opening/closing role for each fence marker. Kept separate
+    /// from `fence_markers` so range-only consumers remain unchanged.
+    pub fence_marker_edges: Vec<(SourceRange, FenceMarkerEdge)>,
     /// Quote prefixes paired with their owning quote node. Continuation-line
     /// prefixes cannot be associated with an owner by comparing source starts.
     /// Kept before range merging so nested, adjacent prefixes retain ownership.
@@ -302,6 +309,12 @@ pub struct ListProjection {
     pub prefixes: Vec<ListProjectionPrefix>,
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
+    fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+    /// Formal quote/list prefix ranges paired with the owning quote's source
+    /// range, when the marker belongs to a quote. List marker ownership is
+    /// resolved through `items` by range so nested list items retain their own
+    /// metadata without leaking a `NodeId` across parse trees.
+    container_markers: Vec<(SourceRange, Option<SourceRange>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,7 +348,12 @@ pub struct ListProjectionList {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListProjectionRow {
     pub source_range: SourceRange,
-    item_index: usize,
+    /// The deepest formal list item owning this row, when the row is inside a
+    /// list. A row can be present without an item when it is a nested code
+    /// line in another container such as a block quote; keeping those rows in
+    /// the same projection lets viewport-only presentation recover the formal
+    /// code-block kind without duplicating a second document-wide index.
+    item_index: Option<usize>,
     is_code_block: bool,
 }
 
@@ -345,13 +363,66 @@ impl ListProjection {
         prefixes: Vec<ListProjectionPrefix>,
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
+        fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+        container_markers: Vec<(SourceRange, Option<SourceRange>)>,
     ) -> Self {
         Self {
             items,
             prefixes,
             lists,
             rows,
+            fence_markers,
+            container_markers,
         }
+    }
+
+    /// The formal opening/closing role for `range`, if it is a fence delimiter.
+    /// Viewport-only parses may mistake literal fence-shaped code content for
+    /// an opening fence; this lets presentation keep only delimiters confirmed
+    /// by the document-wide parse when it projects a list-contained code row.
+    pub fn fence_marker_edge(&self, range: SourceRange) -> Option<FenceMarkerEdge> {
+        self.fence_markers
+            .binary_search_by_key(&(range.start, range.end), |marker| {
+                (marker.0.start, marker.0.end)
+            })
+            .ok()
+            .map(|index| self.fence_markers[index].1)
+    }
+
+    pub fn fence_markers_in(
+        &self,
+        range: SourceRange,
+    ) -> impl Iterator<Item = (SourceRange, FenceMarkerEdge)> + '_ {
+        let start = self
+            .fence_markers
+            .partition_point(|(marker, _)| marker.end <= range.start);
+        let end = self
+            .fence_markers
+            .partition_point(|(marker, _)| marker.start < range.end);
+        self.fence_markers[start..end]
+            .iter()
+            .copied()
+            .filter(move |(marker, _)| marker.intersects(range))
+    }
+
+    /// Formal quote/list prefix ranges in `range`. Viewport-only parses can
+    /// mistake literal `>` or `-` at the start of a code line for a nested
+    /// container; presentation keeps only these document-wide-confirmed
+    /// ranges when projecting a code row.
+    pub fn container_markers_in(
+        &self,
+        range: SourceRange,
+    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>)> + '_ {
+        let start = self
+            .container_markers
+            .partition_point(|(marker, _)| marker.end <= range.start);
+        let end = self
+            .container_markers
+            .partition_point(|(marker, _)| marker.start < range.end);
+        self.container_markers[start..end]
+            .iter()
+            .copied()
+            .filter(move |(marker, _)| marker.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
@@ -379,13 +450,14 @@ impl ListProjection {
     /// have to scan every item in a large list to recover its owner.
     pub fn item_for_range(&self, range: SourceRange) -> Option<&ListProjectionItem> {
         let row = self.row_for_range(range)?;
-        self.items.get(row.item_index)
+        self.items.get(row.item_index?)
     }
 
-    /// Reports whether the formal parse presents the physical list row as code.
-    /// A bounded viewport parse can mistake a four-column list continuation for
-    /// an indented code block; callers use this bit only to restore the formal
-    /// display kind while preserving genuine code nested in the list.
+    /// Reports whether the formal parse presents the physical row as code.
+    /// A bounded viewport parse can mistake a container continuation for an
+    /// indented code block, or fail to see code nested in a large quote;
+    /// callers use this bit only to restore the formal display kind while
+    /// preserving genuine literal code.
     pub fn is_code_block_for_range(&self, range: SourceRange) -> Option<bool> {
         Some(self.row_for_range(range)?.is_code_block)
     }
@@ -421,15 +493,29 @@ impl ListProjection {
     }
 }
 
+/// A single physical line's fence delimiter shape: which byte repeats
+/// (`` ` `` or `~`) and how many times. Exposed so a caller presenting one
+/// physical line at a time (`hane_presentation`) can classify a candidate
+/// fence line without re-parsing the block it belongs to; only whether *this*
+/// line closes a *specific* opening (same [`Self::marker`], [`Self::len`] at
+/// least as long, per [`fence_closes`]) is Markdown-semantic, and that stays
+/// the caller's own decision since only the caller knows which line is the
+/// block's actual opening.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FenceDelimiter {
-    marker: u8,
-    len: usize,
+pub struct FenceDelimiter {
+    pub marker: u8,
+    pub len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceMarkerEdge {
+    Opening,
+    Closing,
 }
 
 /// Opening or closing fence of a fenced code block, if this line is one. Used by
 /// marker derivation to bound the fence delimiters it hides.
-fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
+pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
     let trimmed = source.trim_start_matches(' ');
     if source.len() - trimmed.len() > 3 {
         return None;
@@ -444,6 +530,29 @@ fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
         .take_while(|byte| **byte == marker)
         .count();
     (len >= 3).then_some(FenceDelimiter { marker, len })
+}
+
+/// Returns a delimiter only when the remainder of the physical line is valid
+/// closing-fence whitespace. Opening fences intentionally use
+/// [`fence_delimiter`] because their info string may follow the marker run;
+/// closing fences may contain spaces or tabs, but no info string or other
+/// content.
+pub fn fence_closing_delimiter(source: &str) -> Option<FenceDelimiter> {
+    let delimiter = fence_delimiter(source)?;
+    let trimmed = source.trim_start_matches(' ');
+    trimmed[delimiter.len..]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .then_some(delimiter)
+}
+
+/// Whether a line shaped like `candidate` legally closes a fence that opened
+/// with `opening`: CommonMark requires the same marker character and a run at
+/// least as long as the opening's. A closing-shaped line with the wrong
+/// character or a shorter run is not a fence at all — it is literal code
+/// content, and must stay visible rather than being hidden as markup.
+pub const fn fence_closes(opening: FenceDelimiter, candidate: FenceDelimiter) -> bool {
+    opening.marker == candidate.marker && candidate.len >= opening.len
 }
 
 pub fn is_table_delimiter(source: &str) -> bool {
@@ -473,14 +582,14 @@ const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
 pub struct LocalBlockIndex {
     revision: Revision,
     window: SourceRange,
-    /// Block kinds with their absolute source ranges and line counts, tiling
-    /// `window`.
-    blocks: Vec<(NodeKind, SourceRange, usize)>,
+    /// Block kinds with their absolute source ranges, line counts, and leading
+    /// blank-line offsets, tiling `window`.
+    blocks: Vec<(NodeKind, SourceRange, usize, usize)>,
 }
 
 impl LocalBlockIndex {
     fn indexed(&self, ordinal: usize) -> IndexedBlock {
-        let (kind, source_range, line_count) = self.blocks[ordinal];
+        let (kind, source_range, line_count, leading_content_lines) = self.blocks[ordinal];
         IndexedBlock {
             ordinal,
             // Keyed by start offset rather than a counter: the window is
@@ -492,6 +601,7 @@ impl LocalBlockIndex {
             revision: self.revision,
             confidence: Confidence::Provisional,
             line_count,
+            leading_content_lines,
         }
     }
 
@@ -499,7 +609,7 @@ impl LocalBlockIndex {
     pub fn block_at(&self, offset: SourceOffset) -> Option<IndexedBlock> {
         let ordinal = self
             .blocks
-            .partition_point(|(_, range, _)| range.end.0 <= offset.0)
+            .partition_point(|(_, range, _, _)| range.end.0 <= offset.0)
             .min(self.blocks.len().checked_sub(1)?);
         let block = self.indexed(ordinal);
         (block.source_range.start <= offset && offset <= block.source_range.end).then_some(block)
@@ -509,7 +619,7 @@ impl LocalBlockIndex {
     pub fn blocks_in(&self, range: SourceRange) -> impl Iterator<Item = IndexedBlock> + '_ {
         let first = self
             .blocks
-            .partition_point(|(_, span, _)| span.end.0 <= range.start.0);
+            .partition_point(|(_, span, _, _)| span.end.0 <= range.start.0);
         (first..self.blocks.len())
             .take_while(move |ordinal| {
                 *ordinal == first || self.blocks[*ordinal].1.start.0 < range.end.0
@@ -552,10 +662,10 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()
-        .map(|(kind, length, lines)| {
+        .map(|(kind, length, lines, leading_content_lines)| {
             let range = SourceRange::new(offset, offset + length);
             offset += length;
-            (kind, range, lines)
+            (kind, range, lines, leading_content_lines)
         })
         .collect();
     LocalBlockIndex {
@@ -728,7 +838,7 @@ fn markdown_line_start(source: &str, mut at: usize) -> usize {
     source[..at].rfind(['\r', '\n']).map_or(0, |at| at + 1)
 }
 
-fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn markdown_lines(mut source: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         if source.is_empty() {
             return None;
@@ -971,6 +1081,8 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
 
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
+    fence_markers: Vec<SourceRange>,
+    fence_marker_edges: Vec<(SourceRange, FenceMarkerEdge)>,
     quote_markers: Vec<(SourceRange, NodeId)>,
     list_item_markers: Vec<(SourceRange, NodeId)>,
 }
@@ -981,6 +1093,8 @@ struct DerivedMarkers {
 /// event stream does not expose. Returned ranges are sorted and merged.
 fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
+    let mut fence_markers = Vec::new();
+    let mut fence_marker_edges = Vec::new();
     let mut quote_owners = Vec::new();
     let mut list_item_owners = Vec::new();
     for (id, block) in tree.blocks() {
@@ -1052,29 +1166,73 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             }
             NodeKind::CodeBlock => {
                 // Only the fence delimiter lines are markup; the code between
-                // them is literal content and must stay visible. `tail` runs to
-                // the end of the parsed slice, so clip it to the block first.
-                let body = tail
-                    .get(..block.source_range.end.0 - block.source_range.start.0)
-                    .unwrap_or(tail);
-                if fence_delimiter(body).is_some() {
-                    let opening_end = body.find('\n').unwrap_or(body.len());
-                    let opening = body[..opening_end].trim_end_matches(['\r', '\n']).len();
+                // them is literal content and must stay visible.
+                let node_start = block.source_range.start.0 - range.start.0;
+                let node_end = block.source_range.end.0 - range.start.0;
+                let opening_line = markdown_lines(&source[node_start..node_end])
+                    .next()
+                    .unwrap_or("");
+                if let Some(opening_fence) = fence_delimiter(opening_line) {
+                    let opening_content_len = opening_line.trim_end_matches(['\r', '\n']).len();
+                    // Only the delimiter run itself (leading indentation plus
+                    // the repeated `` ` `` or `~` bytes) is markup. An info
+                    // string after it — a language identifier such as `rust`
+                    // — is not fence syntax and must stay a visible, editable
+                    // part of the line rather than disappearing into the same
+                    // hidden marker.
+                    let indent = opening_content_len
+                        - opening_line[..opening_content_len]
+                            .trim_start_matches(' ')
+                            .len();
+                    let opening = indent + opening_fence.len;
                     if opening > 0 {
-                        markers.push(SourceRange::new(
+                        let marker = SourceRange::new(
                             block.source_range.start.0,
                             block.source_range.start.0 + opening,
-                        ));
+                        );
+                        markers.push(marker);
+                        fence_markers.push(marker);
+                        fence_marker_edges.push((marker, FenceMarkerEdge::Opening));
                     }
-                    let closed = body.trim_end_matches(['\r', '\n']);
-                    if let Some(closing_start) = closed.rfind('\n').map(|line_end| line_end + 1)
-                        && closing_start > opening_end
-                        && fence_delimiter(&closed[closing_start..]).is_some()
+                    // A quote or list item nested fence still carries its
+                    // container's own prefix on every continuation line,
+                    // inside this block's own raw source range (the parser
+                    // reports the node's range in the original, un-stripped
+                    // source, the same reason `quote_markers`/`code_padding`
+                    // exist). Skip exactly that prefix on each physical line
+                    // so the block's real last logical line — not a
+                    // prefix-contaminated lookalike such as `"> ```"` — is
+                    // what gets checked against the opening fence.
+                    let containers = ancestor_containers(tree, id, range, source).unwrap_or_default();
+                    let mut line_start = node_start + opening_line.len();
+                    let mut last_logical: Option<(usize, &str)> = None;
+                    for line in markdown_lines(&source[line_start..node_end]) {
+                        let this_line_start = line_start;
+                        line_start += line.len();
+                        let logical_start =
+                            consume_containers(&containers, this_line_start, line.as_bytes())
+                                .map_or(this_line_start, |cursor| this_line_start + cursor.byte);
+                        last_logical =
+                            Some((logical_start, &source[logical_start..this_line_start + line.len()]));
+                    }
+                    // A closing-shaped last line only really closes the fence
+                    // when it repeats the opening's own marker character at
+                    // least as many times (CommonMark's closing-fence rule);
+                    // otherwise it is an unterminated fence and this line is
+                    // literal code content, not markup, however much it may
+                    // look like a shorter or differently-charactered fence.
+                    if let Some((closing_start, closing_line)) = last_logical
+                        && let Some(closing_fence) = fence_closing_delimiter(closing_line)
+                        && fence_closes(opening_fence, closing_fence)
                     {
-                        markers.push(SourceRange::new(
-                            block.source_range.start.0 + closing_start,
-                            block.source_range.start.0 + closed.len(),
-                        ));
+                        let closing_len = closing_line.trim_end_matches(['\r', '\n']).len();
+                        let marker = SourceRange::new(
+                            range.start.0 + closing_start,
+                            range.start.0 + closing_start + closing_len,
+                        );
+                        markers.push(marker);
+                        fence_markers.push(marker);
+                        fence_marker_edges.push((marker, FenceMarkerEdge::Closing));
                     }
                 }
             }
@@ -1148,8 +1306,14 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             merged.push(marker);
         }
     }
+    fence_markers.sort_by_key(|marker| (marker.start, marker.end));
+    fence_markers.dedup();
+    fence_marker_edges.sort_by_key(|(marker, _)| (marker.start, marker.end));
+    fence_marker_edges.dedup_by_key(|(marker, _)| (marker.start, marker.end));
     DerivedMarkers {
         markers: merged,
+        fence_markers,
+        fence_marker_edges,
         quote_markers: quote_owners,
         list_item_markers: list_item_owners,
     }
@@ -1421,6 +1585,8 @@ pub fn parse_document(
         source_range,
         tree,
         markers: markers.markers,
+        fence_markers: markers.fence_markers,
+        fence_marker_edges: markers.fence_marker_edges,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
         list_structural_prefixes,
@@ -1464,6 +1630,67 @@ mod tests {
                         .all(|marker| !padding.intersects(*marker))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nested_fence_markers_skip_the_quotes_own_prefix_on_every_line() {
+        // The parser reports a nested block's own range in the original,
+        // un-stripped source, so the raw bytes between a nested fence's
+        // opening and closing line still contain the quote's "> " prefix.
+        // Marker derivation must skip exactly that prefix per line to find
+        // the fence's real closing line, not a prefix-contaminated
+        // lookalike such as "> ```".
+        let source = "> ```rust\n> code\n> ```\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        let covered = parsed
+            .markers
+            .iter()
+            .map(|marker| &source[marker.start.0..marker.end.0])
+            .collect::<Vec<_>>();
+        assert_eq!(covered, vec!["> ", "```", "> ", "> ", "```"]);
+    }
+
+    #[test]
+    fn an_unterminated_fences_closing_lookalike_last_line_stays_unhidden() {
+        for source in [
+            // The closing run is shorter than the opening's: CommonMark
+            // leaves the fence open, so the whole document is one code
+            // block and its last physical line — even though it is shaped
+            // like a fence — is literal content, not markup.
+            "````rust\ncode\n```\n",
+            // The closing line's marker character differs from the
+            // opening's: same rule, different reason.
+            "```rust\ncode\n~~~\n",
+            // A closing fence cannot carry an info string or other content;
+            // the marker run is literal when non-whitespace follows it.
+            "```rust\ncode\n```oops\n",
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            let code_block = parsed
+                .tree
+                .blocks()
+                .find(|(_, node)| node.kind == NodeKind::CodeBlock)
+                .unwrap_or_else(|| panic!("expected a code block in {source:?}"));
+            assert_eq!(
+                code_block.1.source_range,
+                SourceRange::new(0, source.len()),
+                "the unterminated fence should swallow the rest of the document: {source:?}"
+            );
+            let trimmed = source.trim_end_matches('\n');
+            let last_line_start = trimmed.rfind('\n').map_or(0, |at| at + 1);
+            assert!(
+                parsed
+                    .markers
+                    .iter()
+                    .all(|marker| marker.start.0 < last_line_start),
+                "the closing-lookalike last line must not be derived as markup for {source:?}: {:?}",
+                parsed.markers
+            );
+            assert!(
+                parsed.markers.iter().any(|marker| marker.start.0 == 0),
+                "the real opening fence should still be derived as markup for {source:?}"
+            );
         }
     }
 
@@ -1586,6 +1813,17 @@ mod tests {
                 .is_some_and(|block| block.confidence == Confidence::Provisional),
             "every locally parsed block is provisional"
         );
+    }
+
+    #[test]
+    fn local_index_remembers_leading_blank_lines_for_the_first_fenced_block() {
+        let buffer = RopeBuffer::from_text("\n\n```rust\ncode\n```\n");
+        let local = local_block_index(&buffer, 2..3);
+        let block = local
+            .block_at(buffer.line_range(LineId(2)).unwrap().start)
+            .expect("fenced block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert_eq!(block.leading_content_lines, 2);
     }
 
     #[test]
