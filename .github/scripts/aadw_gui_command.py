@@ -21,6 +21,7 @@ from typing import Any
 COMMAND_RE = re.compile(r"/gui-validate[ \t]+(head|merge)")
 DATE_BADGE_COMMAND_RE = re.compile(r"/gui-validate[ \t]+date-badge[ \t]+(head|merge)")
 NORMAL_LIST_COMMAND_RE = re.compile(r"/gui-validate[ \t]+normal-list[ \t]+(head|merge)")
+CODE_BLOCK_COMMAND_RE = re.compile(r"/gui-validate[ \t]+code-block[ \t]+(head|merge)")
 SIDEBAR_CHROME_COMMAND_RE = re.compile(r"/gui-validate[ \t]+sidebar-chrome[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
@@ -41,6 +42,10 @@ TRUSTED_ROUTES = {
     "normal-list": {
         "workflow_file": "aadw-gui-validation.yml",
         "procedure_path": "scripts/hosted_normal_list_gui.py",
+    },
+    "code-block": {
+        "workflow_file": "aadw-gui-validation.yml",
+        "procedure_path": "scripts/hosted_code_block_gui.py",
     },
     "sidebar-chrome": {
         "workflow_file": "aadw-sidebar-chrome-gui-validation.yml",
@@ -89,11 +94,16 @@ def parse_route(body: str) -> dict[str, str] | None:
                 validation_kind = "normal-list"
                 execution_context = normal_list.group(1)
             else:
-                sidebar_chrome = SIDEBAR_CHROME_COMMAND_RE.fullmatch(normalized)
-                if not sidebar_chrome:
-                    return None
-                validation_kind = "sidebar-chrome"
-                execution_context = sidebar_chrome.group(1)
+                code_block = CODE_BLOCK_COMMAND_RE.fullmatch(normalized)
+                if code_block:
+                    validation_kind = "code-block"
+                    execution_context = code_block.group(1)
+                else:
+                    sidebar_chrome = SIDEBAR_CHROME_COMMAND_RE.fullmatch(normalized)
+                    if not sidebar_chrome:
+                        return None
+                    validation_kind = "sidebar-chrome"
+                    execution_context = sidebar_chrome.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {
