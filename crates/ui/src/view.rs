@@ -225,12 +225,20 @@ fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: 
     (start_width + pointer_delta).clamp(minimum, maximum)
 }
 
-fn sidebar_content_height(tree_rows: usize, draft_rows: usize, empty_filter_row: bool) -> f32 {
+fn sidebar_content_height(
+    tree_rows: usize,
+    draft_rows: usize,
+    empty_filter_row: bool,
+    show_filter: bool,
+) -> f32 {
     2.0 * SIDEBAR_PADDING
         + SIDEBAR_TOOLBAR_HEIGHT
         + SIDEBAR_TOOLBAR_GAP
-        + SIDEBAR_FILTER_HEIGHT
-        + SIDEBAR_FILTER_GAP
+        + if show_filter {
+            SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
+        } else {
+            0.0
+        }
         + (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
@@ -6140,8 +6148,12 @@ impl EditorView {
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height =
-            sidebar_content_height(tree_row_count, draft_row_count, empty_filter_row);
+        let content_height = sidebar_content_height(
+            tree_row_count,
+            draft_row_count,
+            empty_filter_row,
+            !self.inline_rename_active(),
+        );
         let scrollbar = self.sidebar_scrollbar(sidebar_viewport_height, content_height, cx);
         Some(
             div()
