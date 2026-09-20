@@ -370,8 +370,7 @@ fn build_list_projections(
                             .node(*ancestor)
                             .is_some_and(|node| node.kind == NodeKind::Quote)
                     })
-                    .count()
-                    .saturating_add(1),
+                    .count(),
             )
         })
         .chain(
@@ -404,8 +403,7 @@ fn build_list_projections(
                             .node(*ancestor)
                             .is_some_and(|node| node.kind == NodeKind::Quote)
                     })
-                    .count()
-                    .saturating_add(1),
+                    .count(),
             })
         })
         .collect::<Vec<_>>();
