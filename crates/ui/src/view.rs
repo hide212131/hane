@@ -6568,7 +6568,7 @@ mod tests {
         for _ in 0..5_000 {
             source.push_str("  continued\n");
         }
-        source.push_str("\n  ```\n  **literal**\n  ```\n");
+        source.push_str("\n  ```rust\n  **literal**\n  ```\n");
         let editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one list block");
@@ -6596,6 +6596,21 @@ mod tests {
         );
         assert_eq!(line.style_runs.len(), 1);
         assert_eq!(line.style_runs[0].kind, StyleKind::CodeBlock);
+
+        let opening_line = code_line - 1;
+        let opening = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(opening_line..opening_line + 1),
+            None,
+            Some(projection),
+        )
+        .expect("late code opening presents");
+        assert_eq!(opening.lines[0].visual_text, "rust");
+        assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
+            segment.visibility == Visibility::HiddenMarkup
+                && segment.source_range.end.0 > segment.source_range.start.0
+        }));
     }
 
     #[test]

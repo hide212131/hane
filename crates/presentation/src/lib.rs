@@ -50,7 +50,8 @@ use hane_document::{
 use hane_markdown::{
     BlockId, BlockIndex, Confidence, FenceDelimiter, IndexedBlock, ListProjection,
     ListProjectionItem, ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId,
-    NodeKind, fence_closes, fence_delimiter, has_delimiter_markers, is_table_delimiter,
+    NodeKind, fence_closes, fence_closing_delimiter, fence_delimiter, has_delimiter_markers,
+    is_table_delimiter,
     parse_document,
 };
 use std::ops::Range;
@@ -1708,6 +1709,7 @@ fn present_markdown_from_parse(
             } else {
                 projected_markers.push(ProjectedMarker {
                     range: prefix.source_range,
+                    fence: false,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1719,7 +1721,8 @@ fn present_markdown_from_parse(
     }
     if formal_code_block == Some(true) {
         projected_markers.retain(|marker| {
-            marker.quote_owner.is_some()
+            marker.fence
+                || marker.quote_owner.is_some()
                 || marker.list_owner.is_some()
                 || marker.list_prefix.is_some()
                 || marker.global_list_prefix.is_some()
@@ -2145,6 +2148,7 @@ impl<T> SourceIndex<T> {
 #[derive(Clone, Debug)]
 struct ProjectedMarker {
     range: SourceRange,
+    fence: bool,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2401,6 +2405,12 @@ impl ProjectionIndex {
             )
             .map(|range| ProjectedMarker {
                 range: *range,
+                fence: parsed
+                    .fence_markers
+                    .binary_search_by_key(&(range.start, range.end), |marker| {
+                        (marker.start, marker.end)
+                    })
+                    .is_ok(),
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
@@ -2921,7 +2931,8 @@ fn fence_line_role(
     // fenced block) is literal content, matching what the parser itself
     // already decided when it kept the block open past that line.
     if line + 1 == content_end
-        && fence_delimiter(source).is_some_and(|candidate| fence_closes(opening_delimiter, candidate))
+        && fence_closing_delimiter(source)
+            .is_some_and(|candidate| fence_closes(opening_delimiter, candidate))
     {
         return Some(FenceLine::Closing);
     }

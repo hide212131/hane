@@ -257,6 +257,10 @@ pub struct MarkdownParse {
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
     pub markers: Vec<SourceRange>,
+    /// Fence delimiter ranges kept separately from the merged marker plan so a
+    /// formal list projection can preserve them while filtering unrelated
+    /// inline markers from literal code content.
+    pub fence_markers: Vec<SourceRange>,
     /// Quote prefixes paired with their owning quote node. Continuation-line
     /// prefixes cannot be associated with an owner by comparing source starts.
     /// Kept before range merging so nested, adjacent prefixes retain ownership.
@@ -452,6 +456,20 @@ pub fn fence_delimiter(source: &str) -> Option<FenceDelimiter> {
         .take_while(|byte| **byte == marker)
         .count();
     (len >= 3).then_some(FenceDelimiter { marker, len })
+}
+
+/// Returns a delimiter only when the remainder of the physical line is valid
+/// closing-fence whitespace. Opening fences intentionally use
+/// [`fence_delimiter`] because their info string may follow the marker run;
+/// closing fences may contain spaces or tabs, but no info string or other
+/// content.
+pub fn fence_closing_delimiter(source: &str) -> Option<FenceDelimiter> {
+    let delimiter = fence_delimiter(source)?;
+    let trimmed = source.trim_start_matches(' ');
+    trimmed[delimiter.len..]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .then_some(delimiter)
 }
 
 /// Whether a line shaped like `candidate` legally closes a fence that opened
@@ -988,6 +1006,7 @@ fn line_break_padding(tree: &MarkdownTree, range: SourceRange, source: &str) -> 
 
 struct DerivedMarkers {
     markers: Vec<SourceRange>,
+    fence_markers: Vec<SourceRange>,
     quote_markers: Vec<(SourceRange, NodeId)>,
     list_item_markers: Vec<(SourceRange, NodeId)>,
 }
@@ -998,6 +1017,7 @@ struct DerivedMarkers {
 /// event stream does not expose. Returned ranges are sorted and merged.
 fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> DerivedMarkers {
     let mut markers = Vec::new();
+    let mut fence_markers = Vec::new();
     let mut quote_owners = Vec::new();
     let mut list_item_owners = Vec::new();
     for (id, block) in tree.blocks() {
@@ -1089,10 +1109,12 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                             .len();
                     let opening = indent + opening_fence.len;
                     if opening > 0 {
-                        markers.push(SourceRange::new(
+                        let marker = SourceRange::new(
                             block.source_range.start.0,
                             block.source_range.start.0 + opening,
-                        ));
+                        );
+                        markers.push(marker);
+                        fence_markers.push(marker);
                     }
                     // A quote or list item nested fence still carries its
                     // container's own prefix on every continuation line,
@@ -1122,14 +1144,16 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     // literal code content, not markup, however much it may
                     // look like a shorter or differently-charactered fence.
                     if let Some((closing_start, closing_line)) = last_logical
-                        && let Some(closing_fence) = fence_delimiter(closing_line)
+                        && let Some(closing_fence) = fence_closing_delimiter(closing_line)
                         && fence_closes(opening_fence, closing_fence)
                     {
                         let closing_len = closing_line.trim_end_matches(['\r', '\n']).len();
-                        markers.push(SourceRange::new(
+                        let marker = SourceRange::new(
                             range.start.0 + closing_start,
                             range.start.0 + closing_start + closing_len,
-                        ));
+                        );
+                        markers.push(marker);
+                        fence_markers.push(marker);
                     }
                 }
             }
@@ -1203,8 +1227,11 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
             merged.push(marker);
         }
     }
+    fence_markers.sort_by_key(|marker| (marker.start, marker.end));
+    fence_markers.dedup();
     DerivedMarkers {
         markers: merged,
+        fence_markers,
         quote_markers: quote_owners,
         list_item_markers: list_item_owners,
     }
@@ -1476,6 +1503,7 @@ pub fn parse_document(
         source_range,
         tree,
         markers: markers.markers,
+        fence_markers: markers.fence_markers,
         quote_markers: markers.quote_markers,
         list_item_markers: markers.list_item_markers,
         list_structural_prefixes,
@@ -1551,6 +1579,9 @@ mod tests {
             // The closing line's marker character differs from the
             // opening's: same rule, different reason.
             "```rust\ncode\n~~~\n",
+            // A closing fence cannot carry an info string or other content;
+            // the marker run is literal when non-whitespace follows it.
+            "```rust\ncode\n```oops\n",
         ] {
             let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
             let code_block = parsed
