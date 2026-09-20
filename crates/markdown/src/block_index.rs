@@ -258,8 +258,14 @@ fn build_list_projections(
     let mut code_blocks = parsed
         .tree
         .iter()
-        .filter_map(|(_, node)| {
-            matches!(node.kind, NodeKind::CodeBlock).then_some(node.source_range)
+        .filter_map(|(id, node)| {
+            let nested_in_container = parsed.tree.ancestors(id).any(|ancestor| {
+                parsed.tree.node(ancestor).is_some_and(|node| {
+                    matches!(node.kind, NodeKind::ListItem { .. } | NodeKind::Quote)
+                })
+            });
+            (matches!(node.kind, NodeKind::CodeBlock) && nested_in_container)
+                .then_some(node.source_range)
         })
         .collect::<Vec<_>>();
     code_blocks.sort_by_key(|range| (range.start, range.end));
@@ -350,7 +356,12 @@ fn build_list_projections(
     let mut container_markers = parsed
         .quote_markers
         .iter()
-        .map(|(marker, owner)| (*marker, Some(*owner)))
+        .map(|(marker, owner)| {
+            (
+                *marker,
+                parsed.tree.node(*owner).map(|quote| quote.source_range),
+            )
+        })
         .chain(
             parsed
                 .list_item_markers
@@ -396,7 +407,7 @@ fn build_list_projections(
                 container_markers.partition_point(|(marker, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
-            if block_items.is_empty() && rows.is_empty() && block_fence_markers.is_empty() {
+            if block_items.is_empty() && rows.is_empty() {
                 None
             } else {
                 Some(ListProjection::new(
@@ -1270,6 +1281,15 @@ mod tests {
         index.update(&buffer, &deltas);
         assert!(index.is_empty());
         assert_eq!(index.covered_bytes(), 0);
+    }
+
+    #[test]
+    fn top_level_fenced_code_does_not_build_a_list_projection() {
+        let source = "````rust\ncode\n````";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("top-level code block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        assert!(index.list_projection(&block).is_none());
     }
 
     #[test]

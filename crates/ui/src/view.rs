@@ -7101,12 +7101,17 @@ mod tests {
             source.push_str("    > > literal\n");
         }
         source.push_str("    > ````");
-        let editor = Editor::new(&source);
+        let mut editor = Editor::new(&source);
         let index = BlockIndex::from_buffer(editor.document());
         let block = index.blocks().next().expect("one list block");
         let projection = index
             .list_projection(&block)
             .expect("formal list quote code projection");
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("literal").expect("code content"),
+            )))
+            .unwrap();
         let code_line = source[..source.find("    > > literal").expect("code row")]
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -7121,18 +7126,17 @@ mod tests {
             DEFAULT_LINE_HEIGHT,
         )
         .expect("late list quote code row presents");
-        assert_eq!(code.lines[0].visual_text, "  > literal");
+        assert_eq!(code.lines[0].visual_text, "    > > literal");
         assert_eq!(code.lines[0].kind, BlockKind::CodeBlock);
         let line_start = source.find("    > > literal").expect("code row source");
         let quote_marker = SourceRange::new(line_start + 4, line_start + 6);
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
             segment.source_range == quote_marker
-                && segment.visibility == Visibility::HiddenMarkup
                 && segment.marker_edge == Some(MarkerEdge::Opening)
         }));
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
-            segment.visibility == Visibility::HiddenMarkup
-                && segment.marker_edge == Some(MarkerEdge::Opening)
+            segment.source_range == quote_marker
+                && segment.visibility == Visibility::ExpandedMarkup
         }));
     }
 

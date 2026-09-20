@@ -310,10 +310,11 @@ pub struct ListProjection {
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-    /// Formal quote/list prefix ranges paired with the owning quote, when the
-    /// marker belongs to a quote. List marker ownership is resolved through
-    /// `items` by range so nested list items retain their own metadata.
-    container_markers: Vec<(SourceRange, Option<NodeId>)>,
+    /// Formal quote/list prefix ranges paired with the owning quote's source
+    /// range, when the marker belongs to a quote. List marker ownership is
+    /// resolved through `items` by range so nested list items retain their own
+    /// metadata without leaking a `NodeId` across parse trees.
+    container_markers: Vec<(SourceRange, Option<SourceRange>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,7 +364,7 @@ impl ListProjection {
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-        container_markers: Vec<(SourceRange, Option<NodeId>)>,
+        container_markers: Vec<(SourceRange, Option<SourceRange>)>,
     ) -> Self {
         Self {
             items,
@@ -411,7 +412,7 @@ impl ListProjection {
     pub fn container_markers_in(
         &self,
         range: SourceRange,
-    ) -> impl Iterator<Item = (SourceRange, Option<NodeId>)> + '_ {
+    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>)> + '_ {
         let start = self
             .container_markers
             .partition_point(|(marker, _)| marker.end <= range.start);

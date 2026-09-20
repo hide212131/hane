@@ -1349,6 +1349,9 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|quote| range_touches(quote.source_range, disclosure));
     }
+    if let Some(owner_range) = marker.formal_quote_owner {
+        return range_touches(owner_range, disclosure);
+    }
     if let Some(item) = marker.global_list_item {
         return list_projection.is_some_and(|projection| {
             projected_list_item_range_touches(projection, &item, disclosure)
@@ -1437,6 +1440,7 @@ fn marker_edge(
         return Some(edge);
     }
     if planned.quote_owner.is_some()
+        || planned.formal_quote_owner.is_some()
         || planned.list_owner.is_some()
         || planned.list_prefix.is_some()
         || planned.global_list_prefix.is_some()
@@ -1707,6 +1711,7 @@ fn present_markdown_from_parse(
                     fence_edge: None,
                     formal_container: true,
                     global_list_item: None,
+                    formal_quote_owner: None,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1737,6 +1742,7 @@ fn present_markdown_from_parse(
                         fence_edge: Some(edge),
                         formal_container: false,
                         global_list_item: None,
+                        formal_quote_owner: None,
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1754,7 +1760,7 @@ fn present_markdown_from_parse(
                     .find(|marker| marker.range == container_range)
                 {
                     marker.formal_container = true;
-                    marker.quote_owner = quote_owner;
+                    marker.formal_quote_owner = quote_owner;
                     marker.global_list_item = global_list_item;
                 } else {
                     projected_markers.push(ProjectedMarker {
@@ -1763,7 +1769,8 @@ fn present_markdown_from_parse(
                         fence_edge: None,
                         formal_container: true,
                         global_list_item,
-                        quote_owner,
+                        formal_quote_owner: quote_owner,
+                        quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
                         global_list_prefix: None,
@@ -2208,6 +2215,10 @@ struct ProjectedMarker {
     fence_edge: Option<MarkerEdge>,
     formal_container: bool,
     global_list_item: Option<ListProjectionItem>,
+    /// Source-range owner for a quote marker recovered from the formal parse.
+    /// Unlike `quote_owner`, this remains valid when the viewport parse has a
+    /// different `NodeId` allocation.
+    formal_quote_owner: Option<SourceRange>,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2482,6 +2493,7 @@ impl ProjectionIndex {
                     }),
                 formal_container: false,
                 global_list_item: None,
+                formal_quote_owner: None,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
