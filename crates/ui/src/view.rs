@@ -54,7 +54,7 @@ use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
     MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
-    block_heights, block_heights_with_disclosure, block_is_joinable, block_line_span,
+    block_heights_with_disclosure, block_is_joinable, block_line_span,
     layout_block, parse_joined_span,
     trailing_blank_lines,
 };
@@ -112,7 +112,7 @@ const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
 /// Sub-pixel tolerance for caret/badge visibility checks. Shaping and prefix
 /// sums accumulate f32 rounding error; anything below half a device-independent
-/// pixel is not a visible clip and must not keep a one-shot scroll request alive.
+/// pixel is not a visible clip and must not keep a pending scroll request alive.
 const CARET_VISIBILITY_TOLERANCE: f32 = 0.5;
 /// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
 /// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
@@ -717,9 +717,10 @@ pub struct EditorView {
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
     /// Set after an editor command changes the caret/selection. The immediate
-    /// scroll uses the previous frame's layout; one post-layout recheck is
-    /// needed when progressive disclosure changes a row height (for example,
-    /// an inactive zero-height code fence becoming editable).
+    /// scroll uses the previous frame's layout; the request remains armed until
+    /// a post-layout pass observes stable geometry when progressive disclosure
+    /// changes a row height (for example, an inactive zero-height code fence
+    /// becoming editable).
     pending_caret_visibility_after_layout: bool,
     /// Semantic list owner retained for the empty line created by the most
     /// recent list-item newline. It is presentation-only and is cleared by
@@ -2423,6 +2424,7 @@ impl EditorView {
         } else {
             self.resync_heights();
         }
+        self.ensure_active_disclosure_height();
         self.scroll_cursor_into_view();
         // The command may disclose markup and change its row height only on
         // the next render. Re-check once after that layout is installed so
@@ -3490,6 +3492,7 @@ impl EditorView {
         let revision = self.sessions.active().editor().document().revision();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
+        let disclosure = self.active_height_disclosure();
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -3521,7 +3524,12 @@ impl EditorView {
                 .background_executor()
                 .spawn(async move {
                     let index = BlockIndex::from_buffer(&snapshot);
-                    let heights = HeightIndex::new(block_heights(&snapshot, &index, line_height));
+                    let heights = HeightIndex::new(block_heights_with_disclosure(
+                        &snapshot,
+                        &index,
+                        line_height,
+                        disclosure,
+                    ));
                     (index, heights)
                 })
                 .await;
@@ -3549,12 +3557,26 @@ impl EditorView {
                 view.block_cache.clear();
                 view.joined_parse_cache.clear();
                 let (granularity, len) = view.desired_layout();
-                if granularity == Granularity::Blocks && len == heights.len() {
+                let snapshot_disclosure_is_current = view
+                    .editor()
+                    .document()
+                    .revision()
+                    == revision
+                    && view.active_height_disclosure() == disclosure;
+                if snapshot_disclosure_is_current
+                    && granularity == Granularity::Blocks
+                    && len == heights.len()
+                {
                     view.install_heights(granularity, heights);
                 } else {
-                    // The parse was rebased onto edits made while it ran, so the
-                    // block count moved and the prepared heights no longer fit.
-                    view.resync_heights();
+                    // The parse was rebased onto edits, or the caret/IME moved
+                    // while it ran, so the prepared heights no longer describe
+                    // the current disclosure even when the block count happens
+                    // to be unchanged. Rebuild the same-sized index too; the
+                    // ordinary input path keeps that fast path incremental,
+                    // but this background completion is already off the render
+                    // path and must not leave the old disclosed fence active.
+                    view.resync_heights_for_current_disclosure();
                 }
                 cx.notify();
             });
@@ -4289,18 +4311,61 @@ impl EditorView {
         match granularity {
             Granularity::Lines => vec![line_height; len],
             Granularity::Blocks => {
-                let editor = self.sessions.active().editor();
-                let document = editor.document();
+                let document = self.editor().document();
                 let index = self
                     .current_index()
                     .expect("block granularity has an index");
-                let disclosure = editor
-                    .ime()
-                    .map(|ime| ime.current_range)
-                    .or_else(|| Some(editor.selection().range()));
+                let disclosure = self.active_height_disclosure();
                 block_heights_with_disclosure(document, index, line_height, disclosure)
             }
         }
+    }
+
+    /// Keeps a newly disclosed fence block in the height index before the
+    /// caret-scroll calculation runs. A caret move does not change the block
+    /// count, so `resync_heights` quite deliberately keeps its measured index;
+    /// that fast path must still expand a zero-height block that was just made
+    /// editable or it can disappear from the next virtualization window.
+    fn ensure_active_disclosure_height(&mut self) {
+        if self.granularity != Granularity::Blocks {
+            return;
+        }
+        let Some(disclosure) = self.active_height_disclosure() else {
+            return;
+        };
+        let Some(index) = self.current_index() else {
+            return;
+        };
+        let line_height = self.line_height();
+        let ordinals = index
+            .blocks_in(disclosure)
+            .map(|block| block.ordinal)
+            .collect::<Vec<_>>();
+        let updates = ordinals
+            .into_iter()
+            .filter_map(|ordinal| {
+                let block = index.block(ordinal)?;
+                let projection = index.fence_height_projection(&block)?;
+                let collapsed = projection.inactive_rows_in(
+                    block.source_range,
+                    block.source_range,
+                    Some(disclosure),
+                );
+                let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
+                (self.heights.height(ordinal).is_some_and(|height| height < minimum))
+                    .then_some((ordinal, minimum))
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, minimum) in updates {
+            self.heights.update(ordinal, minimum);
+        }
+    }
+
+    fn active_height_disclosure(&self) -> Option<SourceRange> {
+        self.editor()
+            .ime()
+            .map(|ime| ime.current_range)
+            .or_else(|| Some(self.editor().selection().range()))
     }
 
     /// Keeps `heights` keyed to the same thing the renderer enumerates. This is
@@ -4313,6 +4378,20 @@ impl EditorView {
         }
         let heights = HeightIndex::new(self.item_heights());
         self.install_heights(granularity, heights);
+    }
+
+    /// Rebuilds the height snapshot even when its shape did not change. A
+    /// formal parse can finish after the caret or IME moved without changing
+    /// the block count; retaining the old same-sized tree would retain the
+    /// previous fence disclosure and make presentation and virtualization
+    /// disagree.
+    fn resync_heights_for_current_disclosure(&mut self) {
+        let (granularity, len) = self.desired_layout();
+        if granularity == self.granularity && len == self.heights.len() {
+            self.install_heights(granularity, HeightIndex::new(self.item_heights()));
+        } else {
+            self.resync_heights();
+        }
     }
 
     /// Swaps in a height index, keeping the reader where they were: the scroll
@@ -5635,21 +5714,36 @@ impl Render for EditorView {
         // Resolve the caret from the layouts produced in this frame, not from
         // a cache that may still describe the pre-disclosure zero-height row.
         // A fence can become editable one frame after the input event; keep the
-        // one-shot request armed until that row has a real positive height.
+        // request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
+        let caret_line = self.editor().document().line_for_offset(caret).ok();
         let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
             if caret < visual.source_range.start || visual.source_range.end < caret {
                 return None;
             }
             let point = layout.point_for_source(visual, caret, &shaper)?;
-            Some((*ordinal, point.x, point.y, point.height))
+            let top = match self.granularity {
+                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
+                Granularity::Lines => {
+                    let line = caret_line?;
+                    let line_id = line.0;
+                    let visual_line = visual
+                        .lines
+                        .iter()
+                        .position(|line| line.line_id as usize == line_id)?;
+                    let line_row_top = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == visual_line)
+                        .map(|row| row.y)?;
+                    self.heights.prefix_sum(line.0) + point.y - line_row_top
+                }
+            };
+            Some((point.x, top, point.height))
         });
         if self.pending_caret_visibility_after_layout {
-            if let Some((ordinal, _, y, height)) = fresh_caret
-                && height > 0.0
-            {
+            if let Some((_, top, height)) = fresh_caret && height > 0.0 {
                 let before = self.scroll_y;
-                let top = self.heights.prefix_sum(ordinal) + y;
                 self.scroll_y = scroll_y_for_cursor(
                     self.scroll_y,
                     top,
@@ -5663,12 +5757,16 @@ impl Render for EditorView {
                 );
                 let visible_bottom =
                     top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
-                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE {
+                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
+                    && self.scroll_y == before
+                {
                     self.pending_caret_visibility_after_layout = false;
                 } else {
-                    // The disclosed row is laid out, but the height index /
-                    // virtualization window has not yet converged enough to
-                    // reserve the badge clearance. Keep the request armed.
+                    // Keep the request armed for one more frame whenever this
+                    // correction moved the scroll. A following frame may apply
+                    // the height anchor to newly measured rows; clearing here
+                    // would let that anchor erase the badge clearance before
+                    // the caret has reached a stable layout.
                     cx.notify();
                 }
                 if self.scroll_y != before {
@@ -5684,9 +5782,9 @@ impl Render for EditorView {
             }
         }
         // Where the caret was drawn, for the IME candidate window.
-        self.caret_geometry = fresh_caret.map(|(ordinal, x, y, height)| CaretGeometry {
+        self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
             x: self.theme.line_horizontal_padding + x,
-            y: self.heights.prefix_sum(ordinal) + y - self.scroll_y,
+            y: top - self.scroll_y,
             height,
         });
         // Blocks are drawn whole, so the rendered span can start above the
@@ -8315,6 +8413,83 @@ mod tests {
                     .style_runs
                     .iter()
                     .any(|run| run.kind == hane_presentation::StyleKind::Bold)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_formal_parse_keeps_the_caret_owned_fence_block_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Empty fenced blocks collapse to zero height when inactive. Keep
+        // several of them adjacent so a disclosure-less background snapshot
+        // would make the height index's y=0 lookup select a later block and
+        // drop the caret-owned first block from virtualization.
+        let text = (0..8)
+            .map(|_| "```\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        // `schedule_document_parse` deliberately debounces formal work by a
+        // short real timer; let that job publish before inspecting the layout.
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.current_index().is_some_and(|index| index.len() >= 8));
+            let first_height = view.heights.height(0).expect("first block height");
+            assert!(
+                first_height > 0.0,
+                "the caret-owned opening fence must remain addressable after formal parse"
+            );
+            assert!(
+                view.caret_geometry().is_some(),
+                "formal height publication must not virtualize away the caret"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_formal_parse_rebuilds_heights_when_disclosure_moves_during_parse(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..8)
+            .map(|_| "```\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("last fence");
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Provisional, &document);
+            let heights = HeightIndex::new(block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(0)),
+            ));
+            view.install_heights(Granularity::Blocks, heights);
+            // Start a formal parse with the old disclosure, then move the
+            // caret before its completion without changing the document.
+            view.schedule_document_parse(cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let last = view.current_index().unwrap().len() - 1;
+            assert!(
+                view.heights.height(last).is_some_and(|height| height > 0.0),
+                "the current caret disclosure must win over the parse snapshot"
             );
         });
     }
