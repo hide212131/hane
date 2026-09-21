@@ -110,6 +110,10 @@ const ZOOM_STEP_PER_LINE: f32 = 0.08;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
+/// Sub-pixel tolerance for caret/badge visibility checks. Shaping and prefix
+/// sums accumulate f32 rounding error; anything below half a device-independent
+/// pixel is not a visible clip and must not keep a one-shot scroll request alive.
+const CARET_VISIBILITY_TOLERANCE: f32 = 0.5;
 /// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
 /// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
 /// editor's always-visible thumb) so the sidebar's idle right edge reads as
@@ -5667,7 +5671,7 @@ impl Render for EditorView {
                 );
                 let visible_bottom =
                     top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
-                if visible_bottom <= self.viewport_height + f32::EPSILON {
+                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE {
                     self.pending_caret_visibility_after_layout = false;
                 } else {
                     // The disclosed row is laid out, but the height index /
@@ -7530,7 +7534,8 @@ mod tests {
         let caret = caret.expect("disclosed closing fence caret is visible");
         assert!(caret.height > 0.0, "editing restores the fence row height");
         assert!(
-            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT
+                <= viewport_height + CARET_VISIBILITY_TOLERANCE,
             "expanded fence caret would be clipped: bottom {}, viewport {viewport_height}",
             caret.y + caret.height
         );
