@@ -1206,9 +1206,19 @@ fn disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset() {
         .iter()
         .find(|row| row.line == 1)
         .expect("nested quote row is laid out");
+    let nested_row_index = layout
+        .lines
+        .iter()
+        .position(|row| row.line == 1)
+        .expect("nested quote row has a layout index");
     assert_eq!(nested_row.text_x_origin, 0.0);
     assert_eq!(nested_row.body_x_origin, 40.0);
+    assert_eq!(nested_row.body_gap, 24.0);
     assert_eq!(nested_row.quote_bar_x_origin, Some(30.0));
+    assert_eq!(
+        layout.source_at_x(&block, nested_row_index, 24.0, &shaper()),
+        Some(nested)
+    );
 }
 
 #[test]
@@ -1268,6 +1278,7 @@ fn disclosed_outer_quote_prefix_precedes_nested_list_geometry() {
     assert_eq!(row.text_x_origin, 0.0);
     assert_eq!(row.marker_x_origin, Some(40.0));
     assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
     assert_eq!(row.quote_bar_x_origin, Some(30.0));
 }
 

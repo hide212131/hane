@@ -596,16 +596,11 @@ pub(crate) fn row_element(
         &line.style_runs,
         row.body_visual_start,
     );
-    let marker_body_gap_segment = marker_body_gap_segment(row, &segments);
+    let body_gap_segment = body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
     for (segment_index, segment) in segments.iter().enumerate() {
-        if marker_body_gap_segment == Some(segment_index) {
-            elements.push(
-                div()
-                    .flex_none()
-                    .w(px(row.marker_body_gap))
-                    .into_any_element(),
-            );
+        if body_gap_segment == Some(segment_index) {
+            elements.push(div().flex_none().w(px(row.body_gap)).into_any_element());
         }
         if segment.cursor_before {
             elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
@@ -640,13 +635,8 @@ pub(crate) fn row_element(
             );
         }
     }
-    if marker_body_gap_segment == Some(segments.len()) {
-        elements.push(
-            div()
-                .flex_none()
-                .w(px(row.marker_body_gap))
-                .into_any_element(),
-        );
+    if body_gap_segment == Some(segments.len()) {
+        elements.push(div().flex_none().w(px(row.body_gap)).into_any_element());
     }
     if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
         elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
@@ -743,11 +733,9 @@ fn line_segments(
         .collect()
 }
 
-fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
+fn body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
     let body = row.body_visual_start?;
-    (row.marker_body_gap > 0.0
-        && body > row.line_visual_range.start
-        && body <= row.line_visual_range.end)
+    (row.body_gap > 0.0 && body > row.line_visual_range.start && body <= row.line_visual_range.end)
         .then(|| {
             segments
                 .iter()
@@ -949,6 +937,7 @@ mod tests {
             body_visual_start: None,
             marker_visual_range: None,
             marker_body_gap: 0.0,
+            body_gap: 0.0,
             quote_bar_x_origin: None,
         }
     }
@@ -1029,10 +1018,11 @@ mod tests {
     }
 
     #[test]
-    fn list_marker_body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
+    fn body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
         let mut row = row(0..12, LineWrap::Hard);
         row.body_visual_start = Some(3);
         row.marker_body_gap = 8.0;
+        row.body_gap = 8.0;
         let segments = line_segments(
             0..12,
             None,
@@ -1048,14 +1038,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..3, 3..5, 5..7, 7..9, 9..11, 11..12]
         );
-        assert_eq!(marker_body_gap_segment(&row, &segments), Some(1));
+        assert_eq!(body_gap_segment(&row, &segments), Some(1));
     }
 
     #[test]
-    fn list_marker_body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
+    fn body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
         let mut row = row(0..4, LineWrap::Hard);
         row.body_visual_start = Some(4);
         row.marker_body_gap = 8.0;
+        row.body_gap = 8.0;
         let segments = line_segments(0..4, None, None, None, &[], row.body_visual_start);
 
         assert_eq!(
@@ -1065,10 +1056,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..4]
         );
-        assert_eq!(
-            marker_body_gap_segment(&row, &segments),
-            Some(segments.len())
-        );
+        assert_eq!(body_gap_segment(&row, &segments), Some(segments.len()));
     }
 
     #[test]

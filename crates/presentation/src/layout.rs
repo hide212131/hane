@@ -97,6 +97,10 @@ pub struct LayoutLine {
     /// body column. It is zero for continuation rows and disclosed source
     /// markers.
     pub marker_body_gap: f32,
+    /// Total geometry-only gap between the rendered prefix and the body. This
+    /// includes the quote inset that follows a disclosed outer quote prefix,
+    /// plus any inactive marker alignment gap.
+    pub body_gap: f32,
     /// x of the quote bar in the block's text column, when this row is quoted.
     pub quote_bar_x_origin: Option<f32>,
 }
@@ -128,19 +132,17 @@ impl LayoutLine {
             && body <= self.line_visual_range.end
         {
             let body_fragment_start = body.max(self.line_visual_range.start);
-            if self.marker_body_gap > 0.0
+            if self.body_gap > 0.0
                 && body_fragment_start == body
-                && let Some(marker) = &self.marker_visual_range
-                && marker.start >= self.line_visual_range.start
-                && marker.end <= self.line_visual_range.end
+                && body > self.line_visual_range.start
             {
-                let marker_end_x = self.text_x_origin
+                let rendered_prefix_end_x = self.text_x_origin
                     + shaper.x_for_offset(
                         line,
-                        self.line_visual_range.start..marker.end,
-                        marker.end,
+                        self.line_visual_range.start..body_fragment_start,
+                        body_fragment_start,
                     );
-                if (marker_end_x..self.body_x_origin).contains(&x) {
+                if (rendered_prefix_end_x..self.body_x_origin).contains(&x) {
                     return body_fragment_start;
                 }
             }
@@ -549,6 +551,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 body_visual_start: line_geometry.body_visual_start,
                 marker_visual_range: line_geometry.marker_visual_range.clone(),
                 marker_body_gap: line_geometry.marker_body_gap,
+                body_gap: line_geometry.body_gap,
                 quote_bar_x_origin: line_geometry.quote_bar_x_origin,
             });
             y += height;
@@ -574,6 +577,7 @@ struct LineGeometry {
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
     marker_body_gap: f32,
+    body_gap: f32,
     quote_bar_x_origin: Option<f32>,
 }
 
@@ -630,12 +634,13 @@ fn line_geometry(
         } else {
             quote_x
         };
+        let text_x_origin = if quote_prefix_after_outer {
+            0.0
+        } else {
+            quote_x
+        };
         return LineGeometry {
-            text_x_origin: if quote_prefix_after_outer {
-                0.0
-            } else {
-                quote_x
-            },
+            text_x_origin,
             marker_x_origin: None,
             body_x_origin: body_x,
             first_row_width: if quote_prefix_after_outer {
@@ -647,9 +652,13 @@ fn line_geometry(
             body_visual_start: quote_prefix_end.filter(|_| quote_prefix_after_outer),
             marker_visual_range: None,
             marker_body_gap: 0.0,
-            quote_bar_x_origin: (quote_x > 0.0).then_some(
-                quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
-            ),
+            body_gap: quote_prefix_end
+                .filter(|body| *body > 0)
+                .map_or(0.0, |body| {
+                    (body_x - text_x_origin - shaper.x_for_offset(line, 0..body, body)).max(0.0)
+                }),
+            quote_bar_x_origin: (quote_x > 0.0)
+                .then_some(quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH),
         };
     };
     let quote_x = line.quote.map_or(0.0, |quote| {
@@ -730,8 +739,8 @@ fn line_geometry(
             (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
         });
     let body_x = marker_x + expanded_prefix_width + marker_column_width;
-    let opening_marker = list.marker.is_some()
-        || list.empty_caret_origin == Some(ListCaretOrigin::Marker);
+    let opening_marker =
+        list.marker.is_some() || list.empty_caret_origin == Some(ListCaretOrigin::Marker);
     let text_x_origin = if quote_prefix_after_outer {
         0.0
     } else if opening_marker {
@@ -746,6 +755,11 @@ fn line_geometry(
     } else {
         width - text_x_origin
     };
+    let body_gap = body_visual_start
+        .filter(|body| *body > 0)
+        .map_or(marker_body_gap, |body| {
+            (body_x - text_x_origin - shaper.x_for_offset(line, 0..body, body)).max(0.0)
+        });
     LineGeometry {
         text_x_origin,
         marker_x_origin: opening_marker.then_some(marker_x),
@@ -758,9 +772,9 @@ fn line_geometry(
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
         marker_body_gap,
-        quote_bar_x_origin: (quote_x > 0.0).then_some(
-            quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
-        ),
+        body_gap,
+        quote_bar_x_origin: (quote_x > 0.0)
+            .then_some(quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH),
     }
 }
 
