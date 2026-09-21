@@ -2312,7 +2312,8 @@ impl EditorView {
                     // whichever draft was installed last.
                     self.sessions.activate(initial_session);
                     self.open_path(&path, cx);
-                } else if last_recovered.is_some() {
+                } else if let Some(last_recovered) = last_recovered {
+                    self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
                     self.schedule_document_parse(cx);
                 }
@@ -11325,6 +11326,53 @@ mod tests {
         assert!(
             after < before,
             "loading the active file must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_recovered_active_draft_reveals_its_file_tab(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("recovered-draft-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        view.update(cx, |view, cx| {
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        let recovered = RecoveredDrafts {
+            drafts: vec![RecoveredDraft {
+                id: DraftId::generate(),
+                text: "recovered".to_owned(),
+            }],
+            failed: 0,
+        };
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan((Ok(work_folder), Ok(recovered)), cx);
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "recovering the active draft must reveal its tab: before={before:?}, after={after:?}"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
