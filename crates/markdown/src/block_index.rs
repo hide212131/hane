@@ -965,6 +965,14 @@ impl BlockIndex {
             .filter_map(|ordinal| self.store.get(ordinal))
             .map(|(entry, _)| entry.lines)
             .sum();
+        // Only the first block id survives the merge. Height projections are
+        // keyed by block id, so drop every projection owned by an entry that
+        // disappears here instead of leaving unreachable row vectors behind.
+        for ordinal in first + 1..=last {
+            if let Some((removed, _)) = self.store.get(ordinal) {
+                self.fence_height_projections.remove(&removed.id);
+            }
+        }
         self.store.set_payload(first, entry);
         self.store.splice(first..last + 1, &[(entry, length)]);
         if let Some(from) = self.provisional_from {
@@ -1375,6 +1383,27 @@ mod tests {
                 .inactive_rows_in(after.source_range, after.source_range, None),
             2,
             "nested fence geometry stays stable while formal parsing catches up"
+        );
+    }
+    #[test]
+    fn merging_blocks_drops_fence_height_projections_for_removed_ids() {
+        let source = "> ```\n> one\n> ```\n\nplain\n\n> ```\n> two\n> ```\n";
+        let mut index = BlockIndex::build(Revision(1), source);
+        let blocks = index.blocks().collect::<Vec<_>>();
+        assert!(blocks.len() >= 3, "fixture has separate quote/paragraph blocks");
+        let removed = blocks.last().expect("last quote block").id;
+        assert!(
+            index.fence_height_projections.contains_key(&removed),
+            "last quoted fence has indexed height geometry"
+        );
+
+        let last = blocks.len() - 1;
+        index.merge_run(0, last, source.len(), Revision(2));
+
+        assert_eq!(index.len(), 1);
+        assert!(
+            !index.fence_height_projections.contains_key(&removed),
+            "projection for a block id removed by merge_run must be released"
         );
     }
     #[test]
