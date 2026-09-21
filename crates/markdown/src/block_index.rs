@@ -391,20 +391,19 @@ fn build_list_projections(
     let mut quotes = parsed
         .tree
         .iter()
-        .filter_map(|(id, node)| {
-            (node.kind == NodeKind::Quote).then(|| QuoteProjection {
-                source_range: node.source_range,
-                depth: parsed
-                    .tree
-                    .ancestors(id)
-                    .filter(|ancestor| {
-                        parsed
-                            .tree
-                            .node(*ancestor)
-                            .is_some_and(|node| node.kind == NodeKind::Quote)
-                    })
-                    .count(),
-            })
+        .filter(|(_, node)| node.kind == NodeKind::Quote)
+        .map(|(id, node)| QuoteProjection {
+            source_range: node.source_range,
+            depth: parsed
+                .tree
+                .ancestors(id)
+                .filter(|ancestor| {
+                    parsed
+                        .tree
+                        .node(*ancestor)
+                        .is_some_and(|node| node.kind == NodeKind::Quote)
+                })
+                .count(),
         })
         .collect::<Vec<_>>();
     quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
