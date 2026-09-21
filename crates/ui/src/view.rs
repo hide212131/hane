@@ -3721,9 +3721,6 @@ impl EditorView {
         let fence_height_projection = self
             .current_index()
             .and_then(|index| index.fence_height_projection(&indexed));
-        let fence_height_projection = self
-            .current_index()
-            .and_then(|index| index.fence_height_projection(&indexed));
         let visible = line.0..line.0.saturating_add(1);
         let visual = presented_block_with_projections(
             self.editor(),
@@ -4105,6 +4102,9 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
         let visual = presented_block_with_projections(
             self.editor(),
             &indexed,
