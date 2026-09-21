@@ -5646,7 +5646,6 @@ impl Render for EditorView {
             if let Some((ordinal, _, y, height)) = fresh_caret
                 && height > 0.0
             {
-                self.pending_caret_visibility_after_layout = false;
                 let before = self.scroll_y;
                 let top = self.heights.prefix_sum(ordinal) + y;
                 self.scroll_y = scroll_y_for_cursor(
@@ -5660,6 +5659,16 @@ impl Render for EditorView {
                     self.scrollable_content_height(),
                     self.viewport_height,
                 );
+                let visible_bottom =
+                    top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
+                if visible_bottom <= self.viewport_height + f32::EPSILON {
+                    self.pending_caret_visibility_after_layout = false;
+                } else {
+                    // The disclosed row is laid out, but the height index /
+                    // virtualization window has not yet converged enough to
+                    // reserve the badge clearance. Keep the request armed.
+                    cx.notify();
+                }
                 if self.scroll_y != before {
                     // The visible block set was selected before this corrected
                     // position. One more frame lets virtualization follow it.
