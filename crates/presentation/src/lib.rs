@@ -1324,6 +1324,19 @@ fn present_rule_line(
         if marker.end > range.end {
             continue;
         }
+        let marker_expanded = expanded
+            || marker_is_disclosed(
+                planned,
+                shared.parsed,
+                &shared.projection.nodes,
+                disclosure,
+                shared.list_projection,
+            );
+        let marker_visibility = if marker_expanded {
+            Visibility::ExpandedMarkup
+        } else {
+            Visibility::HiddenMarkup
+        };
         if source_cursor < marker.start.0 {
             append_segment(
                 &mut visual,
@@ -1341,7 +1354,7 @@ fn present_rule_line(
             source,
             range,
             marker,
-            visibility,
+            marker_visibility,
             marker_edge(planned, shared.parsed, &shared.projection.nodes),
         );
         // Keep the ordinary list projection contract even for a Rule. A
@@ -1361,7 +1374,7 @@ fn present_rule_line(
                 .global_list_item
                 .map(|item| list_label(item.start, item.ordinal))
         };
-        if !expanded && let Some(label) = label {
+        if !marker_expanded && let Some(label) = label {
             let visual_start = visual.len();
             visual.push_str(&label);
             segments.push(MappingSegment {

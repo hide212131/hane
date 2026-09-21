@@ -1030,6 +1030,55 @@ fn inactive_quote_wrap_width_reserves_semantic_inset() {
 }
 
 #[test]
+fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
+    let source = "> text\n>\n> ---\n";
+    let cursor = source.find("text").expect("text in source");
+    let rule_start = source.find("---").expect("rule source");
+    let rule_line_start = source[..rule_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| {
+            block.lines.iter().any(|line| {
+                line.source_range.start.0 == rule_line_start && line.kind == BlockKind::Rule
+            })
+        })
+        .expect("the quoted rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.source_range.start.0 == rule_line_start)
+        .expect("the quoted rule line is presented");
+
+    assert_eq!(line.visual_text, "> ");
+    assert_eq!(
+        line.quote,
+        Some(hane_presentation::QuoteRowMetadata {
+            depth: 1,
+            disclosed_depth: 1,
+        })
+    );
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(rule_line_start, rule_line_start + 2)
+            && segment.visibility == hane_presentation::Visibility::ExpandedMarkup
+    }));
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(rule_start, line.source_range.end.0)
+            && segment.visibility == hane_presentation::Visibility::HiddenMarkup
+    }));
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 2)
+        .expect("the quoted rule row is laid out");
+    assert_eq!(row.body_x_origin, 0.0);
+    assert_eq!(row.quote_bar_x_origin, None);
+}
+
+#[test]
 fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
     for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
         let rule_start = source.find("---").expect("rule source");
