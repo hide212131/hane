@@ -743,6 +743,11 @@ pub struct EditorView {
     /// keeping it here coalesces identical requests without walking the whole
     /// selected block range on the input thread.
     last_background_height_disclosure: Option<(Revision, SourceRange)>,
+    /// The disclosure represented by the current height tree at the last
+    /// bounded synchronization. Keeping the previous caret endpoints lets a
+    /// move away from a zero-height fence shrink that old block without
+    /// scanning the intervening document.
+    last_applied_height_disclosure: Option<(Revision, SourceRange)>,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
     /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
@@ -2143,6 +2148,7 @@ impl EditorView {
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
             last_background_height_disclosure: None,
+            last_applied_height_disclosure: None,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
@@ -2389,6 +2395,7 @@ impl EditorView {
         self.pending_list_editing = None;
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
+        self.last_applied_height_disclosure = None;
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
         // for an unrelated block in whatever document replaced it.
@@ -4370,6 +4377,11 @@ impl EditorView {
             return;
         };
         let line_height = self.line_height();
+        let revision = self.editor().document().revision();
+        let previous = self
+            .last_applied_height_disclosure
+            .filter(|(previous_revision, _)| *previous_revision == revision)
+            .map(|(_, disclosure)| disclosure);
         let mut ordinals = Vec::with_capacity(4);
         let mut add_ordinal = |offset: SourceOffset| {
             if let Some(ordinal) = index.ordinal_at(offset)
@@ -4381,6 +4393,12 @@ impl EditorView {
         let selection = self.editor().selection();
         add_ordinal(selection.anchor);
         add_ordinal(selection.active);
+        if let Some(previous) = previous {
+            add_ordinal(previous.start);
+            if !previous.is_empty() {
+                add_ordinal(SourceOffset(previous.end.0.saturating_sub(1)));
+            }
+        }
         if let Some(ime) = self.editor().ime() {
             add_ordinal(ime.current_range.start);
             if !ime.current_range.is_empty() {
@@ -4398,13 +4416,29 @@ impl EditorView {
                     Some(disclosure),
                 );
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
-                (self.heights.height(ordinal).is_some_and(|height| height < minimum))
-                    .then_some((ordinal, minimum))
+                let current = self.heights.height(ordinal)?;
+                let previous_minimum = previous.map(|previous| {
+                    let collapsed = projection.inactive_rows_in(
+                        block.source_range,
+                        block.source_range,
+                        Some(previous),
+                    );
+                    line_height * block.line_count.saturating_sub(collapsed) as f32
+                });
+                let target = if previous_minimum.is_some_and(|old| current <= old)
+                    || current < minimum
+                {
+                    minimum
+                } else {
+                    current
+                };
+                (target != current).then_some((ordinal, target))
             })
             .collect::<Vec<_>>();
         for (ordinal, minimum) in updates {
             self.heights.update(ordinal, minimum);
         }
+        self.last_applied_height_disclosure = Some((revision, disclosure));
     }
 
     fn active_height_disclosure(&self) -> Option<SourceRange> {
@@ -4474,6 +4508,9 @@ impl EditorView {
                 .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
             top + inside
         });
+        self.last_applied_height_disclosure = self
+            .active_height_disclosure()
+            .map(|disclosure| (self.editor().document().revision(), disclosure));
     }
 
     /// Applies the small splice reported by the incremental block index. The
@@ -7723,6 +7760,51 @@ mod tests {
             "expanded fence caret would be clipped: bottom {}, viewport {viewport_height}",
             caret.y + caret.height
         );
+    }
+
+    #[gpui::test]
+    fn moving_away_from_a_hidden_fence_shrinks_the_previous_height(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "```\n```\n\n```\n```";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("closing fence") + 1;
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(1)))
+                .unwrap();
+            let inactive = block_heights_with_disclosure(
+                &document,
+                view.current_index().expect("formal index"),
+                view.line_height(),
+                None,
+            );
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().expect("formal index"),
+                view.line_height(),
+                Some(SourceRange::empty(1)),
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            let expanded = view.heights.height(0).expect("first block height");
+            assert!(expanded > inactive[0]);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+            view.after_input(cx);
+
+            assert_eq!(
+                view.heights.height(0),
+                Some(inactive[0]),
+                "leaving the old fence must remove its temporary disclosure height"
+            );
+        });
     }
     #[test]
     fn height_remeasurement_cannot_leave_scroll_position_below_new_bottom() {
