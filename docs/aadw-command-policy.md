@@ -79,6 +79,16 @@ AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 
 同じ操作や確認が繰り返し問題になると確認された場合だけ、最小の専用部品へ抽出する。
 
+### 2.7 base synchronization と product fix を分離する
+
+target branch の進展を PR branch に取り込む操作は、Issue の製品コードを修正する action とは別に扱う。
+
+- Commander は `behind > 0` や base-sensitive evidence の freshness を解消する目的で、Claude / Codex の product-fix worker に「current main と同等のコードを書いて同期する」よう依頼しない。
+- base sync が必要なら、既存 Git の merge / rebase / update-branch など、target branch の commit を PR branch の ancestry に取り込む Git 操作を使う。完了後は compare で `behind = 0` を確認する。同等のコードが存在するだけでは同期済みと判断しない。
+- conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の実装を正として必要最小限の conflict 解消を行い、同期のために target branch の変更を別実装として複製しない。
+- product-fix worker は Issue の root-cause 修正を担当し、branch ancestry を更新する Git 操作の代替として使わない。
+- 同一 repository で Commander が複数 PR を進めている場合、base-sensitive な高コスト検証を開始した candidate がある間は、緊急でない別 PR を先に merge して target branch を動かさない。target branch が外部要因で進んだ場合は current facts を再観測し、必要な base sync を一度行ってから evidence を取り直す。
+
 ---
 
 ## 3. Observe
@@ -239,8 +249,8 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 - 一つの cluster に対して一つの coherent な fix と回帰テストをまとめる。レビューコメントやテストケースごとに条件分岐・commit・push を分割しない。
 - push 前に、変更範囲に対応する最小の local test / lint と差分検査を実行できる実装経路では、それを完了する。関連する修正をまとめて確認できるまで、次の head を作らない。
 - trusted worker が sandbox のため test / build / lint を実行できず、trusted finalizer だけが push する既存経路では、sandbox を緩めてこの責務を worker に移さない。その場合は current-head CI を push 後の最初の検証とし、CI が成功するまで local validation 済み、review / GUI validation 済み、または次の修正へ進める状態とは扱わない。CI failure は current head の evidence として読み、必要ならその root-cause cluster を修正する。
-- base-sensitive な変更では、最初の高コスト検証を始める前に current target branch と整合する候補 head を作る。後から base を取り込んだ場合、古い候補の evidence を再利用しない。
-- CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対してだけ選ぶ。実行中は、緊急でない product branch の push を行わず、必要な push を行った場合は旧 head の evidence を直ちに無効として新候補を作り直す。
+- base-sensitive な変更では、最初の高コスト検証を始める前に current target branch と整合する候補 head を作る。base sync は product-fix worker による再実装ではなく、target branch commit を ancestry に取り込む Git 操作として行い、compare で `behind = 0` を確認する。後から base を取り込んだ場合、古い候補の evidence を再利用しない。
+- CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対してだけ選ぶ。実行中は、緊急でない product branch の push を行わず、Commander 自身が扱う別 PR の merge で target branch を動かすことも避ける。必要な push / merge が行われた場合は旧 head / base context の evidence を直ちに再評価し、必要なら新候補を作り直す。
 - 同じ cluster が一度の fix 後も再現する場合、局所的な条件追加を続けず、presentation と index、計算値と実測値、同期処理と background 処理など共有される不変条件を再設計し、境界をまたぐ回帰テストを追加する。
 
 この手順の目的は push 数を機械的に制限することではない。current head に結び付かない CI / review / GUI evidence の再利用と、安定していない head に対する高コストな検証の繰り返しを避けることである。
