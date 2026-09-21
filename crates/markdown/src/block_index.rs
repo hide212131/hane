@@ -24,10 +24,12 @@
 
 use crate::block_store::BlockStore;
 use crate::{
-    ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, markdown_lines, parse_document,
+    FenceHeightProjection, ListProjection, ListProjectionItem, ListProjectionList,
+    ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind,
+    markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -184,7 +186,8 @@ fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
     let mut ranges = Vec::new();
     let mut start = range.start.0;
     while start < range.end.0 {
-        let tail = &source[start..range.end.0];
+        let relative = start.saturating_sub(range.start.0);
+        let tail = &source[relative..];
         let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
             offset
                 + if tail.as_bytes()[offset] == b'\r'
@@ -205,13 +208,13 @@ fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
     ranges
 }
 
-fn zero_height_fence_rows(
+fn build_fence_height_projection(
     block_range: SourceRange,
-    source_range: SourceRange,
+    parse_range: SourceRange,
     source: &str,
     fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
     list_item_markers: &[SourceRange],
-) -> Vec<SourceRange> {
+) -> Option<FenceHeightProjection> {
     let line_ranges = source_line_ranges(block_range, source);
     let mut rows = Vec::new();
     for (marker, _) in fence_markers {
@@ -227,22 +230,63 @@ fn zero_height_fence_rows(
             .get(list_item_markers.partition_point(|candidate| candidate.end <= line.start))
             .is_some_and(|candidate| candidate.start < line.end);
         if item_marker {
-            // An inactive list item marker is replaced by a visible synthesized
-            // bullet/number, so a same-line fence row is not visually empty.
             continue;
         }
-        let start = marker.end.0.saturating_sub(source_range.start.0);
-        let end = line.end.0.saturating_sub(source_range.start.0);
-        let Some(remainder) = source.get(start..end) else {
+        let remainder_start = marker.end.0.saturating_sub(parse_range.start.0);
+        let line_end = line.end.0.saturating_sub(parse_range.start.0);
+        let line_start = line.start.0.saturating_sub(parse_range.start.0);
+        let Some(remainder) = source.get(remainder_start..line_end) else {
+            continue;
+        };
+        let Some(line_source) = source.get(line_start..line_end) else {
             continue;
         };
         if remainder.trim().is_empty() {
-            rows.push(*line);
+            rows.push((*line, !line_source.ends_with(['\n', '\r'])));
         }
     }
-    rows.sort_by_key(|row| (row.start, row.end));
-    rows.dedup();
-    rows
+    let projection = FenceHeightProjection::from_absolute_rows(block_range, rows);
+    (!projection.is_empty()).then_some(projection)
+}
+
+fn build_fence_height_projections(
+    parsed: &MarkdownParse,
+    blocks: &[TiledBlock],
+    range: SourceRange,
+    source: &str,
+) -> Vec<Option<FenceHeightProjection>> {
+    let block_ranges = blocks
+        .iter()
+        .scan(range.start.0, |start, (_, length, _, _)| {
+            let block = SourceRange::new(*start, *start + *length);
+            *start = block.end.0;
+            Some(block)
+        })
+        .collect::<Vec<_>>();
+    let mut list_item_markers = parsed
+        .list_item_markers
+        .iter()
+        .map(|(marker, _)| *marker)
+        .collect::<Vec<_>>();
+    list_item_markers.sort_by_key(|marker| (marker.start, marker.end));
+    block_ranges
+        .iter()
+        .map(|block_range| {
+            let start = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.end <= block_range.start);
+            let end = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.start < block_range.end);
+            build_fence_height_projection(
+                *block_range,
+                range,
+                source,
+                &parsed.fence_marker_edges[start..end],
+                &list_item_markers,
+            )
+        })
+        .collect()
 }
 fn build_list_rows(
     block_range: SourceRange,
@@ -308,12 +352,6 @@ fn build_list_projections(
         })
         .collect::<Vec<_>>();
     code_blocks.sort_by_key(|range| (range.start, range.end));
-    let mut list_item_marker_ranges = parsed
-        .list_item_markers
-        .iter()
-        .map(|(marker, _)| *marker)
-        .collect::<Vec<_>>();
-    list_item_marker_ranges.sort_by_key(|marker| (marker.start, marker.end));
     for (list_id, node) in parsed.tree.iter() {
         let NodeKind::List { start } = node.kind else {
             continue;
@@ -446,13 +484,6 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
-            let zero_height_fence_rows = zero_height_fence_rows(
-                block_range,
-                range,
-                source,
-                &block_fence_markers,
-                &list_item_marker_ranges,
-            );
             let container_start =
                 container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
             let container_end =
@@ -468,7 +499,6 @@ fn build_list_projections(
                     block_lists,
                     rows,
                     block_fence_markers,
-                    zero_height_fence_rows,
                     block_container_markers,
                 ))
             }
@@ -530,6 +560,10 @@ pub struct BlockIndex {
     /// Compact list context from the last formal full parse. Incremental
     /// updates clear it because a changed list can alter every later ordinal.
     list_projections: Vec<Option<ListProjection>>,
+    /// Lightweight block-local fence geometry, rebuilt by both formal and
+    /// incremental parses so editing never has to wait for formal list semantics
+    /// merely to keep virtualized heights stable.
+    fence_height_projections: HashMap<BlockId, FenceHeightProjection>,
     /// First ordinal of the conservatively invalidated tail, if any. Invalidation
     /// always covers a suffix, so one ordinal answers "is this block provisional"
     /// in constant time instead of writing a flag into every affected block.
@@ -544,6 +578,15 @@ impl BlockIndex {
         let parsed = parse_document(revision, range, source);
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
+        let fence_height_by_ordinal =
+            build_fence_height_projections(&parsed, &blocks, range, source);
+        let fence_height_projections = fence_height_by_ordinal
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, projection)| {
+                projection.map(|projection| (BlockId(ordinal as u64), projection))
+            })
+            .collect::<HashMap<_, _>>();
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
             |(index, (kind, length, lines, leading_content_lines))| {
@@ -564,6 +607,7 @@ impl BlockIndex {
             store,
             next_id,
             list_projections,
+            fence_height_projections,
             provisional_from: None,
         }
     }
@@ -655,6 +699,21 @@ impl BlockIndex {
                     .get(block.ordinal)
                     .and_then(Option::as_ref)
             })
+            .flatten()
+    }
+
+    /// Height-only fenced-code projection. Unlike list semantics this remains
+    /// available after an incremental parse, as long as the block itself is not
+    /// in the conservatively invalidated tail.
+    pub fn fence_height_projection(
+        &self,
+        block: &IndexedBlock,
+    ) -> Option<&FenceHeightProjection> {
+        let current = self.block(block.ordinal)?;
+        (current.id == block.id
+            && current.source_range == block.source_range
+            && current.confidence == Confidence::Formal)
+            .then(|| self.fence_height_projections.get(&block.id))
             .flatten()
     }
 
@@ -757,6 +816,8 @@ impl BlockIndex {
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);
+            let fence_height_projections =
+                build_fence_height_projections(&parsed, &blocks, window, &text);
             // Re-synchronized when the window's last parsed block lands exactly
             // on the boundary and kind the index already has for the untouched
             // block that closes the window. Everything after that boundary is
@@ -776,7 +837,12 @@ impl BlockIndex {
                 continue;
             }
             let replaced = window_last + 1 - window_first;
-            let inserted = self.splice_window(window_first..window_last + 1, &blocks, revision);
+            let inserted = self.splice_window(
+                window_first..window_last + 1,
+                &blocks,
+                &fence_height_projections,
+                revision,
+            );
             let invalidated = if resynchronized {
                 0
             } else {
@@ -880,6 +946,7 @@ impl BlockIndex {
         &mut self,
         window: Range<usize>,
         blocks: &[TiledBlock],
+        fence_height_projections: &[Option<FenceHeightProjection>],
         revision: Revision,
     ) -> usize {
         let window_start = self.store.start(window.start);
@@ -942,6 +1009,15 @@ impl BlockIndex {
                 leading_content_lines: *leading_content_lines,
             })
             .collect::<Vec<_>>();
+        for previous in &previous {
+            self.fence_height_projections.remove(&previous.id);
+        }
+        for (entry, projection) in entries.iter().zip(fence_height_projections) {
+            if let Some(projection) = projection {
+                self.fence_height_projections
+                    .insert(entry.id, projection.clone());
+            }
+        }
         if blocks.is_empty() {
             // A window that parses to nothing is blank. Its bytes join the block
             // above, keeping the tiling intact; with no block above, the document
