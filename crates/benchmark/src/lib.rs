@@ -278,6 +278,8 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
                     span,
                     lines: &lines,
                     clipped_fence_lines: &[],
+                    zero_height_fence_rows_before: 0,
+                    zero_height_fence_rows_after: 0,
                     joined: None,
                     block_disclosure: None,
                 },
