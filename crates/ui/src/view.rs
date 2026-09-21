@@ -6482,13 +6482,14 @@ impl EditorView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
             .child(
                 div()
+                    .id("file-tab-scroll")
                     .debug_selector(|| "file-tab".to_owned())
                     .h_full()
                     .flex_1()
                     .min_w(px(0.0))
                     .flex()
                     .items_center()
-                    .overflow_x_scroll()
+                    .overflow_scroll()
                     .track_scroll(&self.file_tab_scroll)
                     .children(tabs),
             )
