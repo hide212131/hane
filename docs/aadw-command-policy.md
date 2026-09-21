@@ -223,6 +223,28 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 
 専用 Gate は必須ではない。確認が実運用で繰り返し複雑になる場合だけ、客観条件だけを確認する小さな Gate へ抽出してよい。
 
+### 4.6 修正の収束と高コスト検証
+
+この節は新しい workflow state、generation、receipt、Gate を定義するものではない。PR の修正と検証を開始する順序を、Commander が current facts から判断するための運用ルールである。
+
+複数の finding、失敗、境界条件がある場合、最初に次を一つの作業単位として整理する。
+
+1. current head と、主張に必要な current base context。
+2. Issue の acceptance criteria と、変更が守るべき不変条件。
+3. 同じ原因・設計面に属する finding の root-cause cluster。
+4. 不変条件が変化する境界のテスト表。少なくとも、通常経路と境界値、初期化・再読込、incremental / background 処理、cache / measured value / virtualization、入力・selection・scroll が関係する場合の各状態を含める。
+
+その上で、次を守る。
+
+- 一つの cluster に対して一つの coherent な fix と回帰テストをまとめる。レビューコメントやテストケースごとに条件分岐・commit・push を分割しない。
+- push 前に、変更範囲に対応する最小の local test / lint と差分検査を実行できる実装経路では、それを完了する。関連する修正をまとめて確認できるまで、次の head を作らない。
+- trusted worker が sandbox のため test / build / lint を実行できず、trusted finalizer だけが push する既存経路では、sandbox を緩めてこの責務を worker に移さない。その場合は current-head CI を push 後の最初の検証とし、CI が成功するまで local validation 済み、review / GUI validation 済み、または次の修正へ進める状態とは扱わない。CI failure は current head の evidence として読み、必要ならその root-cause cluster を修正する。
+- base-sensitive な変更では、最初の高コスト検証を始める前に current target branch と整合する候補 head を作る。後から base を取り込んだ場合、古い候補の evidence を再利用しない。
+- CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対してだけ選ぶ。実行中は、緊急でない product branch の push を行わず、必要な push を行った場合は旧 head の evidence を直ちに無効として新候補を作り直す。
+- 同じ cluster が一度の fix 後も再現する場合、局所的な条件追加を続けず、presentation と index、計算値と実測値、同期処理と background 処理など共有される不変条件を再設計し、境界をまたぐ回帰テストを追加する。
+
+この手順の目的は push 数を機械的に制限することではない。current head に結び付かない CI / review / GUI evidence の再利用と、安定していない head に対する高コストな検証の繰り返しを避けることである。
+
 ---
 
 ## 5. Act
