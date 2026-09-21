@@ -6413,6 +6413,33 @@ fn draft_preview(session: &DocumentSession) -> String {
 
 impl EditorView {
     fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active_id = self.sessions.active_id();
+        let tabs = self
+            .sessions
+            .sessions()
+            .map(|session| {
+                let id = session.id();
+                let is_active = id == active_id;
+                let label = session.label();
+                div()
+                    .id(("file-tab", id.0 as usize))
+                    .debug_selector(move || format!("file-tab-{}", id.0))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .cursor_pointer()
+                    .when(is_active, |element| {
+                        element.bg(rgb(self.theme.code_background))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        window.focus(&view.focus_handle);
+                        view.activate_session(id, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
         div()
             .debug_selector(|| "main-panel-header".to_owned())
             .h(px(self.theme.header_height))
@@ -6429,7 +6456,7 @@ impl EditorView {
                     .h_full()
                     .flex()
                     .items_center()
-                    .child(self.sessions.active().label()),
+                    .children(tabs),
             )
     }
 
@@ -9628,6 +9655,45 @@ mod tests {
                 "the editor viewport must exclude both fixed chrome regions"
             );
         });
+    }
+
+    #[gpui::test]
+    fn file_tabs_render_all_open_sessions_and_activate_the_clicked_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut sessions = SessionSet::with_untitled("first", "First");
+        let first_id = sessions.active_id();
+        let second_id = sessions.open_untitled("second", "Second");
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                sessions,
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(480.0)));
+        cx.run_until_parked();
+
+        let first_tab = cx
+            .debug_bounds("file-tab-0")
+            .expect("the first open session must render a tab");
+        cx.debug_bounds("file-tab-1")
+            .expect("the second open session must render a tab");
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_session().id()),
+            second_id,
+            "opening the second session should make its tab active before the click"
+        );
+
+        cx.simulate_click(first_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_session().id()),
+            first_id,
+            "clicking a tab must switch through the active-session path"
+        );
     }
 
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
