@@ -2882,6 +2882,7 @@ impl EditorView {
             .set_view_state(SessionViewState { scroll_y });
         let heading = Self::new_work_folder_note_heading();
         let id = self.sessions.open_untitled(&heading, "Untitled");
+        self.reveal_file_tab(id);
         self.sessions
             .get_mut(id)
             .expect("new work-folder note session exists")
@@ -3510,10 +3511,11 @@ impl EditorView {
                                 .active_mut()
                                 .set_view_state(SessionViewState { scroll_y });
                         }
-                        self.sessions.apply_open(into, loaded);
+                        let opened_id = self.sessions.apply_open(into, loaded);
                         self.remember_recent(path);
                         cx.add_recent_document(path);
                         if is_latest_request {
+                            self.reveal_file_tab(opened_id);
                             self.on_document_replaced();
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
@@ -11240,6 +11242,92 @@ mod tests {
         cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), last);
+    }
+
+    #[gpui::test]
+    fn a_new_work_folder_note_reveals_its_active_file_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("new-note-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "creating the active note must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_newly_loaded_work_folder_file_reveals_its_active_file_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("loaded-file-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Target.md");
+        std::fs::write(&target, "target\n").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        let generation = view.update(cx, |view, _| {
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            view.latest_open_target = Some(target.clone());
+            view.work_folder_generation
+        });
+        cx.run_until_parked();
+
+        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        let loaded = OsFileService.load(&target).unwrap();
+        view.update(cx, |view, cx| {
+            view.finish_open(None, generation, &target, Ok(loaded), cx);
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "loading the active file must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[gpui::test]
