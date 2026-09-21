@@ -6201,7 +6201,26 @@ impl Render for EditorView {
         // request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
         let caret_line = self.editor().document().line_for_offset(caret).ok();
+        // `BlockLayout::point_for_source` accepts a caret at the end of its
+        // last line, so two adjacent block layouts can both claim the same
+        // source boundary. In block granularity the formal index is the
+        // ownership authority; restrict resolution to the block that owns the
+        // caret before asking either layout for a point. Otherwise a collapsed
+        // closing fence immediately before a paragraph can win the search and
+        // leave the IME geometry on the wrong, zero-height block.
+        let caret_block_ordinal = (self.granularity == Granularity::Blocks)
+            .then(|| {
+                self.current_index()
+                    .and_then(|index| index.block_at(caret))
+                    .map(|block| block.ordinal)
+            })
+            .flatten();
         let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
+            if self.granularity == Granularity::Blocks
+                && caret_block_ordinal != Some(*ordinal)
+            {
+                return None;
+            }
             if caret < visual.source_range.start || visual.source_range.end < caret {
                 return None;
             }
@@ -8161,6 +8180,41 @@ mod tests {
             "expanded fence caret would be clipped: bottom {}, viewport {viewport_height}",
             caret.y + caret.height
         );
+    }
+
+    #[gpui::test]
+    fn caret_at_a_block_boundary_resolves_to_the_following_paragraph(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "```\n```\nparagraph";
+        let paragraph = text.find("paragraph").expect("paragraph");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(paragraph)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let (active, caret, pending, owner_ordinal) = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection().active,
+                view.caret_geometry(),
+                view.pending_caret_visibility_after_layout,
+                view.current_index()
+                    .and_then(|index| index.ordinal_at(SourceOffset(paragraph))),
+            )
+        });
+
+        assert_eq!(active, SourceOffset(paragraph));
+        assert!(owner_ordinal.is_some(), "the paragraph must own its boundary");
+        let caret = caret.expect("following paragraph caret is visible");
+        assert!(caret.height > 0.0, "the paragraph must not use the fence geometry");
+        assert!(!pending, "caret visibility must settle after the real owner is laid out");
     }
 
     #[gpui::test]
