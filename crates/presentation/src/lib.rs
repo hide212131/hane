@@ -2087,7 +2087,12 @@ fn present_markdown_from_parse(
             })
         });
     let line_estimated_height = if kind == BlockKind::CodeBlock {
-        fenced_line_height(&visual, has_hidden_fence, disclosure.is_some(), line_height)
+        fenced_line_height(
+            &visual,
+            has_hidden_fence,
+            disclosure.is_some_and(|active| range_touches(range, active)),
+            line_height,
+        )
     } else {
         estimated_height(kind, line_height)
     };
@@ -3332,7 +3337,12 @@ fn present_fenced_code_opening_line(
         Vec::new()
     };
     let line_estimated_height =
-        fenced_line_height(&visual, !expanded, disclosure.is_some(), line_height);
+        fenced_line_height(
+            &visual,
+            !expanded,
+            disclosure.is_some_and(|active| range_touches(range, active)),
+            line_height,
+        );
     VisualLine {
         line_id,
         source_range: range,
@@ -3380,7 +3390,12 @@ fn present_fenced_code_closing_line(
         Vec::new()
     };
     let line_estimated_height =
-        fenced_line_height(&visual_text, !expanded, disclosure.is_some(), line_height);
+        fenced_line_height(
+            &visual_text,
+            !expanded,
+            disclosure.is_some_and(|active| range_touches(range, active)),
+            line_height,
+        );
     VisualLine {
         line_id,
         source_range: range,
