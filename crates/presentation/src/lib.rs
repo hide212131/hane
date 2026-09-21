@@ -743,6 +743,21 @@ impl VisualLine {
         self.measured_height.unwrap_or(self.estimated_height)
     }
 
+    /// Whether a thematic-break body is collapsed to the separator drawn by
+    /// the UI. Container prefixes (for example `> `) may be disclosed while
+    /// the rule body remains hidden, so `visual_text.is_empty()` is not a
+    /// sufficient test for selecting the separator renderer.
+    pub fn rule_body_is_collapsed(&self) -> bool {
+        self.kind == BlockKind::Rule
+            && self
+                .source_map
+                .segments
+                .iter()
+                .rev()
+                .find(|segment| !segment.source_range.is_empty())
+                .is_some_and(|segment| segment.visibility == Visibility::HiddenMarkup)
+    }
+
     /// Render policy for this line. The UI draws from this alone and never
     /// matches on [`BlockKind`].
     pub fn display(&self) -> BlockDisplay {
@@ -1310,7 +1325,8 @@ fn present_rule_line(
     shared: &SharedParse<'_>,
     markers_on_line: &[ProjectedMarker],
 ) -> VisualLine {
-    let expanded = disclosure.is_some_and(|active| range_touches(range, active));
+    let expanded =
+        disclosure.is_some_and(|active| disclosure_owns_physical_line(range, source, active));
     let visibility = if expanded {
         Visibility::ExpandedMarkup
     } else {
@@ -4362,6 +4378,7 @@ mod tests {
         );
         assert_eq!(inactive.kind, BlockKind::Rule);
         assert!(inactive.visual_text.is_empty());
+        assert!(inactive.rule_body_is_collapsed());
         assert_eq!(inactive.source_map.segments[0].source_range, range);
         assert_eq!(
             inactive.source_map.segments[0].visibility,
@@ -4379,6 +4396,7 @@ mod tests {
         );
         assert_eq!(active.kind, BlockKind::Rule);
         assert_eq!(active.visual_text, source);
+        assert!(!active.rule_body_is_collapsed());
         assert_eq!(
             active.source_map.segments[0].visibility,
             Visibility::ExpandedMarkup

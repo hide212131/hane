@@ -17,7 +17,7 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
 use hane_presentation::{
-    BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
+    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
     VisualLine,
     VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
@@ -548,7 +548,7 @@ pub(crate) fn row_element(
         );
     }
 
-    if line.kind == BlockKind::Rule && line.visual_text.is_empty() {
+    if line.rule_body_is_collapsed() {
         return styled_block(
             div()
                 .relative()

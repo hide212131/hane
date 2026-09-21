@@ -1067,6 +1067,7 @@ fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
         segment.source_range == SourceRange::new(rule_start, line.source_range.end.0)
             && segment.visibility == hane_presentation::Visibility::HiddenMarkup
     }));
+    assert!(line.rule_body_is_collapsed());
 
     let layout = layout_block(&block, 160.0, &shaper());
     let row = layout
@@ -1076,6 +1077,28 @@ fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
         .expect("the quoted rule row is laid out");
     assert_eq!(row.body_x_origin, 0.0);
     assert_eq!(row.quote_bar_x_origin, None);
+}
+
+#[test]
+fn caret_on_the_following_line_does_not_disclose_the_previous_rule_body() {
+    let source = "> ---\n> text\n";
+    let cursor = source.find("text").expect("text in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.kind == BlockKind::Rule))
+        .expect("the quoted rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::Rule)
+        .expect("the quoted rule line is presented");
+
+    assert_eq!(line.visual_text, "> ");
+    assert!(line.rule_body_is_collapsed());
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(2, 6)
+            && segment.visibility == hane_presentation::Visibility::HiddenMarkup
+    }));
 }
 
 #[test]
