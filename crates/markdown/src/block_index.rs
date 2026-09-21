@@ -205,6 +205,45 @@ fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
     ranges
 }
 
+fn zero_height_fence_rows(
+    block_range: SourceRange,
+    source_range: SourceRange,
+    source: &str,
+    fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
+    list_item_markers: &[SourceRange],
+) -> Vec<SourceRange> {
+    let line_ranges = source_line_ranges(block_range, source);
+    let mut rows = Vec::new();
+    for (marker, _) in fence_markers {
+        let line = line_ranges
+            .get(line_ranges.partition_point(|line| line.end <= marker.start));
+        let Some(line) = line else {
+            continue;
+        };
+        if !line.intersects(*marker) {
+            continue;
+        }
+        let item_marker = list_item_markers
+            .get(list_item_markers.partition_point(|candidate| candidate.end <= line.start))
+            .is_some_and(|candidate| candidate.start < line.end);
+        if item_marker {
+            // An inactive list item marker is replaced by a visible synthesized
+            // bullet/number, so a same-line fence row is not visually empty.
+            continue;
+        }
+        let start = marker.end.0.saturating_sub(source_range.start.0);
+        let end = line.end.0.saturating_sub(source_range.start.0);
+        let Some(remainder) = source.get(start..end) else {
+            continue;
+        };
+        if remainder.trim().is_empty() {
+            rows.push(*line);
+        }
+    }
+    rows.sort_by_key(|row| (row.start, row.end));
+    rows.dedup();
+    rows
+}
 fn build_list_rows(
     block_range: SourceRange,
     source: &str,
@@ -269,6 +308,12 @@ fn build_list_projections(
         })
         .collect::<Vec<_>>();
     code_blocks.sort_by_key(|range| (range.start, range.end));
+    let mut list_item_marker_ranges = parsed
+        .list_item_markers
+        .iter()
+        .map(|(marker, _)| *marker)
+        .collect::<Vec<_>>();
+    list_item_marker_ranges.sort_by_key(|marker| (marker.start, marker.end));
     for (list_id, node) in parsed.tree.iter() {
         let NodeKind::List { start } = node.kind else {
             continue;
@@ -401,6 +446,13 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
+            let zero_height_fence_rows = zero_height_fence_rows(
+                block_range,
+                range,
+                source,
+                &block_fence_markers,
+                &list_item_marker_ranges,
+            );
             let container_start =
                 container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
             let container_end =
@@ -416,6 +468,7 @@ fn build_list_projections(
                     block_lists,
                     rows,
                     block_fence_markers,
+                    zero_height_fence_rows,
                     block_container_markers,
                 ))
             }
