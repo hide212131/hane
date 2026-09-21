@@ -4024,11 +4024,14 @@ mod tests {
             Visibility::ExpandedMarkup
         );
 
-        for (source, is_rule) in [
-            ("---\n", true),
-            ("title\n---\n", false),
-            ("- item\n", false),
-            ("--- text\n", false),
+        for (source, is_rule, has_list_item) in [
+            ("---\n", true, false),
+            ("title\n---\n", false, false),
+            ("- item\n", false, true),
+            // The leading bullet is not a list marker here: the complete line
+            // is a thematic break, so the parser emits a top-level Rule.
+            ("- ---\n", true, false),
+            ("--- text\n", false, false),
         ] {
             let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
             assert_eq!(
@@ -4036,17 +4039,53 @@ mod tests {
                 is_rule,
                 "Rule must follow parser context for {source:?}"
             );
+            assert_eq!(
+                parsed
+                    .tree
+                    .iter()
+                    .any(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. })),
+                has_list_item,
+                "list-item ancestry must follow parser context for {source:?}"
+            );
         }
     }
 
     #[test]
     fn thematic_break_inside_list_keeps_list_and_quote_presentation_context() {
-        for (source, quoted, indented) in [
-            ("- ---\n", false, false),
-            ("  - ---\n", false, true),
-            ("> - ---\n", true, false),
+        for (source, quoted) in [
+            ("- item\n\n  ---\n", false),
+            ("> - item\n>\n>   ---\n", true),
         ] {
             let range = SourceRange::new(0, source.len());
+            let parsed = parse_document(Revision(1), range, source);
+            let rule_id = parsed
+                .tree
+                .iter()
+                .find_map(|(id, node)| (node.kind == NodeKind::Rule).then_some(id))
+                .expect("parser-confirmed thematic break");
+            let ancestors = parsed
+                .tree
+                .ancestors(rule_id)
+                .skip(1)
+                .filter_map(|id| parsed.tree.node(id).map(|node| node.kind))
+                .collect::<Vec<_>>();
+            assert!(
+                ancestors
+                    .iter()
+                    .any(|kind| matches!(kind, NodeKind::List { .. })),
+                "Rule must be nested in a List: {source:?}"
+            );
+            assert!(
+                ancestors
+                    .iter()
+                    .any(|kind| matches!(kind, NodeKind::ListItem { .. })),
+                "Rule must be nested in a ListItem: {source:?}"
+            );
+            assert_eq!(
+                ancestors.iter().any(|kind| *kind == NodeKind::Quote),
+                quoted,
+                "quote ancestry must follow parser context for {source:?}"
+            );
             let inactive = present_markdown_with_disclosure(
                 0,
                 Revision(1),
@@ -4061,7 +4100,7 @@ mod tests {
             assert_eq!(list.role, ListRowRole::Opening);
             assert_eq!(list.owner.depth, 1);
             assert_eq!(list.owner.marker_kind, ListMarkerKind::Bullet);
-            assert_eq!(list.structural_prefixes.is_empty(), !indented);
+            assert!(!list.structural_prefixes.is_empty(), "source: {source:?}");
             assert_eq!(inactive.source_map.segments.len(), 1);
             assert_eq!(inactive.source_map.segments[0].source_range, range);
             assert_eq!(
