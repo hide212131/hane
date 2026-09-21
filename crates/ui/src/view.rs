@@ -738,10 +738,12 @@ pub struct EditorView {
     /// run while retaining measured heights on both sides.
     height_blocks: HeightBlocks,
     document_parse_job_running: bool,
-    /// The non-empty disclosure for which the last background height snapshot
-    /// was requested. Selection drags can change this on every pointer event;
+    /// The disclosure for which the last background height snapshot was
+    /// requested. Selection drags can change this on every pointer event;
     /// keeping it here coalesces identical requests without walking the whole
-    /// selected block range on the input thread.
+    /// selected block range on the input thread. Empty disclosures matter too:
+    /// they are the snapshot that collapses the middle of a selection after
+    /// the selection is reduced to a caret.
     last_background_height_disclosure: Option<(Revision, SourceRange)>,
     /// The disclosure represented by the current height tree at the last
     /// bounded synchronization. Keeping the previous caret endpoints lets a
@@ -3500,7 +3502,18 @@ impl EditorView {
             .is_some_and(|disclosure| {
                 self.last_background_height_disclosure != Some((revision, disclosure))
             });
-        if !self.block_index.needs_formal_parse(document) && !disclosure_refresh {
+        let disclosure_collapse = disclosure
+            .filter(|disclosure| disclosure.is_empty())
+            .is_some_and(|_| {
+                self.last_background_height_disclosure
+                    .is_some_and(|(background_revision, background)| {
+                        background_revision == revision && !background.is_empty()
+                    })
+            });
+        if !self.block_index.needs_formal_parse(document)
+            && !disclosure_refresh
+            && !disclosure_collapse
+        {
             return;
         }
         if self.document_parse_job_running {
@@ -3510,7 +3523,7 @@ impl EditorView {
         let key = self.document_key();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
-        if let Some(disclosure) = disclosure.filter(|disclosure| !disclosure.is_empty()) {
+        if let Some(disclosure) = disclosure {
             self.last_background_height_disclosure = Some((revision, disclosure));
         }
         let snapshot = self.editor().document().clone();
@@ -3588,25 +3601,33 @@ impl EditorView {
                     && len == heights.len()
                 {
                     view.install_heights(granularity, heights);
-                    if let Some(disclosure) = disclosure.filter(|disclosure| !disclosure.is_empty())
-                    {
+                    if let Some(disclosure) = disclosure {
                         view.last_background_height_disclosure = Some((revision, disclosure));
                     }
                 } else {
                     // The parse was rebased onto edits, or the caret/IME moved
                     // while it ran, so the prepared heights no longer describe
-                    // the current disclosure. A changed non-empty selection is
-                    // deliberately retried in another background snapshot;
-                    // rebuilding all selected blocks here would put the same
-                    // document-sized walk back on the input thread at the
-                    // completion boundary. The bounded active-end update keeps
-                    // the caret addressable until that snapshot lands.
+                    // the current disclosure. A changed selection, including
+                    // a non-empty selection collapsing to a caret, is retried
+                    // in another background snapshot; rebuilding all selected
+                    // blocks here would put the same document-sized walk back
+                    // on the input thread at the completion boundary. The
+                    // bounded active-end update keeps the caret addressable
+                    // until that snapshot lands.
                     let current_disclosure = view.active_height_disclosure();
-                    if current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
-                        && current_disclosure != disclosure
-                    {
+                    let selection_snapshot_requires_retry = current_disclosure
+                        != disclosure
+                        && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
+                            || disclosure.is_some_and(|disclosure| !disclosure.is_empty()));
+                    if selection_snapshot_requires_retry {
                         view.ensure_active_disclosure_height();
                         view.schedule_document_parse(cx);
+                    } else if current_disclosure != disclosure {
+                        // Moving between two caret disclosures only needs the
+                        // bounded endpoint update; a whole-document snapshot
+                        // would make ordinary cursor motion unnecessarily
+                        // expensive.
+                        view.ensure_active_disclosure_height();
                     } else {
                         view.resync_heights_for_current_disclosure();
                     }
@@ -8679,6 +8700,85 @@ mod tests {
                     .height(8)
                     .is_some_and(|height| height > inactive_middle_height),
                 "the background disclosure snapshot must expand selected fence blocks"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_height_snapshot_collapses_middle_blocks_when_selection_ends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..16)
+            .map(|_| "```\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        let inactive_middle_height = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    index,
+                    view.line_height(),
+                    None,
+                )),
+            );
+            let inactive_middle_height = view.heights.height(8).expect("middle block height");
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            inactive_middle_height
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let expanded_middle_height = view.read_with(cx, |view, _| {
+            let height = view.heights.height(8).expect("selected middle block height");
+            assert!(height > inactive_middle_height);
+            height
+        });
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.document_parse_job_running,
+                "collapsing a selection must refresh heights off the input path"
+            );
+            assert_eq!(
+                view.heights.height(8),
+                Some(expanded_middle_height),
+                "the middle block must not be synchronously scanned on caret movement"
+            );
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.heights.height(8),
+                Some(inactive_middle_height),
+                "the empty disclosure snapshot must collapse the old selection interior"
+            );
+            assert!(
+                view.heights.height(0).is_some_and(|height| height > 0.0),
+                "the caret-owned fence block must remain addressable"
             );
         });
     }
