@@ -994,6 +994,11 @@ pub struct BlockWindow<'a> {
     /// inactive vertical footprint. They are height-accounting context only:
     /// never joined into paragraph/list parsing and never rendered directly.
     pub clipped_fence_lines: &'a [BlockLine<'a>],
+    /// Inactive nested fence rows clipped above/below the render window.
+    /// These are pre-counted from the formal projection so presentation does
+    /// not materialize off-screen source rows merely to account for height.
+    pub zero_height_fence_rows_before: usize,
+    pub zero_height_fence_rows_after: usize,
     /// The subset of `lines` (by document line number) to actually turn into
     /// presented [`VisualLine`]s. Lines in `lines` outside this range are
     /// parsing context only and are not drawn.
@@ -1127,8 +1132,8 @@ pub fn present_block_with_list_projection(
     let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
     let first_presented_line = window.span.start.saturating_add(lines_before);
     let presented_end = first_presented_line.saturating_add(lines.len());
-    let mut zero_height_lines_before = 0;
-    let mut zero_height_lines_after = 0;
+    let mut zero_height_lines_before = window.zero_height_fence_rows_before;
+    let mut zero_height_lines_after = window.zero_height_fence_rows_after;
     let mut record_collapsed = |line: usize, collapsed: bool| {
         if !collapsed {
             return;
@@ -1160,29 +1165,6 @@ pub fn present_block_with_list_projection(
             record_collapsed(line.line, collapsed);
         }
     }
-    if context != LineContext::FencedCode {
-        for line in window.lines {
-            if first_presented_line <= line.line && line.line < presented_end {
-                continue;
-            }
-            let collapsed = list_projection.is_some_and(|projection| {
-                projection.is_code_block_for_range(line.range) == Some(true)
-                    && projection.fence_markers_in(line.range).next().is_some()
-                    && present_markdown_with_list_projection(
-                        line.line as u64,
-                        revision,
-                        line.range,
-                        line.text,
-                        line_height,
-                        line.disclosure,
-                        Some(projection),
-                    )
-                    .height()
-                        == 0.0
-            });
-            record_collapsed(line.line, collapsed);
-        }
-    }
     for line in window.clipped_fence_lines {
         let collapsed = if context == LineContext::FencedCode {
             fence_line_role(line.line, content_end, line.text, fence_opening)
@@ -1199,21 +1181,6 @@ pub fn present_block_with_list_projection(
                     .height()
                         == 0.0
                 })
-        } else if list_projection.is_some_and(|projection| {
-            projection.is_code_block_for_range(line.range) == Some(true)
-                && projection.fence_markers_in(line.range).next().is_some()
-        }) {
-            present_markdown_with_list_projection(
-                line.line as u64,
-                revision,
-                line.range,
-                line.text,
-                line_height,
-                line.disclosure,
-                list_projection,
-            )
-            .height()
-                == 0.0
         } else {
             false
         };
@@ -4590,6 +4557,8 @@ mod tests {
                 trailing_blank_lines: 0,
                 lines: &lines,
                 clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
                 render: 0..lines.len(),
                 joined: Some(&joined),
                 block_disclosure: None,
@@ -5439,6 +5408,8 @@ mod tests {
                 trailing_blank_lines: 0,
                 lines: &lines,
                 clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
                 render: 0..2,
                 joined: Some(&joined),
                 block_disclosure: Some(disclosure),
@@ -5559,6 +5530,8 @@ mod tests {
             trailing_blank_lines: 0,
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..2,
             joined: None,
             block_disclosure: None,
@@ -5642,6 +5615,8 @@ mod tests {
             trailing_blank_lines: 0,
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..3,
             joined: None,
             block_disclosure: None,
@@ -5736,6 +5711,8 @@ mod tests {
             trailing_blank_lines: 0,
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..2,
             joined: Some(&joined),
             block_disclosure: None,
@@ -5748,6 +5725,8 @@ mod tests {
             trailing_blank_lines: 0,
             lines: narrow_lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..1,
             joined: Some(&joined),
             block_disclosure: None,
@@ -5833,6 +5812,8 @@ mod tests {
             trailing_blank_lines: 0,
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..lines.len(),
             joined: None,
             block_disclosure: None,
@@ -6135,6 +6116,8 @@ mod tests {
             render: 0..lines.len(),
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             joined: None,
             block_disclosure: None,
         };
@@ -6195,6 +6178,8 @@ mod tests {
             render: 0..lines.len(),
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             joined: None,
             block_disclosure: None,
         };
