@@ -247,11 +247,33 @@ impl BlockLayout {
             .sum()
     }
 
-    /// Mean height of a presented line, used to estimate how far into a block a
-    /// scroll position falls before that part of the block has been laid out.
+    /// Mean height of a visible presented line, used to estimate how far into a
+    /// block a scroll position falls before that part of the block has been laid
+    /// out. A zero-height line is a collapsed structural row (for example an
+    /// inactive fence delimiter), not a visual row; including it in the
+    /// denominator would make a visual y position look farther into the block
+    /// than it really is before the fence projection is inverted.
     pub fn average_line_height(&self) -> Option<f32> {
-        let lines = self.lines.last().map(|row| row.line + 1)?;
-        (lines > 0).then(|| self.lines.iter().map(|row| row.height).sum::<f32>() / lines as f32)
+        let mut total = 0.0;
+        let mut count = 0;
+        let mut current_line = None;
+        let mut current_height = 0.0;
+        for row in &self.lines {
+            if current_line != Some(row.line) {
+                if current_line.is_some() && current_height > 0.0 {
+                    total += current_height;
+                    count += 1;
+                }
+                current_line = Some(row.line);
+                current_height = 0.0;
+            }
+            current_height += row.height;
+        }
+        if current_line.is_some() && current_height > 0.0 {
+            total += current_height;
+            count += 1;
+        }
+        (count > 0).then(|| total / count as f32)
     }
 
     /// The row a source offset renders on.
