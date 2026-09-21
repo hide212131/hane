@@ -1160,6 +1160,29 @@ pub fn present_block_with_list_projection(
             record_collapsed(line.line, collapsed);
         }
     }
+    if context != LineContext::FencedCode {
+        for line in window.lines {
+            if first_presented_line <= line.line && line.line < presented_end {
+                continue;
+            }
+            let collapsed = list_projection.is_some_and(|projection| {
+                projection.is_code_block_for_range(line.range) == Some(true)
+                    && projection.fence_markers_in(line.range).next().is_some()
+                    && present_markdown_with_list_projection(
+                        line.line as u64,
+                        revision,
+                        line.range,
+                        line.text,
+                        line_height,
+                        line.disclosure,
+                        Some(projection),
+                    )
+                    .height()
+                        == 0.0
+            });
+            record_collapsed(line.line, collapsed);
+        }
+    }
     for line in window.clipped_fence_lines {
         let collapsed = if context == LineContext::FencedCode {
             fence_line_role(line.line, content_end, line.text, fence_opening)
