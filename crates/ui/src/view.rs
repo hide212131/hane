@@ -6446,6 +6446,9 @@ impl EditorView {
                     .child(label)
                     .on_click(cx.listener(move |view, _, window, cx| {
                         window.focus(&view.focus_handle);
+                        if !view.cancel_inline_rename(cx) {
+                            return;
+                        }
                         view.activate_session(id, cx);
                     }))
             })
@@ -9724,6 +9727,61 @@ mod tests {
             first_id,
             "clicking a tab must switch through the active-session path"
         );
+    }
+
+    #[gpui::test]
+    fn file_tab_click_during_pending_inline_rename_keeps_the_active_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut sessions = SessionSet::with_untitled("first", "First");
+        let second_id = sessions.open_untitled("second", "Second");
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                sessions,
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(480.0)));
+        cx.run_until_parked();
+
+        let first_tab = cx
+            .debug_bounds("file-tab-0")
+            .expect("the first open session must render a tab");
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("note.md"),
+                text: "renamed".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..7,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: true,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_click(first_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.active_session().id(),
+                second_id,
+                "a pending rename must block tab navigation"
+            );
+            assert_eq!(view.status.as_deref(), Some("Rename in progress"));
+            assert!(
+                view.inline_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.pending),
+                "the pending rename must remain active"
+            );
+        });
     }
 
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
