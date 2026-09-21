@@ -571,6 +571,11 @@ pub struct EditorView {
     sidebar_resize_drag: Option<SidebarResizeDrag>,
     /// Native scroll state for the work-folder list; a custom thumb mirrors it.
     sidebar_scroll: ScrollHandle,
+    /// Native horizontal scroll state for the file-tab strip.
+    file_tab_scroll: ScrollHandle,
+    /// The session whose tab was last made active, used to reveal a newly
+    /// selected tab without resetting user-driven horizontal scrolling.
+    file_tab_active_id: Option<SessionId>,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
@@ -2085,6 +2090,8 @@ impl EditorView {
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
+            file_tab_scroll: ScrollHandle::new(),
+            file_tab_active_id: None,
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
@@ -6420,8 +6427,18 @@ fn tab_foreground(theme: &Theme, is_active: bool) -> u32 {
 }
 
 impl EditorView {
-    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn header_element(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let active_id = self.sessions.active_id();
+        if self.file_tab_active_id != Some(active_id) {
+            self.file_tab_active_id = Some(active_id);
+            if let Some(index) = self
+                .sessions
+                .sessions()
+                .position(|session| session.id() == active_id)
+            {
+                self.file_tab_scroll.scroll_to_item(index);
+            }
+        }
         let tabs = self
             .sessions
             .sessions()
@@ -6467,8 +6484,12 @@ impl EditorView {
                 div()
                     .debug_selector(|| "file-tab".to_owned())
                     .h_full()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .items_center()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.file_tab_scroll)
                     .children(tabs),
             )
     }
@@ -9726,6 +9747,71 @@ mod tests {
             view.read_with(cx, |view, _| view.active_session().id()),
             first_id,
             "clicking a tab must switch through the active-session path"
+        );
+    }
+
+    #[gpui::test]
+    fn narrow_file_tab_strip_scrolls_to_and_activates_a_later_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut sessions = SessionSet::with_untitled(
+            "first",
+            "First session with a deliberately long tab label",
+        );
+        let first_id = sessions.active_id();
+        let mut last_id = first_id;
+        for index in 1..=5 {
+            last_id = sessions.open_untitled(
+                &format!("session {index}"),
+                format!("Session {index} with a deliberately long tab label"),
+            );
+        }
+        sessions.activate(first_id);
+
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                sessions,
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(320.0), px(480.0)));
+        cx.run_until_parked();
+
+        let tab_strip = cx.debug_bounds("file-tab").expect("file tab strip renders");
+        let last_tab_before = cx
+            .debug_bounds("file-tab-5")
+            .expect("the later session tab renders outside the narrow strip");
+        assert!(
+            last_tab_before.origin.x >= tab_strip.right(),
+            "the later tab should start beyond the initial viewport: {last_tab_before:?} vs {tab_strip:?}"
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: tab_strip.center(),
+            delta: ScrollDelta::Pixels(point(px(-2_000.0), px(0.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        let tab_strip = cx.debug_bounds("file-tab").expect("file tab strip renders");
+        let last_tab = cx
+            .debug_bounds("file-tab-5")
+            .expect("the later session tab remains rendered after scrolling");
+        assert!(
+            last_tab.origin.x >= tab_strip.origin.x
+                && last_tab.right() <= tab_strip.right(),
+            "horizontal scrolling must bring the later tab into the viewport: {last_tab:?} vs {tab_strip:?}"
+        );
+
+        cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_session().id()),
+            last_id,
+            "a later tab must remain reachable and activate through the normal click path"
         );
     }
 
