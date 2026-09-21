@@ -601,7 +601,9 @@ fn line_geometry(
     let Some(list) = &line.list else {
         let quote_x = line
             .quote
-            .map_or(0.0, |quote| quote.depth as f32 * QUOTE_DEPTH_INDENT);
+            .map_or(0.0, |quote| {
+                quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+            });
         return LineGeometry {
             marker_x_origin: None,
             body_x_origin: quote_x,
@@ -617,7 +619,9 @@ fn line_geometry(
     };
     let quote_x = line
         .quote
-        .map_or(0.0, |quote| quote.depth as f32 * QUOTE_DEPTH_INDENT);
+        .map_or(0.0, |quote| {
+            quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+        });
     let marker_x = quote_x + list_depth_x(list.owner.depth);
     let aggregate_marker_width = marker_widths
         .get(&list.owner.list_id)

@@ -562,6 +562,10 @@ pub struct ListRowMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuoteRowMetadata {
     pub depth: usize,
+    /// Number of this row's formal quote prefixes that are visible as source
+    /// bytes. Layout keeps semantic inset only for the remaining hidden quote
+    /// depth, so disclosed prefixes do not consume the same space twice.
+    pub disclosed_depth: usize,
 }
 
 impl ListRowMetadata {
@@ -1862,6 +1866,7 @@ fn present_markdown_from_parse(
                 || marker.formal_container
         });
     }
+    let markers_on_line = projected_markers.as_slice();
     let quote_depth = nodes
         .iter()
         .filter_map(|id| parsed.tree.node(**id))
@@ -1883,6 +1888,24 @@ fn present_markdown_from_parse(
                 .max()
                 .unwrap_or(0),
         );
+    let disclosed_quote_depth = markers_on_line
+        .iter()
+        .filter(|planned| {
+            (planned.quote_owner.is_some() || planned.formal_quote_owner.is_some())
+                && marker_is_disclosed(
+                    planned,
+                    parsed,
+                    &shared.projection.nodes,
+                    disclosure,
+                    shared.list_projection,
+                )
+        })
+        .count()
+        .min(quote_depth);
+    let quote = (quote_depth > 0).then_some(QuoteRowMetadata {
+        depth: quote_depth,
+        disclosed_depth: disclosed_quote_depth,
+    });
     if quote_depth > 0 && kind == BlockKind::Paragraph {
         kind = BlockKind::Quote;
     }
@@ -1894,10 +1917,9 @@ fn present_markdown_from_parse(
             source,
             line_height,
             disclosure,
-            (quote_depth > 0).then_some(QuoteRowMetadata { depth: quote_depth }),
+            quote,
         );
     }
-    let markers_on_line = projected_markers.as_slice();
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
     for planned in markers_on_line {
@@ -2067,7 +2089,7 @@ fn present_markdown_from_parse(
         disclosure,
         image: None,
         list,
-        quote: (quote_depth > 0).then_some(QuoteRowMetadata { depth: quote_depth }),
+        quote,
     }
 }
 
@@ -3879,8 +3901,20 @@ mod tests {
 
         assert_eq!(visual.lines[0].visual_text, "outer");
         assert_eq!(visual.lines[1].visual_text, "inner");
-        assert_eq!(visual.lines[0].quote, Some(QuoteRowMetadata { depth: 1 }));
-        assert_eq!(visual.lines[1].quote, Some(QuoteRowMetadata { depth: 2 }));
+        assert_eq!(
+            visual.lines[0].quote,
+            Some(QuoteRowMetadata {
+                depth: 1,
+                disclosed_depth: 0,
+            })
+        );
+        assert_eq!(
+            visual.lines[1].quote,
+            Some(QuoteRowMetadata {
+                depth: 2,
+                disclosed_depth: 0,
+            })
+        );
         assert!(visual.lines[1]
             .style_runs
             .iter()
@@ -3929,7 +3963,13 @@ mod tests {
 
         assert_eq!(visual.lines[0].visual_text, "continuation");
         assert_eq!(visual.lines[0].kind, BlockKind::Quote);
-        assert_eq!(visual.lines[0].quote, Some(QuoteRowMetadata { depth: 1 }));
+        assert_eq!(
+            visual.lines[0].quote,
+            Some(QuoteRowMetadata {
+                depth: 1,
+                disclosed_depth: 0,
+            })
+        );
     }
 
     #[test]

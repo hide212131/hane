@@ -838,6 +838,62 @@ fn disclosed_quote_prefix_width_is_included_in_list_body_geometry() {
 }
 
 #[test]
+fn disclosed_quote_prefix_uses_source_width_without_semantic_inset() {
+    let source = "> item\n";
+    let cursor = source.find("item").expect("item in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the quoted row is laid out");
+
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 0.0);
+    assert_eq!(
+        layout
+            .point_for_source(&block, SourceOffset(cursor), &shaper())
+            .expect("item has a point")
+            .x,
+        16.0
+    );
+}
+
+#[test]
+fn disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset() {
+    let source = "> outer\n> > nested\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+
+    assert_eq!(
+        block.lines[0]
+            .quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((1, 1))
+    );
+    assert_eq!(
+        block.lines[1]
+            .quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((2, 1))
+    );
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let nested = SourceOffset(source.find("nested").expect("nested in source"));
+    let point = layout
+        .point_for_source(&block, nested, &shaper())
+        .expect("nested text has a point");
+    assert_eq!(point.x, 40.0);
+}
+
+#[test]
 fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
     let source = "- outer\n\n  - inner\n";
     let block = present(source, None)
