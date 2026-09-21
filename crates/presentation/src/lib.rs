@@ -4429,7 +4429,7 @@ mod tests {
                 "Rule must be nested in a ListItem: {source:?}"
             );
             assert_eq!(
-                ancestors.iter().any(|kind| *kind == NodeKind::Quote),
+                ancestors.contains(&NodeKind::Quote),
                 quoted,
                 "quote ancestry must follow parser context for {source:?}"
             );
@@ -4443,7 +4443,7 @@ mod tests {
             let line_start = source[..rule_start]
                 .rfind('\n')
                 .map_or(0, |newline| newline + 1);
-            let rule_line = |active| {
+            let rule_line = |active: bool| {
                 let mut offset = 0;
                 let lines = source
                     .split_inclusive('\n')

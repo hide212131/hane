@@ -93,9 +93,9 @@ pub struct LayoutLine {
     pub body_visual_start: Option<usize>,
     /// The visual range of the marker displayed on this line, if any.
     pub marker_visual_range: Option<Range<usize>>,
-    /// Geometry-only gap between the displayed marker and the aligned body
-    /// column. It is zero for continuation rows and for a marker already as
-    /// wide as the list's aggregate label.
+    /// Geometry-only gap between an inactive displayed marker and the aligned
+    /// body column. It is zero for continuation rows and disclosed source
+    /// markers.
     pub marker_body_gap: f32,
     /// x of the quote bar in the block's text column, when this row is quoted.
     pub quote_bar_x_origin: Option<f32>,
@@ -688,7 +688,7 @@ fn line_geometry(
     // marker column so inactive continuation rows still hang under the body.
     // Synthesized markers participate in the list-wide inactive alignment
     // column. Once a marker is disclosed, the source-visible marker is the
-    // coordinate truth: retaining the aggregate column would leave a
+    // coordinate truth: retaining the aggregate column here would leave a
     // geometry-only gap between the raw marker and its body.
     let marker_column_width = if list
         .marker
