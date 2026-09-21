@@ -16,8 +16,8 @@ use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuf
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
-    BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove, VisualBlock,
-    block_line_span, layout_block, present_block, trailing_blank_lines,
+    BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
+    VisualBlock, VisualOffset, block_line_span, layout_block, present_block, trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -861,6 +861,76 @@ fn disclosed_quote_prefix_uses_source_width_without_semantic_inset() {
             .x,
         16.0
     );
+}
+
+#[test]
+fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
+    for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
+        let rule_start = source.find("---").expect("rule source");
+        let line_start = source[..rule_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let rule_line = source[..line_start].bytes().filter(|byte| *byte == b'\n').count();
+        let quoted = source.starts_with('>');
+        let inactive_block = present(source, None)
+            .into_iter()
+            .find(|block| {
+                block.lines.iter().any(|line| {
+                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
+                })
+            })
+            .expect("the nested rule block is presented");
+        let inactive_layout = layout_block(&inactive_block, 160.0, &shaper());
+        let inactive_row = inactive_layout
+            .lines
+            .iter()
+            .find(|row| row.line == rule_line)
+            .expect("collapsed rule row is laid out");
+        let expected_collapsed_body = if quoted { 40.0 } else { 16.0 };
+        assert_eq!(inactive_row.text_x_origin, expected_collapsed_body);
+        assert_eq!(inactive_row.body_x_origin, expected_collapsed_body);
+        assert_eq!(
+            inactive_row.quote_bar_x_origin,
+            quoted.then_some(14.0),
+            "source: {source:?}"
+        );
+
+        let active_block = present(source, Some(rule_start + 1))
+            .into_iter()
+            .find(|block| {
+                block.lines.iter().any(|line| {
+                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
+                })
+            })
+            .expect("the active nested rule block is presented");
+        let active_line = active_block
+            .lines
+            .iter()
+            .find(|line| line.line_id as usize == rule_line)
+            .expect("active rule line");
+        assert_eq!(
+            active_line
+                .list
+                .as_ref()
+                .expect("active rule keeps list metadata")
+                .body_visual_start,
+            VisualOffset(rule_start - line_start)
+        );
+        let active_layout = layout_block(&active_block, 160.0, &shaper());
+        let active_row = active_layout
+            .lines
+            .iter()
+            .find(|row| row.line == rule_line)
+            .expect("active rule row is laid out");
+        let expected_active_body = (rule_start - line_start) as f32 * 8.0;
+        assert_eq!(active_row.text_x_origin, 0.0, "source: {source:?}");
+        assert_eq!(
+            active_row.body_x_origin,
+            expected_active_body,
+            "source: {source:?}"
+        );
+        assert_eq!(active_row.quote_bar_x_origin, None);
+    }
 }
 
 #[test]
