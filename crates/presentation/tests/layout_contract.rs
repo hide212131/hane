@@ -244,6 +244,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     render: span.clone(),
                     span,
                     lines: &lines,
+                    clipped_fence_lines: &[],
                     joined: None,
                     block_disclosure: None,
                 },
