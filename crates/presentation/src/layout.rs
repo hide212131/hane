@@ -666,12 +666,21 @@ fn line_geometry(
     });
     let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
     let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
-    let marker_x = quote_x
-        + list_depth_x(list.owner.depth)
+    let quote_prefix_before_list = quote_prefix_after_outer
+        && list.marker.as_ref().is_some_and(|marker| {
+            line.quote_marker_visual_ranges
+                .first()
+                .is_some_and(|quote| quote.start < marker.visual_range.start)
+        });
+    let marker_x = list_depth_x(list.owner.depth)
         + if quote_prefix_after_outer {
-            quote_prefix_width
+            if quote_prefix_before_list {
+                quote_x + quote_prefix_width
+            } else {
+                0.0
+            }
         } else {
-            0.0
+            quote_x
         };
     let aggregate_marker_width = marker_widths
         .get(&list.owner.list_id)
@@ -684,12 +693,18 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let body_visual_start = match list.empty_caret_origin {
+    let mut body_visual_start = match list.empty_caret_origin {
         Some(ListCaretOrigin::Marker) => None,
         Some(ListCaretOrigin::Body) => Some(0),
         None => Some(list.body_visual_start.0),
     };
-    let body_visual_start_offset = list.body_visual_start.0;
+    if quote_prefix_after_outer {
+        body_visual_start = match (body_visual_start, quote_prefix_end) {
+            (Some(body), Some(prefix_end)) => Some(body.max(prefix_end)),
+            (body, _) => body,
+        };
+    }
+    let body_visual_start_offset = body_visual_start.unwrap_or(list.body_visual_start.0);
     let marker_visual_range = list.marker.as_ref().map(|marker| marker.visual_range);
     let expanded_prefix_width = line
         .source_map
@@ -698,7 +713,11 @@ fn line_geometry(
         .filter(|segment| {
             segment.visibility == crate::Visibility::ExpandedMarkup
                 && (!quote_prefix_after_outer
-                    || quote_prefix_end.is_none_or(|end| segment.visual_range.start.0 >= end))
+                    || !line
+                        .quote_marker_visual_ranges
+                        .iter()
+                        .take(line.quote.map_or(0, |quote| quote.disclosed_depth))
+                        .any(|range| *range == segment.visual_range))
                 && segment.visual_range.start.0 < body_visual_start_offset
                 && segment.visual_range.end.0 <= body_visual_start_offset
                 && marker_visual_range.as_ref() != Some(&segment.visual_range)
@@ -738,9 +757,17 @@ fn line_geometry(
         .map_or(0.0, |_| {
             (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
         });
-    let body_x = marker_x + expanded_prefix_width + marker_column_width;
     let opening_marker =
         list.marker.is_some() || list.empty_caret_origin == Some(ListCaretOrigin::Marker);
+    let body_x = if quote_prefix_after_outer {
+        let body = body_visual_start.unwrap_or(body_visual_start_offset);
+        shaper.x_for_offset(line, 0..body, body)
+            + quote_x
+            + list_depth_x(list.owner.depth)
+            + marker_body_gap
+    } else {
+        marker_x + expanded_prefix_width + marker_column_width
+    };
     let text_x_origin = if quote_prefix_after_outer {
         0.0
     } else if opening_marker {
@@ -787,23 +814,14 @@ fn disclosed_quote_prefix(line: &VisualLine, shaper: &dyn LineShaper) -> (Option
     }
 
     let mut disclosed = 0;
-    let mut width = 0.0;
-    for segment in &line.source_map.segments {
-        if segment.source_range.is_empty() {
-            continue;
-        }
-        if segment.visibility != crate::Visibility::ExpandedMarkup {
-            break;
-        }
+    for marker in &line.quote_marker_visual_ranges {
         disclosed += 1;
-        let visual_end = segment.visual_range.end.0;
-        width += shaper.x_for_offset(
-            line,
-            segment.visual_range.start.0..segment.visual_range.end.0,
-            segment.visual_range.end.0,
-        );
         if disclosed == quote.disclosed_depth {
-            return (Some(visual_end), width);
+            let visual_end = marker.end.0;
+            return (
+                Some(visual_end),
+                shaper.x_for_offset(line, 0..visual_end, visual_end),
+            );
         }
     }
     (None, 0.0)

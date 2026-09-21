@@ -736,6 +736,10 @@ pub struct VisualLine {
     pub list: Option<ListRowMetadata>,
     /// Semantic quote context used by layout/UI to draw the inset and bar.
     pub quote: Option<QuoteRowMetadata>,
+    /// Visual ranges of this line's formal quote markers, in source order.
+    /// Layout uses these ranges to distinguish quote prefixes from other
+    /// expanded container markers such as list indentation.
+    pub quote_marker_visual_ranges: Vec<VisualRange>,
 }
 
 impl VisualLine {
@@ -1285,6 +1289,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         image: None,
         list: None,
         quote: None,
+        quote_marker_visual_ranges: Vec::new(),
     }
 }
 
@@ -1421,6 +1426,7 @@ fn present_rule_line(
             marker_edge: None,
         });
     }
+    let quote_marker_visual_ranges = quote_marker_visual_ranges(markers_on_line, &segments);
     VisualLine {
         line_id,
         source_range: range,
@@ -1437,6 +1443,7 @@ fn present_rule_line(
         image: None,
         list: None,
         quote,
+        quote_marker_visual_ranges,
     }
 }
 
@@ -1877,6 +1884,27 @@ fn append_segment(
         visibility,
         marker_edge,
     });
+}
+
+fn quote_marker_visual_ranges(
+    markers_on_line: &[ProjectedMarker],
+    segments: &[MappingSegment],
+) -> Vec<VisualRange> {
+    markers_on_line
+        .iter()
+        .filter(|marker| {
+            marker.quote_owner.is_some() || marker.formal_quote_owner.is_some()
+        })
+        .filter_map(|marker| {
+            segments
+                .iter()
+                .find(|segment| {
+                    segment.source_range == marker.range
+                        && segment.marker_edge == Some(MarkerEdge::Opening)
+                })
+                .map(|segment| segment.visual_range)
+        })
+        .collect()
 }
 
 /// Builds a native Markdown block with progressive disclosure. Markdown source
@@ -2328,6 +2356,8 @@ fn present_markdown_from_parse(
         }
     }
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+    let quote_marker_visual_ranges =
+        quote_marker_visual_ranges(markers_on_line, &source_map.segments);
     let list = list_row_metadata(
         parsed,
         shared.projection,
@@ -2371,6 +2401,7 @@ fn present_markdown_from_parse(
         image: None,
         list,
         quote,
+        quote_marker_visual_ranges,
     }
 }
 
@@ -3645,6 +3676,7 @@ fn present_fenced_code_opening_line(
         image: None,
         list: None,
         quote: None,
+        quote_marker_visual_ranges: Vec::new(),
     }
 }
 
@@ -3706,6 +3738,7 @@ fn present_fenced_code_closing_line(
         image: None,
         list: None,
         quote: None,
+        quote_marker_visual_ranges: Vec::new(),
     }
 }
 
@@ -3815,6 +3848,7 @@ fn present_image(
         }),
         list: None,
         quote,
+        quote_marker_visual_ranges: Vec::new(),
     }
 }
 
@@ -3849,6 +3883,7 @@ fn present_table_line(
             image: None,
             list: None,
             quote: None,
+            quote_marker_visual_ranges: Vec::new(),
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
@@ -3917,6 +3952,7 @@ fn present_table_line(
         image: None,
         list: None,
         quote: None,
+        quote_marker_visual_ranges: Vec::new(),
     }
 }
 

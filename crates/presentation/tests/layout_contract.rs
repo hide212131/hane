@@ -1104,6 +1104,31 @@ fn caret_on_the_following_line_does_not_disclose_the_previous_rule_body() {
 }
 
 #[test]
+fn collapsed_nested_rule_keeps_the_disclosed_quote_body_gap() {
+    let source = "> outer\n> > ---\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.kind == BlockKind::Rule))
+        .expect("the nested rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::Rule)
+        .expect("the nested rule line is presented");
+    assert!(line.rule_body_is_collapsed());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == line.line_id as usize)
+        .expect("the nested rule row is laid out");
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.body_x_origin, 40.0);
+}
+
+#[test]
 fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
     for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
         let rule_start = source.find("---").expect("rule source");
@@ -1219,6 +1244,53 @@ fn disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset() {
         layout.source_at_x(&block, nested_row_index, 24.0, &shaper()),
         Some(nested)
     );
+}
+
+#[test]
+fn disclosed_quote_prefix_uses_quote_marker_after_leading_indent() {
+    let source = "  > outer\n  > > inner\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the indented quoted block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.line_id == 1)
+        .expect("the nested quote line is presented");
+    assert_eq!(line.quote_marker_visual_ranges.len(), 2);
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the nested quote row is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(46.0));
+}
+
+#[test]
+fn disclosed_quote_prefix_does_not_consume_list_prefix_as_quote() {
+    let source = "- item\n  > outer\n  > > inner\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.line_id == 2))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 2)
+        .expect("the nested quoted continuation is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(46.0));
 }
 
 #[test]

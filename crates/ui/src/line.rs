@@ -561,6 +561,7 @@ pub(crate) fn row_element(
                 .pr(px(theme.line_horizontal_padding))
                 .children(quote_bar(row, theme, zoom))
                 .child(div().flex_none().child(line.visual_text.clone()))
+                .children(body_gap_element(row))
                 .child(
                     div()
                         .h(px(1.0 * zoom))
@@ -735,7 +736,7 @@ fn line_segments(
 
 fn body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
     let body = row.body_visual_start?;
-    (row.body_gap > 0.0 && body > row.line_visual_range.start && body <= row.line_visual_range.end)
+    (body_gap_applies(row, body))
         .then(|| {
             segments
                 .iter()
@@ -743,6 +744,18 @@ fn body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize>
                 .or_else(|| (body == row.line_visual_range.end).then_some(segments.len()))
         })
         .flatten()
+}
+
+fn body_gap_applies(row: &LayoutLine, body: usize) -> bool {
+    row.body_gap > 0.0
+        && body > row.line_visual_range.start
+        && body <= row.line_visual_range.end
+}
+
+fn body_gap_element(row: &LayoutLine) -> Option<Div> {
+    row.body_visual_start
+        .filter(|body| body_gap_applies(row, *body))
+        .map(|_| div().flex_none().w(px(row.body_gap)))
 }
 
 /// Vertical footprint of the caret's input-mode badge below the row it is
