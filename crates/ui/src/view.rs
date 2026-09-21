@@ -2824,10 +2824,15 @@ impl EditorView {
         }
     }
 
+    fn new_work_folder_note_heading() -> String {
+        let today = local_today();
+        format!("# {:04}-{:02}-{:02}_", today.year, today.month, today.day)
+    }
+
     /// Issue #5: starts a brand-new, unnamed note in the current work folder.
-    /// No filename prompt: it opens blank and ready for input immediately,
-    /// and is journalled into the recovery drafts as soon as it holds
-    /// anything, so a crash before it earns a real name never loses it.
+    /// No filename prompt: it opens with a date heading and is ready for input
+    /// immediately, and is journalled into the recovery drafts as soon as it
+    /// holds anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
         if !self.cancel_inline_rename(cx) {
             return;
@@ -2841,7 +2846,14 @@ impl EditorView {
         self.sessions
             .active_mut()
             .set_view_state(SessionViewState { scroll_y });
-        let id = self.sessions.open_untitled("", "Untitled");
+        let heading = Self::new_work_folder_note_heading();
+        let id = self.sessions.open_untitled(&heading, "Untitled");
+        self.sessions
+            .get_mut(id)
+            .expect("new work-folder note session exists")
+            .editor_mut()
+            .set_selection(Selection::caret(SourceOffset(heading.len())))
+            .expect("the new note heading has a valid caret offset");
         self.work_folder_drafts.insert(
             id,
             WorkFolderDraft {
@@ -10523,6 +10535,7 @@ mod tests {
         let root = draft_test_root("switch");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let draft_text = "today I thought about this design";
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -10535,15 +10548,22 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
-            // Start the first unnamed note and type into it.
-            view.new_work_folder_note(cx);
-            view.editor_mut()
-                .insert_text("today I thought about this design")
-                .unwrap();
+            // Use the initial blank session directly so this regression stays
+            // outside the date-heading/title-sync path of new_work_folder_note.
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: root.clone(),
+                },
+            );
+            view.editor_mut().insert_text(draft_text).unwrap();
             view.after_input(cx);
-            // Switch away to a second unnamed note before the debounce timer
-            // for the first one fires.
-            view.new_work_folder_note(cx);
+            // Switch away to a second blank unnamed note before the debounce
+            // timer for the first one fires.
+            view.sessions.open_untitled("", "Untitled");
+            view.on_document_replaced();
         });
 
         // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
@@ -10557,10 +10577,7 @@ mod tests {
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
-        assert_eq!(
-            recovered.drafts[0].text,
-            "today I thought about this design"
-        );
+        assert_eq!(recovered.drafts[0].text, draft_text);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -10579,6 +10596,7 @@ mod tests {
         let old_root = draft_test_root("switch-old");
         std::fs::create_dir_all(&old_root).unwrap();
         let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
 
         let new_root = draft_test_root("switch-new");
         std::fs::create_dir_all(&new_root).unwrap();
@@ -10629,7 +10647,10 @@ mod tests {
         // exactly the way a quit inside the debounce window used to.
         let old_recovered = OsDraftStore.recover(&old_root).unwrap();
         assert_eq!(old_recovered.drafts.len(), 1);
-        assert_eq!(old_recovered.drafts[0].text, "draft in the old folder");
+        assert_eq!(
+            old_recovered.drafts[0].text,
+            format!("{heading}draft in the old folder")
+        );
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
@@ -10800,6 +10821,7 @@ mod tests {
         let root = draft_test_root("quit-flush");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -10825,7 +10847,7 @@ mod tests {
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(
             recovered.drafts[0].text,
-            "quitting before the debounce fires"
+            format!("{heading}quitting before the debounce fires")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -11057,13 +11079,14 @@ mod tests {
         cx.run_until_parked();
     }
 
-    // Issue #6: an unnamed work-folder note earns its filename from the
-    // first H1 it is given, with no filename prompt.
     #[gpui::test]
-    fn a_new_notes_first_h1_names_its_file(cx: &mut gpui::TestAppContext) {
-        let root = draft_test_root("h1-create");
+    fn a_new_work_folder_note_starts_with_a_local_date_heading_and_caret_after_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("date-heading");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let expected = EditorView::new_work_folder_note_heading();
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -11077,18 +11100,50 @@ mod tests {
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# LangChain4j").unwrap();
+
+            assert_eq!(view.editor().document().full_text(), expected);
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(expected.len()))
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #6: an unnamed work-folder note earns its filename from the
+    // first H1 it is given, with no filename prompt.
+    #[gpui::test]
+    fn a_new_notes_first_h1_names_its_file(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join(format!("{title_prefix}LangChain4j.md"));
+        let expected_title = format!("{title_prefix}LangChain4j");
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("LangChain4j").unwrap();
             view.after_input(cx);
         });
 
         settle_debounce(cx);
 
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.active_session().path(),
-                Some(root.join("LangChain4j.md").as_path())
-            );
-            assert_eq!(view.active_session().auto_title(), Some("LangChain4j"));
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+            assert_eq!(view.active_session().auto_title(), Some(expected_title.as_str()));
             assert!(!view.active_session().is_dirty());
             // The sidebar renders `work_folder.entries()`; a note created
             // from its H1 must appear there right away, without waiting for
@@ -11098,14 +11153,14 @@ mod tests {
                 view.work_folder
                     .as_ref()
                     .unwrap()
-                    .entry_for_path(&root.join("LangChain4j.md"))
+                    .entry_for_path(&expected_path)
                     .is_some(),
                 "the new note must appear in the work folder index"
             );
         });
         assert_eq!(
-            std::fs::read_to_string(root.join("LangChain4j.md")).unwrap(),
-            "# LangChain4j"
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}LangChain4j")
         );
         assert!(
             OsDraftStore.recover(&root).unwrap().drafts.is_empty(),
@@ -11394,6 +11449,9 @@ mod tests {
         let root = draft_test_root("h1-create-in-folder");
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -11408,21 +11466,18 @@ mod tests {
             view.work_folder = Some(work_folder);
             view.selected_folder = Some(root.join("dev"));
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
             view.after_input(cx);
         });
 
         settle_debounce(cx);
 
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.active_session().path(),
-                Some(root.join("dev/GPUI.md").as_path())
-            );
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
         });
         assert_eq!(
-            std::fs::read_to_string(root.join("dev/GPUI.md")).unwrap(),
-            "# GPUI"
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -11437,6 +11492,11 @@ mod tests {
         let root = draft_test_root("h1-rename-in-folder");
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let renamed_path = root
+            .join("dev")
+            .join(format!("{title_prefix}GPUI Notes.md"));
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -11451,7 +11511,7 @@ mod tests {
             view.work_folder = Some(work_folder);
             view.selected_folder = Some(root.join("dev"));
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
             view.after_input(cx);
         });
         settle_debounce(cx);
@@ -11470,7 +11530,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.active_session().path(),
-                Some(root.join("dev/GPUI Notes.md").as_path()),
+                Some(renamed_path.as_path()),
                 "the rename must stay inside dev/, not move to the work folder root"
             );
         });
@@ -11485,6 +11545,11 @@ mod tests {
         let root = draft_test_root("h1-rename");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let initial_path = root.join(format!("{title_prefix}LangChain4j.md"));
+        let renamed_path = root.join(format!("{title_prefix}LangChain4j Agent.md"));
+        let expected_title = format!("{title_prefix}LangChain4j Agent");
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -11498,7 +11563,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# LangChain4j").unwrap();
+            view.editor_mut().insert_text("LangChain4j").unwrap();
             view.after_input(cx);
         });
         settle_debounce(cx);
@@ -11517,11 +11582,11 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.active_session().path(),
-                Some(root.join("LangChain4j Agent.md").as_path())
+                Some(renamed_path.as_path())
             );
             assert_eq!(
                 view.active_session().auto_title(),
-                Some("LangChain4j Agent")
+                Some(expected_title.as_str())
             );
             // The sidebar index must follow the rename too: otherwise it
             // keeps showing the old name (which no longer exists on disk)
@@ -11529,21 +11594,21 @@ mod tests {
             let folder = view.work_folder.as_ref().unwrap();
             assert!(
                 folder
-                    .entry_for_path(&root.join("LangChain4j.md"))
+                    .entry_for_path(&initial_path)
                     .is_none(),
                 "the stale pre-rename path must not linger in the sidebar"
             );
             assert!(
                 folder
-                    .entry_for_path(&root.join("LangChain4j Agent.md"))
+                    .entry_for_path(&renamed_path)
                     .is_some(),
                 "the renamed note must be reachable from the sidebar"
             );
         });
-        assert!(!root.join("LangChain4j.md").exists());
+        assert!(!initial_path.exists());
         assert_eq!(
-            std::fs::read_to_string(root.join("LangChain4j Agent.md")).unwrap(),
-            "# LangChain4j Agent"
+            std::fs::read_to_string(&renamed_path).unwrap(),
+            format!("{heading}LangChain4j Agent")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
