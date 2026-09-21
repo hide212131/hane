@@ -113,15 +113,7 @@ pub(crate) fn presented_block(
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
-    presented_block_with_list_projection(
-        editor,
-        block,
-        visible,
-        joined,
-        None,
-        None,
-        DEFAULT_LINE_HEIGHT,
-    )
+    presented_block_with_list_projection(editor, block, visible, joined, None, DEFAULT_LINE_HEIGHT)
 }
 
 /// `line_height` is the caller's zoomed row height (`EditorView::line_height`
@@ -129,6 +121,25 @@ pub(crate) fn presented_block(
 /// tests). It seeds every presented line's `estimated_height`, so a block's
 /// height scales with zoom before `layout_block` ever measures it.
 pub(crate) fn presented_block_with_list_projection(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+    line_height: f32,
+) -> Option<VisualBlock> {
+    presented_block_with_projections(
+        editor,
+        block,
+        visible,
+        joined,
+        list_projection,
+        None,
+        line_height,
+    )
+}
+
+pub(crate) fn presented_block_with_projections(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
