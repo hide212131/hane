@@ -439,9 +439,7 @@ impl ListProjection {
         if disclosure.is_empty() {
             let caret = disclosure.start;
             let active = rows
-                .partition_point(|row| row.end <= caret)
-                .checked_sub(0)
-                .and_then(|index| rows.get(index))
+                .get(rows.partition_point(|row| row.end <= caret))
                 .is_some_and(|row| row.start <= caret && caret < row.end);
             return rows.len().saturating_sub(usize::from(active));
         }
