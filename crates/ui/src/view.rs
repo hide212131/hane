@@ -5630,34 +5630,53 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
-        if self.pending_caret_visibility_after_layout {
-            self.pending_caret_visibility_after_layout = false;
-            let before = self.scroll_y;
-            self.scroll_cursor_into_view();
-            self.scroll_y = clamp_scroll_y(
-                self.scroll_y,
-                self.scrollable_content_height(),
-                self.viewport_height,
-            );
-            if self.scroll_y != before {
-                // The visible block set was selected before this corrected
-                // position. One more frame lets virtualization follow it.
-                cx.notify();
-            }
-        }
-        // Where the caret was drawn, for the IME candidate window. Only the
-        // block that holds it can answer, and only while it is on screen.
+        // Resolve the caret from the layouts produced in this frame, not from
+        // a cache that may still describe the pre-disclosure zero-height row.
+        // A fence can become editable one frame after the input event; keep the
+        // one-shot request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
-        self.caret_geometry = rendered.iter().find_map(|(ordinal, visual, layout)| {
+        let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
             if caret < visual.source_range.start || visual.source_range.end < caret {
                 return None;
             }
             let point = layout.point_for_source(visual, caret, &shaper)?;
-            Some(CaretGeometry {
-                x: self.theme.line_horizontal_padding + point.x,
-                y: self.heights.prefix_sum(*ordinal) + point.y - self.scroll_y,
-                height: point.height,
-            })
+            Some((*ordinal, point.x, point.y, point.height))
+        });
+        if self.pending_caret_visibility_after_layout {
+            if let Some((ordinal, _, y, height)) = fresh_caret
+                && height > 0.0
+            {
+                self.pending_caret_visibility_after_layout = false;
+                let before = self.scroll_y;
+                let top = self.heights.prefix_sum(ordinal) + y;
+                self.scroll_y = scroll_y_for_cursor(
+                    self.scroll_y,
+                    top,
+                    height + CARET_MODE_BADGE_HEIGHT,
+                    self.viewport_height,
+                );
+                self.scroll_y = clamp_scroll_y(
+                    self.scroll_y,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
+                if self.scroll_y != before {
+                    // The visible block set was selected before this corrected
+                    // position. One more frame lets virtualization follow it.
+                    cx.notify();
+                }
+            } else {
+                // The fresh disclosed row has not been laid out yet. Keep the
+                // request alive for the next frame instead of consuming it
+                // against stale zero-height geometry.
+                cx.notify();
+            }
+        }
+        // Where the caret was drawn, for the IME candidate window.
+        self.caret_geometry = fresh_caret.map(|(ordinal, x, y, height)| CaretGeometry {
+            x: self.theme.line_horizontal_padding + x,
+            y: self.heights.prefix_sum(ordinal) + y - self.scroll_y,
+            height,
         });
         // Blocks are drawn whole, so the rendered span can start above the
         // viewport; the spacers have to match what was actually drawn.
