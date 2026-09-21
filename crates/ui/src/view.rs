@@ -568,6 +568,14 @@ pub struct EditorView {
     sidebar_resize_drag: Option<SidebarResizeDrag>,
     /// Native scroll state for the work-folder list; a custom thumb mirrors it.
     sidebar_scroll: ScrollHandle,
+    /// Horizontal scroll state for the file-tab strip. Keeping this in a
+    /// handle lets GPUI reveal a newly activated tab even when the main panel
+    /// is narrower than the open session list.
+    file_tabs_scroll: ScrollHandle,
+    /// Horizontal scroll state for the footer controls, so recent-file
+    /// buttons remain reachable without allowing the footer to cover the
+    /// editor viewport on a narrow main panel.
+    footer_scroll: ScrollHandle,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
@@ -2108,6 +2116,8 @@ impl EditorView {
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
+            file_tabs_scroll: ScrollHandle::new(),
+            footer_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
@@ -2330,6 +2340,19 @@ impl EditorView {
         self.sessions.active()
     }
 
+    fn file_tab_index(&self, id: SessionId) -> Option<usize> {
+        self.sessions
+            .sessions()
+            .enumerate()
+            .find_map(|(index, session)| (session.id() == id).then_some(index))
+    }
+
+    fn reveal_file_tab(&self, id: SessionId) {
+        if let Some(index) = self.file_tab_index(id) {
+            self.file_tabs_scroll.scroll_to_item(index);
+        }
+    }
+
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
     fn active_session_has_sidebar_row(&self) -> bool {
@@ -2354,6 +2377,7 @@ impl EditorView {
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         if id == self.sessions.active_id() {
             self.sidebar_focus = SidebarFocus::ActiveSession;
+            self.reveal_file_tab(id);
             cx.notify();
             return true;
         }
@@ -2364,10 +2388,20 @@ impl EditorView {
         if !self.sessions.activate(id) {
             return false;
         }
+        self.reveal_file_tab(id);
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         cx.notify();
         true
+    }
+
+    fn activate_file_tab(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        self.blur_sidebar_filter(cx);
+        self.sidebar_keyboard_focus = false;
+        self.activate_session(id, cx);
     }
 
     fn document_key(&self) -> DocumentKey {
@@ -5566,7 +5600,7 @@ fn preserve_measured_height_after_fence_delta(
     }
 }
 
-/// The header's status line, combining a persistent `draft_recovery_warning`
+/// The footer's status line, combining a persistent `draft_recovery_warning`
 /// with whatever transient `status` is current. Neither may swallow the
 /// other: the warning has to survive `open_path` cycling `status` through
 /// "Opening…"/"Opened" right after the scan that raised it, but a later
@@ -5575,7 +5609,7 @@ fn preserve_measured_height_after_fence_delta(
 /// startup and an unconditional priority for the warning would otherwise
 /// hide every status for the rest of the session. `None` when neither is
 /// set, so the caller can fall back to its own default line.
-fn header_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
+fn footer_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
     match (warning, status) {
         (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
         (Some(warning), None) => Some(warning.to_owned()),
@@ -6041,7 +6075,8 @@ impl Render for EditorView {
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
-            - self.theme.header_height)
+            - self.theme.header_height
+            - self.theme.footer_height)
             .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
@@ -6316,7 +6351,7 @@ impl Render for EditorView {
         } else {
             ""
         };
-        let status = header_status_line(
+        let status = footer_status_line(
             self.draft_recovery_warning.as_deref(),
             self.status.as_deref(),
         )
@@ -6348,9 +6383,10 @@ impl Render for EditorView {
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(self.header_element(status, cx));
+            .child(self.header_element(cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
@@ -6360,6 +6396,7 @@ impl Render for EditorView {
             div()
                 .relative()
                 .flex_1()
+                .min_h(px(0.0))
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -6429,7 +6466,7 @@ impl Render for EditorView {
                 )
                 .children(editor_scrollbar),
         );
-        let rendered = root.child(main_column);
+        let rendered = root.child(main_column.child(self.footer_element(status, cx)));
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
@@ -7094,7 +7131,67 @@ fn draft_preview(session: &DocumentSession) -> String {
 }
 
 impl EditorView {
-    fn header_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
+    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active_id = self.sessions.active_id();
+        let tab_count = self.sessions.len();
+        let tabs = self
+            .sessions()
+            .enumerate()
+            .map(|(index, session)| {
+                let id = session.id();
+                let is_active = id == active_id;
+                let label = if session.is_dirty() {
+                    format!("{} *", session.short_label())
+                } else {
+                    session.short_label()
+                };
+                let debug_selector = if index == 0 {
+                    "file-tab-first"
+                } else if index + 1 == tab_count {
+                    "file-tab-last"
+                } else {
+                    "file-tab"
+                };
+                div()
+                    .id(("file-tab", index))
+                    .debug_selector(move || debug_selector.to_owned())
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .cursor_pointer()
+                    .whitespace_nowrap()
+                    .when(is_active, |element| {
+                        element
+                            .bg(rgb(self.theme.tab_active_background))
+                            .text_color(rgb(self.theme.tab_active_foreground))
+                    })
+                    .when(!is_active, |element| {
+                        element.text_color(rgb(self.theme.header_foreground))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate_file_tab(id, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("file-tabs")
+            .debug_selector(|| "file-tabs".to_owned())
+            .h(px(self.theme.header_height))
+            .flex_none()
+            .flex()
+            .overflow_x_scroll()
+            .track_scroll(&self.file_tabs_scroll)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
+            .bg(rgb(self.theme.header_background))
+            .text_color(rgb(self.theme.header_foreground))
+            .children(tabs)
+    }
+
+    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
         let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
@@ -7116,61 +7213,77 @@ impl EditorView {
                     |name| name.to_string_lossy().into_owned(),
                 );
                 div()
-                    .id(("recent-file", index))
+                    .id(("footer-recent", index))
+                    .max_w(px(140.0))
                     .px_2()
                     .rounded_sm()
-                    .bg(rgb(self.theme.code_background))
+                    .bg(rgb(self.theme.editor_background))
                     .text_color(rgb(self.theme.foreground))
                     .cursor_pointer()
+                    .truncate()
                     .child(label)
                     .on_click(cx.listener(move |view, _, _, cx| view.open_path(&path, cx)))
             })
             .collect::<Vec<_>>();
+        let controls = div()
+            .h_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .id("footer-autosave")
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(autosave)
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
+            )
+            .child(
+                div()
+                    .id("footer-theme")
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(theme)
+                    .on_click(cx.listener(|view, _, window, cx| view.cycle_theme(window, cx))),
+            )
+            .child("Recent:")
+            .children(recent);
+        let controls = div()
+            .id("footer-controls")
+            .debug_selector(|| "footer-controls".to_owned())
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_x_scroll()
+            .track_scroll(&self.footer_scroll)
+            .child(controls);
+
         div()
-            .h(px(self.theme.header_height))
+            .id("editor-footer")
+            .debug_selector(|| "editor-footer".to_owned())
+            .h(px(self.theme.footer_height))
             .flex_none()
             .flex()
             .flex_col()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
-            .bg(rgb(self.theme.header_background))
-            .text_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child(
                 div()
-                    .h(px(38.0))
+                    .id("footer-status")
+                    .debug_selector(|| "footer-status".to_owned())
+                    .h(px(24.0))
+                    .flex_none()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(self.sessions.active().label())
-                    .child(status),
-            )
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                    .min_w(px(0.0))
                     .px_3()
                     .text_size(px(11.0))
-                    .child(
-                        div()
-                            .id("toggle-autosave")
-                            .cursor_pointer()
-                            .child(autosave)
-                            .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
-                    )
-                    .child(
-                        div()
-                            .id("cycle-theme")
-                            .cursor_pointer()
-                            .child(theme)
-                            .on_click(
-                                cx.listener(|view, _, window, cx| view.cycle_theme(window, cx)),
-                            ),
-                    )
-                    .child("Recent:")
-                    .children(recent),
+                    .truncate()
+                    .child(status),
             )
+            .child(controls)
     }
 }
 
@@ -7273,6 +7386,7 @@ fn collapsed_boundary_bias(
 mod tests {
     use super::*;
     use crate::line::JOIN_SYNC_LINE_BUDGET;
+    use crate::theme::DARK_THEME;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
@@ -7323,6 +7437,19 @@ mod tests {
             assert!(
                 contrast >= 4.5,
                 "date badge foreground contrast is too low for {background:#08x}: {contrast:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_file_tab_foreground_is_readable_in_both_themes() {
+        let foreground_luminance = relative_luminance(DEFAULT_THEME.tab_active_foreground);
+        for theme in [DEFAULT_THEME, DARK_THEME] {
+            let background_luminance = relative_luminance(theme.tab_active_background);
+            let contrast = (foreground_luminance + 0.05) / (background_luminance + 0.05);
+            assert!(
+                contrast >= 4.5,
+                "active tab foreground contrast is too low: {contrast:.2}"
             );
         }
     }
@@ -10970,14 +11097,14 @@ mod tests {
     }
 
     #[test]
-    fn header_status_line_combines_warning_and_status_without_dropping_either() {
-        assert_eq!(header_status_line(None, None), None);
+    fn footer_status_line_combines_warning_and_status_without_dropping_either() {
+        assert_eq!(footer_status_line(None, None), None);
         assert_eq!(
-            header_status_line(Some("2 drafts could not be recovered"), None),
+            footer_status_line(Some("2 drafts could not be recovered"), None),
             Some("2 drafts could not be recovered".to_owned())
         );
         assert_eq!(
-            header_status_line(None, Some("Opened")),
+            footer_status_line(None, Some("Opened")),
             Some("Opened".to_owned())
         );
         // Regression for the P1 review finding: an unconditional priority for
@@ -10986,7 +11113,7 @@ mod tests {
         // recovery warning, since this view only re-scans a work folder once
         // at startup. Both must show.
         assert_eq!(
-            header_status_line(
+            footer_status_line(
                 Some("2 drafts could not be recovered"),
                 Some("Save failed: disk full")
             ),
@@ -10994,7 +11121,7 @@ mod tests {
         );
     }
 
-    // Regression test for the P1 review finding on the header status line: a
+    // Regression test for the P1 review finding on the footer status line: a
     // save failure that happens after a draft-recovery warning was raised
     // must still reach the user, not be hidden behind the warning for the
     // rest of the session.
@@ -11026,7 +11153,7 @@ mod tests {
         });
 
         view.read_with(cx, |view, _| {
-            let combined = header_status_line(
+            let combined = footer_status_line(
                 view.draft_recovery_warning.as_deref(),
                 view.status.as_deref(),
             );
@@ -11045,6 +11172,84 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn file_tabs_switch_sessions_and_keep_rear_tabs_reachable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+        let last = view.update(cx, |view, cx| {
+            let mut last = view.sessions.active_id();
+            for index in 0..8 {
+                last = view
+                    .sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+            last
+        });
+        cx.run_until_parked();
+
+        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        let footer = cx
+            .debug_bounds("editor-footer")
+            .expect("footer rendered");
+        let first_row = cx.debug_bounds("row-0-0").expect("editor row rendered");
+        assert!(first_row.bottom() <= footer.top());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x < px(0.0)));
+
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("rear file tab is reachable after horizontal scrolling");
+        cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), last);
+    }
+
+    #[gpui::test]
+    fn pending_inline_rename_blocks_file_tab_activation(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        let second = view.update(cx, |view, cx| {
+            let second = view
+                .sessions
+                .open_untitled("body\n", "second.md".to_owned());
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("pending.md"),
+                text: "pending".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..0,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: true,
+            });
+            cx.notify();
+            second
+        });
+        cx.run_until_parked();
+
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second file tab rendered");
+        cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.sessions.active_id(), second);
+            assert!(view.inline_rename_active());
+            assert_eq!(view.status.as_deref(), Some("Rename in progress"));
+        });
     }
 
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
