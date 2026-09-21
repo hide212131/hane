@@ -54,7 +54,8 @@ use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
     MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
-    block_heights, block_is_joinable, block_line_span, layout_block, parse_joined_span,
+    block_heights, block_heights_with_disclosure, block_is_joinable, block_line_span,
+    layout_block, parse_joined_span,
     trailing_blank_lines,
 };
 use hane_session::{
@@ -4293,11 +4294,16 @@ impl EditorView {
         match granularity {
             Granularity::Lines => vec![line_height; len],
             Granularity::Blocks => {
-                let document = self.sessions.active().editor().document();
+                let editor = self.sessions.active().editor();
+                let document = editor.document();
                 let index = self
                     .current_index()
                     .expect("block granularity has an index");
-                block_heights(document, index, line_height)
+                let disclosure = editor
+                    .ime()
+                    .and_then(|ime| ime.current_range)
+                    .or_else(|| Some(editor.selection().range()));
+                block_heights_with_disclosure(document, index, line_height, disclosure)
             }
         }
     }
