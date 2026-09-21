@@ -306,6 +306,11 @@ pub struct MarkdownParse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FenceHeightProjection {
     rows: Vec<FenceHeightRow>,
+    /// Absolute document end used for the same final-line exception as the
+    /// presentation layer. A quote owner may disclose a caret exactly at its
+    /// end only when that offset is also the document end; the start of the
+    /// following block must remain outside the preceding quote.
+    document_end: SourceOffset,
     /// Fence rows grouped by the quote owner whose prefix is present on that
     /// row. The groups are disjoint: nested quote prefixes use the outermost
     /// owner on a line, because touching an inner owner also touches that
@@ -339,8 +344,9 @@ struct FenceQuoteOwnerRows {
 }
 
 impl FenceHeightProjection {
-    pub(crate) fn from_absolute_rows(
+    pub(crate) fn from_absolute_rows_with_document_end(
         block_range: SourceRange,
+        document_end: SourceOffset,
         rows: Vec<(SourceRange, bool, Vec<SourceRange>, usize)>,
     ) -> Self {
         let mut normalized = rows
@@ -420,6 +426,7 @@ impl FenceHeightProjection {
         }
         Self {
             rows,
+            document_end,
             quote_owner_rows,
             quote_row_prefix,
             quote_owner_max_end,
@@ -503,7 +510,11 @@ impl FenceHeightProjection {
                 })
                 .map(|_| indices.start + relative_active);
             let quote_active =
-                self.active_quote_rows_in(indices.clone(), SourceRange::empty(caret.0));
+                self.active_quote_rows_in(
+                    indices.clone(),
+                    SourceRange::empty(caret.0),
+                    block_range.start.0 + caret.0 == self.document_end.0,
+                );
             let direct_active = usize::from(active_row.is_some());
             let direct_already_counted = active_row.is_some_and(|row| {
                 self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]
@@ -531,7 +542,7 @@ impl FenceHeightProjection {
         let direct_active = active_end.saturating_sub(active_start);
         let direct_already_counted = self.quote_row_prefix[indices.start + active_end]
             .saturating_sub(self.quote_row_prefix[indices.start + active_start]);
-        let quote_active = self.active_quote_rows_in(indices, disclosure);
+        let quote_active = self.active_quote_rows_in(indices, disclosure, false);
         rows.len().saturating_sub(
             quote_active + direct_active - direct_already_counted,
         )
@@ -541,6 +552,7 @@ impl FenceHeightProjection {
         &self,
         rows: Range<usize>,
         disclosure: SourceRange,
+        caret_at_document_end: bool,
     ) -> usize {
         if self.quote_owner_rows.is_empty() {
             return 0;
@@ -563,7 +575,8 @@ impl FenceHeightProjection {
             .iter()
             .filter(|entry| {
                 if disclosure.is_empty() {
-                    entry.owner.end >= disclosure.start
+                    entry.owner.end > disclosure.start
+                        || (caret_at_document_end && entry.owner.end == disclosure.start)
                 } else {
                     entry.owner.end > disclosure.start
                 }
@@ -1933,8 +1946,9 @@ mod tests {
     #[test]
     fn fence_height_projection_answers_physical_line_prefixes() {
         let block_range = SourceRange::new(100, 500);
-        let projection = FenceHeightProjection::from_absolute_rows(
+        let projection = FenceHeightProjection::from_absolute_rows_with_document_end(
             block_range,
+            block_range.end,
             vec![
                 (SourceRange::new(100, 104), true, Vec::new(), 0),
                 (SourceRange::new(300, 304), true, Vec::new(), 200),

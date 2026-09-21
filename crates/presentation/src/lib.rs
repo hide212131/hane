@@ -3947,6 +3947,29 @@ mod tests {
     }
 
     #[test]
+    fn caret_at_the_next_block_start_does_not_disclose_the_previous_quote() {
+        let source = "> ```\n> code\n> ```\n\nplain";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let quote_block = index
+            .blocks()
+            .find(|block| block.kind == NodeKind::Quote)
+            .expect("quoted block");
+        let inactive = block_heights(&document, &index, 26.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(quote_block.source_range.end.0)),
+        );
+
+        assert_eq!(
+            disclosed, inactive,
+            "the caret at the following block start must not make the preceding quote visible"
+        );
+    }
+
+    #[test]
     fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
         // A prefix-max-only index would scan all preceding spans because the
         // enclosing construct reaches the end. Subtree maxima must prune them.

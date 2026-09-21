@@ -242,6 +242,7 @@ fn source_line_ranges_in(
 
 fn build_fence_height_projection(
     block_range: SourceRange,
+    document_end: SourceOffset,
     parse_range: SourceRange,
     source: &str,
     fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
@@ -290,7 +291,11 @@ fn build_fence_height_projection(
             ));
         }
     }
-    let projection = FenceHeightProjection::from_absolute_rows(block_range, rows);
+    let projection = FenceHeightProjection::from_absolute_rows_with_document_end(
+        block_range,
+        document_end,
+        rows,
+    );
     (!projection.is_empty()).then_some(projection)
 }
 
@@ -298,6 +303,7 @@ fn build_fence_height_projections(
     parsed: &MarkdownParse,
     blocks: &[TiledBlock],
     range: SourceRange,
+    document_end: SourceOffset,
     source: &str,
 ) -> Vec<Option<FenceHeightProjection>> {
     let block_ranges = blocks
@@ -336,6 +342,7 @@ fn build_fence_height_projections(
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             build_fence_height_projection(
                 *block_range,
+                document_end,
                 range,
                 source,
                 &parsed.fence_marker_edges[start..end],
@@ -636,7 +643,13 @@ impl BlockIndex {
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let fence_height_by_ordinal =
-            build_fence_height_projections(&parsed, &blocks, range, source);
+            build_fence_height_projections(
+                &parsed,
+                &blocks,
+                range,
+                SourceOffset(source.len()),
+                source,
+            );
         let fence_height_projections = fence_height_by_ordinal
             .into_iter()
             .enumerate()
@@ -873,8 +886,13 @@ impl BlockIndex {
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);
-            let fence_height_projections =
-                build_fence_height_projections(&parsed, &blocks, window, &text);
+            let fence_height_projections = build_fence_height_projections(
+                &parsed,
+                &blocks,
+                window,
+                SourceOffset(buffer.len_bytes().0),
+                &text,
+            );
             // Re-synchronized when the window's last parsed block lands exactly
             // on the boundary and kind the index already has for the untouched
             // block that closes the window. Everything after that boundary is
