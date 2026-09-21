@@ -6411,6 +6411,14 @@ fn draft_preview(session: &DocumentSession) -> String {
     }
 }
 
+fn tab_foreground(theme: &Theme, is_active: bool) -> u32 {
+    if is_active {
+        theme.foreground
+    } else {
+        theme.header_foreground
+    }
+}
+
 impl EditorView {
     fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
         let active_id = self.sessions.active_id();
@@ -6431,7 +6439,9 @@ impl EditorView {
                     .px_3()
                     .cursor_pointer()
                     .when(is_active, |element| {
-                        element.bg(rgb(self.theme.code_background))
+                        element
+                            .bg(rgb(self.theme.code_background))
+                            .text_color(rgb(tab_foreground(&self.theme, is_active)))
                     })
                     .child(label)
                     .on_click(cx.listener(move |view, _, window, cx| {
@@ -6690,6 +6700,26 @@ mod tests {
                 "date badge foreground contrast is too low for {background:#08x}: {contrast:.2}"
             );
         }
+    }
+
+    #[test]
+    fn active_tab_uses_theme_foreground_without_changing_inactive_tabs() {
+        assert_eq!(
+            tab_foreground(&DEFAULT_THEME, true),
+            DEFAULT_THEME.foreground
+        );
+        assert_eq!(
+            tab_foreground(&crate::theme::DARK_THEME, true),
+            crate::theme::DARK_THEME.foreground
+        );
+        assert_eq!(
+            tab_foreground(&DEFAULT_THEME, false),
+            DEFAULT_THEME.header_foreground
+        );
+        assert_eq!(
+            tab_foreground(&crate::theme::DARK_THEME, false),
+            crate::theme::DARK_THEME.header_foreground
+        );
     }
 
     #[test]
