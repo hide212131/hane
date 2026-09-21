@@ -719,6 +719,11 @@ pub struct EditorView {
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
+    /// Set after an editor command changes the caret/selection. The immediate
+    /// scroll uses the previous frame's layout; one post-layout recheck is
+    /// needed when progressive disclosure changes a row height (for example,
+    /// an inactive zero-height code fence becoming editable).
+    pending_caret_visibility_after_layout: bool,
     /// Semantic list owner retained for the empty line created by the most
     /// recent list-item newline. It is presentation-only and is cleared by
     /// the next input, movement or selection operation.
@@ -2128,6 +2133,7 @@ impl EditorView {
             raw_zoom: 1.0,
             pending_zoom_anchor: None,
             caret_geometry: None,
+            pending_caret_visibility_after_layout: false,
             pending_list_editing: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
@@ -2375,6 +2381,7 @@ impl EditorView {
         self.line_owners.clear();
         self.layout_cache.clear();
         self.caret_geometry = None;
+        self.pending_caret_visibility_after_layout = false;
         self.pending_list_editing = None;
         self.block_index = BlockIndexState::new();
         // A `BlockId` is only unique within the document it was assigned by;
@@ -2420,6 +2427,10 @@ impl EditorView {
             self.resync_heights();
         }
         self.scroll_cursor_into_view();
+        // The command may disclose markup and change its row height only on
+        // the next render. Re-check once after that layout is installed so
+        // the caret and its input-mode badge use current geometry.
+        self.pending_caret_visibility_after_layout = true;
         self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
@@ -5606,6 +5617,21 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
+        if self.pending_caret_visibility_after_layout {
+            self.pending_caret_visibility_after_layout = false;
+            let before = self.scroll_y;
+            self.scroll_cursor_into_view();
+            self.scroll_y = clamp_scroll_y(
+                self.scroll_y,
+                self.scrollable_content_height(),
+                self.viewport_height,
+            );
+            if self.scroll_y != before {
+                // The visible block set was selected before this corrected
+                // position. One more frame lets virtualization follow it.
+                cx.notify();
+            }
+        }
         // Where the caret was drawn, for the IME candidate window. Only the
         // block that holds it can answer, and only while it is on screen.
         let caret = self.editor().selection().active;
