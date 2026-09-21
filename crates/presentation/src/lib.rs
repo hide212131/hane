@@ -990,6 +990,10 @@ pub struct BlockWindow<'a> {
     /// that opens inside `render` — unless `joined` already supplies that
     /// context, in which case `lines` only needs to cover `render`.
     pub lines: &'a [BlockLine<'a>],
+    /// Fence delimiter lines outside `lines` that still affect the block's
+    /// inactive vertical footprint. They are height-accounting context only:
+    /// never joined into paragraph/list parsing and never rendered directly.
+    pub clipped_fence_lines: &'a [BlockLine<'a>],
     /// The subset of `lines` (by document line number) to actually turn into
     /// presented [`VisualLine`]s. Lines in `lines` outside this range are
     /// parsing context only and are not drawn.
@@ -1125,6 +1129,16 @@ pub fn present_block_with_list_projection(
     let presented_end = first_presented_line.saturating_add(lines.len());
     let mut zero_height_lines_before = 0;
     let mut zero_height_lines_after = 0;
+    let mut record_collapsed = |line: usize, collapsed: bool| {
+        if !collapsed {
+            return;
+        }
+        if line < first_presented_line {
+            zero_height_lines_before += 1;
+        } else if line >= presented_end {
+            zero_height_lines_after += 1;
+        }
+    };
     if context == LineContext::FencedCode {
         for line in window.lines {
             let Some(fence_role) =
@@ -1143,15 +1157,44 @@ pub fn present_block_with_list_projection(
             )
             .height()
                 == 0.0;
-            if !collapsed {
-                continue;
-            }
-            if line.line < first_presented_line {
-                zero_height_lines_before += 1;
-            } else if line.line >= presented_end {
-                zero_height_lines_after += 1;
-            }
+            record_collapsed(line.line, collapsed);
         }
+    }
+    for line in window.clipped_fence_lines {
+        let collapsed = if context == LineContext::FencedCode {
+            fence_line_role(line.line, content_end, line.text, fence_opening)
+                .is_some_and(|fence_role| {
+                    present_fenced_code_line(
+                        line.line as u64,
+                        revision,
+                        line.range,
+                        line.text,
+                        line_height,
+                        line.disclosure,
+                        Some(fence_role),
+                    )
+                    .height()
+                        == 0.0
+                })
+        } else if list_projection.is_some_and(|projection| {
+            projection.is_code_block_for_range(line.range) == Some(true)
+                && projection.fence_markers_in(line.range).next().is_some()
+        }) {
+            present_markdown_with_list_projection(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                list_projection,
+            )
+            .height()
+                == 0.0
+        } else {
+            false
+        };
+        record_collapsed(line.line, collapsed);
     }
     VisualBlock {
         id: block.id,
@@ -5461,6 +5504,7 @@ mod tests {
             span: 0..2,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
             render: 0..2,
             joined: None,
             block_disclosure: None,
@@ -5543,6 +5587,7 @@ mod tests {
             span: 0..3,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
             render: 0..3,
             joined: None,
             block_disclosure: None,
@@ -5636,6 +5681,7 @@ mod tests {
             span: 0..2,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
             render: 0..2,
             joined: Some(&joined),
             block_disclosure: None,
@@ -5731,6 +5777,7 @@ mod tests {
             span: 0..lines.len(),
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
             render: 0..lines.len(),
             joined: None,
             block_disclosure: None,
