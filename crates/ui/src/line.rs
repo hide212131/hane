@@ -1129,6 +1129,50 @@ mod tests {
     }
 
     #[test]
+    fn clipped_nested_fences_do_not_reserve_virtual_space() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("code").unwrap() + 1,
+            )))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index
+            .list_projection(&block)
+            .expect("nested code projection");
+
+        let full = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(0..4),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("full nested block presents");
+        let clipped = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(2..3),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("nested code content presents");
+
+        assert_eq!(clipped.lines_before, 2);
+        assert_eq!(clipped.lines_after, 1);
+        assert_eq!(clipped.leading_space(), DEFAULT_LINE_HEIGHT);
+        assert_eq!(clipped.trailing_space(), 0.0);
+        assert_eq!(
+            clipped.height(),
+            full.height(),
+            "nested hidden fence rows must not reappear as virtual space"
+        );
+    }
+    #[test]
     fn a_leading_blank_line_before_the_first_block_does_not_misidentify_the_opening_fence() {
         // Block ordinal 0's tiled span absorbs a leading blank line (tiling
         // rule: leading bytes before the first block belong to block 0), so
