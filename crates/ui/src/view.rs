@@ -46,7 +46,7 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    ListProjection, local_block_index,
+    ListProjection, PublishOutcome, local_block_index,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
@@ -2440,13 +2440,17 @@ impl EditorView {
         } else {
             self.resync_heights();
         }
+        // Schedule before the bounded endpoint update so a disclosure-only
+        // snapshot can capture the complete height disclosure that its current
+        // tree was built from. The endpoint update below is intentionally only
+        // a temporary bridge until that snapshot covers the whole selection.
+        self.schedule_document_parse(cx);
         self.ensure_active_disclosure_height();
         self.scroll_cursor_into_view();
         // The command may disclose markup and change its row height only on
         // the next render. Re-check once after that layout is installed so
         // the caret and its input-mode badge use current geometry.
         self.pending_caret_visibility_after_layout = true;
-        self.schedule_document_parse(cx);
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
@@ -3523,6 +3527,10 @@ impl EditorView {
         let key = self.document_key();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
+        let previous_height_disclosure = self
+            .last_applied_height_disclosure
+            .filter(|(previous_revision, _)| *previous_revision == revision)
+            .map(|(_, disclosure)| disclosure);
         if let Some(disclosure) = disclosure {
             self.last_background_height_disclosure = Some((revision, disclosure));
         }
@@ -3582,13 +3590,21 @@ impl EditorView {
                     return;
                 }
                 let document = view.sessions.active().editor().document();
-                view.block_index
+                let publish_outcome = view
+                    .block_index
                     .publish(index, IndexSource::Formal, document);
-                view.background_presentation_generation = revision.0 + 1;
-                // Formal boundaries can disagree with what the bounded local
-                // parse showed, so every cached presentation is re-derived once.
-                view.block_cache.clear();
-                view.joined_parse_cache.clear();
+                let index_was_updated = matches!(
+                    publish_outcome,
+                    PublishOutcome::Published | PublishOutcome::Rebased(_)
+                );
+                if index_was_updated {
+                    view.background_presentation_generation = revision.0 + 1;
+                    // Formal boundaries can disagree with what the bounded
+                    // local parse showed, so every cached presentation is
+                    // re-derived once when the index actually changed.
+                    view.block_cache.clear();
+                    view.joined_parse_cache.clear();
+                }
                 let (granularity, len) = view.desired_layout();
                 let snapshot_disclosure_is_current = view
                     .editor()
@@ -3600,7 +3616,20 @@ impl EditorView {
                     && granularity == Granularity::Blocks
                     && len == heights.len()
                 {
-                    view.install_heights(granularity, heights);
+                    if publish_outcome == PublishOutcome::NotMoreAuthoritative {
+                        // The formal index is already current in this case;
+                        // this job only refreshed disclosure-dependent fence
+                        // heights. Preserve measured wrapping/image heights and
+                        // invalidate presentations lazily through their
+                        // disclosure check instead of throwing their caches
+                        // away for a selection change.
+                        view.install_disclosure_heights_preserving_measurements(
+                            heights,
+                            previous_height_disclosure,
+                        );
+                    } else if index_was_updated {
+                        view.install_heights(granularity, heights);
+                    }
                     if let Some(disclosure) = disclosure {
                         view.last_background_height_disclosure = Some((revision, disclosure));
                     }
@@ -3620,8 +3649,8 @@ impl EditorView {
                         && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
                             || disclosure.is_some_and(|disclosure| !disclosure.is_empty()));
                     if selection_snapshot_requires_retry {
-                        view.ensure_active_disclosure_height();
                         view.schedule_document_parse(cx);
+                        view.ensure_active_disclosure_height();
                     } else if current_disclosure != disclosure {
                         // Moving between two caret disclosures only needs the
                         // bounded endpoint update; a whole-document snapshot
@@ -4452,7 +4481,12 @@ impl EditorView {
                         // measured body rows stay measured instead of being
                         // replaced by an arithmetic lower bound.
                         let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
-                        (current - code_line_height(line_height) * collapsed_delta).max(minimum)
+                        preserve_measured_height_after_fence_delta(
+                            current,
+                            minimum,
+                            collapsed_delta,
+                            line_height,
+                        )
                     },
                 );
                 (target != current).then_some((ordinal, target))
@@ -4461,7 +4495,98 @@ impl EditorView {
         for (ordinal, minimum) in updates {
             self.heights.update(ordinal, minimum);
         }
-        self.last_applied_height_disclosure = Some((revision, disclosure));
+        // A non-empty disclosure is only applied to the endpoint bridge here;
+        // the background snapshot owns the complete selection. Recording it as
+        // globally applied would make the completion preserve the wrong
+        // baseline and leave the selection's middle blocks collapsed.
+        if !self.document_parse_job_running {
+            self.last_applied_height_disclosure = Some((revision, disclosure));
+        }
+    }
+
+    /// Applies a disclosure-only height snapshot without replacing measured
+    /// block geometry. The formal index is already current when this runs, so
+    /// the old and new fence projections describe the same block ids; only the
+    /// structural fence-row delta needs to move each measured height. The
+    /// snapshot itself supplies the arithmetic minimum for blocks that have
+    /// not been laid out yet.
+    fn install_disclosure_heights_preserving_measurements(
+        &mut self,
+        snapshot: HeightIndex,
+        previous_disclosure: Option<SourceRange>,
+    ) {
+        let Some(disclosure) = self.active_height_disclosure() else {
+            return;
+        };
+        let Some(index) = self.current_index() else {
+            return;
+        };
+        if self.granularity != Granularity::Blocks
+            || self.heights.len() != snapshot.len()
+            || index.len() != snapshot.len()
+        {
+            return;
+        }
+
+        let anchor = self.top_source_offset();
+        let intra = (!self.heights.is_empty()).then(|| {
+            let item = self.heights.block_at_y(self.scroll_y);
+            self.scroll_y - self.heights.prefix_sum(item)
+        });
+        let line_height = self.line_height();
+        let updates = (0..snapshot.len())
+            .filter_map(|ordinal| {
+                let block = index.block(ordinal)?;
+                let minimum = snapshot.height(ordinal)?;
+                let current = self.heights.height(ordinal)?;
+                let target = previous_disclosure.map_or_else(
+                    || current.max(minimum),
+                    |previous| {
+                        let collapsed = index
+                            .fence_height_projection(&block)
+                            .map_or(0, |projection| {
+                                projection.inactive_rows_in(
+                                    block.source_range,
+                                    block.source_range,
+                                    Some(disclosure),
+                                )
+                            });
+                        let previous_collapsed = index
+                            .fence_height_projection(&block)
+                            .map_or(0, |projection| {
+                                projection.inactive_rows_in(
+                                    block.source_range,
+                                    block.source_range,
+                                    Some(previous),
+                                )
+                            });
+                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        preserve_measured_height_after_fence_delta(
+                            current,
+                            minimum,
+                            collapsed_delta,
+                            line_height,
+                        )
+                    },
+                );
+                (target != current).then_some((ordinal, target))
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, height) in updates {
+            self.heights.update(ordinal, height);
+        }
+        self.scroll_y = anchor.map_or(self.scroll_y, |offset| {
+            let top = self.scroll_for_offset(offset);
+            let item = self.heights.block_at_y(top);
+            let inside = intra
+                .zip(self.heights.height(item))
+                .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
+            top + inside
+        });
+        self.last_applied_height_disclosure = Some((
+            self.editor().document().revision(),
+            disclosure,
+        ));
     }
 
     fn active_height_disclosure(&self) -> Option<SourceRange> {
@@ -5261,6 +5386,23 @@ fn invert_visible_line_prefix(
         }
     }
     low
+}
+
+/// Moves a measured block height by the exact number of code-fence rows whose
+/// disclosure changed, without letting floating-point noise leave a value just
+/// above the arithmetic minimum.
+fn preserve_measured_height_after_fence_delta(
+    current: f32,
+    minimum: f32,
+    collapsed_delta: f32,
+    line_height: f32,
+) -> f32 {
+    let adjusted = current - code_line_height(line_height) * collapsed_delta;
+    if adjusted <= minimum + 0.001 {
+        minimum
+    } else {
+        adjusted.max(minimum)
+    }
 }
 
 /// The header's status line, combining a persistent `draft_recovery_warning`
@@ -8860,6 +9002,60 @@ mod tests {
                     .height(8)
                     .is_some_and(|height| height > inactive_middle_height),
                 "the background disclosure snapshot must expand selected fence blocks"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_snapshot_preserves_measured_height_and_cached_presentation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "ordinary paragraph\n\n```\n```\n\ntrailing paragraph";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        let (first_id, measured_height) = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            let first = index.block(0).expect("first paragraph block");
+            let initial_heights = block_heights_with_disclosure(
+                &document,
+                index,
+                view.line_height(),
+                None,
+            );
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(initial_heights),
+            );
+            view.cached_block(&first, &(0..1)).expect("cached paragraph");
+            let measured_height = view.line_height() * 3.0;
+            view.heights.update(first.ordinal, measured_height);
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            assert!(view.document_parse_job_running);
+            (first.id, measured_height)
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.heights.height(0),
+                Some(measured_height),
+                "a disclosure-only snapshot must preserve measured non-fence height"
+            );
+            assert!(
+                view.block_cache.contains_key(&first_id),
+                "a selection disclosure must not clear existing presentation caches"
             );
         });
     }
