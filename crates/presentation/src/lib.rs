@@ -947,7 +947,12 @@ pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32
         .blocks()
         .map(|block| {
             counted += block.line_count;
-            line_height * block.line_count as f32
+            let collapsed = index
+                .fence_height_projection(&block)
+                .map_or(0, |projection| {
+                    projection.inactive_rows_in(block.source_range, block.source_range, None)
+                });
+            line_height * block.line_count.saturating_sub(collapsed) as f32
         })
         .collect::<Vec<_>>();
     // A document ending in a newline has one physical line more than its blocks
