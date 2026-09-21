@@ -131,8 +131,9 @@ pub(crate) fn presented_block_with_list_projection(
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let ctx = block_context(editor, block, &span, &render, joined)?;
+    let ctx = block_context(editor, block, &span, &render, joined, list_projection)?;
     let lines = block_lines(editor, &ctx);
+    let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
     Some(present_block_with_list_projection(
         block,
         document.revision(),
@@ -140,6 +141,7 @@ pub(crate) fn presented_block_with_list_projection(
             trailing_blank_lines: ctx.trailing_blank_lines,
             span,
             lines: &lines,
+            clipped_fence_lines: &clipped_fence_lines,
             render,
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -167,7 +169,7 @@ pub(crate) fn expected_block_disclosures(
 ) -> Option<Vec<(usize, Option<SourceRange>)>> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
-    let ctx = block_context(editor, block, &span, render, joined)?;
+    let ctx = block_context(editor, block, &span, render, joined, None)?;
     let lines = block_lines(editor, &ctx);
     Some(expected_disclosures(
         block.kind,
@@ -175,6 +177,7 @@ pub(crate) fn expected_block_disclosures(
             trailing_blank_lines: ctx.trailing_blank_lines,
             span,
             lines: &lines,
+            clipped_fence_lines: &[],
             render: render.clone(),
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -201,11 +204,10 @@ struct BlockContext {
     /// `None` for any other block kind, or once this line is already covered
     /// by `context` and would otherwise be read twice.
     opening_fence_line: Option<(usize, SourceRange, String)>,
-    /// The block's final construct line when it is outside `context`. For a
-    /// closed fenced block this is the only possible closing delimiter, so
-    /// presentation can account for its zero-height inactive row even while
-    /// it is clipped outside the viewport.
-    closing_fence_line: Option<(usize, SourceRange, String)>,
+    /// Fence delimiter rows outside `context` that are needed only to keep
+    /// virtualized height stable. These are never joined into normal Markdown
+    /// parsing and are not drawn by the current render window.
+    clipped_fence_lines: Vec<(usize, SourceRange, String)>,
 }
 
 fn block_context(
@@ -214,6 +216,7 @@ fn block_context(
     span: &Range<usize>,
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
@@ -265,17 +268,35 @@ fn block_context(
             Some((opening, range, text))
         });
     let content_end = span.end.saturating_sub(trailing_blank_lines);
-    let closing_fence_line = fenced
+    let mut clipped_fence_lines = Vec::new();
+    if let Some(closing) = fenced
         .then(|| content_end.checked_sub(1))
         .flatten()
         .filter(|closing| *closing >= span.start && *closing < span.end)
         .filter(|closing| Some(*closing) != opening_fence_line_number)
         .filter(|closing| !context.contains(closing))
-        .and_then(|closing| {
-            let range = clip_to_block(document.line_range(LineId(closing)).ok()?);
+    {
+        let range = clip_to_block(document.line_range(LineId(closing)).ok()?);
+        let text = document.text(range).unwrap_or_default();
+        clipped_fence_lines.push((closing, range, text));
+    }
+    if let Some(projection) = list_projection {
+        for (marker, _) in projection.fence_markers_in(block.source_range) {
+            let line = document.line_for_offset(marker.start).ok()?.0;
+            if context.contains(&line)
+                || Some(line) == opening_fence_line_number
+                || clipped_fence_lines
+                    .iter()
+                    .any(|(existing, _, _)| *existing == line)
+            {
+                continue;
+            }
+            let range = clip_to_block(document.line_range(LineId(line)).ok()?);
             let text = document.text(range).unwrap_or_default();
-            Some((closing, range, text))
-        });
+            clipped_fence_lines.push((line, range, text));
+        }
+        clipped_fence_lines.sort_by_key(|(line, _, _)| *line);
+    }
     Some(BlockContext {
         trailing_blank_lines,
         context,
@@ -283,20 +304,14 @@ fn block_context(
         texts,
         block_disclosure,
         opening_fence_line,
-        closing_fence_line,
+        clipped_fence_lines,
     })
 }
 
 fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
-    let mut lines = Vec::with_capacity(
-        ctx.context.len()
-            + usize::from(ctx.opening_fence_line.is_some())
-            + usize::from(ctx.closing_fence_line.is_some()),
-    );
-    for (line, range, text) in [&ctx.opening_fence_line, &ctx.closing_fence_line]
-        .into_iter()
-        .flatten()
-    {
+    let mut lines =
+        Vec::with_capacity(ctx.context.len() + usize::from(ctx.opening_fence_line.is_some()));
+    if let Some((line, range, text)) = &ctx.opening_fence_line {
         lines.push(BlockLine {
             line: *line,
             range: *range,
@@ -314,6 +329,18 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
     ));
     lines.sort_by_key(|line| line.line);
     lines
+}
+
+fn clipped_fence_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
+    ctx.clipped_fence_lines
+        .iter()
+        .map(|(line, range, text)| BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: disclosure_for_line(editor, *line, *range),
+        })
+        .collect()
 }
 
 /// Source range whose Markdown markers this line discloses: the caret's own
