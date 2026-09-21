@@ -7446,6 +7446,48 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn moving_into_a_hidden_closing_fence_rechecks_scroll_after_height_expands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut text = (1..=80)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        text.push_str("\n\n```\ncode\n```");
+        let code_offset = text.find("\ncode\n").expect("code line") + 2;
+        let closing_offset = text.rfind("```").expect("closing fence") + 1;
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(code_offset)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveDown { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (active, caret, viewport_height) = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection().active,
+                view.caret_geometry(),
+                view.viewport_height,
+            )
+        });
+        assert_eq!(active, SourceOffset(closing_offset));
+        let caret = caret.expect("disclosed closing fence caret is visible");
+        assert!(caret.height > 0.0, "editing restores the fence row height");
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT <= viewport_height,
+            "expanded fence caret would be clipped: bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
+        );
+    }
     #[test]
     fn height_remeasurement_cannot_leave_scroll_position_below_new_bottom() {
         // This is the position retained by the height anchor after a block at
