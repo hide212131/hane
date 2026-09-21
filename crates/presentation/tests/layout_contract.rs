@@ -245,6 +245,8 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     span,
                     lines: &lines,
                     clipped_fence_lines: &[],
+                    zero_height_fence_rows_before: 0,
+                    zero_height_fence_rows_after: 0,
                     joined: None,
                     block_disclosure: None,
                 },
