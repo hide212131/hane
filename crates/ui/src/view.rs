@@ -738,6 +738,11 @@ pub struct EditorView {
     /// run while retaining measured heights on both sides.
     height_blocks: HeightBlocks,
     document_parse_job_running: bool,
+    /// The non-empty disclosure for which the last background height snapshot
+    /// was requested. Selection drags can change this on every pointer event;
+    /// keeping it here coalesces identical requests without walking the whole
+    /// selected block range on the input thread.
+    last_background_height_disclosure: Option<(Revision, SourceRange)>,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
     /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
@@ -2137,6 +2142,7 @@ impl EditorView {
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
+            last_background_height_disclosure: None,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
@@ -2382,6 +2388,7 @@ impl EditorView {
         self.pending_caret_visibility_after_layout = false;
         self.pending_list_editing = None;
         self.block_index = BlockIndexState::new();
+        self.last_background_height_disclosure = None;
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
         // for an unrelated block in whatever document replaced it.
@@ -3478,10 +3485,15 @@ impl EditorView {
     /// One job at a time; a result that no longer matches the document revision
     /// is rebased or re-scheduled rather than published stale.
     fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        if !self
-            .block_index
-            .needs_formal_parse(self.sessions.active().editor().document())
-        {
+        let document = self.sessions.active().editor().document();
+        let revision = document.revision();
+        let disclosure = self.active_height_disclosure();
+        let disclosure_refresh = disclosure
+            .filter(|disclosure| !disclosure.is_empty())
+            .is_some_and(|disclosure| {
+                self.last_background_height_disclosure != Some((revision, disclosure))
+            });
+        if !self.block_index.needs_formal_parse(document) && !disclosure_refresh {
             return;
         }
         if self.document_parse_job_running {
@@ -3489,10 +3501,11 @@ impl EditorView {
         }
         self.document_parse_job_running = true;
         let key = self.document_key();
-        let revision = self.sessions.active().editor().document().revision();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
-        let disclosure = self.active_height_disclosure();
+        if let Some(disclosure) = disclosure.filter(|disclosure| !disclosure.is_empty()) {
+            self.last_background_height_disclosure = Some((revision, disclosure));
+        }
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -3568,15 +3581,28 @@ impl EditorView {
                     && len == heights.len()
                 {
                     view.install_heights(granularity, heights);
+                    if let Some(disclosure) = disclosure.filter(|disclosure| !disclosure.is_empty())
+                    {
+                        view.last_background_height_disclosure = Some((revision, disclosure));
+                    }
                 } else {
                     // The parse was rebased onto edits, or the caret/IME moved
                     // while it ran, so the prepared heights no longer describe
-                    // the current disclosure even when the block count happens
-                    // to be unchanged. Rebuild the same-sized index too; the
-                    // ordinary input path keeps that fast path incremental,
-                    // but this background completion is already off the render
-                    // path and must not leave the old disclosed fence active.
-                    view.resync_heights_for_current_disclosure();
+                    // the current disclosure. A changed non-empty selection is
+                    // deliberately retried in another background snapshot;
+                    // rebuilding all selected blocks here would put the same
+                    // document-sized walk back on the input thread at the
+                    // completion boundary. The bounded active-end update keeps
+                    // the caret addressable until that snapshot lands.
+                    let current_disclosure = view.active_height_disclosure();
+                    if current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
+                        && current_disclosure != disclosure
+                    {
+                        view.ensure_active_disclosure_height();
+                        view.schedule_document_parse(cx);
+                    } else {
+                        view.resync_heights_for_current_disclosure();
+                    }
                 }
                 cx.notify();
             });
@@ -4321,11 +4347,18 @@ impl EditorView {
         }
     }
 
-    /// Keeps a newly disclosed fence block in the height index before the
+    /// Keeps the active endpoint's fence block in the height index before the
     /// caret-scroll calculation runs. A caret move does not change the block
     /// count, so `resync_heights` quite deliberately keeps its measured index;
     /// that fast path must still expand a zero-height block that was just made
     /// editable or it can disappear from the next virtualization window.
+    ///
+    /// A non-empty selection is different: its complete disclosure is rebuilt
+    /// by the coalesced background parse. Updating every block it spans here
+    /// would make shift-selection and mouse dragging proportional to document
+    /// size. Only the two selection endpoints and the IME range boundaries are
+    /// needed synchronously to keep the caret addressable while that snapshot
+    /// is pending.
     fn ensure_active_disclosure_height(&mut self) {
         if self.granularity != Granularity::Blocks {
             return;
@@ -4337,10 +4370,23 @@ impl EditorView {
             return;
         };
         let line_height = self.line_height();
-        let ordinals = index
-            .blocks_in(disclosure)
-            .map(|block| block.ordinal)
-            .collect::<Vec<_>>();
+        let mut ordinals = Vec::with_capacity(4);
+        let mut add_ordinal = |offset: SourceOffset| {
+            if let Some(ordinal) = index.ordinal_at(offset)
+                && !ordinals.contains(&ordinal)
+            {
+                ordinals.push(ordinal);
+            }
+        };
+        let selection = self.editor().selection();
+        add_ordinal(selection.anchor);
+        add_ordinal(selection.active);
+        if let Some(ime) = self.editor().ime() {
+            add_ordinal(ime.current_range.start);
+            if !ime.current_range.is_empty() {
+                add_ordinal(SourceOffset(ime.current_range.end.0.saturating_sub(1)));
+            }
+        }
         let updates = ordinals
             .into_iter()
             .filter_map(|ordinal| {
@@ -8490,6 +8536,67 @@ mod tests {
             assert!(
                 view.heights.height(last).is_some_and(|height| height > 0.0),
                 "the current caret disclosure must win over the parse snapshot"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_height_snapshot_covers_the_selected_fence_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..16)
+            .map(|_| "```\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        let inactive_middle_height = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    index,
+                    view.line_height(),
+                    None,
+                )),
+            );
+            let inactive_middle_height = view.heights.height(8).expect("middle block height");
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.document_parse_job_running,
+                "a non-empty selection should refresh heights off the input path"
+            );
+            assert_eq!(
+                view.heights.height(8),
+                Some(inactive_middle_height),
+                "the middle block must not be synchronously scanned"
+            );
+            inactive_middle_height
+        });
+
+        // Register the timer before sleeping so the test executor can observe
+        // its wakeup, matching the formal-parse regression tests above.
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.heights
+                    .height(8)
+                    .is_some_and(|height| height > inactive_middle_height),
+                "the background disclosure snapshot must expand selected fence blocks"
             );
         });
     }
