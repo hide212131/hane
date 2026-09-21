@@ -161,6 +161,35 @@ const FIXTURES: &[MarkdownFixture] = &[
         style_runs: &[&[], &[]],
     },
     MarkdownFixture {
+        name: "thematic break with hyphens",
+        source: "---",
+        tree_paths: &[&[NodeKind::Rule]],
+        // A rule owns its whole source line, so its punctuation is disclosed
+        // as one source-mapped row rather than derived as inline markers.
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
+        name: "thematic break with asterisks",
+        source: "***",
+        tree_paths: &[&[NodeKind::Rule]],
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
+        name: "thematic break with underscores",
+        source: "___",
+        tree_paths: &[&[NodeKind::Rule]],
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
         name: "multi-line fenced code",
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
