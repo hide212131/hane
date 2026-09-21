@@ -1294,6 +1294,34 @@ fn disclosed_quote_prefix_does_not_consume_list_prefix_as_quote() {
 }
 
 #[test]
+fn inactive_list_quote_places_inset_after_the_list_prefix() {
+    for (source, line_id, expected_text_x, expected_marker_x) in [
+        ("- > item\n", 0, 0.0, Some(0.0)),
+        ("- item\n  > quote\n", 1, 40.0, None),
+    ] {
+        let block = present(source, None)
+            .into_iter()
+            .find(|block| {
+                block
+                    .lines
+                    .iter()
+                    .any(|line| line.line_id == line_id && line.quote.is_some())
+            })
+            .expect("the list quote block is presented");
+        let layout = layout_block(&block, 160.0, &shaper());
+        let row = layout
+            .lines
+            .iter()
+            .find(|row| row.line_id == line_id)
+            .expect("the list quote row is laid out");
+        assert_eq!(row.text_x_origin, expected_text_x, "source: {source:?}");
+        assert_eq!(row.marker_x_origin, expected_marker_x, "source: {source:?}");
+        assert_eq!(row.body_x_origin, 40.0, "source: {source:?}");
+        assert_eq!(row.quote_bar_x_origin, Some(30.0), "source: {source:?}");
+    }
+}
+
+#[test]
 fn lazy_continuation_image_keeps_quote_geometry() {
     let source = r#"> quote
 ![alt](dest)

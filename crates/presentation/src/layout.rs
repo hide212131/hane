@@ -666,6 +666,24 @@ fn line_geometry(
     });
     let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
     let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
+    let quote_source_start = line
+        .quote_marker_source_ranges
+        .first()
+        .map(|range| range.start.0);
+    let list_prefix_end = list
+        .marker
+        .as_ref()
+        .map(|marker| marker.source_range.end.0)
+        .into_iter()
+        .chain(
+            list.structural_prefixes
+                .iter()
+                .map(|prefix| prefix.source_range.end.0),
+        )
+        .max();
+    let quote_after_list = quote_source_start.is_some_and(|quote_start| {
+        list_prefix_end.is_some_and(|prefix_end| prefix_end <= quote_start)
+    });
     let quote_prefix_before_list = quote_prefix_after_outer
         && list.marker.as_ref().is_some_and(|marker| {
             line.quote_marker_visual_ranges
@@ -679,6 +697,8 @@ fn line_geometry(
             } else {
                 0.0
             }
+        } else if quote_after_list {
+            0.0
         } else {
             quote_x
         };
@@ -766,7 +786,10 @@ fn line_geometry(
             + list_depth_x(list.owner.depth)
             + marker_body_gap
     } else {
-        marker_x + expanded_prefix_width + marker_column_width
+        marker_x
+            + expanded_prefix_width
+            + marker_column_width
+            + if quote_after_list { quote_x } else { 0.0 }
     };
     let text_x_origin = if quote_prefix_after_outer {
         0.0
@@ -787,6 +810,18 @@ fn line_geometry(
         .map_or(marker_body_gap, |body| {
             (body_x - text_x_origin - shaper.x_for_offset(line, 0..body, body)).max(0.0)
         });
+    let quote_bar_x_origin = if quote_x > 0.0 {
+        let quote_bar_x = if quote_prefix_after_outer && quote_prefix_before_list {
+            quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
+        } else if quote_after_list {
+            body_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
+        } else {
+            quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
+        };
+        Some(quote_bar_x)
+    } else {
+        None
+    };
     LineGeometry {
         text_x_origin,
         marker_x_origin: opening_marker.then_some(marker_x),
@@ -800,8 +835,7 @@ fn line_geometry(
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
         marker_body_gap,
         body_gap,
-        quote_bar_x_origin: (quote_x > 0.0)
-            .then_some(quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH),
+        quote_bar_x_origin,
     }
 }
 
