@@ -4296,7 +4296,7 @@ impl EditorView {
                     .expect("block granularity has an index");
                 let disclosure = editor
                     .ime()
-                    .and_then(|ime| ime.current_range)
+                    .map(|ime| ime.current_range)
                     .or_else(|| Some(editor.selection().range()));
                 block_heights_with_disclosure(document, index, line_height, disclosure)
             }
