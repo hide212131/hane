@@ -1201,7 +1201,7 @@ fn present_rule_line(
     quote: Option<QuoteRowMetadata>,
 ) -> VisualLine {
     let expanded = disclosure.is_some_and(|active| range_touches(range, active));
-    let visual_text = expanded.then(|| source.to_owned()).unwrap_or_default();
+    let visual_text = if expanded { source.to_owned() } else { String::new() };
     VisualLine {
         line_id,
         source_range: range,
