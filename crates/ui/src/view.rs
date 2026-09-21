@@ -27,7 +27,8 @@ use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::presented_block;
 use crate::line::{
     BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_list_projection, row_element,
+    expected_block_disclosures, presented_block_with_list_projection,
+    presented_block_with_projections, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -3717,13 +3718,20 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
         let visible = line.0..line.0.saturating_add(1);
-        let visual = presented_block_with_list_projection(
+        let visual = presented_block_with_projections(
             self.editor(),
             &indexed,
             &visible,
             joined.map(|cached| &cached.parse),
             list_projection,
+            fence_height_projection,
             self.line_height(),
         )?;
         let visual_line = visual
@@ -4097,12 +4105,13 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
-        let visual = presented_block_with_list_projection(
+        let visual = presented_block_with_projections(
             self.editor(),
             &indexed,
             &window,
             joined.map(|cached| &cached.parse),
             list_projection,
+            fence_height_projection,
             self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -4598,12 +4607,16 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(block));
-        let mut presented = presented_block_with_list_projection(
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(block));
+        let mut presented = presented_block_with_projections(
             self.sessions.active().editor(),
             block,
             visible,
             joined.map(|cached| &cached.parse),
             list_projection,
+            fence_height_projection,
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
