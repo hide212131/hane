@@ -1352,6 +1352,29 @@ mod tests {
     }
 
     #[test]
+    fn document_end_caret_restores_a_final_nested_closing_fence() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("fence height projection");
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None),
+            2
+        );
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(source.len())),
+            ),
+            1,
+            "the final physical row owns a caret at document end"
+        );
+    }
+    #[test]
     fn incremental_list_edit_keeps_fence_height_projection_current() {
         let source = "- item\n  ```\n  code\n  ```\n";
         let mut buffer = RopeBuffer::from_text(source);
