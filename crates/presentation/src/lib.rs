@@ -942,6 +942,22 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
 /// each block's lines while it tiled them, and this is arithmetic over those
 /// counts. Measured heights replace these as blocks are drawn.
 pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32) -> Vec<f32> {
+    block_heights_with_disclosure(document, index, line_height, None)
+}
+
+/// Initial block heights while respecting the editor's active disclosure.
+///
+/// The height projection is block-relative and cheap to query, so startup and
+/// height-index rebuilds can keep the caret/selection/IME-owned fence row at
+/// normal height without presenting the block first. This prevents a run of
+/// otherwise zero-height fence blocks from disappearing from the initial
+/// virtualization window before the editable row has a chance to render.
+pub fn block_heights_with_disclosure(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+) -> Vec<f32> {
     let mut counted = 0;
     let mut heights = index
         .blocks()
@@ -950,7 +966,11 @@ pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32
             let collapsed = index
                 .fence_height_projection(&block)
                 .map_or(0, |projection| {
-                    projection.inactive_rows_in(block.source_range, block.source_range, None)
+                    projection.inactive_rows_in(
+                        block.source_range,
+                        block.source_range,
+                        disclosure,
+                    )
                 });
             line_height * block.line_count.saturating_sub(collapsed) as f32
         })
