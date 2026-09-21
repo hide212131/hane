@@ -277,6 +277,7 @@ pub fn run_block_layout_scenario(blocks: usize, iterations: usize) -> Distributi
                     render: span.clone(),
                     span,
                     lines: &lines,
+                    clipped_fence_lines: &[],
                     joined: None,
                     block_disclosure: None,
                 },
