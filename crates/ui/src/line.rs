@@ -327,7 +327,12 @@ fn block_context(
     } else {
         clip_to_block(document.line_range(LineId(render.end)).ok()?).start
     };
-    let (zero_height_fence_rows_before, zero_height_fence_rows_after) =
+    let (zero_height_fence_rows_before, zero_height_fence_rows_after) = if fenced {
+        // Top-level fenced blocks already inspect their opening/closing rows
+        // directly below. The projection is still retained in BlockIndex for
+        // initial HeightIndex seeding, but must not be counted twice here.
+        (0, 0)
+    } else {
         fence_height_projection.map_or((0, 0), |projection| {
             (
                 projection.inactive_rows_in(
@@ -341,7 +346,8 @@ fn block_context(
                     block_disclosure,
                 ),
             )
-        });
+        })
+    };
     Some(BlockContext {
         trailing_blank_lines,
         context,
