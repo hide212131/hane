@@ -1910,7 +1910,7 @@ fn present_markdown_from_parse(
         kind = BlockKind::Quote;
     }
     if kind == BlockKind::Rule {
-        return present_rule_line(
+        let mut line = present_rule_line(
             line_id,
             revision,
             range,
@@ -1919,6 +1919,21 @@ fn present_markdown_from_parse(
             disclosure,
             quote,
         );
+        // A rule still owns the surrounding list row. Keep the specialized
+        // separator/source disclosure presentation, but do not skip the
+        // semantic list projection that supplies list ownership/marker
+        // semantics, prefixes and body geometry to layout and editing.
+        line.list = list_row_metadata(
+            parsed,
+            shared.projection,
+            range,
+            markers_on_line,
+            &line.visual_text,
+            &line.source_map,
+            disclosure,
+            shared.list_projection,
+        );
+        return line;
     }
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
@@ -4021,6 +4036,58 @@ mod tests {
                 is_rule,
                 "Rule must follow parser context for {source:?}"
             );
+        }
+    }
+
+    #[test]
+    fn thematic_break_inside_list_keeps_list_and_quote_presentation_context() {
+        for (source, quoted, indented) in [
+            ("- ---\n", false, false),
+            ("  - ---\n", false, true),
+            ("> - ---\n", true, false),
+        ] {
+            let range = SourceRange::new(0, source.len());
+            let inactive = present_markdown_with_disclosure(
+                0,
+                Revision(1),
+                range,
+                source,
+                26.0,
+                None,
+            );
+            assert_eq!(inactive.kind, BlockKind::Rule, "source: {source:?}");
+            assert!(inactive.visual_text.is_empty(), "source: {source:?}");
+            let list = inactive.list.as_ref().expect("rule keeps list metadata");
+            assert_eq!(list.role, ListRowRole::Opening);
+            assert_eq!(list.owner.depth, 1);
+            assert_eq!(list.owner.marker_kind, ListMarkerKind::Bullet);
+            assert_eq!(list.structural_prefixes.is_empty(), !indented);
+            assert_eq!(inactive.source_map.segments.len(), 1);
+            assert_eq!(inactive.source_map.segments[0].source_range, range);
+            assert_eq!(
+                inactive.source_map.segments[0].visibility,
+                Visibility::HiddenMarkup
+            );
+            assert_eq!(inactive.quote.is_some(), quoted);
+
+            let rule_start = source.find("---").expect("rule source");
+            let active = present_markdown_with_disclosure(
+                0,
+                Revision(1),
+                range,
+                source,
+                26.0,
+                Some(SourceRange::empty(rule_start + 1)),
+            );
+            assert_eq!(active.kind, BlockKind::Rule, "source: {source:?}");
+            assert_eq!(active.visual_text, source, "source: {source:?}");
+            assert!(active.list.is_some(), "source: {source:?}");
+            assert_eq!(active.source_map.segments[0].source_range, range);
+            assert_eq!(
+                active.source_map.segments[0].visibility,
+                Visibility::ExpandedMarkup
+            );
+            assert_eq!(active.quote.is_some(), quoted);
         }
     }
 
