@@ -325,6 +325,10 @@ pub struct FenceHeightProjection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FenceHeightRow {
     range: SourceRange,
+    /// Zero-based physical line within the owning block. Keeping this beside
+    /// the source range lets render-time geometry answer prefix queries without
+    /// walking the block's source lines.
+    line: usize,
     owns_end: bool,
 }
 
@@ -337,11 +341,11 @@ struct FenceQuoteOwnerRows {
 impl FenceHeightProjection {
     pub(crate) fn from_absolute_rows(
         block_range: SourceRange,
-        rows: Vec<(SourceRange, bool, Vec<SourceRange>)>,
+        rows: Vec<(SourceRange, bool, Vec<SourceRange>, usize)>,
     ) -> Self {
         let mut normalized = rows
             .into_iter()
-            .map(|(range, owns_end, quote_owners)| {
+            .map(|(range, owns_end, quote_owners, line)| {
                 let range = SourceRange::new(
                     range.start.0.saturating_sub(block_range.start.0),
                     range.end.0.saturating_sub(block_range.start.0),
@@ -357,14 +361,15 @@ impl FenceHeightProjection {
                     .collect::<Vec<_>>();
                 quote_owners.sort_by_key(|owner| (owner.start, owner.end));
                 quote_owners.dedup();
-                (range, owns_end, quote_owners)
+                (range, owns_end, quote_owners, line)
             })
             .collect::<Vec<_>>();
-        normalized.sort_by_key(|(range, _, _)| (range.start, range.end));
-        let mut deduplicated: Vec<(SourceRange, bool, Vec<SourceRange>)> =
+        normalized.sort_by_key(|(range, _, _, line)| (range.start, range.end, *line));
+        let mut deduplicated: Vec<(SourceRange, bool, Vec<SourceRange>, usize)> =
             Vec::with_capacity(normalized.len());
-        for (range, owns_end, quote_owners) in normalized {
-            if let Some((last_range, last_owns_end, last_quote_owners)) = deduplicated.last_mut()
+        for (range, owns_end, quote_owners, line) in normalized {
+            if let Some((last_range, last_owns_end, last_quote_owners, _last_line)) =
+                deduplicated.last_mut()
                 && *last_range == range
             {
                 *last_owns_end |= owns_end;
@@ -372,20 +377,21 @@ impl FenceHeightProjection {
                 last_quote_owners.sort_by_key(|owner| (owner.start, owner.end));
                 last_quote_owners.dedup();
             } else {
-                deduplicated.push((range, owns_end, quote_owners));
+                deduplicated.push((range, owns_end, quote_owners, line));
             }
         }
         let rows = deduplicated
             .iter()
-            .map(|(range, owns_end, _)| FenceHeightRow {
+            .map(|(range, owns_end, _, line)| FenceHeightRow {
                 range: *range,
+                line: *line,
                 owns_end: *owns_end,
             })
             .collect::<Vec<_>>();
         let mut owner_rows = HashMap::<SourceRange, Vec<usize>>::new();
         let mut quote_row_prefix = Vec::with_capacity(rows.len() + 1);
         quote_row_prefix.push(0);
-        for (index, (_, _, quote_owners)) in deduplicated.iter().enumerate() {
+        for (index, (_, _, quote_owners, _)) in deduplicated.iter().enumerate() {
             // Nested quote owners are nested source ranges. Choosing the
             // outermost actual prefix makes the groups disjoint while keeping
             // the disclosure rule exact: an inner disclosure also touches its
@@ -442,7 +448,31 @@ impl FenceHeightProjection {
         );
         let start = self.rows.partition_point(|row| row.range.end <= relative.start);
         let end = self.rows.partition_point(|row| row.range.start < relative.end);
-        let rows = &self.rows[start..end];
+        self.inactive_rows_in_indices(block_range, start..end, disclosure)
+    }
+
+    /// Counts rows before a physical line boundary that remain collapsed under
+    /// `disclosure`. This is the render-time prefix query used to translate a
+    /// visual y position back to a source-line window. Its cost is bounded by
+    /// binary searches over the projection, independent of the total block
+    /// length or fence count.
+    pub fn inactive_rows_before_line(
+        &self,
+        block_range: SourceRange,
+        line: usize,
+        disclosure: Option<SourceRange>,
+    ) -> usize {
+        let end = self.rows.partition_point(|row| row.line < line);
+        self.inactive_rows_in_indices(block_range, 0..end, disclosure)
+    }
+
+    fn inactive_rows_in_indices(
+        &self,
+        block_range: SourceRange,
+        indices: Range<usize>,
+        disclosure: Option<SourceRange>,
+    ) -> usize {
+        let rows = &self.rows[indices.clone()];
         let Some(disclosure) = disclosure else {
             return rows.len();
         };
@@ -460,9 +490,9 @@ impl FenceHeightProjection {
                     row.range.start <= caret
                         && (caret < row.range.end || (row.owns_end && caret == row.range.end))
                 })
-                .map(|_| start + relative_active);
+                .map(|_| indices.start + relative_active);
             let quote_active =
-                self.active_quote_rows_in(start..end, SourceRange::empty(caret.0));
+                self.active_quote_rows_in(indices.clone(), SourceRange::empty(caret.0));
             let direct_active = usize::from(active_row.is_some());
             let direct_already_counted = active_row.is_some_and(|row| {
                 self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]
@@ -488,9 +518,9 @@ impl FenceHeightProjection {
         let active_start = rows.partition_point(|row| row.range.end <= disclosure.start);
         let active_end = rows.partition_point(|row| row.range.start < disclosure.end);
         let direct_active = active_end.saturating_sub(active_start);
-        let direct_already_counted = self.quote_row_prefix[ start + active_end]
-            .saturating_sub(self.quote_row_prefix[start + active_start]);
-        let quote_active = self.active_quote_rows_in(start..end, disclosure);
+        let direct_already_counted = self.quote_row_prefix[indices.start + active_end]
+            .saturating_sub(self.quote_row_prefix[indices.start + active_start]);
+        let quote_active = self.active_quote_rows_in(indices, disclosure);
         rows.len().saturating_sub(
             quote_active + direct_active - direct_already_counted,
         )
@@ -1887,6 +1917,35 @@ mod tests {
             .map(|marker| &source[marker.start.0..marker.end.0])
             .collect::<Vec<_>>();
         assert_eq!(covered, vec!["> ", "```", "> ", "> ", "```"]);
+    }
+
+    #[test]
+    fn fence_height_projection_answers_physical_line_prefixes() {
+        let block_range = SourceRange::new(100, 500);
+        let projection = FenceHeightProjection::from_absolute_rows(
+            block_range,
+            vec![
+                (SourceRange::new(100, 104), true, Vec::new(), 0),
+                (SourceRange::new(300, 304), true, Vec::new(), 200),
+            ],
+        );
+
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 0, None),
+            0
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 1, None),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 200, None),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 201, None),
+            2
+        );
     }
 
     #[test]

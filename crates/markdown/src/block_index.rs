@@ -251,8 +251,9 @@ fn build_fence_height_projection(
     let line_ranges = source_line_ranges_in(parse_range, block_range, source);
     let mut rows = Vec::new();
     for (marker, _) in fence_markers {
+        let line_index = line_ranges.partition_point(|line| line.end <= marker.start);
         let line = line_ranges
-            .get(line_ranges.partition_point(|line| line.end <= marker.start));
+            .get(line_index);
         let Some(line) = line else {
             continue;
         };
@@ -285,6 +286,7 @@ fn build_fence_height_projection(
                 *line,
                 !line_source.ends_with(['\n', '\r']),
                 quote_owners,
+                line_index,
             ));
         }
     }

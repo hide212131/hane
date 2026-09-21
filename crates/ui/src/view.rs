@@ -4640,10 +4640,45 @@ impl EditorView {
                 let line = document
                     .line_for_offset(offset)
                     .map_or(first_line, |line| line.0);
+                let physical_line = line.saturating_sub(first_line);
+                let visible_line = self.visible_line_prefix(&block, physical_line);
                 self.heights.prefix_sum(block.ordinal)
-                    + line.saturating_sub(first_line) as f32 * self.drawn_line_height(&block)
+                    + visible_line as f32 * self.drawn_line_height(&block)
             }
         }
+    }
+
+    /// Number of non-collapsed physical lines before `physical_line` inside a
+    /// block. Fence rows are answered by the formal projection's prefix index;
+    /// the render path never enumerates the block's off-screen fences.
+    fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
+        let Some(projection) = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(block))
+        else {
+            return physical_line;
+        };
+        let collapsed = projection.inactive_rows_before_line(
+            block.source_range,
+            physical_line,
+            self.active_height_disclosure(),
+        );
+        physical_line.saturating_sub(collapsed)
+    }
+
+    /// Inverts [`Self::visible_line_prefix`] for a visual row count. The
+    /// monotone prefix query is inverted with a binary search, so a large
+    /// list/quote block remains bounded by the logarithm of its physical line
+    /// count even when it contains many collapsed fence rows.
+    fn physical_line_prefix_for_visible_rows(
+        &self,
+        block: &IndexedBlock,
+        physical_line_count: usize,
+        visible_rows: usize,
+    ) -> usize {
+        invert_visible_line_prefix(physical_line_count, visible_rows, |line| {
+            self.visible_line_prefix(block, line)
+        })
     }
 
     /// The blocks covering the viewport. `visible` is a range of height entries,
@@ -4699,7 +4734,9 @@ impl EditorView {
     /// block can be taller than the viewport — a document with no blank line in
     /// it is one block. How tall a line is depends on how often it wraps, so the
     /// block's own laid-out rows answer it where they exist and the line height
-    /// stands in where they do not; the overscan absorbs the difference.
+    /// stands in where they do not; the overscan absorbs the difference. When a
+    /// fence projection collapses rows, the visual estimate is inverted through
+    /// its prefix count before the physical source window is selected.
     fn visible_line_window(&self, blocks: &[IndexedBlock], items: &Range<usize>) -> Range<usize> {
         match self.granularity {
             Granularity::Lines => items.clone(),
@@ -4716,12 +4753,28 @@ impl EditorView {
                 ) else {
                     return 0..0;
                 };
-                let into_block = |y: f32, block: &IndexedBlock| {
-                    ((y - self.heights.prefix_sum(block.ordinal)) / self.drawn_line_height(block))
-                        .max(0.0)
+                let local_rows = |y: f32, block: &IndexedBlock, round_up: bool| {
+                    let rows = ((y - self.heights.prefix_sum(block.ordinal)).max(0.0)
+                        / self.drawn_line_height(block))
+                        .max(0.0);
+                    if round_up {
+                        rows.ceil() as usize + 1
+                    } else {
+                        rows.floor() as usize + 1
+                    }
                 };
-                let start = first_span.start + into_block(top, first).floor() as usize;
-                let end = last_span.start + into_block(bottom, last).ceil() as usize + 1;
+                let start_prefix = self.physical_line_prefix_for_visible_rows(
+                    first,
+                    first_span.len(),
+                    local_rows(top, first, false),
+                );
+                let end_prefix = self.physical_line_prefix_for_visible_rows(
+                    last,
+                    last_span.len(),
+                    local_rows(bottom, last, true),
+                );
+                let start = first_span.start + start_prefix.saturating_sub(1);
+                let end = last_span.start + end_prefix;
                 let start = start.min(first_span.end.saturating_sub(1));
                 start..end.max(start + 1).min(last_span.end)
             }
@@ -5186,6 +5239,28 @@ impl EditorView {
             log_summary(&self.metrics);
         }
     }
+}
+
+fn invert_visible_line_prefix(
+    physical_line_count: usize,
+    visible_rows: usize,
+    mut visible_prefix: impl FnMut(usize) -> usize,
+) -> usize {
+    let visible_rows = visible_rows.min(visible_prefix(physical_line_count));
+    if visible_rows == 0 {
+        return 0;
+    }
+    let mut low = 0;
+    let mut high = physical_line_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if visible_prefix(middle) >= visible_rows {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
 }
 
 /// The header's status line, combining a persistent `draft_recovery_warning`
@@ -8003,6 +8078,78 @@ mod tests {
         assert_eq!(visual.leading_space(), 40_000.0 * 26.0);
         assert!(visual.covers(&(40_010..40_040)));
         assert!(!visual.covers(&(39_000..39_050)));
+    }
+
+    #[test]
+    fn visible_line_prefix_inversion_skips_a_long_collapsed_fence_prefix() {
+        // Model a large list/quote block whose first 5,000 physical rows are
+        // inactive fence delimiters. The inverse must select the first visible
+        // source row, not the physical row with the same ordinal as the visual
+        // y position.
+        const COLLAPSED: usize = 5_000;
+        const PHYSICAL: usize = 10_000;
+        let visible_prefix = |physical: usize| {
+            physical.saturating_sub(physical.min(COLLAPSED))
+        };
+
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, 1, visible_prefix),
+            COLLAPSED + 1
+        );
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, 37, visible_prefix),
+            COLLAPSED + 37
+        );
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, PHYSICAL, visible_prefix),
+            PHYSICAL
+        );
+    }
+
+    #[gpui::test]
+    fn clipped_nested_fence_window_uses_the_non_collapsed_source_prefix(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut text = String::new();
+        for _ in 0..128 {
+            text.push_str("> ```\n> ```\n> \n");
+        }
+        text.push_str("> visible tail\n\noutside");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(text.len())))
+                .unwrap();
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            let block = index.blocks().next().expect("quote block");
+            assert!(
+                index.fence_height_projection(&block).is_some(),
+                "fixture must build a nested fence height projection"
+            );
+            view.block_index.publish(index, IndexSource::Formal, &document);
+            let block = view.current_index().unwrap().block(0).unwrap();
+            let span = block_line_span(&document, &block).unwrap();
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    view.current_index().unwrap(),
+                    view.line_height(),
+                    None,
+                )),
+            );
+            view.viewport_height = view.line_height() * 4.0;
+            view.scroll_y = view.line_height() * 50.0;
+
+            let lines = view.visible_line_window(&[block], &(0..1));
+            assert!(
+                lines.start > span.start + 80,
+                "collapsed fence rows must be skipped when selecting the source window: {lines:?}"
+            );
+            assert!(lines.end > lines.start && lines.end <= span.end);
+        });
     }
 
     #[test]
