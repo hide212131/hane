@@ -5317,14 +5317,14 @@ impl EditorView {
 
     fn sidebar_scrollbar(
         &self,
-        top: f32,
+        list_top: f32,
         viewport_height: f32,
         content_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let max_scroll = (content_height - viewport_height).max(0.0);
         let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
-        let (top, thumb_height) =
+        let (thumb_top, thumb_height) =
             scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
         // Idle sidebar shows no track or thumb at all: the only visible
         // right-edge boundary is the thin `sidebar_resizer` line. The thumb
@@ -5336,7 +5336,7 @@ impl EditorView {
             div()
                 .id("work-folder-scrollbar")
                 .absolute()
-                .top(px(top))
+                .top(px(list_top))
                 .right(px(0.0))
                 .w(px(SCROLLBAR_TRACK_WIDTH))
                 .h(px(viewport_height))
@@ -5344,7 +5344,7 @@ impl EditorView {
                     div()
                         .id("work-folder-scrollbar-thumb")
                         .absolute()
-                        .top(px(top))
+                        .top(px(thumb_top))
                         .right(px(
                             (SCROLLBAR_TRACK_WIDTH - SIDEBAR_SCROLLBAR_THUMB_WIDTH) / 2.0
                         ))
