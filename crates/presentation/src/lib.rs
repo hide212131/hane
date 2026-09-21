@@ -6180,6 +6180,7 @@ mod tests {
             span: 0..lines.len(),
             render: 0..lines.len(),
             lines: &lines,
+            clipped_fence_lines: &[],
             joined: None,
             block_disclosure: None,
         };
