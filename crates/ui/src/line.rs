@@ -559,6 +559,7 @@ pub(crate) fn row_element(
                 .pl(px(theme.line_horizontal_padding + row.text_x_origin))
                 .pr(px(theme.line_horizontal_padding))
                 .children(quote_bar(row, theme, zoom))
+                .child(div().flex_none().child(line.visual_text.clone()))
                 .child(
                     div()
                         .h(px(1.0 * zoom))

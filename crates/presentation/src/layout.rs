@@ -539,9 +539,9 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 y,
                 height,
                 text_x_origin: if fragment == 0 {
-                    line_geometry.marker_x_origin.unwrap_or(
-                        line_geometry.body_x_origin - line_geometry.expanded_prefix_width,
-                    )
+                    line_geometry
+                        .marker_x_origin
+                        .unwrap_or(line_geometry.text_x_origin)
                 } else {
                     line_geometry.body_x_origin
                 },
@@ -568,9 +568,10 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 
 #[derive(Clone, Debug)]
 struct LineGeometry {
+    text_x_origin: f32,
     marker_x_origin: Option<f32>,
     body_x_origin: f32,
-    expanded_prefix_width: f32,
+    first_row_width: f32,
     effective_width: f32,
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
@@ -621,25 +622,35 @@ fn line_geometry(
     marker_widths: &HashMap<ListId, f32>,
 ) -> LineGeometry {
     let Some(list) = &line.list else {
-        let quote_x = line
-            .quote
-            .map_or(0.0, |quote| {
-                quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
-            });
+        let quote_x = line.quote.map_or(0.0, |quote| {
+            quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+        });
+        let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
+        let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
+        let body_x = if quote_prefix_after_outer {
+            quote_x + quote_prefix_width
+        } else {
+            quote_x
+        };
         return LineGeometry {
-            marker_x_origin: None,
-            body_x_origin: quote_x,
-            expanded_prefix_width: 0.0,
-            effective_width: if quote_x > 0.0 {
-                (width - quote_x).max(MIN_EFFECTIVE_WRAP_WIDTH)
+            text_x_origin: if quote_prefix_after_outer {
+                0.0
             } else {
-                width.max(0.0)
+                quote_x
             },
-            body_visual_start: None,
+            marker_x_origin: None,
+            body_x_origin: body_x,
+            first_row_width: if quote_prefix_after_outer {
+                width - body_x + quote_prefix_width
+            } else {
+                width - quote_x
+            },
+            effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
+            body_visual_start: quote_prefix_end.filter(|_| quote_prefix_after_outer),
             marker_visual_range: None,
             marker_body_gap: 0.0,
             quote_bar_x_origin: (quote_x > 0.0).then_some(
-                quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
+                quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
             ),
         };
     };
@@ -707,6 +718,7 @@ fn line_geometry(
     };
     let body_x = marker_x + expanded_prefix_width + marker_column_width;
     LineGeometry {
+        text_x_origin: body_x - expanded_prefix_width,
         marker_x_origin: if list.marker.is_some()
             || list.empty_caret_origin == Some(ListCaretOrigin::Marker)
         {
@@ -715,7 +727,14 @@ fn line_geometry(
             None
         },
         body_x_origin: body_x,
-        expanded_prefix_width,
+        first_row_width: width
+            - if list.marker.is_some()
+                || list.empty_caret_origin == Some(ListCaretOrigin::Marker)
+            {
+                marker_x
+            } else {
+                body_x - expanded_prefix_width
+            },
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
         body_visual_start,
         marker_visual_range: list
@@ -736,6 +755,37 @@ fn line_geometry(
     }
 }
 
+fn disclosed_quote_prefix(line: &VisualLine, shaper: &dyn LineShaper) -> (Option<usize>, f32) {
+    let Some(quote) = line.quote else {
+        return (None, 0.0);
+    };
+    if quote.disclosed_depth == 0 {
+        return (None, 0.0);
+    }
+
+    let mut disclosed = 0;
+    let mut width = 0.0;
+    for segment in &line.source_map.segments {
+        if segment.source_range.is_empty() {
+            continue;
+        }
+        if segment.visibility != crate::Visibility::ExpandedMarkup {
+            break;
+        }
+        disclosed += 1;
+        let visual_end = segment.visual_range.end.0;
+        width += shaper.x_for_offset(
+            line,
+            segment.visual_range.start.0..segment.visual_range.end.0,
+            segment.visual_range.end.0,
+        );
+        if disclosed == quote.disclosed_depth {
+            return (Some(visual_end), width);
+        }
+    }
+    (None, 0.0)
+}
+
 /// Fragment boundaries of one line, including 0 and the text length, so
 /// `windows(2)` yields the fragments. A line with nothing to wrap is one
 /// fragment, which is the case for every line until it outgrows the column.
@@ -751,11 +801,8 @@ fn fragment_boundaries(
     if width <= 0.0 || line.image.is_some() {
         return vec![0, len];
     }
-    let first_x_origin = geometry
-        .marker_x_origin
-        .unwrap_or(geometry.body_x_origin - geometry.expanded_prefix_width);
     let first_width =
-        (width - first_x_origin - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
+        (geometry.first_row_width - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);
     let valid_boundaries = |start: usize, row_width: f32| {

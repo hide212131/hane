@@ -2392,6 +2392,21 @@ fn inactive_standalone_image<'a>(
         .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
 }
 
+fn formal_quote_metadata(
+    range: SourceRange,
+    projection: &ListProjection,
+) -> Option<QuoteRowMetadata> {
+    let depth = projection
+        .quotes_in(range)
+        .map(|quote| quote.depth)
+        .max()
+        .unwrap_or(0);
+    (depth > 0).then_some(QuoteRowMetadata {
+        depth,
+        disclosed_depth: 0,
+    })
+}
+
 /// Whether a [`disclosure_runs`] run should be presented and disclosed with
 /// shared-parse semantics — one whole-paragraph parse and one run-wide merged
 /// disclosure (see [`merged_disclosure`]) — rather than as a single
@@ -3355,6 +3370,7 @@ fn present_joined_run_with_list_projection(
                 line.text,
                 line_height,
                 image,
+                list_projection.and_then(|projection| formal_quote_metadata(line.range, projection)),
             ),
             None => present_markdown_from_parse(
                 line.line as u64,
@@ -3467,7 +3483,15 @@ fn present_polished_line_with_fence(
     let mut block = if context == LineContext::FencedCode {
         present_fenced_code_line(line_id, revision, range, source, line_height, disclosure, fence_role)
     } else if let Some(image) = inactive_standalone_image(source, range, disclosure) {
-        present_image(line_id, revision, range, source, line_height, image)
+        present_image(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            image,
+            list_projection.and_then(|projection| formal_quote_metadata(range, projection)),
+        )
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
@@ -3726,6 +3750,7 @@ fn present_image(
     source: &str,
     line_height: f32,
     image: StandaloneImage<'_>,
+    quote: Option<QuoteRowMetadata>,
 ) -> VisualLine {
     let mut segments = Vec::new();
     let base = range.start.0;
@@ -3789,7 +3814,7 @@ fn present_image(
             destination: image.destination.to_owned(),
         }),
         list: None,
-        quote: None,
+        quote,
     }
 }
 

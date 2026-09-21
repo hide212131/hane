@@ -546,6 +546,16 @@ fn build_list_projections(
         })
         .collect::<Vec<_>>();
     quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
+    let mut quotes_by_block = vec![Vec::new(); block_ranges.len()];
+    for quote in quotes {
+        let block = block_ranges.partition_point(|range| range.end <= quote.source_range.start);
+        if block_ranges
+            .get(block)
+            .is_some_and(|range| range.start <= quote.source_range.start)
+        {
+            quotes_by_block[block].push(quote);
+        }
+    }
     blocks
         .iter()
         .enumerate()
@@ -576,11 +586,7 @@ fn build_list_projections(
                 .partition_point(|(marker, _, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
-            let block_quotes = quotes
-                .iter()
-                .copied()
-                .filter(|quote| quote.source_range.intersects(block_range))
-                .collect::<Vec<_>>();
+            let block_quotes = std::mem::take(&mut quotes_by_block[block]);
             if block_items.is_empty() && rows.is_empty() && block_quotes.is_empty() {
                 None
             } else {
@@ -1756,6 +1762,37 @@ mod tests {
                 .map(|quote| quote.depth)
                 .collect::<Vec<_>>(),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn formal_quote_projection_stays_with_its_own_block() {
+        let source = "> first\n\n> second\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let blocks = index.blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+
+        let first = index
+            .list_projection(&blocks[0])
+            .expect("first quote projection");
+        let second = index
+            .list_projection(&blocks[1])
+            .expect("second quote projection");
+        assert_eq!(first.quotes_in(blocks[0].source_range).count(), 1);
+        assert_eq!(second.quotes_in(blocks[1].source_range).count(), 1);
+        assert_eq!(
+            first
+                .quotes_in(blocks[1].source_range)
+                .count(),
+            0,
+            "the first block must not retain quote projections from later blocks"
+        );
+        assert_eq!(
+            second
+                .quotes_in(blocks[0].source_range)
+                .count(),
+            0,
+            "the second block must not retain quote projections from earlier blocks"
         );
     }
 

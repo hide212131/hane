@@ -17,7 +17,8 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block, present_block, trailing_blank_lines,
+    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_list_projection,
+    trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -236,7 +237,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                         .map(SourceRange::empty),
                 })
                 .collect::<Vec<_>>();
-            present_block(
+            present_block_with_list_projection(
                 &block,
                 buffer.revision(),
                 &BlockWindow {
@@ -251,6 +252,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     block_disclosure: None,
                 },
                 LINE_HEIGHT,
+                index.list_projection(&block),
             )
         })
         .collect()
@@ -1199,6 +1201,47 @@ fn disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset() {
         .point_for_source(&block, nested, &shaper())
         .expect("nested text has a point");
     assert_eq!(point.x, 40.0);
+    let nested_row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("nested quote row is laid out");
+    assert_eq!(nested_row.text_x_origin, 0.0);
+    assert_eq!(nested_row.body_x_origin, 40.0);
+    assert_eq!(nested_row.quote_bar_x_origin, Some(30.0));
+}
+
+#[test]
+fn lazy_continuation_image_keeps_quote_geometry() {
+    let source = r#"> quote
+![alt](dest)
+"#;
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.image.is_some()))
+        .expect("the quoted image block is presented");
+    let image = block
+        .lines
+        .iter()
+        .find(|line| line.image.is_some())
+        .expect("the lazy continuation image is presented");
+
+    assert_eq!(image.kind, BlockKind::Image);
+    assert_eq!(
+        image.quote,
+        Some(hane_presentation::QuoteRowMetadata {
+            depth: 1,
+            disclosed_depth: 0,
+        })
+    );
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == image.line_id as usize)
+        .expect("the image row is laid out");
+    assert_eq!(row.body_x_origin, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(14.0));
 }
 
 #[test]
