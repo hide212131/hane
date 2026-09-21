@@ -310,6 +310,10 @@ pub struct ListProjection {
     pub lists: Vec<ListProjectionList>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+    /// Physical source rows whose inactive fence presentation is completely
+    /// empty. Kept sorted by source range so virtualized height accounting can
+    /// count clipped rows with binary search without reading their source text.
+    zero_height_fence_rows: Vec<SourceRange>,
     /// Formal quote/list prefix ranges paired with the owning quote's source
     /// range, when the marker belongs to a quote. List marker ownership is
     /// resolved through `items` by range so nested list items retain their own
@@ -364,6 +368,7 @@ impl ListProjection {
         lists: Vec<ListProjectionList>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
+        zero_height_fence_rows: Vec<SourceRange>,
         container_markers: Vec<(SourceRange, Option<SourceRange>)>,
     ) -> Self {
         Self {
@@ -372,6 +377,7 @@ impl ListProjection {
             lists,
             rows,
             fence_markers,
+            zero_height_fence_rows,
             container_markers,
         }
     }
@@ -403,6 +409,45 @@ impl ListProjection {
             .iter()
             .copied()
             .filter(move |(marker, _)| marker.intersects(range))
+    }
+
+    /// Counts inactive fence rows in `range` that remain zero-height after
+    /// applying the current caret/selection/IME disclosure. The formal index
+    /// precomputes these physical rows once; this query is logarithmic and does
+    /// not materialize source lines while scrolling.
+    pub fn inactive_zero_height_fence_rows_in(
+        &self,
+        range: SourceRange,
+        disclosure: Option<SourceRange>,
+    ) -> usize {
+        if range.is_empty() {
+            return 0;
+        }
+        let start = self
+            .zero_height_fence_rows
+            .partition_point(|row| row.end <= range.start);
+        let end = self
+            .zero_height_fence_rows
+            .partition_point(|row| row.start < range.end);
+        let rows = &self.zero_height_fence_rows[start..end];
+        if rows.is_empty() {
+            return 0;
+        }
+        let Some(disclosure) = disclosure else {
+            return rows.len();
+        };
+        if disclosure.is_empty() {
+            let caret = disclosure.start;
+            let active = rows
+                .partition_point(|row| row.end <= caret)
+                .checked_sub(0)
+                .and_then(|index| rows.get(index))
+                .is_some_and(|row| row.start <= caret && caret < row.end);
+            return rows.len().saturating_sub(usize::from(active));
+        }
+        let active_start = rows.partition_point(|row| row.end <= disclosure.start);
+        let active_end = rows.partition_point(|row| row.start < disclosure.end);
+        rows.len().saturating_sub(active_end.saturating_sub(active_start))
     }
 
     /// Formal quote/list prefix ranges in `range`. Viewport-only parses can
