@@ -809,26 +809,36 @@ pub struct VisualBlock {
     /// Lines of `span` clipped above and below the presented run.
     pub lines_before: usize,
     pub lines_after: usize,
-    /// Height a clipped line stands in for.
+    /// Clipped structural rows whose inactive presentation has zero height.
+    /// These remain part of the physical-line counts above so coverage and
+    /// source-line mapping stay exact while their layout footprint disappears.
+    pub zero_height_lines_before: usize,
+    pub zero_height_lines_after: usize,
+    /// Height a non-collapsed clipped line stands in for.
     pub line_height: f32,
 }
 
 impl VisualBlock {
-    /// Height of the whole block: what was presented, plus line height for what
-    /// was clipped.
+    /// Height of the whole block: what was presented, plus the non-collapsed
+    /// clipped lines standing in above and below it.
     pub fn height(&self) -> f32 {
-        let clipped = (self.lines_before + self.lines_after) as f32 * self.line_height;
-        clipped + self.lines.iter().map(VisualLine::height).sum::<f32>()
+        self.leading_space()
+            + self.trailing_space()
+            + self.lines.iter().map(VisualLine::height).sum::<f32>()
     }
 
     /// Space to leave above the presented lines, inside the block.
     pub fn leading_space(&self) -> f32 {
-        self.lines_before as f32 * self.line_height
+        self.lines_before
+            .saturating_sub(self.zero_height_lines_before) as f32
+            * self.line_height
     }
 
     /// Space to leave below the presented lines, inside the block.
     pub fn trailing_space(&self) -> f32 {
-        self.lines_after as f32 * self.line_height
+        self.lines_after
+            .saturating_sub(self.zero_height_lines_after) as f32
+            * self.line_height
     }
 
     /// Render policy for the block. As with a line, the UI applies this and never
@@ -949,12 +959,39 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
 /// each block's lines while it tiled them, and this is arithmetic over those
 /// counts. Measured heights replace these as blocks are drawn.
 pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32) -> Vec<f32> {
+    block_heights_with_disclosure(document, index, line_height, None)
+}
+
+/// Initial block heights while respecting the editor's active disclosure.
+///
+/// The height projection is block-relative and cheap to query, so startup and
+/// height-index rebuilds can keep the caret/selection/IME-owned fence row at
+/// normal height without presenting the block first. This prevents a run of
+/// otherwise zero-height fence blocks from disappearing from the initial
+/// virtualization window before the editable row has a chance to render.
+pub fn block_heights_with_disclosure(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+) -> Vec<f32> {
     let mut counted = 0;
     let mut heights = index
         .blocks()
         .map(|block| {
             counted += block.line_count;
-            line_height * block.line_count as f32
+            let block_is_final = block.ordinal + 1 == index.len();
+            let collapsed = index
+                .fence_height_projection(&block)
+                .map_or(0, |projection| {
+                    projection.inactive_rows_in(
+                        block.source_range,
+                        block.source_range,
+                        disclosure,
+                        block_is_final,
+                    )
+                });
+            line_height * block.line_count.saturating_sub(collapsed) as f32
         })
         .collect::<Vec<_>>();
     // A document ending in a newline has one physical line more than its blocks
@@ -997,6 +1034,15 @@ pub struct BlockWindow<'a> {
     /// that opens inside `render` — unless `joined` already supplies that
     /// context, in which case `lines` only needs to cover `render`.
     pub lines: &'a [BlockLine<'a>],
+    /// Fence delimiter lines outside `lines` that still affect the block's
+    /// inactive vertical footprint. They are height-accounting context only:
+    /// never joined into paragraph/list parsing and never rendered directly.
+    pub clipped_fence_lines: &'a [BlockLine<'a>],
+    /// Inactive nested fence rows clipped above/below the render window.
+    /// These are pre-counted from the formal projection so presentation does
+    /// not materialize off-screen source rows merely to account for height.
+    pub zero_height_fence_rows_before: usize,
+    pub zero_height_fence_rows_after: usize,
     /// The subset of `lines` (by document line number) to actually turn into
     /// presented [`VisualLine`]s. Lines in `lines` outside this range are
     /// parsing context only and are not drawn.
@@ -1128,6 +1174,62 @@ pub fn present_block_with_list_projection(
         (line.line_id as usize).saturating_sub(window.span.start)
     });
     let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
+    let first_presented_line = window.span.start.saturating_add(lines_before);
+    let presented_end = first_presented_line.saturating_add(lines.len());
+    let mut zero_height_lines_before = window.zero_height_fence_rows_before;
+    let mut zero_height_lines_after = window.zero_height_fence_rows_after;
+    let mut record_collapsed = |line: usize, collapsed: bool| {
+        if !collapsed {
+            return;
+        }
+        if line < first_presented_line {
+            zero_height_lines_before += 1;
+        } else if line >= presented_end {
+            zero_height_lines_after += 1;
+        }
+    };
+    if context == LineContext::FencedCode {
+        for line in window.lines {
+            let Some(fence_role) =
+                fence_line_role(line.line, content_end, line.text, fence_opening)
+            else {
+                continue;
+            };
+            let collapsed = present_fenced_code_line(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+                Some(fence_role),
+            )
+            .height()
+                == 0.0;
+            record_collapsed(line.line, collapsed);
+        }
+    }
+    for line in window.clipped_fence_lines {
+        let collapsed = if context == LineContext::FencedCode {
+            fence_line_role(line.line, content_end, line.text, fence_opening)
+                .is_some_and(|fence_role| {
+                    present_fenced_code_line(
+                        line.line as u64,
+                        revision,
+                        line.range,
+                        line.text,
+                        line_height,
+                        line.disclosure,
+                        Some(fence_role),
+                    )
+                    .height()
+                        == 0.0
+                })
+        } else {
+            false
+        };
+        record_collapsed(line.line, collapsed);
+    }
     VisualBlock {
         id: block.id,
         kind: block_display_kind(block.kind),
@@ -1138,6 +1240,8 @@ pub fn present_block_with_list_projection(
         lines,
         lines_before,
         lines_after,
+        zero_height_lines_before,
+        zero_height_lines_after,
         line_height,
     }
 }
@@ -1411,9 +1515,48 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
     }
 }
 
+/// Height of one fenced-code row when its presentation is not collapsed.
+/// Height-index adjustments use this same policy to remove a disclosed fence
+/// from an already measured block without disturbing the measured content rows
+/// that remain visible.
+pub fn code_line_height(line_height: f32) -> f32 {
+    estimated_height(BlockKind::CodeBlock, line_height)
+}
+
+/// A fence-only source row is structural markup, not an empty code row. Once
+/// its delimiter is collapsed and no visible label/content remains, it must
+/// consume no vertical space. As soon as the delimiter is disclosed for
+/// editing, the ordinary code-row height comes back.
+fn fenced_line_height(
+    visual_text: &str,
+    has_hidden_fence: bool,
+    is_editing: bool,
+    line_height: f32,
+) -> f32 {
+    if has_hidden_fence && !is_editing && visual_text.trim().is_empty() {
+        0.0
+    } else {
+        code_line_height(line_height)
+    }
+}
+
 fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     if disclosure.is_empty() {
         range.start <= disclosure.start && disclosure.start <= range.end
+    } else {
+        range.intersects(disclosure)
+    }
+}
+
+fn disclosure_owns_physical_line(
+    range: SourceRange,
+    source: &str,
+    disclosure: SourceRange,
+) -> bool {
+    if disclosure.is_empty() {
+        range.start <= disclosure.start
+            && (disclosure.start < range.end
+                || (!source.ends_with(['\n', '\r']) && disclosure.start == range.end))
     } else {
         range.intersects(disclosure)
     }
@@ -2166,6 +2309,23 @@ fn present_markdown_from_parse(
         disclosure,
         shared.list_projection,
     );
+    let has_hidden_fence = kind == BlockKind::CodeBlock
+        && markers_on_line.iter().filter(|marker| marker.fence).any(|marker| {
+            source_map.segments.iter().any(|segment| {
+                segment.source_range == marker.range
+                    && segment.visibility == Visibility::HiddenMarkup
+            })
+        });
+    let line_estimated_height = if kind == BlockKind::CodeBlock {
+        fenced_line_height(
+            &visual,
+            has_hidden_fence,
+            disclosure.is_some_and(|active| disclosure_owns_physical_line(range, source, active)),
+            line_height,
+        )
+    } else {
+        estimated_height(kind, line_height)
+    };
     VisualLine {
         line_id,
         source_range: range,
@@ -2173,7 +2333,7 @@ fn present_markdown_from_parse(
         visual_text: visual,
         style_runs,
         source_map,
-        estimated_height: estimated_height(kind, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         kind,
@@ -3409,6 +3569,13 @@ fn present_fenced_code_opening_line(
     } else {
         Vec::new()
     };
+    let line_estimated_height =
+        fenced_line_height(
+            &visual,
+            !expanded,
+            disclosure.is_some_and(|active| range_touches(range, active)),
+            line_height,
+        );
     VisualLine {
         line_id,
         source_range: range,
@@ -3417,7 +3584,7 @@ fn present_fenced_code_opening_line(
         style_runs,
         kind: BlockKind::CodeBlock,
         source_map: SourceMap { segments },
-        estimated_height: estimated_height(BlockKind::CodeBlock, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
@@ -3456,6 +3623,13 @@ fn present_fenced_code_closing_line(
     } else {
         Vec::new()
     };
+    let line_estimated_height =
+        fenced_line_height(
+            &visual_text,
+            !expanded,
+            disclosure.is_some_and(|active| range_touches(range, active)),
+            line_height,
+        );
     VisualLine {
         line_id,
         source_range: range,
@@ -3471,7 +3645,7 @@ fn present_fenced_code_closing_line(
                 marker_edge: Some(MarkerEdge::Closing),
             }],
         },
-        estimated_height: estimated_height(BlockKind::CodeBlock, line_height),
+        estimated_height: line_estimated_height,
         measured_height: None,
         invalid: false,
         context: LineContext::FencedCode,
@@ -3949,6 +4123,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_block_heights_keep_the_caret_owned_fence_row_visible() {
+        let document = RopeBuffer::from_text("```\n```");
+        let index = BlockIndex::from_buffer(&document);
+        let inactive = block_heights(&document, &index, 26.0);
+        assert_eq!(inactive, vec![0.0]);
+
+        let editing = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(1)),
+        );
+        assert_eq!(
+            editing,
+            vec![26.0],
+            "the opening fence owned by the caret must survive initial virtualization"
+        );
+    }
+
+    #[test]
+    fn selection_outside_a_quote_fence_block_does_not_disclose_its_rows() {
+        let source = "before\n\n> ```\n> code\n> ```";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let quote_block = index
+            .blocks()
+            .find(|block| block.kind == NodeKind::Quote)
+            .expect("quote block");
+        assert!(
+            index.fence_height_projection(&quote_block).is_some(),
+            "the fixture must exercise the quote fence projection"
+        );
+        let inactive = block_heights(&document, &index, 26.0);
+        let selection_before_block = SourceRange::new(0, quote_block.source_range.start.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(selection_before_block),
+        );
+
+        assert_eq!(
+            disclosed, inactive,
+            "a selection ending at the block boundary must not activate its fence rows"
+        );
+    }
+
+    #[test]
+    fn caret_at_the_next_block_start_does_not_disclose_the_previous_quote() {
+        let source = "> ```\n> code\n> ```\n\nplain";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let quote_block = index
+            .blocks()
+            .find(|block| block.kind == NodeKind::Quote)
+            .expect("quoted block");
+        let inactive = block_heights(&document, &index, 26.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(quote_block.source_range.end.0)),
+        );
+
+        assert_eq!(
+            disclosed, inactive,
+            "the caret at the following block start must not make the preceding quote visible"
+        );
+    }
+
+    #[test]
+    fn caret_at_a_quote_owner_end_discloses_fence_rows_before_following_list_text() {
+        let source = "- > ```\n  > code\n  > ```\n  after";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let after = source.rfind('\n').expect("following list row") + 1;
+        let inactive = block_heights(&document, &index, 26.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(after)),
+        );
+
+        assert_eq!(inactive.len(), 1, "the fixture must stay in one list block");
+        assert_eq!(disclosed, vec![26.0 * 4.0]);
+        assert_eq!(inactive, vec![26.0 * 3.0]);
+    }
+
+    #[test]
     fn quote_depth_and_inline_style_come_from_the_shared_parse() {
         let source = "> outer\n> > **inner**\n";
         let mut offset = 0;
@@ -3984,6 +4248,9 @@ mod tests {
                 span: 0..lines.len(),
                 trailing_blank_lines: 0,
                 lines: &lines,
+                clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
                 render: 0..lines.len(),
                 joined: Some(&joined),
                 block_disclosure: None,
@@ -4045,6 +4312,9 @@ mod tests {
                 span: 0..2,
                 trailing_blank_lines: 0,
                 lines: &lines,
+                clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
                 render: 1..2,
                 joined: None,
                 block_disclosure: None,
@@ -4994,6 +5264,58 @@ mod tests {
     }
 
     #[test]
+    fn average_line_height_ignores_collapsed_fence_rows() {
+        let opening = present_fenced_code_opening_line(
+            0,
+            Revision(1),
+            SourceRange::new(0, 4),
+            "```\n",
+            26.0,
+            None,
+        );
+        let body = present_fenced_code_content_line(
+            1,
+            Revision(1),
+            SourceRange::new(4, 9),
+            "code\n",
+            26.0,
+        );
+        let closing = present_fenced_code_closing_line(
+            2,
+            Revision(1),
+            SourceRange::new(9, 13),
+            "```\n",
+            26.0,
+            None,
+        );
+        assert_eq!(opening.height(), 0.0);
+        assert!(body.height() > 0.0);
+        assert_eq!(closing.height(), 0.0);
+
+        let block = VisualBlock {
+            id: BlockId(0),
+            kind: BlockKind::CodeBlock,
+            source_range: SourceRange::new(0, 13),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            span: 0..3,
+            lines: vec![opening, body, closing],
+            lines_before: 0,
+            lines_after: 0,
+            zero_height_lines_before: 0,
+            zero_height_lines_after: 0,
+            line_height: 26.0,
+        };
+        let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
+
+        assert_eq!(
+            layout.average_line_height(),
+            Some(code_line_height(26.0)),
+            "collapsed fence rows must not lower the visual-row estimate"
+        );
+    }
+
+    #[test]
     fn quote_disclosure_does_not_expand_inactive_nested_quote_or_inline_markers() {
         let source = "> outer\n> > **nested**";
         let start = 40;
@@ -5331,6 +5653,8 @@ mod tests {
             lines: vec![opening, empty],
             lines_before: 0,
             lines_after: 0,
+            zero_height_lines_before: 0,
+            zero_height_lines_after: 0,
             line_height: 26.0,
         };
         let context = ListEditingContext {
@@ -5453,6 +5777,8 @@ mod tests {
                 ],
                 lines_before: 0,
                 lines_after: 0,
+                zero_height_lines_before: 0,
+                zero_height_lines_after: 0,
                 line_height: 26.0,
             };
             let context = ListEditingContext {
@@ -5797,6 +6123,9 @@ mod tests {
                 span: 0..2,
                 trailing_blank_lines: 0,
                 lines: &lines,
+                clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
                 render: 0..2,
                 joined: Some(&joined),
                 block_disclosure: Some(disclosure),
@@ -5916,6 +6245,9 @@ mod tests {
             span: 0..2,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..2,
             joined: None,
             block_disclosure: None,
@@ -5998,6 +6330,9 @@ mod tests {
             span: 0..3,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..3,
             joined: None,
             block_disclosure: None,
@@ -6091,6 +6426,9 @@ mod tests {
             span: 0..2,
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..2,
             joined: Some(&joined),
             block_disclosure: None,
@@ -6102,6 +6440,9 @@ mod tests {
             span: 0..2,
             trailing_blank_lines: 0,
             lines: narrow_lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..1,
             joined: Some(&joined),
             block_disclosure: None,
@@ -6186,6 +6527,9 @@ mod tests {
             span: 0..lines.len(),
             trailing_blank_lines: 0,
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: 0..lines.len(),
             joined: None,
             block_disclosure: None,
@@ -6487,6 +6831,9 @@ mod tests {
             span: 0..lines.len(),
             render: 0..lines.len(),
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             joined: None,
             block_disclosure: None,
         };
@@ -6546,6 +6893,9 @@ mod tests {
             span: 0..lines.len(),
             render: 0..lines.len(),
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             joined: None,
             block_disclosure: None,
         };

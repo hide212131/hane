@@ -76,8 +76,8 @@ pub struct LayoutLine {
     /// every hanging fragment starts at the item's body column.
     pub text_x_origin: f32,
     /// x at which the owning list item's body starts, in the block's text
-    /// column. Opening markers may be narrower than this column because the
-    /// whole list aligns to its aggregate inactive label width.
+    /// column. Inactive markers may be narrower than this column because the
+    /// whole list aligns to its aggregate synthesized label width.
     pub body_x_origin: f32,
     /// Width passed to the shaper for body-column fragments. The first
     /// fragment of an opening list row receives the wider marker-inclusive
@@ -254,11 +254,33 @@ impl BlockLayout {
             .sum()
     }
 
-    /// Mean height of a presented line, used to estimate how far into a block a
-    /// scroll position falls before that part of the block has been laid out.
+    /// Mean height of a visible presented line, used to estimate how far into a
+    /// block a scroll position falls before that part of the block has been laid
+    /// out. A zero-height line is a collapsed structural row (for example an
+    /// inactive fence delimiter), not a visual row; including it in the
+    /// denominator would make a visual y position look farther into the block
+    /// than it really is before the fence projection is inverted.
     pub fn average_line_height(&self) -> Option<f32> {
-        let lines = self.lines.last().map(|row| row.line + 1)?;
-        (lines > 0).then(|| self.lines.iter().map(|row| row.height).sum::<f32>() / lines as f32)
+        let mut total = 0.0;
+        let mut count = 0;
+        let mut current_line = None;
+        let mut current_height = 0.0;
+        for row in &self.lines {
+            if current_line != Some(row.line) {
+                if current_line.is_some() && current_height > 0.0 {
+                    total += current_height;
+                    count += 1;
+                }
+                current_line = Some(row.line);
+                current_height = 0.0;
+            }
+            current_height += row.height;
+        }
+        if current_line.is_some() && current_height > 0.0 {
+            total += current_height;
+            count += 1;
+        }
+        (count > 0).then(|| total / count as f32)
     }
 
     /// The row a source offset renders on.
@@ -664,7 +686,17 @@ fn line_geometry(
     // item's body, so adding the aggregate marker width would reserve that
     // column a second time. When the prefix is hidden, keep the aggregate
     // marker column so inactive continuation rows still hang under the body.
-    let marker_column_width = if list.marker.is_none() && expanded_prefix_width > 0.0 {
+    // Synthesized markers participate in the list-wide inactive alignment
+    // column. Once a marker is disclosed, the source-visible marker is the
+    // coordinate truth: retaining the aggregate column would leave a
+    // geometry-only gap between the raw marker and its body.
+    let marker_column_width = if list
+        .marker
+        .as_ref()
+        .is_some_and(|marker| !marker.synthesized)
+    {
+        disclosed_marker_width
+    } else if list.marker.is_none() && expanded_prefix_width > 0.0 {
         0.0
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
@@ -686,9 +718,14 @@ fn line_geometry(
             .marker
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
-        marker_body_gap: list.marker.as_ref().map_or(0.0, |_| {
-            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
-        }),
+        marker_body_gap: list
+            .marker
+            .as_ref()
+            .filter(|marker| marker.synthesized)
+            .map_or(0.0, |_| {
+                (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width)
+                    .max(0.0)
+            }),
         quote_bar_x_origin: (quote_x > 0.0).then_some(
             quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
         ),

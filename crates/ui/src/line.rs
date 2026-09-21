@@ -15,14 +15,13 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{IndexedBlock, ListProjection};
+use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
 use hane_presentation::{
     BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
     VisualLine,
     VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
-    expected_disclosures,
-    present_block_with_list_projection, trailing_blank_lines,
+    expected_disclosures, present_block_with_list_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -130,11 +129,39 @@ pub(crate) fn presented_block_with_list_projection(
     list_projection: Option<&ListProjection>,
     line_height: f32,
 ) -> Option<VisualBlock> {
+    presented_block_with_projections(
+        editor,
+        block,
+        visible,
+        joined,
+        list_projection,
+        None,
+        line_height,
+    )
+}
+
+pub(crate) fn presented_block_with_projections(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
+    line_height: f32,
+) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let ctx = block_context(editor, block, &span, &render, joined)?;
+    let ctx = block_context(
+        editor,
+        block,
+        &span,
+        &render,
+        joined,
+        fence_height_projection,
+    )?;
     let lines = block_lines(editor, &ctx);
+    let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
     Some(present_block_with_list_projection(
         block,
         document.revision(),
@@ -142,6 +169,9 @@ pub(crate) fn presented_block_with_list_projection(
             trailing_blank_lines: ctx.trailing_blank_lines,
             span,
             lines: &lines,
+            clipped_fence_lines: &clipped_fence_lines,
+            zero_height_fence_rows_before: ctx.zero_height_fence_rows_before,
+            zero_height_fence_rows_after: ctx.zero_height_fence_rows_after,
             render,
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -169,7 +199,7 @@ pub(crate) fn expected_block_disclosures(
 ) -> Option<Vec<(usize, Option<SourceRange>)>> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
-    let ctx = block_context(editor, block, &span, render, joined)?;
+    let ctx = block_context(editor, block, &span, render, joined, None)?;
     let lines = block_lines(editor, &ctx);
     Some(expected_disclosures(
         block.kind,
@@ -177,6 +207,9 @@ pub(crate) fn expected_block_disclosures(
             trailing_blank_lines: ctx.trailing_blank_lines,
             span,
             lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: render.clone(),
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -203,6 +236,12 @@ struct BlockContext {
     /// `None` for any other block kind, or once this line is already covered
     /// by `context` and would otherwise be read twice.
     opening_fence_line: Option<(usize, SourceRange, String)>,
+    /// Fence delimiter rows outside `context` that are needed only to keep
+    /// virtualized height stable. These are never joined into normal Markdown
+    /// parsing and are not drawn by the current render window.
+    clipped_fence_lines: Vec<(usize, SourceRange, String)>,
+    zero_height_fence_rows_before: usize,
+    zero_height_fence_rows_after: usize,
 }
 
 fn block_context(
@@ -211,6 +250,7 @@ fn block_context(
     span: &Range<usize>,
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
+    fence_height_projection: Option<&FenceHeightProjection>,
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
@@ -249,27 +289,85 @@ fn block_context(
         block.source_range,
         span.end == document.line_count(),
     );
-    let opening_fence_line = (block_line_context(block.kind) == LineContext::FencedCode)
+    let trailing_blank_lines = trailing_blank_lines(document, span);
+    let fenced = block_line_context(block.kind) == LineContext::FencedCode;
+    let opening_fence_line_number = fenced
         .then(|| span.start.saturating_add(block.leading_content_lines))
-        .filter(|opening| *opening < span.end)
+        .filter(|opening| *opening < span.end);
+    let opening_fence_line = opening_fence_line_number
         .filter(|opening| !context.contains(opening))
         .and_then(|opening| {
             let range = clip_to_block(document.line_range(LineId(opening)).ok()?);
             let text = document.text(range).unwrap_or_default();
             Some((opening, range, text))
         });
+    let content_end = span.end.saturating_sub(trailing_blank_lines);
+    let mut clipped_fence_lines = Vec::new();
+    if let Some(closing) = fenced
+        .then(|| content_end.checked_sub(1))
+        .flatten()
+        .filter(|closing| *closing >= span.start && *closing < span.end)
+        .filter(|closing| Some(*closing) != opening_fence_line_number)
+        .filter(|closing| !context.contains(closing))
+    {
+        let range = clip_to_block(document.line_range(LineId(closing)).ok()?);
+        let text = document.text(range).unwrap_or_default();
+        clipped_fence_lines.push((closing, range, text));
+    }
+    let render_start_offset = if render.start <= span.start {
+        block_range.start
+    } else if render.start >= span.end {
+        block_range.end
+    } else {
+        clip_to_block(document.line_range(LineId(render.start)).ok()?).start
+    };
+    let render_end_offset = if render.end <= span.start {
+        block_range.start
+    } else if render.end >= span.end {
+        block_range.end
+    } else {
+        clip_to_block(document.line_range(LineId(render.end)).ok()?).start
+    };
+    let (zero_height_fence_rows_before, zero_height_fence_rows_after) = if fenced {
+        // Top-level fenced blocks already inspect their opening/closing rows
+        // directly below. The projection is still retained in BlockIndex for
+        // initial HeightIndex seeding, but must not be counted twice here.
+        (0, 0)
+    } else {
+        let block_is_final = span.end == document.line_count();
+        fence_height_projection.map_or((0, 0), |projection| {
+            (
+                projection.inactive_rows_in(
+                    block_range,
+                    SourceRange::new(block_range.start.0, render_start_offset.0),
+                    block_disclosure,
+                    block_is_final,
+                ),
+                projection.inactive_rows_in(
+                    block_range,
+                    SourceRange::new(render_end_offset.0, block_range.end.0),
+                    block_disclosure,
+                    block_is_final,
+                ),
+            )
+        })
+    };
     Some(BlockContext {
-        trailing_blank_lines: trailing_blank_lines(document, span),
+        trailing_blank_lines,
         context,
         ranges,
         texts,
         block_disclosure,
         opening_fence_line,
+        clipped_fence_lines,
+        zero_height_fence_rows_before,
+        zero_height_fence_rows_after,
     })
 }
 
 fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
-    let mut lines = Vec::with_capacity(ctx.context.len() + usize::from(ctx.opening_fence_line.is_some()));
+    let mut lines =
+        Vec::with_capacity(ctx.context.len() + usize::from(ctx.opening_fence_line.is_some()));
     if let Some((line, range, text)) = &ctx.opening_fence_line {
         lines.push(BlockLine {
             line: *line,
@@ -286,7 +384,20 @@ fn block_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>>
             disclosure: disclosure_for_line(editor, line, *range),
         },
     ));
+    lines.sort_by_key(|line| line.line);
     lines
+}
+
+fn clipped_fence_lines<'a>(editor: &Editor, ctx: &'a BlockContext) -> Vec<BlockLine<'a>> {
+    ctx.clipped_fence_lines
+        .iter()
+        .map(|(line, range, text)| BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: disclosure_for_line(editor, *line, *range),
+        })
+        .collect()
 }
 
 /// Source range whose Markdown markers this line discloses: the caret's own
@@ -1014,6 +1125,11 @@ mod tests {
         );
         assert_eq!(lines[1].visual_text, "let answer = 42;");
         assert_eq!(lines[2].visual_text, "", "the closing fence collapses");
+        assert_eq!(
+            lines[2].height(),
+            0.0,
+            "a fully hidden closing fence must not reserve an empty row"
+        );
         assert!(
             lines[0]
                 .source_map
@@ -1023,6 +1139,173 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inactive_bare_fence_rows_have_zero_height_and_editing_restores_it() {
+        let source = "```\ncode\n```\n";
+        let code_offset = source.find("code").unwrap() + 1;
+        let closing_offset = source.rfind("```").unwrap() + 1;
+        let mut editor = Editor::new(source);
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(code_offset)))
+            .unwrap();
+        let inactive = presented_lines(&editor);
+        assert_eq!(inactive[0].visual_text, "");
+        assert_eq!(inactive[0].height(), 0.0);
+        assert_eq!(inactive[2].visual_text, "");
+        assert_eq!(inactive[2].height(), 0.0);
+        assert!(
+            inactive[1].height() > 0.0,
+            "an empty structural fence row must not collapse code content"
+        );
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(1)))
+            .unwrap();
+        let editing_opening = presented_lines(&editor);
+        assert!(
+            editing_opening[0].height() > 0.0,
+            "editing the opening fence restores its row height"
+        );
+
+        editor
+            .set_selection(Selection::caret(SourceOffset(closing_offset)))
+            .unwrap();
+        let editing_closing = presented_lines(&editor);
+        assert!(
+            editing_closing[2].height() > 0.0,
+            "editing the closing fence restores its row height"
+        );
+
+        let mut whitespace_only = Editor::new("~~~   \ncode\n~~~\n");
+        whitespace_only
+            .set_selection(Selection::caret(SourceOffset(7)))
+            .unwrap();
+        let inactive_whitespace = presented_lines(&whitespace_only);
+        assert_eq!(
+            inactive_whitespace[0].height(),
+            0.0,
+            "whitespace after an inactive opening fence is not a visible label"
+        );
+
+        whitespace_only
+            .set_selection(Selection::caret(SourceOffset(4)))
+            .unwrap();
+        let editing_whitespace = presented_lines(&whitespace_only);
+        assert!(
+            editing_whitespace[0].height() > 0.0,
+            "editing whitespace after the opening delimiter restores the row height"
+        );
+    }
+
+    #[test]
+    fn clipped_inactive_fences_do_not_reserve_virtual_space() {
+        let source = "```\nfirst\nsecond\n```";
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("first").unwrap() + 1,
+            )))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one fenced block");
+
+        let full = presented_block(&editor, &block, &(0..4), None).expect("full block presents");
+        let clipped =
+            presented_block(&editor, &block, &(1..3), None).expect("middle code rows present");
+
+        assert_eq!(clipped.lines_before, 1);
+        assert_eq!(clipped.lines_after, 1);
+        assert_eq!(clipped.leading_space(), 0.0);
+        assert_eq!(clipped.trailing_space(), 0.0);
+        assert_eq!(
+            clipped.height(),
+            full.height(),
+            "clipping the hidden fence rows must not change the block's visual height"
+        );
+    }
+
+    #[test]
+    fn next_line_start_does_not_restore_the_previous_nested_fence_height() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let mut editor = Editor::new(source);
+        let code_start = source.find("code").expect("code row");
+        editor
+            .set_selection(Selection::caret(SourceOffset(code_start)))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("formal projection");
+        let visual = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(0..4),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("nested fenced code presents");
+
+        let opening = visual
+            .lines
+            .iter()
+            .find(|line| line.line_id == 1)
+            .expect("opening fence line");
+        assert_eq!(
+            opening.height(),
+            0.0,
+            "a caret at the following code-row start does not own the opening fence row"
+        );
+    }
+    #[test]
+    fn clipped_nested_fences_do_not_reserve_virtual_space() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("code").unwrap() + 1,
+            )))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index
+            .list_projection(&block)
+            .expect("nested code projection");
+        let fence_heights = index
+            .fence_height_projection(&block)
+            .expect("nested fence height projection");
+
+        let full = presented_block_with_projections(
+            &editor,
+            &block,
+            &(0..4),
+            None,
+            Some(projection),
+            Some(fence_heights),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("full nested block presents");
+        let clipped = presented_block_with_projections(
+            &editor,
+            &block,
+            &(2..3),
+            None,
+            Some(projection),
+            Some(fence_heights),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("nested code content presents");
+
+        assert_eq!(clipped.lines_before, 2);
+        assert_eq!(clipped.lines_after, 1);
+        assert_eq!(clipped.leading_space(), DEFAULT_LINE_HEIGHT);
+        assert_eq!(clipped.trailing_space(), 0.0);
+        assert_eq!(
+            clipped.height(),
+            full.height(),
+            "nested hidden fence rows must not reappear as virtual space"
+        );
+    }
     #[test]
     fn a_leading_blank_line_before_the_first_block_does_not_misidentify_the_opening_fence() {
         // Block ordinal 0's tiled span absorbs a leading blank line (tiling
