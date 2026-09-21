@@ -9096,7 +9096,7 @@ mod tests {
         let root = draft_test_root("switch");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
-        let heading = EditorView::new_work_folder_note_heading();
+        let draft_text = "today I thought about this design";
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9109,15 +9109,22 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
-            // Start the first unnamed note and type into it.
-            view.new_work_folder_note(cx);
-            view.editor_mut()
-                .insert_text("today I thought about this design")
-                .unwrap();
+            // Use the initial blank session directly so this regression stays
+            // outside the date-heading/title-sync path of new_work_folder_note.
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: root.clone(),
+                },
+            );
+            view.editor_mut().insert_text(draft_text).unwrap();
             view.after_input(cx);
-            // Switch away to a second unnamed note before the debounce timer
-            // for the first one fires.
-            view.new_work_folder_note(cx);
+            // Switch away to a second blank unnamed note before the debounce
+            // timer for the first one fires.
+            view.sessions.open_untitled("", "Untitled");
+            view.on_document_replaced();
         });
 
         // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
@@ -9131,10 +9138,7 @@ mod tests {
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
-        assert_eq!(
-            recovered.drafts[0].text,
-            format!("{heading}today I thought about this design")
-        );
+        assert_eq!(recovered.drafts[0].text, draft_text);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
