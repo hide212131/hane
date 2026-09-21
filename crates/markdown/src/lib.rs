@@ -466,6 +466,17 @@ impl FenceHeightProjection {
         self.inactive_rows_in_indices(block_range, 0..end, disclosure)
     }
 
+    /// Whether a physical block-relative line is one of the fence rows this
+    /// projection can collapse. Keeping this as a binary-search query lets the
+    /// UI use a cached wrapped layout to recover the measured height of a
+    /// visible fence row without enumerating the block's off-screen fences.
+    pub fn is_fence_row_line(&self, line: usize) -> bool {
+        let start = self.rows.partition_point(|row| row.line < line);
+        self.rows
+            .get(start)
+            .is_some_and(|row| row.line == line)
+    }
+
     fn inactive_rows_in_indices(
         &self,
         block_range: SourceRange,

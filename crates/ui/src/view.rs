@@ -45,8 +45,8 @@ use hane_document::{
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
-    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    ListProjection, PublishOutcome, local_block_index,
+    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, FenceHeightProjection, IndexSource,
+    IndexedBlock, ListProjection, PublishOutcome, local_block_index,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
@@ -745,11 +745,15 @@ pub struct EditorView {
     /// they are the snapshot that collapses the middle of a selection after
     /// the selection is reduced to a caret.
     last_background_height_disclosure: Option<(Revision, SourceRange)>,
-    /// The disclosure represented by the current height tree at the last
-    /// bounded synchronization. Keeping the previous caret endpoints lets a
-    /// move away from a zero-height fence shrink that old block without
-    /// scanning the intervening document.
+    /// The complete disclosure represented by the current height tree at the
+    /// last full synchronization. It is the baseline for background snapshots;
+    /// bounded endpoint moves use `last_endpoint_height_disclosure` instead.
     last_applied_height_disclosure: Option<(Revision, SourceRange)>,
+    /// The disclosure used by the most recent bounded endpoint update. It can
+    /// advance while a document-sized background snapshot is running even
+    /// though `last_applied_height_disclosure` must continue to describe the
+    /// complete snapshot baseline used when that job was scheduled.
+    last_endpoint_height_disclosure: Option<(Revision, SourceRange)>,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
     /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
@@ -2151,6 +2155,7 @@ impl EditorView {
             document_parse_job_running: false,
             last_background_height_disclosure: None,
             last_applied_height_disclosure: None,
+            last_endpoint_height_disclosure: None,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
@@ -2398,6 +2403,7 @@ impl EditorView {
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
         self.last_applied_height_disclosure = None;
+        self.last_endpoint_height_disclosure = None;
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
         // for an unrelated block in whatever document replaced it.
@@ -4418,7 +4424,15 @@ impl EditorView {
     /// is pending.
     fn ensure_active_disclosure_height(&mut self) {
         if self.granularity != Granularity::Blocks {
-            return;
+            // A formal parse can publish its index while the view is still on
+            // the initial line-granularity height tree. In that transition
+            // the bounded endpoint bridge must first install the block tree;
+            // otherwise a caret move that races the first parse leaves the
+            // newly published index without any block heights at all.
+            self.resync_heights();
+            if self.granularity != Granularity::Blocks {
+                return;
+            }
         }
         let Some(disclosure) = self.active_height_disclosure() else {
             return;
@@ -4429,7 +4443,7 @@ impl EditorView {
         let line_height = self.line_height();
         let revision = self.editor().document().revision();
         let previous = self
-            .last_applied_height_disclosure
+            .last_endpoint_height_disclosure
             .filter(|(previous_revision, _)| *previous_revision == revision)
             .map(|(_, disclosure)| disclosure);
         let mut ordinals = Vec::with_capacity(4);
@@ -4481,11 +4495,18 @@ impl EditorView {
                         // measured body rows stay measured instead of being
                         // replaced by an arithmetic lower bound.
                         let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        let fence_height_delta = self.fence_height_delta(
+                            &block,
+                            projection,
+                            Some(previous),
+                            Some(disclosure),
+                            collapsed_delta,
+                            line_height,
+                        );
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            collapsed_delta,
-                            line_height,
+                            fence_height_delta,
                         )
                     },
                 );
@@ -4495,13 +4516,91 @@ impl EditorView {
         for (ordinal, minimum) in updates {
             self.heights.update(ordinal, minimum);
         }
-        // A non-empty disclosure is only applied to the endpoint bridge here;
-        // the background snapshot owns the complete selection. Recording it as
-        // globally applied would make the completion preserve the wrong
-        // baseline and leave the selection's middle blocks collapsed.
-        if !self.document_parse_job_running {
-            self.last_applied_height_disclosure = Some((revision, disclosure));
+        // This is the disclosure used by the bounded endpoint bridge, even
+        // while a document-sized snapshot is running. Keep it separate from
+        // `last_applied_height_disclosure`: the latter remains the complete
+        // snapshot baseline used to preserve measured middle blocks when the
+        // background result arrives.
+        self.last_endpoint_height_disclosure = Some((revision, disclosure));
+    }
+
+    /// Returns the amount of measured fence height that changes between two
+    /// disclosures. The arithmetic projection supplies the bounded baseline
+    /// for every transitioned fence row. When the old disclosure's layout is
+    /// cached, replace the baseline for the visible transitioned rows with
+    /// their actual fragment height so a long delimiter that wrapped into
+    /// several layout rows does not leave residual height behind.
+    fn fence_height_delta(
+        &self,
+        block: &IndexedBlock,
+        projection: &FenceHeightProjection,
+        previous: Option<SourceRange>,
+        current: Option<SourceRange>,
+        collapsed_delta: f32,
+        line_height: f32,
+    ) -> f32 {
+        let code_height = code_line_height(line_height);
+        let baseline = code_height * collapsed_delta;
+        let Some(visual) = self.block_cache.get(&block.id) else {
+            return baseline;
+        };
+        let Some(layout) = self.layout_cache.get(&block.id) else {
+            return baseline;
+        };
+        if !layout.is_valid(
+            self.content_width,
+            self.layout_font_revision,
+            self.editor().document().revision(),
+        ) {
+            return baseline;
         }
+        let Some(block_lines) = block_line_span(self.editor().document(), block) else {
+            return baseline;
+        };
+        let first_presented_line = visual.span.start + visual.lines_before;
+        let mut seen = HashSet::new();
+        let mut correction = 0.0;
+        for row in &layout.layout.lines {
+            if !seen.insert(row.line) {
+                continue;
+            }
+            let physical_line = first_presented_line + row.line;
+            let relative_line = physical_line.saturating_sub(block_lines.start);
+            if !projection.is_fence_row_line(relative_line) {
+                continue;
+            }
+            let was_collapsed = fence_row_is_inactive(
+                projection,
+                block.source_range,
+                relative_line,
+                previous,
+            );
+            let is_collapsed = fence_row_is_inactive(
+                projection,
+                block.source_range,
+                relative_line,
+                current,
+            );
+            if was_collapsed == is_collapsed {
+                continue;
+            }
+            let measured = layout.layout.line_height_of(row.line);
+            // A cached layout from the collapsed state has zero height for the
+            // row. It cannot tell us the not-yet-laid-out expanded height, so
+            // keep the arithmetic fallback for that direction. The reverse
+            // transition has the old expanded layout and can use all wrapped
+            // fragments it measured.
+            if measured <= 0.0 {
+                continue;
+            }
+            let measured_delta = measured - code_height;
+            correction += if is_collapsed {
+                measured_delta
+            } else {
+                -measured_delta
+            };
+        }
+        baseline + correction
     }
 
     /// Applies a disclosure-only height snapshot without replacing measured
@@ -4561,11 +4660,23 @@ impl EditorView {
                                 )
                             });
                         let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        let fence_height_delta = index.fence_height_projection(&block).map_or(
+                            code_line_height(line_height) * collapsed_delta,
+                            |projection| {
+                                self.fence_height_delta(
+                                    &block,
+                                    projection,
+                                    Some(previous),
+                                    Some(disclosure),
+                                    collapsed_delta,
+                                    line_height,
+                                )
+                            },
+                        );
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            collapsed_delta,
-                            line_height,
+                            fence_height_delta,
                         )
                     },
                 );
@@ -4584,6 +4695,10 @@ impl EditorView {
             top + inside
         });
         self.last_applied_height_disclosure = Some((
+            self.editor().document().revision(),
+            disclosure,
+        ));
+        self.last_endpoint_height_disclosure = Some((
             self.editor().document().revision(),
             disclosure,
         ));
@@ -4659,6 +4774,7 @@ impl EditorView {
         self.last_applied_height_disclosure = self
             .active_height_disclosure()
             .map(|disclosure| (self.editor().document().revision(), disclosure));
+        self.last_endpoint_height_disclosure = self.last_applied_height_disclosure;
     }
 
     /// Applies the small splice reported by the incremental block index. The
@@ -5388,16 +5504,25 @@ fn invert_visible_line_prefix(
     low
 }
 
-/// Moves a measured block height by the exact number of code-fence rows whose
-/// disclosure changed, without letting floating-point noise leave a value just
-/// above the arithmetic minimum.
+fn fence_row_is_inactive(
+    projection: &FenceHeightProjection,
+    block_range: SourceRange,
+    line: usize,
+    disclosure: Option<SourceRange>,
+) -> bool {
+    projection.inactive_rows_before_line(block_range, line + 1, disclosure)
+        > projection.inactive_rows_before_line(block_range, line, disclosure)
+}
+
+/// Moves a measured block height by the fence-height delta whose disclosure
+/// changed, without letting floating-point noise leave a value just above the
+/// arithmetic minimum.
 fn preserve_measured_height_after_fence_delta(
     current: f32,
     minimum: f32,
-    collapsed_delta: f32,
-    line_height: f32,
+    fence_height_delta: f32,
 ) -> f32 {
-    let adjusted = current - code_line_height(line_height) * collapsed_delta;
+    let adjusted = current - fence_height_delta;
     if adjusted <= minimum + 0.001 {
         minimum
     } else {
@@ -7440,7 +7565,7 @@ mod tests {
         std::thread::sleep(SIDEBAR_SCROLLBAR_HIDE_DELAY + Duration::from_millis(200));
         cx.run_until_parked();
 
-        view.update(cx, |view, _cx| {
+        view.update(cx, |view, cx| {
             assert!(!view.sidebar_scrollbar_visible);
         });
     }
@@ -8049,6 +8174,93 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    fn moving_away_from_a_wrapped_fence_removes_all_measured_fragments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let delimiter = "~".repeat(96);
+        let text = format!("{delimiter}\nbody\n{delimiter}\n\nplain");
+        let opening = 1;
+        let plain = text.find("plain").expect("tail paragraph");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(opening)))
+                .unwrap();
+            let block = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(opening)))
+                .expect("fenced block");
+            let span = block_line_span(&document, &block).expect("fenced block lines");
+            let projection = view
+                .current_index()
+                .and_then(|index| index.fence_height_projection(&block))
+                .expect("fence projection");
+            let visual = presented_block_with_projections(
+                view.editor(),
+                &block,
+                &span,
+                None,
+                None,
+                Some(projection),
+                view.line_height(),
+            )
+            .expect("active fenced block presentation");
+            let width = 80.0;
+            let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
+            let opening_line = visual
+                .lines
+                .iter()
+                .position(|line| line.line_id as usize == span.start)
+                .expect("opening line");
+            let measured_fence_height = layout.line_height_of(opening_line);
+            assert!(
+                measured_fence_height > code_line_height(view.line_height()),
+                "the long disclosed delimiter must occupy multiple wrapped rows"
+            );
+            let measured_block_height = layout.height();
+
+            view.content_width = width;
+            view.block_cache.insert(block.id, visual);
+            view.layout_cache.insert(
+                block.id,
+                LayoutCacheEntry {
+                    layout,
+                    font_revision: view.layout_font_revision,
+                },
+            );
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(opening)),
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            view.heights.update(block.ordinal, measured_block_height);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(plain)))
+                .unwrap();
+            view.after_input(cx);
+
+            let expected = measured_block_height - measured_fence_height;
+            let actual = view
+                .heights
+                .height(block.ordinal)
+                .expect("updated block height");
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "all wrapped fence fragments must be removed: actual {actual}, expected {expected}"
+            );
+        });
+    }
+
     #[test]
     fn height_remeasurement_cannot_leave_scroll_position_below_new_bottom() {
         // This is the position retained by the height anchor after a block at
@@ -8941,6 +9153,109 @@ mod tests {
             assert!(
                 view.heights.height(last).is_some_and(|height| height > 0.0),
                 "the current caret disclosure must win over the parse snapshot"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn initial_line_heights_become_block_heights_when_parse_publishes_after_caret_move(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..8)
+            .map(|_| "```\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("last fence") + 1;
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.granularity, Granularity::Lines);
+            view.schedule_document_parse(cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.current_index().is_some());
+            let last = view.current_index().unwrap().len() - 1;
+            assert!(
+                view.heights.height(last).is_some_and(|height| height > 0.0),
+                "the caret-owned fence block must be installed when the first formal parse publishes"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn caret_moves_during_a_background_parse_shrink_each_previous_fence_endpoint(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..4)
+            .map(|_| "```\nbody\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let fence_offsets = text
+            .match_indices("```")
+            .map(|(offset, _)| offset + 1)
+            .collect::<Vec<_>>();
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[0])))
+                .unwrap();
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(fence_offsets[0])),
+            );
+            let inactive = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                None,
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            view.schedule_document_parse(cx);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[2])))
+                .unwrap();
+            view.after_input(cx);
+            let first_block = view
+                .current_index()
+                .unwrap()
+                .block_at(SourceOffset(fence_offsets[0]));
+            let second_block = view
+                .current_index()
+                .unwrap()
+                .block_at(SourceOffset(fence_offsets[2]));
+            let first_ordinal = first_block.unwrap().ordinal;
+            let second_ordinal = second_block.unwrap().ordinal;
+            assert!(
+                view.heights.height(first_ordinal).unwrap()
+                    <= inactive[first_ordinal] + 0.001,
+                "moving to the second fence must collapse the first endpoint while parse is running"
+            );
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[4])))
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.heights.height(second_ordinal).unwrap()
+                    <= inactive[second_ordinal] + 0.001,
+                "moving to the third fence must collapse the second endpoint while parse is running"
             );
         });
     }
