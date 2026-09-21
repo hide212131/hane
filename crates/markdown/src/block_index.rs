@@ -303,7 +303,15 @@ fn build_fence_height_projections(
     list_item_markers.sort_by_key(|marker| (marker.start, marker.end));
     block_ranges
         .iter()
-        .map(|block_range| {
+        .zip(blocks)
+        .map(|(block_range, (kind, _, _, _))| {
+            // A top-level fenced block already has constant-cost opening /
+            // closing context in presentation. This projection is only for
+            // fences nested inside another indexed block, where the fence rows
+            // can be arbitrarily far outside the render window.
+            if matches!(kind, NodeKind::CodeBlock) {
+                return None;
+            }
             let start = parsed
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.end <= block_range.start);
