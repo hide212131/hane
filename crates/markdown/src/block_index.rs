@@ -1298,21 +1298,24 @@ mod tests {
     }
 
     #[test]
-    fn formal_projection_counts_only_inactive_visually_empty_fence_rows() {
+    fn fence_height_projection_counts_only_inactive_visually_empty_rows() {
         let source = "- item\n  ```\n  code\n  ```\n  ```rust\n  code2\n  ```\n";
         let index = BlockIndex::build(Revision(1), source);
         let block = index.blocks().next().expect("list block");
-        let projection = index.list_projection(&block).expect("formal list projection");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("fence height projection");
 
         assert_eq!(
-            projection.inactive_zero_height_fence_rows_in(block.source_range, None),
+            projection.inactive_rows_in(block.source_range, block.source_range, None),
             3,
             "bare opening/closing and the rust block's closing fence collapse; the rust label does not"
         );
 
         let bare_opening = source.find("```").expect("bare opening");
         assert_eq!(
-            projection.inactive_zero_height_fence_rows_in(
+            projection.inactive_rows_in(
+                block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(bare_opening)),
             ),
@@ -1322,12 +1325,48 @@ mod tests {
 
         let code_start = source.find("code").expect("code row");
         assert_eq!(
-            projection.inactive_zero_height_fence_rows_in(
+            projection.inactive_rows_in(
+                block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(code_start)),
             ),
             3,
             "the following row's start does not own the preceding fence row"
+        );
+    }
+
+    #[test]
+    fn incremental_list_edit_keeps_fence_height_projection_current() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let mut buffer = RopeBuffer::from_text(source);
+        let mut index = BlockIndex::from_buffer(&buffer);
+        let before = index.blocks().next().expect("list block");
+        assert!(index.list_projection(&before).is_some());
+        assert_eq!(
+            index
+                .fence_height_projection(&before)
+                .expect("initial fence heights")
+                .inactive_rows_in(before.source_range, before.source_range, None),
+            2
+        );
+
+        let code = source.find("code").expect("code row") + 2;
+        let update = apply(&mut index, &mut buffer, code, "X");
+        assert!(update.resynchronized);
+
+        let after = index.blocks().next().expect("updated list block");
+        assert_eq!(after.id, before.id, "ordinary typing keeps the block identity");
+        assert!(
+            index.list_projection(&after).is_none(),
+            "incremental parsing intentionally drops formal list semantics"
+        );
+        assert_eq!(
+            index
+                .fence_height_projection(&after)
+                .expect("incremental parse rebuilds fence heights")
+                .inactive_rows_in(after.source_range, after.source_range, None),
+            2,
+            "nested fence geometry stays stable while formal parsing catches up"
         );
     }
     #[test]
