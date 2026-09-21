@@ -3909,6 +3909,35 @@ mod tests {
             "the opening fence owned by the caret must survive initial virtualization"
         );
     }
+
+    #[test]
+    fn selection_outside_a_quote_fence_block_does_not_disclose_its_rows() {
+        let source = "before\n\n> ```\n> code\n> ```";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let quote_block = index
+            .blocks()
+            .find(|block| block.kind == NodeKind::Quote)
+            .expect("quote block");
+        assert!(
+            index.fence_height_projection(&quote_block).is_some(),
+            "the fixture must exercise the quote fence projection"
+        );
+        let inactive = block_heights(&document, &index, 26.0);
+        let selection_before_block = SourceRange::new(0, quote_block.source_range.start.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(selection_before_block),
+        );
+
+        assert_eq!(
+            disclosed, inactive,
+            "a selection ending at the block boundary must not activate its fence rows"
+        );
+    }
+
     #[test]
     fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
         // A prefix-max-only index would scan all preceding spans because the

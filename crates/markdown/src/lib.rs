@@ -471,9 +471,19 @@ impl FenceHeightProjection {
                 .len()
                 .saturating_sub(quote_active + direct_active - usize::from(direct_already_counted));
         }
+        // A non-empty selection only discloses the part of a block that it
+        // actually intersects. Do this test before converting to block-
+        // relative offsets: `saturating_sub` would otherwise turn a range
+        // wholly before the block into `0..0`, which can be mistaken for a
+        // caret on the block's first row by the quote-owner index.
+        if !block_range.intersects(disclosure) {
+            return rows.len();
+        }
         let disclosure = SourceRange::new(
-            disclosure.start.0.saturating_sub(block_range.start.0),
-            disclosure.end.0.saturating_sub(block_range.start.0),
+            disclosure.start.0.max(block_range.start.0).min(block_range.end.0)
+                - block_range.start.0,
+            disclosure.end.0.min(block_range.end.0).max(block_range.start.0)
+                - block_range.start.0,
         );
         let active_start = rows.partition_point(|row| row.range.end <= disclosure.start);
         let active_end = rows.partition_point(|row| row.range.start < disclosure.end);
