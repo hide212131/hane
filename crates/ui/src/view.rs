@@ -54,7 +54,7 @@ use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
     MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
-    block_heights_with_disclosure, block_is_joinable, block_line_span,
+    block_heights_with_disclosure, block_is_joinable, block_line_span, code_line_height,
     layout_block, parse_joined_span,
     trailing_blank_lines,
 };
@@ -4438,21 +4438,23 @@ impl EditorView {
                 );
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
                 let current = self.heights.height(ordinal)?;
-                let previous_minimum = previous.map(|previous| {
-                    let collapsed = projection.inactive_rows_in(
-                        block.source_range,
-                        block.source_range,
-                        Some(previous),
-                    );
-                    line_height * block.line_count.saturating_sub(collapsed) as f32
-                });
-                let target = if previous_minimum.is_some_and(|old| current <= old)
-                    || current < minimum
-                {
-                    minimum
-                } else {
-                    current
-                };
+                let target = previous.map_or_else(
+                    || current.max(minimum),
+                    |previous| {
+                        let previous_collapsed = projection.inactive_rows_in(
+                            block.source_range,
+                            block.source_range,
+                            Some(previous),
+                        );
+                        // `current` may be a measured layout height: a code
+                        // row is taller than the plain line-height seed. Move
+                        // only the fence-row delta between disclosures so the
+                        // measured body rows stay measured instead of being
+                        // replaced by an arithmetic lower bound.
+                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        (current - code_line_height(line_height) * collapsed_delta).max(minimum)
+                    },
+                );
                 (target != current).then_some((ordinal, target))
             })
             .collect::<Vec<_>>();
@@ -7787,7 +7789,7 @@ mod tests {
     fn moving_away_from_a_hidden_fence_shrinks_the_previous_height(
         cx: &mut gpui::TestAppContext,
     ) {
-        let text = "```\n```\n\n```\n```";
+        let text = "```\nbody\n```\n\n```\n```";
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
         let later_fence = text.rfind("```").expect("closing fence") + 1;
 
@@ -7812,18 +7814,21 @@ mod tests {
                 Some(SourceRange::empty(1)),
             );
             view.install_heights(Granularity::Blocks, HeightIndex::new(active));
-            let expanded = view.heights.height(0).expect("first block height");
-            assert!(expanded > inactive[0]);
+            let measured = code_line_height(view.line_height()) * 3.0;
+            view.heights.update(0, measured);
+            assert!(measured > inactive[0]);
 
             view.editor_mut()
                 .set_selection(Selection::caret(SourceOffset(later_fence)))
                 .unwrap();
             view.after_input(cx);
 
-            assert_eq!(
-                view.heights.height(0),
-                Some(inactive[0]),
-                "leaving the old fence must remove its temporary disclosure height"
+            let expected = code_line_height(view.line_height()) * 2.0;
+            assert!(
+                view.heights
+                    .height(0)
+                    .is_some_and(|height| (height - expected).abs() < 0.001),
+                "leaving the old fence must remove only its disclosed row from the measured block"
             );
         });
     }

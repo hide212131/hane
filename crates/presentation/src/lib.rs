@@ -1376,6 +1376,14 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
     }
 }
 
+/// Height of one fenced-code row when its presentation is not collapsed.
+/// Height-index adjustments use this same policy to remove a disclosed fence
+/// from an already measured block without disturbing the measured content rows
+/// that remain visible.
+pub fn code_line_height(line_height: f32) -> f32 {
+    estimated_height(BlockKind::CodeBlock, line_height)
+}
+
 /// A fence-only source row is structural markup, not an empty code row. Once
 /// its delimiter is collapsed and no visible label/content remains, it must
 /// consume no vertical space. As soon as the delimiter is disclosed for
@@ -1389,7 +1397,7 @@ fn fenced_line_height(
     if has_hidden_fence && !is_editing && visual_text.trim().is_empty() {
         0.0
     } else {
-        estimated_height(BlockKind::CodeBlock, line_height)
+        code_line_height(line_height)
     }
 }
 
