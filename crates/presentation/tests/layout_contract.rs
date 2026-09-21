@@ -465,6 +465,141 @@ fn list_body_columns_use_the_widest_actual_marker_label() {
 }
 
 #[test]
+fn disclosed_markers_use_their_source_visible_width_without_a_virtual_gap() {
+    let cases = [
+        ("- body", "body", 16.0),
+        ("+ body", "body", 16.0),
+        ("* body", "body", 16.0),
+        ("1. body", "body", 24.0),
+        ("1) body", "body", 24.0),
+        ("003) body", "body", 40.0),
+    ];
+
+    for (source, body, expected_x) in cases {
+        let cursor = source.find(body).expect("list body");
+        let block = present(source, Some(cursor))
+            .into_iter()
+            .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+            .expect("the list block is presented");
+        let marker = block.lines[0]
+            .list
+            .as_ref()
+            .and_then(|list| list.marker.as_ref())
+            .expect("the disclosed marker is present");
+        assert!(
+            !marker.synthesized,
+            "{source:?} must expose its source marker"
+        );
+
+        let layout = layout_block(&block, 160.0, &shaper());
+        let row = layout
+            .lines
+            .iter()
+            .find(|row| row.line == 0)
+            .expect("the list row is laid out");
+        assert_eq!(row.body_x_origin, expected_x, "{source:?}");
+        assert_eq!(row.marker_body_gap, 0.0, "{source:?}");
+
+        let point = layout
+            .point_for_source(&block, SourceOffset(cursor), &shaper())
+            .expect("the body has a point");
+        assert_eq!(point.x, expected_x, "{source:?}");
+        assert_eq!(
+            layout.source_at_x(&block, point.row, point.x, &shaper()),
+            Some(SourceOffset(cursor)),
+            "source → point → source must preserve the body caret for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn disclosed_empty_markers_put_the_terminal_caret_after_raw_source() {
+    let cases = [("-\n", 1, 8.0), ("003)\n", 4, 32.0)];
+
+    for (source, marker_end, expected_x) in cases {
+        let block = present(source, Some(0))
+            .into_iter()
+            .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+            .expect("the empty list block is presented");
+        let marker = block.lines[0]
+            .list
+            .as_ref()
+            .and_then(|list| list.marker.as_ref())
+            .expect("the empty marker is present");
+        assert!(
+            !marker.synthesized,
+            "{source:?} must not add a bullet or number"
+        );
+        assert_eq!(marker.label, source[..marker_end], "{source:?}");
+
+        let layout = layout_block(&block, 160.0, &shaper());
+        let row = &layout.lines[0];
+        assert_eq!(row.body_x_origin, expected_x, "{source:?}");
+        assert_eq!(row.marker_body_gap, 0.0, "{source:?}");
+        let point = layout
+            .point_for_source(&block, SourceOffset(marker_end), &shaper())
+            .expect("the terminal caret has a point");
+        assert_eq!(point.x, expected_x, "{source:?}");
+        assert_eq!(
+            layout.source_at_x(&block, point.row, point.x, &shaper()),
+            Some(SourceOffset(marker_end)),
+            "source → point → source must preserve the terminal caret for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn disclosing_a_short_ordered_marker_drops_only_the_inactive_alignment_gap() {
+    let source = "9. foo\n10. bar\n";
+    let cursor = source.find("foo").expect("first list body");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the ordered list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let opening = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the disclosed opening row is laid out");
+    let inactive = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the inactive sibling row is laid out");
+
+    assert_eq!(opening.body_x_origin, 24.0);
+    assert_eq!(opening.marker_body_gap, 0.0);
+    assert_eq!(inactive.body_x_origin, 32.0);
+    assert_eq!(inactive.marker_body_gap, 0.0);
+}
+
+#[test]
+fn a_non_list_dash_prefix_keeps_plain_text_coordinates() {
+    let source = "-a\n";
+    let cursor = source.find('a').expect("plain text");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .next()
+        .expect("the paragraph is presented");
+    assert!(block.lines[0].list.is_none());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = &layout.lines[0];
+    assert_eq!(row.body_x_origin, 0.0);
+    assert_eq!(row.marker_x_origin, None);
+    assert_eq!(row.marker_body_gap, 0.0);
+    let point = layout
+        .point_for_source(&block, SourceOffset(cursor), &shaper())
+        .expect("plain text has a point");
+    assert_eq!(point.x, 8.0);
+    assert_eq!(
+        layout.source_at_x(&block, point.row, point.x, &shaper()),
+        Some(SourceOffset(cursor))
+    );
+}
+
+#[test]
 fn list_marker_widths_cache_each_font_scale_once() {
     let source = "- # heading one\n- body two\n- # heading three\n- body four\n";
     let block = present(source, None)
@@ -673,7 +808,7 @@ fn disclosed_prefix_and_marker_stay_intact_before_the_body_when_the_column_is_na
 }
 
 #[test]
-fn disclosed_prefix_marker_gap_is_not_double_counted_in_the_opening_budget() {
+fn disclosed_prefix_marker_uses_raw_width_in_the_opening_budget() {
     let source = "> 9. first character\n> 10. second\n";
     let cursor = source.find("first").expect("list body");
     let block = present(source, Some(cursor))
@@ -694,7 +829,9 @@ fn disclosed_prefix_marker_gap_is_not_double_counted_in_the_opening_budget() {
         .find(|row| row.line == 0)
         .expect("opening row is laid out");
 
-    assert_eq!(opening.line_visual_range, 0..body + 1);
+    assert_eq!(opening.body_x_origin, 40.0);
+    assert_eq!(opening.marker_body_gap, 0.0);
+    assert_eq!(opening.line_visual_range, 0..body + 3);
 }
 
 #[test]

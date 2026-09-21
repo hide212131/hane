@@ -71,8 +71,8 @@ pub struct LayoutLine {
     /// every hanging fragment starts at the item's body column.
     pub text_x_origin: f32,
     /// x at which the owning list item's body starts, in the block's text
-    /// column. Opening markers may be narrower than this column because the
-    /// whole list aligns to its aggregate inactive label width.
+    /// column. Inactive markers may be narrower than this column because the
+    /// whole list aligns to its aggregate synthesized label width.
     pub body_x_origin: f32,
     /// Width passed to the shaper for body-column fragments. The first
     /// fragment of an opening list row receives the wider marker-inclusive
@@ -88,9 +88,9 @@ pub struct LayoutLine {
     pub body_visual_start: Option<usize>,
     /// The visual range of the marker displayed on this line, if any.
     pub marker_visual_range: Option<Range<usize>>,
-    /// Geometry-only gap between the displayed marker and the aligned body
-    /// column. It is zero for continuation rows and for a marker already as
-    /// wide as the list's aggregate label.
+    /// Geometry-only gap between an inactive displayed marker and the aligned
+    /// body column. It is zero for continuation rows and disclosed source
+    /// markers.
     pub marker_body_gap: f32,
 }
 
@@ -664,7 +664,17 @@ fn line_geometry(
     // item's body, so adding the aggregate marker width would reserve that
     // column a second time. When the prefix is hidden, keep the aggregate
     // marker column so inactive continuation rows still hang under the body.
-    let marker_column_width = if list.marker.is_none() && expanded_prefix_width > 0.0 {
+    // Synthesized markers participate in the list-wide inactive alignment
+    // column. Once a marker is disclosed, the source-visible marker is the
+    // coordinate truth: retaining the aggregate column here would leave a
+    // geometry-only gap between the raw marker and its body.
+    let marker_column_width = if list
+        .marker
+        .as_ref()
+        .is_some_and(|marker| !marker.synthesized)
+    {
+        disclosed_marker_width
+    } else if list.marker.is_none() && expanded_prefix_width > 0.0 {
         0.0
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
@@ -686,9 +696,14 @@ fn line_geometry(
             .marker
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
-        marker_body_gap: list.marker.as_ref().map_or(0.0, |_| {
-            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
-        }),
+        marker_body_gap: list
+            .marker
+            .as_ref()
+            .filter(|marker| marker.synthesized)
+            .map_or(0.0, |_| {
+                (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width)
+                    .max(0.0)
+            }),
     }
 }
 
