@@ -38,6 +38,8 @@ pub use block_index::{
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Markdown *syntax* kind, as written in the source.
@@ -304,6 +306,20 @@ pub struct MarkdownParse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FenceHeightProjection {
     rows: Vec<FenceHeightRow>,
+    /// Fence rows grouped by the quote owner whose prefix is present on that
+    /// row. The groups are disjoint: nested quote prefixes use the outermost
+    /// owner on a line, because touching an inner owner also touches that
+    /// owner's enclosing quote. Keeping this reverse index makes disclosure
+    /// queries proportional to quote nesting, not to every fence in a block.
+    quote_owner_rows: Vec<FenceQuoteOwnerRows>,
+    /// Prefix count for rows that carry a quote prefix. It lets the direct
+    /// fence-range query subtract rows already counted through the quote index
+    /// without scanning the rows themselves.
+    quote_row_prefix: Vec<usize>,
+    /// Prefix maximum of quote-owner ends, aligned with `quote_owner_rows`.
+    /// It skips owners that cannot contain a point disclosure before scanning
+    /// the small set of overlapping/nested owners.
+    quote_owner_max_end: Vec<SourceOffset>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,24 +328,96 @@ struct FenceHeightRow {
     owns_end: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FenceQuoteOwnerRows {
+    owner: SourceRange,
+    rows: Vec<usize>,
+}
+
 impl FenceHeightProjection {
     pub(crate) fn from_absolute_rows(
         block_range: SourceRange,
-        rows: Vec<(SourceRange, bool)>,
+        rows: Vec<(SourceRange, bool, Vec<SourceRange>)>,
     ) -> Self {
-        let mut rows = rows
+        let mut normalized = rows
             .into_iter()
-            .map(|(range, owns_end)| FenceHeightRow {
-                range: SourceRange::new(
+            .map(|(range, owns_end, quote_owners)| {
+                let range = SourceRange::new(
                     range.start.0.saturating_sub(block_range.start.0),
                     range.end.0.saturating_sub(block_range.start.0),
-                ),
-                owns_end,
+                );
+                let mut quote_owners = quote_owners
+                    .into_iter()
+                    .map(|owner| {
+                        SourceRange::new(
+                            owner.start.0.saturating_sub(block_range.start.0),
+                            owner.end.0.saturating_sub(block_range.start.0),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                quote_owners.sort_by_key(|owner| (owner.start, owner.end));
+                quote_owners.dedup();
+                (range, owns_end, quote_owners)
             })
             .collect::<Vec<_>>();
-        rows.sort_by_key(|row| (row.range.start, row.range.end));
-        rows.dedup_by_key(|row| (row.range.start, row.range.end));
-        Self { rows }
+        normalized.sort_by_key(|(range, _, _)| (range.start, range.end));
+        let mut deduplicated: Vec<(SourceRange, bool, Vec<SourceRange>)> =
+            Vec::with_capacity(normalized.len());
+        for (range, owns_end, quote_owners) in normalized {
+            if let Some((last_range, last_owns_end, last_quote_owners)) = deduplicated.last_mut()
+                && *last_range == range
+            {
+                *last_owns_end |= owns_end;
+                last_quote_owners.extend(quote_owners);
+                last_quote_owners.sort_by_key(|owner| (owner.start, owner.end));
+                last_quote_owners.dedup();
+            } else {
+                deduplicated.push((range, owns_end, quote_owners));
+            }
+        }
+        let rows = deduplicated
+            .iter()
+            .map(|(range, owns_end, _)| FenceHeightRow {
+                range: *range,
+                owns_end: *owns_end,
+            })
+            .collect::<Vec<_>>();
+        let mut owner_rows = HashMap::<SourceRange, Vec<usize>>::new();
+        let mut quote_row_prefix = Vec::with_capacity(rows.len() + 1);
+        quote_row_prefix.push(0);
+        for (index, (_, _, quote_owners)) in deduplicated.iter().enumerate() {
+            // Nested quote owners are nested source ranges. Choosing the
+            // outermost actual prefix makes the groups disjoint while keeping
+            // the disclosure rule exact: an inner disclosure also touches its
+            // enclosing quote owner.
+            let owner = quote_owners
+                .iter()
+                .min_by_key(|owner| (owner.start, std::cmp::Reverse(owner.end)))
+                .copied();
+            if let Some(owner) = owner {
+                owner_rows.entry(owner).or_default().push(index);
+                quote_row_prefix.push(quote_row_prefix[index] + 1);
+            } else {
+                quote_row_prefix.push(quote_row_prefix[index]);
+            }
+        }
+        let mut quote_owner_rows = owner_rows
+            .into_iter()
+            .map(|(owner, rows)| FenceQuoteOwnerRows { owner, rows })
+            .collect::<Vec<_>>();
+        quote_owner_rows.sort_by_key(|entry| (entry.owner.start, entry.owner.end));
+        let mut quote_owner_max_end = Vec::with_capacity(quote_owner_rows.len());
+        let mut max_end = SourceOffset(0);
+        for entry in &quote_owner_rows {
+            max_end = max_end.max(entry.owner.end);
+            quote_owner_max_end.push(max_end);
+        }
+        Self {
+            rows,
+            quote_owner_rows,
+            quote_row_prefix,
+            quote_owner_max_end,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -363,15 +451,25 @@ impl FenceHeightProjection {
                 return rows.len();
             }
             let caret = SourceOffset(disclosure.start.0 - block_range.start.0);
-            let active = rows
-                .get(rows.partition_point(|row| {
-                    row.range.end < caret || (row.range.end == caret && !row.owns_end)
-                }))
-                .is_some_and(|row| {
+            let relative_active = rows.partition_point(|row| {
+                row.range.end < caret || (row.range.end == caret && !row.owns_end)
+            });
+            let active_row = rows
+                .get(relative_active)
+                .filter(|row| {
                     row.range.start <= caret
                         && (caret < row.range.end || (row.owns_end && caret == row.range.end))
-                });
-            return rows.len().saturating_sub(usize::from(active));
+                })
+                .map(|_| start + relative_active);
+            let quote_active =
+                self.active_quote_rows_in(start..end, SourceRange::empty(caret.0));
+            let direct_active = usize::from(active_row.is_some());
+            let direct_already_counted = active_row.is_some_and(|row| {
+                self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]
+            });
+            return rows
+                .len()
+                .saturating_sub(quote_active + direct_active - usize::from(direct_already_counted));
         }
         let disclosure = SourceRange::new(
             disclosure.start.0.saturating_sub(block_range.start.0),
@@ -379,7 +477,52 @@ impl FenceHeightProjection {
         );
         let active_start = rows.partition_point(|row| row.range.end <= disclosure.start);
         let active_end = rows.partition_point(|row| row.range.start < disclosure.end);
-        rows.len().saturating_sub(active_end.saturating_sub(active_start))
+        let direct_active = active_end.saturating_sub(active_start);
+        let direct_already_counted = self.quote_row_prefix[ start + active_end]
+            .saturating_sub(self.quote_row_prefix[start + active_start]);
+        let quote_active = self.active_quote_rows_in(start..end, disclosure);
+        rows.len().saturating_sub(
+            quote_active + direct_active - direct_already_counted,
+        )
+    }
+
+    fn active_quote_rows_in(
+        &self,
+        rows: Range<usize>,
+        disclosure: SourceRange,
+    ) -> usize {
+        if self.quote_owner_rows.is_empty() {
+            return 0;
+        }
+        let owner_end = if disclosure.is_empty() {
+            self.quote_owner_rows
+                .partition_point(|entry| entry.owner.start <= disclosure.start)
+        } else {
+            self.quote_owner_rows
+                .partition_point(|entry| entry.owner.start < disclosure.end)
+        };
+        let owner_start = if disclosure.is_empty() {
+            self.quote_owner_max_end[..owner_end]
+                .partition_point(|end| *end < disclosure.start)
+        } else {
+            self.quote_owner_max_end[..owner_end]
+                .partition_point(|end| *end <= disclosure.start)
+        };
+        self.quote_owner_rows[owner_start..owner_end]
+            .iter()
+            .filter(|entry| {
+                if disclosure.is_empty() {
+                    entry.owner.end >= disclosure.start
+                } else {
+                    entry.owner.end > disclosure.start
+                }
+            })
+            .map(|entry| {
+                let start = entry.rows.partition_point(|row| *row < rows.start);
+                let end = entry.rows.partition_point(|row| *row < rows.end);
+                end.saturating_sub(start)
+            })
+            .sum()
     }
 }
 /// Document-wide list information retained by a formal [`BlockIndex`] so a

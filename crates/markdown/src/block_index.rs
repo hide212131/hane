@@ -246,6 +246,7 @@ fn build_fence_height_projection(
     source: &str,
     fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
     list_item_markers: &[SourceRange],
+    quote_markers: &[(SourceRange, SourceRange)],
 ) -> Option<FenceHeightProjection> {
     let line_ranges = source_line_ranges_in(parse_range, block_range, source);
     let mut rows = Vec::new();
@@ -274,7 +275,17 @@ fn build_fence_height_projection(
             continue;
         };
         if remainder.trim().is_empty() {
-            rows.push((*line, !line_source.ends_with(['\n', '\r'])));
+            let quote_start = quote_markers.partition_point(|(marker, _)| marker.end <= line.start);
+            let quote_end = quote_markers.partition_point(|(marker, _)| marker.start < line.end);
+            let quote_owners = quote_markers[quote_start..quote_end]
+                .iter()
+                .map(|(_, owner)| *owner)
+                .collect();
+            rows.push((
+                *line,
+                !line_source.ends_with(['\n', '\r']),
+                quote_owners,
+            ));
         }
     }
     let projection = FenceHeightProjection::from_absolute_rows(block_range, rows);
@@ -301,6 +312,17 @@ fn build_fence_height_projections(
         .map(|(marker, _)| *marker)
         .collect::<Vec<_>>();
     list_item_markers.sort_by_key(|marker| (marker.start, marker.end));
+    let mut quote_markers = parsed
+        .quote_markers
+        .iter()
+        .filter_map(|(marker, owner)| {
+            parsed
+                .tree
+                .node(*owner)
+                .map(|quote| (*marker, quote.source_range))
+        })
+        .collect::<Vec<_>>();
+    quote_markers.sort_by_key(|(marker, owner)| (marker.start, marker.end, owner.start));
     block_ranges
         .iter()
         .map(|block_range| {
@@ -316,6 +338,7 @@ fn build_fence_height_projections(
                 source,
                 &parsed.fence_marker_edges[start..end],
                 &list_item_markers,
+                &quote_markers,
             )
         })
         .collect()
@@ -1340,6 +1363,31 @@ mod tests {
             ),
             3,
             "the following row's start does not own the preceding fence row"
+        );
+    }
+
+    #[test]
+    fn disclosed_quote_prefix_keeps_nested_fence_rows_at_normal_height() {
+        let source = "> ```\n> code\n> ```";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("quoted block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("quoted fence height projection");
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None),
+            2
+        );
+        let code = source.find("code").expect("code row");
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(code)),
+            ),
+            0,
+            "the visible quote prefix discloses both fence rows"
         );
     }
 
