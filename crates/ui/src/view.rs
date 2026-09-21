@@ -7141,9 +7141,9 @@ impl EditorView {
                 let id = session.id();
                 let is_active = id == active_id;
                 let label = if session.is_dirty() {
-                    format!("{} *", session.short_label())
+                    format!("{} *", session.label())
                 } else {
-                    session.short_label()
+                    session.label()
                 };
                 let debug_selector = if index == 0 {
                     "file-tab-first"
