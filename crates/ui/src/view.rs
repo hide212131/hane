@@ -7565,7 +7565,7 @@ mod tests {
         std::thread::sleep(SIDEBAR_SCROLLBAR_HIDE_DELAY + Duration::from_millis(200));
         cx.run_until_parked();
 
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _cx| {
             assert!(!view.sidebar_scrollbar_visible);
         });
     }
@@ -8185,7 +8185,7 @@ mod tests {
         let plain = text.find("plain").expect("tail paragraph");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
 
-        view.update(cx, |view, _cx| {
+        view.update(cx, |view, cx| {
             let document = view.editor().document().clone();
             let index = BlockIndex::from_buffer(&document);
             view.block_index
