@@ -1129,6 +1129,38 @@ mod tests {
     }
 
     #[test]
+    fn next_line_start_does_not_restore_the_previous_nested_fence_height() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let mut editor = Editor::new(source);
+        let code_start = source.find("code").expect("code row");
+        editor
+            .set_selection(Selection::caret(SourceOffset(code_start)))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one list block");
+        let projection = index.list_projection(&block).expect("formal projection");
+        let visual = presented_block_with_list_projection(
+            &editor,
+            &block,
+            &(0..4),
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("nested fenced code presents");
+
+        let opening = visual
+            .lines
+            .iter()
+            .find(|line| line.line_id == 1)
+            .expect("opening fence line");
+        assert_eq!(
+            opening.height(),
+            0.0,
+            "a caret at the following code-row start does not own the opening fence row"
+        );
+    }
+    #[test]
     fn clipped_nested_fences_do_not_reserve_virtual_space() {
         let source = "- item\n  ```\n  code\n  ```";
         let mut editor = Editor::new(source);
