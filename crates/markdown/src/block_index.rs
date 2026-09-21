@@ -1190,6 +1190,39 @@ mod tests {
     }
 
     #[test]
+    fn formal_projection_counts_only_inactive_visually_empty_fence_rows() {
+        let source = "- item\n  ```\n  code\n  ```\n  ```rust\n  code2\n  ```\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index.list_projection(&block).expect("formal list projection");
+
+        assert_eq!(
+            projection.inactive_zero_height_fence_rows_in(block.source_range, None),
+            3,
+            "bare opening/closing and the rust block's closing fence collapse; the rust label does not"
+        );
+
+        let bare_opening = SourceOffset(source.find("```").expect("bare opening"));
+        assert_eq!(
+            projection.inactive_zero_height_fence_rows_in(
+                block.source_range,
+                Some(SourceRange::empty(bare_opening)),
+            ),
+            2,
+            "editing a fence restores only that physical row"
+        );
+
+        let code_start = SourceOffset(source.find("code").expect("code row"));
+        assert_eq!(
+            projection.inactive_zero_height_fence_rows_in(
+                block.source_range,
+                Some(SourceRange::empty(code_start)),
+            ),
+            3,
+            "the following row's start does not own the preceding fence row"
+        );
+    }
+    #[test]
     fn typing_inside_a_block_reparses_only_its_neighborhood() {
         let mut source = String::new();
         for line in 0..20_000 {
