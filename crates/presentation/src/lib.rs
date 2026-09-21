@@ -3889,6 +3889,26 @@ pub fn anchored_scroll_y(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_block_heights_keep_the_caret_owned_fence_row_visible() {
+        let document = RopeBuffer::from_text("```\n```");
+        let index = BlockIndex::from_buffer(&document);
+        let inactive = block_heights(&document, &index, 26.0);
+        assert_eq!(inactive, vec![0.0]);
+
+        let editing = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(1)),
+        );
+        assert_eq!(
+            editing,
+            vec![26.0],
+            "the opening fence owned by the caret must survive initial virtualization"
+        );
+    }
     #[test]
     fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
         // A prefix-max-only index would scan all preceding spans because the
