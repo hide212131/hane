@@ -15,7 +15,7 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{IndexedBlock, ListProjection};
+use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
     InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock, VisualLine,
@@ -113,7 +113,15 @@ pub(crate) fn presented_block(
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
 ) -> Option<VisualBlock> {
-    presented_block_with_list_projection(editor, block, visible, joined, None, DEFAULT_LINE_HEIGHT)
+    presented_block_with_list_projection(
+        editor,
+        block,
+        visible,
+        joined,
+        None,
+        None,
+        DEFAULT_LINE_HEIGHT,
+    )
 }
 
 /// `line_height` is the caller's zoomed row height (`EditorView::line_height`
@@ -126,12 +134,20 @@ pub(crate) fn presented_block_with_list_projection(
     visible: &Range<usize>,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
     line_height: f32,
 ) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
-    let ctx = block_context(editor, block, &span, &render, joined, list_projection)?;
+    let ctx = block_context(
+        editor,
+        block,
+        &span,
+        &render,
+        joined,
+        fence_height_projection,
+    )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
     Some(present_block_with_list_projection(
@@ -222,7 +238,7 @@ fn block_context(
     span: &Range<usize>,
     render: &Range<usize>,
     joined: Option<&JoinedParse>,
-    list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
 ) -> Option<BlockContext> {
     let document = editor.document();
     let joinable = block_is_joinable(block.kind);
@@ -301,13 +317,15 @@ fn block_context(
         clip_to_block(document.line_range(LineId(render.end)).ok()?).start
     };
     let (zero_height_fence_rows_before, zero_height_fence_rows_after) =
-        list_projection.map_or((0, 0), |projection| {
+        fence_height_projection.map_or((0, 0), |projection| {
             (
-                projection.inactive_zero_height_fence_rows_in(
+                projection.inactive_rows_in(
+                    block_range,
                     SourceRange::new(block_range.start.0, render_start_offset.0),
                     block_disclosure,
                 ),
-                projection.inactive_zero_height_fence_rows_in(
+                projection.inactive_rows_in(
+                    block_range,
                     SourceRange::new(render_end_offset.0, block_range.end.0),
                     block_disclosure,
                 ),
