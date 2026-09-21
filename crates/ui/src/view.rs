@@ -7131,7 +7131,7 @@ fn draft_preview(session: &DocumentSession) -> String {
 }
 
 impl EditorView {
-    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let active_id = self.sessions.active_id();
         let tab_count = self.sessions.len();
         let tabs = self
@@ -7191,7 +7191,11 @@ impl EditorView {
             .children(tabs)
     }
 
-    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
+    fn footer_element(
+        &self,
+        status: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
