@@ -4496,10 +4496,12 @@ impl EditorView {
             .filter_map(|ordinal| {
                 let block = index.block(ordinal)?;
                 let projection = index.fence_height_projection(&block)?;
+                let block_is_final = ordinal + 1 == index.len();
                 let collapsed = projection.inactive_rows_in(
                     block.source_range,
                     block.source_range,
                     Some(disclosure),
+                    block_is_final,
                 );
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
                 let current = self.heights.height(ordinal)?;
@@ -4510,6 +4512,7 @@ impl EditorView {
                             block.source_range,
                             block.source_range,
                             Some(previous),
+                            block_is_final,
                         );
                         // `current` may be a measured layout height: a code
                         // row is taller than the plain line-height seed. Move
@@ -4580,6 +4583,9 @@ impl EditorView {
             return baseline;
         };
         let first_presented_line = visual.span.start + visual.lines_before;
+        let block_is_final = self
+            .current_index()
+            .is_some_and(|index| block.ordinal + 1 == index.len());
         let mut seen = HashSet::new();
         let mut correction = 0.0;
         for row in &layout.layout.lines {
@@ -4596,12 +4602,14 @@ impl EditorView {
                 block.source_range,
                 relative_line,
                 previous,
+                block_is_final,
             );
             let is_collapsed = fence_row_is_inactive(
                 projection,
                 block.source_range,
                 relative_line,
                 current,
+                block_is_final,
             );
             if was_collapsed == is_collapsed {
                 continue;
@@ -4663,6 +4671,7 @@ impl EditorView {
                 let target = previous_disclosure.map_or_else(
                     || current.max(minimum),
                     |previous| {
+                        let block_is_final = ordinal + 1 == index.len();
                         let collapsed = index
                             .fence_height_projection(&block)
                             .map_or(0, |projection| {
@@ -4670,6 +4679,7 @@ impl EditorView {
                                     block.source_range,
                                     block.source_range,
                                     Some(disclosure),
+                                    block_is_final,
                                 )
                             });
                         let previous_collapsed = index
@@ -4679,6 +4689,7 @@ impl EditorView {
                                     block.source_range,
                                     block.source_range,
                                     Some(previous),
+                                    block_is_final,
                                 )
                             });
                         let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
@@ -4915,16 +4926,18 @@ impl EditorView {
     /// block. Fence rows are answered by the formal projection's prefix index;
     /// the render path never enumerates the block's off-screen fences.
     fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
-        let Some(projection) = self
-            .current_index()
-            .and_then(|index| index.fence_height_projection(block))
-        else {
+        let Some(index) = self.current_index() else {
             return physical_line;
         };
+        let Some(projection) = index.fence_height_projection(block) else {
+            return physical_line;
+        };
+        let block_is_final = block.ordinal + 1 == index.len();
         let collapsed = projection.inactive_rows_before_line(
             block.source_range,
             physical_line,
             self.active_height_disclosure(),
+            block_is_final,
         );
         physical_line.saturating_sub(collapsed)
     }
@@ -5531,9 +5544,10 @@ fn fence_row_is_inactive(
     block_range: SourceRange,
     line: usize,
     disclosure: Option<SourceRange>,
+    block_is_final: bool,
 ) -> bool {
-    projection.inactive_rows_before_line(block_range, line + 1, disclosure)
-        > projection.inactive_rows_before_line(block_range, line, disclosure)
+    projection.inactive_rows_before_line(block_range, line + 1, disclosure, block_is_final)
+        > projection.inactive_rows_before_line(block_range, line, disclosure, block_is_final)
 }
 
 /// Moves a measured block height by the fence-height delta whose disclosure

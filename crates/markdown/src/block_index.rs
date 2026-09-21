@@ -242,7 +242,6 @@ fn source_line_ranges_in(
 
 fn build_fence_height_projection(
     block_range: SourceRange,
-    document_end: SourceOffset,
     parse_range: SourceRange,
     source: &str,
     fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
@@ -291,11 +290,7 @@ fn build_fence_height_projection(
             ));
         }
     }
-    let projection = FenceHeightProjection::from_absolute_rows_with_document_end(
-        block_range,
-        document_end,
-        rows,
-    );
+    let projection = FenceHeightProjection::from_absolute_rows(block_range, rows);
     (!projection.is_empty()).then_some(projection)
 }
 
@@ -303,7 +298,6 @@ fn build_fence_height_projections(
     parsed: &MarkdownParse,
     blocks: &[TiledBlock],
     range: SourceRange,
-    document_end: SourceOffset,
     source: &str,
 ) -> Vec<Option<FenceHeightProjection>> {
     let block_ranges = blocks
@@ -342,7 +336,6 @@ fn build_fence_height_projections(
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             build_fence_height_projection(
                 *block_range,
-                document_end,
                 range,
                 source,
                 &parsed.fence_marker_edges[start..end],
@@ -643,13 +636,7 @@ impl BlockIndex {
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let fence_height_by_ordinal =
-            build_fence_height_projections(
-                &parsed,
-                &blocks,
-                range,
-                SourceOffset(source.len()),
-                source,
-            );
+            build_fence_height_projections(&parsed, &blocks, range, source);
         let fence_height_projections = fence_height_by_ordinal
             .into_iter()
             .enumerate()
@@ -886,13 +873,8 @@ impl BlockIndex {
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);
-            let fence_height_projections = build_fence_height_projections(
-                &parsed,
-                &blocks,
-                window,
-                SourceOffset(buffer.len_bytes().0),
-                &text,
-            );
+            let fence_height_projections =
+                build_fence_height_projections(&parsed, &blocks, window, &text);
             // Re-synchronized when the window's last parsed block lands exactly
             // on the boundary and kind the index already has for the untouched
             // block that closes the window. Everything after that boundary is
@@ -1358,7 +1340,7 @@ mod tests {
             .expect("fence height projection");
 
         assert_eq!(
-            projection.inactive_rows_in(block.source_range, block.source_range, None),
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
             3,
             "bare opening/closing and the rust block's closing fence collapse; the rust label does not"
         );
@@ -1369,6 +1351,7 @@ mod tests {
                 block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(bare_opening)),
+                true,
             ),
             2,
             "editing a fence restores only that physical row"
@@ -1380,6 +1363,7 @@ mod tests {
                 block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(code_start)),
+                true,
             ),
             3,
             "the following row's start does not own the preceding fence row"
@@ -1396,7 +1380,7 @@ mod tests {
             .expect("quoted fence height projection");
 
         assert_eq!(
-            projection.inactive_rows_in(block.source_range, block.source_range, None),
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
             2
         );
         let code = source.find("code").expect("code row");
@@ -1405,6 +1389,7 @@ mod tests {
                 block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(code)),
+                true,
             ),
             0,
             "the visible quote prefix discloses both fence rows"
@@ -1421,7 +1406,7 @@ mod tests {
             .expect("fence height projection");
 
         assert_eq!(
-            projection.inactive_rows_in(block.source_range, block.source_range, None),
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
             2
         );
         assert_eq!(
@@ -1429,11 +1414,52 @@ mod tests {
                 block.source_range,
                 block.source_range,
                 Some(SourceRange::empty(source.len())),
+                true,
             ),
             1,
             "the final physical row owns a caret at document end"
         );
     }
+
+    #[test]
+    fn an_incremental_edit_before_the_last_quote_uses_the_current_document_end() {
+        let source = "before\n\nmiddle one\n\nmiddle two\n\n> ```\n> code\n> ```";
+        let mut buffer = RopeBuffer::from_text(source);
+        let mut index = BlockIndex::from_buffer(&buffer);
+        let before = index.blocks().last().expect("final quote block");
+        let before_projection = index
+            .fence_height_projection(&before)
+            .expect("final quote fence projection");
+        assert_eq!(
+            before_projection.inactive_rows_in(
+                before.source_range,
+                before.source_range,
+                Some(SourceRange::empty(source.len())),
+                true,
+            ),
+            0
+        );
+
+        // The bounded incremental window reparses the edited block and its
+        // neighbor, not the distant final quote block. Its block-relative
+        // fence rows must nevertheless honor the current final-block status.
+        apply(&mut index, &mut buffer, 1, "X");
+        let after = index.blocks().last().expect("final quote block after edit");
+        let after_projection = index
+            .fence_height_projection(&after)
+            .expect("final quote projection after edit");
+        assert_eq!(
+            after_projection.inactive_rows_in(
+                after.source_range,
+                after.source_range,
+                Some(SourceRange::empty(buffer.len_bytes().0)),
+                true,
+            ),
+            0,
+            "a stale absolute document end must not hide the quote owner after an earlier edit"
+        );
+    }
+
     #[test]
     fn incremental_list_edit_keeps_fence_height_projection_current() {
         let source = "- item\n  ```\n  code\n  ```\n";
@@ -1445,7 +1471,7 @@ mod tests {
             index
                 .fence_height_projection(&before)
                 .expect("initial fence heights")
-                .inactive_rows_in(before.source_range, before.source_range, None),
+                .inactive_rows_in(before.source_range, before.source_range, None, true),
             2
         );
 
@@ -1463,7 +1489,7 @@ mod tests {
             index
                 .fence_height_projection(&after)
                 .expect("incremental parse rebuilds fence heights")
-                .inactive_rows_in(after.source_range, after.source_range, None),
+                .inactive_rows_in(after.source_range, after.source_range, None, true),
             2,
             "nested fence geometry stays stable while formal parsing catches up"
         );

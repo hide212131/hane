@@ -333,17 +333,20 @@ fn block_context(
         // initial HeightIndex seeding, but must not be counted twice here.
         (0, 0)
     } else {
+        let block_is_final = span.end == document.line_count();
         fence_height_projection.map_or((0, 0), |projection| {
             (
                 projection.inactive_rows_in(
                     block_range,
                     SourceRange::new(block_range.start.0, render_start_offset.0),
                     block_disclosure,
+                    block_is_final,
                 ),
                 projection.inactive_rows_in(
                     block_range,
                     SourceRange::new(render_end_offset.0, block_range.end.0),
                     block_disclosure,
+                    block_is_final,
                 ),
             )
         })

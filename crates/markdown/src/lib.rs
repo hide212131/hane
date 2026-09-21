@@ -306,11 +306,6 @@ pub struct MarkdownParse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FenceHeightProjection {
     rows: Vec<FenceHeightRow>,
-    /// Absolute document end used for the same final-line exception as the
-    /// presentation layer. A quote owner may disclose a caret exactly at its
-    /// end only when that offset is also the document end; the start of the
-    /// following block must remain outside the preceding quote.
-    document_end: SourceOffset,
     /// Fence rows grouped by the quote owner whose prefix is present on that
     /// row. The groups are disjoint: nested quote prefixes use the outermost
     /// owner on a line, because touching an inner owner also touches that
@@ -344,9 +339,8 @@ struct FenceQuoteOwnerRows {
 }
 
 impl FenceHeightProjection {
-    pub(crate) fn from_absolute_rows_with_document_end(
+    pub(crate) fn from_absolute_rows(
         block_range: SourceRange,
-        document_end: SourceOffset,
         rows: Vec<(SourceRange, bool, Vec<SourceRange>, usize)>,
     ) -> Self {
         let mut normalized = rows
@@ -426,7 +420,6 @@ impl FenceHeightProjection {
         }
         Self {
             rows,
-            document_end,
             quote_owner_rows,
             quote_row_prefix,
             quote_owner_max_end,
@@ -439,12 +432,16 @@ impl FenceHeightProjection {
 
     /// Counts rows in `range` that remain collapsed under the current
     /// disclosure. Ranges stored here are block-relative, so byte edits in
-    /// earlier blocks do not require rebasing this projection.
+    /// earlier blocks do not require rebasing this projection. `block_is_final`
+    /// supplies the current block topology for the document-end quote-owner
+    /// exception; it is intentionally not cached in the projection because
+    /// incremental edits can change which block is final without reparsing it.
     pub fn inactive_rows_in(
         &self,
         block_range: SourceRange,
         range: SourceRange,
         disclosure: Option<SourceRange>,
+        block_is_final: bool,
     ) -> usize {
         if range.is_empty() || self.rows.is_empty() {
             return 0;
@@ -455,22 +452,24 @@ impl FenceHeightProjection {
         );
         let start = self.rows.partition_point(|row| row.range.end <= relative.start);
         let end = self.rows.partition_point(|row| row.range.start < relative.end);
-        self.inactive_rows_in_indices(block_range, start..end, disclosure)
+        self.inactive_rows_in_indices(block_range, start..end, disclosure, block_is_final)
     }
 
     /// Counts rows before a physical line boundary that remain collapsed under
     /// `disclosure`. This is the render-time prefix query used to translate a
     /// visual y position back to a source-line window. Its cost is bounded by
     /// binary searches over the projection, independent of the total block
-    /// length or fence count.
+    /// length or fence count. See [`Self::inactive_rows_in`] for the meaning
+    /// of `block_is_final`.
     pub fn inactive_rows_before_line(
         &self,
         block_range: SourceRange,
         line: usize,
         disclosure: Option<SourceRange>,
+        block_is_final: bool,
     ) -> usize {
         let end = self.rows.partition_point(|row| row.line < line);
-        self.inactive_rows_in_indices(block_range, 0..end, disclosure)
+        self.inactive_rows_in_indices(block_range, 0..end, disclosure, block_is_final)
     }
 
     /// Whether a physical block-relative line is one of the fence rows this
@@ -489,6 +488,7 @@ impl FenceHeightProjection {
         block_range: SourceRange,
         indices: Range<usize>,
         disclosure: Option<SourceRange>,
+        block_is_final: bool,
     ) -> usize {
         let rows = &self.rows[indices.clone()];
         let Some(disclosure) = disclosure else {
@@ -513,7 +513,7 @@ impl FenceHeightProjection {
                 self.active_quote_rows_in(
                     indices.clone(),
                     SourceRange::empty(caret.0),
-                    block_range.start.0 + caret.0 == self.document_end.0,
+                    block_is_final && block_range.start.0 + caret.0 == block_range.end.0,
                 );
             let direct_active = usize::from(active_row.is_some());
             let direct_already_counted = active_row.is_some_and(|row| {
@@ -1946,9 +1946,8 @@ mod tests {
     #[test]
     fn fence_height_projection_answers_physical_line_prefixes() {
         let block_range = SourceRange::new(100, 500);
-        let projection = FenceHeightProjection::from_absolute_rows_with_document_end(
+        let projection = FenceHeightProjection::from_absolute_rows(
             block_range,
-            block_range.end,
             vec![
                 (SourceRange::new(100, 104), true, Vec::new(), 0),
                 (SourceRange::new(300, 304), true, Vec::new(), 200),
@@ -1956,19 +1955,19 @@ mod tests {
         );
 
         assert_eq!(
-            projection.inactive_rows_before_line(block_range, 0, None),
+            projection.inactive_rows_before_line(block_range, 0, None, true),
             0
         );
         assert_eq!(
-            projection.inactive_rows_before_line(block_range, 1, None),
+            projection.inactive_rows_before_line(block_range, 1, None, true),
             1
         );
         assert_eq!(
-            projection.inactive_rows_before_line(block_range, 200, None),
+            projection.inactive_rows_before_line(block_range, 200, None, true),
             1
         );
         assert_eq!(
-            projection.inactive_rows_before_line(block_range, 201, None),
+            projection.inactive_rows_before_line(block_range, 201, None, true),
             2
         );
     }

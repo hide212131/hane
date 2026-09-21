@@ -963,6 +963,7 @@ pub fn block_heights_with_disclosure(
         .blocks()
         .map(|block| {
             counted += block.line_count;
+            let block_is_final = block.ordinal + 1 == index.len();
             let collapsed = index
                 .fence_height_projection(&block)
                 .map_or(0, |projection| {
@@ -970,6 +971,7 @@ pub fn block_heights_with_disclosure(
                         block.source_range,
                         block.source_range,
                         disclosure,
+                        block_is_final,
                     )
                 });
             line_height * block.line_count.saturating_sub(collapsed) as f32
