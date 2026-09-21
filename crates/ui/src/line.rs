@@ -142,6 +142,8 @@ pub(crate) fn presented_block_with_list_projection(
             span,
             lines: &lines,
             clipped_fence_lines: &clipped_fence_lines,
+            zero_height_fence_rows_before: ctx.zero_height_fence_rows_before,
+            zero_height_fence_rows_after: ctx.zero_height_fence_rows_after,
             render,
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -178,6 +180,8 @@ pub(crate) fn expected_block_disclosures(
             span,
             lines: &lines,
             clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
             render: render.clone(),
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -208,6 +212,8 @@ struct BlockContext {
     /// virtualized height stable. These are never joined into normal Markdown
     /// parsing and are not drawn by the current render window.
     clipped_fence_lines: Vec<(usize, SourceRange, String)>,
+    zero_height_fence_rows_before: usize,
+    zero_height_fence_rows_after: usize,
 }
 
 fn block_context(
@@ -280,23 +286,33 @@ fn block_context(
         let text = document.text(range).unwrap_or_default();
         clipped_fence_lines.push((closing, range, text));
     }
-    if let Some(projection) = list_projection {
-        for (marker, _) in projection.fence_markers_in(block.source_range) {
-            let line = document.line_for_offset(marker.start).ok()?.0;
-            if context.contains(&line)
-                || Some(line) == opening_fence_line_number
-                || clipped_fence_lines
-                    .iter()
-                    .any(|(existing, _, _)| *existing == line)
-            {
-                continue;
-            }
-            let range = clip_to_block(document.line_range(LineId(line)).ok()?);
-            let text = document.text(range).unwrap_or_default();
-            clipped_fence_lines.push((line, range, text));
-        }
-        clipped_fence_lines.sort_by_key(|(line, _, _)| *line);
-    }
+    let render_start_offset = if render.start <= span.start {
+        block_range.start
+    } else if render.start >= span.end {
+        block_range.end
+    } else {
+        clip_to_block(document.line_range(LineId(render.start)).ok()?).start
+    };
+    let render_end_offset = if render.end <= span.start {
+        block_range.start
+    } else if render.end >= span.end {
+        block_range.end
+    } else {
+        clip_to_block(document.line_range(LineId(render.end)).ok()?).start
+    };
+    let (zero_height_fence_rows_before, zero_height_fence_rows_after) =
+        list_projection.map_or((0, 0), |projection| {
+            (
+                projection.inactive_zero_height_fence_rows_in(
+                    SourceRange::new(block_range.start.0, render_start_offset.0),
+                    block_disclosure,
+                ),
+                projection.inactive_zero_height_fence_rows_in(
+                    SourceRange::new(render_end_offset.0, block_range.end.0),
+                    block_disclosure,
+                ),
+            )
+        });
     Some(BlockContext {
         trailing_blank_lines,
         context,
@@ -305,6 +321,8 @@ fn block_context(
         block_disclosure,
         opening_fence_line,
         clipped_fence_lines,
+        zero_height_fence_rows_before,
+        zero_height_fence_rows_after,
     })
 }
 
