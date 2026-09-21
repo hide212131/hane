@@ -1202,7 +1202,7 @@ mod tests {
             "bare opening/closing and the rust block's closing fence collapse; the rust label does not"
         );
 
-        let bare_opening = SourceOffset(source.find("```").expect("bare opening"));
+        let bare_opening = source.find("```").expect("bare opening");
         assert_eq!(
             projection.inactive_zero_height_fence_rows_in(
                 block.source_range,
@@ -1212,7 +1212,7 @@ mod tests {
             "editing a fence restores only that physical row"
         );
 
-        let code_start = SourceOffset(source.find("code").expect("code row"));
+        let code_start = source.find("code").expect("code row");
         assert_eq!(
             projection.inactive_zero_height_fence_rows_in(
                 block.source_range,
