@@ -8149,6 +8149,14 @@ mod tests {
                 "collapsed fence rows must be skipped when selecting the source window: {lines:?}"
             );
             assert!(lines.end > lines.start && lines.end <= span.end);
+
+            let source_anchor = document.line_range(LineId(120)).unwrap().start;
+            let anchored_y = view.scroll_for_offset(source_anchor);
+            assert_eq!(
+                anchored_y,
+                view.line_height() * 40.0,
+                "scroll anchors must use the same collapsed-row prefix as the render window"
+            );
         });
     }
 
