@@ -4682,6 +4682,58 @@ mod tests {
     }
 
     #[test]
+    fn average_line_height_ignores_collapsed_fence_rows() {
+        let opening = present_fenced_code_opening_line(
+            0,
+            Revision(1),
+            SourceRange::new(0, 4),
+            "```\n",
+            26.0,
+            None,
+        );
+        let body = present_fenced_code_content_line(
+            1,
+            Revision(1),
+            SourceRange::new(4, 9),
+            "code\n",
+            26.0,
+        );
+        let closing = present_fenced_code_closing_line(
+            2,
+            Revision(1),
+            SourceRange::new(9, 13),
+            "```\n",
+            26.0,
+            None,
+        );
+        assert_eq!(opening.height(), 0.0);
+        assert!(body.height() > 0.0);
+        assert_eq!(closing.height(), 0.0);
+
+        let block = VisualBlock {
+            id: BlockId(0),
+            kind: BlockKind::CodeBlock,
+            source_range: SourceRange::new(0, 13),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            span: 0..3,
+            lines: vec![opening, body, closing],
+            lines_before: 0,
+            lines_after: 0,
+            zero_height_lines_before: 0,
+            zero_height_lines_after: 0,
+            line_height: 26.0,
+        };
+        let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
+
+        assert_eq!(
+            layout.average_line_height(),
+            Some(code_line_height(26.0)),
+            "collapsed fence rows must not lower the visual-row estimate"
+        );
+    }
+
+    #[test]
     fn quote_disclosure_does_not_expand_inactive_nested_quote_or_inline_markers() {
         let source = "> outer\n> > **nested**";
         let start = 40;
