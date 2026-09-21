@@ -1409,6 +1409,20 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     }
 }
 
+fn disclosure_owns_physical_line(
+    range: SourceRange,
+    source: &str,
+    disclosure: SourceRange,
+) -> bool {
+    if disclosure.is_empty() {
+        range.start <= disclosure.start
+            && (disclosure.start < range.end
+                || (!source.ends_with(['\n', '\r']) && disclosure.start == range.end))
+    } else {
+        range.intersects(disclosure)
+    }
+}
+
 /// Resolves an empty disclosure at a list-item boundary to the item that
 /// starts there. Markdown list-item ranges are allowed to meet exactly at the
 /// following item's start, so the generic inclusive caret check would
@@ -2090,7 +2104,7 @@ fn present_markdown_from_parse(
         fenced_line_height(
             &visual,
             has_hidden_fence,
-            disclosure.is_some_and(|active| range_touches(range, active)),
+            disclosure.is_some_and(|active| disclosure_owns_physical_line(range, source, active)),
             line_height,
         )
     } else {
