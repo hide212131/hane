@@ -630,7 +630,11 @@ fn line_geometry(
             marker_x_origin: None,
             body_x_origin: quote_x,
             expanded_prefix_width: 0.0,
-            effective_width: width.max(0.0),
+            effective_width: if quote_x > 0.0 {
+                (width - quote_x).max(MIN_EFFECTIVE_WRAP_WIDTH)
+            } else {
+                width.max(0.0)
+            },
             body_visual_start: None,
             marker_visual_range: None,
             marker_body_gap: 0.0,

@@ -1004,6 +1004,32 @@ fn disclosed_quote_prefix_uses_source_width_without_semantic_inset() {
 }
 
 #[test]
+fn inactive_quote_wrap_width_reserves_semantic_inset() {
+    let quoted_source = "> quoted text that wraps in a narrow column\n";
+    let quoted_block = present(quoted_source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+    let quoted_layout = layout_block(&quoted_block, 80.0, &shaper());
+    let quoted_rows = quoted_layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(quoted_rows.len() > 1, "the quoted body must wrap");
+    assert!(quoted_rows.iter().all(|row| row.effective_width == 56.0));
+
+    let plain_source = "plain text that wraps in a narrow column\n";
+    let plain_block = present(plain_source, None)
+        .into_iter()
+        .next()
+        .expect("the plain block is presented");
+    let plain_layout = layout_block(&plain_block, 80.0, &shaper());
+    assert!(plain_layout.lines.iter().all(|row| row.effective_width == 80.0));
+}
+
+#[test]
 fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
     for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
         let rule_start = source.find("---").expect("rule source");
