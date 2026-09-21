@@ -186,8 +186,40 @@ fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
     let mut ranges = Vec::new();
     let mut start = range.start.0;
     while start < range.end.0 {
-        let relative = start.saturating_sub(range.start.0);
-        let tail = &source[relative..];
+        let tail = &source[start..range.end.0];
+        let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
+            offset
+                + if tail.as_bytes()[offset] == b'\r'
+                    && tail.as_bytes().get(offset + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                }
+        });
+        let next = (start + end).min(range.end.0);
+        if next <= start {
+            break;
+        }
+        ranges.push(SourceRange::new(start, next));
+        start = next;
+    }
+    ranges
+}
+
+fn source_line_ranges_in(
+    parse_range: SourceRange,
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let mut ranges = Vec::new();
+    let mut start = range.start.0;
+    while start < range.end.0 {
+        let relative = start.saturating_sub(parse_range.start.0);
+        let relative_end = range.end.0.saturating_sub(parse_range.start.0);
+        let Some(tail) = source.get(relative..relative_end) else {
+            break;
+        };
         let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
             offset
                 + if tail.as_bytes()[offset] == b'\r'
@@ -215,7 +247,7 @@ fn build_fence_height_projection(
     fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
     list_item_markers: &[SourceRange],
 ) -> Option<FenceHeightProjection> {
-    let line_ranges = source_line_ranges(block_range, source);
+    let line_ranges = source_line_ranges_in(parse_range, block_range, source);
     let mut rows = Vec::new();
     for (marker, _) in fence_markers {
         let line = line_ranges
