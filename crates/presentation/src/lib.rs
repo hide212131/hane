@@ -4996,6 +4996,8 @@ mod tests {
                 ],
                 lines_before: 0,
                 lines_after: 0,
+                zero_height_lines_before: 0,
+                zero_height_lines_after: 0,
                 line_height: 26.0,
             };
             let context = ListEditingContext {
