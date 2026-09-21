@@ -60,6 +60,8 @@ jobs:
     needs: rust_ci_changes
     if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
     runs-on: macos-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Fail when Rust CI path detection failed
         if: ${{ needs.rust_ci_changes.result != 'success' }}
@@ -72,6 +74,11 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup show
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
 
       - name: Run workspace tests
         run: cargo test --workspace --all-features
@@ -90,6 +97,8 @@ jobs:
     needs: rust_ci_changes
     if: ${{ always() && (needs.rust_ci_changes.result != 'success' || needs.rust_ci_changes.outputs.required == 'true') }}
     runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Fail when Rust CI path detection failed
         if: ${{ needs.rust_ci_changes.result != 'success' }}
@@ -102,6 +111,11 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup show
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> target"
 
       - name: Run workspace tests
         run: cargo test --workspace --all-features
