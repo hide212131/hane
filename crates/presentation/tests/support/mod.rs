@@ -180,6 +180,7 @@ fn present_document(buffer: &RopeBuffer, cursor: Option<usize>) -> Vec<VisualLin
                 render: line..end,
                 span,
                 lines: &block_lines,
+                    clipped_fence_lines: &[],
                 joined: None,
                 block_disclosure: None,
             },
