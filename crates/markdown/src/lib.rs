@@ -364,7 +364,9 @@ impl FenceHeightProjection {
             }
             let caret = SourceOffset(disclosure.start.0 - block_range.start.0);
             let active = rows
-                .get(rows.partition_point(|row| row.range.end <= caret))
+                .get(rows.partition_point(|row| {
+                    row.range.end < caret || (row.range.end == caret && !row.owns_end)
+                }))
                 .is_some_and(|row| {
                     row.range.start <= caret
                         && (caret < row.range.end || (row.owns_end && caret == row.range.end))
