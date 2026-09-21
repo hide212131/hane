@@ -1422,6 +1422,32 @@ mod tests {
     }
 
     #[test]
+    fn caret_at_a_quote_owner_end_inside_a_block_restores_fence_rows() {
+        let source = "- > ```\n  > code\n  > ```\n  after";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("quoted fence height projection");
+        let after = source.rfind('\n').expect("following list row") + 1;
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(after)),
+                true,
+            ),
+            0,
+            "the quote owner remains disclosed at its interior end boundary"
+        );
+    }
+
+    #[test]
     fn an_incremental_edit_before_the_last_quote_uses_the_current_document_end() {
         let source = "before\n\nmiddle one\n\nmiddle two\n\n> ```\n> code\n> ```";
         let mut buffer = RopeBuffer::from_text(source);

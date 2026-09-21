@@ -509,12 +509,13 @@ impl FenceHeightProjection {
                         && (caret < row.range.end || (row.owns_end && caret == row.range.end))
                 })
                 .map(|_| indices.start + relative_active);
-            let quote_active =
-                self.active_quote_rows_in(
-                    indices.clone(),
-                    SourceRange::empty(caret.0),
-                    block_is_final && block_range.start.0 + caret.0 == block_range.end.0,
-                );
+            let caret_absolute = block_range.start.0 + caret.0;
+            let quote_active = self.active_quote_rows_in(
+                indices.clone(),
+                SourceRange::empty(caret.0),
+                caret_absolute < block_range.end.0
+                    || (block_is_final && caret_absolute == block_range.end.0),
+            );
             let direct_active = usize::from(active_row.is_some());
             let direct_already_counted = active_row.is_some_and(|row| {
                 self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]
@@ -552,7 +553,7 @@ impl FenceHeightProjection {
         &self,
         rows: Range<usize>,
         disclosure: SourceRange,
-        caret_at_document_end: bool,
+        allow_owner_end: bool,
     ) -> usize {
         if self.quote_owner_rows.is_empty() {
             return 0;
@@ -576,7 +577,7 @@ impl FenceHeightProjection {
             .filter(|entry| {
                 if disclosure.is_empty() {
                     entry.owner.end > disclosure.start
-                        || (caret_at_document_end && entry.owner.end == disclosure.start)
+                        || (allow_owner_end && entry.owner.end == disclosure.start)
                 } else {
                     entry.owner.end > disclosure.start
                 }

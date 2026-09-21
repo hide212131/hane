@@ -3972,6 +3972,25 @@ mod tests {
     }
 
     #[test]
+    fn caret_at_a_quote_owner_end_discloses_fence_rows_before_following_list_text() {
+        let source = "- > ```\n  > code\n  > ```\n  after";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let after = source.rfind('\n').expect("following list row") + 1;
+        let inactive = block_heights(&document, &index, 26.0);
+        let disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(after)),
+        );
+
+        assert_eq!(inactive.len(), 1, "the fixture must stay in one list block");
+        assert_eq!(disclosed, vec![26.0 * 4.0]);
+        assert_eq!(inactive, vec![26.0 * 3.0]);
+    }
+
+    #[test]
     fn source_index_skips_offscreen_spans_under_a_long_enclosing_construct() {
         // A prefix-max-only index would scan all preceding spans because the
         // enclosing construct reaches the end. Subtree maxima must prune them.
