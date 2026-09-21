@@ -11247,9 +11247,11 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
         let second = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
             let second = view
                 .sessions
                 .open_untitled("body\n", "second.md".to_owned());
+            assert!(view.activate_session(first, cx));
             view.inline_rename = Some(InlineRename {
                 kind: InlineRenameKind::File,
                 from: PathBuf::from("pending.md"),
