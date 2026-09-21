@@ -483,7 +483,10 @@ fn disclosed_markers_use_their_source_visible_width_without_a_virtual_gap() {
             .as_ref()
             .and_then(|list| list.marker.as_ref())
             .expect("the disclosed marker is present");
-        assert!(!marker.synthesized, "{source:?} must expose its source marker");
+        assert!(
+            !marker.synthesized,
+            "{source:?} must expose its source marker"
+        );
 
         let layout = layout_block(&block, 160.0, &shaper());
         let row = layout
@@ -520,7 +523,10 @@ fn disclosed_empty_markers_put_the_terminal_caret_after_raw_source() {
             .as_ref()
             .and_then(|list| list.marker.as_ref())
             .expect("the empty marker is present");
-        assert!(!marker.synthesized, "{source:?} must not add a bullet or number");
+        assert!(
+            !marker.synthesized,
+            "{source:?} must not add a bullet or number"
+        );
         assert_eq!(marker.label, source[..marker_end], "{source:?}");
 
         let layout = layout_block(&block, 160.0, &shaper());
