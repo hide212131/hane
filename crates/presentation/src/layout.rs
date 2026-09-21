@@ -539,9 +539,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 y,
                 height,
                 text_x_origin: if fragment == 0 {
-                    line_geometry
-                        .marker_x_origin
-                        .unwrap_or(line_geometry.text_x_origin)
+                    line_geometry.text_x_origin
                 } else {
                     line_geometry.body_x_origin
                 },
@@ -654,12 +652,18 @@ fn line_geometry(
             ),
         };
     };
-    let quote_x = line
-        .quote
-        .map_or(0.0, |quote| {
-            quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
-        });
-    let marker_x = quote_x + list_depth_x(list.owner.depth);
+    let quote_x = line.quote.map_or(0.0, |quote| {
+        quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+    });
+    let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
+    let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
+    let marker_x = quote_x
+        + list_depth_x(list.owner.depth)
+        + if quote_prefix_after_outer {
+            quote_prefix_width
+        } else {
+            0.0
+        };
     let aggregate_marker_width = marker_widths
         .get(&list.owner.list_id)
         .copied()
@@ -684,6 +688,8 @@ fn line_geometry(
         .iter()
         .filter(|segment| {
             segment.visibility == crate::Visibility::ExpandedMarkup
+                && (!quote_prefix_after_outer
+                    || quote_prefix_end.is_none_or(|end| segment.visual_range.start.0 >= end))
                 && segment.visual_range.start.0 < body_visual_start_offset
                 && segment.visual_range.end.0 <= body_visual_start_offset
                 && marker_visual_range.as_ref() != Some(&segment.visual_range)
@@ -716,41 +722,44 @@ fn line_geometry(
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
     };
+    let marker_body_gap = list
+        .marker
+        .as_ref()
+        .filter(|marker| marker.synthesized)
+        .map_or(0.0, |_| {
+            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
+        });
     let body_x = marker_x + expanded_prefix_width + marker_column_width;
+    let opening_marker = list.marker.is_some()
+        || list.empty_caret_origin == Some(ListCaretOrigin::Marker);
+    let text_x_origin = if quote_prefix_after_outer {
+        0.0
+    } else if opening_marker {
+        marker_x
+    } else {
+        body_x - expanded_prefix_width
+    };
+    let first_row_width = if quote_prefix_after_outer {
+        body_visual_start.map_or(width - text_x_origin, |body| {
+            shaper.x_for_offset(line, 0..body, body) + width - body_x + marker_body_gap
+        })
+    } else {
+        width - text_x_origin
+    };
     LineGeometry {
-        text_x_origin: body_x - expanded_prefix_width,
-        marker_x_origin: if list.marker.is_some()
-            || list.empty_caret_origin == Some(ListCaretOrigin::Marker)
-        {
-            Some(marker_x)
-        } else {
-            None
-        },
+        text_x_origin,
+        marker_x_origin: opening_marker.then_some(marker_x),
         body_x_origin: body_x,
-        first_row_width: width
-            - if list.marker.is_some()
-                || list.empty_caret_origin == Some(ListCaretOrigin::Marker)
-            {
-                marker_x
-            } else {
-                body_x - expanded_prefix_width
-            },
+        first_row_width,
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
         body_visual_start,
         marker_visual_range: list
             .marker
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
-        marker_body_gap: list
-            .marker
-            .as_ref()
-            .filter(|marker| marker.synthesized)
-            .map_or(0.0, |_| {
-                (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width)
-                    .max(0.0)
-            }),
+        marker_body_gap,
         quote_bar_x_origin: (quote_x > 0.0).then_some(
-            quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
+            quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH,
         ),
     }
 }

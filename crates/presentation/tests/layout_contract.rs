@@ -1245,6 +1245,33 @@ fn lazy_continuation_image_keeps_quote_geometry() {
 }
 
 #[test]
+fn disclosed_outer_quote_prefix_precedes_nested_list_geometry() {
+    let source = r#"> outer
+> > - item
+"#;
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the nested list block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.list.is_some())
+        .expect("the nested list line is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == line.line_id as usize)
+        .expect("the nested list row is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.marker_x_origin, Some(40.0));
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.quote_bar_x_origin, Some(30.0));
+}
+
+#[test]
 fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
     let source = "- outer\n\n  - inner\n";
     let block = present(source, None)
