@@ -26,7 +26,7 @@ use crate::block_store::BlockStore;
 use crate::{
     FenceHeightProjection, ListProjection, ListProjectionItem, ListProjectionList,
     ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind,
-    markdown_lines, parse_document,
+    QuoteProjection, markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::collections::HashMap;
@@ -500,23 +500,62 @@ fn build_list_projections(
             (
                 *marker,
                 parsed.tree.node(*owner).map(|quote| quote.source_range),
+                parsed
+                    .tree
+                    .ancestors(*owner)
+                    .filter(|ancestor| {
+                        parsed
+                            .tree
+                            .node(*ancestor)
+                            .is_some_and(|node| node.kind == NodeKind::Quote)
+                    })
+                    .count(),
             )
         })
         .chain(
             parsed
                 .list_item_markers
                 .iter()
-                .map(|(marker, _)| (*marker, None)),
+                .map(|(marker, _)| (*marker, None, 0)),
         )
         .chain(
             parsed
                 .list_structural_prefixes
                 .iter()
-                .map(|(marker, _, _)| (*marker, None)),
+                .map(|(marker, _, _)| (*marker, None, 0)),
         )
         .collect::<Vec<_>>();
-    container_markers.sort_by_key(|(marker, _)| (marker.start, marker.end));
-    container_markers.dedup_by_key(|(marker, _)| (marker.start, marker.end));
+    container_markers.sort_by_key(|(marker, _, _)| (marker.start, marker.end));
+    container_markers.dedup_by_key(|(marker, _, _)| (marker.start, marker.end));
+    let mut quotes = parsed
+        .tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::Quote)
+        .map(|(id, node)| QuoteProjection {
+            source_range: node.source_range,
+            depth: parsed
+                .tree
+                .ancestors(id)
+                .filter(|ancestor| {
+                    parsed
+                        .tree
+                        .node(*ancestor)
+                        .is_some_and(|node| node.kind == NodeKind::Quote)
+                })
+                .count(),
+        })
+        .collect::<Vec<_>>();
+    quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
+    let mut quotes_by_block = vec![Vec::new(); block_ranges.len()];
+    for quote in quotes {
+        let block = block_ranges.partition_point(|range| range.end <= quote.source_range.start);
+        if block_ranges
+            .get(block)
+            .is_some_and(|range| range.start <= quote.source_range.start)
+        {
+            quotes_by_block[block].push(quote);
+        }
+    }
     blocks
         .iter()
         .enumerate()
@@ -541,19 +580,21 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
-            let container_start =
-                container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
-            let container_end =
-                container_markers.partition_point(|(marker, _)| marker.start < block_range.end);
+            let container_start = container_markers
+                .partition_point(|(marker, _, _)| marker.end <= block_range.start);
+            let container_end = container_markers
+                .partition_point(|(marker, _, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
-            if block_items.is_empty() && rows.is_empty() {
+            let block_quotes = std::mem::take(&mut quotes_by_block[block]);
+            if block_items.is_empty() && rows.is_empty() && block_quotes.is_empty() {
                 None
             } else {
                 Some(ListProjection::new(
                     block_items,
                     block_prefixes,
                     block_lists,
+                    block_quotes,
                     rows,
                     block_fence_markers,
                     block_container_markers,
@@ -1695,6 +1736,64 @@ mod tests {
         let block = index.block(0).expect("top-level code block");
         assert_eq!(block.kind, NodeKind::CodeBlock);
         assert!(index.list_projection(&block).is_none());
+    }
+
+    #[test]
+    fn formal_projection_keeps_nested_quote_depth_for_viewport_rows() {
+        let source = "> outer\n> > inner\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("quote block");
+        let projection = index
+            .list_projection(&block)
+            .expect("quote projection");
+        let outer_line = SourceRange::new(0, "> outer\n".len());
+        let inner_start = "> outer\n".len();
+        let inner_line = SourceRange::new(inner_start, source.len());
+        assert_eq!(
+            projection
+                .quotes_in(outer_line)
+                .map(|quote| quote.depth)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            projection
+                .quotes_in(inner_line)
+                .map(|quote| quote.depth)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn formal_quote_projection_stays_with_its_own_block() {
+        let source = "> first\n\n> second\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let blocks = index.blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+
+        let first = index
+            .list_projection(&blocks[0])
+            .expect("first quote projection");
+        let second = index
+            .list_projection(&blocks[1])
+            .expect("second quote projection");
+        assert_eq!(first.quotes_in(blocks[0].source_range).count(), 1);
+        assert_eq!(second.quotes_in(blocks[1].source_range).count(), 1);
+        assert_eq!(
+            first
+                .quotes_in(blocks[1].source_range)
+                .count(),
+            0,
+            "the first block must not retain quote projections from later blocks"
+        );
+        assert_eq!(
+            second
+                .quotes_in(blocks[0].source_range)
+                .count(),
+            0,
+            "the second block must not retain quote projections from earlier blocks"
+        );
     }
 
     #[test]

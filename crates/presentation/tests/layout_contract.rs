@@ -16,8 +16,9 @@ use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuf
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
-    BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove, VisualBlock,
-    block_line_span, layout_block, present_block, trailing_blank_lines,
+    BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
+    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_list_projection,
+    trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -236,7 +237,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                         .map(SourceRange::empty),
                 })
                 .collect::<Vec<_>>();
-            present_block(
+            present_block_with_list_projection(
                 &block,
                 buffer.revision(),
                 &BlockWindow {
@@ -251,6 +252,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     block_disclosure: None,
                 },
                 LINE_HEIGHT,
+                index.list_projection(&block),
             )
         })
         .collect()
@@ -975,6 +977,409 @@ fn disclosed_quote_prefix_width_is_included_in_list_body_geometry() {
             .x,
         40.0
     );
+}
+
+#[test]
+fn disclosed_quote_prefix_uses_source_width_without_semantic_inset() {
+    let source = "> item\n";
+    let cursor = source.find("item").expect("item in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the quoted row is laid out");
+
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 0.0);
+    assert_eq!(
+        layout
+            .point_for_source(&block, SourceOffset(cursor), &shaper())
+            .expect("item has a point")
+            .x,
+        16.0
+    );
+}
+
+#[test]
+fn inactive_quote_wrap_width_reserves_semantic_inset() {
+    let quoted_source = "> quoted text that wraps in a narrow column\n";
+    let quoted_block = present(quoted_source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+    let quoted_layout = layout_block(&quoted_block, 80.0, &shaper());
+    let quoted_rows = quoted_layout
+        .lines
+        .iter()
+        .filter(|row| row.line == 0)
+        .collect::<Vec<_>>();
+
+    assert!(quoted_rows.len() > 1, "the quoted body must wrap");
+    assert!(quoted_rows.iter().all(|row| row.effective_width == 56.0));
+
+    let plain_source = "plain text that wraps in a narrow column\n";
+    let plain_block = present(plain_source, None)
+        .into_iter()
+        .next()
+        .expect("the plain block is presented");
+    let plain_layout = layout_block(&plain_block, 80.0, &shaper());
+    assert!(plain_layout.lines.iter().all(|row| row.effective_width == 80.0));
+}
+
+#[test]
+fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
+    let source = "> text\n>\n> ---\n";
+    let cursor = source.find("text").expect("text in source");
+    let rule_start = source.find("---").expect("rule source");
+    let rule_line_start = source[..rule_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| {
+            block.lines.iter().any(|line| {
+                line.source_range.start.0 == rule_line_start && line.kind == BlockKind::Rule
+            })
+        })
+        .expect("the quoted rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.source_range.start.0 == rule_line_start)
+        .expect("the quoted rule line is presented");
+
+    assert_eq!(line.visual_text, "> ");
+    assert_eq!(
+        line.quote,
+        Some(hane_presentation::QuoteRowMetadata {
+            depth: 1,
+            disclosed_depth: 1,
+        })
+    );
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(rule_line_start, rule_line_start + 2)
+            && segment.visibility == hane_presentation::Visibility::ExpandedMarkup
+    }));
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(rule_start, line.source_range.end.0)
+            && segment.visibility == hane_presentation::Visibility::HiddenMarkup
+    }));
+    assert!(line.rule_body_is_collapsed());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 2)
+        .expect("the quoted rule row is laid out");
+    assert_eq!(row.body_x_origin, 0.0);
+    assert_eq!(row.quote_bar_x_origin, None);
+}
+
+#[test]
+fn caret_on_the_following_line_does_not_disclose_the_previous_rule_body() {
+    let source = "> ---\n> text\n";
+    let cursor = source.find("text").expect("text in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.kind == BlockKind::Rule))
+        .expect("the quoted rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::Rule)
+        .expect("the quoted rule line is presented");
+
+    assert_eq!(line.visual_text, "> ");
+    assert!(line.rule_body_is_collapsed());
+    assert!(line.source_map.segments.iter().any(|segment| {
+        segment.source_range == SourceRange::new(2, 6)
+            && segment.visibility == hane_presentation::Visibility::HiddenMarkup
+    }));
+}
+
+#[test]
+fn collapsed_nested_rule_keeps_the_disclosed_quote_body_gap() {
+    let source = "> outer\n> > ---\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.kind == BlockKind::Rule))
+        .expect("the nested rule block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::Rule)
+        .expect("the nested rule line is presented");
+    assert!(line.rule_body_is_collapsed());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == line.line_id as usize)
+        .expect("the nested rule row is laid out");
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.body_x_origin, 40.0);
+}
+
+#[test]
+fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
+    for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
+        let rule_start = source.find("---").expect("rule source");
+        let line_start = source[..rule_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let rule_line = source[..line_start].bytes().filter(|byte| *byte == b'\n').count();
+        let quoted = source.starts_with('>');
+        let inactive_block = present(source, None)
+            .into_iter()
+            .find(|block| {
+                block.lines.iter().any(|line| {
+                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
+                })
+            })
+            .expect("the nested rule block is presented");
+        let inactive_layout = layout_block(&inactive_block, 160.0, &shaper());
+        let inactive_row = inactive_layout
+            .lines
+            .iter()
+            .find(|row| row.line == rule_line)
+            .expect("collapsed rule row is laid out");
+        let expected_collapsed_body = if quoted { 40.0 } else { 16.0 };
+        assert_eq!(inactive_row.text_x_origin, expected_collapsed_body);
+        assert_eq!(inactive_row.body_x_origin, expected_collapsed_body);
+        assert_eq!(
+            inactive_row.quote_bar_x_origin,
+            quoted.then_some(14.0),
+            "source: {source:?}"
+        );
+
+        let active_block = present(source, Some(rule_start + 1))
+            .into_iter()
+            .find(|block| {
+                block.lines.iter().any(|line| {
+                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
+                })
+            })
+            .expect("the active nested rule block is presented");
+        let active_line = active_block
+            .lines
+            .iter()
+            .find(|line| line.line_id as usize == rule_line)
+            .expect("active rule line");
+        assert_eq!(
+            active_line
+                .list
+                .as_ref()
+                .expect("active rule keeps list metadata")
+                .body_visual_start,
+            VisualOffset(rule_start - line_start)
+        );
+        let active_layout = layout_block(&active_block, 160.0, &shaper());
+        let active_row = active_layout
+            .lines
+            .iter()
+            .find(|row| row.line == rule_line)
+            .expect("active rule row is laid out");
+        let expected_active_body = (rule_start - line_start) as f32 * 8.0;
+        assert_eq!(active_row.text_x_origin, 0.0, "source: {source:?}");
+        assert_eq!(
+            active_row.body_x_origin,
+            expected_active_body,
+            "source: {source:?}"
+        );
+        assert_eq!(active_row.quote_bar_x_origin, None);
+    }
+}
+
+#[test]
+fn disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset() {
+    let source = "> outer\n> > nested\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the quoted block is presented");
+
+    assert_eq!(
+        block.lines[0]
+            .quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((1, 1))
+    );
+    assert_eq!(
+        block.lines[1]
+            .quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((2, 1))
+    );
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let nested = SourceOffset(source.find("nested").expect("nested in source"));
+    let point = layout
+        .point_for_source(&block, nested, &shaper())
+        .expect("nested text has a point");
+    assert_eq!(point.x, 40.0);
+    let nested_row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("nested quote row is laid out");
+    let nested_row_index = layout
+        .lines
+        .iter()
+        .position(|row| row.line == 1)
+        .expect("nested quote row has a layout index");
+    assert_eq!(nested_row.text_x_origin, 0.0);
+    assert_eq!(nested_row.body_x_origin, 40.0);
+    assert_eq!(nested_row.body_gap, 24.0);
+    assert_eq!(nested_row.quote_bar_x_origin, Some(30.0));
+    assert_eq!(
+        layout.source_at_x(&block, nested_row_index, 24.0, &shaper()),
+        Some(nested)
+    );
+}
+
+#[test]
+fn disclosed_quote_prefix_uses_quote_marker_after_leading_indent() {
+    let source = "  > outer\n  > > inner\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.quote.is_some()))
+        .expect("the indented quoted block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.line_id == 1)
+        .expect("the nested quote line is presented");
+    assert_eq!(line.quote_marker_visual_ranges.len(), 2);
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the nested quote row is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(46.0));
+}
+
+#[test]
+fn disclosed_quote_prefix_does_not_consume_list_prefix_as_quote() {
+    let source = "- item\n  > outer\n  > > inner\n";
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.line_id == 2))
+        .expect("the list block is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == 2)
+        .expect("the nested quoted continuation is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(46.0));
+}
+
+#[test]
+fn inactive_list_quote_places_inset_after_the_list_prefix() {
+    for (source, line_id, expected_text_x, expected_marker_x) in [
+        ("- > item\n", 0, 0.0, Some(0.0)),
+        ("- item\n  > quote\n", 1, 40.0, None),
+    ] {
+        let block = present(source, None)
+            .into_iter()
+            .find(|block| {
+                block
+                    .lines
+                    .iter()
+                    .any(|line| line.line_id == line_id && line.quote.is_some())
+            })
+            .expect("the list quote block is presented");
+        let layout = layout_block(&block, 160.0, &shaper());
+        let row = layout
+            .lines
+            .iter()
+            .find(|row| row.line_id == line_id)
+            .expect("the list quote row is laid out");
+        assert_eq!(row.text_x_origin, expected_text_x, "source: {source:?}");
+        assert_eq!(row.marker_x_origin, expected_marker_x, "source: {source:?}");
+        assert_eq!(row.body_x_origin, 40.0, "source: {source:?}");
+        assert_eq!(row.quote_bar_x_origin, Some(30.0), "source: {source:?}");
+    }
+}
+
+#[test]
+fn lazy_continuation_image_keeps_quote_geometry() {
+    let source = r#"> quote
+![alt](dest)
+"#;
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.image.is_some()))
+        .expect("the quoted image block is presented");
+    let image = block
+        .lines
+        .iter()
+        .find(|line| line.image.is_some())
+        .expect("the lazy continuation image is presented");
+
+    assert_eq!(image.kind, BlockKind::Image);
+    assert_eq!(
+        image.quote,
+        Some(hane_presentation::QuoteRowMetadata {
+            depth: 1,
+            disclosed_depth: 0,
+        })
+    );
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == image.line_id as usize)
+        .expect("the image row is laid out");
+    assert_eq!(row.body_x_origin, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(14.0));
+}
+
+#[test]
+fn disclosed_outer_quote_prefix_precedes_nested_list_geometry() {
+    let source = r#"> outer
+> > - item
+"#;
+    let cursor = source.find("outer").expect("outer in source");
+    let block = present(source, Some(cursor))
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the nested list block is presented");
+    let line = block
+        .lines
+        .iter()
+        .find(|line| line.list.is_some())
+        .expect("the nested list line is presented");
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == line.line_id as usize)
+        .expect("the nested list row is laid out");
+    assert_eq!(row.text_x_origin, 0.0);
+    assert_eq!(row.marker_x_origin, Some(40.0));
+    assert_eq!(row.body_x_origin, 56.0);
+    assert_eq!(row.body_gap, 24.0);
+    assert_eq!(row.quote_bar_x_origin, Some(30.0));
 }
 
 #[test]

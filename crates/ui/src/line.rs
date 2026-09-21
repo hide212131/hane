@@ -17,10 +17,11 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
 use hane_presentation::{
-    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock, VisualLine,
-    VisualOffset, block_is_joinable, block_line_context, block_line_span, expected_disclosures,
-    present_block_with_list_projection, trailing_blank_lines,
+    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
+    BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
+    VisualLine,
+    VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
+    expected_disclosures, present_block_with_list_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -481,6 +482,18 @@ fn row_owns_visual(row: &LayoutLine, visual: usize) -> bool {
         && (visual < row.line_visual_range.end || row.wrap == LineWrap::Hard)
 }
 
+fn quote_bar(row: &LayoutLine, theme: Theme, zoom: f32) -> Option<Div> {
+    row.quote_bar_x_origin.map(|x| {
+        div()
+            .absolute()
+            .left(px(theme.line_horizontal_padding + x))
+            .top(px(4.0 * zoom))
+            .bottom(px(4.0 * zoom))
+            .w(px(QUOTE_BAR_WIDTH * zoom))
+            .bg(rgb(theme.quote_foreground))
+    })
+}
+
 /// One row of a block: the text that fits on it, with the caret, selection and
 /// IME underline that fall inside it.
 ///
@@ -504,21 +517,24 @@ pub(crate) fn row_element(
     if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
         let media_padding = theme.line_horizontal_padding * zoom;
-        let image_max_width = (640.0 * zoom).min(layout.width);
+        let image_max_width = (640.0 * zoom).min(row.effective_width.max(1.0));
         let image_inner_height = (row.height - 32.0 * zoom).max(1.0);
         return styled_block(
             div()
+                .relative()
                 .h(px(row.height))
                 .w_full()
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .px(px(media_padding)),
+                .pl(px(media_padding + row.body_x_origin))
+                .pr(px(media_padding)),
             display,
             theme,
             zoom,
         )
+        .children(quote_bar(row, theme, zoom))
         .child(
             img(resolved)
                 .max_w(px(image_max_width))
@@ -530,6 +546,31 @@ pub(crate) fn row_element(
                 .text_size(px(12.0 * zoom))
                 .text_color(rgb(theme.quote_foreground))
                 .child(image.alt.clone()),
+        );
+    }
+
+    if line.rule_body_is_collapsed() {
+        return styled_block(
+            div()
+                .relative()
+                .h(px(row.height))
+                .w_full()
+                .flex()
+                .items_center()
+                .pl(px(theme.line_horizontal_padding + row.text_x_origin))
+                .pr(px(theme.line_horizontal_padding))
+                .children(quote_bar(row, theme, zoom))
+                .child(div().flex_none().child(line.visual_text.clone()))
+                .children(body_gap_element(row))
+                .child(
+                    div()
+                        .h(px(1.0 * zoom))
+                        .flex_1()
+                        .bg(rgb(theme.quote_foreground)),
+                ),
+            display,
+            theme,
+            zoom,
         );
     }
 
@@ -556,16 +597,11 @@ pub(crate) fn row_element(
         &line.style_runs,
         row.body_visual_start,
     );
-    let marker_body_gap_segment = marker_body_gap_segment(row, &segments);
+    let body_gap_segment = body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
     for (segment_index, segment) in segments.iter().enumerate() {
-        if marker_body_gap_segment == Some(segment_index) {
-            elements.push(
-                div()
-                    .flex_none()
-                    .w(px(row.marker_body_gap))
-                    .into_any_element(),
-            );
+        if body_gap_segment == Some(segment_index) {
+            elements.push(div().flex_none().w(px(row.body_gap)).into_any_element());
         }
         if segment.cursor_before {
             elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
@@ -600,13 +636,8 @@ pub(crate) fn row_element(
             );
         }
     }
-    if marker_body_gap_segment == Some(segments.len()) {
-        elements.push(
-            div()
-                .flex_none()
-                .w(px(row.marker_body_gap))
-                .into_any_element(),
-        );
+    if body_gap_segment == Some(segments.len()) {
+        elements.push(div().flex_none().w(px(row.body_gap)).into_any_element());
     }
     if visual_cursor == Some(VisualOffset(row.line_visual_range.end)) {
         elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
@@ -614,6 +645,7 @@ pub(crate) fn row_element(
 
     styled_block(
         div()
+            .relative()
             .h(px(row.height))
             .w_full()
             .flex()
@@ -627,6 +659,7 @@ pub(crate) fn row_element(
         theme,
         zoom,
     )
+    .children(quote_bar(row, theme, zoom))
     .children(elements)
 }
 
@@ -701,11 +734,9 @@ fn line_segments(
         .collect()
 }
 
-fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
+fn body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize> {
     let body = row.body_visual_start?;
-    (row.marker_body_gap > 0.0
-        && body > row.line_visual_range.start
-        && body <= row.line_visual_range.end)
+    (body_gap_applies(row, body))
         .then(|| {
             segments
                 .iter()
@@ -713,6 +744,18 @@ fn marker_body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option
                 .or_else(|| (body == row.line_visual_range.end).then_some(segments.len()))
         })
         .flatten()
+}
+
+fn body_gap_applies(row: &LayoutLine, body: usize) -> bool {
+    row.body_gap > 0.0
+        && body > row.line_visual_range.start
+        && body <= row.line_visual_range.end
+}
+
+fn body_gap_element(row: &LayoutLine) -> Option<Div> {
+    row.body_visual_start
+        .filter(|body| body_gap_applies(row, *body))
+        .map(|_| div().flex_none().w(px(row.body_gap)))
 }
 
 /// Vertical footprint of the caret's input-mode badge below the row it is
@@ -907,6 +950,8 @@ mod tests {
             body_visual_start: None,
             marker_visual_range: None,
             marker_body_gap: 0.0,
+            body_gap: 0.0,
+            quote_bar_x_origin: None,
         }
     }
 
@@ -986,10 +1031,11 @@ mod tests {
     }
 
     #[test]
-    fn list_marker_body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
+    fn body_gap_is_inserted_once_when_body_has_multiple_paint_segments() {
         let mut row = row(0..12, LineWrap::Hard);
         row.body_visual_start = Some(3);
         row.marker_body_gap = 8.0;
+        row.body_gap = 8.0;
         let segments = line_segments(
             0..12,
             None,
@@ -1005,14 +1051,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..3, 3..5, 5..7, 7..9, 9..11, 11..12]
         );
-        assert_eq!(marker_body_gap_segment(&row, &segments), Some(1));
+        assert_eq!(body_gap_segment(&row, &segments), Some(1));
     }
 
     #[test]
-    fn list_marker_body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
+    fn body_gap_is_inserted_before_terminal_caret_when_body_is_empty() {
         let mut row = row(0..4, LineWrap::Hard);
         row.body_visual_start = Some(4);
         row.marker_body_gap = 8.0;
+        row.body_gap = 8.0;
         let segments = line_segments(0..4, None, None, None, &[], row.body_visual_start);
 
         assert_eq!(
@@ -1022,10 +1069,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0..4]
         );
-        assert_eq!(
-            marker_body_gap_segment(&row, &segments),
-            Some(segments.len())
-        );
+        assert_eq!(body_gap_segment(&row, &segments), Some(segments.len()));
     }
 
     #[test]

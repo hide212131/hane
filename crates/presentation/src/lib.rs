@@ -40,8 +40,9 @@ mod layout;
 pub mod testing;
 
 pub use layout::{
-    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, VerticalMove,
-    layout_block, line_visual_start,
+    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap,
+    QUOTE_BAR_GAP, QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, VerticalMove, layout_block,
+    line_visual_start,
 };
 
 use hane_document::{
@@ -553,6 +554,20 @@ pub struct ListRowMetadata {
     pub source_prefix: Option<SourceRange>,
 }
 
+/// Formal quote context for one physical line. The depth comes from the
+/// parser tree or the document-wide projection, never from counting `>` in
+/// the source at render time. The UI uses it only for the quote inset/bar;
+/// quote marker bytes remain ordinary source-map segments so disclosure and
+/// editing can reveal them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuoteRowMetadata {
+    pub depth: usize,
+    /// Number of this row's formal quote prefixes that are visible as source
+    /// bytes. Layout keeps semantic inset only for the remaining hidden quote
+    /// depth, so disclosed prefixes do not consume the same space twice.
+    pub disclosed_depth: usize,
+}
+
 impl ListRowMetadata {
     fn rebase(&mut self, deltas: &[RevisionDelta]) -> bool {
         if let Some(marker) = &mut self.marker {
@@ -719,11 +734,34 @@ pub struct VisualLine {
     /// line is not owned by a list item (or was deliberately rendered through
     /// a literal/raw fallback).
     pub list: Option<ListRowMetadata>,
+    /// Semantic quote context used by layout/UI to draw the inset and bar.
+    pub quote: Option<QuoteRowMetadata>,
+    /// Visual ranges of this line's formal quote markers, in source order.
+    /// Layout uses these ranges to distinguish quote prefixes from other
+    /// expanded container markers such as list indentation.
+    pub quote_marker_visual_ranges: Vec<VisualRange>,
+    /// Source ranges paired with [`Self::quote_marker_visual_ranges`].
+    pub quote_marker_source_ranges: Vec<SourceRange>,
 }
 
 impl VisualLine {
     pub fn height(&self) -> f32 {
         self.measured_height.unwrap_or(self.estimated_height)
+    }
+
+    /// Whether a thematic-break body is collapsed to the separator drawn by
+    /// the UI. Container prefixes (for example `> `) may be disclosed while
+    /// the rule body remains hidden, so `visual_text.is_empty()` is not a
+    /// sufficient test for selecting the separator renderer.
+    pub fn rule_body_is_collapsed(&self) -> bool {
+        self.kind == BlockKind::Rule
+            && self
+                .source_map
+                .segments
+                .iter()
+                .rev()
+                .find(|segment| !segment.source_range.is_empty())
+                .is_some_and(|segment| segment.visibility == Visibility::HiddenMarkup)
     }
 
     /// Render policy for this line. The UI draws from this alone and never
@@ -1252,6 +1290,9 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
+        quote_marker_visual_ranges: Vec::new(),
+        quote_marker_source_ranges: Vec::new(),
     }
 }
 
@@ -1272,6 +1313,143 @@ fn present_raw_source(
     block.kind = BlockKind::Unsupported;
     block.estimated_height = estimated_height(BlockKind::Unsupported, line_height);
     block
+}
+
+/// Presents a parser-confirmed thematic break. Inactive rows become an empty
+/// source-mapped row for the UI to paint as a separator; touching the rule with
+/// a caret, selection or IME expands the exact source bytes for direct editing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "rule presentation keeps the shared parse and projected markers with row inputs"
+)]
+fn present_rule_line(
+    line_id: u64,
+    revision: Revision,
+    range: SourceRange,
+    source: &str,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+    quote: Option<QuoteRowMetadata>,
+    shared: &SharedParse<'_>,
+    markers_on_line: &[ProjectedMarker],
+) -> VisualLine {
+    let expanded =
+        disclosure.is_some_and(|active| disclosure_owns_physical_line(range, source, active));
+    let visibility = if expanded {
+        Visibility::ExpandedMarkup
+    } else {
+        Visibility::HiddenMarkup
+    };
+    let mut visual = String::new();
+    let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
+    let mut source_cursor = range.start.0;
+    for planned in markers_on_line {
+        let marker = planned.range;
+        if marker.end > range.end {
+            continue;
+        }
+        let marker_expanded = expanded
+            || marker_is_disclosed(
+                planned,
+                shared.parsed,
+                &shared.projection.nodes,
+                disclosure,
+                shared.list_projection,
+            );
+        let marker_visibility = if marker_expanded {
+            Visibility::ExpandedMarkup
+        } else {
+            Visibility::HiddenMarkup
+        };
+        if source_cursor < marker.start.0 {
+            append_segment(
+                &mut visual,
+                &mut segments,
+                source,
+                range,
+                SourceRange::new(source_cursor, marker.start.0),
+                visibility,
+                None,
+            );
+        }
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            marker,
+            marker_visibility,
+            marker_edge(planned, shared.parsed, &shared.projection.nodes),
+        );
+        // Keep the ordinary list projection contract even for a Rule. A
+        // parser-confirmed Rule can be a continuation row inside a list, and
+        // an opening marker (if one ever shares the row) still gets the same
+        // synthesized inactive label as every other list row.
+        let label = if let Some(owner) = planned.list_owner {
+            list_item_label_with_projection(
+                shared.parsed,
+                &shared.projection.list_item_ordinals,
+                owner,
+                shared.list_projection,
+                planned.range,
+            )
+        } else {
+            planned
+                .global_list_item
+                .map(|item| list_label(item.start, item.ordinal))
+        };
+        if !marker_expanded && let Some(label) = label {
+            let visual_start = visual.len();
+            visual.push_str(&label);
+            segments.push(MappingSegment {
+                source_range: SourceRange::empty(marker.start.0),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                visibility: Visibility::Synthesized,
+                marker_edge: None,
+            });
+        }
+        source_cursor = marker.end.0;
+    }
+    if source_cursor < range.end.0 {
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            SourceRange::new(source_cursor, range.end.0),
+            visibility,
+            None,
+        );
+    }
+    if segments.is_empty() {
+        segments.push(MappingSegment {
+            source_range: range,
+            visual_range: VisualRange::new(0, visual.len()),
+            visibility,
+            marker_edge: None,
+        });
+    }
+    let (quote_marker_visual_ranges, quote_marker_source_ranges) =
+        quote_marker_ranges(markers_on_line, &segments);
+    VisualLine {
+        line_id,
+        source_range: range,
+        revision,
+        visual_text: visual,
+        style_runs: Vec::new(),
+        kind: BlockKind::Rule,
+        source_map: SourceMap { segments },
+        estimated_height: estimated_height(BlockKind::Rule, line_height),
+        measured_height: None,
+        invalid: false,
+        context: LineContext::Normal,
+        disclosure,
+        image: None,
+        list: None,
+        quote,
+        quote_marker_visual_ranges,
+        quote_marker_source_ranges,
+    }
 }
 
 /// Maps a parser syntax kind to the display kind for a block. Returning `None`
@@ -1713,6 +1891,27 @@ fn append_segment(
     });
 }
 
+fn quote_marker_ranges(
+    markers_on_line: &[ProjectedMarker],
+    segments: &[MappingSegment],
+) -> (Vec<VisualRange>, Vec<SourceRange>) {
+    markers_on_line
+        .iter()
+        .filter(|marker| {
+            marker.quote_owner.is_some() || marker.formal_quote_owner.is_some()
+        })
+        .filter_map(|marker| {
+            segments
+                .iter()
+                .find(|segment| {
+                    segment.source_range == marker.range
+                        && segment.marker_edge == Some(MarkerEdge::Opening)
+                })
+                .map(|segment| (segment.visual_range, segment.source_range))
+        })
+        .unzip()
+}
+
 /// Builds a native Markdown block with progressive disclosure. Markdown source
 /// remains authoritative; only marker ranges outside `disclosure` collapse.
 pub fn present_markdown_with_disclosure(
@@ -1829,6 +2028,7 @@ fn present_markdown_from_parse(
         .find_map(|block| match block.kind {
             NodeKind::Heading(level) => Some(BlockKind::Heading(level)),
             NodeKind::CodeBlock => Some(BlockKind::CodeBlock),
+            NodeKind::Rule => Some(BlockKind::Rule),
             _ => None,
         })
         .or_else(|| blocks().find_map(|block| syntax_display(block.kind).node_block))
@@ -1861,6 +2061,7 @@ fn present_markdown_from_parse(
                     global_list_item: None,
                     formal_list_item: None,
                     formal_quote_owner: None,
+                    formal_quote_depth: None,
                     quote_owner: None,
                     list_owner: None,
                     list_prefix: None,
@@ -1893,6 +2094,7 @@ fn present_markdown_from_parse(
                         global_list_item: None,
                         formal_list_item: None,
                         formal_quote_owner: None,
+                        formal_quote_depth: None,
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1900,7 +2102,9 @@ fn present_markdown_from_parse(
                     });
                 }
             }
-            for (container_range, quote_owner) in projection.container_markers_in(range) {
+            for (container_range, quote_owner, quote_depth) in
+                projection.container_markers_in(range)
+            {
                 let global_list_item = projection
                     .item_for_marker(container_range)
                     .copied()
@@ -1912,6 +2116,7 @@ fn present_markdown_from_parse(
                 {
                     marker.formal_container = true;
                     marker.formal_quote_owner = quote_owner;
+                    marker.formal_quote_depth = (quote_owner.is_some()).then_some(quote_depth);
                     marker.global_list_item = global_list_item;
                     marker.formal_list_item = formal_list_item;
                 } else {
@@ -1923,6 +2128,7 @@ fn present_markdown_from_parse(
                         global_list_item,
                         formal_list_item,
                         formal_quote_owner: quote_owner,
+                        formal_quote_depth: (quote_owner.is_some()).then_some(quote_depth),
                         quote_owner: None,
                         list_owner: None,
                         list_prefix: None,
@@ -1941,6 +2147,76 @@ fn present_markdown_from_parse(
         });
     }
     let markers_on_line = projected_markers.as_slice();
+    let quote_depth = nodes
+        .iter()
+        .filter_map(|id| parsed.tree.node(**id))
+        .filter(|node| node.kind == NodeKind::Quote)
+        .count()
+        .max(
+            shared
+                .list_projection
+                .into_iter()
+                .flat_map(|projection| projection.quotes_in(range))
+                .map(|quote| quote.depth)
+                .max()
+                .unwrap_or(0),
+        )
+        .max(
+            projected_markers
+                .iter()
+                .filter_map(|marker| marker.formal_quote_depth)
+                .max()
+                .unwrap_or(0),
+        );
+    let disclosed_quote_depth = markers_on_line
+        .iter()
+        .filter(|planned| {
+            (planned.quote_owner.is_some() || planned.formal_quote_owner.is_some())
+                && marker_is_disclosed(
+                    planned,
+                    parsed,
+                    &shared.projection.nodes,
+                    disclosure,
+                    shared.list_projection,
+                )
+        })
+        .count()
+        .min(quote_depth);
+    let quote = (quote_depth > 0).then_some(QuoteRowMetadata {
+        depth: quote_depth,
+        disclosed_depth: disclosed_quote_depth,
+    });
+    if quote_depth > 0 && kind == BlockKind::Paragraph {
+        kind = BlockKind::Quote;
+    }
+    if kind == BlockKind::Rule {
+        let mut line = present_rule_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+            quote,
+            shared,
+            markers_on_line,
+        );
+        // A rule still owns the surrounding list row. Keep the specialized
+        // separator/source disclosure presentation, but do not skip the
+        // semantic list projection that supplies list ownership/marker
+        // semantics, prefixes and body geometry to layout and editing.
+        line.list = list_row_metadata(
+            parsed,
+            shared.projection,
+            range,
+            markers_on_line,
+            &line.visual_text,
+            &line.source_map,
+            disclosure,
+            shared.list_projection,
+        );
+        return line;
+    }
     let mut segments = Vec::with_capacity(markers_on_line.len() * 2 + 1);
     let mut source_cursor = range.start.0;
     for planned in markers_on_line {
@@ -2085,6 +2361,8 @@ fn present_markdown_from_parse(
         }
     }
     style_runs.sort_by_key(|run| (run.visual_range.start.0, run.visual_range.end.0));
+    let (quote_marker_visual_ranges, quote_marker_source_ranges) =
+        quote_marker_ranges(markers_on_line, &source_map.segments);
     let list = list_row_metadata(
         parsed,
         shared.projection,
@@ -2127,6 +2405,9 @@ fn present_markdown_from_parse(
         disclosure,
         image: None,
         list,
+        quote,
+        quote_marker_visual_ranges,
+        quote_marker_source_ranges,
     }
 }
 
@@ -2146,6 +2427,21 @@ fn inactive_standalone_image<'a>(
 ) -> Option<StandaloneImage<'a>> {
     parse_standalone_image(source)
         .filter(|_| disclosure.is_none_or(|active| !range_touches(range, active)))
+}
+
+fn formal_quote_metadata(
+    range: SourceRange,
+    projection: &ListProjection,
+) -> Option<QuoteRowMetadata> {
+    let depth = projection
+        .quotes_in(range)
+        .map(|quote| quote.depth)
+        .max()
+        .unwrap_or(0);
+    (depth > 0).then_some(QuoteRowMetadata {
+        depth,
+        disclosed_depth: 0,
+    })
 }
 
 /// Whether a [`disclosure_runs`] run should be presented and disclosed with
@@ -2393,6 +2689,7 @@ struct ProjectedMarker {
     /// Unlike `quote_owner`, this remains valid when the viewport parse has a
     /// different `NodeId` allocation.
     formal_quote_owner: Option<SourceRange>,
+    formal_quote_depth: Option<usize>,
     quote_owner: Option<NodeId>,
     list_owner: Option<NodeId>,
     /// `Some((owner, columns))` for a list item's own structural continuation
@@ -2669,6 +2966,7 @@ impl ProjectionIndex {
                 global_list_item: None,
                 formal_list_item: None,
                 formal_quote_owner: None,
+                formal_quote_depth: None,
                 quote_owner: owners.get(&(range.start, range.end)).copied(),
                 list_owner: list_owners.get(&(range.start, range.end)).copied(),
                 list_prefix: list_prefixes.get(&(range.start, range.end)).copied(),
@@ -3109,6 +3407,7 @@ fn present_joined_run_with_list_projection(
                 line.text,
                 line_height,
                 image,
+                list_projection.and_then(|projection| formal_quote_metadata(line.range, projection)),
             ),
             None => present_markdown_from_parse(
                 line.line as u64,
@@ -3221,7 +3520,15 @@ fn present_polished_line_with_fence(
     let mut block = if context == LineContext::FencedCode {
         present_fenced_code_line(line_id, revision, range, source, line_height, disclosure, fence_role)
     } else if let Some(image) = inactive_standalone_image(source, range, disclosure) {
-        present_image(line_id, revision, range, source, line_height, image)
+        present_image(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            image,
+            list_projection.and_then(|projection| formal_quote_metadata(range, projection)),
+        )
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
@@ -3374,6 +3681,9 @@ fn present_fenced_code_opening_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
+        quote_marker_visual_ranges: Vec::new(),
+        quote_marker_source_ranges: Vec::new(),
     }
 }
 
@@ -3434,6 +3744,9 @@ fn present_fenced_code_closing_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
+        quote_marker_visual_ranges: Vec::new(),
+        quote_marker_source_ranges: Vec::new(),
     }
 }
 
@@ -3478,6 +3791,7 @@ fn present_image(
     source: &str,
     line_height: f32,
     image: StandaloneImage<'_>,
+    quote: Option<QuoteRowMetadata>,
 ) -> VisualLine {
     let mut segments = Vec::new();
     let base = range.start.0;
@@ -3541,6 +3855,9 @@ fn present_image(
             destination: image.destination.to_owned(),
         }),
         list: None,
+        quote,
+        quote_marker_visual_ranges: Vec::new(),
+        quote_marker_source_ranges: Vec::new(),
     }
 }
 
@@ -3574,6 +3891,9 @@ fn present_table_line(
             disclosure: None,
             image: None,
             list: None,
+            quote: None,
+            quote_marker_visual_ranges: Vec::new(),
+            quote_marker_source_ranges: Vec::new(),
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
@@ -3641,6 +3961,9 @@ fn present_table_line(
         disclosure: None,
         image: None,
         list: None,
+        quote: None,
+        quote_marker_visual_ranges: Vec::new(),
+        quote_marker_source_ranges: Vec::new(),
     }
 }
 
@@ -3988,6 +4311,327 @@ mod tests {
         assert_eq!(inactive.len(), 1, "the fixture must stay in one list block");
         assert_eq!(disclosed, vec![26.0 * 4.0]);
         assert_eq!(inactive, vec![26.0 * 3.0]);
+    }
+
+    #[test]
+    fn quote_depth_and_inline_style_come_from_the_shared_parse() {
+        let source = "> outer\n> > **inner**\n";
+        let mut offset = 0;
+        let lines = source
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(line, text)| {
+                let range = SourceRange::new(offset, offset + text.len());
+                offset = range.end.0;
+                BlockLine {
+                    line,
+                    range,
+                    text,
+                    disclosure: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let block = IndexedBlock {
+            ordinal: 0,
+            id: BlockId(0),
+            kind: NodeKind::Quote,
+            source_range: SourceRange::new(0, source.len()),
+            revision: Revision(1),
+            confidence: Confidence::Formal,
+            line_count: lines.len(),
+            leading_content_lines: 0,
+        };
+        let joined = parse_joined_block(&lines, Revision(1));
+        let visual = present_block(
+            &block,
+            Revision(1),
+            &BlockWindow {
+                span: 0..lines.len(),
+                trailing_blank_lines: 0,
+                lines: &lines,
+                clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
+                render: 0..lines.len(),
+                joined: Some(&joined),
+                block_disclosure: None,
+            },
+            26.0,
+        );
+
+        assert_eq!(visual.lines[0].visual_text, "outer");
+        assert_eq!(visual.lines[1].visual_text, "inner");
+        assert_eq!(
+            visual.lines[0].quote,
+            Some(QuoteRowMetadata {
+                depth: 1,
+                disclosed_depth: 0,
+            })
+        );
+        assert_eq!(
+            visual.lines[1].quote,
+            Some(QuoteRowMetadata {
+                depth: 2,
+                disclosed_depth: 0,
+            })
+        );
+        assert!(visual.lines[1]
+            .style_runs
+            .iter()
+            .any(|run| run.kind == StyleKind::Bold));
+        assert!(visual.lines[1]
+            .source_map
+            .segments
+            .iter()
+            .any(|segment| segment.visibility == Visibility::HiddenMarkup));
+        let layout = layout_block(&visual, 400.0, &testing::FixedAdvanceShaper::default());
+        assert_eq!(layout.lines[0].text_x_origin, QUOTE_DEPTH_INDENT);
+        assert_eq!(layout.lines[1].text_x_origin, QUOTE_DEPTH_INDENT * 2.0);
+        assert!(layout.lines[1].quote_bar_x_origin.is_some());
+    }
+
+    #[test]
+    fn formal_quote_projection_carries_lazy_continuation_depth() {
+        let source = "> outer\ncontinuation\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("quote block");
+        let projection = index
+            .list_projection(&block)
+            .expect("formal quote projection");
+        let line_start = "> outer\n".len();
+        let line_range = SourceRange::new(line_start, source.len());
+        let lines = [BlockLine {
+            line: 1,
+            range: line_range,
+            text: &source[line_start..],
+            disclosure: None,
+        }];
+        let visual = present_block_with_list_projection(
+            &block,
+            Revision(1),
+            &BlockWindow {
+                span: 0..2,
+                trailing_blank_lines: 0,
+                lines: &lines,
+                clipped_fence_lines: &[],
+                zero_height_fence_rows_before: 0,
+                zero_height_fence_rows_after: 0,
+                render: 1..2,
+                joined: None,
+                block_disclosure: None,
+            },
+            26.0,
+            Some(projection),
+        );
+
+        assert_eq!(visual.lines[0].visual_text, "continuation");
+        assert_eq!(visual.lines[0].kind, BlockKind::Quote);
+        assert_eq!(
+            visual.lines[0].quote,
+            Some(QuoteRowMetadata {
+                depth: 1,
+                disclosed_depth: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn thematic_break_uses_parser_kind_and_discloses_its_source() {
+        let source = "---\n";
+        let range = SourceRange::new(0, source.len());
+        let inactive = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            None,
+            LineContext::Normal,
+        );
+        assert_eq!(inactive.kind, BlockKind::Rule);
+        assert!(inactive.visual_text.is_empty());
+        assert!(inactive.rule_body_is_collapsed());
+        assert_eq!(inactive.source_map.segments[0].source_range, range);
+        assert_eq!(
+            inactive.source_map.segments[0].visibility,
+            Visibility::HiddenMarkup
+        );
+
+        let active = present_polished_line(
+            0,
+            Revision(1),
+            range,
+            source,
+            26.0,
+            Some(SourceRange::empty(1)),
+            LineContext::Normal,
+        );
+        assert_eq!(active.kind, BlockKind::Rule);
+        assert_eq!(active.visual_text, source);
+        assert!(!active.rule_body_is_collapsed());
+        assert_eq!(
+            active.source_map.segments[0].visibility,
+            Visibility::ExpandedMarkup
+        );
+
+        for (source, is_rule, has_list_item) in [
+            ("---\n", true, false),
+            ("title\n---\n", false, false),
+            ("- item\n", false, true),
+            // The leading bullet is not a list marker here: the complete line
+            // is a thematic break, so the parser emits a top-level Rule.
+            ("- ---\n", true, false),
+            ("--- text\n", false, false),
+        ] {
+            let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+            assert_eq!(
+                parsed.tree.iter().any(|(_, node)| node.kind == NodeKind::Rule),
+                is_rule,
+                "Rule must follow parser context for {source:?}"
+            );
+            assert_eq!(
+                parsed
+                    .tree
+                    .iter()
+                    .any(|(_, node)| matches!(node.kind, NodeKind::ListItem { .. })),
+                has_list_item,
+                "list-item ancestry must follow parser context for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thematic_break_parser_tree_preserves_list_and_quote_ancestors() {
+        for (source, quoted) in [
+            ("- item\n\n  ---\n", false),
+            ("> - item\n>\n>   ---\n", true),
+        ] {
+            let range = SourceRange::new(0, source.len());
+            let parsed = parse_document(Revision(1), range, source);
+            let rule_id = parsed
+                .tree
+                .iter()
+                .find_map(|(id, node)| (node.kind == NodeKind::Rule).then_some(id))
+                .expect("parser-confirmed thematic break");
+            let ancestors = parsed
+                .tree
+                .ancestors(rule_id)
+                .skip(1)
+                .filter_map(|id| parsed.tree.node(id).map(|node| node.kind))
+                .collect::<Vec<_>>();
+            assert!(
+                ancestors
+                    .iter()
+                    .any(|kind| matches!(kind, NodeKind::List { .. })),
+                "Rule must be nested in a List: {source:?}"
+            );
+            assert!(
+                ancestors
+                    .iter()
+                    .any(|kind| matches!(kind, NodeKind::ListItem { .. })),
+                "Rule must be nested in a ListItem: {source:?}"
+            );
+            assert_eq!(
+                ancestors.contains(&NodeKind::Quote),
+                quoted,
+                "quote ancestry must follow parser context for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_rule_projects_container_prefixes_into_source_map_and_layout_metadata() {
+        for source in ["- item\n\n  ---\n", "> - item\n>\n>   ---\n"] {
+            let rule_start = source.find("---").expect("rule source");
+            let line_start = source[..rule_start]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            let rule_line = |active: bool| {
+                let mut offset = 0;
+                let lines = source
+                    .split_inclusive('\n')
+                    .enumerate()
+                    .map(|(line, text)| {
+                        let line_range = SourceRange::new(offset, offset + text.len());
+                        offset = line_range.end.0;
+                        BlockLine {
+                            line,
+                            range: line_range,
+                            text,
+                            disclosure: active
+                                .then_some(SourceRange::empty(rule_start + 1))
+                                .filter(|disclosure| range_touches(line_range, *disclosure)),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let joined = parse_joined_block(&lines, Revision(1));
+                let mut presented = Vec::new();
+                present_joined_run(
+                    &lines,
+                    Revision(1),
+                    26.0,
+                    &(0..lines.len()),
+                    Some(&joined),
+                    None,
+                    &mut presented,
+                );
+                presented
+                    .into_iter()
+                    .find(|line| line.source_range.start.0 == line_start)
+                    .expect("the rule line is presented")
+            };
+
+            let inactive = rule_line(false);
+            assert_eq!(inactive.kind, BlockKind::Rule, "source: {source:?}");
+            assert!(inactive.visual_text.is_empty(), "source: {source:?}");
+            let list = inactive.list.as_ref().expect("nested rule keeps list metadata");
+            assert_eq!(list.body_visual_start, VisualOffset(0));
+            let hidden_prefix_bytes = inactive
+                .source_map
+                .segments
+                .iter()
+                .filter(|segment| {
+                    segment.source_range.start.0 >= line_start
+                        && segment.source_range.end.0 <= rule_start
+                        && segment.visibility == Visibility::HiddenMarkup
+                })
+                .map(|segment| segment.source_range.len_bytes())
+                .sum::<usize>();
+            assert_eq!(hidden_prefix_bytes, rule_start - line_start);
+            assert_eq!(inactive.quote.is_some(), source.starts_with('>'));
+
+            let active = rule_line(true);
+            assert_eq!(active.kind, BlockKind::Rule, "source: {source:?}");
+            assert_eq!(
+                active.visual_text,
+                source[line_start..]
+                    .trim_end_matches(['\r', '\n']),
+                "source: {source:?}"
+            );
+            let active_list = active.list.as_ref().expect("active rule keeps list metadata");
+            assert_eq!(
+                active_list.body_visual_start,
+                VisualOffset(rule_start - line_start)
+            );
+            let expanded_prefix_bytes = active
+                .source_map
+                .segments
+                .iter()
+                .filter(|segment| {
+                    segment.source_range.start.0 >= line_start
+                        && segment.source_range.end.0 <= rule_start
+                        && segment.visibility == Visibility::ExpandedMarkup
+                })
+                .map(|segment| segment.source_range.len_bytes())
+                .sum::<usize>();
+            assert_eq!(expanded_prefix_bytes, rule_start - line_start);
+            assert!(active
+                .source_map
+                .segments
+                .iter()
+                .all(|segment| segment.source_range.is_empty()
+                    || segment.visibility == Visibility::ExpandedMarkup));
+        }
     }
 
     #[test]
