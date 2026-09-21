@@ -1221,22 +1221,27 @@ mod tests {
         let projection = index
             .list_projection(&block)
             .expect("nested code projection");
+        let fence_heights = index
+            .fence_height_projection(&block)
+            .expect("nested fence height projection");
 
-        let full = presented_block_with_list_projection(
+        let full = presented_block_with_projections(
             &editor,
             &block,
             &(0..4),
             None,
             Some(projection),
+            Some(fence_heights),
             DEFAULT_LINE_HEIGHT,
         )
         .expect("full nested block presents");
-        let clipped = presented_block_with_list_projection(
+        let clipped = presented_block_with_projections(
             &editor,
             &block,
             &(2..3),
             None,
             Some(projection),
+            Some(fence_heights),
             DEFAULT_LINE_HEIGHT,
         )
         .expect("nested code content presents");
