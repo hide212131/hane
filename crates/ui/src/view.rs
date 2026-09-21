@@ -231,21 +231,12 @@ fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: 
     (start_width + pointer_delta).clamp(minimum, maximum)
 }
 
-fn sidebar_content_height(
+fn sidebar_list_content_height(
     tree_rows: usize,
     draft_rows: usize,
     empty_filter_row: bool,
-    show_filter: bool,
 ) -> f32 {
-    2.0 * SIDEBAR_PADDING
-        + SIDEBAR_TOOLBAR_HEIGHT
-        + SIDEBAR_TOOLBAR_GAP
-        + if show_filter {
-            SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
-        } else {
-            0.0
-        }
-        + (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
+    (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
 /// The width layout wraps against: the window viewport, minus whatever the
@@ -5360,13 +5351,14 @@ impl EditorView {
 
     fn sidebar_scrollbar(
         &self,
+        list_top: f32,
         viewport_height: f32,
         content_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let max_scroll = (content_height - viewport_height).max(0.0);
         let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
-        let (top, thumb_height) =
+        let (thumb_top, thumb_height) =
             scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
         // Idle sidebar shows no track or thumb at all: the only visible
         // right-edge boundary is the thin `sidebar_resizer` line. The thumb
@@ -5378,7 +5370,7 @@ impl EditorView {
             div()
                 .id("work-folder-scrollbar")
                 .absolute()
-                .top(px(0.0))
+                .top(px(list_top))
                 .right(px(0.0))
                 .w(px(SCROLLBAR_TRACK_WIDTH))
                 .h(px(viewport_height))
@@ -5386,7 +5378,7 @@ impl EditorView {
                     div()
                         .id("work-folder-scrollbar-thumb")
                         .absolute()
-                        .top(px(top))
+                        .top(px(thumb_top))
                         .right(px(
                             (SCROLLBAR_TRACK_WIDTH - SIDEBAR_SCROLLBAR_THUMB_WIDTH) / 2.0
                         ))
@@ -6030,6 +6022,7 @@ impl EditorView {
         };
         let toolbar = div()
             .id("work-folder-toolbar")
+            .debug_selector(|| "sidebar-toolbar".to_owned())
             .h(px(SIDEBAR_TOOLBAR_HEIGHT))
             .flex_none()
             .flex()
@@ -6058,7 +6051,8 @@ impl EditorView {
             );
         }
         filter_input = filter_input.child(InlineRenameInput { input: cx.entity() });
-        let filter = (!self.inline_rename_active()).then(|| {
+        let show_filter = !self.inline_rename_active();
+        let filter = show_filter.then(|| {
             div()
                 .id("work-folder-file-filter")
                 .debug_selector(|| "sidebar-filter".to_owned())
@@ -6327,13 +6321,34 @@ impl EditorView {
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height = sidebar_content_height(
+        let content_height = sidebar_list_content_height(
             tree_row_count,
             draft_row_count,
             empty_filter_row,
-            !self.inline_rename_active(),
         );
-        let scrollbar = self.sidebar_scrollbar(sidebar_viewport_height, content_height, cx);
+        let list_top = SIDEBAR_PADDING
+            + SIDEBAR_TOOLBAR_HEIGHT
+            + SIDEBAR_TOOLBAR_GAP
+            + if show_filter {
+                SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
+            } else {
+                0.0
+            };
+        let list_viewport_height = (sidebar_viewport_height - list_top - SIDEBAR_PADDING).max(0.0);
+        let scrollbar = self.sidebar_scrollbar(list_top, list_viewport_height, content_height, cx);
+        let list = div()
+            .id("work-folder-sidebar-list")
+            .debug_selector(|| "sidebar-list".to_owned())
+            .flex_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .on_scroll_wheel(
+                cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)),
+            )
+            .child(root_row)
+            .children(tree)
+            .children(empty_filter)
+            .children(drafts);
         Some(
             div()
                 .id("work-folder-panel")
@@ -6347,11 +6362,6 @@ impl EditorView {
                     div()
                         .id("work-folder-sidebar")
                         .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.sidebar_scroll)
-                        .on_scroll_wheel(
-                            cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)),
-                        )
                         .flex()
                         .flex_col()
                         .pt(px(SIDEBAR_PADDING))
@@ -6363,10 +6373,7 @@ impl EditorView {
                         .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
                         .children(filter)
-                        .child(root_row)
-                        .children(tree)
-                        .children(empty_filter)
-                        .children(drafts),
+                        .child(list),
                 )
                 .children(scrollbar),
         )
@@ -7028,7 +7035,7 @@ mod tests {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
 
         view.update(cx, |view, cx| {
-            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_none());
+            assert!(view.sidebar_scrollbar(0.0, 100.0, 400.0, cx).is_none());
 
             view.sidebar_scrollbar_drag = Some(ScrollbarDrag {
                 pointer_y: 0.0,
@@ -7036,8 +7043,41 @@ mod tests {
                 viewport_height: 100.0,
                 content_height: 400.0,
             });
-            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_some());
+            assert!(view.sidebar_scrollbar(0.0, 100.0, 400.0, cx).is_some());
         });
+    }
+
+    #[gpui::test]
+    fn sidebar_scrolls_rows_without_moving_fixed_controls(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("fixed-controls-scroll");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..40 {
+            std::fs::write(root.join(format!("Note-{index:02}.md")), "# Note\n").unwrap();
+        }
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let toolbar_before = cx.debug_bounds("sidebar-toolbar").unwrap();
+        let filter_before = cx.debug_bounds("sidebar-filter").unwrap();
+        let list_before = cx.debug_bounds("sidebar-list").unwrap();
+        let root_before = cx.debug_bounds("sidebar-root").unwrap();
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: list_before.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.debug_bounds("sidebar-toolbar").unwrap(), toolbar_before);
+        assert_eq!(cx.debug_bounds("sidebar-filter").unwrap(), filter_before);
+        assert_eq!(cx.debug_bounds("sidebar-list").unwrap(), list_before);
+        assert!(cx.debug_bounds("sidebar-root").unwrap().top() < root_before.top());
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_scroll.offset().y < px(0.0));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
