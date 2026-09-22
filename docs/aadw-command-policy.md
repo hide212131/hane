@@ -83,11 +83,14 @@ AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 
 target branch の進展を PR branch に取り込む操作は、Issue の製品コードを修正する action とは別に扱う。
 
-- Commander は `behind > 0` や base-sensitive evidence の freshness を解消する目的で、Claude / Codex の product-fix worker に「current main と同等のコードを書いて同期する」よう依頼しない。
-- base sync が必要なら、既存 Git の merge / rebase / update-branch など、target branch の commit を PR branch の ancestry に取り込む Git 操作を使う。完了後は compare で `behind = 0` を確認する。同等のコードが存在するだけでは同期済みと判断しない。
+- target branch が継続的に進むことを通常状態として扱う。個人開発でも、互いに競合しにくい機能・領域を選んだ複数 PR の並行開発を妨げない。base を固定するためだけに開発を直列化しない。
+- Commander が並行する Issue / PR の選択に関与できる場合は、同じファイル・同じ責務・同じ UI 領域への変更が重ならない組み合わせを優先し、不要な conflict の発生確率を下げる。
+- target branch が進んだだけでは自動的に base sync を行わない。まず compare と変更内容を確認し、current PR の変更領域、merge result、CI / review / GUI evidence の主張に影響するかを判断する。無関係な進展なら、必要な根拠を残して current candidate を継続できる。
+- base sync が必要なのは、変更領域の重なり、merge conflict、base-sensitive な挙動・evidence への影響、または merge 前の統合条件として current target branch の取り込みが必要な場合とする。target branch の各 commit を追いかけて逐次同期しない。
+- Commander は `behind > 0` だけを理由に、Claude / Codex の product-fix worker に「current main と同等のコードを書いて同期する」よう依頼しない。
+- base sync が必要なら、既存 Git の merge / rebase / update-branch など、target branch の commit を PR branch の ancestry に取り込む Git 操作を使う。同期が必要と判断した場合は完了後に compare で `behind = 0` を確認する。同等のコードが存在するだけでは同期済みと判断しない。
 - conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の実装を正として必要最小限の conflict 解消を行い、同期のために target branch の変更を別実装として複製しない。
 - product-fix worker は Issue の root-cause 修正を担当し、branch ancestry を更新する Git 操作の代替として使わない。
-- 同一 repository で Commander が複数 PR を進めている場合、base-sensitive な高コスト検証を開始した candidate がある間は、緊急でない別 PR を先に merge して target branch を動かさない。target branch が外部要因で進んだ場合は current facts を再観測し、必要な base sync を一度行ってから evidence を取り直す。
 
 ---
 
@@ -249,8 +252,10 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 - 一つの cluster に対して一つの coherent な fix と回帰テストをまとめる。レビューコメントやテストケースごとに条件分岐・commit・push を分割しない。
 - push 前に、変更範囲に対応する最小の local test / lint と差分検査を実行できる実装経路では、それを完了する。関連する修正をまとめて確認できるまで、次の head を作らない。
 - trusted worker が sandbox のため test / build / lint を実行できず、trusted finalizer だけが push する既存経路では、sandbox を緩めてこの責務を worker に移さない。その場合は current-head CI を push 後の最初の検証とし、CI が成功するまで local validation 済み、review / GUI validation 済み、または次の修正へ進める状態とは扱わない。CI failure は current head の evidence として読み、必要ならその root-cause cluster を修正する。
-- base-sensitive な変更では、最初の高コスト検証を始める前に current target branch と整合する候補 head を作る。base sync は product-fix worker による再実装ではなく、target branch commit を ancestry に取り込む Git 操作として行い、compare で `behind = 0` を確認する。後から base を取り込んだ場合、古い候補の evidence を再利用しない。
-- CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対してだけ選ぶ。実行中は、緊急でない product branch の push を行わず、Commander 自身が扱う別 PR の merge で target branch を動かすことも避ける。必要な push / merge が行われた場合は旧 head / base context の evidence を直ちに再評価し、必要なら新候補を作り直す。
+- 高コスト検証を始める前に current target branch の進展を観測し、candidate への影響を判断する。変更領域が重なる、merge result が変わる、または evidence が base-sensitive なら統合ポイントとして base sync を行う。無関係な進展なら candidate を維持し、base-independent と判断した根拠を残す。
+- base sync が必要な場合は product-fix worker による再実装ではなく、target branch commit を ancestry に取り込む Git 操作として行う。同期後は compare で `behind = 0` を確認し、古い base-sensitive evidence を再利用しない。
+- CI、review、GUI validation など所要時間の大きい action は、実行経路に応じた最初の検証（local validation または trusted worker 経路の current-head CI）を通過した安定候補 head に対して選ぶ。検証中に target branch が進んでも、それだけで candidate や evidence を破棄しない。進展内容と evidence の base sensitivity を再評価し、影響がある場合だけ sync / 再検証する。
+- 並行開発そのものを抑止しない。Commander が作業順を選べる場合は conflict の可能性が低い Issue を並行させ、同じファイル・同じ責務を大きく変更する PR 同士は可能な範囲で同時進行を避ける。
 - 同じ cluster が一度の fix 後も再現する場合、局所的な条件追加を続けず、presentation と index、計算値と実測値、同期処理と background 処理など共有される不変条件を再設計し、境界をまたぐ回帰テストを追加する。
 
 この手順の目的は push 数を機械的に制限することではない。current head に結び付かない CI / review / GUI evidence の再利用と、安定していない head に対する高コストな検証の繰り返しを避けることである。
