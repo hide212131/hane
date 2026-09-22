@@ -17,11 +17,11 @@ use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
 use hane_presentation::{
-    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
-    BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
-    TableCellDisplay, TableRowDisplay, VisualLine,
-    VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
-    expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
+    BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
+    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, QUOTE_BAR_WIDTH,
+    TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset, block_is_joinable,
+    block_line_context, block_line_span, expected_disclosures, present_block_with_table_projection,
+    trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -141,6 +141,7 @@ pub(crate) fn presented_block_with_list_projection(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn presented_block_with_projections(
     editor: &Editor,
     block: &IndexedBlock,
@@ -628,14 +629,11 @@ pub(crate) fn row_element(
             .table_projection
             .as_ref()
             .and_then(|projection| {
-                projection
-                    .rows
-                    .iter()
-                    .find(|projected| {
-                        projected.source_range == line.source_range
-                            || (projected.source_range.start < line.source_range.end
-                                && line.source_range.start < projected.source_range.end)
-                    })
+                projection.rows.iter().find(|projected| {
+                    projected.source_range == line.source_range
+                        || (projected.source_range.start < line.source_range.end
+                            && line.source_range.start < projected.source_range.end)
+                })
             })
             .is_some_and(|projected| projected.header);
         let table = TableRowDisplay {
@@ -1049,9 +1047,7 @@ fn body_gap_segment(row: &LayoutLine, segments: &[LineSegment]) -> Option<usize>
 }
 
 fn body_gap_applies(row: &LayoutLine, body: usize) -> bool {
-    row.body_gap > 0.0
-        && body > row.line_visual_range.start
-        && body <= row.line_visual_range.end
+    row.body_gap > 0.0 && body > row.line_visual_range.start && body <= row.line_visual_range.end
 }
 
 fn body_gap_element(row: &LayoutLine) -> Option<Div> {

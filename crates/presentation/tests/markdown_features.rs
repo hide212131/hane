@@ -202,11 +202,7 @@ const FIXTURES: &[MarkdownFixture] = &[
             BlockKind::CodeBlock,
         ],
         visual_lines: &["", "let answer = 42;", ""],
-        style_runs: &[
-            &[],
-            &[style(CodeBlock, 0, 16)],
-            &[],
-        ],
+        style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[]],
     },
     MarkdownFixture {
         name: "image",

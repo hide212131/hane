@@ -17,10 +17,7 @@
 //! with a fixed advance width, which is what makes the coordinate contract
 //! verifiable without a window.
 
-use crate::{
-    BlockKind, LineContext, ListCaretOrigin, ListId, VisualBlock, VisualLine, VisualOffset,
-    VisualRange,
-};
+use crate::{BlockKind, LineContext, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
 use hane_markdown::{BlockId, TableAlignment, TableProjection, is_table_delimiter};
 use std::collections::{HashMap, HashSet};
@@ -162,16 +159,16 @@ impl LayoutLine {
                 .map(|(_, cell)| cell)
         {
             let visual = visual.clamp(cell.visual_range.start, cell.visual_range.end);
-            if let Some(fragment) = cell
-                .fragments
-                .iter()
-                .enumerate()
-                .find_map(|(index, fragment)| {
-                    (visual < fragment.visual_range.end
-                        || (index + 1 == cell.fragments.len()
-                            && visual == fragment.visual_range.end))
-                        .then_some(fragment)
-                })
+            if let Some(fragment) =
+                cell.fragments
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, fragment)| {
+                        (visual < fragment.visual_range.end
+                            || (index + 1 == cell.fragments.len()
+                                && visual == fragment.visual_range.end))
+                            .then_some(fragment)
+                    })
             {
                 return fragment.text_x
                     + shaper.x_for_offset(
@@ -224,8 +221,7 @@ impl LayoutLine {
             .find(|(index, cell)| {
                 x >= cell.x
                     && (x < cell.x + cell.width
-                        || (*index + 1 == self.table_cells.len()
-                            && x <= cell.x + cell.width))
+                        || (*index + 1 == self.table_cells.len() && x <= cell.x + cell.width))
             })
             .map(|(_, cell)| cell)
         {
@@ -614,8 +610,7 @@ pub fn line_visual_start(block: &VisualBlock, index: usize) -> usize {
 /// break falls, how tall a row is, where a row sits — is decided here so it is
 /// the same with any font.
 pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
-    if block.kind == BlockKind::TableRow
-        || block.lines.iter().any(|line| line.table_row.is_some())
+    if block.kind == BlockKind::TableRow || block.lines.iter().any(|line| line.table_row.is_some())
     {
         return layout_table_block(block, width, shaper);
     }
@@ -755,7 +750,10 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
                     fragment: 0,
                     wrap: LineWrap::Hard,
                     line_visual_range: 0..line.visual_text.len(),
-                    visual_range: VisualRange::new(block_start, block_start + line.visual_text.len()),
+                    visual_range: VisualRange::new(
+                        block_start,
+                        block_start + line.visual_text.len(),
+                    ),
                     source_range: line.source_range,
                     y,
                     height,
@@ -1025,13 +1023,11 @@ fn table_column_widths(
             let Some(preferred_column) = preferred.get_mut(column) else {
                 continue;
             };
-            *preferred_column = (*preferred_column).max(
-                TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0),
-            );
+            *preferred_column =
+                (*preferred_column).max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
             if let Some(minimum_column) = minimum.get_mut(column) {
-                *minimum_column = (*minimum_column).max(
-                    TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0),
-                );
+                *minimum_column =
+                    (*minimum_column).max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
             }
         }
     }
@@ -1064,11 +1060,11 @@ fn table_column_widths(
                 let Some(preferred_column) = preferred.get_mut(cell.column) else {
                     continue;
                 };
-                *preferred_column =
-                    (*preferred_column).max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
+                *preferred_column = (*preferred_column)
+                    .max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
                 if let Some(minimum_column) = minimum.get_mut(cell.column) {
-                    *minimum_column =
-                        (*minimum_column).max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
+                    *minimum_column = (*minimum_column)
+                        .max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
                 }
             }
         }
@@ -1184,11 +1180,7 @@ fn table_cell_intrinsic_widths(
         }
     }
     if let Some(start) = run_start {
-        minimum = minimum.max(shaper.x_for_offset(
-            line,
-            start..visual_range.end,
-            visual_range.end,
-        ));
+        minimum = minimum.max(shaper.x_for_offset(line, start..visual_range.end, visual_range.end));
     }
     Some((preferred, minimum))
 }
@@ -1339,11 +1331,7 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let mut body_visual_start = match list.empty_caret_origin {
-        Some(ListCaretOrigin::Marker) => None,
-        Some(ListCaretOrigin::Body) => Some(0),
-        None => Some(list.body_visual_start.0),
-    };
+    let mut body_visual_start = Some(list.body_visual_start.0);
     if quote_prefix_after_outer {
         body_visual_start = match (body_visual_start, quote_prefix_end) {
             (Some(body), Some(prefix_end)) => Some(body.max(prefix_end)),
@@ -1403,8 +1391,7 @@ fn line_geometry(
         .map_or(0.0, |_| {
             (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
         });
-    let opening_marker =
-        list.marker.is_some() || list.empty_caret_origin == Some(ListCaretOrigin::Marker);
+    let opening_marker = list.marker.is_some();
     let body_x = if quote_prefix_after_outer {
         let body = body_visual_start.unwrap_or(body_visual_start_offset);
         shaper.x_for_offset(line, 0..body, body)

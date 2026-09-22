@@ -27,10 +27,11 @@ use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::presented_block;
 #[cfg(test)]
 use crate::line::presented_block_with_list_projection;
+#[cfg(test)]
+use crate::line::presented_block_with_projections;
 use crate::line::{
     BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_projections,
-    presented_block_with_table_projection, row_element,
+    expected_block_disclosures, presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -38,7 +39,7 @@ use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement,
     IntoElement, MagnifyEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, PathPromptOptions, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, point,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, div, point,
     prelude::FluentBuilder, px, rgb,
 };
 use hane_document::{
@@ -48,17 +49,16 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, FenceHeightProjection, IndexSource,
-    IndexedBlock, ListProjection, PublishOutcome, TableProjection, local_block_index,
+    IndexedBlock, ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan,
+    PublishOutcome, SourceSelection, TableProjection, local_block_index, plan_list_edit,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
 use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
-    MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
-    block_heights_with_disclosure, block_is_joinable, block_line_span, code_line_height,
-    layout_block, parse_joined_span,
-    trailing_blank_lines,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    VisualBlock, VisualLine, block_heights_with_disclosure, block_is_joinable, block_line_span,
+    code_line_height, layout_block, parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -72,6 +72,7 @@ use hane_session::{
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
@@ -233,11 +234,7 @@ fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: 
     (start_width + pointer_delta).clamp(minimum, maximum)
 }
 
-fn sidebar_list_content_height(
-    tree_rows: usize,
-    draft_rows: usize,
-    empty_filter_row: bool,
-) -> f32 {
+fn sidebar_list_content_height(tree_rows: usize, draft_rows: usize, empty_filter_row: bool) -> f32 {
     (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
@@ -357,6 +354,12 @@ struct InlineRenameComposition {
     text: String,
     selected_range: Range<usize>,
     selection_reversed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FileTabContextMenu {
+    position: gpui::Point<Pixels>,
+    path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -574,6 +577,10 @@ pub struct EditorView {
     /// handle lets GPUI reveal a newly activated tab even when the main panel
     /// is narrower than the open session list.
     file_tabs_scroll: ScrollHandle,
+    /// The file tab context menu, if open. Its path is captured from the tab
+    /// that was clicked so the menu action cannot accidentally fall back to
+    /// the active session.
+    file_tab_context_menu: Option<FileTabContextMenu>,
     /// Horizontal scroll state for the footer controls, so recent-file
     /// buttons remain reachable without allowing the footer to cover the
     /// editor viewport on a narrow main panel.
@@ -732,10 +739,6 @@ pub struct EditorView {
     /// changes a row height (for example, an inactive zero-height code fence
     /// becoming editable).
     pending_caret_visibility_after_layout: bool,
-    /// Semantic list owner retained for the empty line created by the most
-    /// recent list-item newline. It is presentation-only and is cleared by
-    /// the next input, movement or selection operation.
-    pending_list_editing: Option<ListEditingContext>,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -2119,6 +2122,7 @@ impl EditorView {
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
             file_tabs_scroll: ScrollHandle::new(),
+            file_tab_context_menu: None,
             footer_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
@@ -2164,7 +2168,6 @@ impl EditorView {
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
-            pending_list_editing: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
@@ -2407,6 +2410,71 @@ impl EditorView {
         self.activate_session(id, cx);
     }
 
+    fn open_file_tab_context_menu(
+        &mut self,
+        id: SessionId,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .sessions
+            .get(id)
+            .and_then(DocumentSession::path)
+            .map(Path::to_path_buf);
+        self.file_tab_context_menu = Some(FileTabContextMenu { position, path });
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_file_tab_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.file_tab_context_menu.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close_file_tab_context_menu(
+        &mut self,
+        _: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_file_tab_context_menu(cx);
+    }
+
+    fn vscode_launch_command(path: &Path) -> Command {
+        #[cfg(target_os = "macos")]
+        {
+            // Launch Services opens the regular VS Code application even when
+            // its optional `code` CLI is not installed in PATH.
+            let mut command = Command::new("open");
+            command.args(["-b", "com.microsoft.VSCode"]).arg(path);
+            command
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut command = Command::new("code");
+            command.arg(path);
+            command
+        }
+    }
+
+    fn open_file_tab_in_vscode(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.file_tab_context_menu = None;
+        let Some(path) = path else {
+            self.status = Some("VSCodeで開くにはファイルを保存してください".to_owned());
+            cx.notify();
+            return;
+        };
+
+        match Self::vscode_launch_command(&path).spawn() {
+            Ok(_) => self.status = Some("VSCodeで開きました".to_owned()),
+            Err(error) => self.status = Some(format!("VSCodeで開けません: {error}")),
+        }
+        cx.notify();
+    }
+
     fn document_key(&self) -> DocumentKey {
         DocumentKey {
             session: self.sessions.active_id(),
@@ -2441,7 +2509,6 @@ impl EditorView {
         self.layout_cache.clear();
         self.caret_geometry = None;
         self.pending_caret_visibility_after_layout = false;
-        self.pending_list_editing = None;
         self.block_index = BlockIndexState::new();
         self.last_background_height_disclosure = None;
         self.last_applied_height_disclosure = None;
@@ -3573,10 +3640,11 @@ impl EditorView {
         let disclosure_collapse = disclosure
             .filter(|disclosure| disclosure.is_empty())
             .is_some_and(|_| {
-                self.last_background_height_disclosure
-                    .is_some_and(|(background_revision, background)| {
+                self.last_background_height_disclosure.is_some_and(
+                    |(background_revision, background)| {
                         background_revision == revision && !background.is_empty()
-                    })
+                    },
+                )
             });
         if !self.block_index.needs_formal_parse(document)
             && !disclosure_refresh
@@ -3659,9 +3727,9 @@ impl EditorView {
                     return;
                 }
                 let document = view.sessions.active().editor().document();
-                let publish_outcome = view
-                    .block_index
-                    .publish(index, IndexSource::Formal, document);
+                let publish_outcome =
+                    view.block_index
+                        .publish(index, IndexSource::Formal, document);
                 let index_was_updated = matches!(
                     publish_outcome,
                     PublishOutcome::Published | PublishOutcome::Rebased(_)
@@ -3675,10 +3743,7 @@ impl EditorView {
                     view.joined_parse_cache.clear();
                 }
                 let (granularity, len) = view.desired_layout();
-                let snapshot_disclosure_is_current = view
-                    .editor()
-                    .document()
-                    .revision()
+                let snapshot_disclosure_is_current = view.editor().document().revision()
                     == revision
                     && view.active_height_disclosure() == disclosure;
                 if snapshot_disclosure_is_current
@@ -3713,8 +3778,7 @@ impl EditorView {
                     // bounded active-end update keeps the caret addressable
                     // until that snapshot lands.
                     let current_disclosure = view.active_height_disclosure();
-                    let selection_snapshot_requires_retry = current_disclosure
-                        != disclosure
+                    let selection_snapshot_requires_retry = current_disclosure != disclosure
                         && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
                             || disclosure.is_some_and(|disclosure| !disclosure.is_empty())
                             || snapshot_is_collapsing_disclosure);
@@ -3857,105 +3921,78 @@ impl EditorView {
         self.status = Some(format!("{operation} rejected: {error}"));
     }
 
-    pub(crate) fn clear_pending_list_editing(&mut self) {
-        if self.pending_list_editing.take().is_some() {
-            // The transient owner is applied to the frame-local presentation,
-            // not retained as document state. Drop both caches when it ends so
-            // a normal frame cannot reuse its layout-only caret origin.
-            self.block_cache.clear();
-            self.layout_cache.clear();
+    /// Plans and applies one Markdown-aware structural edit. The planner owns
+    /// all list semantics; the editor only receives a generic source range
+    /// replacement, so the operation participates in ordinary undo/redo.
+    pub(crate) fn apply_list_edit_intent(
+        &mut self,
+        intent: ListEditIntent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.editor().ime().is_some() {
+            return false;
         }
-    }
-
-    pub(crate) fn pending_list_indentation(&self) -> String {
-        self.pending_list_editing
-            .as_ref()
-            .map(|context| context.indentation.clone())
-            .unwrap_or_default()
-    }
-
-    /// Finds the semantic list owner of the current line before inserting a
-    /// newline. Presentation supplies the owner, depth and marker alignment;
-    /// this method does not inspect Markdown source to reconstruct them.
-    fn list_editing_context(&self, caret_origin: ListCaretOrigin) -> Option<ListEditingContext> {
         let selection = self.editor().selection();
-        if !selection.range().is_empty() {
-            return None;
-        }
-        let caret = selection.active;
+        let source_selection = SourceSelection {
+            anchor: selection.anchor,
+            active: selection.active,
+        };
         let document = self.editor().document();
-        let line = document.line_for_offset(caret).ok()?;
-        let content_range = document.line_content_range(line).ok()?;
-        let line_range = document.line_range(line).ok()?;
-        if caret != content_range.end {
-            return None;
+        let index = self
+            .current_index()
+            .filter(|index| index.revision() == document.revision())
+            .cloned()
+            .unwrap_or_else(|| BlockIndex::from_buffer(document));
+        let Some(projection) =
+            index.list_edit_projection_at(self.editor().document(), selection.active)
+        else {
+            return false;
+        };
+        let Ok(result) = plan_list_edit(
+            self.editor().document(),
+            &projection,
+            source_selection,
+            intent,
+        ) else {
+            return false;
+        };
+        match result {
+            ListEditPlanResult::NotApplicable => false,
+            ListEditPlanResult::Handled(MarkdownEditPlan::NoOp { .. }) => true,
+            ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
+                range,
+                replacement,
+                selection_after,
+            }) => {
+                let selection_after = Selection {
+                    anchor: selection_after.anchor,
+                    active: selection_after.active,
+                };
+                match self
+                    .editor_mut()
+                    .replace_range_recorded(range, &replacement, selection_after)
+                {
+                    Ok(_) => {
+                        self.status = None;
+                    }
+                    Err(error) => self.report_error("list edit", error),
+                }
+                self.after_input(cx);
+                true
+            }
         }
-        let indexed = self.block_at_offset(caret)?;
-        let revision = document.revision();
-        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == indexed.source_range
-        });
-        let list_projection = self
-            .current_index()
-            .and_then(|index| index.list_projection(&indexed));
-        let fence_height_projection = self
-            .current_index()
-            .and_then(|index| index.fence_height_projection(&indexed));
-        let visible = line.0..line.0.saturating_add(1);
-        let visual = presented_block_with_projections(
-            self.editor(),
-            &indexed,
-            &visible,
-            joined.map(|cached| &cached.parse),
-            list_projection,
-            fence_height_projection,
-            self.line_height(),
-        )?;
-        let visual_line = visual
-            .lines
-            .iter()
-            .find(|visual| visual.line_id == line.0 as u64)
-            .filter(|visual| visual.list.is_some())?;
-        let list = visual_line.list.as_ref()?;
-        let indentation = list
-            .source_prefix
-            .and_then(|range| document.text(range).ok())
-            .unwrap_or_default();
-        Some(ListEditingContext {
-            offset: SourceOffset(caret.0.checked_add(1)?),
-            owner: list.owner.clone(),
-            caret_origin,
-            line_ending_len: line_range.end.0.saturating_sub(content_range.end.0),
-            indentation,
-        })
     }
 
-    pub(crate) fn insert_newline(&mut self, caret_origin: ListCaretOrigin, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
-        let context = self.list_editing_context(caret_origin);
+    pub(crate) fn insert_newline(&mut self, cx: &mut Context<Self>) {
         match self.editor_mut().dispatch(EditorCommand::Insert("\n")) {
-            Ok(_) => {
-                self.status = None;
-                self.pending_list_editing = context;
-            }
-            Err(error) => {
-                self.report_error("editor command", error);
-                self.pending_list_editing = None;
-            }
+            Ok(_) => self.status = None,
+            Err(error) => self.report_error("editor command", error),
         }
         self.after_input(cx);
     }
 
-    /// Inserts text after a list-aware newline. The exact source indentation
-    /// before the current item's marker is deferred until the user chooses the
-    /// next text, so an empty line remains an ordinary source line and a second
-    /// Enter can leave the list without committing a marker or numbering.
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let indentation = self.pending_list_indentation();
-        self.clear_pending_list_editing();
-        let mut inserted = indentation;
-        inserted.push_str(text);
-        match self.editor_mut().insert_text(&inserted) {
+        match self.editor_mut().insert_text(text) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("text input", error),
         }
@@ -3963,7 +4000,6 @@ impl EditorView {
     }
 
     pub(crate) fn dispatch(&mut self, command: EditorCommand<'_>, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
         match self.editor_mut().dispatch(command) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -3972,7 +4008,6 @@ impl EditorView {
     }
 
     pub(crate) fn perform_cancel_composition(&mut self, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
         if let Err(error) = self.editor_mut().cancel_composition() {
             self.report_error("composition cancel", error);
         }
@@ -4147,7 +4182,6 @@ impl EditorView {
         } else {
             Selection::caret(offset)
         };
-        self.clear_pending_list_editing();
         if let Err(error) = self.editor_mut().set_selection(selection) {
             self.report_error("mouse selection", error);
         } else {
@@ -4177,7 +4211,6 @@ impl EditorView {
             anchor: self.editor().selection().anchor,
             active: offset,
         };
-        self.clear_pending_list_editing();
         if self.editor_mut().set_selection(selection).is_ok() {
             self.after_input(cx);
         }
@@ -4198,7 +4231,6 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.clear_pending_list_editing();
         let shaper = WindowShaper::new(window, self.zoom);
         if self.move_vertical_by_layout(down, extend, &shaper) {
             self.after_input(cx);
@@ -4731,26 +4763,28 @@ impl EditorView {
                     || current.max(minimum),
                     |previous| {
                         let block_is_final = ordinal + 1 == index.len();
-                        let collapsed = index
-                            .fence_height_projection(&block)
-                            .map_or(0, |projection| {
-                                projection.inactive_rows_in(
-                                    block.source_range,
-                                    block.source_range,
-                                    Some(disclosure),
-                                    block_is_final,
-                                )
-                            });
-                        let previous_collapsed = index
-                            .fence_height_projection(&block)
-                            .map_or(0, |projection| {
-                                projection.inactive_rows_in(
-                                    block.source_range,
-                                    block.source_range,
-                                    Some(previous),
-                                    block_is_final,
-                                )
-                            });
+                        let collapsed =
+                            index
+                                .fence_height_projection(&block)
+                                .map_or(0, |projection| {
+                                    projection.inactive_rows_in(
+                                        block.source_range,
+                                        block.source_range,
+                                        Some(disclosure),
+                                        block_is_final,
+                                    )
+                                });
+                        let previous_collapsed =
+                            index
+                                .fence_height_projection(&block)
+                                .map_or(0, |projection| {
+                                    projection.inactive_rows_in(
+                                        block.source_range,
+                                        block.source_range,
+                                        Some(previous),
+                                        block_is_final,
+                                    )
+                                });
                         let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
                         let fence_height_delta = index.fence_height_projection(&block).map_or(
                             code_line_height(line_height) * collapsed_delta,
@@ -4786,14 +4820,10 @@ impl EditorView {
                 .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
             top + inside
         });
-        self.last_applied_height_disclosure = Some((
-            self.editor().document().revision(),
-            disclosure,
-        ));
-        self.last_endpoint_height_disclosure = Some((
-            self.editor().document().revision(),
-            disclosure,
-        ));
+        self.last_applied_height_disclosure =
+            Some((self.editor().document().revision(), disclosure));
+        self.last_endpoint_height_disclosure =
+            Some((self.editor().document().revision(), disclosure));
     }
 
     fn active_height_disclosure(&self) -> Option<SourceRange> {
@@ -5091,7 +5121,7 @@ impl EditorView {
                 let local_rows = |y: f32, block: &IndexedBlock, round_up: bool| {
                     let rows = ((y - self.heights.prefix_sum(block.ordinal)).max(0.0)
                         / self.drawn_line_height(block))
-                        .max(0.0);
+                    .max(0.0);
                     if round_up {
                         rows.ceil() as usize + 1
                     } else {
@@ -5167,11 +5197,6 @@ impl EditorView {
                 && self.disclosures_are_current(block, &cached)
             {
                 self.block_cache.insert(block.id, cached.clone());
-                if let Some(context) = &self.pending_list_editing
-                    && apply_list_editing_context(&mut cached, context)
-                {
-                    return Some((cached, false));
-                }
                 return Some((cached, true));
             }
         }
@@ -5187,7 +5212,7 @@ impl EditorView {
         let table_projection = self
             .current_index()
             .and_then(|index| index.table_projection(block));
-        let mut presented = presented_block_with_table_projection(
+        let presented = presented_block_with_table_projection(
             self.sessions.active().editor(),
             block,
             visible,
@@ -5198,11 +5223,6 @@ impl EditorView {
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
-        if let Some(context) = &self.pending_list_editing
-            && apply_list_editing_context(&mut presented, context)
-        {
-            return Some((presented, false));
-        }
         Some((presented, false))
     }
 
@@ -6284,9 +6304,7 @@ impl Render for EditorView {
             })
             .flatten();
         let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
-            if self.granularity == Granularity::Blocks
-                && caret_block_ordinal != Some(*ordinal)
-            {
+            if self.granularity == Granularity::Blocks && caret_block_ordinal != Some(*ordinal) {
                 return None;
             }
             if caret < visual.source_range.start || visual.source_range.end < caret {
@@ -6313,7 +6331,9 @@ impl Render for EditorView {
             Some((point.x, top, point.height))
         });
         if self.pending_caret_visibility_after_layout {
-            if let Some((_, top, height)) = fresh_caret && height > 0.0 {
+            if let Some((_, top, height)) = fresh_caret
+                && height > 0.0
+            {
                 let before = self.scroll_y;
                 self.scroll_y = scroll_y_for_cursor(
                     self.scroll_y,
@@ -6326,8 +6346,7 @@ impl Render for EditorView {
                     self.scrollable_content_height(),
                     self.viewport_height,
                 );
-                let visible_bottom =
-                    top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
+                let visible_bottom = top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
                 if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
                     && self.scroll_y == before
                 {
@@ -6501,6 +6520,16 @@ impl Render for EditorView {
                 .children(editor_scrollbar),
         );
         let rendered = root.child(main_column.child(self.footer_element(status, cx)));
+        let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
+            rendered.child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window()
+                    .child(self.file_tab_context_menu_element(menu, cx)),
+            )
+        } else {
+            rendered
+        };
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
@@ -6993,11 +7022,8 @@ impl EditorView {
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height = sidebar_list_content_height(
-            tree_row_count,
-            draft_row_count,
-            empty_filter_row,
-        );
+        let content_height =
+            sidebar_list_content_height(tree_row_count, draft_row_count, empty_filter_row);
         let list_top = SIDEBAR_PADDING
             + SIDEBAR_TOOLBAR_HEIGHT
             + SIDEBAR_TOOLBAR_GAP
@@ -7014,9 +7040,7 @@ impl EditorView {
             .flex_1()
             .overflow_y_scroll()
             .track_scroll(&self.sidebar_scroll)
-            .on_scroll_wheel(
-                cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)),
-            )
+            .on_scroll_wheel(cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)))
             .child(root_row)
             .children(tree)
             .children(empty_filter)
@@ -7165,6 +7189,49 @@ fn draft_preview(session: &DocumentSession) -> String {
 }
 
 impl EditorView {
+    fn file_tab_context_menu_element(
+        &self,
+        menu: &FileTabContextMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let path = menu.path.clone();
+        let can_open = path.is_some();
+        let item = div()
+            .id("file-tab-context-open-vscode")
+            .debug_selector(|| "file-tab-context-open-vscode".to_owned())
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .when(can_open, |element| {
+                element
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+            })
+            .when(!can_open, |element| {
+                element.text_color(rgb(self.theme.quote_foreground))
+            })
+            .child("VSCodeで開く")
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.open_file_tab_in_vscode(path.clone(), cx);
+            }));
+
+        div()
+            .id("file-tab-context-menu")
+            .debug_selector(|| "file-tab-context-menu".to_owned())
+            .min_w(px(180.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
+            .on_mouse_down_out(cx.listener(Self::close_file_tab_context_menu))
+            .child(item)
+    }
+
     fn header_element(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let active_id = self.sessions.active_id();
         let tab_count = self.sessions.len();
@@ -7208,6 +7275,12 @@ impl EditorView {
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.activate_file_tab(id, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                            view.open_file_tab_context_menu(id, event.position, cx);
+                        }),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -7225,11 +7298,7 @@ impl EditorView {
             .children(tabs)
     }
 
-    fn footer_element(
-        &self,
-        status: String,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
@@ -7490,6 +7559,30 @@ mod tests {
                 "active tab foreground contrast is too low: {contrast:.2}"
             );
         }
+    }
+
+    #[test]
+    fn vscode_launch_command_keeps_the_path_as_one_argument() {
+        let path = Path::new("/tmp/file with spaces;$(touch should-not-run).md");
+        let command = EditorView::vscode_launch_command(path);
+        let args: Vec<_> = command.get_args().collect();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("open"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new("com.microsoft.VSCode"),
+                path.as_os_str(),
+            ]
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("code"));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(args, vec![path.as_os_str()]);
     }
 
     #[test]
@@ -8291,9 +8384,8 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let (caret, viewport_height) = view.read_with(cx, |view, _| {
-            (view.caret_geometry(), view.viewport_height)
-        });
+        let (caret, viewport_height) =
+            view.read_with(cx, |view, _| (view.caret_geometry(), view.viewport_height));
         let caret = caret.expect("caret is on screen at the document end");
 
         assert!(
@@ -8376,16 +8468,23 @@ mod tests {
         });
 
         assert_eq!(active, SourceOffset(paragraph));
-        assert!(owner_ordinal.is_some(), "the paragraph must own its boundary");
+        assert!(
+            owner_ordinal.is_some(),
+            "the paragraph must own its boundary"
+        );
         let caret = caret.expect("following paragraph caret is visible");
-        assert!(caret.height > 0.0, "the paragraph must not use the fence geometry");
-        assert!(!pending, "caret visibility must settle after the real owner is laid out");
+        assert!(
+            caret.height > 0.0,
+            "the paragraph must not use the fence geometry"
+        );
+        assert!(
+            !pending,
+            "caret visibility must settle after the real owner is laid out"
+        );
     }
 
     #[gpui::test]
-    fn moving_away_from_a_hidden_fence_shrinks_the_previous_height(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn moving_away_from_a_hidden_fence_shrinks_the_previous_height(cx: &mut gpui::TestAppContext) {
         let text = "```\nbody\n```\n\n```\n```";
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
         let later_fence = text.rfind("```").expect("closing fence") + 1;
@@ -8697,9 +8796,7 @@ mod tests {
         // y position.
         const COLLAPSED: usize = 5_000;
         const PHYSICAL: usize = 10_000;
-        let visible_prefix = |physical: usize| {
-            physical.saturating_sub(physical.min(COLLAPSED))
-        };
+        let visible_prefix = |physical: usize| physical.saturating_sub(physical.min(COLLAPSED));
 
         assert_eq!(
             invert_visible_line_prefix(PHYSICAL, 1, visible_prefix),
@@ -8737,7 +8834,8 @@ mod tests {
                 index.fence_height_projection(&block).is_some(),
                 "fixture must build a nested fence height projection"
             );
-            view.block_index.publish(index, IndexSource::Formal, &document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
             let block = view.current_index().unwrap().block(0).unwrap();
             let span = block_line_span(&document, &block).unwrap();
             view.install_heights(
@@ -8927,7 +9025,11 @@ mod tests {
         .expect("late code row presents");
         let line = &presented.lines[0];
         assert_eq!(line.visual_text, "```oops");
-        assert!(line.style_runs.iter().any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
     }
 
     #[test]
@@ -8956,10 +9058,12 @@ mod tests {
         )
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
-        assert!(presented.lines[0]
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            presented.lines[0]
+                .style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
 
         let closing_line = source[..source.rfind("    ````").expect("closing fence")]
             .bytes()
@@ -8976,7 +9080,12 @@ mod tests {
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
         assert_eq!(
-            closing.lines[0].source_map.segments.last().unwrap().marker_edge,
+            closing.lines[0]
+                .source_map
+                .segments
+                .last()
+                .unwrap()
+                .marker_edge,
             Some(MarkerEdge::Closing)
         );
     }
@@ -9011,10 +9120,11 @@ mod tests {
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "> **literal**");
         assert_eq!(line.kind, BlockKind::CodeBlock);
-        assert!(line
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
 
         let opening = presented_block_with_list_projection(
             &editor,
@@ -9069,12 +9179,10 @@ mod tests {
         let line_start = source.find("    > > literal").expect("code row source");
         let quote_marker = SourceRange::new(line_start + 4, line_start + 6);
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
-            segment.source_range == quote_marker
-                && segment.marker_edge == Some(MarkerEdge::Opening)
+            segment.source_range == quote_marker && segment.marker_edge == Some(MarkerEdge::Opening)
         }));
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
-            segment.source_range == quote_marker
-                && segment.visibility == Visibility::ExpandedMarkup
+            segment.source_range == quote_marker && segment.visibility == Visibility::ExpandedMarkup
         }));
     }
 
@@ -9106,10 +9214,11 @@ mod tests {
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "- literal");
         assert_eq!(line.kind, BlockKind::CodeBlock);
-        assert!(line
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
     }
 
     #[test]
@@ -9142,7 +9251,11 @@ mod tests {
         assert_eq!(line.kind, BlockKind::CodeBlock);
         let list = line.list.as_ref().expect("formal child list metadata");
         assert_eq!(list.role, ListRowRole::Opening);
-        assert!(list.marker.as_ref().is_some_and(|marker| marker.synthesized));
+        assert!(
+            list.marker
+                .as_ref()
+                .is_some_and(|marker| marker.synthesized)
+        );
     }
 
     #[test]
@@ -9198,10 +9311,16 @@ mod tests {
         let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
         let inner_marker = SourceRange::new(opening_start + 6, opening_start + 8);
         for marker_range in [outer_marker, inner_marker] {
-            assert!(disclosed.lines[0].source_map.segments.iter().any(|segment| {
-                segment.source_range == marker_range
-                    && segment.visibility == Visibility::ExpandedMarkup
-            }));
+            assert!(
+                disclosed.lines[0]
+                    .source_map
+                    .segments
+                    .iter()
+                    .any(|segment| {
+                        segment.source_range == marker_range
+                            && segment.visibility == Visibility::ExpandedMarkup
+                    })
+            );
         }
     }
 
@@ -9343,10 +9462,7 @@ mod tests {
         // several of them adjacent so a disclosure-less background snapshot
         // would make the height index's y=0 lookup select a later block and
         // drop the caret-owned first block from virtualization.
-        let text = (0..8)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
 
         // `schedule_document_parse` deliberately debounces formal work by a
@@ -9373,10 +9489,7 @@ mod tests {
     fn background_formal_parse_rebuilds_heights_when_disclosure_moves_during_parse(
         cx: &mut gpui::TestAppContext,
     ) {
-        let text = (0..8)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
         let later_fence = text.rfind("```").expect("last fence");
         view.update(cx, |view, cx| {
@@ -9416,10 +9529,7 @@ mod tests {
     fn initial_line_heights_become_block_heights_when_parse_publishes_after_caret_move(
         cx: &mut gpui::TestAppContext,
     ) {
-        let text = (0..8)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
         let later_fence = text.rfind("```").expect("last fence") + 1;
 
@@ -9498,8 +9608,7 @@ mod tests {
             let first_ordinal = first_block.unwrap().ordinal;
             let second_ordinal = second_block.unwrap().ordinal;
             assert!(
-                view.heights.height(first_ordinal).unwrap()
-                    <= inactive[first_ordinal] + 0.001,
+                view.heights.height(first_ordinal).unwrap() <= inactive[first_ordinal] + 0.001,
                 "moving to the second fence must collapse the first endpoint while parse is running"
             );
 
@@ -9508,8 +9617,7 @@ mod tests {
                 .unwrap();
             view.after_input(cx);
             assert!(
-                view.heights.height(second_ordinal).unwrap()
-                    <= inactive[second_ordinal] + 0.001,
+                view.heights.height(second_ordinal).unwrap() <= inactive[second_ordinal] + 0.001,
                 "moving to the third fence must collapse the second endpoint while parse is running"
             );
         });
@@ -9519,10 +9627,7 @@ mod tests {
     fn background_selection_height_snapshot_covers_the_selected_fence_range(
         cx: &mut gpui::TestAppContext,
     ) {
-        let text = (0..16)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
 
         let inactive_middle_height = view.update(cx, |view, cx| {
@@ -9589,17 +9694,11 @@ mod tests {
                 .publish(index, IndexSource::Formal, &document);
             let index = view.current_index().expect("formal index");
             let first = index.block(0).expect("first paragraph block");
-            let initial_heights = block_heights_with_disclosure(
-                &document,
-                index,
-                view.line_height(),
-                None,
-            );
-            view.install_heights(
-                Granularity::Blocks,
-                HeightIndex::new(initial_heights),
-            );
-            view.cached_block(&first, &(0..1)).expect("cached paragraph");
+            let initial_heights =
+                block_heights_with_disclosure(&document, index, view.line_height(), None);
+            view.install_heights(Granularity::Blocks, HeightIndex::new(initial_heights));
+            view.cached_block(&first, &(0..1))
+                .expect("cached paragraph");
             let measured_height = view.line_height() * 3.0;
             view.heights.update(first.ordinal, measured_height);
             view.editor_mut()
@@ -9634,10 +9733,7 @@ mod tests {
     fn background_selection_height_snapshot_collapses_middle_blocks_when_selection_ends(
         cx: &mut gpui::TestAppContext,
     ) {
-        let text = (0..16)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
 
         let inactive_middle_height = view.update(cx, |view, cx| {
@@ -9671,7 +9767,10 @@ mod tests {
         cx.run_until_parked();
 
         let expanded_middle_height = view.read_with(cx, |view, _| {
-            let height = view.heights.height(8).expect("selected middle block height");
+            let height = view
+                .heights
+                .height(8)
+                .expect("selected middle block height");
             assert!(height > inactive_middle_height);
             height
         });
@@ -9710,13 +9809,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn background_collapse_snapshot_retries_when_caret_moves(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let text = (0..16)
-            .map(|_| "```\n```")
-            .collect::<Vec<_>>()
-            .join("\n\n");
+    fn background_collapse_snapshot_retries_when_caret_moves(cx: &mut gpui::TestAppContext) {
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
         let last_fence = text.rfind("```").expect("last fence") + 1;
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
 
@@ -9751,7 +9845,10 @@ mod tests {
         cx.run_until_parked();
 
         let expanded_middle_height = view.read_with(cx, |view, _| {
-            let height = view.heights.height(8).expect("selected middle block height");
+            let height = view
+                .heights
+                .height(8)
+                .expect("selected middle block height");
             assert!(height > inactive_middle_height);
             height
         });
@@ -10104,241 +10201,31 @@ mod tests {
     }
 
     #[gpui::test]
-    fn list_enter_keeps_semantic_depth_until_the_next_text_edit(cx: &mut gpui::TestAppContext) {
-        for (source, indentation, depth, marker_x, typed, expected) in [
-            ("- abc", "", 1, 0.0, "- def", "- abc\n- def"),
-            ("- abc", "", 1, 0.0, "  - xyz", "- abc\n  - xyz"),
-            (
-                "- abc\n  - xyz",
-                "  ",
-                2,
-                24.0,
-                "- def",
-                "- abc\n  - xyz\n  - def",
-            ),
-            (
-                "10. abc\n    1. xyz",
-                "    ",
-                2,
-                24.0,
-                "- def",
-                "10. abc\n    1. xyz\n    - def",
-            ),
-            ("10. abc", "", 1, 0.0, "20. def", "10. abc\n20. def"),
-        ] {
-            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-            view.update(cx, |view, cx| {
-                let end = SourceOffset(source.len());
-                view.editor_mut()
-                    .set_selection(Selection::caret(end))
-                    .unwrap();
-                let context = view
-                    .list_editing_context(ListCaretOrigin::Marker)
-                    .expect("list item end has semantic editing context");
-                assert_eq!(context.indentation, indentation);
-                assert_eq!(context.owner.depth, depth);
-
-                view.insert_newline(ListCaretOrigin::Marker, cx);
-                assert_eq!(view.editor().document().full_text(), format!("{source}\n"));
-                assert_eq!(
-                    view.editor().selection().active,
-                    SourceOffset(source.len() + 1)
-                );
-
-                let pending = view
-                    .pending_list_editing
-                    .clone()
-                    .expect("newline keeps the owner until text input");
-                let line = view
-                    .editor()
-                    .document()
-                    .line_for_offset(pending.offset)
-                    .unwrap();
-                let indexed = view.block_at_offset(pending.offset).unwrap();
-                let mut visual = presented_block_with_list_projection(
-                    view.editor(),
-                    &indexed,
-                    &(line.0..line.0 + 1),
-                    None,
-                    None,
-                    view.line_height(),
-                )
-                .expect("the empty line presents");
-                assert!(apply_list_editing_context(&mut visual, &pending));
-                let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-                let point = layout
-                    .point_for_source(&visual, pending.offset, &FixedAdvanceShaper::default())
-                    .expect("the empty line owns the caret");
-                assert_eq!(point.x, marker_x);
-                assert_eq!(
-                    layout.source_for_point(
-                        &visual,
-                        point.x,
-                        point.y,
-                        &FixedAdvanceShaper::default()
-                    ),
-                    Some(pending.offset)
-                );
-
-                view.insert_text(typed, cx);
-                assert_eq!(view.editor().document().full_text(), expected);
-                assert!(view.pending_list_editing.is_none());
-            });
-        }
-
-        let source = "- first\n- abc\n- last";
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-        view.update(cx, |view, cx| {
-            let caret = SourceOffset("- first\n- abc".len());
-            view.editor_mut()
-                .set_selection(Selection::caret(caret))
-                .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_text("- def", cx);
-            assert_eq!(
-                view.editor().document().full_text(),
-                "- first\n- abc\n- def\n- last"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn list_enter_variants_keep_continuation_and_history_contracts(cx: &mut gpui::TestAppContext) {
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
+    fn source_first_list_editing_commits_enter_and_immediate_tab(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- A\n- B", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
+                .set_selection(Selection::caret(SourceOffset(7)))
                 .unwrap();
-            view.insert_newline(ListCaretOrigin::Body, cx);
-            let context = view.pending_list_editing.as_ref().unwrap();
-            let indexed = view.block_at_offset(context.offset).unwrap();
-            let line = view
-                .editor()
-                .document()
-                .line_for_offset(context.offset)
-                .unwrap();
-            let mut visual = presented_block_with_list_projection(
-                view.editor(),
-                &indexed,
-                &(line.0..line.0 + 1),
-                None,
-                None,
-                view.line_height(),
-            )
-            .unwrap();
-            assert!(apply_list_editing_context(&mut visual, context));
-            let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-            assert_eq!(
-                layout
-                    .point_for_source(&visual, context.offset, &FixedAdvanceShaper::default())
-                    .unwrap()
-                    .x,
-                16.0
-            );
+            assert!(view.apply_list_edit_intent(ListEditIntent::Indent, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
 
-            view.insert_text("def", cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\ndef");
+            assert!(view.apply_list_edit_intent(ListEditIntent::Outdent, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
         });
 
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- A", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
+                .set_selection(Selection::caret(SourceOffset(3)))
                 .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.dispatch(EditorCommand::Backspace, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(5)));
-
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n\n");
-            assert!(view.pending_list_editing.is_none());
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert!(view.editor().can_undo());
         });
-
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
-        view.update(cx, |view, cx| {
-            view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
-                .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_text("- def", cx);
-            let after = view.editor().document().full_text();
-            assert_eq!(after, "- abc\n- def");
-            view.dispatch(EditorCommand::Undo, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n");
-            view.dispatch(EditorCommand::Redo, cx);
-            assert_eq!(view.editor().document().full_text(), after);
-        });
-    }
-
-    #[gpui::test]
-    fn list_enter_preserves_caret_geometry_when_the_new_row_owns_an_existing_line_ending(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        for (source, line_ending_len) in [
-            ("- first\n- abc\n- last", 1),
-            ("- abc\n", 1),
-            ("- abc\r\n", 2),
-            ("- abc\r", 1),
-        ] {
-            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-            view.update(cx, |view, cx| {
-                let caret = source
-                    .find("- abc")
-                    .map(|offset| offset + "- abc".len())
-                    .unwrap_or_else(|| source.trim_end_matches('\n').len());
-                view.editor_mut()
-                    .set_selection(Selection::caret(SourceOffset(caret)))
-                    .unwrap();
-                view.insert_newline(ListCaretOrigin::Marker, cx);
-
-                let pending = view
-                    .pending_list_editing
-                    .clone()
-                    .expect("list newline keeps transient context");
-                assert_eq!(pending.line_ending_len, line_ending_len);
-                let indexed = view.block_at_offset(pending.offset).unwrap();
-                let line = view
-                    .editor()
-                    .document()
-                    .line_for_offset(pending.offset)
-                    .unwrap();
-                let mut visual = presented_block_with_list_projection(
-                    view.editor(),
-                    &indexed,
-                    &(line.0..line.0 + 1),
-                    None,
-                    None,
-                    view.line_height(),
-                )
-                .expect("existing line ending row presents");
-                assert!(apply_list_editing_context(&mut visual, &pending));
-
-                for (origin, expected_x) in [
-                    (ListCaretOrigin::Marker, 0.0),
-                    (ListCaretOrigin::Body, 16.0),
-                ] {
-                    let mut context = pending.clone();
-                    context.caret_origin = origin;
-                    assert!(apply_list_editing_context(&mut visual, &context));
-                    let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-                    let point = layout
-                        .point_for_source(&visual, pending.offset, &FixedAdvanceShaper::default())
-                        .expect("line ending row owns the caret");
-                    assert_eq!(point.x, expected_x);
-                    assert_eq!(
-                        layout.source_for_point(
-                            &visual,
-                            point.x,
-                            point.y,
-                            &FixedAdvanceShaper::default(),
-                        ),
-                        Some(pending.offset)
-                    );
-                }
-            });
-        }
     }
 
     #[test]
@@ -11223,9 +11110,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_tabs_switch_sessions_and_keep_rear_tabs_reachable(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn file_tabs_switch_sessions_and_keep_rear_tabs_reachable(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
         let last = view.update(cx, |view, cx| {
@@ -11240,10 +11125,10 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
-        let footer = cx
-            .debug_bounds("editor-footer")
-            .expect("footer rendered");
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
+        let footer = cx.debug_bounds("editor-footer").expect("footer rendered");
         let first_row = cx.debug_bounds("row-0-0").expect("editor row rendered");
         assert!(first_row.bottom() <= footer.top());
 
@@ -11261,13 +11146,133 @@ mod tests {
             .expect("rear file tab is reachable after horizontal scrolling");
         cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), last);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            last
+        );
     }
 
     #[gpui::test]
-    fn a_new_work_folder_note_reveals_its_active_file_tab(
+    fn right_clicking_a_file_tab_targets_that_session_without_activating_it(
         cx: &mut gpui::TestAppContext,
     ) {
+        let active_path = PathBuf::from("active.md");
+        let clicked_path = PathBuf::from("clicked.md");
+        let expected_clicked_path = clicked_path.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("clicked\n"),
+                    identity: hane_session::FileIdentity::lexical(clicked_path),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(
+                sessions,
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let clicked_tab = cx.debug_bounds("file-tab-last").expect("second tab rendered");
+        cx.simulate_mouse_down(
+            clicked_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            clicked_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert_eq!(
+                view.file_tab_context_menu
+                    .as_ref()
+                    .and_then(|menu| menu.path.as_deref()),
+                Some(expected_clicked_path.as_path())
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_some());
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_handles_an_untitled_session_without_spawning(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let item = cx
+            .debug_bounds("file-tab-context-open-vscode")
+            .expect("context menu item rendered");
+        view.read_with(cx, |view, _| {
+            assert!(view
+                .file_tab_context_menu
+                .as_ref()
+                .is_some_and(|menu| menu.path.is_none()));
+        });
+
+        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(
+                view.status.as_deref(),
+                Some("VSCodeで開くにはファイルを保存してください")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_closes_with_escape_and_outside_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        cx.simulate_click(point(px(620.0), px(220.0)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_new_work_folder_note_reveals_its_active_file_tab(cx: &mut gpui::TestAppContext) {
         let root = draft_test_root("new-note-reveals-file-tab");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
@@ -11284,7 +11289,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
         cx.simulate_event(ScrollWheelEvent {
             position: tabs.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
@@ -11306,9 +11313,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_newly_loaded_work_folder_file_reveals_its_active_file_tab(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn a_newly_loaded_work_folder_file_reveals_its_active_file_tab(cx: &mut gpui::TestAppContext) {
         let root = draft_test_root("loaded-file-reveals-file-tab");
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("Target.md");
@@ -11326,7 +11331,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
         cx.simulate_event(ScrollWheelEvent {
             position: tabs.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
@@ -11367,7 +11374,9 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let tabs = cx.debug_bounds("file-tabs").expect("file tab strip rendered");
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
         cx.simulate_event(ScrollWheelEvent {
             position: tabs.center(),
             delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
@@ -11508,7 +11517,10 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
-            assert_eq!(view.active_session().auto_title(), Some(expected_title.as_str()));
+            assert_eq!(
+                view.active_session().auto_title(),
+                Some(expected_title.as_str())
+            );
             assert!(!view.active_session().is_dirty());
             // The sidebar renders `work_folder.entries()`; a note created
             // from its H1 must appear there right away, without waiting for
@@ -11955,15 +11967,11 @@ mod tests {
             // and drops the new one until the folder is reopened.
             let folder = view.work_folder.as_ref().unwrap();
             assert!(
-                folder
-                    .entry_for_path(&initial_path)
-                    .is_none(),
+                folder.entry_for_path(&initial_path).is_none(),
                 "the stale pre-rename path must not linger in the sidebar"
             );
             assert!(
-                folder
-                    .entry_for_path(&renamed_path)
-                    .is_some(),
+                folder.entry_for_path(&renamed_path).is_some(),
                 "the renamed note must be reachable from the sidebar"
             );
         });

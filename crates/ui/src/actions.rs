@@ -1,7 +1,7 @@
 use crate::view::EditorView;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
 use hane_editor::EditorCommand;
-use hane_presentation::ListCaretOrigin;
+use hane_markdown::ListEditIntent;
 
 macro_rules! command_actions {
     ($(
@@ -94,8 +94,10 @@ command_actions! {
             } else {
                 view.confirm_inline_rename(cx);
             }
-        } else if view.editor().ime().is_none() {
-            view.insert_newline(ListCaretOrigin::Marker, cx);
+        } else if view.editor().ime().is_none()
+            && !view.apply_list_edit_intent(ListEditIntent::Enter, cx)
+        {
+            view.insert_newline(cx);
         }
     },
     ShiftNewline ("shift-enter") => shift_newline |view, _window, cx| {
@@ -110,12 +112,24 @@ command_actions! {
             } else {
                 view.confirm_inline_rename(cx);
             }
-        } else if view.editor().ime().is_none() {
-            view.insert_newline(ListCaretOrigin::Body, cx);
+        } else if view.editor().ime().is_none()
+            && !view.apply_list_edit_intent(ListEditIntent::ShiftEnter, cx)
+        {
+            view.insert_newline(cx);
         }
     },
     Backspace ("backspace") => backspace |view, _window, cx| {
-        if view.sidebar_filter_is_focused() { view.backspace_sidebar_filter(cx); } else if view.inline_rename_active() { view.backspace_inline_rename(cx); } else { view.dispatch(EditorCommand::Backspace, cx); }
+        if view.sidebar_filter_is_focused() { view.backspace_sidebar_filter(cx); } else if view.inline_rename_active() { view.backspace_inline_rename(cx); } else if !view.apply_list_edit_intent(ListEditIntent::Backspace, cx) { view.dispatch(EditorCommand::Backspace, cx); }
+    },
+    Indent ("tab") => indent |view, _window, cx| {
+        if !view.sidebar_filter_is_focused() && !view.inline_rename_active() {
+            view.apply_list_edit_intent(ListEditIntent::Indent, cx);
+        }
+    },
+    Outdent ("shift-tab") => outdent |view, _window, cx| {
+        if !view.sidebar_filter_is_focused() && !view.inline_rename_active() {
+            view.apply_list_edit_intent(ListEditIntent::Outdent, cx);
+        }
     },
     Delete ("delete") => delete |view, _window, cx| {
         if view.sidebar_filter_is_focused() { view.delete_sidebar_filter(cx); } else if view.inline_rename_active() { view.delete_inline_rename(cx); } else { view.dispatch(EditorCommand::Delete, cx); }
@@ -232,6 +246,9 @@ command_actions! {
         }
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| {
+        if view.dismiss_file_tab_context_menu(cx) {
+            return;
+        }
         if view.sidebar_filter_is_focused() {
             if view.sidebar_filter_has_composition() {
                 view.cancel_sidebar_filter_composition(cx);

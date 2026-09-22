@@ -196,11 +196,13 @@ fn hidden_and_synthesized_positions_normalize_idempotently() {
     );
     let table = table_block.table_row.expect("table presentation metadata");
     assert_eq!(table.cells.len(), 2);
-    assert!(!table_block
-        .source_map
-        .segments
-        .iter()
-        .any(|segment| segment.visibility == Visibility::Synthesized));
+    assert!(
+        !table_block
+            .source_map
+            .segments
+            .iter()
+            .any(|segment| segment.visibility == Visibility::Synthesized)
+    );
     for cell in table.cells {
         for affinity in [Bias::Before, Bias::After] {
             let visual = cell.visual_range.start;
