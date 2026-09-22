@@ -642,9 +642,64 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
     } else {
         width.max(0.0) / columns as f32
     };
+    let marker_widths = list_marker_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
+        if line.table_row.is_none() {
+            let block_start = line_visual_start(block, index);
+            let height = line.height();
+            let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+            let boundaries = if width <= 0.0 {
+                vec![0, line.visual_text.len()]
+            } else {
+                fragment_boundaries(line, &line_geometry, width, shaper)
+            };
+            for (fragment, pair) in boundaries.windows(2).enumerate() {
+                let (start, end) = (pair[0], pair[1]);
+                let last = end == line.visual_text.len();
+                let source_start = if fragment == 0 {
+                    line.source_range.start
+                } else {
+                    source_at_visual(line, start)
+                };
+                let source_end = if last {
+                    line.source_range.end
+                } else {
+                    source_at_visual(line, end)
+                };
+                lines.push(LayoutLine {
+                    line: index,
+                    line_id: line.line_id,
+                    fragment,
+                    wrap: if last { LineWrap::Hard } else { LineWrap::Soft },
+                    line_visual_range: start..end,
+                    visual_range: VisualRange::new(block_start + start, block_start + end),
+                    source_range: SourceRange {
+                        start: source_start,
+                        end: source_end.max(source_start),
+                    },
+                    y,
+                    height,
+                    text_x_origin: if fragment == 0 {
+                        line_geometry.text_x_origin
+                    } else {
+                        line_geometry.body_x_origin
+                    },
+                    body_x_origin: line_geometry.body_x_origin,
+                    effective_width: line_geometry.effective_width,
+                    marker_x_origin: line_geometry.marker_x_origin,
+                    body_visual_start: line_geometry.body_visual_start,
+                    marker_visual_range: line_geometry.marker_visual_range.clone(),
+                    marker_body_gap: line_geometry.marker_body_gap,
+                    body_gap: line_geometry.body_gap,
+                    quote_bar_x_origin: line_geometry.quote_bar_x_origin,
+                    table_cells: Vec::new(),
+                });
+                y += height;
+            }
+            continue;
+        }
         let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
             row.cells
                 .iter()

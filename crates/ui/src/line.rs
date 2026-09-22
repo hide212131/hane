@@ -121,6 +121,7 @@ pub(crate) fn presented_block(
 /// at runtime, or [`DEFAULT_LINE_HEIGHT`] for callers outside a view, such as
 /// tests). It seeds every presented line's `estimated_height`, so a block's
 /// height scales with zoom before `layout_block` ever measures it.
+#[cfg(test)]
 pub(crate) fn presented_block_with_list_projection(
     editor: &Editor,
     block: &IndexedBlock,

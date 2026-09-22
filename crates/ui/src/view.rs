@@ -25,10 +25,12 @@ use crate::instrument::{Instrumentation, log_summary};
 use crate::line::DEFAULT_LINE_HEIGHT;
 #[cfg(test)]
 use crate::line::presented_block;
+#[cfg(test)]
+use crate::line::presented_block_with_list_projection;
 use crate::line::{
     BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_list_projection,
-    presented_block_with_projections, presented_block_with_table_projection, row_element,
+    expected_block_disclosures, presented_block_with_projections,
+    presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -46,7 +48,7 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, FenceHeightProjection, IndexSource,
-    IndexedBlock, ListProjection, PublishOutcome, local_block_index,
+    IndexedBlock, ListProjection, PublishOutcome, TableProjection, local_block_index,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
@@ -4326,6 +4328,9 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
         target_in_neighbor(
             self.editor(),
             &indexed,
@@ -4336,6 +4341,7 @@ impl EditorView {
             shaper,
             joined.map(|cached| &cached.parse),
             list_projection,
+            table_projection,
             self.line_height(),
         )
     }
@@ -5321,14 +5327,17 @@ fn target_in_neighbor(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    table_projection: Option<&TableProjection>,
     line_height: f32,
 ) -> Option<SourceOffset> {
-    let visual = presented_block_with_list_projection(
+    let visual = presented_block_with_table_projection(
         editor,
         indexed,
         &window,
         joined,
         list_projection,
+        None,
+        table_projection,
         line_height,
     )?;
     let layout = layout_block(&visual, width, shaper);
@@ -5373,6 +5382,7 @@ fn neighbor_row_target(
         width,
         shaper,
         joined,
+        None,
         None,
         DEFAULT_LINE_HEIGHT,
     )
