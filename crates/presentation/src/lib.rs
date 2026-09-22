@@ -4221,6 +4221,7 @@ fn present_table_line(
         }
         column += 1;
     }
+    let table_content_visual_end = visual.len();
     if content_end < source.len() {
         append_segment(
             &mut visual,
@@ -4242,7 +4243,7 @@ fn present_table_line(
         cells.push(TableCellDisplay {
             column,
             source_range: SourceRange::empty(base + content_end),
-            visual_range: VisualRange::new(visual.len(), visual.len()),
+            visual_range: VisualRange::new(table_content_visual_end, table_content_visual_end),
             alignment: alignments
                 .get(column)
                 .copied()
@@ -7214,6 +7215,10 @@ mod tests {
             vec![0, 1]
         );
         assert!(sparse_cells[1].visual_range.start == sparse_cells[1].visual_range.end);
+        assert_eq!(
+            sparse_cells[1].visual_range.start.0,
+            sparse.visual_text.trim_end_matches(['\r', '\n']).len()
+        );
         let excess = present_table_line(
             1,
             Revision(3),
