@@ -677,6 +677,90 @@ fn table_layout_compresses_overflowing_minimums_without_widening_the_panel() {
 }
 
 #[test]
+fn table_cell_fragments_wrap_visible_text_within_shared_columns() {
+    let source = "| URL | 日本語 |\n| --- | --- |\n| https://example.com/a/very/long/identifier | これは空白のない長い日本語のセルです |\n| short | 別の行 |";
+    let (block, layout) = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 120.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let shaper = shaper();
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[1].table_cells[1].fragments.len() > 1);
+    assert!(rows[1].table_cells[0].fragments.len() > 1);
+
+    for row in &rows {
+        for cell in &row.table_cells {
+            if cell.fragments.is_empty() {
+                assert!(cell.visual_range.is_empty());
+                continue;
+            }
+            assert_eq!(
+                cell.fragments.first().unwrap().visual_range.start,
+                cell.visual_range.start
+            );
+            assert_eq!(
+                cell.fragments.last().unwrap().visual_range.end,
+                cell.visual_range.end
+            );
+            for pair in cell.fragments.windows(2) {
+                assert_eq!(
+                    pair[0].visual_range.end,
+                    pair[1].visual_range.start,
+                    "cell fragments must tile visible text without a gap"
+                );
+            }
+            for fragment in &cell.fragments {
+                let text = &block.lines[row.line].visual_text;
+                assert!(text.is_char_boundary(fragment.visual_range.start));
+                assert!(text.is_char_boundary(fragment.visual_range.end));
+                let fragment_width = shaper.x_for_offset(
+                    &block.lines[row.line],
+                    fragment.visual_range.clone(),
+                    fragment.visual_range.end,
+                );
+                assert!(
+                    fragment_width <= cell.width - 16.0 + f32::EPSILON,
+                    "fragment {:?} exceeds its cell content width {}",
+                    fragment.visual_range,
+                    cell.width - 16.0
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        rows[0].table_cells[0].x,
+        rows[1].table_cells[0].x,
+        "wrapping must not move a shared column boundary"
+    );
+    assert_eq!(
+        rows[0].table_cells[0].width,
+        rows[1].table_cells[0].width,
+        "wrapping must not change a shared column width"
+    );
+
+    let identifier = SourceOffset(source.find("identifier").expect("identifier"));
+    let point = layout
+        .point_for_source(&block, identifier, &shaper)
+        .expect("wrapped cell source maps to a point");
+    let row = &rows[1];
+    assert!(
+        point.x >= row.table_cells[0].x + 8.0
+            && point.x <= row.table_cells[0].x + row.table_cells[0].width - 8.0,
+        "caret x must stay inside the wrapped cell"
+    );
+}
+
+#[test]
 fn soft_wrapped_rows_tile_their_line_and_keep_the_break_kind() {
     let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
     let rows: Vec<_> = layout

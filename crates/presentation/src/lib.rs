@@ -44,7 +44,7 @@ pub use hane_markdown::TableAlignment;
 pub use layout::{
     BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap,
     QUOTE_BAR_GAP, QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, VerticalMove, layout_block,
-    line_visual_start, TableCellLayout,
+    line_visual_start, TableCellFragment, TableCellLayout,
 };
 
 use hane_document::{

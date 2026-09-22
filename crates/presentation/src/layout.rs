@@ -38,9 +38,8 @@ pub const QUOTE_BAR_GAP: f32 = 8.0;
 const MIN_EFFECTIVE_WRAP_WIDTH: f32 = 1.0;
 /// Horizontal padding painted inside every inactive table cell.
 ///
-/// Keep this in the layout model so the intrinsic column measurements and the
-/// geometry handed to the UI describe the same box. Cell wrapping is a later
-/// concern; for now a cell is clipped to this box by the UI.
+/// Keep this in the layout model so the intrinsic column measurements, cell
+/// fragments, and geometry handed to the UI describe the same box.
 const TABLE_CELL_PADDING: f32 = 8.0;
 const TABLE_CELL_HORIZONTAL_PADDING: f32 = TABLE_CELL_PADDING * 2.0;
 
@@ -57,8 +56,20 @@ pub enum LineWrap {
     Soft,
 }
 
+/// One visual line of a table cell. The range is always a UTF-8 boundary and
+/// fragments tile their owning cell's visible range in order. `text_x` is in
+/// the table row's coordinate space, while `y` is relative to that row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCellFragment {
+    pub visual_range: Range<usize>,
+    pub text_x: f32,
+    pub y: f32,
+    pub height: f32,
+}
+
 /// Geometry for one table cell on a laid-out row. The presentation model owns
-/// the source/visual ranges; layout adds the font-dependent x coordinates.
+/// the source/visual ranges; layout adds the font-dependent x coordinates and
+/// the cell's visual fragments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableCellLayout {
     pub column: usize,
@@ -68,6 +79,7 @@ pub struct TableCellLayout {
     pub x: f32,
     pub width: f32,
     pub text_x: f32,
+    pub fragments: Vec<TableCellFragment>,
 }
 
 /// One row of a block: a whole physical line, or one fragment of a wrapped one.
@@ -149,12 +161,26 @@ impl LayoutLine {
                 })
                 .map(|(_, cell)| cell)
         {
-            return cell.text_x
-                + shaper.x_for_offset(
-                    line,
-                    cell.visual_range.clone(),
-                    visual.clamp(cell.visual_range.start, cell.visual_range.end),
-                );
+            let visual = visual.clamp(cell.visual_range.start, cell.visual_range.end);
+            if let Some(fragment) = cell
+                .fragments
+                .iter()
+                .enumerate()
+                .find_map(|(index, fragment)| {
+                    (visual < fragment.visual_range.end
+                        || (index + 1 == cell.fragments.len()
+                            && visual == fragment.visual_range.end))
+                        .then_some(fragment)
+                })
+            {
+                return fragment.text_x
+                    + shaper.x_for_offset(
+                        line,
+                        fragment.visual_range.clone(),
+                        visual.clamp(fragment.visual_range.start, fragment.visual_range.end),
+                    );
+            }
+            return cell.text_x;
         }
         if let Some(first) = self.table_cells.first()
             && visual < first.visual_range.start
@@ -203,13 +229,12 @@ impl LayoutLine {
             })
             .map(|(_, cell)| cell)
         {
-            return shaper
-                .offset_for_x(
-                    line,
-                    cell.visual_range.clone(),
-                    (x - cell.text_x).max(0.0),
-                )
-                .clamp(cell.visual_range.start, cell.visual_range.end);
+            let fragment = cell.fragments.first().map(|fragment| &fragment.visual_range);
+            return fragment.map_or(cell.visual_range.start, |fragment| {
+                shaper
+                    .offset_for_x(line, fragment.clone(), (x - cell.text_x).max(0.0))
+                    .clamp(fragment.start, fragment.end)
+            });
         }
         if let Some(body) = self.body_visual_start
             && body <= self.line_visual_range.end
@@ -666,8 +691,8 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 /// the unused space remains outside the grid. Otherwise widths are allocated
 /// deterministically between minimum and preferred widths, with a final
 /// proportional compression when even the minimums do not fit. The latter is
-/// deliberately bounded by `width`: a future wrapping layout can consume the
-/// same safe geometry without making the table widen the editor viewport.
+/// deliberately bounded by `width`: cell fragments consume the same safe
+/// geometry without making the table widen the editor viewport.
 fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
     let formal_columns = block
         .table_projection
@@ -710,7 +735,16 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
         if line.table_row.is_none() {
             if let Some(cells) = editing_table_cells(line, block.table_projection.as_ref()) {
                 let block_start = line_visual_start(block, index);
-                let height = line.height();
+                let fragment_height = line.height();
+                let cells = table_cell_layouts(
+                    line,
+                    cells,
+                    &column_offsets,
+                    &column_widths,
+                    fragment_height,
+                    shaper,
+                );
+                let height = table_row_height(&cells, fragment_height);
                 lines.push(LayoutLine {
                     line: index,
                     line_id: line.line_id,
@@ -730,13 +764,7 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
                     marker_body_gap: 0.0,
                     body_gap: 0.0,
                     quote_bar_x_origin: None,
-                    table_cells: table_cell_layouts(
-                        line,
-                        cells,
-                        &column_offsets,
-                        &column_widths,
-                        shaper,
-                    ),
+                    table_cells: cells,
                 });
                 y += height;
                 continue;
@@ -794,17 +822,19 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
             }
             continue;
         }
+        let fragment_height = line.height();
         let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
             table_cell_layouts(
                 line,
                 row.cells.clone(),
                 &column_offsets,
                 &column_widths,
+                fragment_height,
                 shaper,
             )
         });
         let block_start = line_visual_start(block, index);
-        let height = line.height();
+        let height = table_row_height(&cells, fragment_height);
         lines.push(LayoutLine {
             line: index,
             line_id: line.line_id,
@@ -843,6 +873,7 @@ fn table_cell_layouts(
     cells: Vec<crate::TableCellDisplay>,
     column_offsets: &[f32],
     column_widths: &[f32],
+    fragment_height: f32,
     shaper: &dyn LineShaper,
 ) -> Vec<TableCellLayout> {
     cells
@@ -852,12 +883,18 @@ fn table_cell_layouts(
             let x = column_offsets.get(cell.column).copied().unwrap_or(0.0);
             let column_width = column_widths.get(cell.column).copied().unwrap_or(0.0);
             let inner_width = (column_width - TABLE_CELL_HORIZONTAL_PADDING).max(0.0);
-            let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
-            let text_x = x + TABLE_CELL_PADDING + match cell.alignment {
-                TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
-                TableAlignment::Right => (inner_width - text_width).max(0.0),
-                TableAlignment::Default | TableAlignment::Left => 0.0,
-            };
+            let fragments = table_cell_fragments(
+                line,
+                visual_range.clone(),
+                x,
+                inner_width,
+                cell.alignment,
+                fragment_height,
+                shaper,
+            );
+            let text_x = fragments
+                .first()
+                .map_or(x + TABLE_CELL_PADDING, |fragment| fragment.text_x);
             TableCellLayout {
                 column: cell.column,
                 visual_range,
@@ -866,6 +903,76 @@ fn table_cell_layouts(
                 x,
                 width: column_width,
                 text_x,
+                fragments,
+            }
+        })
+        .collect()
+}
+
+fn table_row_height(cells: &[TableCellLayout], fragment_height: f32) -> f32 {
+    let fragment_count = cells
+        .iter()
+        .map(|cell| cell.fragments.len())
+        .max()
+        .unwrap_or(1);
+    fragment_height * fragment_count as f32
+}
+
+/// Splits one visible cell into the same font-shaped boundaries used by the
+/// ordinary line wrapper. A cell's column width is its outer box, so padding is
+/// removed before asking the shaper for breaks. The shaper returns byte offsets;
+/// the defensive boundary checks keep a faulty or platform-specific result from
+/// ever slicing through a UTF-8 code point.
+fn table_cell_fragments(
+    line: &VisualLine,
+    visual_range: Range<usize>,
+    x: f32,
+    inner_width: f32,
+    alignment: TableAlignment,
+    fragment_height: f32,
+    shaper: &dyn LineShaper,
+) -> Vec<TableCellFragment> {
+    if visual_range.is_empty() {
+        return Vec::new();
+    }
+
+    let mut boundaries = shaper
+        .wrap_boundaries(line, visual_range.clone(), inner_width)
+        .into_iter()
+        .filter(|offset| {
+            *offset > visual_range.start
+                && *offset < visual_range.end
+                && line.visual_text.is_char_boundary(*offset)
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut ranges = Vec::with_capacity(boundaries.len() + 1);
+    let mut start = visual_range.start;
+    for boundary in boundaries {
+        ranges.push(start..boundary);
+        start = boundary;
+    }
+    ranges.push(start..visual_range.end);
+
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(|(index, visual_range)| {
+            let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+            let text_x = x
+                + TABLE_CELL_PADDING
+                + match alignment {
+                    TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
+                    TableAlignment::Right => (inner_width - text_width).max(0.0),
+                    TableAlignment::Default | TableAlignment::Left => 0.0,
+                };
+            TableCellFragment {
+                visual_range,
+                text_x,
+                y: index as f32 * fragment_height,
+                height: fragment_height,
             }
         })
         .collect()
@@ -1035,9 +1142,9 @@ fn bound_table_column_widths(mut widths: Vec<f32>, available: f32) -> Vec<f32> {
 /// Returns `(preferred, minimum)` text widths for one presented cell.
 ///
 /// The preferred width measures the complete cell. The minimum width measures
-/// the widest non-whitespace run, which is the amount a later cell-wrapping
-/// implementation cannot split at ordinary whitespace. Both measurements use
-/// the line's shaper, so header weight and inline font changes are respected.
+/// the widest non-whitespace run, which is the amount ordinary whitespace
+/// wrapping cannot split. Both measurements use the line's shaper, so header
+/// weight and inline font changes are respected.
 fn table_cell_intrinsic_widths(
     line: &VisualLine,
     visual_range: Range<usize>,
