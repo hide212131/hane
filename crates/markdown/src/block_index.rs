@@ -25,7 +25,8 @@
 use crate::block_store::BlockStore;
 use crate::{
     ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind, markdown_lines, parse_document,
+    ListProjectionRow, ListEditProjection, MarkdownParse, MarkdownTree, NodeKind,
+    build_list_edit_projection, markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::ops::Range;
@@ -603,6 +604,24 @@ impl BlockIndex {
                     .and_then(Option::as_ref)
             })
             .flatten()
+    }
+
+    /// Builds the exact-current-revision list editing projection for the block
+    /// containing `offset`. This is intentionally synchronous and local to the
+    /// caret's block: the input path must be able to apply Enter and then Tab
+    /// without waiting for the background formal projection.
+    pub fn list_edit_projection_at(
+        &self,
+        buffer: &RopeBuffer,
+        offset: SourceOffset,
+    ) -> Option<ListEditProjection> {
+        if self.revision != buffer.revision() {
+            return None;
+        }
+        let block = self.block_at(offset)?;
+        let source = buffer.text(block.source_range).ok()?;
+        let parsed = parse_document(buffer.revision(), block.source_range, &source);
+        Some(build_list_edit_projection(&parsed, &source))
     }
 
     /// Every block in document order.

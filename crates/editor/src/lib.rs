@@ -33,7 +33,7 @@ mod selection;
 pub use ime::{ImeCancelOutcome, ImeState, utf16_range_to_byte};
 pub use selection::Selection;
 
-use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, TextBuffer};
+use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
 use history::{EditKind, History};
 use std::time::{Duration, Instant};
@@ -257,6 +257,54 @@ impl Editor {
             .expect("inserting text always produces an edit"))
     }
 
+    /// Applies one caller-planned source replacement as one undoable
+    /// transaction. The editor remains unaware of Markdown: callers provide a
+    /// range, replacement text, and the post-edit selection only.
+    pub fn replace_range_recorded(
+        &mut self,
+        range: SourceRange,
+        replacement: &str,
+        selection_after: Selection,
+    ) -> Result<EditSummary, BufferError> {
+        self.history.break_group();
+        self.commit_composition();
+        self.document.validate_range(range)?;
+        let next_len = self
+            .document
+            .len_bytes()
+            .0
+            .saturating_sub(range.len_bytes())
+            .saturating_add(replacement.len());
+        if selection_after.anchor.0 > next_len {
+            return Err(BufferError::OffsetOutOfBounds {
+                offset: selection_after.anchor,
+                len: hane_document::ByteLen(next_len),
+            });
+        }
+        if selection_after.active.0 > next_len {
+            return Err(BufferError::OffsetOutOfBounds {
+                offset: selection_after.active,
+                len: hane_document::ByteLen(next_len),
+            });
+        }
+        let received = Instant::now();
+        let selection_before = self.selection;
+        let summary = self.document.edit(range, replacement)?;
+        self.selection = selection_after;
+        self.preferred_grapheme_column = None;
+        self.preferred_visual_x = None;
+        self.history.record_replacement(
+            summary.range_before.start.0,
+            summary.inverse.replacement.clone(),
+            replacement.to_owned(),
+            selection_before,
+            selection_after,
+            EditKind::Replace,
+        );
+        self.record_model_update(received, InputMeasurementKind::Command);
+        Ok(summary)
+    }
+
     pub(crate) fn record_model_update(&mut self, received_at: Instant, kind: InputMeasurementKind) {
         self.pending_measurements.push(InputMeasurement {
             sequence: self.next_input_sequence,
@@ -409,6 +457,26 @@ mod tests {
         e.dispatch(EditorCommand::Redo).unwrap();
         assert_eq!(e.document().full_text(), "hello");
         assert_eq!(e.selection(), Selection::caret(SourceOffset(5)));
+    }
+
+    #[test]
+    fn recorded_range_replacement_is_one_undoable_structural_transaction() {
+        let mut editor = Editor::new("- A");
+        editor.set_selection(Selection::caret(SourceOffset(3))).unwrap();
+        editor
+            .replace_range_recorded(
+                SourceRange::empty(3),
+                "\n- ",
+                Selection::caret(SourceOffset(6)),
+            )
+            .unwrap();
+        assert_eq!(editor.document().full_text(), "- A\n- ");
+        editor.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(editor.document().full_text(), "- A");
+        assert_eq!(editor.selection(), Selection::caret(SourceOffset(3)));
+        editor.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(editor.document().full_text(), "- A\n- ");
+        assert_eq!(editor.selection(), Selection::caret(SourceOffset(6)));
     }
 
     #[test]

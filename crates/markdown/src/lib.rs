@@ -30,10 +30,15 @@
 
 mod block_index;
 mod block_store;
+mod list_editing;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
     PublishOutcome,
+};
+pub use list_editing::{
+    build_list_edit_projection, plan_list_edit, ListEditIntent, ListEditItem,
+    ListEditPlanResult, ListEditProjection, ListMarker, MarkdownEditPlan, SourceSelection,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};

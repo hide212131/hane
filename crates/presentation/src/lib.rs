@@ -481,37 +481,6 @@ pub struct ListOwnerMetadata {
     pub alignment: ListAlignment,
 }
 
-/// The horizontal column where a list-aware newline places the next caret.
-/// This is an editing hint only; it does not add source bytes or visual text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ListCaretOrigin {
-    /// Start at the semantic marker column so the next source bytes can form a
-    /// sibling or child marker.
-    Marker,
-    /// Start at the list item's body column for an explicit body continuation.
-    Body,
-}
-
-/// Transient presentation context for the empty line created by a list-aware
-/// newline. The document remains the source of truth: this context only
-/// carries the existing semantic owner into the empty line's layout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ListEditingContext {
-    pub offset: SourceOffset,
-    pub owner: ListOwnerMetadata,
-    pub caret_origin: ListCaretOrigin,
-    /// Bytes owned by the physical line that is empty except for an existing
-    /// line ending. A newline inserted before that ending creates a new line
-    /// whose source range is non-empty even though its editable content is
-    /// empty. Zero means the new line is the document's zero-length final
-    /// line.
-    pub line_ending_len: usize,
-    /// Source indentation before the current item's marker. It is inserted
-    /// ahead of the first text typed on the new line, so Enter itself does not
-    /// commit a Markdown structure before the user chooses a marker or text.
-    pub indentation: String,
-}
-
 /// The marker a row currently displays. `visual_range` points at either the
 /// synthesized inactive label or the disclosed source marker. In both cases
 /// `anchor` is the real source marker start; no synthetic edit position is
@@ -545,12 +514,6 @@ pub struct ListRowMetadata {
     /// presentation. Phase 2 may replace this source-derived visual padding
     /// with absolute layout geometry while retaining the same semantic owner.
     pub body_visual_start: VisualOffset,
-    /// Set only on the empty line immediately created by a list-aware newline.
-    /// It changes caret geometry, never the source map or visual text.
-    pub empty_caret_origin: Option<ListCaretOrigin>,
-    /// Source range containing the current item's leading container prefix.
-    /// It is used by the editor to carry exact spaces/tabs into the next line.
-    pub source_prefix: Option<SourceRange>,
 }
 
 impl ListRowMetadata {
@@ -570,14 +533,6 @@ impl ListRowMetadata {
                     return false;
                 };
                 prefix.source_range = range;
-            }
-        }
-        if let Some(source_prefix) = &mut self.source_prefix {
-            for delta in deltas {
-                let Some(range) = delta.transform_range(*source_prefix) else {
-                    return false;
-                };
-                *source_prefix = range;
             }
         }
         true
@@ -861,33 +816,6 @@ impl VisualBlock {
         self.revision = current;
         true
     }
-}
-
-/// Applies a list-aware caret position to the empty source line created by an
-/// edit. The line keeps its original source map and empty visual text; only
-/// the semantic owner and layout hint are carried across the newline.
-pub fn apply_list_editing_context(block: &mut VisualBlock, context: &ListEditingContext) -> bool {
-    let empty_line_range = SourceRange::new(
-        context.offset.0,
-        context.offset.0.saturating_add(context.line_ending_len),
-    );
-    let Some(line) = block
-        .lines
-        .iter_mut()
-        .find(|line| line.source_range == empty_line_range)
-    else {
-        return false;
-    };
-    line.list = Some(ListRowMetadata {
-        owner: context.owner.clone(),
-        role: ListRowRole::Continuation,
-        marker: None,
-        structural_prefixes: Vec::new(),
-        body_visual_start: VisualOffset(0),
-        empty_caret_origin: Some(context.caret_origin),
-        source_prefix: None,
-    });
-    true
 }
 
 /// Physical source lines a block covers.
@@ -2715,15 +2643,6 @@ fn list_row_metadata(
             })
         })
         .collect::<Vec<_>>();
-    let source_prefix = opening
-        .map(|planned| SourceRange::new(range.start.0, planned.range.start.0))
-        .filter(|range| !range.is_empty())
-        .or_else(|| {
-            projected.map(|projected| {
-                SourceRange::new(projected.item_range.start.0, projected.marker_range.start.0)
-            })
-        })
-        .filter(|range| !range.is_empty());
     let body_visual_start = markers_on_line
         .iter()
         .filter(|planned| {
@@ -2775,8 +2694,6 @@ fn list_row_metadata(
         marker,
         structural_prefixes,
         body_visual_start,
-        empty_caret_origin: None,
-        source_prefix,
     })
 }
 
@@ -4778,224 +4695,8 @@ mod tests {
         assert_eq!(sibling_meta.role, ListRowRole::Opening);
     }
 
-    fn empty_list_editing_block(
-        owner: ListOwnerMetadata,
-        offset: usize,
-    ) -> (VisualBlock, SourceMap) {
-        let opening = present_plain(0, Revision(1), SourceRange::empty(0), "");
-        let empty = present_plain(1, Revision(1), SourceRange::empty(offset), "");
-        let source_map = empty.source_map.clone();
-        let mut block = VisualBlock {
-            id: BlockId(0),
-            kind: BlockKind::Paragraph,
-            source_range: SourceRange::new(0, offset),
-            revision: Revision(1),
-            confidence: Confidence::Formal,
-            span: 0..2,
-            lines: vec![opening, empty],
-            lines_before: 0,
-            lines_after: 0,
-            line_height: 26.0,
-        };
-        let context = ListEditingContext {
-            offset: SourceOffset(offset),
-            owner,
-            caret_origin: ListCaretOrigin::Marker,
-            line_ending_len: 0,
-            indentation: String::new(),
-        };
-        assert!(apply_list_editing_context(&mut block, &context));
-        (block, source_map)
-    }
-
-    #[test]
-    fn list_editing_context_preserves_source_mapping_and_places_marker_caret() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(1),
-            item_id: ListItemId(1),
-            marker_kind: ListMarkerKind::Bullet,
-            start: None,
-            ordinal: 0,
-            depth: 2,
-            alignment: ListAlignment {
-                max_marker_label: "• ".to_owned(),
-                max_marker_columns: 2,
-                marker_labels: vec!["• ".to_owned()].into(),
-            },
-        };
-        let (mut block, original_source_map) = empty_list_editing_block(owner.clone(), 6);
-        let line = &block.lines[1];
-        assert!(line.visual_text.is_empty());
-        assert_eq!(line.source_map, original_source_map);
-        assert_eq!(
-            line.source_map
-                .source_to_visual(SourceOffset(6), Bias::After)
-                .map(|candidate| candidate.visual_offset),
-            Some(VisualOffset(0))
-        );
-        assert_eq!(line.list.as_ref().unwrap().owner, owner);
-
-        let marker_layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let marker_point = marker_layout
-            .point_for_source(
-                &block,
-                SourceOffset(6),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("empty list line owns the caret");
-        assert_eq!(marker_point.x, LIST_DEPTH_INDENT);
-        assert_eq!(
-            marker_layout.source_for_point(
-                &block,
-                marker_point.x,
-                marker_point.y,
-                &testing::FixedAdvanceShaper::default()
-            ),
-            Some(SourceOffset(6))
-        );
-
-        block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(ListCaretOrigin::Body);
-        let body_layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let body_point = body_layout
-            .point_for_source(
-                &block,
-                SourceOffset(6),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("body list line owns the caret");
-        assert_eq!(body_point.x, LIST_DEPTH_INDENT + 16.0);
-        assert_eq!(
-            body_layout.source_for_point(
-                &block,
-                body_point.x,
-                body_point.y,
-                &testing::FixedAdvanceShaper::default()
-            ),
-            Some(SourceOffset(6))
-        );
-    }
-
-    #[test]
-    fn list_editing_context_owns_existing_line_ending_without_losing_source_bytes() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(1),
-            item_id: ListItemId(1),
-            marker_kind: ListMarkerKind::Bullet,
-            start: None,
-            ordinal: 0,
-            depth: 2,
-            alignment: ListAlignment {
-                max_marker_label: "• ".to_owned(),
-                max_marker_columns: 2,
-                marker_labels: vec!["• ".to_owned()].into(),
-            },
-        };
-
-        for ending in ["\n", "\r\n", "\r"] {
-            let offset = 6;
-            let mut empty = present_plain(
-                1,
-                Revision(1),
-                SourceRange::new(offset, offset + ending.len()),
-                ending,
-            );
-            let original_source_map = empty.source_map.clone();
-            // `presented_block` trims line-ending bytes from visual text while
-            // retaining them in the source map. Mirror that render contract
-            // in this focused range/geometry test.
-            empty.visual_text.clear();
-            let mut block = VisualBlock {
-                id: BlockId(0),
-                kind: BlockKind::Paragraph,
-                source_range: SourceRange::new(0, offset + ending.len()),
-                revision: Revision(1),
-                confidence: Confidence::Formal,
-                span: 0..2,
-                lines: vec![
-                    present_plain(0, Revision(1), SourceRange::empty(0), ""),
-                    empty,
-                ],
-                lines_before: 0,
-                lines_after: 0,
-                line_height: 26.0,
-            };
-            let context = ListEditingContext {
-                offset: SourceOffset(offset),
-                owner: owner.clone(),
-                caret_origin: ListCaretOrigin::Marker,
-                line_ending_len: ending.len(),
-                indentation: String::new(),
-            };
-
-            assert!(apply_list_editing_context(&mut block, &context));
-            let line = &block.lines[1];
-            assert_eq!(
-                line.source_range,
-                SourceRange::new(offset, offset + ending.len())
-            );
-            assert_eq!(line.source_map, original_source_map);
-            assert_eq!(
-                line.source_map
-                    .source_to_visual(SourceOffset(offset), Bias::After)
-                    .map(|candidate| candidate.visual_offset),
-                Some(VisualOffset(0))
-            );
-
-            for (origin, expected_x) in [
-                (ListCaretOrigin::Marker, LIST_DEPTH_INDENT),
-                (ListCaretOrigin::Body, LIST_DEPTH_INDENT + 16.0),
-            ] {
-                block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(origin);
-                let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-                let point = layout
-                    .point_for_source(
-                        &block,
-                        SourceOffset(offset),
-                        &testing::FixedAdvanceShaper::default(),
-                    )
-                    .expect("line ending-only row owns the caret");
-                assert_eq!(point.x, expected_x, "line ending bytes: {ending:?}");
-                assert_eq!(
-                    layout.source_for_point(
-                        &block,
-                        point.x,
-                        point.y,
-                        &testing::FixedAdvanceShaper::default(),
-                    ),
-                    Some(SourceOffset(offset)),
-                    "line ending bytes: {ending:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn list_editing_context_uses_actual_multi_digit_marker_width() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(10),
-            item_id: ListItemId(10),
-            marker_kind: ListMarkerKind::Ordered,
-            start: Some(10),
-            ordinal: 0,
-            depth: 1,
-            alignment: ListAlignment {
-                max_marker_label: "10. ".to_owned(),
-                max_marker_columns: 4,
-                marker_labels: vec!["10. ".to_owned()].into(),
-            },
-        };
-        let (mut block, _) = empty_list_editing_block(owner, 5);
-        block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(ListCaretOrigin::Body);
-        let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let point = layout
-            .point_for_source(
-                &block,
-                SourceOffset(5),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("ordered empty line owns the caret");
-        assert_eq!(point.x, 32.0);
-    }
+    // The old transient list-editing geometry tests were superseded by the
+    // source-first planner and UI contract tests.
 
     #[test]
     fn list_row_metadata_distinguishes_continuation_and_loose_paragraphs() {

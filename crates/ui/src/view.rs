@@ -45,14 +45,15 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    ListProjection, local_block_index,
+    ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan, SourceSelection,
+    local_block_index, plan_list_edit,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
 use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, ListCaretOrigin, ListEditingContext,
-    MarkerEdge, VerticalMove, Visibility, VisualBlock, VisualLine, apply_list_editing_context,
+    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    VisualBlock, VisualLine,
     block_heights, block_is_joinable, block_line_span, layout_block, parse_joined_span,
     trailing_blank_lines,
 };
@@ -719,10 +720,6 @@ pub struct EditorView {
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
-    /// Semantic list owner retained for the empty line created by the most
-    /// recent list-item newline. It is presentation-only and is cleared by
-    /// the next input, movement or selection operation.
-    pending_list_editing: Option<ListEditingContext>,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -2128,7 +2125,6 @@ impl EditorView {
             raw_zoom: 1.0,
             pending_zoom_anchor: None,
             caret_geometry: None,
-            pending_list_editing: None,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
@@ -2375,7 +2371,6 @@ impl EditorView {
         self.line_owners.clear();
         self.layout_cache.clear();
         self.caret_geometry = None;
-        self.pending_list_editing = None;
         self.block_index = BlockIndexState::new();
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
@@ -3665,101 +3660,80 @@ impl EditorView {
         self.status = Some(format!("{operation} rejected: {error}"));
     }
 
-    pub(crate) fn clear_pending_list_editing(&mut self) {
-        if self.pending_list_editing.take().is_some() {
-            // The transient owner is applied to the frame-local presentation,
-            // not retained as document state. Drop both caches when it ends so
-            // a normal frame cannot reuse its layout-only caret origin.
-            self.block_cache.clear();
-            self.layout_cache.clear();
+    /// Plans and applies one Markdown-aware structural edit. The planner owns
+    /// all list semantics; the editor only receives a generic source range
+    /// replacement, so the operation participates in ordinary undo/redo.
+    pub(crate) fn apply_list_edit_intent(
+        &mut self,
+        intent: ListEditIntent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.editor().ime().is_some() {
+            return false;
         }
-    }
-
-    pub(crate) fn pending_list_indentation(&self) -> String {
-        self.pending_list_editing
-            .as_ref()
-            .map(|context| context.indentation.clone())
-            .unwrap_or_default()
-    }
-
-    /// Finds the semantic list owner of the current line before inserting a
-    /// newline. Presentation supplies the owner, depth and marker alignment;
-    /// this method does not inspect Markdown source to reconstruct them.
-    fn list_editing_context(&self, caret_origin: ListCaretOrigin) -> Option<ListEditingContext> {
         let selection = self.editor().selection();
-        if !selection.range().is_empty() {
-            return None;
-        }
-        let caret = selection.active;
+        let source_selection = SourceSelection {
+            anchor: selection.anchor,
+            active: selection.active,
+        };
         let document = self.editor().document();
-        let line = document.line_for_offset(caret).ok()?;
-        let content_range = document.line_content_range(line).ok()?;
-        let line_range = document.line_range(line).ok()?;
-        if caret != content_range.end {
-            return None;
-        }
-        let indexed = self.block_at_offset(caret)?;
-        let revision = document.revision();
-        let joined = self.joined_parse_cache.get(&indexed.id).filter(|cached| {
-            cached.revision == revision && cached.source_range == indexed.source_range
-        });
-        let list_projection = self
+        let index = self
             .current_index()
-            .and_then(|index| index.list_projection(&indexed));
-        let visible = line.0..line.0.saturating_add(1);
-        let visual = presented_block_with_list_projection(
-            self.editor(),
-            &indexed,
-            &visible,
-            joined.map(|cached| &cached.parse),
-            list_projection,
-            self.line_height(),
-        )?;
-        let visual_line = visual
-            .lines
-            .iter()
-            .find(|visual| visual.line_id == line.0 as u64)
-            .filter(|visual| visual.list.is_some())?;
-        let list = visual_line.list.as_ref()?;
-        let indentation = list
-            .source_prefix
-            .and_then(|range| document.text(range).ok())
-            .unwrap_or_default();
-        Some(ListEditingContext {
-            offset: SourceOffset(caret.0.checked_add(1)?),
-            owner: list.owner.clone(),
-            caret_origin,
-            line_ending_len: line_range.end.0.saturating_sub(content_range.end.0),
-            indentation,
-        })
+            .filter(|index| index.revision() == document.revision())
+            .cloned()
+            .unwrap_or_else(|| BlockIndex::from_buffer(document));
+        let Some(projection) = index.list_edit_projection_at(
+            self.editor().document(),
+            selection.active,
+        ) else {
+            return false;
+        };
+        let Ok(result) = plan_list_edit(
+            self.editor().document(),
+            &projection,
+            source_selection,
+            intent,
+        ) else {
+            return false;
+        };
+        match result {
+            ListEditPlanResult::NotApplicable => false,
+            ListEditPlanResult::Handled(MarkdownEditPlan::NoOp { .. }) => true,
+            ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
+                range,
+                replacement,
+                selection_after,
+            }) => {
+                let selection_after = Selection {
+                    anchor: selection_after.anchor,
+                    active: selection_after.active,
+                };
+                match self.editor_mut().replace_range_recorded(
+                    range,
+                    &replacement,
+                    selection_after,
+                ) {
+                    Ok(_) => {
+                        self.status = None;
+                    }
+                    Err(error) => self.report_error("list edit", error),
+                }
+                self.after_input(cx);
+                true
+            }
+        }
     }
 
-    pub(crate) fn insert_newline(&mut self, caret_origin: ListCaretOrigin, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
-        let context = self.list_editing_context(caret_origin);
+    pub(crate) fn insert_newline(&mut self, cx: &mut Context<Self>) {
         match self.editor_mut().dispatch(EditorCommand::Insert("\n")) {
-            Ok(_) => {
-                self.status = None;
-                self.pending_list_editing = context;
-            }
-            Err(error) => {
-                self.report_error("editor command", error);
-                self.pending_list_editing = None;
-            }
+            Ok(_) => self.status = None,
+            Err(error) => self.report_error("editor command", error),
         }
         self.after_input(cx);
     }
 
-    /// Inserts text after a list-aware newline. The exact source indentation
-    /// before the current item's marker is deferred until the user chooses the
-    /// next text, so an empty line remains an ordinary source line and a second
-    /// Enter can leave the list without committing a marker or numbering.
     pub(crate) fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let indentation = self.pending_list_indentation();
-        self.clear_pending_list_editing();
-        let mut inserted = indentation;
-        inserted.push_str(text);
-        match self.editor_mut().insert_text(&inserted) {
+        match self.editor_mut().insert_text(text) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("text input", error),
         }
@@ -3767,7 +3741,6 @@ impl EditorView {
     }
 
     pub(crate) fn dispatch(&mut self, command: EditorCommand<'_>, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
         match self.editor_mut().dispatch(command) {
             Ok(_) => self.status = None,
             Err(error) => self.report_error("editor command", error),
@@ -3776,7 +3749,6 @@ impl EditorView {
     }
 
     pub(crate) fn perform_cancel_composition(&mut self, cx: &mut Context<Self>) {
-        self.clear_pending_list_editing();
         if let Err(error) = self.editor_mut().cancel_composition() {
             self.report_error("composition cancel", error);
         }
@@ -3951,7 +3923,6 @@ impl EditorView {
         } else {
             Selection::caret(offset)
         };
-        self.clear_pending_list_editing();
         if let Err(error) = self.editor_mut().set_selection(selection) {
             self.report_error("mouse selection", error);
         } else {
@@ -3981,7 +3952,6 @@ impl EditorView {
             anchor: self.editor().selection().anchor,
             active: offset,
         };
-        self.clear_pending_list_editing();
         if self.editor_mut().set_selection(selection).is_ok() {
             self.after_input(cx);
         }
@@ -4002,7 +3972,6 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.clear_pending_list_editing();
         let shaper = WindowShaper::new(window, self.zoom);
         if self.move_vertical_by_layout(down, extend, &shaper) {
             self.after_input(cx);
@@ -4573,11 +4542,6 @@ impl EditorView {
                 && self.disclosures_are_current(block, &cached)
             {
                 self.block_cache.insert(block.id, cached.clone());
-                if let Some(context) = &self.pending_list_editing
-                    && apply_list_editing_context(&mut cached, context)
-                {
-                    return Some((cached, false));
-                }
                 return Some((cached, true));
             }
         }
@@ -4587,7 +4551,7 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(block));
-        let mut presented = presented_block_with_list_projection(
+        let presented = presented_block_with_list_projection(
             self.sessions.active().editor(),
             block,
             visible,
@@ -4596,11 +4560,6 @@ impl EditorView {
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
-        if let Some(context) = &self.pending_list_editing
-            && apply_list_editing_context(&mut presented, context)
-        {
-            return Some((presented, false));
-        }
         Some((presented, false))
     }
 
@@ -8460,241 +8419,31 @@ mod tests {
     }
 
     #[gpui::test]
-    fn list_enter_keeps_semantic_depth_until_the_next_text_edit(cx: &mut gpui::TestAppContext) {
-        for (source, indentation, depth, marker_x, typed, expected) in [
-            ("- abc", "", 1, 0.0, "- def", "- abc\n- def"),
-            ("- abc", "", 1, 0.0, "  - xyz", "- abc\n  - xyz"),
-            (
-                "- abc\n  - xyz",
-                "  ",
-                2,
-                24.0,
-                "- def",
-                "- abc\n  - xyz\n  - def",
-            ),
-            (
-                "10. abc\n    1. xyz",
-                "    ",
-                2,
-                24.0,
-                "- def",
-                "10. abc\n    1. xyz\n    - def",
-            ),
-            ("10. abc", "", 1, 0.0, "20. def", "10. abc\n20. def"),
-        ] {
-            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-            view.update(cx, |view, cx| {
-                let end = SourceOffset(source.len());
-                view.editor_mut()
-                    .set_selection(Selection::caret(end))
-                    .unwrap();
-                let context = view
-                    .list_editing_context(ListCaretOrigin::Marker)
-                    .expect("list item end has semantic editing context");
-                assert_eq!(context.indentation, indentation);
-                assert_eq!(context.owner.depth, depth);
-
-                view.insert_newline(ListCaretOrigin::Marker, cx);
-                assert_eq!(view.editor().document().full_text(), format!("{source}\n"));
-                assert_eq!(
-                    view.editor().selection().active,
-                    SourceOffset(source.len() + 1)
-                );
-
-                let pending = view
-                    .pending_list_editing
-                    .clone()
-                    .expect("newline keeps the owner until text input");
-                let line = view
-                    .editor()
-                    .document()
-                    .line_for_offset(pending.offset)
-                    .unwrap();
-                let indexed = view.block_at_offset(pending.offset).unwrap();
-                let mut visual = presented_block_with_list_projection(
-                    view.editor(),
-                    &indexed,
-                    &(line.0..line.0 + 1),
-                    None,
-                    None,
-                    view.line_height(),
-                )
-                .expect("the empty line presents");
-                assert!(apply_list_editing_context(&mut visual, &pending));
-                let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-                let point = layout
-                    .point_for_source(&visual, pending.offset, &FixedAdvanceShaper::default())
-                    .expect("the empty line owns the caret");
-                assert_eq!(point.x, marker_x);
-                assert_eq!(
-                    layout.source_for_point(
-                        &visual,
-                        point.x,
-                        point.y,
-                        &FixedAdvanceShaper::default()
-                    ),
-                    Some(pending.offset)
-                );
-
-                view.insert_text(typed, cx);
-                assert_eq!(view.editor().document().full_text(), expected);
-                assert!(view.pending_list_editing.is_none());
-            });
-        }
-
-        let source = "- first\n- abc\n- last";
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-        view.update(cx, |view, cx| {
-            let caret = SourceOffset("- first\n- abc".len());
-            view.editor_mut()
-                .set_selection(Selection::caret(caret))
-                .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_text("- def", cx);
-            assert_eq!(
-                view.editor().document().full_text(),
-                "- first\n- abc\n- def\n- last"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn list_enter_variants_keep_continuation_and_history_contracts(cx: &mut gpui::TestAppContext) {
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
+    fn source_first_list_editing_commits_enter_and_immediate_tab(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- A\n- B", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
+                .set_selection(Selection::caret(SourceOffset(7)))
                 .unwrap();
-            view.insert_newline(ListCaretOrigin::Body, cx);
-            let context = view.pending_list_editing.as_ref().unwrap();
-            let indexed = view.block_at_offset(context.offset).unwrap();
-            let line = view
-                .editor()
-                .document()
-                .line_for_offset(context.offset)
-                .unwrap();
-            let mut visual = presented_block_with_list_projection(
-                view.editor(),
-                &indexed,
-                &(line.0..line.0 + 1),
-                None,
-                None,
-                view.line_height(),
-            )
-            .unwrap();
-            assert!(apply_list_editing_context(&mut visual, context));
-            let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-            assert_eq!(
-                layout
-                    .point_for_source(&visual, context.offset, &FixedAdvanceShaper::default())
-                    .unwrap()
-                    .x,
-                16.0
-            );
+            assert!(view.apply_list_edit_intent(ListEditIntent::Indent, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
 
-            view.insert_text("def", cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\ndef");
+            assert!(view.apply_list_edit_intent(ListEditIntent::Outdent, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n- B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
         });
 
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- A", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
+                .set_selection(Selection::caret(SourceOffset(3)))
                 .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.dispatch(EditorCommand::Backspace, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(5)));
-
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n\n");
-            assert!(view.pending_list_editing.is_none());
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- A\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
+            assert!(view.editor().can_undo());
         });
-
-        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
-        view.update(cx, |view, cx| {
-            view.editor_mut()
-                .set_selection(Selection::caret(SourceOffset(5)))
-                .unwrap();
-            view.insert_newline(ListCaretOrigin::Marker, cx);
-            view.insert_text("- def", cx);
-            let after = view.editor().document().full_text();
-            assert_eq!(after, "- abc\n- def");
-            view.dispatch(EditorCommand::Undo, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n");
-            view.dispatch(EditorCommand::Redo, cx);
-            assert_eq!(view.editor().document().full_text(), after);
-        });
-    }
-
-    #[gpui::test]
-    fn list_enter_preserves_caret_geometry_when_the_new_row_owns_an_existing_line_ending(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        for (source, line_ending_len) in [
-            ("- first\n- abc\n- last", 1),
-            ("- abc\n", 1),
-            ("- abc\r\n", 2),
-            ("- abc\r", 1),
-        ] {
-            let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
-            view.update(cx, |view, cx| {
-                let caret = source
-                    .find("- abc")
-                    .map(|offset| offset + "- abc".len())
-                    .unwrap_or_else(|| source.trim_end_matches('\n').len());
-                view.editor_mut()
-                    .set_selection(Selection::caret(SourceOffset(caret)))
-                    .unwrap();
-                view.insert_newline(ListCaretOrigin::Marker, cx);
-
-                let pending = view
-                    .pending_list_editing
-                    .clone()
-                    .expect("list newline keeps transient context");
-                assert_eq!(pending.line_ending_len, line_ending_len);
-                let indexed = view.block_at_offset(pending.offset).unwrap();
-                let line = view
-                    .editor()
-                    .document()
-                    .line_for_offset(pending.offset)
-                    .unwrap();
-                let mut visual = presented_block_with_list_projection(
-                    view.editor(),
-                    &indexed,
-                    &(line.0..line.0 + 1),
-                    None,
-                    None,
-                    view.line_height(),
-                )
-                .expect("existing line ending row presents");
-                assert!(apply_list_editing_context(&mut visual, &pending));
-
-                for (origin, expected_x) in [
-                    (ListCaretOrigin::Marker, 0.0),
-                    (ListCaretOrigin::Body, 16.0),
-                ] {
-                    let mut context = pending.clone();
-                    context.caret_origin = origin;
-                    assert!(apply_list_editing_context(&mut visual, &context));
-                    let layout = layout_block(&visual, 400.0, &FixedAdvanceShaper::default());
-                    let point = layout
-                        .point_for_source(&visual, pending.offset, &FixedAdvanceShaper::default())
-                        .expect("line ending row owns the caret");
-                    assert_eq!(point.x, expected_x);
-                    assert_eq!(
-                        layout.source_for_point(
-                            &visual,
-                            point.x,
-                            point.y,
-                            &FixedAdvanceShaper::default(),
-                        ),
-                        Some(pending.offset)
-                    );
-                }
-            });
-        }
     }
 
     #[test]
