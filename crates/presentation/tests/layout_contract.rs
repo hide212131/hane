@@ -419,6 +419,53 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
 }
 
 #[test]
+fn issue_14_table_example_reaches_every_visible_grid_row() {
+    let source = "| Name | Count | Status |\n|:-----|------:|:------:|\n| Hane | 3 | Ready |\n| Long value | 120 | Working |";
+    let blocks = present(source, None);
+    let block = blocks
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("Issue #14 example must produce a table block");
+
+    assert_eq!(
+        block.lines.iter().map(|line| line.kind).collect::<Vec<_>>(),
+        vec![
+            BlockKind::TableRow,
+            BlockKind::TableDelimiter,
+            BlockKind::TableRow,
+            BlockKind::TableRow,
+        ]
+    );
+    assert_eq!(block.lines[0].visual_text.trim(), "Name  Count  Status");
+    assert_eq!(block.lines[2].visual_text.trim(), "Hane  3  Ready");
+    assert_eq!(
+        block.lines[3].visual_text.trim(),
+        "Long value  120  Working"
+    );
+
+    let layout = layout_block(&block, 640.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3, "header and both body rows must be drawable");
+    assert!(rows.iter().all(|row| row.table_cells.len() == 3));
+    for column in 0..3 {
+        assert_eq!(rows[0].table_cells[column].x, rows[1].table_cells[column].x);
+        assert_eq!(rows[0].table_cells[column].x, rows[2].table_cells[column].x);
+        assert_eq!(
+            rows[0].table_cells[column].width,
+            rows[1].table_cells[column].width
+        );
+        assert_eq!(
+            rows[0].table_cells[column].width,
+            rows[2].table_cells[column].width
+        );
+    }
+}
+
+#[test]
 fn empty_table_cells_keep_a_visible_row_for_editing() {
     let source = "|||\n|---|---|\n|||";
     let (block, layout) = laid_out(source)

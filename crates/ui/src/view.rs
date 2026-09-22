@@ -12612,6 +12612,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn issue_14_table_example_paints_the_header_and_both_body_rows(cx: &mut gpui::TestAppContext) {
+        let text = "| Name | Count | Status |\n|:-----|------:|:------:|\n| Hane | 3 | Ready |\n| Long value | 120 | Working |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.run_until_parked();
+
+        for (line, selector) in [(0, "row-0-0"), (2, "row-2-2"), (3, "row-3-3")] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("each Issue #14 table row must be painted: line {line}"));
+            assert!(bounds.size.height > px(0.0));
+        }
+
+        view.read_with(cx, |view, _| {
+            assert!(view.rendered_line(0).is_some_and(|line| line.table_header));
+            for line in [2, 3] {
+                let visual = view.rendered_line(line).expect("table line is rendered");
+                assert_eq!(
+                    visual.table_row.as_ref().map(|row| row.cells.len()),
+                    Some(3)
+                );
+            }
+        });
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open(
         cx: &mut gpui::TestAppContext,
     ) {
