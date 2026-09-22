@@ -4133,6 +4133,7 @@ impl EditorView {
         line: usize,
         fragment: Range<usize>,
         window_x: f32,
+        window_y: f32,
         window: &Window,
     ) -> Option<SourceOffset> {
         let (block_id, visual_line) = *self.line_owners.get(&line)?;
@@ -4143,11 +4144,41 @@ impl EditorView {
             .iter()
             .position(|row| row.line == visual_line && row.line_visual_range == fragment)?;
         let x = window_x - self.main_column_left - self.theme.line_horizontal_padding;
+        let row_top = self.content_y_for_row(block_id, row_index)?;
+        let content_y = self.scroll_y + window_y - self.theme.header_height;
+        let local_y = content_y - row_top;
         let shaper = WindowShaper::new(window, self.zoom);
-        let visual_offset = layout.visual_at_x(visual, row_index, x, &shaper)?;
+        let visual_offset = layout.visual_at_xy(visual, row_index, x, local_y, &shaper)?;
         let line = visual.lines.get(visual_line)?;
         let bias = collapsed_boundary_bias(line, visual_offset.0, Some(&fragment));
-        layout.source_at_x_with_bias(visual, row_index, x, &shaper, bias)
+        layout.source_at_xy_with_bias(visual, row_index, x, local_y, &shaper, bias)
+    }
+
+    /// Absolute document-content y for one rendered row. The input event is in
+    /// window coordinates, while a table row's wrapped fragments are laid out
+    /// in block-local coordinates. Keeping this conversion here makes mouse
+    /// hit-testing use the same block/line height tree as scrolling and paint.
+    fn content_y_for_row(&self, block_id: BlockId, row_index: usize) -> Option<f32> {
+        let layout = &self.layout_cache.get(&block_id)?.layout;
+        let row = layout.lines.get(row_index)?;
+        match self.granularity {
+            Granularity::Blocks => {
+                let ordinal = self
+                    .current_index()?
+                    .blocks()
+                    .find(|block| block.id == block_id)?
+                    .ordinal;
+                Some(self.heights.prefix_sum(ordinal) + row.y + layout.leading_space)
+            }
+            Granularity::Lines => {
+                let line_start = layout
+                    .lines
+                    .iter()
+                    .find(|candidate| candidate.line == row.line)
+                    .map(|candidate| candidate.y)?;
+                Some(self.heights.prefix_sum(row.line_id as usize) + row.y - line_start)
+            }
+        }
     }
 
     fn on_editor_mouse_down(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -4169,9 +4200,13 @@ impl EditorView {
         window.focus(&self.focus_handle);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
-        let Some(offset) =
-            self.offset_at_row_x(line, fragment, f32::from(event.position.x), window)
-        else {
+        let Some(offset) = self.offset_at_row_x(
+            line,
+            fragment,
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+            window,
+        ) else {
             return;
         };
         let selection = if event.modifiers.shift {
@@ -4202,9 +4237,13 @@ impl EditorView {
         if !self.text_selection_drag || !event.dragging() {
             return;
         }
-        let Some(offset) =
-            self.offset_at_row_x(line, fragment, f32::from(event.position.x), window)
-        else {
+        let Some(offset) = self.offset_at_row_x(
+            line,
+            fragment,
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+            window,
+        ) else {
             return;
         };
         let selection = Selection {
@@ -12121,6 +12160,56 @@ mod tests {
         })
     }
 
+    /// Returns a click point in one wrapped table-cell fragment and the source
+    /// boundary painted there. Unlike `row_click`, this deliberately uses the
+    /// fragment's own y so the real mouse handler has to choose the matching
+    /// fragment inside a variable-height physical table row.
+    fn table_fragment_click(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+        line: usize,
+        column: usize,
+        fragment_index: usize,
+    ) -> (gpui::Point<gpui::Pixels>, SourceOffset) {
+        let bounds = cx.debug_bounds(selector).expect("table row painted");
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                let visual = editor_view.rendered_line(line).expect("line rendered");
+                let (block_id, visual_line) = *editor_view
+                    .line_owners
+                    .get(&line)
+                    .expect("line owner recorded");
+                let layout = &editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout;
+                let row_index = layout
+                    .lines
+                    .iter()
+                    .position(|row| row.line == visual_line)
+                    .expect("table row layout exists");
+                let row = &layout.lines[row_index];
+                let cell = &row.table_cells[column];
+                let fragment = &cell.fragments[fragment_index];
+                let visual_offset = fragment.visual_range.start;
+                let expected = source_offset_for_visual_position(
+                    editor_view.editor(),
+                    line,
+                    &visual,
+                    visual_offset,
+                    Some(&row.line_visual_range),
+                );
+                let x = f32::from(bounds.origin.x)
+                    + editor_view.theme.line_horizontal_padding
+                    + fragment.text_x;
+                let y = f32::from(bounds.origin.y) + fragment.y + fragment.height / 2.0;
+                (point(px(x), px(y)), expected)
+            })
+        })
+    }
+
     /// Opens an `EditorView` in a real window for GPUI mouse-event
     /// regression tests: a fixed size so layout is deterministic, and
     /// optionally a work-folder sidebar so the main column sits to the right
@@ -12498,6 +12587,24 @@ mod tests {
             assert_eq!(view.editor().selection(), Selection { anchor, active });
         });
         assert_ne!(anchor, active);
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn table_mouse_hit_testing_uses_the_clicked_cell_fragment_y(cx: &mut gpui::TestAppContext) {
+        let text = "| URL | 日本語 |\n| --- | --- |\n| https://example.com/a/very/long/identifier | これは空白のない長い日本語のセルです |\n| short | 別の行 |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.simulate_resize(gpui::size(px(420.0), px(760.0)));
+        cx.run_until_parked();
+
+        let (point, expected) = table_fragment_click(&view, cx, "row-2-2", 2, 0, 1);
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(expected));
+        });
 
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();

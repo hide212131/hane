@@ -144,19 +144,101 @@ impl LayoutLine {
         self.y + self.height
     }
 
+    fn table_cell_for_visual(&self, visual: usize) -> Option<&TableCellLayout> {
+        self.table_cells
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| {
+                cell.visual_range.start <= visual
+                    && (visual < cell.visual_range.end
+                        || (*index + 1 == self.table_cells.len()
+                            && visual == cell.visual_range.end))
+            })
+            .map(|(_, cell)| cell)
+    }
+
+    fn table_cell_for_x(&self, x: f32) -> Option<&TableCellLayout> {
+        self.table_cells
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| {
+                x >= cell.x
+                    && (x < cell.x + cell.width
+                        || (*index + 1 == self.table_cells.len() && x <= cell.x + cell.width))
+            })
+            .map(|(_, cell)| cell)
+    }
+
+    fn table_fragment_for_local_y<'a>(
+        &self,
+        cell: &'a TableCellLayout,
+        local_y: f32,
+    ) -> Option<&'a TableCellFragment> {
+        let local_y = local_y.clamp(0.0, self.height.max(0.0));
+        cell.fragments
+            .iter()
+            .find(|fragment| local_y < fragment.y + fragment.height)
+            .or_else(|| cell.fragments.last())
+    }
+
+    fn table_fragment_for_visual<'a>(
+        &self,
+        cell: &'a TableCellLayout,
+        visual: usize,
+    ) -> Option<&'a TableCellFragment> {
+        cell.fragments
+            .iter()
+            .enumerate()
+            .find_map(|(index, fragment)| {
+                (visual < fragment.visual_range.end
+                    || (index + 1 == cell.fragments.len() && visual == fragment.visual_range.end))
+                    .then_some(fragment)
+            })
+    }
+
+    fn table_fragment_index_for_visual(&self, visual: usize) -> usize {
+        self.table_cell_for_visual(visual)
+            .and_then(|cell| {
+                cell.fragments
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, fragment)| {
+                        (visual < fragment.visual_range.end
+                            || (index + 1 == cell.fragments.len()
+                                && visual == fragment.visual_range.end))
+                            .then_some(index)
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    fn table_fragment_count_for_visual(&self, visual: usize) -> usize {
+        self.table_cell_for_visual(visual)
+            .map(|cell| cell.fragments.len())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn table_edge_y_for_x(&self, x: f32, down: bool) -> f32 {
+        if down {
+            return 0.0;
+        }
+        self.table_cell_for_x(x)
+            .and_then(|cell| cell.fragments.last())
+            .map_or(0.0, |fragment| fragment.y)
+    }
+
+    fn fragment_y_for_visual(&self, visual: usize) -> (f32, f32) {
+        let Some(cell) = self.table_cell_for_visual(visual) else {
+            return (0.0, self.height);
+        };
+        self.table_fragment_for_visual(cell, visual)
+            .map_or((0.0, self.height), |fragment| (fragment.y, fragment.height))
+    }
+
     fn x_for_visual(&self, line: &VisualLine, visual: usize, shaper: &dyn LineShaper) -> f32 {
         if !self.table_cells.is_empty()
-            && let Some(cell) = self
-                .table_cells
-                .iter()
-                .enumerate()
-                .find(|(index, cell)| {
-                    cell.visual_range.start <= visual
-                        && (visual < cell.visual_range.end
-                            || (*index + 1 == self.table_cells.len()
-                                && visual == cell.visual_range.end))
-                })
-                .map(|(_, cell)| cell)
+            && let Some(cell) = self.table_cell_for_visual(visual)
         {
             let visual = visual.clamp(cell.visual_range.start, cell.visual_range.end);
             if let Some(fragment) =
@@ -213,19 +295,15 @@ impl LayoutLine {
         self.text_x_origin + shaper.x_for_offset(line, self.line_visual_range.clone(), visual)
     }
 
-    fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
-        if let Some(cell) = self
-            .table_cells
-            .iter()
-            .enumerate()
-            .find(|(index, cell)| {
-                x >= cell.x
-                    && (x < cell.x + cell.width
-                        || (*index + 1 == self.table_cells.len() && x <= cell.x + cell.width))
-            })
-            .map(|(_, cell)| cell)
-        {
-            let fragment = cell.fragments.first();
+    fn visual_for_xy(
+        &self,
+        line: &VisualLine,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> usize {
+        if let Some(cell) = self.table_cell_for_x(x) {
+            let fragment = self.table_fragment_for_local_y(cell, local_y);
             return fragment.map_or(cell.visual_range.start, |fragment| {
                 shaper
                     .offset_for_x(
@@ -270,6 +348,10 @@ impl LayoutLine {
         shaper
             .offset_for_x(line, self.line_visual_range.clone(), x - self.text_x_origin)
             .clamp(self.line_visual_range.start, self.line_visual_range.end)
+    }
+
+    fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
+        self.visual_for_xy(line, x, 0.0, shaper)
     }
 
     /// True when `offset` is inside this row, or at its end and the row is the
@@ -448,11 +530,12 @@ impl BlockLayout {
                 candidate.visual_offset.0
             })
             .clamp(row.line_visual_range.start, row.line_visual_range.end);
+        let (fragment_y, fragment_height) = row.fragment_y_for_visual(visual);
         Some(LayoutPoint {
             row: row_index,
             x: row.x_for_visual(line, visual, shaper),
-            y: self.leading_space + row.y,
-            height: row.height,
+            y: self.leading_space + row.y + fragment_y,
+            height: fragment_height,
         })
     }
 
@@ -464,7 +547,10 @@ impl BlockLayout {
         y: f32,
         shaper: &dyn LineShaper,
     ) -> Option<SourceOffset> {
-        self.source_at_x(block, self.row_at_y(y)?, x, shaper)
+        let row_index = self.row_at_y(y)?;
+        let row = self.lines.get(row_index)?;
+        let local_y = y - self.leading_space - row.y;
+        self.source_at_xy(block, row_index, x, local_y, shaper)
     }
 
     /// The line-local visual offset under `x` on one row.
@@ -480,6 +566,22 @@ impl BlockLayout {
         Some(VisualOffset(row.visual_for_x(line, x, shaper)))
     }
 
+    /// The line-local visual offset under `(x, y)` on one physical row. Table
+    /// rows contain several visual fragments, so the y coordinate selects the
+    /// fragment before x is measured against its own aligned text origin.
+    pub fn visual_at_xy(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<VisualOffset> {
+        let row = self.lines.get(row_index)?;
+        let line = block.lines.get(row.line)?;
+        Some(VisualOffset(row.visual_for_xy(line, x, local_y, shaper)))
+    }
+
     /// The source offset at `x` on one row. Vertical movement is this applied to
     /// the row above or below, which is why it is separate from the point form.
     pub fn source_at_x(
@@ -490,6 +592,19 @@ impl BlockLayout {
         shaper: &dyn LineShaper,
     ) -> Option<SourceOffset> {
         self.source_at_x_with_bias(block, row_index, x, shaper, Bias::After)
+    }
+
+    /// The source offset at `(x, y)` on one physical row, using the default
+    /// boundary affinity. `local_y` is relative to the top of the row.
+    pub fn source_at_xy(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+    ) -> Option<SourceOffset> {
+        self.source_at_xy_with_bias(block, row_index, x, local_y, shaper, Bias::After)
     }
 
     /// The source offset at `x`, using the caller's boundary affinity.
@@ -516,6 +631,26 @@ impl BlockLayout {
         )
     }
 
+    /// The source offset at `(x, y)`, using the caller's boundary affinity.
+    pub fn source_at_xy_with_bias(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        x: f32,
+        local_y: f32,
+        shaper: &dyn LineShaper,
+        affinity: Bias,
+    ) -> Option<SourceOffset> {
+        let row = self.lines.get(row_index)?;
+        let line = block.lines.get(row.line)?;
+        let visual = self.visual_at_xy(block, row_index, x, local_y, shaper)?.0;
+        Some(
+            line.source_map
+                .visual_to_source(VisualOffset(visual), affinity)
+                .map_or(row.source_range.start, |candidate| candidate.source_offset),
+        )
+    }
+
     /// The caret target one row above or below `offset`, aiming at `x`.
     ///
     /// This is what replaces the grapheme column: a column is a property of a
@@ -531,11 +666,44 @@ impl BlockLayout {
         let Some(row) = self.row_for_source(offset) else {
             return VerticalMove::Unknown;
         };
+        let line = block.lines.get(self.lines[row].line);
+        let current_visual = line.and_then(|line| {
+            line.source_map
+                .source_to_visual(offset, Bias::After)
+                .map(|candidate| candidate.visual_offset.0)
+        });
+        let current_fragment = current_visual
+            .map(|visual| self.lines[row].table_fragment_index_for_visual(visual))
+            .unwrap_or(0);
+        let fragment_count = current_visual.map_or(1, |visual| {
+            self.lines[row].table_fragment_count_for_visual(visual)
+        });
+        if (down && current_fragment + 1 < fragment_count) || (!down && current_fragment > 0) {
+            let target_fragment = if down {
+                current_fragment + 1
+            } else {
+                current_fragment - 1
+            };
+            let local_y = current_visual
+                .and_then(|visual| self.lines[row].table_cell_for_visual(visual))
+                .and_then(|cell| cell.fragments.get(target_fragment))
+                .map_or_else(
+                    || {
+                        let fragment_height = self.lines[row].height / fragment_count as f32;
+                        target_fragment as f32 * fragment_height
+                    },
+                    |fragment| fragment.y,
+                );
+            return self
+                .source_at_xy(block, row, x, local_y, shaper)
+                .map_or(VerticalMove::Unknown, VerticalMove::To);
+        }
         let target = if down { row + 1 } else { row.wrapping_sub(1) };
         if down && target >= self.lines.len() || !down && row == 0 {
             return VerticalMove::PastEdge;
         }
-        self.source_at_x(block, target, x, shaper)
+        let target_y = self.lines[target].table_edge_y_for_x(x, down);
+        self.source_at_xy(block, target, x, target_y, shaper)
             .map_or(VerticalMove::Unknown, VerticalMove::To)
     }
 

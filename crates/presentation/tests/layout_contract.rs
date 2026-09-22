@@ -832,6 +832,141 @@ fn table_cell_fragments_wrap_visible_text_within_shared_columns() {
 }
 
 #[test]
+fn table_rows_use_fragment_y_for_caret_hit_testing_and_vertical_movement() {
+    let source = "| URL | 日本語 |\n| --- | --- |\n| https://example.com/a/very/long/identifier | これは空白のない長い日本語のセルです |\n| short | 別の行 |\n| tail | end |";
+    let (block, layout) = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 120.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let wrapped_index = layout
+        .lines
+        .iter()
+        .position(|row| row.line_id == 2)
+        .expect("wrapped body row");
+    let wrapped = &layout.lines[wrapped_index];
+    let max_fragments = wrapped
+        .table_cells
+        .iter()
+        .map(|cell| cell.fragments.len())
+        .max()
+        .unwrap_or(1);
+    assert!(max_fragments > 1, "the body row must contain wrapped cells");
+    let fragment_height = wrapped
+        .table_cells
+        .iter()
+        .flat_map(|cell| cell.fragments.first())
+        .map(|fragment| fragment.height)
+        .next()
+        .expect("wrapped row has a fragment");
+    assert_eq!(wrapped.height, fragment_height * max_fragments as f32);
+    assert_eq!(
+        layout.height(),
+        layout.leading_space
+            + layout.trailing_space
+            + layout.lines.iter().map(|row| row.height).sum::<f32>(),
+        "table block height must include every variable-height physical row"
+    );
+
+    let cell = &wrapped.table_cells[0];
+    let second = &cell.fragments[1];
+    let second_visual = second.visual_range.start + 1;
+    let second_source = block.lines[wrapped.line]
+        .source_map
+        .visual_to_source(VisualOffset(second_visual), Bias::After)
+        .expect("second fragment has a source boundary")
+        .source_offset;
+    let point = layout
+        .point_for_source(&block, second_source, &shaper())
+        .expect("wrapped source has a point");
+    assert_eq!(point.row, wrapped_index);
+    assert_eq!(point.y, wrapped.y + second.y);
+    assert_eq!(point.height, second.height);
+    let back = layout
+        .source_for_point(&block, point.x, point.y, &shaper())
+        .expect("point has a source boundary");
+    let back_visual = block.lines[wrapped.line]
+        .source_map
+        .source_to_visual(back, Bias::After)
+        .expect("hit-test source maps back to visual text")
+        .visual_offset
+        .0;
+    assert!(
+        second.visual_range.contains(&back_visual),
+        "source and point conversion must use the same wrapped fragment"
+    );
+
+    let first_source = layout
+        .source_at_xy(
+            &block,
+            wrapped_index,
+            cell.text_x,
+            cell.fragments[0].y + fragment_height / 2.0,
+            &shaper(),
+        )
+        .expect("first fragment has a hit-test boundary");
+    let VerticalMove::To(next_source) =
+        layout.vertical_target(&block, first_source, true, cell.text_x, &shaper())
+    else {
+        panic!("vertical movement must enter the next fragment in the same physical row");
+    };
+    let next_point = layout
+        .point_for_source(&block, next_source, &shaper())
+        .expect("vertical target has a point");
+    assert_eq!(next_point.row, wrapped_index);
+    assert_eq!(next_point.y, wrapped.y + second.y);
+
+    let third = &cell.fragments[2];
+    let VerticalMove::To(third_target) =
+        layout.vertical_target(&block, next_source, true, cell.text_x, &shaper())
+    else {
+        panic!("vertical movement must advance one fragment at a time");
+    };
+    let third_point = layout
+        .point_for_source(&block, third_target, &shaper())
+        .expect("third fragment target has a point");
+    assert_eq!(third_point.y, wrapped.y + third.y);
+
+    let last = cell
+        .fragments
+        .last()
+        .expect("wrapped cell has a last fragment");
+    let last_source = block.lines[wrapped.line]
+        .source_map
+        .visual_to_source(VisualOffset(last.visual_range.start + 1), Bias::After)
+        .expect("last fragment has a source boundary")
+        .source_offset;
+    let VerticalMove::To(next_row_source) =
+        layout.vertical_target(&block, last_source, true, cell.text_x, &shaper())
+    else {
+        panic!("vertical movement must leave the wrapped physical row");
+    };
+    assert_eq!(
+        layout
+            .point_for_source(&block, next_row_source, &shaper())
+            .map(|point| point.row),
+        Some(wrapped_index + 1)
+    );
+    let VerticalMove::To(up_source) = layout.vertical_target(
+        &block,
+        next_row_source,
+        false,
+        cell.text_x,
+        &shaper(),
+    ) else {
+        panic!("moving up must enter the previous row's last fragment");
+    };
+    let up_point = layout
+        .point_for_source(&block, up_source, &shaper())
+        .expect("upward target has a point");
+    assert_eq!(up_point.row, wrapped_index);
+    assert_eq!(up_point.y, wrapped.y + last.y);
+}
+
+#[test]
 fn soft_wrapped_rows_tile_their_line_and_keep_the_break_kind() {
     let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
     let rows: Vec<_> = layout
