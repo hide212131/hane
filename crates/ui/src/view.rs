@@ -6449,6 +6449,7 @@ impl Render for EditorView {
                                         &visual,
                                         &layout,
                                         row_index,
+                                        &shaper,
                                         self.theme,
                                         self.zoom,
                                         &resolver,

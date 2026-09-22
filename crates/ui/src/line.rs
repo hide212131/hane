@@ -530,6 +530,7 @@ pub(crate) fn row_element(
     block: &VisualBlock,
     layout: &BlockLayout,
     row_index: usize,
+    shaper: &dyn hane_presentation::LineShaper,
     theme: Theme,
     zoom: f32,
     resolver: &ResourceResolver,
@@ -609,9 +610,11 @@ pub(crate) fn row_element(
             table,
             layout,
             row_index,
+            shaper,
             display,
             theme,
             zoom,
+            caret_input_mode,
         );
     }
 
@@ -713,13 +716,19 @@ fn table_row_element(
     table: &hane_presentation::TableRowDisplay,
     layout: &BlockLayout,
     row_index: usize,
+    shaper: &dyn hane_presentation::LineShaper,
     display: BlockDisplay,
     theme: Theme,
     zoom: f32,
+    caret_input_mode: Option<KeyboardInputMode>,
 ) -> Div {
     let selection = editor.selection().range();
     let marked = editor.ime().map(|ime| ime.marked_range);
     let selected_visual = layout.visual_range_on_row(block, row_index, selection);
+    let cursor_x = layout
+        .point_for_source(block, editor.selection().active, shaper)
+        .filter(|point| point.row == row_index)
+        .map(|point| point.x);
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
     for cell_layout in &row.table_cells {
         let Some(cell) = table
@@ -785,6 +794,16 @@ fn table_row_element(
             .h(px(1.0))
             .bg(rgb(theme.table_border)),
     );
+    if let Some(cursor_x) = cursor_x {
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cursor_x))
+                .top(px(0.0))
+                .h(px(row.height))
+                .child(cursor_overlay(theme, caret_input_mode)),
+        );
+    }
     styled_block(
         div()
             .relative()
