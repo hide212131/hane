@@ -508,16 +508,60 @@ fn row_owns_visual(row: &LayoutLine, visual: usize) -> bool {
         && (visual < row.line_visual_range.end || row.wrap == LineWrap::Hard)
 }
 
-fn quote_bar(row: &LayoutLine, theme: Theme, zoom: f32) -> Option<Div> {
-    row.quote_bar_x_origin.map(|x| {
+const QUOTE_BAR_EDGE_INSET: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QuoteBarIdentity {
+    x_origin: f32,
+    depth: usize,
+}
+
+fn quote_bar_identity(row: &LayoutLine, line: &VisualLine) -> Option<QuoteBarIdentity> {
+    Some(QuoteBarIdentity {
+        x_origin: row.quote_bar_x_origin?,
+        depth: line.quote?.depth,
+    })
+}
+
+fn quote_bar_insets(
+    current: Option<QuoteBarIdentity>,
+    previous: Option<QuoteBarIdentity>,
+    next: Option<QuoteBarIdentity>,
+) -> (f32, f32) {
+    let continues = |adjacent| current.is_some() && current == adjacent;
+    (
+        if continues(previous) {
+            0.0
+        } else {
+            QUOTE_BAR_EDGE_INSET
+        },
+        if continues(next) {
+            0.0
+        } else {
+            QUOTE_BAR_EDGE_INSET
+        },
+    )
+}
+
+fn quote_bar(
+    row: &LayoutLine,
+    current: Option<QuoteBarIdentity>,
+    previous: Option<QuoteBarIdentity>,
+    next: Option<QuoteBarIdentity>,
+    theme: Theme,
+    zoom: f32,
+) -> Option<Div> {
+    let x = row.quote_bar_x_origin?;
+    let (top, bottom) = quote_bar_insets(current, previous, next);
+    Some(
         div()
             .absolute()
             .left(px(theme.line_horizontal_padding + x))
-            .top(px(4.0 * zoom))
-            .bottom(px(4.0 * zoom))
+            .top(px(top * zoom))
+            .bottom(px(bottom * zoom))
             .w(px(QUOTE_BAR_WIDTH * zoom))
-            .bg(rgb(theme.quote_foreground))
-    })
+            .bg(rgb(theme.quote_foreground)),
+    )
 }
 
 /// One row of a block: the text that fits on it, with the caret, selection and
@@ -540,6 +584,22 @@ pub(crate) fn row_element(
 ) -> Div {
     let row = &layout.lines[row_index];
     let line = &block.lines[row.line];
+    let current_quote_bar = quote_bar_identity(row, line);
+    let previous_quote_bar = row_index
+        .checked_sub(1)
+        .and_then(|index| layout.lines.get(index))
+        .and_then(|adjacent| {
+            block
+                .lines
+                .get(adjacent.line)
+                .and_then(|line| quote_bar_identity(adjacent, line))
+        });
+    let next_quote_bar = layout.lines.get(row_index + 1).and_then(|adjacent| {
+        block
+            .lines
+            .get(adjacent.line)
+            .and_then(|line| quote_bar_identity(adjacent, line))
+    });
     let display = line.display();
     if let Some(image) = &line.image {
         let resolved = resolver.resolve(&image.destination);
@@ -561,7 +621,14 @@ pub(crate) fn row_element(
             theme,
             zoom,
         )
-        .children(quote_bar(row, theme, zoom))
+        .children(quote_bar(
+            row,
+            current_quote_bar,
+            previous_quote_bar,
+            next_quote_bar,
+            theme,
+            zoom,
+        ))
         .child(
             img(resolved)
                 .max_w(px(image_max_width))
@@ -586,7 +653,14 @@ pub(crate) fn row_element(
                 .items_center()
                 .pl(px(theme.line_horizontal_padding + row.text_x_origin))
                 .pr(px(theme.line_horizontal_padding))
-                .children(quote_bar(row, theme, zoom))
+                .children(quote_bar(
+                    row,
+                    current_quote_bar,
+                    previous_quote_bar,
+                    next_quote_bar,
+                    theme,
+                    zoom,
+                ))
                 .child(div().flex_none().child(line.visual_text.clone()))
                 .children(body_gap_element(row))
                 .child(
@@ -759,7 +833,14 @@ pub(crate) fn row_element(
         theme,
         zoom,
     )
-    .children(quote_bar(row, theme, zoom))
+    .children(quote_bar(
+        row,
+        current_quote_bar,
+        previous_quote_bar,
+        next_quote_bar,
+        theme,
+        zoom,
+    ))
     .children(elements)
 }
 
@@ -1265,6 +1346,99 @@ mod tests {
             quote_bar_x_origin: None,
             table_cells: Vec::new(),
         }
+    }
+
+    #[test]
+    fn quote_bar_insets_join_matching_visual_rows_only() {
+        let first_depth = QuoteBarIdentity {
+            x_origin: 14.0,
+            depth: 1,
+        };
+        let nested_depth = QuoteBarIdentity {
+            x_origin: 30.0,
+            depth: 2,
+        };
+
+        assert_eq!(
+            quote_bar_insets(Some(first_depth), None, Some(first_depth)),
+            (QUOTE_BAR_EDGE_INSET, 0.0),
+            "the first soft-wrapped row keeps only the block's top inset"
+        );
+        assert_eq!(
+            quote_bar_insets(Some(first_depth), Some(first_depth), Some(first_depth)),
+            (0.0, 0.0),
+            "a middle visual row joins the bars above and below it"
+        );
+        assert_eq!(
+            quote_bar_insets(Some(first_depth), Some(first_depth), None),
+            (0.0, QUOTE_BAR_EDGE_INSET),
+            "the final row keeps only the block's bottom inset"
+        );
+        assert_eq!(
+            quote_bar_insets(Some(first_depth), Some(first_depth), Some(nested_depth)),
+            (0.0, QUOTE_BAR_EDGE_INSET),
+            "a quote-depth boundary must not join unlike bars"
+        );
+        assert_eq!(
+            quote_bar_insets(Some(nested_depth), Some(first_depth), None),
+            (QUOTE_BAR_EDGE_INSET, QUOTE_BAR_EDGE_INSET),
+            "a changed quote depth starts a new bar"
+        );
+    }
+
+    #[test]
+    fn quote_bar_layout_joins_soft_wraps_but_not_a_quote_depth_change() {
+        let source = "> one two three four five six seven eight nine\n> > nested\n";
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(SourceOffset(
+                source.find("one").expect("quoted text") + 1,
+            )))
+            .expect("caret moves into quoted text");
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("quote block");
+        let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
+            .expect("quote block presents");
+        let layout = hane_presentation::layout_block(
+            &visual,
+            80.0,
+            &hane_presentation::testing::FixedAdvanceShaper::default(),
+        );
+
+        let soft_wrap_index = layout
+            .lines
+            .windows(2)
+            .position(|rows| rows[0].line == rows[1].line && rows[0].wrap == LineWrap::Soft)
+            .expect("quoted text wraps into adjacent visual rows");
+        let soft_wrap = &layout.lines[soft_wrap_index..soft_wrap_index + 2];
+        let first = quote_bar_identity(&soft_wrap[0], &visual.lines[soft_wrap[0].line]);
+        let second = quote_bar_identity(&soft_wrap[1], &visual.lines[soft_wrap[1].line]);
+        assert!(first.is_some() && second.is_some());
+        assert_eq!(
+            quote_bar_insets(first, None, second),
+            (QUOTE_BAR_EDGE_INSET, 0.0),
+            "the bar remains continuous across a soft-wrap boundary"
+        );
+
+        let depth_boundary_index = layout
+            .lines
+            .windows(2)
+            .position(|rows| {
+                let first_depth = visual.lines[rows[0].line].quote.map(|quote| quote.depth);
+                let second_depth = visual.lines[rows[1].line].quote.map(|quote| quote.depth);
+                first_depth.is_some() && first_depth != second_depth
+            })
+            .expect("quote depth changes between adjacent rows");
+        let previous = &layout.lines[depth_boundary_index];
+        let current = &layout.lines[depth_boundary_index + 1];
+        let previous = quote_bar_identity(previous, &visual.lines[previous.line]);
+        let current = quote_bar_identity(current, &visual.lines[current.line]);
+        assert!(previous.is_some() && current.is_some());
+        assert_eq!(
+            quote_bar_insets(current, previous, None).0,
+            QUOTE_BAR_EDGE_INSET,
+            "a changed quote depth starts a new bar"
+        );
     }
 
     #[test]
