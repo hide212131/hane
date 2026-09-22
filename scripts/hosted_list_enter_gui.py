@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-list-enter/2"
+PROCEDURE_VERSION = "hosted-list-enter/3"
 VERIFICATION_KIND = "list_enter_editing_focused"
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -98,6 +98,18 @@ CASES = (
         (("press-key", "enter", "nosave"), ("press-key", "backspace", "save")),
         "- abc",
         "空行直後の Backspace で元の item 末尾へ戻る",
+    ),
+    Case(
+        "backspace_after_enter_exits_list",
+        "- abc\n- def",
+        "def",
+        (
+            ("press-key", "enter", "nosave"),
+            ("press-key", "backspace", "nosave"),
+            ("type-save", "xyz"),
+        ),
+        "- abc\n- def\nxyz",
+        "空マーカーを Backspace で削除した後の文字入力を通常 paragraph として扱う",
     ),
     Case(
         "enter_twice",

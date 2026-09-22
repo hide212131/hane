@@ -107,7 +107,15 @@ impl ListEditProjection {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.prefix_range.start.0 <= offset.0 && offset.0 <= item.item_range.end.0
+                item.prefix_range.start.0 <= offset.0
+                    && (offset.0 < item.item_range.end.0
+                        // A parser item range may include its terminating line
+                        // break. The caret at the end of the final physical
+                        // line is still in the item, but the caret immediately
+                        // after that line break belongs to the following
+                        // paragraph (or the document boundary).
+                        || (offset.0 == item.item_range.end.0
+                            && item.body_range.end.0 == item.item_range.end.0))
             })
             .max_by_key(|(_, item)| (item.depth, item.item_range.start.0))
     }
