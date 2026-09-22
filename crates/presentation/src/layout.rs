@@ -892,9 +892,16 @@ fn table_cell_layouts(
                 fragment_height,
                 shaper,
             );
+            // A wrapped aligned cell can have a short first fragment (for
+            // example, a leading space) whose origin is farther right than a
+            // later, wider fragment. Keep the cell-level origin at the
+            // leftmost fragment origin so source→visual→x coordinates never
+            // fall to the left of the cell geometry they belong to.
             let text_x = fragments
-                .first()
-                .map_or(x + TABLE_CELL_PADDING, |fragment| fragment.text_x);
+                .iter()
+                .fold(x + TABLE_CELL_PADDING, |origin, fragment| {
+                    origin.min(fragment.text_x)
+                });
             TableCellLayout {
                 column: cell.column,
                 visual_range,

@@ -386,7 +386,15 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
         .point_for_source(&block, count_offset, &shaper())
         .expect("cell source maps to a point");
     assert_eq!(point.row, 0);
-    assert!(point.x >= rows[0].table_cells[1].text_x);
+    let count_cell = &rows[0].table_cells[1];
+    assert!(
+        count_cell
+            .fragments
+            .iter()
+            .all(|fragment| fragment.text_x >= count_cell.text_x),
+        "cell text origin must be no farther right than any fragment origin"
+    );
+    assert!(point.x >= count_cell.text_x);
 
     let (aligned_block, aligned_layout) = laid_out("|a|b|\n|---|---:|\n|c|d|")
         .into_iter()
