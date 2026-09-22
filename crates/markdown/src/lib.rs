@@ -892,7 +892,7 @@ pub const fn fence_closes(opening: FenceDelimiter, candidate: FenceDelimiter) ->
 pub fn is_table_delimiter(source: &str) -> bool {
     let content = source.trim_end_matches(['\r', '\n']).trim();
     let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
-    cells.len() >= 2
+    !cells.is_empty()
         && cells.iter().all(|cell| {
             let trimmed = cell.trim().trim_matches(':');
             trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')

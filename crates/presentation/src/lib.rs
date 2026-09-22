@@ -7152,6 +7152,16 @@ mod tests {
             .as_slice();
         assert_eq!(indented_cells.len(), 2);
         assert_eq!(indented_cells[0].source_range.start, SourceOffset(3));
+        let one_column_delimiter = present_polished_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| --- |\n".len()),
+            "| --- |\n",
+            26.0,
+            None,
+            LineContext::Table,
+        );
+        assert_eq!(one_column_delimiter.kind, BlockKind::TableDelimiter);
         let sparse = present_table_line(
             1,
             Revision(3),
