@@ -33,6 +33,7 @@ cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --l
 Hane 起動後（ウィンドウが既に key / first responder の状態）に日本語入力ソースへ切り替えても、AppKit は現在の first responder の `NSTextInputContext` を自動では再同期しない。Text Services Manager はそのコンテキストが最後に activate されたときの入力ソースのまま composing を続ける（または始めない）ため、Romaji 入力のような変換前提の IME に切り替えても preedit が始まらず、未変換のローマ字がそのまま `insertText:` 経由で確定してしまう。
 
 - `NSTextInputContextKeyboardSelectionDidChangeNotification`（GPUI が既に keyboard layout 変更検知のために監視している通知）のハンドラで、key window の現在の first responder が持つ `NSTextInputContext` を `deactivate` → `activate` し、AppKit の通常の responder 遷移を再現して TSM を新しい入力ソースへ即座に再同期させる。active な context に `activate` だけを直接呼んでも、既存の入力ソースとの紐付けは更新されない。
+- 同じ入力ソースの通知（コンテキスト更新やスクロールなどに伴う再通知を含む）では同期的な TSM 再活性化を繰り返さず、入力ソース ID または IME の ASCII 可否が実際に変わった通知だけを再同期する。
 - key window / first responder / input context が存在しない場合は何もしない。フォーカスが無いときや通常のフォーカス遷移時の動作は変更しない。
 - text input context の再入は抑止し、1回の入力ソース変更通知につき再同期を1回だけ行う。
 - キーバインド解決用の `MacKeyboardMapper` 再構築ロジックは変更しない。

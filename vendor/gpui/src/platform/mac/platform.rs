@@ -70,6 +70,9 @@ static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
 #[cfg(test)]
 static TEST_KEY_WINDOW_OVERRIDE: OnceLock<Mutex<Option<Option<usize>>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_CURRENT_INPUT_SOURCE_SIGNATURE: OnceLock<Mutex<Option<(String, bool)>>> =
+    OnceLock::new();
 
 #[ctor]
 unsafe fn build_classes() {
@@ -179,6 +182,7 @@ pub(crate) struct MacPlatformState {
     dock_menu: Option<id>,
     menus: Option<Vec<OwnedMenu>>,
     keyboard_mapper: Rc<MacKeyboardMapper>,
+    keyboard_input_source_signature: (String, bool),
 }
 
 impl Default for MacPlatform {
@@ -199,6 +203,7 @@ impl MacPlatform {
 
         let keyboard_layout = MacKeyboardLayout::new();
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+        let keyboard_input_source_signature = current_keyboard_input_source_signature();
 
         Self(Mutex::new(MacPlatformState {
             headless,
@@ -221,6 +226,7 @@ impl MacPlatform {
             on_keyboard_layout_change: None,
             menus: None,
             keyboard_mapper,
+            keyboard_input_source_signature,
         }))
     }
 
@@ -1432,8 +1438,15 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
     let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
     let keyboard_layout = MacKeyboardLayout::new();
+    let input_source_signature = current_keyboard_input_source_signature();
+    let mut lock = platform.0.lock();
+    // AppKit can post this notification while the current input context is
+    // being refreshed for another reason (for example, during scrolling).
+    // Only re-enter the synchronous TSM path when the text-producing source
+    // actually changed.
+    let input_source_changed = lock.keyboard_input_source_signature != input_source_signature;
+    lock.keyboard_input_source_signature = input_source_signature;
     lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
     if let Some(mut callback) = lock.on_keyboard_layout_change.take() {
         drop(lock);
@@ -1446,7 +1459,38 @@ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
     } else {
         drop(lock);
     }
-    reactivate_key_window_text_input_context();
+    if input_source_changed {
+        reactivate_key_window_text_input_context();
+    }
+}
+
+fn current_keyboard_input_source_signature() -> (String, bool) {
+    #[cfg(test)]
+    if let Some(signature) = TEST_CURRENT_INPUT_SOURCE_SIGNATURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+    {
+        return signature;
+    }
+
+    unsafe {
+        let input_source = TISCopyCurrentKeyboardInputSource();
+        let id: *mut Object =
+            TISGetInputSourceProperty(input_source, kTISPropertyInputSourceID as *const c_void);
+        let id: *const c_char = msg_send![id, UTF8String];
+        let id = CStr::from_ptr(id).to_string_lossy().into_owned();
+        let is_ascii_capable: *mut Object = TISGetInputSourceProperty(
+            input_source,
+            kTISPropertyInputSourceIsASCIICapable as *const c_void,
+        );
+        let is_ascii_capable = if is_ascii_capable.is_null() {
+            true
+        } else {
+            msg_send![is_ascii_capable, boolValue]
+        };
+        (id, is_ascii_capable)
+    }
 }
 
 // AppKit associates each NSResponder's NSTextInputContext with whichever input
@@ -1981,7 +2025,10 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders() {
+    fn keyboard_selection_change_reactivates_only_after_input_source_change() {
+        *TEST_CURRENT_INPUT_SOURCE_SIGNATURE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(("test.initial".to_owned(), false));
         let platform = MacPlatform::new(false);
         let callback_count = Arc::new(AtomicUsize::new(0));
         platform.on_keyboard_layout_change(Box::new({
@@ -2012,6 +2059,9 @@ mod tests {
         *TEST_KEY_WINDOW_OVERRIDE
             .get_or_init(|| Mutex::new(None))
             .lock() = Some(Some(key_window as usize));
+        *TEST_CURRENT_INPUT_SOURCE_SIGNATURE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = Some(("test.changed".to_owned(), false));
         let delegate = unsafe {
             let delegate: id = msg_send![APP_DELEGATE_CLASS, new];
             (*delegate).set_ivar(
@@ -2062,6 +2112,10 @@ mod tests {
             );
             drop(input_state);
 
+            unsafe { post_keyboard_selection_change(delegate) };
+            assert_eq!(TEST_DEACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(TEST_ACTIVATE_COUNT.load(Ordering::SeqCst), 1);
+
             *TEST_KEY_WINDOW_OVERRIDE
                 .get_or_init(|| Mutex::new(None))
                 .lock() = Some(None);
@@ -2090,6 +2144,9 @@ mod tests {
 
         TEST_NOTIFICATION_OBSERVER.store(ptr::null_mut(), Ordering::SeqCst);
         *TEST_KEY_WINDOW_OVERRIDE
+            .get_or_init(|| Mutex::new(None))
+            .lock() = None;
+        *TEST_CURRENT_INPUT_SOURCE_SIGNATURE
             .get_or_init(|| Mutex::new(None))
             .lock() = None;
     }
