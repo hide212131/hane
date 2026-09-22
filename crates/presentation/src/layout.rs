@@ -33,6 +33,13 @@ pub const QUOTE_DEPTH_INDENT: f32 = 24.0;
 pub const QUOTE_BAR_WIDTH: f32 = 2.0;
 pub const QUOTE_BAR_GAP: f32 = 8.0;
 const MIN_EFFECTIVE_WRAP_WIDTH: f32 = 1.0;
+/// Horizontal padding painted inside every inactive table cell.
+///
+/// Keep this in the layout model so the intrinsic column measurements and the
+/// geometry handed to the UI describe the same box. Cell wrapping is a later
+/// concern; for now a cell is clipped to this box by the UI.
+const TABLE_CELL_PADDING: f32 = 8.0;
+const TABLE_CELL_HORIZONTAL_PADDING: f32 = TABLE_CELL_PADDING * 2.0;
 
 /// How a row ends.
 ///
@@ -625,10 +632,16 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
     }
 }
 
-/// Lays out visible table rows on shared equal-width columns. Equal allocation
-/// keeps the grid stable across rows and forces long values to remain inside
-/// the editor's existing horizontal viewport. Cell text is still shaped by the
-/// caller's real font; presentation never assumes monospace metrics.
+/// Lays out visible table rows on shared intrinsic-width columns.
+///
+/// Each column is measured across the currently presented header/body cells.
+/// The preferred width is the widest complete cell, while the minimum width is
+/// the widest unbreakable segment in that column. If all preferred widths fit,
+/// the unused space remains outside the grid. Otherwise widths are allocated
+/// deterministically between minimum and preferred widths, with a final
+/// proportional compression when even the minimums do not fit. The latter is
+/// deliberately bounded by `width`: a future wrapping layout can consume the
+/// same safe geometry without making the table widen the editor viewport.
 fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
     let columns = block
         .lines
@@ -637,11 +650,12 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
         .map(|row| row.column_count)
         .max()
         .unwrap_or(0);
-    let column_width = if columns == 0 {
-        0.0
-    } else {
-        width.max(0.0) / columns as f32
-    };
+    let column_widths = table_column_widths(block, columns, width, shaper);
+    let mut column_offsets = Vec::with_capacity(column_widths.len() + 1);
+    column_offsets.push(0.0);
+    for column_width in &column_widths {
+        column_offsets.push(column_offsets.last().copied().unwrap_or(0.0) + *column_width);
+    }
     let marker_widths = list_marker_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
@@ -705,10 +719,12 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
                 .iter()
                 .map(|cell| {
                     let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
-                    let x = cell.column as f32 * column_width;
-                    let inner_width = (column_width - 16.0).max(0.0);
-                    let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
-                    let text_x = x + 8.0 + match cell.alignment {
+                    let x = column_offsets.get(cell.column).copied().unwrap_or(0.0);
+                    let column_width = column_widths.get(cell.column).copied().unwrap_or(0.0);
+                    let inner_width = (column_width - TABLE_CELL_HORIZONTAL_PADDING).max(0.0);
+                    let text_width =
+                        shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+                    let text_x = x + TABLE_CELL_PADDING + match cell.alignment {
                         TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
                         TableAlignment::Right => (inner_width - text_width).max(0.0),
                         TableAlignment::Default | TableAlignment::Left => 0.0,
@@ -757,6 +773,145 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
         leading_space: block.leading_space(),
         trailing_space: block.trailing_space(),
     }
+}
+
+/// Measures the intrinsic widths of the columns shared by all visible rows of
+/// one table block and clamps their allocation to the available text column.
+fn table_column_widths(
+    block: &VisualBlock,
+    columns: usize,
+    width: f32,
+    shaper: &dyn LineShaper,
+) -> Vec<f32> {
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    let mut preferred = vec![TABLE_CELL_HORIZONTAL_PADDING; columns];
+    let mut minimum = vec![TABLE_CELL_HORIZONTAL_PADDING; columns];
+    for line in &block.lines {
+        let Some(table) = &line.table_row else {
+            continue;
+        };
+        for cell in &table.cells {
+            let Some((preferred_text, minimum_text)) = table_cell_intrinsic_widths(
+                line,
+                cell.visual_range.start.0..cell.visual_range.end.0,
+                shaper,
+            ) else {
+                continue;
+            };
+            let Some(preferred_column) = preferred.get_mut(cell.column) else {
+                continue;
+            };
+            *preferred_column = (*preferred_column).max(
+                TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0),
+            );
+            if let Some(minimum_column) = minimum.get_mut(cell.column) {
+                *minimum_column = (*minimum_column).max(
+                    TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0),
+                );
+            }
+        }
+    }
+
+    let available = if width.is_finite() {
+        width.max(0.0)
+    } else {
+        0.0
+    };
+    let preferred_total = preferred.iter().sum::<f32>();
+    if preferred_total <= available {
+        return preferred;
+    }
+
+    let minimum_total = minimum.iter().sum::<f32>();
+    if minimum_total > available {
+        if minimum_total <= 0.0 {
+            return vec![0.0; columns];
+        }
+        return bound_table_column_widths(
+            minimum
+                .into_iter()
+                .map(|column| available * column / minimum_total)
+                .collect(),
+            available,
+        );
+    }
+
+    let remaining = available - minimum_total;
+    let capacity_total = preferred
+        .iter()
+        .zip(&minimum)
+        .map(|(preferred, minimum)| (preferred - minimum).max(0.0))
+        .sum::<f32>();
+    if capacity_total <= 0.0 {
+        return minimum;
+    }
+    bound_table_column_widths(
+        minimum
+            .into_iter()
+            .zip(preferred)
+            .map(|(minimum, preferred)| {
+                minimum + remaining * (preferred - minimum).max(0.0) / capacity_total
+            })
+            .collect(),
+        available,
+    )
+}
+
+/// Keeps the floating-point allocation inside the main panel even when the
+/// final proportional sum differs from the target by a rounding unit.
+fn bound_table_column_widths(mut widths: Vec<f32>, available: f32) -> Vec<f32> {
+    let mut used = 0.0;
+    for column in &mut widths {
+        let remaining = (available - used).max(0.0);
+        *column = (*column).max(0.0).min(remaining);
+        used += *column;
+    }
+    widths
+}
+
+/// Returns `(preferred, minimum)` text widths for one presented cell.
+///
+/// The preferred width measures the complete cell. The minimum width measures
+/// the widest non-whitespace run, which is the amount a later cell-wrapping
+/// implementation cannot split at ordinary whitespace. Both measurements use
+/// the line's shaper, so header weight and inline font changes are respected.
+fn table_cell_intrinsic_widths(
+    line: &VisualLine,
+    visual_range: Range<usize>,
+    shaper: &dyn LineShaper,
+) -> Option<(f32, f32)> {
+    if visual_range.start > visual_range.end
+        || visual_range.end > line.visual_text.len()
+        || !line.visual_text.is_char_boundary(visual_range.start)
+        || !line.visual_text.is_char_boundary(visual_range.end)
+    {
+        return None;
+    }
+    let preferred = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+    let text = &line.visual_text[visual_range.clone()];
+    let mut minimum = 0.0;
+    let mut run_start = None;
+    for (relative, character) in text.char_indices() {
+        let offset = visual_range.start + relative;
+        if character.is_whitespace() {
+            if let Some(start) = run_start.take() {
+                minimum = minimum.max(shaper.x_for_offset(line, start..offset, offset));
+            }
+        } else if run_start.is_none() {
+            run_start = Some(offset);
+        }
+    }
+    if let Some(start) = run_start {
+        minimum = minimum.max(shaper.x_for_offset(
+            line,
+            start..visual_range.end,
+            visual_range.end,
+        ));
+    }
+    Some((preferred, minimum))
 }
 
 #[derive(Clone, Debug)]

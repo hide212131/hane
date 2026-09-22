@@ -366,6 +366,85 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
 }
 
 #[test]
+fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
+    let (block, layout) = present("| a | wide |\n| --- | --- |\n| bb | x |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 400.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].table_cells[0].width, 48.0);
+    assert_eq!(rows[0].table_cells[1].width, 64.0);
+    assert_eq!(rows[0].table_cells[1].x, 48.0);
+    assert_eq!(rows[1].table_cells[0].width, 48.0);
+    assert_eq!(rows[1].table_cells[1].x, 48.0);
+    assert_eq!(
+        rows[0].table_cells[1].x + rows[0].table_cells[1].width,
+        112.0
+    );
+    assert!(
+        rows[0].table_cells[1].x + rows[0].table_cells[1].width < 400.0,
+        "preferred columns must not absorb unused table width"
+    );
+    assert_eq!(block.lines[0].table_row.as_ref().unwrap().column_count, 2);
+    assert_eq!(block.lines[2].table_row.as_ref().unwrap().column_count, 2);
+}
+
+#[test]
+fn table_layout_distributes_available_width_between_minimum_and_preferred() {
+    let (block, layout) = present("| abc def | x |\n| --- | --- |\n| a | b |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 100.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("header row");
+    assert_eq!(row.table_cells[0].width, 67.0);
+    assert_eq!(row.table_cells[1].width, 33.0);
+    assert_eq!(row.table_cells[1].x, 67.0);
+    assert_eq!(row.table_cells[1].x + row.table_cells[1].width, 100.0);
+}
+
+#[test]
+fn table_layout_compresses_overflowing_minimums_without_widening_the_panel() {
+    let (_, layout) = present("| abcdef | ghijkl |\n| --- | --- |\n| 1 | 2 |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 100.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("header row");
+    assert_eq!(row.table_cells[0].width, 50.0);
+    assert_eq!(row.table_cells[1].x, 50.0);
+    assert!(
+        row.table_cells
+            .iter()
+            .all(|cell| cell.x + cell.width <= 100.0),
+        "compressed table geometry must stay inside the available column"
+    );
+}
+
+#[test]
 fn soft_wrapped_rows_tile_their_line_and_keep_the_break_kind() {
     let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
     let rows: Vec<_> = layout
