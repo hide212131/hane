@@ -922,7 +922,7 @@ fn table_column_widths(
     // inactive table presenter used for visible rows, so source ranges,
     // alignment and the raw inline text all follow one geometry contract.
     if let Some(projection) = &block.table_projection {
-        for row in &projection.rows {
+        for row in projection.rows.iter() {
             let metric = crate::present_table_line(
                 0,
                 block.revision,

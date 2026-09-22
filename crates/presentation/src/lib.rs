@@ -4177,7 +4177,7 @@ fn table_cells_from_visual_mapping(
     let mut cells = Vec::new();
     let mut cursor = leading_indent;
     let mut column = 0;
-    let mut previous_pipe = None;
+    let mut previous_pipe: Option<SourceOffset> = None;
     for pipe in pipes {
         let pipe_source = source_for_pipe(pipe)?;
         if cursor < pipe {
