@@ -221,7 +221,7 @@ jobs:
               procedure_path='scripts/hosted_normal_list_gui.py'
               validation_kind='normal-list'
               ;;
-            'hosted-code-block/1')
+            'hosted-code-block/1'|'hosted-code-block/2')
               procedure_path='scripts/hosted_code_block_gui.py'
               validation_kind='code-block'
               ;;

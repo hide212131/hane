@@ -194,17 +194,16 @@ const FIXTURES: &[MarkdownFixture] = &[
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
         markers: &["```", "```"],
-        // The fence delimiters hide; the opening line's info string stays as
-        // a visible language label and the closing line collapses to empty.
-        // Code content in between stays fully literal.
+        // The opening/closing fence rows and opening info string collapse;
+        // code content in between stays fully literal.
         block_kinds: &[
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
         ],
-        visual_lines: &["rust", "let answer = 42;", ""],
+        visual_lines: &["", "let answer = 42;", ""],
         style_runs: &[
-            &[style(CodeBlock, 0, 4)],
+            &[],
             &[style(CodeBlock, 0, 16)],
             &[],
         ],
