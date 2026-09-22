@@ -91,13 +91,37 @@ pub struct IndexedBlock {
     pub leading_content_lines: usize,
 }
 
-/// Compact table metadata used by presentation for rows outside the current
-/// viewport. It intentionally carries no cell text.
+/// One cell in the formal source projection of a table row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionCell {
+    pub column: usize,
+    pub source_range: SourceRange,
+}
+
+/// One physical table row retained by the formal source projection.
+///
+/// The source text is the exact row slice from the parsed revision. Keeping it
+/// here lets presentation measure a row that is outside the current viewport
+/// without reparsing a shortened visual line or depending on which rows happen
+/// to be materialized by virtualization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionRow {
+    pub source_range: SourceRange,
+    pub source: Arc<str>,
+    pub header: bool,
+    pub cells: Arc<[TableProjectionCell]>,
+}
+
+/// Formal table metadata used by presentation for rows outside the current
+/// viewport. The row source is tied to the same formal parse revision as the
+/// block, so it is discarded with the projection when an incremental update
+/// makes the index provisional.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableProjection {
     pub source_range: SourceRange,
     pub delimiter_range: Option<SourceRange>,
     pub alignments: Arc<[TableAlignment]>,
+    pub rows: Arc<[TableProjectionRow]>,
 }
 
 impl IndexedBlock {
@@ -655,12 +679,52 @@ fn build_table_projections(
                         .get(relative..end)
                         .is_some_and(is_table_delimiter)
                 });
+            let rows = parsed
+                .tree
+                .children(table.node)
+                .iter()
+                .filter_map(|row_id| {
+                    let row = parsed.tree.node(*row_id)?;
+                    let header = row.kind == NodeKind::TableHead;
+                    if !header && row.kind != NodeKind::TableRow {
+                        return None;
+                    }
+                    let source_start = row.source_range.start.0.checked_sub(range.start.0)?;
+                    let source_end = row.source_range.end.0.checked_sub(range.start.0)?;
+                    let source = source.get(source_start..source_end)?.to_owned().into();
+                    let cells = parsed
+                        .tree
+                        .children(*row_id)
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(column, cell_id)| {
+                            let cell = parsed.tree.node(*cell_id)?;
+                            (cell.kind == NodeKind::TableCell
+                                && (table.alignments.is_empty()
+                                    || column < table.alignments.len()))
+                                .then_some(TableProjectionCell {
+                                    column,
+                                    source_range: cell.source_range,
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                    Some(TableProjectionRow {
+                        source_range: row.source_range,
+                        source,
+                        header,
+                        cells,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
             Some((
                 BlockId(ordinal as u64),
                 TableProjection {
                     source_range: node.source_range,
                     delimiter_range,
                     alignments: table.alignments.clone(),
+                    rows,
                 },
             ))
         })
