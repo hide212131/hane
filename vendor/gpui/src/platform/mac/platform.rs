@@ -2025,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_selection_change_reactivates_only_after_input_source_change() {
+    fn keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders() {
         *TEST_CURRENT_INPUT_SOURCE_SIGNATURE
             .get_or_init(|| Mutex::new(None))
             .lock() = Some(("test.initial".to_owned(), false));
