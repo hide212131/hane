@@ -892,7 +892,7 @@ fn table_cell_intrinsic_widths(
     }
     let preferred = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
     let text = &line.visual_text[visual_range.clone()];
-    let mut minimum = 0.0;
+    let mut minimum: f32 = 0.0;
     let mut run_start = None;
     for (relative, character) in text.char_indices() {
         let offset = visual_range.start + relative;
