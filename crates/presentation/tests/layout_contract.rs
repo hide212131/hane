@@ -342,6 +342,27 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
         .expect("cell source maps to a point");
     assert_eq!(point.row, 0);
     assert!(point.x >= rows[0].table_cells[1].text_x);
+
+    let (aligned_block, aligned_layout) = laid_out("|a|b|\n|---|---:|\n|c|d|")
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("aligned table block");
+    let aligned_row = aligned_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 2)
+        .expect("aligned body row");
+    assert!(aligned_row.table_cells[1].text_x > aligned_row.table_cells[0].text_x);
+    let right_offset = SourceOffset("|a|b|\n|---|---:|\n|c|d|".rfind('d').expect("right cell"));
+    let right_point = aligned_layout
+        .point_for_source(&aligned_block, right_offset, &shaper())
+        .expect("right-aligned cell source maps to a point");
+    assert!(
+        right_point.x >= aligned_row.table_cells[1].text_x,
+        "point {:?} should be inside right cell text origin {}",
+        right_point,
+        aligned_row.table_cells[1].text_x
+    );
 }
 
 #[test]

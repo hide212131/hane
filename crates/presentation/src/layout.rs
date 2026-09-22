@@ -19,7 +19,7 @@
 
 use crate::{ListCaretOrigin, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
-use hane_markdown::BlockId;
+use hane_markdown::{BlockId, TableAlignment};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -126,9 +126,17 @@ impl LayoutLine {
 
     fn x_for_visual(&self, line: &VisualLine, visual: usize, shaper: &dyn LineShaper) -> f32 {
         if !self.table_cells.is_empty()
-            && let Some(cell) = self.table_cells.iter().find(|cell| {
-                cell.visual_range.start <= visual && visual <= cell.visual_range.end
-            })
+            && let Some(cell) = self
+                .table_cells
+                .iter()
+                .enumerate()
+                .find(|(index, cell)| {
+                    cell.visual_range.start <= visual
+                        && (visual < cell.visual_range.end
+                            || (*index + 1 == self.table_cells.len()
+                                && visual == cell.visual_range.end))
+                })
+                .map(|(_, cell)| cell)
         {
             return cell.text_x
                 + shaper.x_for_offset(
@@ -154,9 +162,18 @@ impl LayoutLine {
     }
 
     fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
-        if let Some(cell) = self.table_cells.iter().find(|cell| {
-            x >= cell.x && x <= cell.x + cell.width
-        }) {
+        if let Some(cell) = self
+            .table_cells
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| {
+                x >= cell.x
+                    && (x < cell.x + cell.width
+                        || (*index + 1 == self.table_cells.len()
+                            && x <= cell.x + cell.width))
+            })
+            .map(|(_, cell)| cell)
+        {
             return shaper
                 .offset_for_x(
                     line,
@@ -612,7 +629,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 /// keeps the grid stable across rows and forces long values to remain inside
 /// the editor's existing horizontal viewport. Cell text is still shaped by the
 /// caller's real font; presentation never assumes monospace metrics.
-fn layout_table_block(block: &VisualBlock, width: f32, _shaper: &dyn LineShaper) -> BlockLayout {
+fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
     let columns = block
         .lines
         .iter()
@@ -631,13 +648,24 @@ fn layout_table_block(block: &VisualBlock, width: f32, _shaper: &dyn LineShaper)
         let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
             row.cells
                 .iter()
-                .map(|cell| TableCellLayout {
-                    column: cell.column,
-                    visual_range: cell.visual_range.start.0..cell.visual_range.end.0,
-                    source_range: cell.source_range,
-                    x: cell.column as f32 * column_width,
-                    width: column_width,
-                    text_x: cell.column as f32 * column_width + 8.0,
+                .map(|cell| {
+                    let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+                    let x = cell.column as f32 * column_width;
+                    let inner_width = (column_width - 16.0).max(0.0);
+                    let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+                    let text_x = x + 8.0 + match cell.alignment {
+                        TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
+                        TableAlignment::Right => (inner_width - text_width).max(0.0),
+                        TableAlignment::Default | TableAlignment::Left => 0.0,
+                    };
+                    TableCellLayout {
+                        column: cell.column,
+                        visual_range,
+                        source_range: cell.source_range,
+                        x,
+                        width: column_width,
+                        text_x,
+                    }
                 })
                 .collect()
         });

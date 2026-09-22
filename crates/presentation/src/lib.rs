@@ -4155,6 +4155,17 @@ fn present_table_line(
                     .unwrap_or(TableAlignment::Default),
             });
             column += 1;
+        } else if index > 0 {
+            cells.push(TableCellDisplay {
+                column,
+                source_range: SourceRange::empty(base + cursor),
+                visual_range: VisualRange::new(visual.len(), visual.len()),
+                alignment: alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Default),
+            });
+            column += 1;
         }
         let at = visual.len();
         segments.push(MappingSegment {
@@ -7088,6 +7099,21 @@ mod tests {
             .segments
             .iter()
             .any(|segment| segment.visibility == Visibility::Synthesized));
+        let empty = present_polished_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| x || z |\n".len()),
+            "| x || z |\n",
+            26.0,
+            None,
+            LineContext::Table,
+        );
+        let empty_cells = empty.table_row.as_ref().expect("empty table row").cells.as_slice();
+        assert_eq!(
+            empty_cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(empty_cells[1].visual_range.start == empty_cells[1].visual_range.end);
         let active = present_polished_line(
             1,
             Revision(3),

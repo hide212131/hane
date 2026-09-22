@@ -756,22 +756,22 @@ fn table_row_element(
         elements.push(
             div()
                 .absolute()
-                .left(px(theme.line_horizontal_padding + cell_layout.x * zoom))
+                .left(px(theme.line_horizontal_padding + cell_layout.x))
                 .top(px(0.0))
-                .w(px(cell_layout.width * zoom))
+                .w(px(cell_layout.width))
                 .h(px(row.height))
                 .flex()
                 .items_center()
-                .px(px(8.0 * zoom))
+                .px(px(8.0))
                 .overflow_hidden()
                 .child(text_element),
         );
         elements.push(
             div()
                 .absolute()
-                .left(px(theme.line_horizontal_padding + cell_layout.x * zoom))
+                .left(px(theme.line_horizontal_padding + cell_layout.x))
                 .top(px(0.0))
-                .w(px(1.0 * zoom))
+                .w(px(1.0))
                 .h(px(row.height))
                 .bg(rgb(theme.table_border)),
         );
@@ -782,7 +782,7 @@ fn table_row_element(
             .left(px(theme.line_horizontal_padding))
             .right(px(theme.line_horizontal_padding))
             .bottom(px(0.0))
-            .h(px(1.0 * zoom))
+            .h(px(1.0))
             .bg(rgb(theme.table_border)),
     );
     styled_block(
