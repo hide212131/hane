@@ -246,6 +246,9 @@ command_actions! {
         }
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| {
+        if view.dismiss_file_tab_context_menu(cx) {
+            return;
+        }
         if view.sidebar_filter_is_focused() {
             if view.sidebar_filter_has_composition() {
                 view.cancel_sidebar_filter_composition(cx);
