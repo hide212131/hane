@@ -4156,7 +4156,10 @@ fn table_cells_from_visual_mapping(
     line: &VisualLine,
     alignments: &[TableAlignment],
 ) -> Option<Vec<TableCellDisplay>> {
-    if line.context != LineContext::Table || is_table_delimiter(&line.visual_text) {
+    if line.context != LineContext::Table
+        || line.kind == BlockKind::TableDelimiter
+        || is_table_delimiter(&line.visual_text)
+    {
         return None;
     }
     let content_end = line.visual_text.trim_end_matches(['\r', '\n']).len();

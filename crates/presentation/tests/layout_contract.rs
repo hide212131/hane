@@ -444,6 +444,32 @@ fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
 }
 
 #[test]
+fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
+    let source = "| h | short |\n| --- | --- |\n| a | x |";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let delimiter = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::TableDelimiter)
+        .expect("table delimiter line");
+    assert!(delimiter.visual_text.is_empty());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let delimiter_row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == delimiter.line_id)
+        .expect("table delimiter layout row");
+    assert!(
+        delimiter_row.table_cells.is_empty(),
+        "hidden delimiter rows must not become editing table rows"
+    );
+}
+
+#[test]
 fn table_layout_keeps_shared_columns_when_the_widest_row_is_being_edited() {
     let source = "| h | short |\n| --- | --- |\n| a | the widest cell |\n| b | x |";
     let inactive = present(source, None)

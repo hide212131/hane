@@ -1009,7 +1009,10 @@ fn editing_table_cells(
     line: &VisualLine,
     projection: Option<&TableProjection>,
 ) -> Option<Vec<crate::TableCellDisplay>> {
-    if line.context != LineContext::Table || is_table_delimiter(&line.visual_text) {
+    if line.context != LineContext::Table
+        || line.kind == BlockKind::TableDelimiter
+        || is_table_delimiter(&line.visual_text)
+    {
         return None;
     }
     let alignments = projection.map_or(&[][..], |projection| projection.alignments.as_ref());
