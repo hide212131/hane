@@ -1489,12 +1489,12 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     .unwrap_or("");
                 if let Some(opening_fence) = fence_delimiter(opening_line) {
                     let opening_content_len = opening_line.trim_end_matches(['\r', '\n']).len();
-                    // Only the delimiter run itself (leading indentation plus
-                    // the repeated `` ` `` or `~` bytes) is markup. An info
-                    // string after it — a language identifier such as `rust`
-                    // — is not fence syntax and must stay a visible, editable
-                    // part of the line rather than disappearing into the same
-                    // hidden marker.
+                    // Keep the delimiter run (leading indentation plus the
+                    // repeated `` ` `` or `~` bytes) as its own marker. The
+                    // presenter maps the remaining info string/trailing
+                    // whitespace separately so the opening edge remains
+                    // source-addressable while the inactive row can collapse
+                    // as a whole.
                     let indent = opening_content_len
                         - opening_line[..opening_content_len]
                             .trim_start_matches(' ')

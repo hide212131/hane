@@ -1111,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fenced_block_hides_its_delimiters_and_keeps_the_language_label() {
+    fn a_fenced_block_hides_its_delimiters_and_info_string() {
         let mut editor = Editor::new("```rust\nlet answer = 42;\n```\n");
         // `Editor::new` always places the caret at offset 0, and the disclosure
         // policy keeps a marker visible when the caret touches it (see
@@ -1122,10 +1122,7 @@ mod tests {
             .set_selection(Selection::caret(SourceOffset(12)))
             .unwrap();
         let lines = presented_lines(&editor);
-        assert_eq!(
-            lines[0].visual_text, "rust",
-            "the opening delimiter hides; the info string reads as a label"
-        );
+        assert_eq!(lines[0].visual_text, "");
         assert_eq!(lines[1].visual_text, "let answer = 42;");
         assert_eq!(lines[2].visual_text, "", "the closing fence collapses");
         assert_eq!(
@@ -1320,8 +1317,8 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].visual_text, "");
         assert_eq!(
-            lines[1].visual_text, "rust",
-            "the real opening fence hides, not the leading blank line"
+            lines[1].visual_text, "",
+            "the real opening fence collapses, not the leading blank line"
         );
         assert_eq!(lines[2].visual_text, "let answer = 42;");
         assert_eq!(lines[3].visual_text, "", "the closing fence collapses");

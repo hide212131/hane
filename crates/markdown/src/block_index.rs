@@ -250,7 +250,7 @@ fn build_fence_height_projection(
 ) -> Option<FenceHeightProjection> {
     let line_ranges = source_line_ranges_in(parse_range, block_range, source);
     let mut rows = Vec::new();
-    for (marker, _) in fence_markers {
+    for (marker, edge) in fence_markers {
         let line_index = line_ranges.partition_point(|line| line.end <= marker.start);
         let line = line_ranges
             .get(line_index);
@@ -275,7 +275,16 @@ fn build_fence_height_projection(
         let Some(line_source) = source.get(line_start..line_end) else {
             continue;
         };
-        if remainder.trim().is_empty() {
+        let collapses_when_inactive = match edge {
+            // The opening fence's info string is part of the inactive
+            // structural row now, so its presence must not reserve a line.
+            crate::FenceMarkerEdge::Opening => true,
+            // A closing fence is valid only when the bytes after its
+            // delimiter are whitespace; keep the existing guard for that
+            // edge so a literal closing-lookalike never collapses.
+            crate::FenceMarkerEdge::Closing => remainder.trim().is_empty(),
+        };
+        if collapses_when_inactive {
             let quote_start = quote_markers.partition_point(|(marker, _)| marker.end <= line.start);
             let quote_end = quote_markers.partition_point(|(marker, _)| marker.start < line.end);
             let quote_owners = quote_markers[quote_start..quote_end]
@@ -1382,8 +1391,8 @@ mod tests {
 
         assert_eq!(
             projection.inactive_rows_in(block.source_range, block.source_range, None, true),
-            3,
-            "bare opening/closing and the rust block's closing fence collapse; the rust label does not"
+            4,
+            "both opening rows and both closing fences collapse while inactive"
         );
 
         let bare_opening = source.find("```").expect("bare opening");
@@ -1394,7 +1403,7 @@ mod tests {
                 Some(SourceRange::empty(bare_opening)),
                 true,
             ),
-            2,
+            3,
             "editing a fence restores only that physical row"
         );
 
@@ -1406,7 +1415,7 @@ mod tests {
                 Some(SourceRange::empty(code_start)),
                 true,
             ),
-            3,
+            4,
             "the following row's start does not own the preceding fence row"
         );
     }

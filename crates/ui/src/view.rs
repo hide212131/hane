@@ -8874,7 +8874,7 @@ mod tests {
             DEFAULT_LINE_HEIGHT,
         )
         .expect("late code opening presents");
-        assert_eq!(opening.lines[0].visual_text, "rust");
+        assert_eq!(opening.lines[0].visual_text, "");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range.end.0 > segment.source_range.start.0
@@ -9006,9 +9006,9 @@ mod tests {
             DEFAULT_LINE_HEIGHT,
         )
         .expect("late quote code opening presents");
-        assert_eq!(opening.lines[0].visual_text, "> rust");
+        assert_eq!(opening.lines[0].visual_text, "> ````rust");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
-            segment.visibility == Visibility::HiddenMarkup
+            segment.visibility == Visibility::ExpandedMarkup
                 && segment.marker_edge == Some(MarkerEdge::Opening)
         }));
     }
@@ -9119,7 +9119,7 @@ mod tests {
         )
         .expect("same-line nested fence presents");
         let line = &opening.lines[0];
-        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.visual_text, "• ");
         assert_eq!(line.kind, BlockKind::CodeBlock);
         let list = line.list.as_ref().expect("formal child list metadata");
         assert_eq!(list.role, ListRowRole::Opening);
@@ -9153,7 +9153,7 @@ mod tests {
         )
         .expect("same-line multi-level fence presents");
         let line = &opening.lines[0];
-        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.visual_text, "• ");
         assert_eq!(line.kind, BlockKind::CodeBlock);
         let list = line.list.as_ref().expect("formal child list metadata");
         assert_eq!(list.owner.depth, 3);
