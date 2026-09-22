@@ -386,7 +386,15 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
         .point_for_source(&block, count_offset, &shaper())
         .expect("cell source maps to a point");
     assert_eq!(point.row, 0);
-    assert!(point.x >= rows[0].table_cells[1].text_x);
+    let count_cell = &rows[0].table_cells[1];
+    assert!(
+        count_cell
+            .fragments
+            .iter()
+            .all(|fragment| fragment.text_x >= count_cell.text_x),
+        "cell text origin must be no farther right than any fragment origin"
+    );
+    assert!(point.x >= count_cell.text_x);
 
     let (aligned_block, aligned_layout) = laid_out("|a|b|\n|---|---:|\n|c|d|")
         .into_iter()
@@ -407,6 +415,69 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
         "point {:?} should be inside right cell text origin {}",
         right_point,
         aligned_row.table_cells[1].text_x
+    );
+}
+
+#[test]
+fn empty_table_cells_keep_a_visible_row_for_editing() {
+    let source = "|||\n|---|---|\n|||";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 2)
+        .expect("empty body row");
+
+    assert_eq!(row.table_cells.len(), 2);
+    assert!(row.table_cells.iter().all(|cell| cell.fragments.is_empty()));
+    assert_eq!(row.height, block.lines[row.line].height());
+    assert!(
+        row.height > 0.0,
+        "empty cells must still own an editable row"
+    );
+}
+
+#[test]
+fn aligned_table_hit_testing_uses_the_selected_fragment_origin() {
+    let source = "| a reallylongword |\n| ---: |\n| x |";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row_index = layout
+        .lines
+        .iter()
+        .position(|row| row.line_id == 0)
+        .expect("aligned header row");
+    let row = &layout.lines[row_index];
+    let cell = &row.table_cells[0];
+    let first = cell.fragments.first().expect("wrapped first fragment");
+
+    assert!(first.text_x > cell.text_x);
+    assert_eq!(
+        layout.visual_at_x(&block, row_index, first.text_x, &shaper()),
+        Some(VisualOffset(first.visual_range.start)),
+        "hit testing must measure from the selected fragment's aligned origin"
+    );
+}
+
+#[test]
+fn disclosed_table_headers_keep_the_projected_header_state() {
+    let source = "| Header | body |\n| --- | --- |\n| value | cell |";
+    let active = present(source, Some(source.find("Header").expect("header cell")));
+    let block = active
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let header = block.lines.first().expect("header line");
+
+    assert!(header.table_row.is_none(), "the disclosed row stays raw");
+    assert!(
+        header.table_header,
+        "the projected header state must survive disclosure"
     );
 }
 
@@ -676,6 +747,87 @@ fn table_layout_compresses_overflowing_minimums_without_widening_the_panel() {
             .iter()
             .all(|cell| cell.x + cell.width <= 100.0),
         "compressed table geometry must stay inside the available column"
+    );
+}
+
+#[test]
+fn table_cell_fragments_wrap_visible_text_within_shared_columns() {
+    let source = "| URL | 日本語 |\n| --- | --- |\n| https://example.com/a/very/long/identifier | これは空白のない長い日本語のセルです |\n| short | 別の行 |";
+    let (block, layout) = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 120.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let shaper = shaper();
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[1].table_cells[1].fragments.len() > 1);
+    assert!(rows[1].table_cells[0].fragments.len() > 1);
+
+    for row in &rows {
+        for cell in &row.table_cells {
+            if cell.fragments.is_empty() {
+                assert!(cell.visual_range.is_empty());
+                continue;
+            }
+            assert_eq!(
+                cell.fragments.first().unwrap().visual_range.start,
+                cell.visual_range.start
+            );
+            assert_eq!(
+                cell.fragments.last().unwrap().visual_range.end,
+                cell.visual_range.end
+            );
+            for pair in cell.fragments.windows(2) {
+                assert_eq!(
+                    pair[0].visual_range.end, pair[1].visual_range.start,
+                    "cell fragments must tile visible text without a gap"
+                );
+            }
+            for fragment in &cell.fragments {
+                let text = &block.lines[row.line].visual_text;
+                assert!(text.is_char_boundary(fragment.visual_range.start));
+                assert!(text.is_char_boundary(fragment.visual_range.end));
+                let fragment_width = shaper.x_for_offset(
+                    &block.lines[row.line],
+                    fragment.visual_range.clone(),
+                    fragment.visual_range.end,
+                );
+                assert!(
+                    fragment_width <= cell.width - 16.0 + f32::EPSILON,
+                    "fragment {:?} exceeds its cell content width {}",
+                    fragment.visual_range,
+                    cell.width - 16.0
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        rows[0].table_cells[0].x, rows[1].table_cells[0].x,
+        "wrapping must not move a shared column boundary"
+    );
+    assert_eq!(
+        rows[0].table_cells[0].width, rows[1].table_cells[0].width,
+        "wrapping must not change a shared column width"
+    );
+
+    let identifier = SourceOffset(source.find("identifier").expect("identifier"));
+    let point = layout
+        .point_for_source(&block, identifier, &shaper)
+        .expect("wrapped cell source maps to a point");
+    let row = &rows[1];
+    assert!(
+        point.x >= row.table_cells[0].x + 8.0
+            && point.x <= row.table_cells[0].x + row.table_cells[0].width - 8.0,
+        "caret x must stay inside the wrapped cell"
     );
 }
 

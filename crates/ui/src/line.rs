@@ -18,7 +18,7 @@ use hane_editor::Editor;
 use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight, BlockWindow,
-    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, QUOTE_BAR_WIDTH, TableAlignment,
+    InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, QUOTE_BAR_WIDTH,
     TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset, block_is_joinable,
     block_line_context, block_line_span, expected_disclosures, present_block_with_table_projection,
     trailing_blank_lines,
@@ -790,7 +790,7 @@ fn table_row_element(
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
     let editing = line.table_row.is_none();
     for cell_layout in &row.table_cells {
-        let Some(cell) = table
+        let Some(_cell) = table
             .cells
             .iter()
             .find(|cell| cell.column == cell_layout.column)
@@ -812,68 +812,82 @@ fn table_row_element(
         let cell_range = cell_layout.visual_range.clone();
         let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
         let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
-        let text = line.visual_text[cell_range.clone()].to_owned();
-        let cell_elements = if cell_selected.is_none() && cell_marked.is_none() {
-            let mut text_element = div()
-                .w_full()
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
-                .when(table.header, |element| {
-                    element.font_weight(FontWeight::SEMIBOLD)
-                })
-                .child(text);
-            text_element = match cell.alignment {
-                TableAlignment::Center => text_element.text_center(),
-                TableAlignment::Right => text_element.text_right(),
-                TableAlignment::Default | TableAlignment::Left => text_element.text_left(),
-            };
-            vec![text_element]
-        } else {
-            line_segments(
-                cell_range.clone(),
-                None,
-                cell_selected,
-                cell_marked,
-                &line.style_runs,
-                None,
-            )
-            .into_iter()
-            .filter(|segment| !segment.visual_range.is_empty())
-            .map(|segment| {
-                let x = cell_layout.text_x - cell_layout.x
-                    + shaper.x_for_offset(line, cell_range.clone(), segment.visual_range.start);
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(0.0))
-                    .h(px(row.height))
-                    .flex()
-                    .items_center()
-                    .whitespace_nowrap()
-                    .when(segment.selected, |element| {
-                        element.bg(rgb(theme.selection_background))
+        let cell_elements = cell_layout
+            .fragments
+            .iter()
+            .flat_map(|fragment| {
+                let fragment_range = fragment.visual_range.clone();
+                let fragment_selected =
+                    clip_visual_range(cell_selected.as_ref(), fragment_range.clone());
+                let fragment_marked =
+                    clip_visual_range(cell_marked.as_ref(), fragment_range.clone());
+                if fragment_selected.is_none() && fragment_marked.is_none() {
+                    let text = line.visual_text[fragment_range].to_owned();
+                    let text_element = div()
+                        .absolute()
+                        .left(px(fragment.text_x - cell_layout.x))
+                        .top(px(fragment.y))
+                        .h(px(fragment.height))
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .when(table.header, |element| {
+                            element.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .child(text);
+                    vec![text_element]
+                } else {
+                    line_segments(
+                        fragment_range.clone(),
+                        None,
+                        fragment_selected,
+                        fragment_marked,
+                        &line.style_runs,
+                        None,
+                    )
+                    .into_iter()
+                    .filter(|segment| !segment.visual_range.is_empty())
+                    .map(|segment| {
+                        let x = fragment.text_x - cell_layout.x
+                            + shaper.x_for_offset(
+                                line,
+                                fragment_range.clone(),
+                                segment.visual_range.start,
+                            );
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(fragment.y))
+                            .h(px(fragment.height))
+                            .flex()
+                            .items_center()
+                            .whitespace_nowrap()
+                            .when(segment.selected, |element| {
+                                element.bg(rgb(theme.selection_background))
+                            })
+                            .when(segment.marked || segment.display.underline, |element| {
+                                element.underline()
+                            })
+                            .when(table.header, |element| {
+                                element.font_weight(FontWeight::SEMIBOLD)
+                            })
+                            .when(segment.display.bold, |element| {
+                                element.font_weight(FontWeight::BOLD)
+                            })
+                            .when(segment.display.italic, |element| element.italic())
+                            .when(segment.display.strikethrough, |element| {
+                                element.line_through()
+                            })
+                            .when(segment.display.monospace, |element| {
+                                element.font_family("ui-monospace")
+                            })
+                            .child(line.visual_text[segment.visual_range].to_owned())
                     })
-                    .when(segment.marked || segment.display.underline, |element| {
-                        element.underline()
-                    })
-                    .when(table.header, |element| {
-                        element.font_weight(FontWeight::SEMIBOLD)
-                    })
-                    .when(segment.display.bold, |element| {
-                        element.font_weight(FontWeight::BOLD)
-                    })
-                    .when(segment.display.italic, |element| element.italic())
-                    .when(segment.display.strikethrough, |element| {
-                        element.line_through()
-                    })
-                    .when(segment.display.monospace, |element| {
-                        element.font_family("ui-monospace")
-                    })
-                    .child(line.visual_text[segment.visual_range].to_owned())
+                    .collect::<Vec<_>>()
+                }
             })
-            .collect::<Vec<_>>()
-        };
+            .collect::<Vec<_>>();
         elements.push(
             div()
                 .absolute()
