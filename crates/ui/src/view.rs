@@ -10267,6 +10267,50 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn source_first_list_editing_exits_list_after_empty_marker_backspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\n- def", "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(14)));
+
+            let index = BlockIndex::from_buffer(view.editor().document());
+            let projection = index
+                .list_edit_projection_at(view.editor().document(), SourceOffset(14))
+                .expect("current list edit projection");
+            let (_, empty_item) = projection
+                .item_at(SourceOffset(14))
+                .expect("the parser/projection must own the empty marker");
+            assert_eq!(empty_item.prefix_range, SourceRange::new(12, 14));
+            assert_eq!(empty_item.body_range, SourceRange::new(14, 14));
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
+
+            let index = BlockIndex::from_buffer(view.editor().document());
+            let projection = index
+                .list_edit_projection_at(view.editor().document(), SourceOffset(12))
+                .expect("current projection after marker removal");
+            assert!(
+                projection.item_at(SourceOffset(12)).is_none(),
+                "the paragraph caret must no longer be owned by the preceding list item: {projection:#?}"
+            );
+
+            view.editor_mut().insert_text("xyz").unwrap();
+            view.after_input(cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\nxyz");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(15)));
+        });
+    }
+
     #[test]
     fn every_line_resolves_to_its_markdown_block() {
         let source = "# title\n\nparagraph one\ncontinued\n\n```rust\nlet x = 1;\n```\n\ntail\n";
