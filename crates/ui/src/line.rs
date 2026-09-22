@@ -783,10 +783,16 @@ fn table_row_element(
     let marked_visual = editor
         .ime()
         .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
-    let cursor_x = layout
+    let cursor_geometry = layout
         .point_for_source(block, editor.selection().active, shaper)
         .filter(|point| point.row == row_index)
-        .map(|point| point.x);
+        .map(|point| {
+            (
+                point.x,
+                point.y - layout.leading_space - row.y,
+                point.height,
+            )
+        });
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
     let editing = line.table_row.is_none();
     for cell_layout in &row.table_cells {
@@ -931,13 +937,13 @@ fn table_row_element(
             .h(px(1.0))
             .bg(rgb(theme.table_border)),
     );
-    if let Some(cursor_x) = cursor_x {
+    if let Some((cursor_x, cursor_y, cursor_height)) = cursor_geometry {
         elements.push(
             div()
                 .absolute()
                 .left(px(theme.line_horizontal_padding + cursor_x))
-                .top(px(0.0))
-                .h(px(row.height))
+                .top(px(cursor_y))
+                .h(px(cursor_height))
                 .child(cursor_overlay(theme, caret_input_mode)),
         );
     }
