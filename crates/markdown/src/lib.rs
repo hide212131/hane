@@ -34,15 +34,17 @@ mod list_editing;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
-    PublishOutcome,
+    PublishOutcome, TableProjection, TableProjectionCell, TableProjectionRow,
 };
 pub use list_editing::{
-    build_list_edit_projection, plan_list_edit, ListEditIntent, ListEditItem,
-    ListEditPlanResult, ListEditProjection, ListMarker, MarkdownEditPlan, SourceSelection,
+    ListEditIntent, ListEditItem, ListEditPlanResult, ListEditProjection, ListMarker,
+    MarkdownEditPlan, SourceSelection, build_list_edit_projection, plan_list_edit,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Markdown *syntax* kind, as written in the source.
@@ -163,6 +165,23 @@ pub struct MarkdownNode {
     pub depth: usize,
 }
 
+/// Alignment declared by a GFM pipe-table delimiter row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableAlignment {
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+/// Table-level parser metadata kept beside the syntax tree so the alignment
+/// vector from pulldown-cmark is not lost when `Tag::Table` becomes `NodeKind`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableParse {
+    pub node: NodeId,
+    pub alignments: Arc<[TableAlignment]>,
+}
+
 /// Block/inline node tree for one parsed source slice: parent/child structure,
 /// document order, and a source range on every node.
 ///
@@ -258,6 +277,8 @@ pub struct MarkdownParse {
     pub revision: Revision,
     pub source_range: SourceRange,
     pub tree: MarkdownTree,
+    /// Alignment metadata for each parsed table node, keyed by its tree node.
+    pub table_parses: Vec<TableParse>,
     /// Sorted, non-overlapping source ranges of the syntactic markers (heading
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
@@ -302,6 +323,303 @@ pub struct MarkdownParse {
     pub line_break_padding: Vec<SourceRange>,
 }
 
+/// Block-local geometry metadata for fenced-code rows that collapse to zero
+/// height while inactive. This is deliberately separate from [`ListProjection`]:
+/// incremental block parsing can keep this geometry current even while formal
+/// list numbering/container semantics are temporarily unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FenceHeightProjection {
+    rows: Vec<FenceHeightRow>,
+    /// Fence rows grouped by the quote owner whose prefix is present on that
+    /// row. The groups are disjoint: nested quote prefixes use the outermost
+    /// owner on a line, because touching an inner owner also touches that
+    /// owner's enclosing quote. Keeping this reverse index makes disclosure
+    /// queries proportional to quote nesting, not to every fence in a block.
+    quote_owner_rows: Vec<FenceQuoteOwnerRows>,
+    /// Prefix count for rows that carry a quote prefix. It lets the direct
+    /// fence-range query subtract rows already counted through the quote index
+    /// without scanning the rows themselves.
+    quote_row_prefix: Vec<usize>,
+    /// Prefix maximum of quote-owner ends, aligned with `quote_owner_rows`.
+    /// It skips owners that cannot contain a point disclosure before scanning
+    /// the small set of overlapping/nested owners.
+    quote_owner_max_end: Vec<SourceOffset>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FenceHeightRow {
+    range: SourceRange,
+    /// Zero-based physical line within the owning block. Keeping this beside
+    /// the source range lets render-time geometry answer prefix queries without
+    /// walking the block's source lines.
+    line: usize,
+    owns_end: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FenceQuoteOwnerRows {
+    owner: SourceRange,
+    rows: Vec<usize>,
+}
+
+impl FenceHeightProjection {
+    pub(crate) fn from_absolute_rows(
+        block_range: SourceRange,
+        rows: Vec<(SourceRange, bool, Vec<SourceRange>, usize)>,
+    ) -> Self {
+        let mut normalized = rows
+            .into_iter()
+            .map(|(range, owns_end, quote_owners, line)| {
+                let range = SourceRange::new(
+                    range.start.0.saturating_sub(block_range.start.0),
+                    range.end.0.saturating_sub(block_range.start.0),
+                );
+                let mut quote_owners = quote_owners
+                    .into_iter()
+                    .map(|owner| {
+                        SourceRange::new(
+                            owner.start.0.saturating_sub(block_range.start.0),
+                            owner.end.0.saturating_sub(block_range.start.0),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                quote_owners.sort_by_key(|owner| (owner.start, owner.end));
+                quote_owners.dedup();
+                (range, owns_end, quote_owners, line)
+            })
+            .collect::<Vec<_>>();
+        normalized.sort_by_key(|(range, _, _, line)| (range.start, range.end, *line));
+        let mut deduplicated: Vec<(SourceRange, bool, Vec<SourceRange>, usize)> =
+            Vec::with_capacity(normalized.len());
+        for (range, owns_end, quote_owners, line) in normalized {
+            if let Some((last_range, last_owns_end, last_quote_owners, _last_line)) =
+                deduplicated.last_mut()
+                && *last_range == range
+            {
+                *last_owns_end |= owns_end;
+                last_quote_owners.extend(quote_owners);
+                last_quote_owners.sort_by_key(|owner| (owner.start, owner.end));
+                last_quote_owners.dedup();
+            } else {
+                deduplicated.push((range, owns_end, quote_owners, line));
+            }
+        }
+        let rows = deduplicated
+            .iter()
+            .map(|(range, owns_end, _, line)| FenceHeightRow {
+                range: *range,
+                line: *line,
+                owns_end: *owns_end,
+            })
+            .collect::<Vec<_>>();
+        let mut owner_rows = HashMap::<SourceRange, Vec<usize>>::new();
+        let mut quote_row_prefix = Vec::with_capacity(rows.len() + 1);
+        quote_row_prefix.push(0);
+        for (index, (_, _, quote_owners, _)) in deduplicated.iter().enumerate() {
+            // Nested quote owners are nested source ranges. Choosing the
+            // outermost actual prefix makes the groups disjoint while keeping
+            // the disclosure rule exact: an inner disclosure also touches its
+            // enclosing quote owner.
+            let owner = quote_owners
+                .iter()
+                .min_by_key(|owner| (owner.start, std::cmp::Reverse(owner.end)))
+                .copied();
+            if let Some(owner) = owner {
+                owner_rows.entry(owner).or_default().push(index);
+                quote_row_prefix.push(quote_row_prefix[index] + 1);
+            } else {
+                quote_row_prefix.push(quote_row_prefix[index]);
+            }
+        }
+        let mut quote_owner_rows = owner_rows
+            .into_iter()
+            .map(|(owner, rows)| FenceQuoteOwnerRows { owner, rows })
+            .collect::<Vec<_>>();
+        quote_owner_rows.sort_by_key(|entry| (entry.owner.start, entry.owner.end));
+        let mut quote_owner_max_end = Vec::with_capacity(quote_owner_rows.len());
+        let mut max_end = SourceOffset(0);
+        for entry in &quote_owner_rows {
+            max_end = max_end.max(entry.owner.end);
+            quote_owner_max_end.push(max_end);
+        }
+        Self {
+            rows,
+            quote_owner_rows,
+            quote_row_prefix,
+            quote_owner_max_end,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Counts rows in `range` that remain collapsed under the current
+    /// disclosure. Ranges stored here are block-relative, so byte edits in
+    /// earlier blocks do not require rebasing this projection. `block_is_final`
+    /// supplies the current block topology for the document-end quote-owner
+    /// exception; it is intentionally not cached in the projection because
+    /// incremental edits can change which block is final without reparsing it.
+    pub fn inactive_rows_in(
+        &self,
+        block_range: SourceRange,
+        range: SourceRange,
+        disclosure: Option<SourceRange>,
+        block_is_final: bool,
+    ) -> usize {
+        if range.is_empty() || self.rows.is_empty() {
+            return 0;
+        }
+        let relative = SourceRange::new(
+            range.start.0.saturating_sub(block_range.start.0),
+            range.end.0.saturating_sub(block_range.start.0),
+        );
+        let start = self
+            .rows
+            .partition_point(|row| row.range.end <= relative.start);
+        let end = self
+            .rows
+            .partition_point(|row| row.range.start < relative.end);
+        self.inactive_rows_in_indices(block_range, start..end, disclosure, block_is_final)
+    }
+
+    /// Counts rows before a physical line boundary that remain collapsed under
+    /// `disclosure`. This is the render-time prefix query used to translate a
+    /// visual y position back to a source-line window. Its cost is bounded by
+    /// binary searches over the projection, independent of the total block
+    /// length or fence count. See [`Self::inactive_rows_in`] for the meaning
+    /// of `block_is_final`.
+    pub fn inactive_rows_before_line(
+        &self,
+        block_range: SourceRange,
+        line: usize,
+        disclosure: Option<SourceRange>,
+        block_is_final: bool,
+    ) -> usize {
+        let end = self.rows.partition_point(|row| row.line < line);
+        self.inactive_rows_in_indices(block_range, 0..end, disclosure, block_is_final)
+    }
+
+    /// Whether a physical block-relative line is one of the fence rows this
+    /// projection can collapse. Keeping this as a binary-search query lets the
+    /// UI use a cached wrapped layout to recover the measured height of a
+    /// visible fence row without enumerating the block's off-screen fences.
+    pub fn is_fence_row_line(&self, line: usize) -> bool {
+        let start = self.rows.partition_point(|row| row.line < line);
+        self.rows.get(start).is_some_and(|row| row.line == line)
+    }
+
+    fn inactive_rows_in_indices(
+        &self,
+        block_range: SourceRange,
+        indices: Range<usize>,
+        disclosure: Option<SourceRange>,
+        block_is_final: bool,
+    ) -> usize {
+        let rows = &self.rows[indices.clone()];
+        let Some(disclosure) = disclosure else {
+            return rows.len();
+        };
+        if disclosure.is_empty() {
+            if disclosure.start < block_range.start || disclosure.start > block_range.end {
+                return rows.len();
+            }
+            let caret = SourceOffset(disclosure.start.0 - block_range.start.0);
+            let relative_active = rows.partition_point(|row| {
+                row.range.end < caret || (row.range.end == caret && !row.owns_end)
+            });
+            let active_row = rows
+                .get(relative_active)
+                .filter(|row| {
+                    row.range.start <= caret
+                        && (caret < row.range.end || (row.owns_end && caret == row.range.end))
+                })
+                .map(|_| indices.start + relative_active);
+            let caret_absolute = block_range.start.0 + caret.0;
+            let quote_active = self.active_quote_rows_in(
+                indices.clone(),
+                SourceRange::empty(caret.0),
+                caret_absolute < block_range.end.0
+                    || (block_is_final && caret_absolute == block_range.end.0),
+            );
+            let direct_active = usize::from(active_row.is_some());
+            let direct_already_counted = active_row
+                .is_some_and(|row| self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]);
+            return rows.len().saturating_sub(
+                quote_active + direct_active - usize::from(direct_already_counted),
+            );
+        }
+        // A non-empty selection only discloses the part of a block that it
+        // actually intersects. Do this test before converting to block-
+        // relative offsets: `saturating_sub` would otherwise turn a range
+        // wholly before the block into `0..0`, which can be mistaken for a
+        // caret on the block's first row by the quote-owner index.
+        if !block_range.intersects(disclosure) {
+            return rows.len();
+        }
+        let disclosure = SourceRange::new(
+            disclosure
+                .start
+                .0
+                .max(block_range.start.0)
+                .min(block_range.end.0)
+                - block_range.start.0,
+            disclosure
+                .end
+                .0
+                .min(block_range.end.0)
+                .max(block_range.start.0)
+                - block_range.start.0,
+        );
+        let active_start = rows.partition_point(|row| row.range.end <= disclosure.start);
+        let active_end = rows.partition_point(|row| row.range.start < disclosure.end);
+        let direct_active = active_end.saturating_sub(active_start);
+        let direct_already_counted = self.quote_row_prefix[indices.start + active_end]
+            .saturating_sub(self.quote_row_prefix[indices.start + active_start]);
+        let quote_active = self.active_quote_rows_in(indices, disclosure, false);
+        rows.len()
+            .saturating_sub(quote_active + direct_active - direct_already_counted)
+    }
+
+    fn active_quote_rows_in(
+        &self,
+        rows: Range<usize>,
+        disclosure: SourceRange,
+        allow_owner_end: bool,
+    ) -> usize {
+        if self.quote_owner_rows.is_empty() {
+            return 0;
+        }
+        let owner_end = if disclosure.is_empty() {
+            self.quote_owner_rows
+                .partition_point(|entry| entry.owner.start <= disclosure.start)
+        } else {
+            self.quote_owner_rows
+                .partition_point(|entry| entry.owner.start < disclosure.end)
+        };
+        let owner_start = if disclosure.is_empty() {
+            self.quote_owner_max_end[..owner_end].partition_point(|end| *end < disclosure.start)
+        } else {
+            self.quote_owner_max_end[..owner_end].partition_point(|end| *end <= disclosure.start)
+        };
+        self.quote_owner_rows[owner_start..owner_end]
+            .iter()
+            .filter(|entry| {
+                if disclosure.is_empty() {
+                    entry.owner.end > disclosure.start
+                        || (allow_owner_end && entry.owner.end == disclosure.start)
+                } else {
+                    entry.owner.end > disclosure.start
+                }
+            })
+            .map(|entry| {
+                let start = entry.rows.partition_point(|row| *row < rows.start);
+                let end = entry.rows.partition_point(|row| *row < rows.end);
+                end.saturating_sub(start)
+            })
+            .sum()
+    }
+}
 /// Document-wide list information retained by a formal [`BlockIndex`] so a
 /// viewport-only presentation can keep the same numbering and nesting while
 /// the block's full Markdown parse is still being prepared in the background.
@@ -313,13 +631,17 @@ pub struct ListProjection {
     pub items: Vec<ListProjectionItem>,
     pub prefixes: Vec<ListProjectionPrefix>,
     pub lists: Vec<ListProjectionList>,
+    /// Formal quote containers intersecting the owning block. This keeps quote
+    /// depth available when a bounded viewport parse starts on a continuation
+    /// line and cannot recover the quote's ancestors from that line alone.
+    quotes: Vec<QuoteProjection>,
     rows: Vec<ListProjectionRow>,
     fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
     /// Formal quote/list prefix ranges paired with the owning quote's source
     /// range, when the marker belongs to a quote. List marker ownership is
     /// resolved through `items` by range so nested list items retain their own
     /// metadata without leaking a `NodeId` across parse trees.
-    container_markers: Vec<(SourceRange, Option<SourceRange>)>,
+    container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,6 +660,12 @@ pub struct ListProjectionPrefix {
     pub source_range: SourceRange,
     pub item_range: SourceRange,
     pub columns: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuoteProjection {
+    pub source_range: SourceRange,
+    pub depth: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -367,14 +695,16 @@ impl ListProjection {
         items: Vec<ListProjectionItem>,
         prefixes: Vec<ListProjectionPrefix>,
         lists: Vec<ListProjectionList>,
+        quotes: Vec<QuoteProjection>,
         rows: Vec<ListProjectionRow>,
         fence_markers: Vec<(SourceRange, FenceMarkerEdge)>,
-        container_markers: Vec<(SourceRange, Option<SourceRange>)>,
+        container_markers: Vec<(SourceRange, Option<SourceRange>, usize)>,
     ) -> Self {
         Self {
             items,
             prefixes,
             lists,
+            quotes,
             rows,
             fence_markers,
             container_markers,
@@ -417,17 +747,27 @@ impl ListProjection {
     pub fn container_markers_in(
         &self,
         range: SourceRange,
-    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>)> + '_ {
+    ) -> impl Iterator<Item = (SourceRange, Option<SourceRange>, usize)> + '_ {
         let start = self
             .container_markers
-            .partition_point(|(marker, _)| marker.end <= range.start);
+            .partition_point(|(marker, _, _)| marker.end <= range.start);
         let end = self
             .container_markers
-            .partition_point(|(marker, _)| marker.start < range.end);
+            .partition_point(|(marker, _, _)| marker.start < range.end);
         self.container_markers[start..end]
             .iter()
             .copied()
-            .filter(move |(marker, _)| marker.intersects(range))
+            .filter(move |(marker, _, _)| marker.intersects(range))
+    }
+
+    /// Formal quote containers intersecting `range`, ordered by source range.
+    /// Presentation uses this for rows whose bounded parse sees only a lazy
+    /// continuation and therefore has no local quote marker or ancestor.
+    pub fn quotes_in(&self, range: SourceRange) -> impl Iterator<Item = QuoteProjection> + '_ {
+        self.quotes
+            .iter()
+            .copied()
+            .filter(move |quote| quote.source_range.intersects(range))
     }
 
     pub fn item_for_marker(&self, marker_range: SourceRange) -> Option<&ListProjectionItem> {
@@ -563,7 +903,7 @@ pub const fn fence_closes(opening: FenceDelimiter, candidate: FenceDelimiter) ->
 pub fn is_table_delimiter(source: &str) -> bool {
     let content = source.trim_end_matches(['\r', '\n']).trim();
     let cells = content.trim_matches('|').split('|').collect::<Vec<_>>();
-    cells.len() >= 2
+    !cells.is_empty()
         && cells.iter().all(|cell| {
             let trimmed = cell.trim().trim_matches(':');
             trimmed.len() >= 3 && trimmed.bytes().all(|byte| byte == b'-')
@@ -1179,12 +1519,12 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     .unwrap_or("");
                 if let Some(opening_fence) = fence_delimiter(opening_line) {
                     let opening_content_len = opening_line.trim_end_matches(['\r', '\n']).len();
-                    // Only the delimiter run itself (leading indentation plus
-                    // the repeated `` ` `` or `~` bytes) is markup. An info
-                    // string after it — a language identifier such as `rust`
-                    // — is not fence syntax and must stay a visible, editable
-                    // part of the line rather than disappearing into the same
-                    // hidden marker.
+                    // Keep the delimiter run (leading indentation plus the
+                    // repeated `` ` `` or `~` bytes) as its own marker. The
+                    // presenter maps the remaining info string/trailing
+                    // whitespace separately so the opening edge remains
+                    // source-addressable while the inactive row can collapse
+                    // as a whole.
                     let indent = opening_content_len
                         - opening_line[..opening_content_len]
                             .trim_start_matches(' ')
@@ -1208,7 +1548,8 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     // so the block's real last logical line — not a
                     // prefix-contaminated lookalike such as `"> ```"` — is
                     // what gets checked against the opening fence.
-                    let containers = ancestor_containers(tree, id, range, source).unwrap_or_default();
+                    let containers =
+                        ancestor_containers(tree, id, range, source).unwrap_or_default();
                     let mut line_start = node_start + opening_line.len();
                     let mut last_logical: Option<(usize, &str)> = None;
                     for line in markdown_lines(&source[line_start..node_end]) {
@@ -1217,8 +1558,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                         let logical_start =
                             consume_containers(&containers, this_line_start, line.as_bytes())
                                 .map_or(this_line_start, |cursor| this_line_start + cursor.byte);
-                        last_logical =
-                            Some((logical_start, &source[logical_start..this_line_start + line.len()]));
+                        last_logical = Some((
+                            logical_start,
+                            &source[logical_start..this_line_start + line.len()],
+                        ));
                     }
                     // A closing-shaped last line only really closes the fence
                     // when it repeats the opening's own marker character at
@@ -1486,8 +1829,12 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 /// pairs push and pop; every other event becomes a leaf under the open
 /// container. Unmodeled tags still push a node so the stack stays balanced and
 /// their source range remains reachable.
-fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<ParsedCodeSpan>) {
+fn build_tree(
+    source_range: SourceRange,
+    source: &str,
+) -> (MarkdownTree, Vec<ParsedCodeSpan>, Vec<TableParse>) {
     let mut codes = Vec::new();
+    let mut tables = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -1520,6 +1867,21 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
         match event {
             Event::Start(tag) => {
                 let id = push(&mut nodes, &open, node_kind_for_tag(&tag), range);
+                if let Tag::Table(alignments) = &tag {
+                    tables.push(TableParse {
+                        node: id,
+                        alignments: alignments
+                            .iter()
+                            .map(|alignment| match alignment {
+                                pulldown_cmark::Alignment::None => TableAlignment::Default,
+                                pulldown_cmark::Alignment::Left => TableAlignment::Left,
+                                pulldown_cmark::Alignment::Center => TableAlignment::Center,
+                                pulldown_cmark::Alignment::Right => TableAlignment::Right,
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    });
+                }
                 open.push(id);
             }
             Event::End(_) => {
@@ -1568,7 +1930,7 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
             }
         }
     }
-    (MarkdownTree { nodes }, codes)
+    (MarkdownTree { nodes }, codes, tables)
 }
 
 /// Parses a source slice into a node tree and retains the byte range of every
@@ -1580,7 +1942,7 @@ pub fn parse_document(
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let (tree, codes) = build_tree(source_range, source);
+    let (tree, codes, table_parses) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
@@ -1589,6 +1951,7 @@ pub fn parse_document(
         revision,
         source_range,
         tree,
+        table_parses,
         markers: markers.markers,
         fence_markers: markers.fence_markers,
         fence_marker_edges: markers.fence_marker_edges,
@@ -1654,6 +2017,35 @@ mod tests {
             .map(|marker| &source[marker.start.0..marker.end.0])
             .collect::<Vec<_>>();
         assert_eq!(covered, vec!["> ", "```", "> ", "> ", "```"]);
+    }
+
+    #[test]
+    fn fence_height_projection_answers_physical_line_prefixes() {
+        let block_range = SourceRange::new(100, 500);
+        let projection = FenceHeightProjection::from_absolute_rows(
+            block_range,
+            vec![
+                (SourceRange::new(100, 104), true, Vec::new(), 0),
+                (SourceRange::new(300, 304), true, Vec::new(), 200),
+            ],
+        );
+
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 0, None, true),
+            0
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 1, None, true),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 200, None, true),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_before_line(block_range, 201, None, true),
+            2
+        );
     }
 
     #[test]
@@ -1797,6 +2189,44 @@ mod tests {
                 "each row has two cells"
             );
         }
+    }
+
+    #[test]
+    fn table_parse_retains_delimiter_alignments() {
+        let source =
+            "| left | center | right | default |\n|:---|:---:|---:|---|\n| a | b | c | d |";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert_eq!(parsed.table_parses.len(), 1);
+        assert_eq!(
+            parsed.table_parses[0].alignments.as_ref(),
+            &[
+                TableAlignment::Left,
+                TableAlignment::Center,
+                TableAlignment::Right,
+                TableAlignment::Default,
+            ]
+        );
+    }
+
+    #[test]
+    fn formal_block_index_exposes_compact_table_projection() {
+        let source = "| left | right |\n|:---|---:|\n| a | b |";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("table block");
+        let projection = index.table_projection(&block).expect("table projection");
+        assert_eq!(projection.delimiter_range, Some(SourceRange::new(17, 29)));
+        assert_eq!(
+            projection.alignments.as_ref(),
+            &[TableAlignment::Left, TableAlignment::Right]
+        );
+        assert_eq!(projection.rows.len(), 2);
+        assert!(projection.rows[0].header);
+        assert_eq!(
+            projection.rows[0].source.trim_end_matches(['\r', '\n']),
+            "| left | right |"
+        );
+        assert_eq!(projection.rows[0].cells.len(), 2);
+        assert!(!projection.rows[1].header);
     }
 
     #[test]

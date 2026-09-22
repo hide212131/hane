@@ -24,12 +24,15 @@
 
 use crate::block_store::BlockStore;
 use crate::{
-    ListProjection, ListProjectionItem, ListProjectionList, ListProjectionPrefix,
-    ListProjectionRow, ListEditProjection, MarkdownParse, MarkdownTree, NodeKind,
-    build_list_edit_projection, markdown_lines, parse_document,
+    FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
+    ListProjectionList, ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree,
+    NodeKind, QuoteProjection, TableAlignment, build_list_edit_projection, is_table_delimiter,
+    markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Bytes a single incremental update may re-parse while hunting for a
@@ -87,6 +90,39 @@ pub struct IndexedBlock {
     /// tiling starts at byte zero; keeping the offset in the index lets the UI
     /// locate a fenced block's opening line without rescanning those blanks.
     pub leading_content_lines: usize,
+}
+
+/// One cell in the formal source projection of a table row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionCell {
+    pub column: usize,
+    pub source_range: SourceRange,
+}
+
+/// One physical table row retained by the formal source projection.
+///
+/// The source text is the exact row slice from the parsed revision. Keeping it
+/// here lets presentation measure a row that is outside the current viewport
+/// without reparsing a shortened visual line or depending on which rows happen
+/// to be materialized by virtualization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjectionRow {
+    pub source_range: SourceRange,
+    pub source: Arc<str>,
+    pub header: bool,
+    pub cells: Arc<[TableProjectionCell]>,
+}
+
+/// Formal table metadata used by presentation for rows outside the current
+/// viewport. The row source is tied to the same formal parse revision as the
+/// block, so it is discarded with the projection when an incremental update
+/// makes the index provisional.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjection {
+    pub source_range: SourceRange,
+    pub delimiter_range: Option<SourceRange>,
+    pub alignments: Arc<[TableAlignment]>,
+    pub rows: Arc<[TableProjectionRow]>,
 }
 
 impl IndexedBlock {
@@ -206,6 +242,152 @@ fn source_line_ranges(range: SourceRange, source: &str) -> Vec<SourceRange> {
     ranges
 }
 
+fn source_line_ranges_in(
+    parse_range: SourceRange,
+    range: SourceRange,
+    source: &str,
+) -> Vec<SourceRange> {
+    let mut ranges = Vec::new();
+    let mut start = range.start.0;
+    while start < range.end.0 {
+        let relative = start.saturating_sub(parse_range.start.0);
+        let relative_end = range.end.0.saturating_sub(parse_range.start.0);
+        let Some(tail) = source.get(relative..relative_end) else {
+            break;
+        };
+        let end = tail.find(['\r', '\n']).map_or(tail.len(), |offset| {
+            offset
+                + if tail.as_bytes()[offset] == b'\r'
+                    && tail.as_bytes().get(offset + 1) == Some(&b'\n')
+                {
+                    2
+                } else {
+                    1
+                }
+        });
+        let next = (start + end).min(range.end.0);
+        if next <= start {
+            break;
+        }
+        ranges.push(SourceRange::new(start, next));
+        start = next;
+    }
+    ranges
+}
+
+fn build_fence_height_projection(
+    block_range: SourceRange,
+    parse_range: SourceRange,
+    source: &str,
+    fence_markers: &[(SourceRange, crate::FenceMarkerEdge)],
+    list_item_markers: &[SourceRange],
+    quote_markers: &[(SourceRange, SourceRange)],
+) -> Option<FenceHeightProjection> {
+    let line_ranges = source_line_ranges_in(parse_range, block_range, source);
+    let mut rows = Vec::new();
+    for (marker, edge) in fence_markers {
+        let line_index = line_ranges.partition_point(|line| line.end <= marker.start);
+        let line = line_ranges.get(line_index);
+        let Some(line) = line else {
+            continue;
+        };
+        if !line.intersects(*marker) {
+            continue;
+        }
+        let item_marker = list_item_markers
+            .get(list_item_markers.partition_point(|candidate| candidate.end <= line.start))
+            .is_some_and(|candidate| candidate.start < line.end);
+        if item_marker {
+            continue;
+        }
+        let remainder_start = marker.end.0.saturating_sub(parse_range.start.0);
+        let line_end = line.end.0.saturating_sub(parse_range.start.0);
+        let line_start = line.start.0.saturating_sub(parse_range.start.0);
+        let Some(remainder) = source.get(remainder_start..line_end) else {
+            continue;
+        };
+        let Some(line_source) = source.get(line_start..line_end) else {
+            continue;
+        };
+        let collapses_when_inactive = match edge {
+            // The opening fence's info string is part of the inactive
+            // structural row now, so its presence must not reserve a line.
+            crate::FenceMarkerEdge::Opening => true,
+            // A closing fence is valid only when the bytes after its
+            // delimiter are whitespace; keep the existing guard for that
+            // edge so a literal closing-lookalike never collapses.
+            crate::FenceMarkerEdge::Closing => remainder.trim().is_empty(),
+        };
+        if collapses_when_inactive {
+            let quote_start = quote_markers.partition_point(|(marker, _)| marker.end <= line.start);
+            let quote_end = quote_markers.partition_point(|(marker, _)| marker.start < line.end);
+            let quote_owners = quote_markers[quote_start..quote_end]
+                .iter()
+                .map(|(_, owner)| *owner)
+                .collect();
+            rows.push((
+                *line,
+                !line_source.ends_with(['\n', '\r']),
+                quote_owners,
+                line_index,
+            ));
+        }
+    }
+    let projection = FenceHeightProjection::from_absolute_rows(block_range, rows);
+    (!projection.is_empty()).then_some(projection)
+}
+
+fn build_fence_height_projections(
+    parsed: &MarkdownParse,
+    blocks: &[TiledBlock],
+    range: SourceRange,
+    source: &str,
+) -> Vec<Option<FenceHeightProjection>> {
+    let block_ranges = blocks
+        .iter()
+        .scan(range.start.0, |start, (_, length, _, _)| {
+            let block = SourceRange::new(*start, *start + *length);
+            *start = block.end.0;
+            Some(block)
+        })
+        .collect::<Vec<_>>();
+    let mut list_item_markers = parsed
+        .list_item_markers
+        .iter()
+        .map(|(marker, _)| *marker)
+        .collect::<Vec<_>>();
+    list_item_markers.sort_by_key(|marker| (marker.start, marker.end));
+    let mut quote_markers = parsed
+        .quote_markers
+        .iter()
+        .filter_map(|(marker, owner)| {
+            parsed
+                .tree
+                .node(*owner)
+                .map(|quote| (*marker, quote.source_range))
+        })
+        .collect::<Vec<_>>();
+    quote_markers.sort_by_key(|(marker, owner)| (marker.start, marker.end, owner.start));
+    block_ranges
+        .iter()
+        .map(|block_range| {
+            let start = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.end <= block_range.start);
+            let end = parsed
+                .fence_marker_edges
+                .partition_point(|(marker, _)| marker.start < block_range.end);
+            build_fence_height_projection(
+                *block_range,
+                range,
+                source,
+                &parsed.fence_marker_edges[start..end],
+                &list_item_markers,
+                &quote_markers,
+            )
+        })
+        .collect()
+}
 fn build_list_rows(
     block_range: SourceRange,
     source: &str,
@@ -361,23 +543,62 @@ fn build_list_projections(
             (
                 *marker,
                 parsed.tree.node(*owner).map(|quote| quote.source_range),
+                parsed
+                    .tree
+                    .ancestors(*owner)
+                    .filter(|ancestor| {
+                        parsed
+                            .tree
+                            .node(*ancestor)
+                            .is_some_and(|node| node.kind == NodeKind::Quote)
+                    })
+                    .count(),
             )
         })
         .chain(
             parsed
                 .list_item_markers
                 .iter()
-                .map(|(marker, _)| (*marker, None)),
+                .map(|(marker, _)| (*marker, None, 0)),
         )
         .chain(
             parsed
                 .list_structural_prefixes
                 .iter()
-                .map(|(marker, _, _)| (*marker, None)),
+                .map(|(marker, _, _)| (*marker, None, 0)),
         )
         .collect::<Vec<_>>();
-    container_markers.sort_by_key(|(marker, _)| (marker.start, marker.end));
-    container_markers.dedup_by_key(|(marker, _)| (marker.start, marker.end));
+    container_markers.sort_by_key(|(marker, _, _)| (marker.start, marker.end));
+    container_markers.dedup_by_key(|(marker, _, _)| (marker.start, marker.end));
+    let mut quotes = parsed
+        .tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::Quote)
+        .map(|(id, node)| QuoteProjection {
+            source_range: node.source_range,
+            depth: parsed
+                .tree
+                .ancestors(id)
+                .filter(|ancestor| {
+                    parsed
+                        .tree
+                        .node(*ancestor)
+                        .is_some_and(|node| node.kind == NodeKind::Quote)
+                })
+                .count(),
+        })
+        .collect::<Vec<_>>();
+    quotes.sort_by_key(|quote| (quote.source_range.start, quote.source_range.end));
+    let mut quotes_by_block = vec![Vec::new(); block_ranges.len()];
+    for quote in quotes {
+        let block = block_ranges.partition_point(|range| range.end <= quote.source_range.start);
+        if block_ranges
+            .get(block)
+            .is_some_and(|range| range.start <= quote.source_range.start)
+        {
+            quotes_by_block[block].push(quote);
+        }
+    }
     blocks
         .iter()
         .enumerate()
@@ -403,23 +624,106 @@ fn build_list_projections(
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
             let container_start =
-                container_markers.partition_point(|(marker, _)| marker.end <= block_range.start);
+                container_markers.partition_point(|(marker, _, _)| marker.end <= block_range.start);
             let container_end =
-                container_markers.partition_point(|(marker, _)| marker.start < block_range.end);
+                container_markers.partition_point(|(marker, _, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
-            if block_items.is_empty() && rows.is_empty() {
+            let block_quotes = std::mem::take(&mut quotes_by_block[block]);
+            if block_items.is_empty() && rows.is_empty() && block_quotes.is_empty() {
                 None
             } else {
                 Some(ListProjection::new(
                     block_items,
                     block_prefixes,
                     block_lists,
+                    block_quotes,
                     rows,
                     block_fence_markers,
                     block_container_markers,
                 ))
             }
+        })
+        .collect()
+}
+
+fn build_table_projections(
+    parsed: &MarkdownParse,
+    blocks: &[TiledBlock],
+    range: SourceRange,
+    source: &str,
+) -> HashMap<BlockId, TableProjection> {
+    let block_ranges = blocks
+        .iter()
+        .scan(range.start.0, |start, (_, length, _, _)| {
+            let block = SourceRange::new(*start, *start + *length);
+            *start = block.end.0;
+            Some(block)
+        })
+        .collect::<Vec<_>>();
+    parsed
+        .table_parses
+        .iter()
+        .filter_map(|table| {
+            let node = parsed.tree.node(table.node)?;
+            let ordinal = block_ranges.iter().position(|block| {
+                block.start <= node.source_range.start && node.source_range.start < block.end
+            })?;
+            let block_range = block_ranges[ordinal];
+            let delimiter_range = source_line_ranges_in(range, block_range, source)
+                .into_iter()
+                .find(|line| {
+                    let relative = line.start.0.saturating_sub(range.start.0);
+                    let end = line.end.0.saturating_sub(range.start.0);
+                    source.get(relative..end).is_some_and(is_table_delimiter)
+                });
+            let rows = parsed
+                .tree
+                .children(table.node)
+                .iter()
+                .filter_map(|row_id| {
+                    let row = parsed.tree.node(*row_id)?;
+                    let header = row.kind == NodeKind::TableHead;
+                    if !header && row.kind != NodeKind::TableRow {
+                        return None;
+                    }
+                    let source_start = row.source_range.start.0.checked_sub(range.start.0)?;
+                    let source_end = row.source_range.end.0.checked_sub(range.start.0)?;
+                    let source = source.get(source_start..source_end)?.to_owned().into();
+                    let cells = parsed
+                        .tree
+                        .children(*row_id)
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(column, cell_id)| {
+                            let cell = parsed.tree.node(*cell_id)?;
+                            (cell.kind == NodeKind::TableCell
+                                && (table.alignments.is_empty() || column < table.alignments.len()))
+                            .then_some(TableProjectionCell {
+                                column,
+                                source_range: cell.source_range,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                    Some(TableProjectionRow {
+                        source_range: row.source_range,
+                        source,
+                        header,
+                        cells,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+            Some((
+                BlockId(ordinal as u64),
+                TableProjection {
+                    source_range: node.source_range,
+                    delimiter_range,
+                    alignments: table.alignments.clone(),
+                    rows,
+                },
+            ))
         })
         .collect()
 }
@@ -478,6 +782,13 @@ pub struct BlockIndex {
     /// Compact list context from the last formal full parse. Incremental
     /// updates clear it because a changed list can alter every later ordinal.
     list_projections: Vec<Option<ListProjection>>,
+    /// Lightweight block-local fence geometry, rebuilt by both formal and
+    /// incremental parses so editing never has to wait for formal list semantics
+    /// merely to keep virtualized heights stable.
+    fence_height_projections: HashMap<BlockId, FenceHeightProjection>,
+    /// Formal table metadata; cleared by incremental edits and repopulated by
+    /// the next formal parse so stale alignment cannot reach the renderer.
+    table_projections: HashMap<BlockId, TableProjection>,
     /// First ordinal of the conservatively invalidated tail, if any. Invalidation
     /// always covers a suffix, so one ordinal answers "is this block provisional"
     /// in constant time instead of writing a flag into every affected block.
@@ -492,6 +803,16 @@ impl BlockIndex {
         let parsed = parse_document(revision, range, source);
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
+        let table_projections = build_table_projections(&parsed, &blocks, range, source);
+        let fence_height_by_ordinal =
+            build_fence_height_projections(&parsed, &blocks, range, source);
+        let fence_height_projections = fence_height_by_ordinal
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, projection)| {
+                projection.map(|projection| (BlockId(ordinal as u64), projection))
+            })
+            .collect::<HashMap<_, _>>();
         let next_id = blocks.len() as u64;
         let store = BlockStore::new(blocks.into_iter().enumerate().map(
             |(index, (kind, length, lines, leading_content_lines))| {
@@ -512,6 +833,8 @@ impl BlockIndex {
             store,
             next_id,
             list_projections,
+            fence_height_projections,
+            table_projections,
             provisional_from: None,
         }
     }
@@ -624,6 +947,29 @@ impl BlockIndex {
         Some(build_list_edit_projection(&parsed, &source))
     }
 
+    /// Height-only fenced-code projection. Unlike list semantics this remains
+    /// available after an incremental parse, as long as the block itself is not
+    /// in the conservatively invalidated tail.
+    pub fn fence_height_projection(&self, block: &IndexedBlock) -> Option<&FenceHeightProjection> {
+        let current = self.block(block.ordinal)?;
+        (current.id == block.id
+            && current.source_range == block.source_range
+            && current.confidence == Confidence::Formal)
+            .then(|| self.fence_height_projections.get(&block.id))
+            .flatten()
+    }
+
+    /// Formal table metadata for a current block. Provisional/stale values are
+    /// deliberately withheld; presentation can safely fall back to raw source.
+    pub fn table_projection(&self, block: &IndexedBlock) -> Option<&TableProjection> {
+        let current = self.block(block.ordinal)?;
+        (current.id == block.id
+            && current.source_range == block.source_range
+            && current.confidence == Confidence::Formal)
+            .then(|| self.table_projections.get(&block.id))
+            .flatten()
+    }
+
     /// Every block in document order.
     pub fn blocks(&self) -> impl Iterator<Item = IndexedBlock> + '_ {
         self.blocks_from(0)
@@ -679,6 +1025,7 @@ impl BlockIndex {
             return finish(self, 0, 0, 0, 0, 0, true);
         }
         self.list_projections.clear();
+        self.table_projections.clear();
         // Only a document with no block at all indexes to nothing, so this
         // rebuild parses a blank (hence tiny) document.
         if self.is_empty() {
@@ -723,6 +1070,8 @@ impl BlockIndex {
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);
+            let fence_height_projections =
+                build_fence_height_projections(&parsed, &blocks, window, &text);
             // Re-synchronized when the window's last parsed block lands exactly
             // on the boundary and kind the index already has for the untouched
             // block that closes the window. Everything after that boundary is
@@ -742,7 +1091,12 @@ impl BlockIndex {
                 continue;
             }
             let replaced = window_last + 1 - window_first;
-            let inserted = self.splice_window(window_first..window_last + 1, &blocks, revision);
+            let inserted = self.splice_window(
+                window_first..window_last + 1,
+                &blocks,
+                &fence_height_projections,
+                revision,
+            );
             let invalidated = if resynchronized {
                 0
             } else {
@@ -825,6 +1179,14 @@ impl BlockIndex {
             .filter_map(|ordinal| self.store.get(ordinal))
             .map(|(entry, _)| entry.lines)
             .sum();
+        // Only the first block id survives the merge. Height projections are
+        // keyed by block id, so drop every projection owned by an entry that
+        // disappears here instead of leaving unreachable row vectors behind.
+        for ordinal in first + 1..=last {
+            if let Some((removed, _)) = self.store.get(ordinal) {
+                self.fence_height_projections.remove(&removed.id);
+            }
+        }
         self.store.set_payload(first, entry);
         self.store.splice(first..last + 1, &[(entry, length)]);
         if let Some(from) = self.provisional_from {
@@ -846,6 +1208,7 @@ impl BlockIndex {
         &mut self,
         window: Range<usize>,
         blocks: &[TiledBlock],
+        fence_height_projections: &[Option<FenceHeightProjection>],
         revision: Revision,
     ) -> usize {
         let window_start = self.store.start(window.start);
@@ -908,6 +1271,15 @@ impl BlockIndex {
                 leading_content_lines: *leading_content_lines,
             })
             .collect::<Vec<_>>();
+        for previous in &previous {
+            self.fence_height_projections.remove(&previous.id);
+        }
+        for (entry, projection) in entries.iter().zip(fence_height_projections) {
+            if let Some(projection) = projection {
+                self.fence_height_projections
+                    .insert(entry.id, projection.clone());
+            }
+        }
         if blocks.is_empty() {
             // A window that parses to nothing is blank. Its bytes join the block
             // above, keeping the tiling intact; with no block above, the document
@@ -1156,6 +1528,223 @@ mod tests {
     }
 
     #[test]
+    fn fence_height_projection_counts_only_inactive_visually_empty_rows() {
+        let source = "- item\n  ```\n  code\n  ```\n  ```rust\n  code2\n  ```\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("fence height projection");
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
+            4,
+            "both opening rows and both closing fences collapse while inactive"
+        );
+
+        let bare_opening = source.find("```").expect("bare opening");
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(bare_opening)),
+                true,
+            ),
+            3,
+            "editing a fence restores only that physical row"
+        );
+
+        let code_start = source.find("code").expect("code row");
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(code_start)),
+                true,
+            ),
+            4,
+            "the following row's start does not own the preceding fence row"
+        );
+    }
+
+    #[test]
+    fn disclosed_quote_prefix_keeps_nested_fence_rows_at_normal_height() {
+        let source = "> ```\n> code\n> ```";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("quoted block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("quoted fence height projection");
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
+            2
+        );
+        let code = source.find("code").expect("code row");
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(code)),
+                true,
+            ),
+            0,
+            "the visible quote prefix discloses both fence rows"
+        );
+    }
+
+    #[test]
+    fn document_end_caret_restores_a_final_nested_closing_fence() {
+        let source = "- item\n  ```\n  code\n  ```";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("fence height projection");
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
+            2
+        );
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(source.len())),
+                true,
+            ),
+            1,
+            "the final physical row owns a caret at document end"
+        );
+    }
+
+    #[test]
+    fn caret_at_a_quote_owner_end_inside_a_block_restores_fence_rows() {
+        let source = "- > ```\n  > code\n  > ```\n  after";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.blocks().next().expect("list block");
+        let projection = index
+            .fence_height_projection(&block)
+            .expect("quoted fence height projection");
+        let after = source.rfind('\n').expect("following list row") + 1;
+
+        assert_eq!(
+            projection.inactive_rows_in(block.source_range, block.source_range, None, true),
+            1
+        );
+        assert_eq!(
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                Some(SourceRange::empty(after)),
+                true,
+            ),
+            0,
+            "the quote owner remains disclosed at its interior end boundary"
+        );
+    }
+
+    #[test]
+    fn an_incremental_edit_before_the_last_quote_uses_the_current_document_end() {
+        let source = "before\n\nmiddle one\n\nmiddle two\n\n> ```\n> code\n> ```";
+        let mut buffer = RopeBuffer::from_text(source);
+        let mut index = BlockIndex::from_buffer(&buffer);
+        let before = index.blocks().last().expect("final quote block");
+        let before_projection = index
+            .fence_height_projection(&before)
+            .expect("final quote fence projection");
+        assert_eq!(
+            before_projection.inactive_rows_in(
+                before.source_range,
+                before.source_range,
+                Some(SourceRange::empty(source.len())),
+                true,
+            ),
+            0
+        );
+
+        // The bounded incremental window reparses the edited block and its
+        // neighbor, not the distant final quote block. Its block-relative
+        // fence rows must nevertheless honor the current final-block status.
+        apply(&mut index, &mut buffer, 1, "X");
+        let after = index.blocks().last().expect("final quote block after edit");
+        let after_projection = index
+            .fence_height_projection(&after)
+            .expect("final quote projection after edit");
+        assert_eq!(
+            after_projection.inactive_rows_in(
+                after.source_range,
+                after.source_range,
+                Some(SourceRange::empty(buffer.len_bytes().0)),
+                true,
+            ),
+            0,
+            "a stale absolute document end must not hide the quote owner after an earlier edit"
+        );
+    }
+
+    #[test]
+    fn incremental_list_edit_keeps_fence_height_projection_current() {
+        let source = "- item\n  ```\n  code\n  ```\n";
+        let mut buffer = RopeBuffer::from_text(source);
+        let mut index = BlockIndex::from_buffer(&buffer);
+        let before = index.blocks().next().expect("list block");
+        assert!(index.list_projection(&before).is_some());
+        assert_eq!(
+            index
+                .fence_height_projection(&before)
+                .expect("initial fence heights")
+                .inactive_rows_in(before.source_range, before.source_range, None, true),
+            2
+        );
+
+        let code = source.find("code").expect("code row") + 2;
+        let update = apply(&mut index, &mut buffer, code, "X");
+        assert!(update.resynchronized);
+
+        let after = index.blocks().next().expect("updated list block");
+        assert_eq!(
+            after.id, before.id,
+            "ordinary typing keeps the block identity"
+        );
+        assert!(
+            index.list_projection(&after).is_none(),
+            "incremental parsing intentionally drops formal list semantics"
+        );
+        assert_eq!(
+            index
+                .fence_height_projection(&after)
+                .expect("incremental parse rebuilds fence heights")
+                .inactive_rows_in(after.source_range, after.source_range, None, true),
+            2,
+            "nested fence geometry stays stable while formal parsing catches up"
+        );
+    }
+    #[test]
+    fn merging_blocks_drops_fence_height_projections_for_removed_ids() {
+        let source = "> ```\n> one\n> ```\n\nplain\n\n> ```\n> two\n> ```\n";
+        let mut index = BlockIndex::build(Revision(1), source);
+        let blocks = index.blocks().collect::<Vec<_>>();
+        assert!(
+            blocks.len() >= 3,
+            "fixture has separate quote/paragraph blocks"
+        );
+        let removed = blocks.last().expect("last quote block").id;
+        assert!(
+            index.fence_height_projections.contains_key(&removed),
+            "last quoted fence has indexed height geometry"
+        );
+
+        let last = blocks.len() - 1;
+        index.merge_run(0, last, source.len(), Revision(2));
+
+        assert_eq!(index.len(), 1);
+        assert!(
+            !index.fence_height_projections.contains_key(&removed),
+            "projection for a block id removed by merge_run must be released"
+        );
+    }
+    #[test]
     fn typing_inside_a_block_reparses_only_its_neighborhood() {
         let mut source = String::new();
         for line in 0..20_000 {
@@ -1309,6 +1898,58 @@ mod tests {
         let block = index.block(0).expect("top-level code block");
         assert_eq!(block.kind, NodeKind::CodeBlock);
         assert!(index.list_projection(&block).is_none());
+    }
+
+    #[test]
+    fn formal_projection_keeps_nested_quote_depth_for_viewport_rows() {
+        let source = "> outer\n> > inner\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("quote block");
+        let projection = index.list_projection(&block).expect("quote projection");
+        let outer_line = SourceRange::new(0, "> outer\n".len());
+        let inner_start = "> outer\n".len();
+        let inner_line = SourceRange::new(inner_start, source.len());
+        assert_eq!(
+            projection
+                .quotes_in(outer_line)
+                .map(|quote| quote.depth)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            projection
+                .quotes_in(inner_line)
+                .map(|quote| quote.depth)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn formal_quote_projection_stays_with_its_own_block() {
+        let source = "> first\n\n> second\n";
+        let index = BlockIndex::build(Revision(1), source);
+        let blocks = index.blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 2);
+
+        let first = index
+            .list_projection(&blocks[0])
+            .expect("first quote projection");
+        let second = index
+            .list_projection(&blocks[1])
+            .expect("second quote projection");
+        assert_eq!(first.quotes_in(blocks[0].source_range).count(), 1);
+        assert_eq!(second.quotes_in(blocks[1].source_range).count(), 1);
+        assert_eq!(
+            first.quotes_in(blocks[1].source_range).count(),
+            0,
+            "the first block must not retain quote projections from later blocks"
+        );
+        assert_eq!(
+            second.quotes_in(blocks[0].source_range).count(),
+            0,
+            "the second block must not retain quote projections from earlier blocks"
+        );
     }
 
     #[test]

@@ -98,7 +98,9 @@ fn ime_composition_does_not_inject_structural_prefixes() {
     editor
         .set_selection(Selection::caret(SourceOffset("- item\n".len())))
         .unwrap();
-    editor.replace_and_mark_text(None, "日本", Some(2..2)).unwrap();
+    editor
+        .replace_and_mark_text(None, "日本", Some(2..2))
+        .unwrap();
     assert_eq!(editor.document().full_text(), "- item\n日本");
     assert_eq!(editor.ime().unwrap().marked_range, SourceRange::new(7, 13));
     editor.commit_text(None, "日本語").unwrap();

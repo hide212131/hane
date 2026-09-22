@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted focused GUI validation for fenced code blocks (Issue #226 / #16).
+"""Trusted focused GUI validation for fenced code blocks (Issue #270).
 
 One fixture, one Hane launch, OCR presence checks, one direct edit of the
 hidden opening fence, one undo/save, and focused screenshots. This procedure
@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-code-block/1"
+PROCEDURE_VERSION = "hosted-code-block/2"
 VERIFICATION_KIND = "code_block_focused"
 SCOPE_NOTE = (
-    "Issue #16 の fenced code block に限定した focused GUI evidence。"
-    "1 fixture / 1 launch で inactive 表示、language label、コード本文、"
+    "Issue #270 の fenced code block に限定した focused GUI evidence。"
+    "1 fixture / 1 launch で inactive 表示、raw fence / info string 非表示、コード本文、"
     "hidden opening fence の直接編集・保存、Undo/Save による原文復元を確認する。"
     "日本語 IME、一般 inline syntax、list、sidebar、再起動、包括的 regression は含まない。"
 )
@@ -51,12 +51,14 @@ FIXTURE_EDITED = (
 )
 OCR_REQUIRED = (
     "Neutral anchor",
-    "rust",
     "let answer = 42",
     "literal markdown",
     "Tail anchor",
 )
-MAX_LABEL_CODE_X_DELTA = 0.015
+OCR_FORBIDDEN = (
+    "rust",
+    "~~~",
+)
 
 
 def load_module(control_dir: Path, relative: str, name: str):
@@ -85,7 +87,7 @@ def reason_for(steps: list[dict]) -> str:
         for item in steps
         if item.get("result") not in ("pass", "skipped") and item.get("reason")
     ]
-    return "; ".join(reasons) if reasons else "Issue #16 focused code-block GUI checks passed"
+    return "; ".join(reasons) if reasons else "Issue #270 focused code-block GUI checks passed"
 
 
 def overall_result(steps: list[dict], priority: dict[str, int]) -> str:
@@ -100,45 +102,17 @@ def normalize_ocr(text: str) -> str:
 def evaluate_initial_ocr(text: str) -> dict:
     normalized = normalize_ocr(text)
     missing = [expected for expected in OCR_REQUIRED if normalize_ocr(expected) not in normalized]
+    forbidden = [expected for expected in OCR_FORBIDDEN if normalize_ocr(expected) in normalized]
+    failed = bool(missing or forbidden)
     return step(
         "inactive_code_block_text",
-        "pass" if not missing else "fail",
-        None if not missing else "inactive code block の language label / code content を OCR で確認できない",
+        "fail" if failed else "pass",
+        None if not failed else "inactive 表示で code block の本文が欠落するか raw fence / info string が見える",
         required=list(OCR_REQUIRED),
         missing=missing,
+        forbidden=list(OCR_FORBIDDEN),
+        forbidden_found=forbidden,
         recognized_text=text,
-    )
-
-
-def parse_click_evidence(stdout: str) -> dict:
-    try:
-        payload = json.loads(stdout)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f"click-text evidence is not valid JSON: {stdout!r}") from exc
-    required = {"matched_text", "bounding_box", "window_bounds", "click_point", "edge"}
-    missing = required - payload.keys()
-    if missing:
-        raise ValueError(f"click-text evidence is missing fields: {sorted(missing)}")
-    return payload
-
-
-def evaluate_fence_alignment(label_evidence: dict, code_evidence: dict) -> dict:
-    label_x = float(label_evidence["bounding_box"]["minX"])
-    code_x = float(code_evidence["bounding_box"]["minX"])
-    delta = abs(label_x - code_x)
-    return step(
-        "inactive_fence_alignment",
-        "pass" if delta <= MAX_LABEL_CODE_X_DELTA else "fail",
-        None if delta <= MAX_LABEL_CODE_X_DELTA else (
-            "language label がコード本文より大きく右へずれており、"
-            "raw opening fence が前置表示されている可能性がある"
-        ),
-        language_label_min_x=label_x,
-        code_content_min_x=code_x,
-        absolute_delta=delta,
-        maximum_delta=MAX_LABEL_CODE_X_DELTA,
-        label_evidence=label_evidence,
-        code_evidence=code_evidence,
     )
 
 
@@ -198,37 +172,6 @@ def run_focused_scenario(
                 if ok
                 else step("inactive_code_block_text", "blocked", error)
             )
-
-            alignment_evidence = []
-            for pattern in (r"rust", r"let answer = 42"):
-                ok_click, click_out, click_error = interaction.run_helper(
-                    helper,
-                    ["click-text", str(pid), str(inactive_png), pattern, "start"],
-                    helper_timeout,
-                )
-                if not ok_click:
-                    steps.append(step(
-                        "inactive_fence_alignment", "blocked",
-                        f"相対位置 evidence を取得できない: {click_error}",
-                        pattern=pattern,
-                    ))
-                    alignment_evidence = []
-                    break
-                try:
-                    alignment_evidence.append(parse_click_evidence(click_out))
-                except ValueError as exc:
-                    steps.append(step(
-                        "inactive_fence_alignment", "blocked", str(exc), pattern=pattern
-                    ))
-                    alignment_evidence = []
-                    break
-                interaction.run_helper(
-                    helper, ["move-doc-start", str(pid)], helper_timeout
-                )
-            if len(alignment_evidence) == 2:
-                steps.append(evaluate_fence_alignment(
-                    alignment_evidence[0], alignment_evidence[1]
-                ))
 
             ok, _out, error = interaction.run_helper(
                 helper, ["move-doc-start", str(pid)], helper_timeout
@@ -414,7 +357,7 @@ def main() -> int:
             s.get("reason") for s in scenarios
             if s.get("result") != "pass" and s.get("reason")
         ]
-        reason = "; ".join(reasons) or "Issue #16 focused code-block GUI checks passed"
+        reason = "; ".join(reasons) or "Issue #270 focused code-block GUI checks passed"
         result = {
             "schema_version": SCHEMA_VERSION,
             "procedure_version": PROCEDURE_VERSION,

@@ -17,9 +17,9 @@
 //! with a fixed advance width, which is what makes the coordinate contract
 //! verifiable without a window.
 
-use crate::{ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
+use crate::{BlockKind, LineContext, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
-use hane_markdown::BlockId;
+use hane_markdown::{BlockId, TableAlignment, TableProjection, is_table_delimiter};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -27,7 +27,19 @@ use std::ops::Range;
 /// geometry, not a claim about how many source spaces a Markdown parser
 /// consumed.
 pub const LIST_DEPTH_INDENT: f32 = 24.0;
+/// Horizontal inset between nested quote bodies. This is semantic display
+/// geometry; it is independent of how many source spaces follow `>`.
+pub const QUOTE_DEPTH_INDENT: f32 = 24.0;
+pub const QUOTE_BAR_WIDTH: f32 = 2.0;
+pub const QUOTE_BAR_GAP: f32 = 8.0;
 const MIN_EFFECTIVE_WRAP_WIDTH: f32 = 1.0;
+/// Horizontal padding painted inside every inactive table cell.
+///
+/// Keep this in the layout model so the intrinsic column measurements and the
+/// geometry handed to the UI describe the same box. Cell wrapping is a later
+/// concern; for now a cell is clipped to this box by the UI.
+const TABLE_CELL_PADDING: f32 = 8.0;
+const TABLE_CELL_HORIZONTAL_PADDING: f32 = TABLE_CELL_PADDING * 2.0;
 
 /// How a row ends.
 ///
@@ -40,6 +52,19 @@ pub enum LineWrap {
     Hard,
     /// The row ends because the text did not fit, and continues on the next row.
     Soft,
+}
+
+/// Geometry for one table cell on a laid-out row. The presentation model owns
+/// the source/visual ranges; layout adds the font-dependent x coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCellLayout {
+    pub column: usize,
+    pub visual_range: Range<usize>,
+    pub source_range: SourceRange,
+    pub alignment: TableAlignment,
+    pub x: f32,
+    pub width: f32,
+    pub text_x: f32,
 }
 
 /// One row of a block: a whole physical line, or one fragment of a wrapped one.
@@ -71,8 +96,8 @@ pub struct LayoutLine {
     /// every hanging fragment starts at the item's body column.
     pub text_x_origin: f32,
     /// x at which the owning list item's body starts, in the block's text
-    /// column. Opening markers may be narrower than this column because the
-    /// whole list aligns to its aggregate inactive label width.
+    /// column. Inactive markers may be narrower than this column because the
+    /// whole list aligns to its aggregate synthesized label width.
     pub body_x_origin: f32,
     /// Width passed to the shaper for body-column fragments. The first
     /// fragment of an opening list row receives the wider marker-inclusive
@@ -88,10 +113,18 @@ pub struct LayoutLine {
     pub body_visual_start: Option<usize>,
     /// The visual range of the marker displayed on this line, if any.
     pub marker_visual_range: Option<Range<usize>>,
-    /// Geometry-only gap between the displayed marker and the aligned body
-    /// column. It is zero for continuation rows and for a marker already as
-    /// wide as the list's aggregate label.
+    /// Geometry-only gap between an inactive displayed marker and the aligned
+    /// body column. It is zero for continuation rows and disclosed source
+    /// markers.
     pub marker_body_gap: f32,
+    /// Total geometry-only gap between the rendered prefix and the body. This
+    /// includes the quote inset that follows a disclosed outer quote prefix,
+    /// plus any inactive marker alignment gap.
+    pub body_gap: f32,
+    /// x of the quote bar in the block's text column, when this row is quoted.
+    pub quote_bar_x_origin: Option<f32>,
+    /// Cell geometry for a structured table row. Empty for ordinary rows.
+    pub table_cells: Vec<TableCellLayout>,
 }
 
 impl LayoutLine {
@@ -100,6 +133,44 @@ impl LayoutLine {
     }
 
     fn x_for_visual(&self, line: &VisualLine, visual: usize, shaper: &dyn LineShaper) -> f32 {
+        if !self.table_cells.is_empty()
+            && let Some(cell) = self
+                .table_cells
+                .iter()
+                .enumerate()
+                .find(|(index, cell)| {
+                    cell.visual_range.start <= visual
+                        && (visual < cell.visual_range.end
+                            || (*index + 1 == self.table_cells.len()
+                                && visual == cell.visual_range.end))
+                })
+                .map(|(_, cell)| cell)
+        {
+            return cell.text_x
+                + shaper.x_for_offset(
+                    line,
+                    cell.visual_range.clone(),
+                    visual.clamp(cell.visual_range.start, cell.visual_range.end),
+                );
+        }
+        if let Some(first) = self.table_cells.first()
+            && visual < first.visual_range.start
+        {
+            return first.x;
+        }
+        if let Some(next) = self
+            .table_cells
+            .windows(2)
+            .find(|cells| visual < cells[1].visual_range.start)
+            .map(|cells| &cells[1])
+        {
+            return next.x;
+        }
+        if let Some(last) = self.table_cells.last()
+            && visual >= last.visual_range.end
+        {
+            return last.x + last.width;
+        }
         let visual = visual.clamp(self.line_visual_range.start, self.line_visual_range.end);
         if let Some(body) = self.body_visual_start
             && body <= self.line_visual_range.end
@@ -117,23 +188,36 @@ impl LayoutLine {
     }
 
     fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
+        if let Some(cell) = self
+            .table_cells
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| {
+                x >= cell.x
+                    && (x < cell.x + cell.width
+                        || (*index + 1 == self.table_cells.len() && x <= cell.x + cell.width))
+            })
+            .map(|(_, cell)| cell)
+        {
+            return shaper
+                .offset_for_x(line, cell.visual_range.clone(), (x - cell.text_x).max(0.0))
+                .clamp(cell.visual_range.start, cell.visual_range.end);
+        }
         if let Some(body) = self.body_visual_start
             && body <= self.line_visual_range.end
         {
             let body_fragment_start = body.max(self.line_visual_range.start);
-            if self.marker_body_gap > 0.0
+            if self.body_gap > 0.0
                 && body_fragment_start == body
-                && let Some(marker) = &self.marker_visual_range
-                && marker.start >= self.line_visual_range.start
-                && marker.end <= self.line_visual_range.end
+                && body > self.line_visual_range.start
             {
-                let marker_end_x = self.text_x_origin
+                let rendered_prefix_end_x = self.text_x_origin
                     + shaper.x_for_offset(
                         line,
-                        self.line_visual_range.start..marker.end,
-                        marker.end,
+                        self.line_visual_range.start..body_fragment_start,
+                        body_fragment_start,
                     );
-                if (marker_end_x..self.body_x_origin).contains(&x) {
+                if (rendered_prefix_end_x..self.body_x_origin).contains(&x) {
                     return body_fragment_start;
                 }
             }
@@ -247,11 +331,33 @@ impl BlockLayout {
             .sum()
     }
 
-    /// Mean height of a presented line, used to estimate how far into a block a
-    /// scroll position falls before that part of the block has been laid out.
+    /// Mean height of a visible presented line, used to estimate how far into a
+    /// block a scroll position falls before that part of the block has been laid
+    /// out. A zero-height line is a collapsed structural row (for example an
+    /// inactive fence delimiter), not a visual row; including it in the
+    /// denominator would make a visual y position look farther into the block
+    /// than it really is before the fence projection is inverted.
     pub fn average_line_height(&self) -> Option<f32> {
-        let lines = self.lines.last().map(|row| row.line + 1)?;
-        (lines > 0).then(|| self.lines.iter().map(|row| row.height).sum::<f32>() / lines as f32)
+        let mut total = 0.0;
+        let mut count = 0;
+        let mut current_line = None;
+        let mut current_height = 0.0;
+        for row in &self.lines {
+            if current_line != Some(row.line) {
+                if current_line.is_some() && current_height > 0.0 {
+                    total += current_height;
+                    count += 1;
+                }
+                current_line = Some(row.line);
+                current_height = 0.0;
+            }
+            current_height += row.height;
+        }
+        if current_line.is_some() && current_height > 0.0 {
+            total += current_height;
+            count += 1;
+        }
+        (count > 0).then(|| total / count as f32)
     }
 
     /// The row a source offset renders on.
@@ -471,6 +577,10 @@ pub fn line_visual_start(block: &VisualBlock, index: usize) -> usize {
 /// break falls, how tall a row is, where a row sits — is decided here so it is
 /// the same with any font.
 pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
+    if block.kind == BlockKind::TableRow || block.lines.iter().any(|line| line.table_row.is_some())
+    {
+        return layout_table_block(block, width, shaper);
+    }
     let marker_widths = list_marker_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
@@ -510,9 +620,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 y,
                 height,
                 text_x_origin: if fragment == 0 {
-                    line_geometry.marker_x_origin.unwrap_or(
-                        line_geometry.body_x_origin - line_geometry.expanded_prefix_width,
-                    )
+                    line_geometry.text_x_origin
                 } else {
                     line_geometry.body_x_origin
                 },
@@ -522,6 +630,9 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 body_visual_start: line_geometry.body_visual_start,
                 marker_visual_range: line_geometry.marker_visual_range.clone(),
                 marker_body_gap: line_geometry.marker_body_gap,
+                body_gap: line_geometry.body_gap,
+                quote_bar_x_origin: line_geometry.quote_bar_x_origin,
+                table_cells: Vec::new(),
             });
             y += height;
         }
@@ -536,15 +647,435 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
     }
 }
 
+/// Lays out presented table rows on shared intrinsic-width columns.
+///
+/// Each column is measured across the currently presented header/body cells,
+/// including a raw row that is being edited. The formal rows remain
+/// authoritative for the table's column count when both forms are present.
+/// The preferred width is the widest complete cell, while the minimum width is
+/// the widest unbreakable segment in that column. If all preferred widths fit,
+/// the unused space remains outside the grid. Otherwise widths are allocated
+/// deterministically between minimum and preferred widths, with a final
+/// proportional compression when even the minimums do not fit. The latter is
+/// deliberately bounded by `width`: a future wrapping layout can consume the
+/// same safe geometry without making the table widen the editor viewport.
+fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
+    let formal_columns = block
+        .table_projection
+        .as_ref()
+        .map(|projection| projection.alignments.len())
+        .filter(|columns| *columns > 0)
+        .or_else(|| {
+            block
+                .lines
+                .iter()
+                .filter_map(|line| line.table_row.as_ref().map(|row| row.column_count))
+                .max()
+        });
+    let columns = formal_columns.unwrap_or_else(|| {
+        block
+            .lines
+            .iter()
+            .filter_map(|line| {
+                editing_table_cells(line, block.table_projection.as_ref()).map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| cell.column.saturating_add(1))
+                        .max()
+                        .unwrap_or(0)
+                })
+            })
+            .max()
+            .unwrap_or(0)
+    });
+    let column_widths = table_column_widths(block, columns, width, shaper);
+    let mut column_offsets = Vec::with_capacity(column_widths.len() + 1);
+    column_offsets.push(0.0);
+    for column_width in &column_widths {
+        column_offsets.push(column_offsets.last().copied().unwrap_or(0.0) + *column_width);
+    }
+    let marker_widths = list_marker_widths(block, shaper);
+    let mut lines = Vec::with_capacity(block.lines.len());
+    let mut y = 0.0;
+    for (index, line) in block.lines.iter().enumerate() {
+        if line.table_row.is_none() {
+            if let Some(cells) = editing_table_cells(line, block.table_projection.as_ref()) {
+                let block_start = line_visual_start(block, index);
+                let height = line.height();
+                lines.push(LayoutLine {
+                    line: index,
+                    line_id: line.line_id,
+                    fragment: 0,
+                    wrap: LineWrap::Hard,
+                    line_visual_range: 0..line.visual_text.len(),
+                    visual_range: VisualRange::new(
+                        block_start,
+                        block_start + line.visual_text.len(),
+                    ),
+                    source_range: line.source_range,
+                    y,
+                    height,
+                    text_x_origin: 0.0,
+                    body_x_origin: 0.0,
+                    effective_width: width.max(MIN_EFFECTIVE_WRAP_WIDTH),
+                    marker_x_origin: None,
+                    body_visual_start: None,
+                    marker_visual_range: None,
+                    marker_body_gap: 0.0,
+                    body_gap: 0.0,
+                    quote_bar_x_origin: None,
+                    table_cells: table_cell_layouts(
+                        line,
+                        cells,
+                        &column_offsets,
+                        &column_widths,
+                        shaper,
+                    ),
+                });
+                y += height;
+                continue;
+            }
+            let block_start = line_visual_start(block, index);
+            let height = line.height();
+            let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+            let boundaries = if width <= 0.0 {
+                vec![0, line.visual_text.len()]
+            } else {
+                fragment_boundaries(line, &line_geometry, width, shaper)
+            };
+            for (fragment, pair) in boundaries.windows(2).enumerate() {
+                let (start, end) = (pair[0], pair[1]);
+                let last = end == line.visual_text.len();
+                let source_start = if fragment == 0 {
+                    line.source_range.start
+                } else {
+                    source_at_visual(line, start)
+                };
+                let source_end = if last {
+                    line.source_range.end
+                } else {
+                    source_at_visual(line, end)
+                };
+                lines.push(LayoutLine {
+                    line: index,
+                    line_id: line.line_id,
+                    fragment,
+                    wrap: if last { LineWrap::Hard } else { LineWrap::Soft },
+                    line_visual_range: start..end,
+                    visual_range: VisualRange::new(block_start + start, block_start + end),
+                    source_range: SourceRange {
+                        start: source_start,
+                        end: source_end.max(source_start),
+                    },
+                    y,
+                    height,
+                    text_x_origin: if fragment == 0 {
+                        line_geometry.text_x_origin
+                    } else {
+                        line_geometry.body_x_origin
+                    },
+                    body_x_origin: line_geometry.body_x_origin,
+                    effective_width: line_geometry.effective_width,
+                    marker_x_origin: line_geometry.marker_x_origin,
+                    body_visual_start: line_geometry.body_visual_start,
+                    marker_visual_range: line_geometry.marker_visual_range.clone(),
+                    marker_body_gap: line_geometry.marker_body_gap,
+                    body_gap: line_geometry.body_gap,
+                    quote_bar_x_origin: line_geometry.quote_bar_x_origin,
+                    table_cells: Vec::new(),
+                });
+                y += height;
+            }
+            continue;
+        }
+        let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
+            table_cell_layouts(
+                line,
+                row.cells.clone(),
+                &column_offsets,
+                &column_widths,
+                shaper,
+            )
+        });
+        let block_start = line_visual_start(block, index);
+        let height = line.height();
+        lines.push(LayoutLine {
+            line: index,
+            line_id: line.line_id,
+            fragment: 0,
+            wrap: LineWrap::Hard,
+            line_visual_range: 0..line.visual_text.len(),
+            visual_range: VisualRange::new(block_start, block_start + line.visual_text.len()),
+            source_range: line.source_range,
+            y,
+            height,
+            text_x_origin: 0.0,
+            body_x_origin: 0.0,
+            effective_width: width.max(MIN_EFFECTIVE_WRAP_WIDTH),
+            marker_x_origin: None,
+            body_visual_start: None,
+            marker_visual_range: None,
+            marker_body_gap: 0.0,
+            body_gap: 0.0,
+            quote_bar_x_origin: None,
+            table_cells: cells,
+        });
+        y += height;
+    }
+    BlockLayout {
+        block: block.id,
+        revision: block.revision,
+        width,
+        lines,
+        leading_space: block.leading_space(),
+        trailing_space: block.trailing_space(),
+    }
+}
+
+fn table_cell_layouts(
+    line: &VisualLine,
+    cells: Vec<crate::TableCellDisplay>,
+    column_offsets: &[f32],
+    column_widths: &[f32],
+    shaper: &dyn LineShaper,
+) -> Vec<TableCellLayout> {
+    cells
+        .into_iter()
+        .map(|cell| {
+            let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+            let x = column_offsets.get(cell.column).copied().unwrap_or(0.0);
+            let column_width = column_widths.get(cell.column).copied().unwrap_or(0.0);
+            let inner_width = (column_width - TABLE_CELL_HORIZONTAL_PADDING).max(0.0);
+            let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+            let text_x = x
+                + TABLE_CELL_PADDING
+                + match cell.alignment {
+                    TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
+                    TableAlignment::Right => (inner_width - text_width).max(0.0),
+                    TableAlignment::Default | TableAlignment::Left => 0.0,
+                };
+            TableCellLayout {
+                column: cell.column,
+                visual_range,
+                source_range: cell.source_range,
+                alignment: cell.alignment,
+                x,
+                width: column_width,
+                text_x,
+            }
+        })
+        .collect()
+}
+
+/// Measures the intrinsic widths of one table block and clamps their allocation
+/// to the available text column. A formal projection contributes rows outside
+/// the current presentation window as well.
+fn table_column_widths(
+    block: &VisualBlock,
+    columns: usize,
+    width: f32,
+    shaper: &dyn LineShaper,
+) -> Vec<f32> {
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    let mut preferred = vec![TABLE_CELL_HORIZONTAL_PADDING; columns];
+    let mut minimum = vec![TABLE_CELL_HORIZONTAL_PADDING; columns];
+    for line in &block.lines {
+        let cells = line
+            .table_row
+            .as_ref()
+            .map(|table| table.cells.clone())
+            .or_else(|| editing_table_cells(line, block.table_projection.as_ref()));
+        let Some(cells) = cells else {
+            continue;
+        };
+        for cell in cells {
+            let column = cell.column;
+            let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+            let Some((preferred_text, minimum_text)) =
+                table_cell_intrinsic_widths(line, visual_range, shaper)
+            else {
+                continue;
+            };
+            let Some(preferred_column) = preferred.get_mut(column) else {
+                continue;
+            };
+            *preferred_column =
+                (*preferred_column).max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
+            if let Some(minimum_column) = minimum.get_mut(column) {
+                *minimum_column =
+                    (*minimum_column).max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
+            }
+        }
+    }
+
+    // A formal table projection owns every row, including rows clipped out of
+    // the current presentation window. Measure those rows through the same
+    // inactive table presenter used for visible rows, so source ranges,
+    // alignment and the raw inline text all follow one geometry contract.
+    if let Some(projection) = &block.table_projection {
+        for row in projection.rows.iter() {
+            let metric = crate::present_table_line(
+                0,
+                block.revision,
+                row.source_range,
+                row.source.as_ref(),
+                block.line_height,
+                row.header,
+                &projection.alignments,
+            );
+            let Some(table) = metric.table_row.as_ref() else {
+                continue;
+            };
+            for cell in &table.cells {
+                let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+                let Some((preferred_text, minimum_text)) =
+                    table_cell_intrinsic_widths(&metric, visual_range, shaper)
+                else {
+                    continue;
+                };
+                let Some(preferred_column) = preferred.get_mut(cell.column) else {
+                    continue;
+                };
+                *preferred_column = (*preferred_column)
+                    .max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
+                if let Some(minimum_column) = minimum.get_mut(cell.column) {
+                    *minimum_column = (*minimum_column)
+                        .max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
+                }
+            }
+        }
+    }
+
+    let available = if width.is_finite() {
+        width.max(0.0)
+    } else {
+        0.0
+    };
+    let preferred_total = preferred.iter().sum::<f32>();
+    if preferred_total <= available {
+        return preferred;
+    }
+
+    let minimum_total = minimum.iter().sum::<f32>();
+    if minimum_total > available {
+        if minimum_total <= 0.0 {
+            return vec![0.0; columns];
+        }
+        return bound_table_column_widths(
+            minimum
+                .into_iter()
+                .map(|column| available * column / minimum_total)
+                .collect(),
+            available,
+        );
+    }
+
+    let remaining = available - minimum_total;
+    let capacity_total = preferred
+        .iter()
+        .zip(&minimum)
+        .map(|(preferred, minimum)| (preferred - minimum).max(0.0))
+        .sum::<f32>();
+    if capacity_total <= 0.0 {
+        return minimum;
+    }
+    bound_table_column_widths(
+        minimum
+            .into_iter()
+            .zip(preferred)
+            .map(|(minimum, preferred)| {
+                minimum + remaining * (preferred - minimum).max(0.0) / capacity_total
+            })
+            .collect(),
+        available,
+    )
+}
+
+/// Returns cell ranges for a table row that is currently disclosed for
+/// editing. Formal rows use the parser-owned source ranges; provisional rows
+/// use the existing source↔visual map. In both cases inline marker bytes stay
+/// in the source range while the displayed cell range follows the shortened
+/// visual text.
+fn editing_table_cells(
+    line: &VisualLine,
+    projection: Option<&TableProjection>,
+) -> Option<Vec<crate::TableCellDisplay>> {
+    if line.context != LineContext::Table
+        || line.kind == BlockKind::TableDelimiter
+        || is_table_delimiter(&line.visual_text)
+    {
+        return None;
+    }
+    let alignments = projection.map_or(&[][..], |projection| projection.alignments.as_ref());
+    crate::table_row_from_projection(line, projection, line.source_range, false, alignments)
+        .map(|table| table.cells)
+}
+
+/// Keeps the floating-point allocation inside the main panel even when the
+/// final proportional sum differs from the target by a rounding unit.
+fn bound_table_column_widths(mut widths: Vec<f32>, available: f32) -> Vec<f32> {
+    let mut used = 0.0;
+    for column in &mut widths {
+        let remaining = (available - used).max(0.0);
+        *column = (*column).max(0.0).min(remaining);
+        used += *column;
+    }
+    widths
+}
+
+/// Returns `(preferred, minimum)` text widths for one presented cell.
+///
+/// The preferred width measures the complete cell. The minimum width measures
+/// the widest non-whitespace run, which is the amount a later cell-wrapping
+/// implementation cannot split at ordinary whitespace. Both measurements use
+/// the line's shaper, so header weight and inline font changes are respected.
+fn table_cell_intrinsic_widths(
+    line: &VisualLine,
+    visual_range: Range<usize>,
+    shaper: &dyn LineShaper,
+) -> Option<(f32, f32)> {
+    if visual_range.start > visual_range.end
+        || visual_range.end > line.visual_text.len()
+        || !line.visual_text.is_char_boundary(visual_range.start)
+        || !line.visual_text.is_char_boundary(visual_range.end)
+    {
+        return None;
+    }
+    let preferred = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+    let text = &line.visual_text[visual_range.clone()];
+    let mut minimum: f32 = 0.0;
+    let mut run_start = None;
+    for (relative, character) in text.char_indices() {
+        let offset = visual_range.start + relative;
+        if character.is_whitespace() {
+            if let Some(start) = run_start.take() {
+                minimum = minimum.max(shaper.x_for_offset(line, start..offset, offset));
+            }
+        } else if run_start.is_none() {
+            run_start = Some(offset);
+        }
+    }
+    if let Some(start) = run_start {
+        minimum = minimum.max(shaper.x_for_offset(line, start..visual_range.end, visual_range.end));
+    }
+    Some((preferred, minimum))
+}
+
 #[derive(Clone, Debug)]
 struct LineGeometry {
+    text_x_origin: f32,
     marker_x_origin: Option<f32>,
     body_x_origin: f32,
-    expanded_prefix_width: f32,
+    first_row_width: f32,
     effective_width: f32,
     body_visual_start: Option<usize>,
     marker_visual_range: Option<Range<usize>>,
     marker_body_gap: f32,
+    body_gap: f32,
+    quote_bar_x_origin: Option<f32>,
 }
 
 fn list_marker_widths(block: &VisualBlock, shaper: &dyn LineShaper) -> HashMap<ListId, f32> {
@@ -590,17 +1121,84 @@ fn line_geometry(
     marker_widths: &HashMap<ListId, f32>,
 ) -> LineGeometry {
     let Some(list) = &line.list else {
+        let quote_x = line.quote.map_or(0.0, |quote| {
+            quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+        });
+        let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
+        let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
+        let body_x = if quote_prefix_after_outer {
+            quote_x + quote_prefix_width
+        } else {
+            quote_x
+        };
+        let text_x_origin = if quote_prefix_after_outer {
+            0.0
+        } else {
+            quote_x
+        };
         return LineGeometry {
+            text_x_origin,
             marker_x_origin: None,
-            body_x_origin: 0.0,
-            expanded_prefix_width: 0.0,
-            effective_width: width.max(0.0),
-            body_visual_start: None,
+            body_x_origin: body_x,
+            first_row_width: if quote_prefix_after_outer {
+                width - body_x + quote_prefix_width
+            } else {
+                width - quote_x
+            },
+            effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
+            body_visual_start: quote_prefix_end.filter(|_| quote_prefix_after_outer),
             marker_visual_range: None,
             marker_body_gap: 0.0,
+            body_gap: quote_prefix_end
+                .filter(|body| *body > 0)
+                .map_or(0.0, |body| {
+                    (body_x - text_x_origin - shaper.x_for_offset(line, 0..body, body)).max(0.0)
+                }),
+            quote_bar_x_origin: (quote_x > 0.0)
+                .then_some(quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH),
         };
     };
-    let marker_x = list_depth_x(list.owner.depth);
+    let quote_x = line.quote.map_or(0.0, |quote| {
+        quote.depth.saturating_sub(quote.disclosed_depth) as f32 * QUOTE_DEPTH_INDENT
+    });
+    let (quote_prefix_end, quote_prefix_width) = disclosed_quote_prefix(line, shaper);
+    let quote_prefix_after_outer = quote_x > 0.0 && quote_prefix_end.is_some();
+    let quote_source_start = line
+        .quote_marker_source_ranges
+        .first()
+        .map(|range| range.start.0);
+    let list_prefix_end = list
+        .marker
+        .as_ref()
+        .map(|marker| marker.source_range.end.0)
+        .into_iter()
+        .chain(
+            list.structural_prefixes
+                .iter()
+                .map(|prefix| prefix.source_range.end.0),
+        )
+        .max();
+    let quote_after_list = quote_source_start.is_some_and(|quote_start| {
+        list_prefix_end.is_some_and(|prefix_end| prefix_end <= quote_start)
+    });
+    let quote_prefix_before_list = quote_prefix_after_outer
+        && list.marker.as_ref().is_some_and(|marker| {
+            line.quote_marker_visual_ranges
+                .first()
+                .is_some_and(|quote| quote.start < marker.visual_range.start)
+        });
+    let marker_x = list_depth_x(list.owner.depth)
+        + if quote_prefix_after_outer {
+            if quote_prefix_before_list {
+                quote_x + quote_prefix_width
+            } else {
+                0.0
+            }
+        } else if quote_after_list {
+            0.0
+        } else {
+            quote_x
+        };
     let aggregate_marker_width = marker_widths
         .get(&list.owner.list_id)
         .copied()
@@ -612,8 +1210,14 @@ fn line_geometry(
             marker.visual_range.end.0,
         )
     });
-    let body_visual_start = Some(list.body_visual_start.0);
-    let body_visual_start_offset = list.body_visual_start.0;
+    let mut body_visual_start = Some(list.body_visual_start.0);
+    if quote_prefix_after_outer {
+        body_visual_start = match (body_visual_start, quote_prefix_end) {
+            (Some(body), Some(prefix_end)) => Some(body.max(prefix_end)),
+            (body, _) => body,
+        };
+    }
+    let body_visual_start_offset = body_visual_start.unwrap_or(list.body_visual_start.0);
     let marker_visual_range = list.marker.as_ref().map(|marker| marker.visual_range);
     let expanded_prefix_width = line
         .source_map
@@ -621,6 +1225,12 @@ fn line_geometry(
         .iter()
         .filter(|segment| {
             segment.visibility == crate::Visibility::ExpandedMarkup
+                && (!quote_prefix_after_outer
+                    || !line
+                        .quote_marker_visual_ranges
+                        .iter()
+                        .take(line.quote.map_or(0, |quote| quote.disclosed_depth))
+                        .any(|range| *range == segment.visual_range))
                 && segment.visual_range.start.0 < body_visual_start_offset
                 && segment.visual_range.end.0 <= body_visual_start_offset
                 && marker_visual_range.as_ref() != Some(&segment.visual_range)
@@ -638,30 +1248,109 @@ fn line_geometry(
     // item's body, so adding the aggregate marker width would reserve that
     // column a second time. When the prefix is hidden, keep the aggregate
     // marker column so inactive continuation rows still hang under the body.
-    let marker_column_width = if list.marker.is_none() && expanded_prefix_width > 0.0 {
+    // Synthesized markers participate in the list-wide inactive alignment
+    // column. Once a marker is disclosed, the source-visible marker is the
+    // coordinate truth: retaining the aggregate column here would leave a
+    // geometry-only gap between the raw marker and its body.
+    let marker_column_width = if list
+        .marker
+        .as_ref()
+        .is_some_and(|marker| !marker.synthesized)
+    {
+        disclosed_marker_width
+    } else if list.marker.is_none() && expanded_prefix_width > 0.0 {
         0.0
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
     };
-    let body_x = marker_x + expanded_prefix_width + marker_column_width;
-    LineGeometry {
-        marker_x_origin: if list.marker.is_some() {
-            Some(marker_x)
+    let marker_body_gap = list
+        .marker
+        .as_ref()
+        .filter(|marker| marker.synthesized)
+        .map_or(0.0, |_| {
+            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
+        });
+    let opening_marker = list.marker.is_some();
+    let body_x = if quote_prefix_after_outer {
+        let body = body_visual_start.unwrap_or(body_visual_start_offset);
+        shaper.x_for_offset(line, 0..body, body)
+            + quote_x
+            + list_depth_x(list.owner.depth)
+            + marker_body_gap
+    } else {
+        marker_x
+            + expanded_prefix_width
+            + marker_column_width
+            + if quote_after_list { quote_x } else { 0.0 }
+    };
+    let text_x_origin = if quote_prefix_after_outer {
+        0.0
+    } else if opening_marker {
+        marker_x
+    } else {
+        body_x - expanded_prefix_width
+    };
+    let first_row_width = if quote_prefix_after_outer {
+        body_visual_start.map_or(width - text_x_origin, |body| {
+            shaper.x_for_offset(line, 0..body, body) + width - body_x + marker_body_gap
+        })
+    } else {
+        width - text_x_origin
+    };
+    let body_gap = body_visual_start
+        .filter(|body| *body > 0)
+        .map_or(marker_body_gap, |body| {
+            (body_x - text_x_origin - shaper.x_for_offset(line, 0..body, body)).max(0.0)
+        });
+    let quote_bar_x_origin = if quote_x > 0.0 {
+        let quote_bar_x = if quote_prefix_after_outer && quote_prefix_before_list {
+            quote_prefix_width + quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
+        } else if quote_after_list {
+            body_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
         } else {
-            None
-        },
+            quote_x - QUOTE_BAR_GAP - QUOTE_BAR_WIDTH
+        };
+        Some(quote_bar_x)
+    } else {
+        None
+    };
+    LineGeometry {
+        text_x_origin,
+        marker_x_origin: opening_marker.then_some(marker_x),
         body_x_origin: body_x,
-        expanded_prefix_width,
+        first_row_width,
         effective_width: (width - body_x).max(MIN_EFFECTIVE_WRAP_WIDTH),
         body_visual_start,
         marker_visual_range: list
             .marker
             .as_ref()
             .map(|marker| marker.visual_range.start.0..marker.visual_range.end.0),
-        marker_body_gap: list.marker.as_ref().map_or(0.0, |_| {
-            (aggregate_marker_width.max(disclosed_marker_width) - disclosed_marker_width).max(0.0)
-        }),
+        marker_body_gap,
+        body_gap,
+        quote_bar_x_origin,
     }
+}
+
+fn disclosed_quote_prefix(line: &VisualLine, shaper: &dyn LineShaper) -> (Option<usize>, f32) {
+    let Some(quote) = line.quote else {
+        return (None, 0.0);
+    };
+    if quote.disclosed_depth == 0 {
+        return (None, 0.0);
+    }
+
+    let mut disclosed = 0;
+    for marker in &line.quote_marker_visual_ranges {
+        disclosed += 1;
+        if disclosed == quote.disclosed_depth {
+            let visual_end = marker.end.0;
+            return (
+                Some(visual_end),
+                shaper.x_for_offset(line, 0..visual_end, visual_end),
+            );
+        }
+    }
+    (None, 0.0)
 }
 
 /// Fragment boundaries of one line, including 0 and the text length, so
@@ -679,11 +1368,8 @@ fn fragment_boundaries(
     if width <= 0.0 || line.image.is_some() {
         return vec![0, len];
     }
-    let first_x_origin = geometry
-        .marker_x_origin
-        .unwrap_or(geometry.body_x_origin - geometry.expanded_prefix_width);
     let first_width =
-        (width - first_x_origin - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
+        (geometry.first_row_width - geometry.marker_body_gap).max(MIN_EFFECTIVE_WRAP_WIDTH);
     let mut boundaries = Vec::with_capacity(4);
     boundaries.push(0);
     let valid_boundaries = |start: usize, row_width: f32| {

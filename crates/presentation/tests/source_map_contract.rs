@@ -194,23 +194,29 @@ fn hidden_and_synthesized_positions_normalize_idempotently() {
         None,
         LineContext::Table,
     );
-    let synthesized = table_block
-        .source_map
-        .segments
-        .iter()
-        .find(|segment| segment.visibility == Visibility::Synthesized)
-        .expect("table presentation must expose synthesized separators");
-    for affinity in [Bias::Before, Bias::After] {
-        let normalized = table_block
+    let table = table_block.table_row.expect("table presentation metadata");
+    assert_eq!(table.cells.len(), 2);
+    assert!(
+        !table_block
             .source_map
-            .normalize_visual(synthesized.visual_range.start, affinity)
-            .unwrap();
-        assert_eq!(
-            table_block
+            .segments
+            .iter()
+            .any(|segment| segment.visibility == Visibility::Synthesized)
+    );
+    for cell in table.cells {
+        for affinity in [Bias::Before, Bias::After] {
+            let visual = cell.visual_range.start;
+            let normalized = table_block
                 .source_map
-                .normalize_visual(normalized, affinity),
-            Some(normalized)
-        );
+                .normalize_visual(visual, affinity)
+                .unwrap();
+            assert_eq!(
+                table_block
+                    .source_map
+                    .normalize_visual(normalized, affinity),
+                Some(normalized)
+            );
+        }
     }
 }
 

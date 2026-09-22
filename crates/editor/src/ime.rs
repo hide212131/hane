@@ -47,12 +47,7 @@ impl ImeState {
         })
     }
 
-    fn update(
-        &mut self,
-        summary: &EditSummary,
-        text: &str,
-        selected_utf16: Range<usize>,
-    ) {
+    fn update(&mut self, summary: &EditSummary, text: &str, selected_utf16: Range<usize>) {
         self.current_range = summary.range_after;
         self.marked_range = summary.range_after;
         self.marked_text = text.to_owned();
@@ -87,11 +82,7 @@ impl Editor {
             };
             let transaction_id = TransactionId(self.next_transaction);
             self.next_transaction += 1;
-            self.ime = Some(ImeState::begin(
-                self,
-                transaction_id,
-                original_range,
-            )?);
+            self.ime = Some(ImeState::begin(self, transaction_id, original_range)?);
             original_range
         };
         let summary = self.document.edit(current, text)?;
@@ -165,9 +156,7 @@ impl Editor {
         self.history.record_replacement(
             ime.original_range.start.0,
             ime.original_text,
-            {
-                ime.marked_text
-            },
+            ime.marked_text,
             ime.original_selection,
             self.selection,
             crate::history::EditKind::Ime,

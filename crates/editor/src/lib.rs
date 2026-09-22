@@ -462,7 +462,9 @@ mod tests {
     #[test]
     fn recorded_range_replacement_is_one_undoable_structural_transaction() {
         let mut editor = Editor::new("- A");
-        editor.set_selection(Selection::caret(SourceOffset(3))).unwrap();
+        editor
+            .set_selection(Selection::caret(SourceOffset(3)))
+            .unwrap();
         editor
             .replace_range_recorded(
                 SourceRange::empty(3),

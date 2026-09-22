@@ -25,9 +25,13 @@ use crate::instrument::{Instrumentation, log_summary};
 use crate::line::DEFAULT_LINE_HEIGHT;
 #[cfg(test)]
 use crate::line::presented_block;
+#[cfg(test)]
+use crate::line::presented_block_with_list_projection;
+#[cfg(test)]
+use crate::line::presented_block_with_projections;
 use crate::line::{
     BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
-    expected_block_disclosures, presented_block_with_list_projection, row_element,
+    expected_block_disclosures, presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -44,18 +48,17 @@ use hane_document::{
 };
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
-    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, IndexSource, IndexedBlock,
-    ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan, SourceSelection,
-    local_block_index, plan_list_edit,
+    BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, FenceHeightProjection, IndexSource,
+    IndexedBlock, ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan,
+    PublishOutcome, SourceSelection, TableProjection, local_block_index, plan_list_edit,
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
 use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
-    VisualBlock, VisualLine,
-    block_heights, block_is_joinable, block_line_span, layout_block, parse_joined_span,
-    trailing_blank_lines,
+    VisualBlock, VisualLine, block_heights_with_disclosure, block_is_joinable, block_line_span,
+    code_line_height, layout_block, parse_joined_span, trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -109,6 +112,10 @@ const ZOOM_STEP_PER_LINE: f32 = 0.08;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
+/// Sub-pixel tolerance for caret/badge visibility checks. Shaping and prefix
+/// sums accumulate f32 rounding error; anything below half a device-independent
+/// pixel is not a visible clip and must not keep a pending scroll request alive.
+const CARET_VISIBILITY_TOLERANCE: f32 = 0.5;
 /// Width of the sidebar's overlay scrollbar thumb while it is briefly shown
 /// during a scroll. Kept well under half of `SCROLLBAR_THUMB_WIDTH` (the
 /// editor's always-visible thumb) so the sidebar's idle right edge reads as
@@ -226,21 +233,8 @@ fn sidebar_width_for_drag(start_width: f32, pointer_delta: f32, viewport_width: 
     (start_width + pointer_delta).clamp(minimum, maximum)
 }
 
-fn sidebar_content_height(
-    tree_rows: usize,
-    draft_rows: usize,
-    empty_filter_row: bool,
-    show_filter: bool,
-) -> f32 {
-    2.0 * SIDEBAR_PADDING
-        + SIDEBAR_TOOLBAR_HEIGHT
-        + SIDEBAR_TOOLBAR_GAP
-        + if show_filter {
-            SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
-        } else {
-            0.0
-        }
-        + (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
+fn sidebar_list_content_height(tree_rows: usize, draft_rows: usize, empty_filter_row: bool) -> f32 {
+    (1 + tree_rows + draft_rows + usize::from(empty_filter_row)) as f32 * SIDEBAR_ROW_HEIGHT
 }
 
 /// The width layout wraps against: the window viewport, minus whatever the
@@ -572,6 +566,14 @@ pub struct EditorView {
     sidebar_resize_drag: Option<SidebarResizeDrag>,
     /// Native scroll state for the work-folder list; a custom thumb mirrors it.
     sidebar_scroll: ScrollHandle,
+    /// Horizontal scroll state for the file-tab strip. Keeping this in a
+    /// handle lets GPUI reveal a newly activated tab even when the main panel
+    /// is narrower than the open session list.
+    file_tabs_scroll: ScrollHandle,
+    /// Horizontal scroll state for the footer controls, so recent-file
+    /// buttons remain reachable without allowing the footer to cover the
+    /// editor viewport on a narrow main panel.
+    footer_scroll: ScrollHandle,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
@@ -720,6 +722,12 @@ pub struct EditorView {
     /// Where the caret was drawn last frame, relative to the content area. The
     /// IME asks for this to place its candidate window.
     caret_geometry: Option<CaretGeometry>,
+    /// Set after an editor command changes the caret/selection. The immediate
+    /// scroll uses the previous frame's layout; the request remains armed until
+    /// a post-layout pass observes stable geometry when progressive disclosure
+    /// changes a row height (for example, an inactive zero-height code fence
+    /// becoming editable).
+    pending_caret_visibility_after_layout: bool,
     /// Markdown block boundaries for the current revision. Updated incrementally
     /// on the input path and republished by the background parse; the publish
     /// priority between the two lives in `BlockIndexState`.
@@ -732,6 +740,26 @@ pub struct EditorView {
     /// run while retaining measured heights on both sides.
     height_blocks: HeightBlocks,
     document_parse_job_running: bool,
+    /// The disclosure for which the last background height snapshot was
+    /// requested. Selection drags can change this on every pointer event;
+    /// keeping it here coalesces identical requests without walking the whole
+    /// selected block range on the input thread. Empty disclosures matter too:
+    /// they are the snapshot that collapses the middle of a selection after
+    /// the selection is reduced to a caret.
+    last_background_height_disclosure: Option<(Revision, SourceRange)>,
+    /// The complete disclosure represented by the current height tree at the
+    /// last full synchronization. It is the baseline for background snapshots;
+    /// bounded endpoint moves use `last_endpoint_height_disclosure` instead.
+    last_applied_height_disclosure: Option<(Revision, SourceRange)>,
+    /// The disclosure used by the most recent bounded endpoint update. It can
+    /// advance while a document-sized background snapshot is running even
+    /// though `last_applied_height_disclosure` must continue to describe the
+    /// complete snapshot baseline used when that job was scheduled.
+    last_endpoint_height_disclosure: Option<(Revision, SourceRange)>,
+    /// A changed caret can arrive while a selection-collapse snapshot is in
+    /// flight. In that case both the old and new disclosures may be empty, so
+    /// the ordinary disclosure comparison cannot request another snapshot.
+    force_height_disclosure_snapshot: bool,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
     /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
@@ -2082,6 +2110,8 @@ impl EditorView {
             sidebar_width: theme.sidebar_width,
             sidebar_resize_drag: None,
             sidebar_scroll: ScrollHandle::new(),
+            file_tabs_scroll: ScrollHandle::new(),
+            footer_scroll: ScrollHandle::new(),
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
@@ -2125,10 +2155,15 @@ impl EditorView {
             raw_zoom: 1.0,
             pending_zoom_anchor: None,
             caret_geometry: None,
+            pending_caret_visibility_after_layout: false,
             block_index: BlockIndexState::new(),
             granularity: Granularity::Lines,
             height_blocks: HeightBlocks::default(),
             document_parse_job_running: false,
+            last_background_height_disclosure: None,
+            last_applied_height_disclosure: None,
+            last_endpoint_height_disclosure: None,
+            force_height_disclosure_snapshot: false,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
@@ -2270,7 +2305,8 @@ impl EditorView {
                     // whichever draft was installed last.
                     self.sessions.activate(initial_session);
                     self.open_path(&path, cx);
-                } else if last_recovered.is_some() {
+                } else if let Some(last_recovered) = last_recovered {
+                    self.reveal_file_tab(last_recovered);
                     self.on_document_replaced();
                     self.schedule_document_parse(cx);
                 }
@@ -2298,6 +2334,19 @@ impl EditorView {
         self.sessions.active()
     }
 
+    fn file_tab_index(&self, id: SessionId) -> Option<usize> {
+        self.sessions
+            .sessions()
+            .enumerate()
+            .find_map(|(index, session)| (session.id() == id).then_some(index))
+    }
+
+    fn reveal_file_tab(&self, id: SessionId) {
+        if let Some(index) = self.file_tab_index(id) {
+            self.file_tabs_scroll.scroll_to_item(index);
+        }
+    }
+
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
     fn active_session_has_sidebar_row(&self) -> bool {
@@ -2322,6 +2371,7 @@ impl EditorView {
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         if id == self.sessions.active_id() {
             self.sidebar_focus = SidebarFocus::ActiveSession;
+            self.reveal_file_tab(id);
             cx.notify();
             return true;
         }
@@ -2332,10 +2382,20 @@ impl EditorView {
         if !self.sessions.activate(id) {
             return false;
         }
+        self.reveal_file_tab(id);
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         cx.notify();
         true
+    }
+
+    fn activate_file_tab(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        self.blur_sidebar_filter(cx);
+        self.sidebar_keyboard_focus = false;
+        self.activate_session(id, cx);
     }
 
     fn document_key(&self) -> DocumentKey {
@@ -2371,7 +2431,12 @@ impl EditorView {
         self.line_owners.clear();
         self.layout_cache.clear();
         self.caret_geometry = None;
+        self.pending_caret_visibility_after_layout = false;
         self.block_index = BlockIndexState::new();
+        self.last_background_height_disclosure = None;
+        self.last_applied_height_disclosure = None;
+        self.last_endpoint_height_disclosure = None;
+        self.force_height_disclosure_snapshot = false;
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
         // for an unrelated block in whatever document replaced it.
@@ -2414,8 +2479,17 @@ impl EditorView {
         } else {
             self.resync_heights();
         }
-        self.scroll_cursor_into_view();
+        // Schedule before the bounded endpoint update so a disclosure-only
+        // snapshot can capture the complete height disclosure that its current
+        // tree was built from. The endpoint update below is intentionally only
+        // a temporary bridge until that snapshot covers the whole selection.
         self.schedule_document_parse(cx);
+        self.ensure_active_disclosure_height();
+        self.scroll_cursor_into_view();
+        // The command may disclose markup and change its row height only on
+        // the next render. Re-check once after that layout is installed so
+        // the caret and its input-mode badge use current geometry.
+        self.pending_caret_visibility_after_layout = true;
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
@@ -2777,10 +2851,15 @@ impl EditorView {
         }
     }
 
+    fn new_work_folder_note_heading() -> String {
+        let today = local_today();
+        format!("# {:04}-{:02}-{:02}_", today.year, today.month, today.day)
+    }
+
     /// Issue #5: starts a brand-new, unnamed note in the current work folder.
-    /// No filename prompt: it opens blank and ready for input immediately,
-    /// and is journalled into the recovery drafts as soon as it holds
-    /// anything, so a crash before it earns a real name never loses it.
+    /// No filename prompt: it opens with a date heading and is ready for input
+    /// immediately, and is journalled into the recovery drafts as soon as it
+    /// holds anything, so a crash before it earns a real name never loses it.
     pub fn new_work_folder_note(&mut self, cx: &mut Context<Self>) {
         if !self.cancel_inline_rename(cx) {
             return;
@@ -2794,7 +2873,15 @@ impl EditorView {
         self.sessions
             .active_mut()
             .set_view_state(SessionViewState { scroll_y });
-        let id = self.sessions.open_untitled("", "Untitled");
+        let heading = Self::new_work_folder_note_heading();
+        let id = self.sessions.open_untitled(&heading, "Untitled");
+        self.reveal_file_tab(id);
+        self.sessions
+            .get_mut(id)
+            .expect("new work-folder note session exists")
+            .editor_mut()
+            .set_selection(Selection::caret(SourceOffset(heading.len())))
+            .expect("the new note heading has a valid caret offset");
         self.work_folder_drafts.insert(
             id,
             WorkFolderDraft {
@@ -3417,10 +3504,11 @@ impl EditorView {
                                 .active_mut()
                                 .set_view_state(SessionViewState { scroll_y });
                         }
-                        self.sessions.apply_open(into, loaded);
+                        let opened_id = self.sessions.apply_open(into, loaded);
                         self.remember_recent(path);
                         cx.add_recent_document(path);
                         if is_latest_request {
+                            self.reveal_file_tab(opened_id);
                             self.on_document_replaced();
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
@@ -3463,20 +3551,49 @@ impl EditorView {
     /// One job at a time; a result that no longer matches the document revision
     /// is rebased or re-scheduled rather than published stale.
     fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        if !self
-            .block_index
-            .needs_formal_parse(self.sessions.active().editor().document())
+        let document = self.sessions.active().editor().document();
+        let revision = document.revision();
+        let disclosure = self.active_height_disclosure();
+        let force_height_disclosure_snapshot = self.force_height_disclosure_snapshot;
+        let disclosure_refresh = disclosure
+            .filter(|disclosure| !disclosure.is_empty())
+            .is_some_and(|disclosure| {
+                self.last_background_height_disclosure != Some((revision, disclosure))
+            });
+        let disclosure_collapse = disclosure
+            .filter(|disclosure| disclosure.is_empty())
+            .is_some_and(|_| {
+                self.last_background_height_disclosure.is_some_and(
+                    |(background_revision, background)| {
+                        background_revision == revision && !background.is_empty()
+                    },
+                )
+            });
+        if !self.block_index.needs_formal_parse(document)
+            && !disclosure_refresh
+            && !disclosure_collapse
+            && !force_height_disclosure_snapshot
         {
             return;
         }
         if self.document_parse_job_running {
             return;
         }
+        self.force_height_disclosure_snapshot = false;
         self.document_parse_job_running = true;
         let key = self.document_key();
-        let revision = self.sessions.active().editor().document().revision();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
+        let previous_height_disclosure = self
+            .last_applied_height_disclosure
+            .filter(|(previous_revision, _)| *previous_revision == revision)
+            .map(|(_, disclosure)| disclosure);
+        let snapshot_is_collapsing_disclosure = previous_height_disclosure
+            .is_some_and(|previous| !previous.is_empty())
+            && disclosure.is_some_and(|disclosure| disclosure.is_empty());
+        if let Some(disclosure) = disclosure {
+            self.last_background_height_disclosure = Some((revision, disclosure));
+        }
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             gpui::Timer::after(Duration::from_millis(40)).await;
@@ -3508,7 +3625,12 @@ impl EditorView {
                 .background_executor()
                 .spawn(async move {
                     let index = BlockIndex::from_buffer(&snapshot);
-                    let heights = HeightIndex::new(block_heights(&snapshot, &index, line_height));
+                    let heights = HeightIndex::new(block_heights_with_disclosure(
+                        &snapshot,
+                        &index,
+                        line_height,
+                        disclosure,
+                    ));
                     (index, heights)
                 })
                 .await;
@@ -3528,20 +3650,82 @@ impl EditorView {
                     return;
                 }
                 let document = view.sessions.active().editor().document();
-                view.block_index
-                    .publish(index, IndexSource::Formal, document);
-                view.background_presentation_generation = revision.0 + 1;
-                // Formal boundaries can disagree with what the bounded local
-                // parse showed, so every cached presentation is re-derived once.
-                view.block_cache.clear();
-                view.joined_parse_cache.clear();
+                let publish_outcome =
+                    view.block_index
+                        .publish(index, IndexSource::Formal, document);
+                let index_was_updated = matches!(
+                    publish_outcome,
+                    PublishOutcome::Published | PublishOutcome::Rebased(_)
+                );
+                if index_was_updated {
+                    view.background_presentation_generation = revision.0 + 1;
+                    // Formal boundaries can disagree with what the bounded
+                    // local parse showed, so every cached presentation is
+                    // re-derived once when the index actually changed.
+                    view.block_cache.clear();
+                    view.joined_parse_cache.clear();
+                }
                 let (granularity, len) = view.desired_layout();
-                if granularity == Granularity::Blocks && len == heights.len() {
-                    view.install_heights(granularity, heights);
+                let snapshot_disclosure_is_current = view.editor().document().revision()
+                    == revision
+                    && view.active_height_disclosure() == disclosure;
+                if snapshot_disclosure_is_current
+                    && granularity == Granularity::Blocks
+                    && len == heights.len()
+                {
+                    if publish_outcome == PublishOutcome::NotMoreAuthoritative {
+                        // The formal index is already current in this case;
+                        // this job only refreshed disclosure-dependent fence
+                        // heights. Preserve measured wrapping/image heights and
+                        // invalidate presentations lazily through their
+                        // disclosure check instead of throwing their caches
+                        // away for a selection change.
+                        view.install_disclosure_heights_preserving_measurements(
+                            heights,
+                            previous_height_disclosure,
+                        );
+                    } else if index_was_updated {
+                        view.install_heights(granularity, heights);
+                    }
+                    if let Some(disclosure) = disclosure {
+                        view.last_background_height_disclosure = Some((revision, disclosure));
+                    }
                 } else {
-                    // The parse was rebased onto edits made while it ran, so the
-                    // block count moved and the prepared heights no longer fit.
-                    view.resync_heights();
+                    // The parse was rebased onto edits, or the caret/IME moved
+                    // while it ran, so the prepared heights no longer describe
+                    // the current disclosure. A changed selection, including
+                    // a non-empty selection collapsing to a caret, is retried
+                    // in another background snapshot; rebuilding all selected
+                    // blocks here would put the same document-sized walk back
+                    // on the input thread at the completion boundary. The
+                    // bounded active-end update keeps the caret addressable
+                    // until that snapshot lands.
+                    let current_disclosure = view.active_height_disclosure();
+                    let selection_snapshot_requires_retry = current_disclosure != disclosure
+                        && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
+                            || disclosure.is_some_and(|disclosure| !disclosure.is_empty())
+                            || snapshot_is_collapsing_disclosure);
+                    if selection_snapshot_requires_retry {
+                        if snapshot_is_collapsing_disclosure
+                            && current_disclosure.is_some_and(|disclosure| disclosure.is_empty())
+                        {
+                            // Both snapshots are caret disclosures, so the
+                            // usual non-empty comparison cannot make the
+                            // queued job distinguish the latest caret from
+                            // the one that was captured before it started.
+                            view.force_height_disclosure_snapshot = true;
+                        }
+                        view.schedule_document_parse(cx);
+                        view.ensure_active_disclosure_height();
+                    } else if current_disclosure != disclosure {
+                        // Moving between two caret disclosures only needs the
+                        // bounded endpoint update; a whole-document snapshot
+                        // would make ordinary cursor motion unnecessarily
+                        // expensive.
+                        view.ensure_active_disclosure_height();
+                    } else {
+                        view.resync_heights_for_current_disclosure();
+                    }
                 }
                 cx.notify();
             });
@@ -3682,10 +3866,9 @@ impl EditorView {
             .filter(|index| index.revision() == document.revision())
             .cloned()
             .unwrap_or_else(|| BlockIndex::from_buffer(document));
-        let Some(projection) = index.list_edit_projection_at(
-            self.editor().document(),
-            selection.active,
-        ) else {
+        let Some(projection) =
+            index.list_edit_projection_at(self.editor().document(), selection.active)
+        else {
             return false;
         };
         let Ok(result) = plan_list_edit(
@@ -3708,11 +3891,10 @@ impl EditorView {
                     anchor: selection_after.anchor,
                     active: selection_after.active,
                 };
-                match self.editor_mut().replace_range_recorded(
-                    range,
-                    &replacement,
-                    selection_after,
-                ) {
+                match self
+                    .editor_mut()
+                    .replace_range_recorded(range, &replacement, selection_after)
+                {
                     Ok(_) => {
                         self.status = None;
                     }
@@ -4055,12 +4237,20 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
-        let visual = presented_block_with_list_projection(
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
+        let visual = presented_block_with_table_projection(
             self.editor(),
             &indexed,
             &window,
             joined.map(|cached| &cached.parse),
             list_projection,
+            fence_height_projection,
+            table_projection,
             self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -4093,6 +4283,9 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(&indexed));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
         target_in_neighbor(
             self.editor(),
             &indexed,
@@ -4103,6 +4296,7 @@ impl EditorView {
             shaper,
             joined.map(|cached| &cached.parse),
             list_projection,
+            table_projection,
             self.line_height(),
         )
     }
@@ -4242,13 +4436,324 @@ impl EditorView {
         match granularity {
             Granularity::Lines => vec![line_height; len],
             Granularity::Blocks => {
-                let document = self.sessions.active().editor().document();
+                let document = self.editor().document();
                 let index = self
                     .current_index()
                     .expect("block granularity has an index");
-                block_heights(document, index, line_height)
+                let disclosure = self.active_height_disclosure();
+                block_heights_with_disclosure(document, index, line_height, disclosure)
             }
         }
+    }
+
+    /// Keeps the active endpoint's fence block in the height index before the
+    /// caret-scroll calculation runs. A caret move does not change the block
+    /// count, so `resync_heights` quite deliberately keeps its measured index;
+    /// that fast path must still expand a zero-height block that was just made
+    /// editable or it can disappear from the next virtualization window.
+    ///
+    /// A non-empty selection is different: its complete disclosure is rebuilt
+    /// by the coalesced background parse. Updating every block it spans here
+    /// would make shift-selection and mouse dragging proportional to document
+    /// size. Only the two selection endpoints and the IME range boundaries are
+    /// needed synchronously to keep the caret addressable while that snapshot
+    /// is pending.
+    fn ensure_active_disclosure_height(&mut self) {
+        if self.granularity != Granularity::Blocks {
+            // A formal parse can publish its index while the view is still on
+            // the initial line-granularity height tree. In that transition
+            // the bounded endpoint bridge must first install the block tree;
+            // otherwise a caret move that races the first parse leaves the
+            // newly published index without any block heights at all.
+            self.resync_heights();
+            if self.granularity != Granularity::Blocks {
+                return;
+            }
+        }
+        let Some(disclosure) = self.active_height_disclosure() else {
+            return;
+        };
+        let Some(index) = self.current_index() else {
+            return;
+        };
+        let line_height = self.line_height();
+        let revision = self.editor().document().revision();
+        let previous = self
+            .last_endpoint_height_disclosure
+            .filter(|(previous_revision, _)| *previous_revision == revision)
+            .map(|(_, disclosure)| disclosure);
+        let mut ordinals = Vec::with_capacity(4);
+        let mut add_ordinal = |offset: SourceOffset| {
+            if let Some(ordinal) = index.ordinal_at(offset)
+                && !ordinals.contains(&ordinal)
+            {
+                ordinals.push(ordinal);
+            }
+        };
+        let selection = self.editor().selection();
+        add_ordinal(selection.anchor);
+        add_ordinal(selection.active);
+        if let Some(previous) = previous {
+            add_ordinal(previous.start);
+            if !previous.is_empty() {
+                add_ordinal(SourceOffset(previous.end.0.saturating_sub(1)));
+            }
+        }
+        if let Some(ime) = self.editor().ime() {
+            add_ordinal(ime.current_range.start);
+            if !ime.current_range.is_empty() {
+                add_ordinal(SourceOffset(ime.current_range.end.0.saturating_sub(1)));
+            }
+        }
+        let updates = ordinals
+            .into_iter()
+            .filter_map(|ordinal| {
+                let block = index.block(ordinal)?;
+                let projection = index.fence_height_projection(&block)?;
+                let block_is_final = ordinal + 1 == index.len();
+                let collapsed = projection.inactive_rows_in(
+                    block.source_range,
+                    block.source_range,
+                    Some(disclosure),
+                    block_is_final,
+                );
+                let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
+                let current = self.heights.height(ordinal)?;
+                let target = previous.map_or_else(
+                    || current.max(minimum),
+                    |previous| {
+                        let previous_collapsed = projection.inactive_rows_in(
+                            block.source_range,
+                            block.source_range,
+                            Some(previous),
+                            block_is_final,
+                        );
+                        // `current` may be a measured layout height: a code
+                        // row is taller than the plain line-height seed. Move
+                        // only the fence-row delta between disclosures so the
+                        // measured body rows stay measured instead of being
+                        // replaced by an arithmetic lower bound.
+                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        let fence_height_delta = self.fence_height_delta(
+                            &block,
+                            projection,
+                            Some(previous),
+                            Some(disclosure),
+                            collapsed_delta,
+                            line_height,
+                        );
+                        preserve_measured_height_after_fence_delta(
+                            current,
+                            minimum,
+                            fence_height_delta,
+                        )
+                    },
+                );
+                (target != current).then_some((ordinal, target))
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, minimum) in updates {
+            self.heights.update(ordinal, minimum);
+        }
+        // This is the disclosure used by the bounded endpoint bridge, even
+        // while a document-sized snapshot is running. Keep it separate from
+        // `last_applied_height_disclosure`: the latter remains the complete
+        // snapshot baseline used to preserve measured middle blocks when the
+        // background result arrives.
+        self.last_endpoint_height_disclosure = Some((revision, disclosure));
+    }
+
+    /// Returns the amount of measured fence height that changes between two
+    /// disclosures. The arithmetic projection supplies the bounded baseline
+    /// for every transitioned fence row. When the old disclosure's layout is
+    /// cached, replace the baseline for the visible transitioned rows with
+    /// their actual fragment height so a long delimiter that wrapped into
+    /// several layout rows does not leave residual height behind.
+    fn fence_height_delta(
+        &self,
+        block: &IndexedBlock,
+        projection: &FenceHeightProjection,
+        previous: Option<SourceRange>,
+        current: Option<SourceRange>,
+        collapsed_delta: f32,
+        line_height: f32,
+    ) -> f32 {
+        let code_height = code_line_height(line_height);
+        let baseline = code_height * collapsed_delta;
+        let Some(visual) = self.block_cache.get(&block.id) else {
+            return baseline;
+        };
+        let Some(layout) = self.layout_cache.get(&block.id) else {
+            return baseline;
+        };
+        if !layout.is_valid(
+            self.content_width,
+            self.layout_font_revision,
+            self.editor().document().revision(),
+        ) {
+            return baseline;
+        }
+        let Some(block_lines) = block_line_span(self.editor().document(), block) else {
+            return baseline;
+        };
+        let first_presented_line = visual.span.start + visual.lines_before;
+        let block_is_final = self
+            .current_index()
+            .is_some_and(|index| block.ordinal + 1 == index.len());
+        let mut seen = HashSet::new();
+        let mut correction = 0.0;
+        for row in &layout.layout.lines {
+            if !seen.insert(row.line) {
+                continue;
+            }
+            let physical_line = first_presented_line + row.line;
+            let relative_line = physical_line.saturating_sub(block_lines.start);
+            if !projection.is_fence_row_line(relative_line) {
+                continue;
+            }
+            let was_collapsed = fence_row_is_inactive(
+                projection,
+                block.source_range,
+                relative_line,
+                previous,
+                block_is_final,
+            );
+            let is_collapsed = fence_row_is_inactive(
+                projection,
+                block.source_range,
+                relative_line,
+                current,
+                block_is_final,
+            );
+            if was_collapsed == is_collapsed {
+                continue;
+            }
+            let measured = layout.layout.line_height_of(row.line);
+            // A cached layout from the collapsed state has zero height for the
+            // row. It cannot tell us the not-yet-laid-out expanded height, so
+            // keep the arithmetic fallback for that direction. The reverse
+            // transition has the old expanded layout and can use all wrapped
+            // fragments it measured.
+            if measured <= 0.0 {
+                continue;
+            }
+            let measured_delta = measured - code_height;
+            correction += if is_collapsed {
+                measured_delta
+            } else {
+                -measured_delta
+            };
+        }
+        baseline + correction
+    }
+
+    /// Applies a disclosure-only height snapshot without replacing measured
+    /// block geometry. The formal index is already current when this runs, so
+    /// the old and new fence projections describe the same block ids; only the
+    /// structural fence-row delta needs to move each measured height. The
+    /// snapshot itself supplies the arithmetic minimum for blocks that have
+    /// not been laid out yet.
+    fn install_disclosure_heights_preserving_measurements(
+        &mut self,
+        snapshot: HeightIndex,
+        previous_disclosure: Option<SourceRange>,
+    ) {
+        let Some(disclosure) = self.active_height_disclosure() else {
+            return;
+        };
+        let Some(index) = self.current_index() else {
+            return;
+        };
+        if self.granularity != Granularity::Blocks
+            || self.heights.len() != snapshot.len()
+            || index.len() != snapshot.len()
+        {
+            return;
+        }
+
+        let anchor = self.top_source_offset();
+        let intra = (!self.heights.is_empty()).then(|| {
+            let item = self.heights.block_at_y(self.scroll_y);
+            self.scroll_y - self.heights.prefix_sum(item)
+        });
+        let line_height = self.line_height();
+        let updates = (0..snapshot.len())
+            .filter_map(|ordinal| {
+                let block = index.block(ordinal)?;
+                let minimum = snapshot.height(ordinal)?;
+                let current = self.heights.height(ordinal)?;
+                let target = previous_disclosure.map_or_else(
+                    || current.max(minimum),
+                    |previous| {
+                        let block_is_final = ordinal + 1 == index.len();
+                        let collapsed =
+                            index
+                                .fence_height_projection(&block)
+                                .map_or(0, |projection| {
+                                    projection.inactive_rows_in(
+                                        block.source_range,
+                                        block.source_range,
+                                        Some(disclosure),
+                                        block_is_final,
+                                    )
+                                });
+                        let previous_collapsed =
+                            index
+                                .fence_height_projection(&block)
+                                .map_or(0, |projection| {
+                                    projection.inactive_rows_in(
+                                        block.source_range,
+                                        block.source_range,
+                                        Some(previous),
+                                        block_is_final,
+                                    )
+                                });
+                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
+                        let fence_height_delta = index.fence_height_projection(&block).map_or(
+                            code_line_height(line_height) * collapsed_delta,
+                            |projection| {
+                                self.fence_height_delta(
+                                    &block,
+                                    projection,
+                                    Some(previous),
+                                    Some(disclosure),
+                                    collapsed_delta,
+                                    line_height,
+                                )
+                            },
+                        );
+                        preserve_measured_height_after_fence_delta(
+                            current,
+                            minimum,
+                            fence_height_delta,
+                        )
+                    },
+                );
+                (target != current).then_some((ordinal, target))
+            })
+            .collect::<Vec<_>>();
+        for (ordinal, height) in updates {
+            self.heights.update(ordinal, height);
+        }
+        self.scroll_y = anchor.map_or(self.scroll_y, |offset| {
+            let top = self.scroll_for_offset(offset);
+            let item = self.heights.block_at_y(top);
+            let inside = intra
+                .zip(self.heights.height(item))
+                .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
+            top + inside
+        });
+        self.last_applied_height_disclosure =
+            Some((self.editor().document().revision(), disclosure));
+        self.last_endpoint_height_disclosure =
+            Some((self.editor().document().revision(), disclosure));
+    }
+
+    fn active_height_disclosure(&self) -> Option<SourceRange> {
+        self.editor()
+            .ime()
+            .map(|ime| ime.current_range)
+            .or_else(|| Some(self.editor().selection().range()))
     }
 
     /// Keeps `heights` keyed to the same thing the renderer enumerates. This is
@@ -4261,6 +4766,20 @@ impl EditorView {
         }
         let heights = HeightIndex::new(self.item_heights());
         self.install_heights(granularity, heights);
+    }
+
+    /// Rebuilds the height snapshot even when its shape did not change. A
+    /// formal parse can finish after the caret or IME moved without changing
+    /// the block count; retaining the old same-sized tree would retain the
+    /// previous fence disclosure and make presentation and virtualization
+    /// disagree.
+    fn resync_heights_for_current_disclosure(&mut self) {
+        let (granularity, len) = self.desired_layout();
+        if granularity == self.granularity && len == self.heights.len() {
+            self.install_heights(granularity, HeightIndex::new(self.item_heights()));
+        } else {
+            self.resync_heights();
+        }
     }
 
     /// Swaps in a height index, keeping the reader where they were: the scroll
@@ -4297,6 +4816,10 @@ impl EditorView {
                 .map_or(0.0, |(intra, height)| intra.clamp(0.0, height));
             top + inside
         });
+        self.last_applied_height_disclosure = self
+            .active_height_disclosure()
+            .map(|disclosure| (self.editor().document().revision(), disclosure));
+        self.last_endpoint_height_disclosure = self.last_applied_height_disclosure;
     }
 
     /// Applies the small splice reported by the incremental block index. The
@@ -4403,10 +4926,47 @@ impl EditorView {
                 let line = document
                     .line_for_offset(offset)
                     .map_or(first_line, |line| line.0);
+                let physical_line = line.saturating_sub(first_line);
+                let visible_line = self.visible_line_prefix(&block, physical_line);
                 self.heights.prefix_sum(block.ordinal)
-                    + line.saturating_sub(first_line) as f32 * self.drawn_line_height(&block)
+                    + visible_line as f32 * self.drawn_line_height(&block)
             }
         }
+    }
+
+    /// Number of non-collapsed physical lines before `physical_line` inside a
+    /// block. Fence rows are answered by the formal projection's prefix index;
+    /// the render path never enumerates the block's off-screen fences.
+    fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
+        let Some(index) = self.current_index() else {
+            return physical_line;
+        };
+        let Some(projection) = index.fence_height_projection(block) else {
+            return physical_line;
+        };
+        let block_is_final = block.ordinal + 1 == index.len();
+        let collapsed = projection.inactive_rows_before_line(
+            block.source_range,
+            physical_line,
+            self.active_height_disclosure(),
+            block_is_final,
+        );
+        physical_line.saturating_sub(collapsed)
+    }
+
+    /// Inverts [`Self::visible_line_prefix`] for a visual row count. The
+    /// monotone prefix query is inverted with a binary search, so a large
+    /// list/quote block remains bounded by the logarithm of its physical line
+    /// count even when it contains many collapsed fence rows.
+    fn physical_line_prefix_for_visible_rows(
+        &self,
+        block: &IndexedBlock,
+        physical_line_count: usize,
+        visible_rows: usize,
+    ) -> usize {
+        invert_visible_line_prefix(physical_line_count, visible_rows, |line| {
+            self.visible_line_prefix(block, line)
+        })
     }
 
     /// The blocks covering the viewport. `visible` is a range of height entries,
@@ -4462,7 +5022,9 @@ impl EditorView {
     /// block can be taller than the viewport — a document with no blank line in
     /// it is one block. How tall a line is depends on how often it wraps, so the
     /// block's own laid-out rows answer it where they exist and the line height
-    /// stands in where they do not; the overscan absorbs the difference.
+    /// stands in where they do not; the overscan absorbs the difference. When a
+    /// fence projection collapses rows, the visual estimate is inverted through
+    /// its prefix count before the physical source window is selected.
     fn visible_line_window(&self, blocks: &[IndexedBlock], items: &Range<usize>) -> Range<usize> {
         match self.granularity {
             Granularity::Lines => items.clone(),
@@ -4479,12 +5041,28 @@ impl EditorView {
                 ) else {
                     return 0..0;
                 };
-                let into_block = |y: f32, block: &IndexedBlock| {
-                    ((y - self.heights.prefix_sum(block.ordinal)) / self.drawn_line_height(block))
-                        .max(0.0)
+                let local_rows = |y: f32, block: &IndexedBlock, round_up: bool| {
+                    let rows = ((y - self.heights.prefix_sum(block.ordinal)).max(0.0)
+                        / self.drawn_line_height(block))
+                    .max(0.0);
+                    if round_up {
+                        rows.ceil() as usize + 1
+                    } else {
+                        rows.floor() as usize + 1
+                    }
                 };
-                let start = first_span.start + into_block(top, first).floor() as usize;
-                let end = last_span.start + into_block(bottom, last).ceil() as usize + 1;
+                let start_prefix = self.physical_line_prefix_for_visible_rows(
+                    first,
+                    first_span.len(),
+                    local_rows(top, first, false),
+                );
+                let end_prefix = self.physical_line_prefix_for_visible_rows(
+                    last,
+                    last_span.len(),
+                    local_rows(bottom, last, true),
+                );
+                let start = first_span.start + start_prefix.saturating_sub(1);
+                let end = last_span.start + end_prefix;
                 let start = start.min(first_span.end.saturating_sub(1));
                 start..end.max(start + 1).min(last_span.end)
             }
@@ -4551,12 +5129,20 @@ impl EditorView {
         let list_projection = self
             .current_index()
             .and_then(|index| index.list_projection(block));
-        let presented = presented_block_with_list_projection(
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(block));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(block));
+        let presented = presented_block_with_table_projection(
             self.sessions.active().editor(),
             block,
             visible,
             joined.map(|cached| &cached.parse),
             list_projection,
+            fence_height_projection,
+            table_projection,
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());
@@ -4684,14 +5270,17 @@ fn target_in_neighbor(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    table_projection: Option<&TableProjection>,
     line_height: f32,
 ) -> Option<SourceOffset> {
-    let visual = presented_block_with_list_projection(
+    let visual = presented_block_with_table_projection(
         editor,
         indexed,
         &window,
         joined,
         list_projection,
+        None,
+        table_projection,
         line_height,
     )?;
     let layout = layout_block(&visual, width, shaper);
@@ -4736,6 +5325,7 @@ fn neighbor_row_target(
         width,
         shaper,
         joined,
+        None,
         None,
         DEFAULT_LINE_HEIGHT,
     )
@@ -4937,7 +5527,56 @@ impl EditorView {
     }
 }
 
-/// The header's status line, combining a persistent `draft_recovery_warning`
+fn invert_visible_line_prefix(
+    physical_line_count: usize,
+    visible_rows: usize,
+    mut visible_prefix: impl FnMut(usize) -> usize,
+) -> usize {
+    let visible_rows = visible_rows.min(visible_prefix(physical_line_count));
+    if visible_rows == 0 {
+        return 0;
+    }
+    let mut low = 0;
+    let mut high = physical_line_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if visible_prefix(middle) >= visible_rows {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+fn fence_row_is_inactive(
+    projection: &FenceHeightProjection,
+    block_range: SourceRange,
+    line: usize,
+    disclosure: Option<SourceRange>,
+    block_is_final: bool,
+) -> bool {
+    projection.inactive_rows_before_line(block_range, line + 1, disclosure, block_is_final)
+        > projection.inactive_rows_before_line(block_range, line, disclosure, block_is_final)
+}
+
+/// Moves a measured block height by the fence-height delta whose disclosure
+/// changed, without letting floating-point noise leave a value just above the
+/// arithmetic minimum.
+fn preserve_measured_height_after_fence_delta(
+    current: f32,
+    minimum: f32,
+    fence_height_delta: f32,
+) -> f32 {
+    let adjusted = current - fence_height_delta;
+    if adjusted <= minimum + 0.001 {
+        minimum
+    } else {
+        adjusted.max(minimum)
+    }
+}
+
+/// The footer's status line, combining a persistent `draft_recovery_warning`
 /// with whatever transient `status` is current. Neither may swallow the
 /// other: the warning has to survive `open_path` cycling `status` through
 /// "Opening…"/"Opened" right after the scan that raised it, but a later
@@ -4946,7 +5585,7 @@ impl EditorView {
 /// startup and an unconditional priority for the warning would otherwise
 /// hide every status for the rest of the session. `None` when neither is
 /// set, so the caller can fall back to its own default line.
-fn header_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
+fn footer_status_line(warning: Option<&str>, status: Option<&str>) -> Option<String> {
     match (warning, status) {
         (Some(warning), Some(status)) => Some(format!("{warning} · {status}")),
         (Some(warning), None) => Some(warning.to_owned()),
@@ -5285,13 +5924,14 @@ impl EditorView {
 
     fn sidebar_scrollbar(
         &self,
+        list_top: f32,
         viewport_height: f32,
         content_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
         let max_scroll = (content_height - viewport_height).max(0.0);
         let scroll_y = (-f32::from(self.sidebar_scroll.offset().y)).clamp(0.0, max_scroll);
-        let (top, thumb_height) =
+        let (thumb_top, thumb_height) =
             scrollbar_thumb_geometry(viewport_height, content_height, scroll_y)?;
         // Idle sidebar shows no track or thumb at all: the only visible
         // right-edge boundary is the thin `sidebar_resizer` line. The thumb
@@ -5303,7 +5943,7 @@ impl EditorView {
             div()
                 .id("work-folder-scrollbar")
                 .absolute()
-                .top(px(0.0))
+                .top(px(list_top))
                 .right(px(0.0))
                 .w(px(SCROLLBAR_TRACK_WIDTH))
                 .h(px(viewport_height))
@@ -5311,7 +5951,7 @@ impl EditorView {
                     div()
                         .id("work-folder-scrollbar-thumb")
                         .absolute()
-                        .top(px(top))
+                        .top(px(thumb_top))
                         .right(px(
                             (SCROLLBAR_TRACK_WIDTH - SIDEBAR_SCROLLBAR_THUMB_WIDTH) / 2.0
                         ))
@@ -5411,7 +6051,8 @@ impl Render for EditorView {
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
-            - self.theme.header_height)
+            - self.theme.header_height
+            - self.theme.footer_height)
             .max(self.line_height());
         self.step_measurement_scroll(window);
         // The width of the text column decides where every row breaks, so it is
@@ -5565,19 +6206,99 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
-        // Where the caret was drawn, for the IME candidate window. Only the
-        // block that holds it can answer, and only while it is on screen.
+        // Resolve the caret from the layouts produced in this frame, not from
+        // a cache that may still describe the pre-disclosure zero-height row.
+        // A fence can become editable one frame after the input event; keep the
+        // request armed until that row has a real positive height.
         let caret = self.editor().selection().active;
-        self.caret_geometry = rendered.iter().find_map(|(ordinal, visual, layout)| {
+        let caret_line = self.editor().document().line_for_offset(caret).ok();
+        // `BlockLayout::point_for_source` accepts a caret at the end of its
+        // last line, so two adjacent block layouts can both claim the same
+        // source boundary. In block granularity the formal index is the
+        // ownership authority; restrict resolution to the block that owns the
+        // caret before asking either layout for a point. Otherwise a collapsed
+        // closing fence immediately before a paragraph can win the search and
+        // leave the IME geometry on the wrong, zero-height block.
+        let caret_block_ordinal = (self.granularity == Granularity::Blocks)
+            .then(|| {
+                self.current_index()
+                    .and_then(|index| index.block_at(caret))
+                    .map(|block| block.ordinal)
+            })
+            .flatten();
+        let fresh_caret = rendered.iter().find_map(|(ordinal, visual, layout)| {
+            if self.granularity == Granularity::Blocks && caret_block_ordinal != Some(*ordinal) {
+                return None;
+            }
             if caret < visual.source_range.start || visual.source_range.end < caret {
                 return None;
             }
             let point = layout.point_for_source(visual, caret, &shaper)?;
-            Some(CaretGeometry {
-                x: self.theme.line_horizontal_padding + point.x,
-                y: self.heights.prefix_sum(*ordinal) + point.y - self.scroll_y,
-                height: point.height,
-            })
+            let top = match self.granularity {
+                Granularity::Blocks => self.heights.prefix_sum(*ordinal) + point.y,
+                Granularity::Lines => {
+                    let line = caret_line?;
+                    let line_id = line.0;
+                    let visual_line = visual
+                        .lines
+                        .iter()
+                        .position(|line| line.line_id as usize == line_id)?;
+                    let line_row_top = layout
+                        .lines
+                        .iter()
+                        .find(|row| row.line == visual_line)
+                        .map(|row| row.y)?;
+                    self.heights.prefix_sum(line.0) + point.y - line_row_top
+                }
+            };
+            Some((point.x, top, point.height))
+        });
+        if self.pending_caret_visibility_after_layout {
+            if let Some((_, top, height)) = fresh_caret
+                && height > 0.0
+            {
+                let before = self.scroll_y;
+                self.scroll_y = scroll_y_for_cursor(
+                    self.scroll_y,
+                    top,
+                    height + CARET_MODE_BADGE_HEIGHT,
+                    self.viewport_height,
+                );
+                self.scroll_y = clamp_scroll_y(
+                    self.scroll_y,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
+                let visible_bottom = top + height + CARET_MODE_BADGE_HEIGHT - self.scroll_y;
+                if visible_bottom <= self.viewport_height + CARET_VISIBILITY_TOLERANCE
+                    && self.scroll_y == before
+                {
+                    self.pending_caret_visibility_after_layout = false;
+                } else {
+                    // Keep the request armed for one more frame whenever this
+                    // correction moved the scroll. A following frame may apply
+                    // the height anchor to newly measured rows; clearing here
+                    // would let that anchor erase the badge clearance before
+                    // the caret has reached a stable layout.
+                    cx.notify();
+                }
+                if self.scroll_y != before {
+                    // The visible block set was selected before this corrected
+                    // position. One more frame lets virtualization follow it.
+                    cx.notify();
+                }
+            } else {
+                // The fresh disclosed row has not been laid out yet. Keep the
+                // request alive for the next frame instead of consuming it
+                // against stale zero-height geometry.
+                cx.notify();
+            }
+        }
+        // Where the caret was drawn, for the IME candidate window.
+        self.caret_geometry = fresh_caret.map(|(x, top, height)| CaretGeometry {
+            x: self.theme.line_horizontal_padding + x,
+            y: top - self.scroll_y,
+            height,
         });
         // Blocks are drawn whole, so the rendered span can start above the
         // viewport; the spacers have to match what was actually drawn.
@@ -5605,7 +6326,7 @@ impl Render for EditorView {
         } else {
             ""
         };
-        let status = header_status_line(
+        let status = footer_status_line(
             self.draft_recovery_warning.as_deref(),
             self.status.as_deref(),
         )
@@ -5637,9 +6358,10 @@ impl Render for EditorView {
         let main_column = div()
             .flex_1()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(self.header_element(status, cx));
+            .child(self.header_element(cx));
         // Relative image destinations resolve against the session's own file,
         // never against the directory the process happens to run in.
         let resolver = self.sessions.active().resource_resolver();
@@ -5649,6 +6371,7 @@ impl Render for EditorView {
             div()
                 .relative()
                 .flex_1()
+                .min_h(px(0.0))
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
@@ -5678,6 +6401,7 @@ impl Render for EditorView {
                                         &visual,
                                         &layout,
                                         row_index,
+                                        &shaper,
                                         self.theme,
                                         self.zoom,
                                         &resolver,
@@ -5718,7 +6442,7 @@ impl Render for EditorView {
                 )
                 .children(editor_scrollbar),
         );
-        let rendered = root.child(main_column);
+        let rendered = root.child(main_column.child(self.footer_element(status, cx)));
         self.metrics.record_layout(layout_started.elapsed());
         rendered
     }
@@ -5912,6 +6636,7 @@ impl EditorView {
         };
         let toolbar = div()
             .id("work-folder-toolbar")
+            .debug_selector(|| "sidebar-toolbar".to_owned())
             .h(px(SIDEBAR_TOOLBAR_HEIGHT))
             .flex_none()
             .flex()
@@ -5940,7 +6665,8 @@ impl EditorView {
             );
         }
         filter_input = filter_input.child(InlineRenameInput { input: cx.entity() });
-        let filter = (!self.inline_rename_active()).then(|| {
+        let show_filter = !self.inline_rename_active();
+        let filter = show_filter.then(|| {
             div()
                 .id("work-folder-file-filter")
                 .debug_selector(|| "sidebar-filter".to_owned())
@@ -6209,13 +6935,29 @@ impl EditorView {
                     }))
             })
             .collect::<Vec<_>>();
-        let content_height = sidebar_content_height(
-            tree_row_count,
-            draft_row_count,
-            empty_filter_row,
-            !self.inline_rename_active(),
-        );
-        let scrollbar = self.sidebar_scrollbar(sidebar_viewport_height, content_height, cx);
+        let content_height =
+            sidebar_list_content_height(tree_row_count, draft_row_count, empty_filter_row);
+        let list_top = SIDEBAR_PADDING
+            + SIDEBAR_TOOLBAR_HEIGHT
+            + SIDEBAR_TOOLBAR_GAP
+            + if show_filter {
+                SIDEBAR_FILTER_HEIGHT + SIDEBAR_FILTER_GAP
+            } else {
+                0.0
+            };
+        let list_viewport_height = (sidebar_viewport_height - list_top - SIDEBAR_PADDING).max(0.0);
+        let scrollbar = self.sidebar_scrollbar(list_top, list_viewport_height, content_height, cx);
+        let list = div()
+            .id("work-folder-sidebar-list")
+            .debug_selector(|| "sidebar-list".to_owned())
+            .flex_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
+            .on_scroll_wheel(cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)))
+            .child(root_row)
+            .children(tree)
+            .children(empty_filter)
+            .children(drafts);
         Some(
             div()
                 .id("work-folder-panel")
@@ -6229,11 +6971,6 @@ impl EditorView {
                     div()
                         .id("work-folder-sidebar")
                         .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.sidebar_scroll)
-                        .on_scroll_wheel(
-                            cx.listener(|view, _, _, cx| view.show_sidebar_scrollbar_briefly(cx)),
-                        )
                         .flex()
                         .flex_col()
                         .pt(px(SIDEBAR_PADDING))
@@ -6245,10 +6982,7 @@ impl EditorView {
                         .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
                         .children(filter)
-                        .child(root_row)
-                        .children(tree)
-                        .children(empty_filter)
-                        .children(drafts),
+                        .child(list),
                 )
                 .children(scrollbar),
         )
@@ -6368,7 +7102,67 @@ fn draft_preview(session: &DocumentSession) -> String {
 }
 
 impl EditorView {
-    fn header_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Div {
+    fn header_element(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let active_id = self.sessions.active_id();
+        let tab_count = self.sessions.len();
+        let tabs = self
+            .sessions()
+            .enumerate()
+            .map(|(index, session)| {
+                let id = session.id();
+                let is_active = id == active_id;
+                let label = if session.is_dirty() {
+                    format!("{} *", session.label())
+                } else {
+                    session.label()
+                };
+                let debug_selector = if index == 0 {
+                    "file-tab-first"
+                } else if index + 1 == tab_count {
+                    "file-tab-last"
+                } else {
+                    "file-tab"
+                };
+                div()
+                    .id(("file-tab", index))
+                    .debug_selector(move || debug_selector.to_owned())
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .cursor_pointer()
+                    .whitespace_nowrap()
+                    .when(is_active, |element| {
+                        element
+                            .bg(rgb(self.theme.tab_active_background))
+                            .text_color(rgb(self.theme.tab_active_foreground))
+                    })
+                    .when(!is_active, |element| {
+                        element.text_color(rgb(self.theme.header_foreground))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate_file_tab(id, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .id("file-tabs")
+            .debug_selector(|| "file-tabs".to_owned())
+            .h(px(self.theme.header_height))
+            .flex_none()
+            .flex()
+            .overflow_x_scroll()
+            .track_scroll(&self.file_tabs_scroll)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
+            .bg(rgb(self.theme.header_background))
+            .text_color(rgb(self.theme.header_foreground))
+            .children(tabs)
+    }
+
+    fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let autosave = if self.settings.autosave {
             "Autosave on"
         } else {
@@ -6390,61 +7184,77 @@ impl EditorView {
                     |name| name.to_string_lossy().into_owned(),
                 );
                 div()
-                    .id(("recent-file", index))
+                    .id(("footer-recent", index))
+                    .max_w(px(140.0))
                     .px_2()
                     .rounded_sm()
-                    .bg(rgb(self.theme.code_background))
+                    .bg(rgb(self.theme.editor_background))
                     .text_color(rgb(self.theme.foreground))
                     .cursor_pointer()
+                    .truncate()
                     .child(label)
                     .on_click(cx.listener(move |view, _, _, cx| view.open_path(&path, cx)))
             })
             .collect::<Vec<_>>();
+        let controls = div()
+            .h_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .id("footer-autosave")
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(autosave)
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
+            )
+            .child(
+                div()
+                    .id("footer-theme")
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(theme)
+                    .on_click(cx.listener(|view, _, window, cx| view.cycle_theme(window, cx))),
+            )
+            .child("Recent:")
+            .children(recent);
+        let controls = div()
+            .id("footer-controls")
+            .debug_selector(|| "footer-controls".to_owned())
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_x_scroll()
+            .track_scroll(&self.footer_scroll)
+            .child(controls);
+
         div()
-            .h(px(self.theme.header_height))
+            .id("editor-footer")
+            .debug_selector(|| "editor-footer".to_owned())
+            .h(px(self.theme.footer_height))
             .flex_none()
             .flex()
             .flex_col()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
-            .bg(rgb(self.theme.header_background))
-            .text_color(rgb(self.theme.header_foreground))
+            .bg(rgb(self.theme.code_background))
+            .text_color(rgb(self.theme.foreground))
             .child(
                 div()
-                    .h(px(38.0))
+                    .id("footer-status")
+                    .debug_selector(|| "footer-status".to_owned())
+                    .h(px(24.0))
+                    .flex_none()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .px_3()
-                    .child(self.sessions.active().label())
-                    .child(status),
-            )
-            .child(
-                div()
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap_2()
+                    .min_w(px(0.0))
                     .px_3()
                     .text_size(px(11.0))
-                    .child(
-                        div()
-                            .id("toggle-autosave")
-                            .cursor_pointer()
-                            .child(autosave)
-                            .on_click(cx.listener(|view, _, _, cx| view.toggle_autosave(cx))),
-                    )
-                    .child(
-                        div()
-                            .id("cycle-theme")
-                            .cursor_pointer()
-                            .child(theme)
-                            .on_click(
-                                cx.listener(|view, _, window, cx| view.cycle_theme(window, cx)),
-                            ),
-                    )
-                    .child("Recent:")
-                    .children(recent),
+                    .truncate()
+                    .child(status),
             )
+            .child(controls)
     }
 }
 
@@ -6547,6 +7357,7 @@ fn collapsed_boundary_bias(
 mod tests {
     use super::*;
     use crate::line::JOIN_SYNC_LINE_BUDGET;
+    use crate::theme::DARK_THEME;
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
@@ -6597,6 +7408,19 @@ mod tests {
             assert!(
                 contrast >= 4.5,
                 "date badge foreground contrast is too low for {background:#08x}: {contrast:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_file_tab_foreground_is_readable_in_both_themes() {
+        let foreground_luminance = relative_luminance(DEFAULT_THEME.tab_active_foreground);
+        for theme in [DEFAULT_THEME, DARK_THEME] {
+            let background_luminance = relative_luminance(theme.tab_active_background);
+            let contrast = (foreground_luminance + 0.05) / (background_luminance + 0.05);
+            assert!(
+                contrast >= 4.5,
+                "active tab foreground contrast is too low: {contrast:.2}"
             );
         }
     }
@@ -6910,7 +7734,7 @@ mod tests {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
 
         view.update(cx, |view, cx| {
-            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_none());
+            assert!(view.sidebar_scrollbar(0.0, 100.0, 400.0, cx).is_none());
 
             view.sidebar_scrollbar_drag = Some(ScrollbarDrag {
                 pointer_y: 0.0,
@@ -6918,8 +7742,41 @@ mod tests {
                 viewport_height: 100.0,
                 content_height: 400.0,
             });
-            assert!(view.sidebar_scrollbar(100.0, 400.0, cx).is_some());
+            assert!(view.sidebar_scrollbar(0.0, 100.0, 400.0, cx).is_some());
         });
+    }
+
+    #[gpui::test]
+    fn sidebar_scrolls_rows_without_moving_fixed_controls(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("fixed-controls-scroll");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..40 {
+            std::fs::write(root.join(format!("Note-{index:02}.md")), "# Note\n").unwrap();
+        }
+        let (view, cx) = open_inline_rename_test_view(cx, &root);
+
+        let toolbar_before = cx.debug_bounds("sidebar-toolbar").unwrap();
+        let filter_before = cx.debug_bounds("sidebar-filter").unwrap();
+        let list_before = cx.debug_bounds("sidebar-list").unwrap();
+        let root_before = cx.debug_bounds("sidebar-root").unwrap();
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: list_before.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.debug_bounds("sidebar-toolbar").unwrap(), toolbar_before);
+        assert_eq!(cx.debug_bounds("sidebar-filter").unwrap(), filter_before);
+        assert_eq!(cx.debug_bounds("sidebar-list").unwrap(), list_before);
+        assert!(cx.debug_bounds("sidebar-root").unwrap().top() < root_before.top());
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_scroll.offset().y < px(0.0));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7367,9 +8224,8 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let (caret, viewport_height) = view.read_with(cx, |view, _| {
-            (view.caret_geometry(), view.viewport_height)
-        });
+        let (caret, viewport_height) =
+            view.read_with(cx, |view, _| (view.caret_geometry(), view.viewport_height));
         let caret = caret.expect("caret is on screen at the document end");
 
         assert!(
@@ -7377,6 +8233,226 @@ mod tests {
             "badge would be clipped: caret bottom {}, viewport {viewport_height}",
             caret.y + caret.height
         );
+    }
+
+    #[gpui::test]
+    fn moving_into_a_hidden_closing_fence_rechecks_scroll_after_height_expands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut text = (1..=80)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        text.push_str("\n\n```\ncode\n```");
+        let code_offset = text.find("\ncode\n").expect("code line") + 2;
+        let closing_offset = text.rfind("```").expect("closing fence") + 1;
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(code_offset)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::MoveDown { extend: false }, cx);
+        });
+        cx.run_until_parked();
+
+        let (active, caret, viewport_height) = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection().active,
+                view.caret_geometry(),
+                view.viewport_height,
+            )
+        });
+        assert_eq!(active, SourceOffset(closing_offset));
+        let caret = caret.expect("disclosed closing fence caret is visible");
+        assert!(caret.height > 0.0, "editing restores the fence row height");
+        assert!(
+            caret.y + caret.height + CARET_MODE_BADGE_HEIGHT
+                <= viewport_height + CARET_VISIBILITY_TOLERANCE,
+            "expanded fence caret would be clipped: bottom {}, viewport {viewport_height}",
+            caret.y + caret.height
+        );
+    }
+
+    #[gpui::test]
+    fn caret_at_a_block_boundary_resolves_to_the_following_paragraph(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "```\n```\nparagraph";
+        let paragraph = text.find("paragraph").expect("paragraph");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, text, false);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(paragraph)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let (active, caret, pending, owner_ordinal) = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection().active,
+                view.caret_geometry(),
+                view.pending_caret_visibility_after_layout,
+                view.current_index()
+                    .and_then(|index| index.ordinal_at(SourceOffset(paragraph))),
+            )
+        });
+
+        assert_eq!(active, SourceOffset(paragraph));
+        assert!(
+            owner_ordinal.is_some(),
+            "the paragraph must own its boundary"
+        );
+        let caret = caret.expect("following paragraph caret is visible");
+        assert!(
+            caret.height > 0.0,
+            "the paragraph must not use the fence geometry"
+        );
+        assert!(
+            !pending,
+            "caret visibility must settle after the real owner is laid out"
+        );
+    }
+
+    #[gpui::test]
+    fn moving_away_from_a_hidden_fence_shrinks_the_previous_height(cx: &mut gpui::TestAppContext) {
+        let text = "```\nbody\n```\n\n```\n```";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("closing fence") + 1;
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(1)))
+                .unwrap();
+            let inactive = block_heights_with_disclosure(
+                &document,
+                view.current_index().expect("formal index"),
+                view.line_height(),
+                None,
+            );
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().expect("formal index"),
+                view.line_height(),
+                Some(SourceRange::empty(1)),
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            let measured = code_line_height(view.line_height()) * 3.0;
+            view.heights.update(0, measured);
+            assert!(measured > inactive[0]);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+            view.after_input(cx);
+
+            let expected = code_line_height(view.line_height()) * 2.0;
+            assert!(
+                view.heights
+                    .height(0)
+                    .is_some_and(|height| (height - expected).abs() < 0.001),
+                "leaving the old fence must remove only its disclosed row from the measured block"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn moving_away_from_a_wrapped_fence_removes_all_measured_fragments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let delimiter = "~".repeat(96);
+        let text = format!("{delimiter}\nbody\n{delimiter}\n\nplain");
+        let opening = 1;
+        let plain = text.find("plain").expect("tail paragraph");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(opening)))
+                .unwrap();
+            let block = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(opening)))
+                .expect("fenced block");
+            let span = block_line_span(&document, &block).expect("fenced block lines");
+            let projection = view
+                .current_index()
+                .and_then(|index| index.fence_height_projection(&block))
+                .expect("fence projection");
+            let visual = presented_block_with_projections(
+                view.editor(),
+                &block,
+                &span,
+                None,
+                None,
+                Some(projection),
+                view.line_height(),
+            )
+            .expect("active fenced block presentation");
+            let width = 80.0;
+            let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
+            let opening_line = visual
+                .lines
+                .iter()
+                .position(|line| line.line_id as usize == span.start)
+                .expect("opening line");
+            let measured_fence_height = layout.line_height_of(opening_line);
+            assert!(
+                measured_fence_height > code_line_height(view.line_height()),
+                "the long disclosed delimiter must occupy multiple wrapped rows"
+            );
+            let measured_block_height = layout.height();
+
+            view.content_width = width;
+            view.block_cache.insert(block.id, visual);
+            view.layout_cache.insert(
+                block.id,
+                LayoutCacheEntry {
+                    layout,
+                    font_revision: view.layout_font_revision,
+                },
+            );
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(opening)),
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            view.heights.update(block.ordinal, measured_block_height);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(plain)))
+                .unwrap();
+            view.after_input(cx);
+
+            let expected = measured_block_height - measured_fence_height;
+            let actual = view
+                .heights
+                .height(block.ordinal)
+                .expect("updated block height");
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "all wrapped fence fragments must be removed: actual {actual}, expected {expected}"
+            );
+        });
     }
 
     #[test]
@@ -7553,6 +8629,85 @@ mod tests {
     }
 
     #[test]
+    fn visible_line_prefix_inversion_skips_a_long_collapsed_fence_prefix() {
+        // Model a large list/quote block whose first 5,000 physical rows are
+        // inactive fence delimiters. The inverse must select the first visible
+        // source row, not the physical row with the same ordinal as the visual
+        // y position.
+        const COLLAPSED: usize = 5_000;
+        const PHYSICAL: usize = 10_000;
+        let visible_prefix = |physical: usize| physical.saturating_sub(physical.min(COLLAPSED));
+
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, 1, visible_prefix),
+            COLLAPSED + 1
+        );
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, 37, visible_prefix),
+            COLLAPSED + 37
+        );
+        assert_eq!(
+            invert_visible_line_prefix(PHYSICAL, PHYSICAL, visible_prefix),
+            PHYSICAL
+        );
+    }
+
+    #[gpui::test]
+    fn clipped_nested_fence_window_uses_the_non_collapsed_source_prefix(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut text = String::new();
+        for _ in 0..128 {
+            text.push_str("> ```\n> ```\n> \n");
+        }
+        text.push_str("> visible tail\n\noutside");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(text.len())))
+                .unwrap();
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            let block = index.blocks().next().expect("quote block");
+            assert!(
+                index.fence_height_projection(&block).is_some(),
+                "fixture must build a nested fence height projection"
+            );
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let block = view.current_index().unwrap().block(0).unwrap();
+            let span = block_line_span(&document, &block).unwrap();
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    view.current_index().unwrap(),
+                    view.line_height(),
+                    None,
+                )),
+            );
+            view.viewport_height = view.line_height() * 4.0;
+            view.scroll_y = view.line_height() * 50.0;
+
+            let lines = view.visible_line_window(&[block], &(0..1));
+            assert!(
+                lines.start > span.start + 80,
+                "collapsed fence rows must be skipped when selecting the source window: {lines:?}"
+            );
+            assert!(lines.end > lines.start && lines.end <= span.end);
+
+            let source_anchor = document.line_range(LineId(120)).unwrap().start;
+            let anchored_y = view.scroll_for_offset(source_anchor);
+            assert_eq!(
+                anchored_y,
+                view.line_height() * 40.0,
+                "scroll anchors must use the same collapsed-row prefix as the render window"
+            );
+        });
+    }
+
+    #[test]
     fn a_large_list_viewport_keeps_formal_numbering_and_nesting() {
         let mut source = String::from("1. outer\n   1. nested\n1. second\n");
         for _ in 3..5_000 {
@@ -7676,7 +8831,7 @@ mod tests {
             DEFAULT_LINE_HEIGHT,
         )
         .expect("late code opening presents");
-        assert_eq!(opening.lines[0].visual_text, "rust");
+        assert_eq!(opening.lines[0].visual_text, "");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
             segment.visibility == Visibility::HiddenMarkup
                 && segment.source_range.end.0 > segment.source_range.start.0
@@ -7710,7 +8865,11 @@ mod tests {
         .expect("late code row presents");
         let line = &presented.lines[0];
         assert_eq!(line.visual_text, "```oops");
-        assert!(line.style_runs.iter().any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
     }
 
     #[test]
@@ -7739,10 +8898,12 @@ mod tests {
         )
         .expect("late nested code row presents");
         assert_eq!(presented.lines[0].visual_text, "```oops");
-        assert!(presented.lines[0]
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            presented.lines[0]
+                .style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
 
         let closing_line = source[..source.rfind("    ````").expect("closing fence")]
             .bytes()
@@ -7759,7 +8920,12 @@ mod tests {
         .expect("late nested closing fence presents");
         assert_eq!(closing.lines[0].visual_text, "");
         assert_eq!(
-            closing.lines[0].source_map.segments.last().unwrap().marker_edge,
+            closing.lines[0]
+                .source_map
+                .segments
+                .last()
+                .unwrap()
+                .marker_edge,
             Some(MarkerEdge::Closing)
         );
     }
@@ -7794,10 +8960,11 @@ mod tests {
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "> **literal**");
         assert_eq!(line.kind, BlockKind::CodeBlock);
-        assert!(line
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
 
         let opening = presented_block_with_list_projection(
             &editor,
@@ -7808,9 +8975,9 @@ mod tests {
             DEFAULT_LINE_HEIGHT,
         )
         .expect("late quote code opening presents");
-        assert_eq!(opening.lines[0].visual_text, "> rust");
+        assert_eq!(opening.lines[0].visual_text, "> ````rust");
         assert!(opening.lines[0].source_map.segments.iter().any(|segment| {
-            segment.visibility == Visibility::HiddenMarkup
+            segment.visibility == Visibility::ExpandedMarkup
                 && segment.marker_edge == Some(MarkerEdge::Opening)
         }));
     }
@@ -7852,12 +9019,10 @@ mod tests {
         let line_start = source.find("    > > literal").expect("code row source");
         let quote_marker = SourceRange::new(line_start + 4, line_start + 6);
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
-            segment.source_range == quote_marker
-                && segment.marker_edge == Some(MarkerEdge::Opening)
+            segment.source_range == quote_marker && segment.marker_edge == Some(MarkerEdge::Opening)
         }));
         assert!(code.lines[0].source_map.segments.iter().any(|segment| {
-            segment.source_range == quote_marker
-                && segment.visibility == Visibility::ExpandedMarkup
+            segment.source_range == quote_marker && segment.visibility == Visibility::ExpandedMarkup
         }));
     }
 
@@ -7889,10 +9054,11 @@ mod tests {
         let line = &code.lines[0];
         assert_eq!(line.visual_text, "- literal");
         assert_eq!(line.kind, BlockKind::CodeBlock);
-        assert!(line
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::CodeBlock));
+        assert!(
+            line.style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::CodeBlock)
+        );
     }
 
     #[test]
@@ -7921,11 +9087,15 @@ mod tests {
         )
         .expect("same-line nested fence presents");
         let line = &opening.lines[0];
-        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.visual_text, "• ");
         assert_eq!(line.kind, BlockKind::CodeBlock);
         let list = line.list.as_ref().expect("formal child list metadata");
         assert_eq!(list.role, ListRowRole::Opening);
-        assert!(list.marker.as_ref().is_some_and(|marker| marker.synthesized));
+        assert!(
+            list.marker
+                .as_ref()
+                .is_some_and(|marker| marker.synthesized)
+        );
     }
 
     #[test]
@@ -7955,7 +9125,7 @@ mod tests {
         )
         .expect("same-line multi-level fence presents");
         let line = &opening.lines[0];
-        assert_eq!(line.visual_text, "• rust");
+        assert_eq!(line.visual_text, "• ");
         assert_eq!(line.kind, BlockKind::CodeBlock);
         let list = line.list.as_ref().expect("formal child list metadata");
         assert_eq!(list.owner.depth, 3);
@@ -7981,10 +9151,16 @@ mod tests {
         let outer_marker = SourceRange::new(opening_start + 4, opening_start + 6);
         let inner_marker = SourceRange::new(opening_start + 6, opening_start + 8);
         for marker_range in [outer_marker, inner_marker] {
-            assert!(disclosed.lines[0].source_map.segments.iter().any(|segment| {
-                segment.source_range == marker_range
-                    && segment.visibility == Visibility::ExpandedMarkup
-            }));
+            assert!(
+                disclosed.lines[0]
+                    .source_map
+                    .segments
+                    .iter()
+                    .any(|segment| {
+                        segment.source_range == marker_range
+                            && segment.visibility == Visibility::ExpandedMarkup
+                    })
+            );
         }
     }
 
@@ -8114,6 +9290,452 @@ mod tests {
                     .style_runs
                     .iter()
                     .any(|run| run.kind == hane_presentation::StyleKind::Bold)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_formal_parse_keeps_the_caret_owned_fence_block_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Empty fenced blocks collapse to zero height when inactive. Keep
+        // several of them adjacent so a disclosure-less background snapshot
+        // would make the height index's y=0 lookup select a later block and
+        // drop the caret-owned first block from virtualization.
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        // `schedule_document_parse` deliberately debounces formal work by a
+        // short real timer; let that job publish before inspecting the layout.
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.current_index().is_some_and(|index| index.len() >= 8));
+            let first_height = view.heights.height(0).expect("first block height");
+            assert!(
+                first_height > 0.0,
+                "the caret-owned opening fence must remain addressable after formal parse"
+            );
+            assert!(
+                view.caret_geometry().is_some(),
+                "formal height publication must not virtualize away the caret"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_formal_parse_rebuilds_heights_when_disclosure_moves_during_parse(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("last fence");
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Provisional, &document);
+            let heights = HeightIndex::new(block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(0)),
+            ));
+            view.install_heights(Granularity::Blocks, heights);
+            // Start a formal parse with the old disclosure, then move the
+            // caret before its completion without changing the document.
+            view.schedule_document_parse(cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let last = view.current_index().unwrap().len() - 1;
+            assert!(
+                view.heights.height(last).is_some_and(|height| height > 0.0),
+                "the current caret disclosure must win over the parse snapshot"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn initial_line_heights_become_block_heights_when_parse_publishes_after_caret_move(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..8).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+        let later_fence = text.rfind("```").expect("last fence") + 1;
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.granularity, Granularity::Lines);
+            view.schedule_document_parse(cx);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(later_fence)))
+                .unwrap();
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.current_index().is_some());
+            let last = view.current_index().unwrap().len() - 1;
+            assert!(
+                view.heights.height(last).is_some_and(|height| height > 0.0),
+                "the caret-owned fence block must be installed when the first formal parse publishes"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn caret_moves_during_a_background_parse_shrink_each_previous_fence_endpoint(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..4)
+            .map(|_| "```\nbody\n```")
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let fence_offsets = text
+            .match_indices("```")
+            .map(|(offset, _)| offset + 1)
+            .collect::<Vec<_>>();
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[0])))
+                .unwrap();
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(fence_offsets[0])),
+            );
+            let inactive = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                None,
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            view.schedule_document_parse(cx);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[2])))
+                .unwrap();
+            view.after_input(cx);
+            let first_block = view
+                .current_index()
+                .unwrap()
+                .block_at(SourceOffset(fence_offsets[0]));
+            let second_block = view
+                .current_index()
+                .unwrap()
+                .block_at(SourceOffset(fence_offsets[2]));
+            let first_ordinal = first_block.unwrap().ordinal;
+            let second_ordinal = second_block.unwrap().ordinal;
+            assert!(
+                view.heights.height(first_ordinal).unwrap() <= inactive[first_ordinal] + 0.001,
+                "moving to the second fence must collapse the first endpoint while parse is running"
+            );
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(fence_offsets[4])))
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.heights.height(second_ordinal).unwrap() <= inactive[second_ordinal] + 0.001,
+                "moving to the third fence must collapse the second endpoint while parse is running"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_height_snapshot_covers_the_selected_fence_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        let inactive_middle_height = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    index,
+                    view.line_height(),
+                    None,
+                )),
+            );
+            let inactive_middle_height = view.heights.height(8).expect("middle block height");
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.document_parse_job_running,
+                "a non-empty selection should refresh heights off the input path"
+            );
+            assert_eq!(
+                view.heights.height(8),
+                Some(inactive_middle_height),
+                "the middle block must not be synchronously scanned"
+            );
+            inactive_middle_height
+        });
+
+        // Register the timer before sleeping so the test executor can observe
+        // its wakeup, matching the formal-parse regression tests above.
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.heights
+                    .height(8)
+                    .is_some_and(|height| height > inactive_middle_height),
+                "the background disclosure snapshot must expand selected fence blocks"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_snapshot_preserves_measured_height_and_cached_presentation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "ordinary paragraph\n\n```\n```\n\ntrailing paragraph";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(text, "Untitled", cx));
+        let (first_id, measured_height) = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            let first = index.block(0).expect("first paragraph block");
+            let initial_heights =
+                block_heights_with_disclosure(&document, index, view.line_height(), None);
+            view.install_heights(Granularity::Blocks, HeightIndex::new(initial_heights));
+            view.cached_block(&first, &(0..1))
+                .expect("cached paragraph");
+            let measured_height = view.line_height() * 3.0;
+            view.heights.update(first.ordinal, measured_height);
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            assert!(view.document_parse_job_running);
+            (first.id, measured_height)
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.heights.height(0),
+                Some(measured_height),
+                "a disclosure-only snapshot must preserve measured non-fence height"
+            );
+            assert!(
+                view.block_cache.contains_key(&first_id),
+                "a selection disclosure must not clear existing presentation caches"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_selection_height_snapshot_collapses_middle_blocks_when_selection_ends(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        let inactive_middle_height = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    index,
+                    view.line_height(),
+                    None,
+                )),
+            );
+            let inactive_middle_height = view.heights.height(8).expect("middle block height");
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            inactive_middle_height
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let expanded_middle_height = view.read_with(cx, |view, _| {
+            let height = view
+                .heights
+                .height(8)
+                .expect("selected middle block height");
+            assert!(height > inactive_middle_height);
+            height
+        });
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.after_input(cx);
+            assert!(
+                view.document_parse_job_running,
+                "collapsing a selection must refresh heights off the input path"
+            );
+            assert_eq!(
+                view.heights.height(8),
+                Some(expanded_middle_height),
+                "the middle block must not be synchronously scanned on caret movement"
+            );
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.heights.height(8),
+                Some(inactive_middle_height),
+                "the empty disclosure snapshot must collapse the old selection interior"
+            );
+            assert!(
+                view.heights.height(0).is_some_and(|height| height > 0.0),
+                "the caret-owned fence block must remain addressable"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn background_collapse_snapshot_retries_when_caret_moves(cx: &mut gpui::TestAppContext) {
+        let text = (0..16).map(|_| "```\n```").collect::<Vec<_>>().join("\n\n");
+        let last_fence = text.rfind("```").expect("last fence") + 1;
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        let inactive_middle_height = view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            let index = view.current_index().expect("formal index");
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    index,
+                    view.line_height(),
+                    None,
+                )),
+            );
+            let inactive = view.heights.height(8).expect("middle block height");
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(text.len()),
+                })
+                .unwrap();
+            view.after_input(cx);
+            inactive
+        });
+
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+
+        let expanded_middle_height = view.read_with(cx, |view, _| {
+            let height = view
+                .heights
+                .height(8)
+                .expect("selected middle block height");
+            assert!(height > inactive_middle_height);
+            height
+        });
+
+        // Start a selection-collapse snapshot, then move the caret again
+        // before its timer completes. Both disclosures are empty, so the
+        // completion path must explicitly queue a snapshot for the latest
+        // caret instead of treating the stale collapse as sufficient.
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            view.after_input(cx);
+            assert!(view.document_parse_job_running);
+        });
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(last_fence)))
+                .unwrap();
+            view.after_input(cx);
+            assert!(view.document_parse_job_running);
+            assert_eq!(
+                view.heights.height(8),
+                Some(expanded_middle_height),
+                "the latest caret move must not synchronously scan the old selection interior"
+            );
+        });
+
+        // The first stale completion queues the current-caret snapshot; allow
+        // both the stale job and that retry to complete.
+        for _ in 0..3 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(80));
+            cx.run_until_parked();
+        }
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.heights.height(8),
+                Some(inactive_middle_height),
+                "a moved caret must not leave the old selection interior expanded"
+            );
+            assert!(
+                view.heights
+                    .height(view.current_index().expect("formal index").len() - 1)
+                    .is_some_and(|height| height > 0.0),
+                "the latest caret-owned fence block must remain addressable"
             );
         });
     }
@@ -8793,6 +10415,7 @@ mod tests {
         let root = draft_test_root("switch");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let draft_text = "today I thought about this design";
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -8805,15 +10428,22 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
-            // Start the first unnamed note and type into it.
-            view.new_work_folder_note(cx);
-            view.editor_mut()
-                .insert_text("today I thought about this design")
-                .unwrap();
+            // Use the initial blank session directly so this regression stays
+            // outside the date-heading/title-sync path of new_work_folder_note.
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: root.clone(),
+                },
+            );
+            view.editor_mut().insert_text(draft_text).unwrap();
             view.after_input(cx);
-            // Switch away to a second unnamed note before the debounce timer
-            // for the first one fires.
-            view.new_work_folder_note(cx);
+            // Switch away to a second blank unnamed note before the debounce
+            // timer for the first one fires.
+            view.sessions.open_untitled("", "Untitled");
+            view.on_document_replaced();
         });
 
         // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
@@ -8827,10 +10457,7 @@ mod tests {
 
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
-        assert_eq!(
-            recovered.drafts[0].text,
-            "today I thought about this design"
-        );
+        assert_eq!(recovered.drafts[0].text, draft_text);
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -8849,6 +10476,7 @@ mod tests {
         let old_root = draft_test_root("switch-old");
         std::fs::create_dir_all(&old_root).unwrap();
         let old_work_folder = OsWorkFolderScanner.scan(&old_root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
 
         let new_root = draft_test_root("switch-new");
         std::fs::create_dir_all(&new_root).unwrap();
@@ -8899,7 +10527,10 @@ mod tests {
         // exactly the way a quit inside the debounce window used to.
         let old_recovered = OsDraftStore.recover(&old_root).unwrap();
         assert_eq!(old_recovered.drafts.len(), 1);
-        assert_eq!(old_recovered.drafts[0].text, "draft in the old folder");
+        assert_eq!(
+            old_recovered.drafts[0].text,
+            format!("{heading}draft in the old folder")
+        );
 
         std::fs::remove_dir_all(&old_root).unwrap();
         std::fs::remove_dir_all(&new_root).unwrap();
@@ -9070,6 +10701,7 @@ mod tests {
         let root = draft_test_root("quit-flush");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9095,7 +10727,7 @@ mod tests {
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(
             recovered.drafts[0].text,
-            "quitting before the debounce fires"
+            format!("{heading}quitting before the debounce fires")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -9240,14 +10872,14 @@ mod tests {
     }
 
     #[test]
-    fn header_status_line_combines_warning_and_status_without_dropping_either() {
-        assert_eq!(header_status_line(None, None), None);
+    fn footer_status_line_combines_warning_and_status_without_dropping_either() {
+        assert_eq!(footer_status_line(None, None), None);
         assert_eq!(
-            header_status_line(Some("2 drafts could not be recovered"), None),
+            footer_status_line(Some("2 drafts could not be recovered"), None),
             Some("2 drafts could not be recovered".to_owned())
         );
         assert_eq!(
-            header_status_line(None, Some("Opened")),
+            footer_status_line(None, Some("Opened")),
             Some("Opened".to_owned())
         );
         // Regression for the P1 review finding: an unconditional priority for
@@ -9256,7 +10888,7 @@ mod tests {
         // recovery warning, since this view only re-scans a work folder once
         // at startup. Both must show.
         assert_eq!(
-            header_status_line(
+            footer_status_line(
                 Some("2 drafts could not be recovered"),
                 Some("Save failed: disk full")
             ),
@@ -9264,7 +10896,7 @@ mod tests {
         );
     }
 
-    // Regression test for the P1 review finding on the header status line: a
+    // Regression test for the P1 review finding on the footer status line: a
     // save failure that happens after a draft-recovery warning was raised
     // must still reach the user, not be hidden behind the warning for the
     // rest of the session.
@@ -9296,7 +10928,7 @@ mod tests {
         });
 
         view.read_with(cx, |view, _| {
-            let combined = header_status_line(
+            let combined = footer_status_line(
                 view.draft_recovery_warning.as_deref(),
                 view.status.as_deref(),
             );
@@ -9317,6 +10949,222 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[gpui::test]
+    fn file_tabs_switch_sessions_and_keep_rear_tabs_reachable(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+        let last = view.update(cx, |view, cx| {
+            let mut last = view.sessions.active_id();
+            for index in 0..8 {
+                last = view
+                    .sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+            last
+        });
+        cx.run_until_parked();
+
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
+        let footer = cx.debug_bounds("editor-footer").expect("footer rendered");
+        let first_row = cx.debug_bounds("row-0-0").expect("editor row rendered");
+        assert!(first_row.bottom() <= footer.top());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x < px(0.0)));
+
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("rear file tab is reachable after horizontal scrolling");
+        cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.sessions.active_id()),
+            last
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_work_folder_note_reveals_its_active_file_tab(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("new-note-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        view.update(cx, |view, cx| view.new_work_folder_note(cx));
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "creating the active note must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_newly_loaded_work_folder_file_reveals_its_active_file_tab(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("loaded-file-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("Target.md");
+        std::fs::write(&target, "target\n").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        let generation = view.update(cx, |view, _| {
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            view.latest_open_target = Some(target.clone());
+            view.work_folder_generation
+        });
+        cx.run_until_parked();
+
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        let loaded = OsFileService.load(&target).unwrap();
+        view.update(cx, |view, cx| {
+            view.finish_open(None, generation, &target, Ok(loaded), cx);
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "loading the active file must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_recovered_active_draft_reveals_its_file_tab(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("recovered-draft-reveals-file-tab");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+
+        view.update(cx, |view, cx| {
+            for index in 0..8 {
+                view.sessions
+                    .open_untitled("body\n", format!("A-very-long-file-name-{index}.md"));
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let tabs = cx
+            .debug_bounds("file-tabs")
+            .expect("file tab strip rendered");
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-800.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+
+        let recovered = RecoveredDrafts {
+            drafts: vec![RecoveredDraft {
+                id: DraftId::generate(),
+                text: "recovered".to_owned(),
+            }],
+            failed: 0,
+        };
+        view.update(cx, |view, cx| {
+            view.finish_work_folder_scan((Ok(work_folder), Ok(recovered)), cx);
+        });
+        cx.run_until_parked();
+        let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
+        assert!(
+            after < before,
+            "recovering the active draft must reveal its tab: before={before:?}, after={after:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn pending_inline_rename_blocks_file_tab_activation(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        let second = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view
+                .sessions
+                .open_untitled("body\n", "second.md".to_owned());
+            assert!(view.activate_session(first, cx));
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("pending.md"),
+                text: "pending".to_owned(),
+                fixed_extension: Some(".md".to_owned()),
+                selected_range: 0..0,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: true,
+            });
+            cx.notify();
+            second
+        });
+        cx.run_until_parked();
+
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second file tab rendered");
+        cx.simulate_click(last_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.sessions.active_id(), second);
+            assert!(view.inline_rename_active());
+            assert_eq!(view.status.as_deref(), Some("Rename in progress"));
+        });
+    }
+
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
     /// and friends) to fire, the same way `draft_save_survives_switching_…`
     /// above does: they run on a real `gpui::Timer`, not the deterministic
@@ -9327,13 +11175,14 @@ mod tests {
         cx.run_until_parked();
     }
 
-    // Issue #6: an unnamed work-folder note earns its filename from the
-    // first H1 it is given, with no filename prompt.
     #[gpui::test]
-    fn a_new_notes_first_h1_names_its_file(cx: &mut gpui::TestAppContext) {
-        let root = draft_test_root("h1-create");
+    fn a_new_work_folder_note_starts_with_a_local_date_heading_and_caret_after_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("date-heading");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let expected = EditorView::new_work_folder_note_heading();
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9347,18 +11196,52 @@ mod tests {
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# LangChain4j").unwrap();
+            assert_eq!(view.editor().document().full_text(), expected);
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(expected.len()))
+            );
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #6: an unnamed work-folder note earns its filename from the
+    // first H1 it is given, with no filename prompt.
+    #[gpui::test]
+    fn a_new_notes_first_h1_names_its_file(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("h1-create");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join(format!("{title_prefix}LangChain4j.md"));
+        let expected_title = format!("{title_prefix}LangChain4j");
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("LangChain4j").unwrap();
             view.after_input(cx);
         });
 
         settle_debounce(cx);
 
         view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
             assert_eq!(
-                view.active_session().path(),
-                Some(root.join("LangChain4j.md").as_path())
+                view.active_session().auto_title(),
+                Some(expected_title.as_str())
             );
-            assert_eq!(view.active_session().auto_title(), Some("LangChain4j"));
             assert!(!view.active_session().is_dirty());
             // The sidebar renders `work_folder.entries()`; a note created
             // from its H1 must appear there right away, without waiting for
@@ -9368,14 +11251,14 @@ mod tests {
                 view.work_folder
                     .as_ref()
                     .unwrap()
-                    .entry_for_path(&root.join("LangChain4j.md"))
+                    .entry_for_path(&expected_path)
                     .is_some(),
                 "the new note must appear in the work folder index"
             );
         });
         assert_eq!(
-            std::fs::read_to_string(root.join("LangChain4j.md")).unwrap(),
-            "# LangChain4j"
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}LangChain4j")
         );
         assert!(
             OsDraftStore.recover(&root).unwrap().drafts.is_empty(),
@@ -9664,6 +11547,9 @@ mod tests {
         let root = draft_test_root("h1-create-in-folder");
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9678,21 +11564,18 @@ mod tests {
             view.work_folder = Some(work_folder);
             view.selected_folder = Some(root.join("dev"));
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
             view.after_input(cx);
         });
 
         settle_debounce(cx);
 
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.active_session().path(),
-                Some(root.join("dev/GPUI.md").as_path())
-            );
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
         });
         assert_eq!(
-            std::fs::read_to_string(root.join("dev/GPUI.md")).unwrap(),
-            "# GPUI"
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{heading}GPUI")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -9707,6 +11590,11 @@ mod tests {
         let root = draft_test_root("h1-rename-in-folder");
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let renamed_path = root
+            .join("dev")
+            .join(format!("{title_prefix}GPUI Notes.md"));
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9721,7 +11609,7 @@ mod tests {
             view.work_folder = Some(work_folder);
             view.selected_folder = Some(root.join("dev"));
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# GPUI").unwrap();
+            view.editor_mut().insert_text("GPUI").unwrap();
             view.after_input(cx);
         });
         settle_debounce(cx);
@@ -9740,7 +11628,7 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.active_session().path(),
-                Some(root.join("dev/GPUI Notes.md").as_path()),
+                Some(renamed_path.as_path()),
                 "the rename must stay inside dev/, not move to the work folder root"
             );
         });
@@ -9755,6 +11643,11 @@ mod tests {
         let root = draft_test_root("h1-rename");
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let initial_path = root.join(format!("{title_prefix}LangChain4j.md"));
+        let renamed_path = root.join(format!("{title_prefix}LangChain4j Agent.md"));
+        let expected_title = format!("{title_prefix}LangChain4j Agent");
 
         let view = gpui::AppContext::new(cx, |cx| {
             EditorView::from_sessions(
@@ -9768,7 +11661,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.work_folder = Some(work_folder);
             view.new_work_folder_note(cx);
-            view.editor_mut().insert_text("# LangChain4j").unwrap();
+            view.editor_mut().insert_text("LangChain4j").unwrap();
             view.after_input(cx);
         });
         settle_debounce(cx);
@@ -9785,35 +11678,28 @@ mod tests {
         settle_debounce(cx);
 
         view.read_with(cx, |view, _| {
-            assert_eq!(
-                view.active_session().path(),
-                Some(root.join("LangChain4j Agent.md").as_path())
-            );
+            assert_eq!(view.active_session().path(), Some(renamed_path.as_path()));
             assert_eq!(
                 view.active_session().auto_title(),
-                Some("LangChain4j Agent")
+                Some(expected_title.as_str())
             );
             // The sidebar index must follow the rename too: otherwise it
             // keeps showing the old name (which no longer exists on disk)
             // and drops the new one until the folder is reopened.
             let folder = view.work_folder.as_ref().unwrap();
             assert!(
-                folder
-                    .entry_for_path(&root.join("LangChain4j.md"))
-                    .is_none(),
+                folder.entry_for_path(&initial_path).is_none(),
                 "the stale pre-rename path must not linger in the sidebar"
             );
             assert!(
-                folder
-                    .entry_for_path(&root.join("LangChain4j Agent.md"))
-                    .is_some(),
+                folder.entry_for_path(&renamed_path).is_some(),
                 "the renamed note must be reachable from the sidebar"
             );
         });
-        assert!(!root.join("LangChain4j.md").exists());
+        assert!(!initial_path.exists());
         assert_eq!(
-            std::fs::read_to_string(root.join("LangChain4j Agent.md")).unwrap(),
-            "# LangChain4j Agent"
+            std::fs::read_to_string(&renamed_path).unwrap(),
+            format!("{heading}LangChain4j Agent")
         );
 
         std::fs::remove_dir_all(&root).unwrap();

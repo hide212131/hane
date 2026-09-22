@@ -93,6 +93,10 @@ caret のブロックを（その前後1行を含めて）レイアウトして 
 `bounds_for_range` は最後のフレームが描いた caret 矩形（`CaretGeometry`）を返すので、
 IME の候補ウィンドウがカーソル位置に出る。
 
+リスト marker / prefix を `ExpandedMarkup` として source 表示している範囲では、source-visible
+prefix の実幅を座標の正とする。inactive の synthesized list alignment 用に予約する仮想 gap は、
+開示中の marker / prefix には加えない。
+
 ### レイアウトはブロック単位でキャッシュし、編集で rebase する
 
 `layout_cache: HashMap<BlockId, BlockLayout>` を `block_cache` と同じ保持規則で持つ。

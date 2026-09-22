@@ -317,11 +317,10 @@ impl EntityInputHandler for EditorView {
             );
             return;
         }
-        if let Err(error) = self.editor_mut().replace_and_mark_text(
-            range_utf16,
-            new_text,
-            new_selected_range_utf16,
-        ) {
+        if let Err(error) =
+            self.editor_mut()
+                .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
+        {
             self.report_error("IME update", error);
         }
         self.after_input(cx);

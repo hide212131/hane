@@ -30,44 +30,15 @@ class FixtureTests(unittest.TestCase):
             len(mod.FIXTURE_ORIGINAL) + 1,
         )
 
-    def test_procedure_is_focused_version_one(self):
-        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-code-block/1")
+    def test_procedure_is_focused_version_two(self):
+        self.assertEqual(mod.PROCEDURE_VERSION, "hosted-code-block/2")
         self.assertEqual(mod.VERIFICATION_KIND, "code_block_focused")
-
-
-class AlignmentTests(unittest.TestCase):
-    @staticmethod
-    def evidence(min_x):
-        return {
-            "matched_text": "x",
-            "bounding_box": {"minX": min_x, "maxX": min_x + 0.05},
-            "window_bounds": {},
-            "click_point": {},
-            "edge": "start",
-        }
-
-    def test_accepts_language_label_aligned_with_code_content(self):
-        result = mod.evaluate_fence_alignment(
-            self.evidence(0.25), self.evidence(0.255)
-        )
-        self.assertEqual(result["result"], "pass")
-
-    def test_rejects_large_prefix_like_horizontal_shift(self):
-        result = mod.evaluate_fence_alignment(
-            self.evidence(0.25), self.evidence(0.28)
-        )
-        self.assertEqual(result["result"], "fail")
-
-    def test_parse_click_evidence_rejects_missing_fields(self):
-        with self.assertRaises(ValueError):
-            mod.parse_click_evidence('{"matched_text":"rust"}')
 
 
 class OcrEvaluationTests(unittest.TestCase):
     def test_accepts_required_visible_text(self):
         text = (
             "Neutral anchor\n"
-            "rust\n"
             "let answer = 42;\n"
             "literal markdown\n"
             "Tail anchor"
@@ -79,13 +50,18 @@ class OcrEvaluationTests(unittest.TestCase):
     def test_rejects_missing_language_label_or_code_content(self):
         result = mod.evaluate_initial_ocr("Neutral anchor\nTail anchor")
         self.assertEqual(result["result"], "fail")
-        self.assertIn("rust", result["missing"])
         self.assertIn("let answer = 42", result["missing"])
+
+    def test_rejects_inactive_language_label_or_raw_fence(self):
+        result = mod.evaluate_initial_ocr(
+            "Neutral anchor\nrust\nlet answer = 42\n~~~\nTail anchor"
+        )
+        self.assertEqual(result["result"], "fail")
+        self.assertEqual(result["forbidden_found"], ["rust", "~~~"])
 
     def test_ocr_check_is_whitespace_and_case_tolerant_only(self):
         text = (
             "NEUTRAL   ANCHOR\n"
-            "RUST\n"
             "LET ANSWER = 42\n"
             "LITERAL MARKDOWN\n"
             "TAIL ANCHOR"

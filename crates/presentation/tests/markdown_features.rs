@@ -161,24 +161,48 @@ const FIXTURES: &[MarkdownFixture] = &[
         style_runs: &[&[], &[]],
     },
     MarkdownFixture {
+        name: "thematic break with hyphens",
+        source: "---",
+        tree_paths: &[&[NodeKind::Rule]],
+        // A rule owns its whole source line, so its punctuation is disclosed
+        // as one source-mapped row rather than derived as inline markers.
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
+        name: "thematic break with asterisks",
+        source: "***",
+        tree_paths: &[&[NodeKind::Rule]],
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
+        name: "thematic break with underscores",
+        source: "___",
+        tree_paths: &[&[NodeKind::Rule]],
+        markers: &[],
+        block_kinds: &[BlockKind::Rule],
+        visual_lines: &[""],
+        style_runs: &[&[]],
+    },
+    MarkdownFixture {
         name: "multi-line fenced code",
         source: "```rust\nlet answer = 42;\n```",
         tree_paths: &[&[NodeKind::CodeBlock, NodeKind::Text]],
         markers: &["```", "```"],
-        // The fence delimiters hide; the opening line's info string stays as
-        // a visible language label and the closing line collapses to empty.
-        // Code content in between stays fully literal.
+        // The opening/closing fence rows and opening info string collapse;
+        // code content in between stays fully literal.
         block_kinds: &[
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
             BlockKind::CodeBlock,
         ],
-        visual_lines: &["rust", "let answer = 42;", ""],
-        style_runs: &[
-            &[style(CodeBlock, 0, 4)],
-            &[style(CodeBlock, 0, 16)],
-            &[],
-        ],
+        visual_lines: &["", "let answer = 42;", ""],
+        style_runs: &[&[], &[style(CodeBlock, 0, 16)], &[]],
     },
     MarkdownFixture {
         name: "image",
@@ -198,16 +222,17 @@ const FIXTURES: &[MarkdownFixture] = &[
             &[NodeKind::Table, NodeKind::TableHead, NodeKind::TableCell],
             &[NodeKind::Table, NodeKind::TableRow, NodeKind::TableCell],
         ],
-        // Pipes are replaced by synthesized separators in `present_table_line`,
-        // so no marker derivation is involved.
+        // Pipes are hidden in the source map and cell geometry is carried as
+        // presentation metadata; no fake separator character is inserted into
+        // the editable visual text.
         markers: &[],
         block_kinds: &[
             BlockKind::TableRow,
             BlockKind::TableDelimiter,
             BlockKind::TableRow,
         ],
-        visual_lines: &[" 名前 │ 値 ", "", " 羽 │ 3 "],
-        style_runs: &[&[style(Table, 0, 17)], &[], &[style(Table, 0, 11)]],
+        visual_lines: &[" 名前  値 ", "", " 羽  3 "],
+        style_runs: &[&[style(Table, 0, 14)], &[], &[style(Table, 0, 8)]],
     },
     MarkdownFixture {
         name: "link",
