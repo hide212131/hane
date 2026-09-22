@@ -15,13 +15,13 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
+use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
-    VisualLine,
+    TableAlignment, VisualLine,
     VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
-    expected_disclosures, present_block_with_list_projection, trailing_blank_lines,
+    expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -121,6 +121,7 @@ pub(crate) fn presented_block(
 /// at runtime, or [`DEFAULT_LINE_HEIGHT`] for callers outside a view, such as
 /// tests). It seeds every presented line's `estimated_height`, so a block's
 /// height scales with zoom before `layout_block` ever measures it.
+#[cfg(test)]
 pub(crate) fn presented_block_with_list_projection(
     editor: &Editor,
     block: &IndexedBlock,
@@ -149,6 +150,29 @@ pub(crate) fn presented_block_with_projections(
     fence_height_projection: Option<&FenceHeightProjection>,
     line_height: f32,
 ) -> Option<VisualBlock> {
+    presented_block_with_table_projection(
+        editor,
+        block,
+        visible,
+        joined,
+        list_projection,
+        fence_height_projection,
+        None,
+        line_height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn presented_block_with_table_projection(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
+    table_projection: Option<&TableProjection>,
+    line_height: f32,
+) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
@@ -162,7 +186,7 @@ pub(crate) fn presented_block_with_projections(
     )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
-    Some(present_block_with_list_projection(
+    Some(present_block_with_table_projection(
         block,
         document.revision(),
         &BlockWindow {
@@ -178,6 +202,7 @@ pub(crate) fn presented_block_with_projections(
         },
         line_height,
         list_projection,
+        table_projection,
     ))
 }
 
@@ -506,6 +531,7 @@ pub(crate) fn row_element(
     block: &VisualBlock,
     layout: &BlockLayout,
     row_index: usize,
+    shaper: &dyn hane_presentation::LineShaper,
     theme: Theme,
     zoom: f32,
     resolver: &ResourceResolver,
@@ -571,6 +597,25 @@ pub(crate) fn row_element(
             display,
             theme,
             zoom,
+        );
+    }
+
+    if let Some(table) = &line.table_row
+        && !row.table_cells.is_empty()
+    {
+        return table_row_element(
+            editor,
+            block,
+            line,
+            row,
+            table,
+            layout,
+            row_index,
+            shaper,
+            display,
+            theme,
+            zoom,
+            caret_input_mode,
         );
     }
 
@@ -663,6 +708,165 @@ pub(crate) fn row_element(
     .children(elements)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn table_row_element(
+    editor: &Editor,
+    block: &VisualBlock,
+    line: &VisualLine,
+    row: &LayoutLine,
+    table: &hane_presentation::TableRowDisplay,
+    layout: &BlockLayout,
+    row_index: usize,
+    shaper: &dyn hane_presentation::LineShaper,
+    display: BlockDisplay,
+    theme: Theme,
+    zoom: f32,
+    caret_input_mode: Option<KeyboardInputMode>,
+) -> Div {
+    let selection = editor.selection().range();
+    let selected_visual = layout.visual_range_on_row(block, row_index, selection);
+    let marked_visual = editor
+        .ime()
+        .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
+    let cursor_x = layout
+        .point_for_source(block, editor.selection().active, shaper)
+        .filter(|point| point.row == row_index)
+        .map(|point| point.x);
+    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
+    for cell_layout in &row.table_cells {
+        let Some(cell) = table
+            .cells
+            .iter()
+            .find(|cell| cell.column == cell_layout.column)
+        else {
+            continue;
+        };
+        let cell_range = cell_layout.visual_range.clone();
+        let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
+        let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
+        let text = line.visual_text[cell_range.clone()].to_owned();
+        let cell_elements = if cell_selected.is_none() && cell_marked.is_none() {
+            let mut text_element = div()
+                .w_full()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .when(table.header, |element| {
+                    element.font_weight(FontWeight::SEMIBOLD)
+                })
+                .child(text);
+            text_element = match cell.alignment {
+                TableAlignment::Center => text_element.text_center(),
+                TableAlignment::Right => text_element.text_right(),
+                TableAlignment::Default | TableAlignment::Left => text_element.text_left(),
+            };
+            vec![text_element]
+        } else {
+            line_segments(
+                cell_range.clone(),
+                None,
+                cell_selected,
+                cell_marked,
+                &line.style_runs,
+                None,
+            )
+            .into_iter()
+            .filter(|segment| !segment.visual_range.is_empty())
+            .map(|segment| {
+                let x = cell_layout.text_x - cell_layout.x
+                    + shaper.x_for_offset(
+                        line,
+                        cell_range.clone(),
+                        segment.visual_range.start,
+                    );
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(0.0))
+                    .h(px(row.height))
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .when(segment.selected, |element| {
+                        element.bg(rgb(theme.selection_background))
+                    })
+                    .when(segment.marked || segment.display.underline, |element| {
+                        element.underline()
+                    })
+                    .when(table.header, |element| {
+                        element.font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(segment.display.bold, |element| {
+                        element.font_weight(FontWeight::BOLD)
+                    })
+                    .when(segment.display.italic, |element| element.italic())
+                    .when(segment.display.strikethrough, |element| {
+                        element.line_through()
+                    })
+                    .when(segment.display.monospace, |element| {
+                        element.font_family("ui-monospace")
+                    })
+                    .child(line.visual_text[segment.visual_range].to_owned())
+            })
+            .collect::<Vec<_>>()
+        };
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cell_layout.x))
+                .top(px(0.0))
+                .w(px(cell_layout.width))
+                .h(px(row.height))
+                .relative()
+                .px(px(8.0))
+                .overflow_hidden()
+                .children(cell_elements),
+        );
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cell_layout.x))
+                .top(px(0.0))
+                .w(px(1.0))
+                .h(px(row.height))
+                .bg(rgb(theme.table_border)),
+        );
+    }
+    elements.push(
+        div()
+            .absolute()
+            .left(px(theme.line_horizontal_padding))
+            .right(px(theme.line_horizontal_padding))
+            .bottom(px(0.0))
+            .h(px(1.0))
+            .bg(rgb(theme.table_border)),
+    );
+    if let Some(cursor_x) = cursor_x {
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cursor_x))
+                .top(px(0.0))
+                .h(px(row.height))
+                .child(cursor_overlay(theme, caret_input_mode)),
+        );
+    }
+    styled_block(
+        div()
+            .relative()
+            .h(px(row.height))
+            .w_full()
+            .overflow_hidden()
+            .children(elements),
+        display,
+        theme,
+        zoom,
+    )
+    .when(table.header, |element| {
+        element.bg(rgb(theme.table_header_background))
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct LineSegment {
     visual_range: Range<usize>,
@@ -699,6 +903,12 @@ pub(crate) fn inline_display_for(
 /// Splits one row's stretch of visual text where the caret, the selection, the
 /// IME underline or an inline style begins or ends. Everything is clamped into
 /// `bounds`, so a construct that spans a soft wrap contributes to both rows.
+fn clip_visual_range(source: Option<&Range<usize>>, bounds: Range<usize>) -> Option<Range<usize>> {
+    let source = source?;
+    let clipped = source.start.max(bounds.start)..source.end.min(bounds.end);
+    (!clipped.is_empty()).then_some(clipped)
+}
+
 fn line_segments(
     bounds: Range<usize>,
     cursor: Option<usize>,
@@ -952,6 +1162,7 @@ mod tests {
             marker_body_gap: 0.0,
             body_gap: 0.0,
             quote_bar_x_origin: None,
+            table_cells: Vec::new(),
         }
     }
 

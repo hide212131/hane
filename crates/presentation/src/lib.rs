@@ -39,10 +39,12 @@
 mod layout;
 pub mod testing;
 
+pub use hane_markdown::TableAlignment;
+
 pub use layout::{
     BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap,
     QUOTE_BAR_GAP, QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, VerticalMove, layout_block,
-    line_visual_start,
+    line_visual_start, TableCellLayout,
 };
 
 use hane_document::{
@@ -51,8 +53,8 @@ use hane_document::{
 use hane_markdown::{
     BlockId, BlockIndex, Confidence, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection,
     ListProjectionItem, ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId,
-    NodeKind, fence_closes, fence_closing_delimiter, fence_delimiter, has_delimiter_markers,
-    is_table_delimiter,
+    NodeKind, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
+    has_delimiter_markers, is_table_delimiter,
     parse_document,
 };
 use std::ops::Range;
@@ -288,6 +290,27 @@ pub enum StyleKind {
 pub struct StyleRun {
     pub visual_range: VisualRange,
     pub kind: StyleKind,
+}
+
+/// Source and visual geometry for one inactive table cell. The visual range is
+/// a range into the row's concatenated visible text; pipes and grid decoration
+/// never become editable visual offsets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableCellDisplay {
+    pub column: usize,
+    pub source_range: SourceRange,
+    pub visual_range: VisualRange,
+    pub alignment: TableAlignment,
+}
+
+/// Presentation metadata for one physical table row. `header` is a display
+/// role, not a Markdown parser kind, so the UI can style it without parsing
+/// source text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableRowDisplay {
+    pub header: bool,
+    pub column_count: usize,
+    pub cells: Vec<TableCellDisplay>,
 }
 
 /// Render policy for one inline run, the same idea as [`BlockDisplay`] one level
@@ -685,7 +708,6 @@ impl BlockKind {
             },
             Self::TableRow => BlockDisplay {
                 surface: BlockSurface::Table,
-                monospace: true,
                 ..BlockDisplay::default()
             },
             Self::Image => BlockDisplay {
@@ -746,6 +768,8 @@ pub struct VisualLine {
     pub quote_marker_visual_ranges: Vec<VisualRange>,
     /// Source ranges paired with [`Self::quote_marker_visual_ranges`].
     pub quote_marker_source_ranges: Vec<SourceRange>,
+    /// Cell-level metadata for an inactive structured table row.
+    pub table_row: Option<TableRowDisplay>,
 }
 
 impl VisualLine {
@@ -798,6 +822,16 @@ impl VisualLine {
             && !list.rebase(deltas)
         {
             return false;
+        }
+        if let Some(table) = &mut self.table_row {
+            for cell in &mut table.cells {
+                for delta in deltas {
+                    let Some(rebased) = delta.transform_range(cell.source_range) else {
+                        return false;
+                    };
+                    cell.source_range = rebased;
+                }
+            }
         }
         self.source_range = range;
         self.revision = current;
@@ -1128,8 +1162,56 @@ pub fn present_block_with_list_projection(
     line_height: f32,
     list_projection: Option<&ListProjection>,
 ) -> VisualBlock {
+    present_block_with_table_projection(
+        block,
+        revision,
+        window,
+        line_height,
+        list_projection,
+        None,
+    )
+}
+
+/// Presents a block with document-wide list and table metadata. The compact
+/// table projection is optional so provisional/local callers can safely use
+/// the bounded delimiter fallback.
+pub fn present_block_with_table_projection(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+    list_projection: Option<&ListProjection>,
+    table_projection: Option<&TableProjection>,
+) -> VisualBlock {
     let context = block_line_context(block.kind);
     let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
+    let local_table_delimiter_line = (context == LineContext::Table)
+        .then(|| {
+            window
+                .lines
+                .iter()
+                .find(|line| is_table_delimiter(line.text))
+                .map(|line| line.line)
+        })
+        .flatten();
+    let table_delimiter_line = table_projection
+        .and_then(|projection| projection.delimiter_range)
+        .and_then(|delimiter| {
+            window
+                .lines
+                .iter()
+                .find(|line| line.range == delimiter)
+                .map(|line| line.line)
+        })
+        .or(local_table_delimiter_line);
+    let table_alignments = table_projection.map_or_else(
+        || {
+            table_delimiter_line
+                .and_then(|delimiter| window.lines.iter().find(|line| line.line == delimiter))
+                .map_or_else(Vec::new, |line| table_alignments(line.text))
+        },
+        |projection| projection.alignments.to_vec(),
+    );
     // The opening fence's own marker shape, read from whichever of `window.lines`
     // carries the block's true first physical line — present regardless of
     // `window.render` (see `BlockWindow::lines`'s own "parsing context only"
@@ -1189,6 +1271,11 @@ pub fn present_block_with_list_projection(
             line_context,
             list_projection,
             fence_role,
+            table_projection
+                .and_then(|projection| projection.delimiter_range)
+                .is_some_and(|delimiter| line.range.end <= delimiter.start)
+                || table_delimiter_line.is_some_and(|delimiter| line.line < delimiter),
+            &table_alignments,
         );
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
@@ -1297,6 +1384,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         quote: None,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
+        table_row: None,
     }
 }
 
@@ -1453,6 +1541,7 @@ fn present_rule_line(
         quote,
         quote_marker_visual_ranges,
         quote_marker_source_ranges,
+        table_row: None,
     }
 }
 
@@ -2488,6 +2577,7 @@ fn present_markdown_from_parse(
         quote,
         quote_marker_visual_ranges,
         quote_marker_source_ranges,
+        table_row: None,
     }
 }
 
@@ -3531,6 +3621,8 @@ pub fn present_polished_line(
         context,
         None,
         None,
+        false,
+        &[],
     )
 }
 
@@ -3593,6 +3685,8 @@ fn present_polished_line_with_fence(
     context: LineContext,
     list_projection: Option<&ListProjection>,
     fence_role: Option<FenceLine>,
+    table_header: bool,
+    table_alignments: &[TableAlignment],
 ) -> VisualLine {
     // A fenced-code line has no disclosable inline markup; its content is literal,
     // so it stays a code block regardless of cursor position and wins over image
@@ -3612,7 +3706,15 @@ fn present_polished_line_with_fence(
     } else if context == LineContext::Table
         && disclosure.is_none_or(|active| !range_touches(range, active))
     {
-        present_table_line(line_id, revision, range, source, line_height)
+        present_table_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            table_header,
+            table_alignments,
+        )
     } else {
         present_markdown_with_list_projection(
             line_id,
@@ -3767,6 +3869,7 @@ fn present_fenced_code_opening_line(
         quote: None,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
+        table_row: None,
     }
 }
 
@@ -3830,6 +3933,7 @@ fn present_fenced_code_closing_line(
         quote: None,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
+        table_row: None,
     }
 }
 
@@ -3941,7 +4045,47 @@ fn present_image(
         quote,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
+        table_row: None,
     }
+}
+
+fn table_alignments(source: &str) -> Vec<TableAlignment> {
+    let content_end = source.trim_end_matches(['\r', '\n']).len();
+    let trimmed = source[..content_end].trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    trimmed
+        .split('|')
+        .map(|cell| {
+            let cell = cell.trim();
+            match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => TableAlignment::Center,
+                (true, false) => TableAlignment::Left,
+                (false, true) => TableAlignment::Right,
+                (false, false) => TableAlignment::Default,
+            }
+        })
+        .collect()
+}
+
+fn unescaped_table_pipes(source: &str, content_end: usize) -> Vec<usize> {
+    let bytes = source.as_bytes();
+    let mut pipes = Vec::new();
+    for index in 0..content_end {
+        if bytes[index] != b'|' {
+            continue;
+        }
+        let mut backslashes = 0;
+        let mut cursor = index;
+        while cursor > 0 && bytes[cursor - 1] == b'\\' {
+            backslashes += 1;
+            cursor -= 1;
+        }
+        if backslashes % 2 == 0 {
+            pipes.push(index);
+        }
+    }
+    pipes
 }
 
 fn present_table_line(
@@ -3950,6 +4094,8 @@ fn present_table_line(
     range: SourceRange,
     source: &str,
     line_height: f32,
+    header: bool,
+    alignments: &[TableAlignment],
 ) -> VisualLine {
     if is_table_delimiter(source) {
         return VisualLine {
@@ -3977,15 +4123,36 @@ fn present_table_line(
             quote: None,
             quote_marker_visual_ranges: Vec::new(),
             quote_marker_source_ranges: Vec::new(),
+            table_row: None,
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
+    let pipes = unescaped_table_pipes(source, content_end);
+    let leading_indent = pipes
+        .first()
+        .copied()
+        .filter(|index| {
+            *index <= 3 && source[..*index].bytes().all(|byte| byte == b' ')
+        })
+        .unwrap_or(0);
+    let opening_pipe = pipes.first().copied().unwrap_or(leading_indent);
     let mut visual = String::new();
     let mut segments = Vec::new();
+    let mut cells = Vec::new();
     let base = range.start.0;
-    let mut cursor = 0;
-    for (index, marker) in source[..content_end].match_indices('|') {
+    if leading_indent > 0 {
+        segments.push(MappingSegment {
+            source_range: SourceRange::new(base, base + leading_indent),
+            visual_range: VisualRange::new(0, 0),
+            visibility: Visibility::HiddenMarkup,
+            marker_edge: None,
+        });
+    }
+    let mut cursor = leading_indent;
+    let mut column = 0;
+    for index in pipes {
         if cursor < index {
+            let visual_start = visual.len();
             append_segment(
                 &mut visual,
                 &mut segments,
@@ -3995,32 +4162,65 @@ fn present_table_line(
                 Visibility::Visible,
                 None,
             );
+            cells.push(TableCellDisplay {
+                column,
+                source_range: SourceRange::new(base + cursor, base + index),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                alignment: alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Default),
+            });
+            column += 1;
+        } else if index != opening_pipe {
+            cells.push(TableCellDisplay {
+                column,
+                source_range: SourceRange::empty(base + cursor),
+                visual_range: VisualRange::new(visual.len(), visual.len()),
+                alignment: alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Default),
+            });
+            column += 1;
         }
         let at = visual.len();
         segments.push(MappingSegment {
-            source_range: SourceRange::new(base + index, base + index + marker.len()),
+            source_range: SourceRange::new(base + index, base + index + 1),
             visual_range: VisualRange::new(at, at),
             visibility: Visibility::HiddenMarkup,
             marker_edge: None,
         });
-        if index > 0 && index + 1 < content_end {
-            visual.push('│');
-            segments.push(MappingSegment {
-                source_range: SourceRange::empty(base + index + 1),
-                visual_range: VisualRange::new(at, visual.len()),
-                visibility: Visibility::Synthesized,
-                marker_edge: None,
-            });
-        }
-        cursor = index + marker.len();
+        cursor = index + 1;
     }
-    if cursor < source.len() {
+    if cursor < content_end {
+        let visual_start = visual.len();
         append_segment(
             &mut visual,
             &mut segments,
             source,
             range,
-            SourceRange::new(base + cursor, range.end.0),
+            SourceRange::new(base + cursor, base + content_end),
+            Visibility::Visible,
+            None,
+        );
+        cells.push(TableCellDisplay {
+            column,
+            source_range: SourceRange::new(base + cursor, base + content_end),
+            visual_range: VisualRange::new(visual_start, visual.len()),
+            alignment: alignments
+                .get(column)
+                .copied()
+                .unwrap_or(TableAlignment::Default),
+        });
+    }
+    if content_end < source.len() {
+        append_segment(
+            &mut visual,
+            &mut segments,
+            source,
+            range,
+            SourceRange::new(base + content_end, range.end.0),
             Visibility::Visible,
             None,
         );
@@ -4047,6 +4247,11 @@ fn present_table_line(
         quote: None,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
+        table_row: Some(TableRowDisplay {
+            header,
+            column_count: alignments.len().max(cells.len()),
+            cells,
+        }),
     }
 }
 
@@ -6892,7 +7097,7 @@ mod tests {
     }
 
     #[test]
-    fn phase4_table_uses_synthesized_separators_with_canonical_mapping() {
+    fn table_rows_expose_cells_without_fake_separator_offsets() {
         let source = "| 名前 | 値 |\n";
         let range = SourceRange::new(50, 50 + source.len());
         let block = present_polished_line(
@@ -6905,22 +7110,71 @@ mod tests {
             LineContext::Table,
         );
         assert_eq!(block.kind, BlockKind::TableRow);
-        assert_eq!(block.visual_text, " 名前 │ 値 \n");
-        let synthesized = block
+        assert_eq!(block.visual_text, " 名前  値 \n");
+        let table = block.table_row.as_ref().expect("table metadata");
+        assert_eq!(table.cells.len(), 2);
+        assert_eq!(table.cells[0].source_range, SourceRange::new(51, 59));
+        assert_eq!(table.cells[1].source_range, SourceRange::new(60, 65));
+        assert!(!block
             .source_map
             .segments
             .iter()
-            .find(|segment| segment.visibility == Visibility::Synthesized)
-            .unwrap();
-        assert!(synthesized.source_range.is_empty());
-        for affinity in [Bias::Before, Bias::After] {
-            let visual = synthesized.visual_range.start;
-            let normalized = block.source_map.normalize_visual(visual, affinity).unwrap();
-            assert_eq!(
-                block.source_map.normalize_visual(normalized, affinity),
-                Some(normalized)
-            );
-        }
+            .any(|segment| segment.visibility == Visibility::Synthesized));
+        let empty = present_polished_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| x || z |\n".len()),
+            "| x || z |\n",
+            26.0,
+            None,
+            LineContext::Table,
+        );
+        let empty_cells = empty.table_row.as_ref().expect("empty table row").cells.as_slice();
+        assert_eq!(
+            empty_cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(empty_cells[1].visual_range.start == empty_cells[1].visual_range.end);
+        let indented = present_table_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "  | a | b |\n".len()),
+            "  | a | b |\n",
+            26.0,
+            false,
+            &[TableAlignment::Left, TableAlignment::Right],
+        );
+        let indented_cells = indented
+            .table_row
+            .as_ref()
+            .expect("indented table row")
+            .cells
+            .as_slice();
+        assert_eq!(indented_cells.len(), 2);
+        assert_eq!(indented_cells[0].source_range.start, SourceOffset(3));
+        let one_column_delimiter = present_polished_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| --- |\n".len()),
+            "| --- |\n",
+            26.0,
+            None,
+            LineContext::Table,
+        );
+        assert_eq!(one_column_delimiter.kind, BlockKind::TableDelimiter);
+        let sparse = present_table_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| only |\n".len()),
+            "| only |\n",
+            26.0,
+            false,
+            &[TableAlignment::Default, TableAlignment::Right],
+        );
+        assert_eq!(
+            sparse.table_row.expect("sparse table row").column_count,
+            2
+        );
         let active = present_polished_line(
             1,
             Revision(3),

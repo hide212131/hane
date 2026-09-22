@@ -19,7 +19,7 @@
 
 use crate::{ListCaretOrigin, ListId, VisualBlock, VisualLine, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
-use hane_markdown::BlockId;
+use hane_markdown::{BlockId, TableAlignment};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -45,6 +45,18 @@ pub enum LineWrap {
     Hard,
     /// The row ends because the text did not fit, and continues on the next row.
     Soft,
+}
+
+/// Geometry for one table cell on a laid-out row. The presentation model owns
+/// the source/visual ranges; layout adds the font-dependent x coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCellLayout {
+    pub column: usize,
+    pub visual_range: Range<usize>,
+    pub source_range: SourceRange,
+    pub x: f32,
+    pub width: f32,
+    pub text_x: f32,
 }
 
 /// One row of a block: a whole physical line, or one fragment of a wrapped one.
@@ -103,6 +115,8 @@ pub struct LayoutLine {
     pub body_gap: f32,
     /// x of the quote bar in the block's text column, when this row is quoted.
     pub quote_bar_x_origin: Option<f32>,
+    /// Cell geometry for a structured table row. Empty for ordinary rows.
+    pub table_cells: Vec<TableCellLayout>,
 }
 
 impl LayoutLine {
@@ -111,6 +125,26 @@ impl LayoutLine {
     }
 
     fn x_for_visual(&self, line: &VisualLine, visual: usize, shaper: &dyn LineShaper) -> f32 {
+        if !self.table_cells.is_empty()
+            && let Some(cell) = self
+                .table_cells
+                .iter()
+                .enumerate()
+                .find(|(index, cell)| {
+                    cell.visual_range.start <= visual
+                        && (visual < cell.visual_range.end
+                            || (*index + 1 == self.table_cells.len()
+                                && visual == cell.visual_range.end))
+                })
+                .map(|(_, cell)| cell)
+        {
+            return cell.text_x
+                + shaper.x_for_offset(
+                    line,
+                    cell.visual_range.clone(),
+                    visual.clamp(cell.visual_range.start, cell.visual_range.end),
+                );
+        }
         let visual = visual.clamp(self.line_visual_range.start, self.line_visual_range.end);
         if let Some(body) = self.body_visual_start
             && body <= self.line_visual_range.end
@@ -128,6 +162,26 @@ impl LayoutLine {
     }
 
     fn visual_for_x(&self, line: &VisualLine, x: f32, shaper: &dyn LineShaper) -> usize {
+        if let Some(cell) = self
+            .table_cells
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| {
+                x >= cell.x
+                    && (x < cell.x + cell.width
+                        || (*index + 1 == self.table_cells.len()
+                            && x <= cell.x + cell.width))
+            })
+            .map(|(_, cell)| cell)
+        {
+            return shaper
+                .offset_for_x(
+                    line,
+                    cell.visual_range.clone(),
+                    (x - cell.text_x).max(0.0),
+                )
+                .clamp(cell.visual_range.start, cell.visual_range.end);
+        }
         if let Some(body) = self.body_visual_start
             && body <= self.line_visual_range.end
         {
@@ -502,6 +556,9 @@ pub fn line_visual_start(block: &VisualBlock, index: usize) -> usize {
 /// break falls, how tall a row is, where a row sits — is decided here so it is
 /// the same with any font.
 pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
+    if block.lines.iter().any(|line| line.table_row.is_some()) {
+        return layout_table_block(block, width, shaper);
+    }
     let marker_widths = list_marker_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
@@ -553,9 +610,144 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
                 marker_body_gap: line_geometry.marker_body_gap,
                 body_gap: line_geometry.body_gap,
                 quote_bar_x_origin: line_geometry.quote_bar_x_origin,
+                table_cells: Vec::new(),
             });
             y += height;
         }
+    }
+    BlockLayout {
+        block: block.id,
+        revision: block.revision,
+        width,
+        lines,
+        leading_space: block.leading_space(),
+        trailing_space: block.trailing_space(),
+    }
+}
+
+/// Lays out visible table rows on shared equal-width columns. Equal allocation
+/// keeps the grid stable across rows and forces long values to remain inside
+/// the editor's existing horizontal viewport. Cell text is still shaped by the
+/// caller's real font; presentation never assumes monospace metrics.
+fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
+    let columns = block
+        .lines
+        .iter()
+        .filter_map(|line| line.table_row.as_ref())
+        .map(|row| row.column_count)
+        .max()
+        .unwrap_or(0);
+    let column_width = if columns == 0 {
+        0.0
+    } else {
+        width.max(0.0) / columns as f32
+    };
+    let marker_widths = list_marker_widths(block, shaper);
+    let mut lines = Vec::with_capacity(block.lines.len());
+    let mut y = 0.0;
+    for (index, line) in block.lines.iter().enumerate() {
+        if line.table_row.is_none() {
+            let block_start = line_visual_start(block, index);
+            let height = line.height();
+            let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+            let boundaries = if width <= 0.0 {
+                vec![0, line.visual_text.len()]
+            } else {
+                fragment_boundaries(line, &line_geometry, width, shaper)
+            };
+            for (fragment, pair) in boundaries.windows(2).enumerate() {
+                let (start, end) = (pair[0], pair[1]);
+                let last = end == line.visual_text.len();
+                let source_start = if fragment == 0 {
+                    line.source_range.start
+                } else {
+                    source_at_visual(line, start)
+                };
+                let source_end = if last {
+                    line.source_range.end
+                } else {
+                    source_at_visual(line, end)
+                };
+                lines.push(LayoutLine {
+                    line: index,
+                    line_id: line.line_id,
+                    fragment,
+                    wrap: if last { LineWrap::Hard } else { LineWrap::Soft },
+                    line_visual_range: start..end,
+                    visual_range: VisualRange::new(block_start + start, block_start + end),
+                    source_range: SourceRange {
+                        start: source_start,
+                        end: source_end.max(source_start),
+                    },
+                    y,
+                    height,
+                    text_x_origin: if fragment == 0 {
+                        line_geometry.text_x_origin
+                    } else {
+                        line_geometry.body_x_origin
+                    },
+                    body_x_origin: line_geometry.body_x_origin,
+                    effective_width: line_geometry.effective_width,
+                    marker_x_origin: line_geometry.marker_x_origin,
+                    body_visual_start: line_geometry.body_visual_start,
+                    marker_visual_range: line_geometry.marker_visual_range.clone(),
+                    marker_body_gap: line_geometry.marker_body_gap,
+                    body_gap: line_geometry.body_gap,
+                    quote_bar_x_origin: line_geometry.quote_bar_x_origin,
+                    table_cells: Vec::new(),
+                });
+                y += height;
+            }
+            continue;
+        }
+        let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
+            row.cells
+                .iter()
+                .map(|cell| {
+                    let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+                    let x = cell.column as f32 * column_width;
+                    let inner_width = (column_width - 16.0).max(0.0);
+                    let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+                    let text_x = x + 8.0 + match cell.alignment {
+                        TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
+                        TableAlignment::Right => (inner_width - text_width).max(0.0),
+                        TableAlignment::Default | TableAlignment::Left => 0.0,
+                    };
+                    TableCellLayout {
+                        column: cell.column,
+                        visual_range,
+                        source_range: cell.source_range,
+                        x,
+                        width: column_width,
+                        text_x,
+                    }
+                })
+                .collect()
+        });
+        let block_start = line_visual_start(block, index);
+        let height = line.height();
+        lines.push(LayoutLine {
+            line: index,
+            line_id: line.line_id,
+            fragment: 0,
+            wrap: LineWrap::Hard,
+            line_visual_range: 0..line.visual_text.len(),
+            visual_range: VisualRange::new(block_start, block_start + line.visual_text.len()),
+            source_range: line.source_range,
+            y,
+            height,
+            text_x_origin: 0.0,
+            body_x_origin: 0.0,
+            effective_width: width.max(MIN_EFFECTIVE_WRAP_WIDTH),
+            marker_x_origin: None,
+            body_visual_start: None,
+            marker_visual_range: None,
+            marker_body_gap: 0.0,
+            body_gap: 0.0,
+            quote_bar_x_origin: None,
+            table_cells: cells,
+        });
+        y += height;
     }
     BlockLayout {
         block: block.id,

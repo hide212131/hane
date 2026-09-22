@@ -57,7 +57,8 @@ impl WindowShaper {
                 }
             }
         }
-        let semibold = line.display().weight == BlockWeight::Semibold;
+        let semibold = line.display().weight == BlockWeight::Semibold
+            || line.table_row.as_ref().is_some_and(|table| table.header);
         partition(fragment.clone(), boundaries)
             .into_iter()
             .map(|range| {

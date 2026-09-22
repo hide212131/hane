@@ -226,16 +226,17 @@ const FIXTURES: &[MarkdownFixture] = &[
             &[NodeKind::Table, NodeKind::TableHead, NodeKind::TableCell],
             &[NodeKind::Table, NodeKind::TableRow, NodeKind::TableCell],
         ],
-        // Pipes are replaced by synthesized separators in `present_table_line`,
-        // so no marker derivation is involved.
+        // Pipes are hidden in the source map and cell geometry is carried as
+        // presentation metadata; no fake separator character is inserted into
+        // the editable visual text.
         markers: &[],
         block_kinds: &[
             BlockKind::TableRow,
             BlockKind::TableDelimiter,
             BlockKind::TableRow,
         ],
-        visual_lines: &[" 名前 │ 値 ", "", " 羽 │ 3 "],
-        style_runs: &[&[style(Table, 0, 17)], &[], &[style(Table, 0, 11)]],
+        visual_lines: &[" 名前  値 ", "", " 羽  3 "],
+        style_runs: &[&[style(Table, 0, 14)], &[], &[style(Table, 0, 8)]],
     },
     MarkdownFixture {
         name: "link",
