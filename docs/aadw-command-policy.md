@@ -89,7 +89,7 @@ target branch の進展を PR branch に取り込む操作は、Issue の製品�
 - base sync が必要なのは、変更領域の重なり、merge conflict、base-sensitive な挙動・evidence への影響、または merge 前の統合条件として current target branch の取り込みが必要な場合とする。target branch の各 commit を追いかけて逐次同期しない。
 - Commander は `behind > 0` だけを理由に、Claude / Codex の product-fix worker に「current main と同等のコードを書いて同期する」よう依頼しない。
 - base sync が必要なら、既存 Git の merge / rebase / update-branch など、target branch の commit を PR branch の ancestry に取り込む Git 操作を使う。同期が必要と判断した場合は完了後に compare で `behind = 0` を確認する。同等のコードが存在するだけでは同期済みと判断しない。
-- conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の実装を正として必要最小限の conflict 解消を行い、同期のために target branch の変更を別実装として複製しない。
+- conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の変更を基準として取り込みつつ、current Issue の acceptance criteria と PR の root-cause 修正を保持する。両立できない場合は機械的に片側を採用せず、conflict の意味を再評価する。同期のために target branch の変更を別実装として複製しない。
 - product-fix worker は Issue の root-cause 修正を担当し、branch ancestry を更新する Git 操作の代替として使わない。
 
 ---
