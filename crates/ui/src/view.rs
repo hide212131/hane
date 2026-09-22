@@ -2434,14 +2434,36 @@ impl EditorView {
         cx.notify();
     }
 
+    pub(crate) fn dismiss_file_tab_context_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.file_tab_context_menu.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
     fn close_file_tab_context_menu(
         &mut self,
         _: &MouseDownEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.file_tab_context_menu.take().is_some() {
-            cx.notify();
+        self.dismiss_file_tab_context_menu(cx);
+    }
+
+    fn vscode_launch_command(path: &Path) -> Command {
+        #[cfg(target_os = "macos")]
+        {
+            // Launch Services opens the regular VS Code application even when
+            // its optional `code` CLI is not installed in PATH.
+            let mut command = Command::new("open");
+            command.args(["-b", "com.microsoft.VSCode"]).arg(path);
+            command
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Command::new("code").arg(path)
         }
     }
 
@@ -2453,7 +2475,7 @@ impl EditorView {
             return;
         };
 
-        match Command::new("code").arg(&path).spawn() {
+        match Self::vscode_launch_command(&path).spawn() {
             Ok(_) => self.status = Some("VSCodeで開きました".to_owned()),
             Err(error) => self.status = Some(format!("VSCodeで開けません: {error}")),
         }
@@ -7237,6 +7259,7 @@ impl EditorView {
         let can_open = path.is_some();
         let item = div()
             .id("file-tab-context-open-vscode")
+            .debug_selector(|| "file-tab-context-open-vscode".to_owned())
             .w_full()
             .px_2()
             .py_1()
@@ -7256,6 +7279,7 @@ impl EditorView {
 
         div()
             .id("file-tab-context-menu")
+            .debug_selector(|| "file-tab-context-menu".to_owned())
             .min_w(px(180.0))
             .flex()
             .flex_col()
@@ -7309,13 +7333,15 @@ impl EditorView {
                         element.text_color(rgb(self.theme.header_foreground))
                     })
                     .child(label)
-                    .on_click(cx.listener(move |view, event: &ClickEvent, _, cx| {
-                        if event.is_right_click() {
-                            view.open_file_tab_context_menu(id, event.position(), cx);
-                        } else {
-                            view.activate_file_tab(id, cx);
-                        }
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.activate_file_tab(id, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, _, cx| {
+                            view.open_file_tab_context_menu(id, event.position, cx);
+                        }),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -7598,6 +7624,30 @@ mod tests {
                 "active tab foreground contrast is too low: {contrast:.2}"
             );
         }
+    }
+
+    #[test]
+    fn vscode_launch_command_keeps_the_path_as_one_argument() {
+        let path = Path::new("/tmp/file with spaces;$(touch should-not-run).md");
+        let command = EditorView::vscode_launch_command(path);
+        let args: Vec<_> = command.get_args().collect();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("open"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new("com.microsoft.VSCode"),
+                path.as_os_str(),
+            ]
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("code"));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(args, vec![path.as_os_str()]);
     }
 
     #[test]
@@ -11379,7 +11429,7 @@ mod tests {
         let active_path = PathBuf::from("active.md");
         let clicked_path = PathBuf::from("clicked.md");
         let expected_clicked_path = clicked_path.clone();
-        let view = gpui::AppContext::new(cx, |cx| {
+        let (view, cx) = cx.add_window_view(|_, cx| {
             let mut sessions = SessionSet::with_loaded(LoadedFile {
                 document: RopeBuffer::from_text("active\n"),
                 identity: hane_session::FileIdentity::lexical(active_path),
@@ -11460,6 +11510,35 @@ mod tests {
                 Some("VSCodeで開くにはファイルを保存してください")
             );
         });
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_closes_with_escape_and_outside_click(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx.debug_bounds("file-tab-first").expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
+
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        cx.simulate_click(point(px(620.0), px(220.0)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_none()));
     }
 
     #[gpui::test]
