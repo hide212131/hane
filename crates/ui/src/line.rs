@@ -792,7 +792,7 @@ fn table_row_element(
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
     let editing = line.table_row.is_none();
     for cell_layout in &row.table_cells {
-        let Some(cell) = table
+        let Some(_cell) = table
             .cells
             .iter()
             .find(|cell| cell.column == cell_layout.column)
