@@ -466,6 +466,39 @@ fn issue_14_table_example_reaches_every_visible_grid_row() {
 }
 
 #[test]
+fn readme_shortcut_table_keeps_text_in_all_three_columns() {
+    let source = "| 操作 | macOS | Windows / Linux |\n| --- | --- | --- |\n| カーソル移動 | 矢印キー / Home / End | 矢印キー / Home / End |\n| 選択 | Shift + 矢印キー | Shift + 矢印キー |\n| 文頭・文末へ移動 | Command + ↑ / ↓ | Ctrl + Home / End（Ctrl + ↑ / ↓ も可） |\n| 全選択 | Command + A | Ctrl + A |\n| コピー / 切り取り / 貼り付け | Command + C / X / V | Ctrl + C / X / V |\n| 元に戻す / やり直す | Command + Z / Command + Shift + Z | Ctrl + Z / Ctrl + Y（Ctrl + Shift + Z も可） |\n| 開く | Command + O | Ctrl + O |\n| フォルダを開く（work folder mode） | Command + Shift + O | Ctrl + Shift + O |\n| 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |\n| 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("README shortcut table must produce a table block");
+    let layout = layout_block(&block, 920.0, &shaper());
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 11);
+    assert!(rows.iter().all(|row| row.table_cells.len() == 3));
+    for row in rows {
+        for cell in &row.table_cells {
+            let text = &block.lines[row.line].visual_text[cell.visual_range.clone()];
+            assert!(
+                !text.trim().is_empty(),
+                "README shortcut table column {} must retain visible text",
+                cell.column
+            );
+            assert!(
+                !cell.fragments.is_empty(),
+                "README shortcut table column {} must have drawable fragments",
+                cell.column
+            );
+        }
+    }
+}
+
+#[test]
 fn empty_table_cells_keep_a_visible_row_for_editing() {
     let source = "|||\n|---|---|\n|||";
     let (block, layout) = laid_out(source)

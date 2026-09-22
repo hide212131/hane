@@ -10,8 +10,8 @@
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
-    Div, FontWeight, IntoElement, KeyboardInputMode, ObjectFit, ParentElement, Styled, StyledImage,
-    div, img, prelude::FluentBuilder, px, relative, rgb,
+    Div, FontWeight, InteractiveElement, IntoElement, KeyboardInputMode, ObjectFit, ParentElement,
+    Styled, StyledImage, div, img, prelude::FluentBuilder, px, relative, rgb,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
@@ -821,7 +821,8 @@ fn table_row_element(
         let cell_elements = cell_layout
             .fragments
             .iter()
-            .flat_map(|fragment| {
+            .enumerate()
+            .flat_map(|(fragment_index, fragment)| {
                 let fragment_range = fragment.visual_range.clone();
                 let fragment_selected =
                     clip_visual_range(cell_selected.as_ref(), fragment_range.clone());
@@ -840,6 +841,13 @@ fn table_row_element(
                         .overflow_hidden()
                         .when(table.header, |element| {
                             element.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .debug_selector({
+                            let selector = format!(
+                                "table-cell-text-{}-{}-{}-{}",
+                                line.line_id, row_index, cell_layout.column, fragment_index
+                            );
+                            move || selector.clone()
                         })
                         .child(text);
                     vec![text_element]
@@ -901,7 +909,6 @@ fn table_row_element(
                 .top(px(0.0))
                 .w(px(cell_layout.width))
                 .h(px(row.height))
-                .relative()
                 .px(px(8.0))
                 .overflow_hidden()
                 .children(cell_elements),

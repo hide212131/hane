@@ -12685,6 +12685,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn readme_shortcut_table_paints_text_in_all_three_columns(cx: &mut gpui::TestAppContext) {
+        let text = "| 操作 | macOS | Windows / Linux |\n| --- | --- | --- |\n| カーソル移動 | 矢印キー / Home / End | 矢印キー / Home / End |\n| 選択 | Shift + 矢印キー | Shift + 矢印キー |\n| 文頭・文末へ移動 | Command + ↑ / ↓ | Ctrl + Home / End（Ctrl + ↑ / ↓ も可） |\n| 全選択 | Command + A | Ctrl + A |\n| コピー / 切り取り / 貼り付け | Command + C / X / V | Ctrl + C / X / V |\n| 元に戻す / やり直す | Command + Z / Command + Shift + Z | Ctrl + Z / Ctrl + Y（Ctrl + Shift + Z も可） |\n| 開く | Command + O | Ctrl + O |\n| フォルダを開く（work folder mode） | Command + Shift + O | Ctrl + Shift + O |\n| 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |\n| 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.run_until_parked();
+
+        for (line, row_index) in std::iter::once(0).chain(2..=11).enumerate() {
+            let physical_line = if line == 0 { 0 } else { line + 1 };
+            let mut origins = Vec::new();
+            for column in 0..3 {
+                let selector: &'static str = Box::leak(
+                    format!("table-cell-text-{physical_line}-{row_index}-{column}-0")
+                        .into_boxed_str(),
+                );
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("README table cell text is not painted: {selector}"));
+                assert!(bounds.size.width > px(0.0));
+                origins.push(bounds.origin.x);
+            }
+            assert!(
+                origins[0] < origins[1],
+                "table columns overlap: {origins:?}"
+            );
+            assert!(
+                origins[1] < origins[2],
+                "table columns overlap: {origins:?}"
+            );
+        }
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        drop(view);
+    }
+
+    #[gpui::test]
     fn drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open(
         cx: &mut gpui::TestAppContext,
     ) {
