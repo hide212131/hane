@@ -419,6 +419,63 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
 }
 
 #[test]
+fn empty_table_cells_keep_a_visible_row_for_editing() {
+    let source = "|||\n|---|---|\n|||";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 2)
+        .expect("empty body row");
+
+    assert_eq!(row.table_cells.len(), 2);
+    assert!(row.table_cells.iter().all(|cell| cell.fragments.is_empty()));
+    assert_eq!(row.height, block.lines[row.line].height());
+    assert!(row.height > 0.0, "empty cells must still own an editable row");
+}
+
+#[test]
+fn aligned_table_hit_testing_uses_the_selected_fragment_origin() {
+    let source = "| a reallylongword |\n| ---: |\n| x |";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let row_index = layout
+        .lines
+        .iter()
+        .position(|row| row.line_id == 0)
+        .expect("aligned header row");
+    let row = &layout.lines[row_index];
+    let cell = &row.table_cells[0];
+    let first = cell.fragments.first().expect("wrapped first fragment");
+
+    assert!(first.text_x > cell.text_x);
+    assert_eq!(
+        layout.visual_at_x(&block, row_index, first.text_x, &shaper()),
+        Some(VisualOffset(first.visual_range.start)),
+        "hit testing must measure from the selected fragment's aligned origin"
+    );
+}
+
+#[test]
+fn disclosed_table_headers_keep_the_projected_header_state() {
+    let source = "| Header | body |\n| --- | --- |\n| value | cell |";
+    let active = present(source, Some(source.find("Header").expect("header cell")));
+    let block = active
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let header = block.lines.first().expect("header line");
+
+    assert!(header.table_row.is_none(), "the disclosed row stays raw");
+    assert!(header.table_header, "the projected header state must survive disclosure");
+}
+
+#[test]
 fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
     let (block, layout) = present("| a | wide |\n| --- | --- |\n| bb | x |", None)
         .into_iter()

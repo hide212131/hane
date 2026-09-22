@@ -229,11 +229,15 @@ impl LayoutLine {
             })
             .map(|(_, cell)| cell)
         {
-            let fragment = cell.fragments.first().map(|fragment| &fragment.visual_range);
+            let fragment = cell.fragments.first();
             return fragment.map_or(cell.visual_range.start, |fragment| {
                 shaper
-                    .offset_for_x(line, fragment.clone(), (x - cell.text_x).max(0.0))
-                    .clamp(fragment.start, fragment.end)
+                    .offset_for_x(
+                        line,
+                        fragment.visual_range.clone(),
+                        (x - fragment.text_x).max(0.0),
+                    )
+                    .clamp(fragment.visual_range.start, fragment.visual_range.end)
             });
         }
         if let Some(body) = self.body_visual_start
@@ -921,7 +925,8 @@ fn table_row_height(cells: &[TableCellLayout], fragment_height: f32) -> f32 {
         .iter()
         .map(|cell| cell.fragments.len())
         .max()
-        .unwrap_or(1);
+        .unwrap_or(0)
+        .max(1);
     fragment_height * fragment_count as f32
 }
 

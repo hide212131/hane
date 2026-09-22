@@ -58,7 +58,8 @@ impl WindowShaper {
             }
         }
         let semibold = line.display().weight == BlockWeight::Semibold
-            || line.table_row.as_ref().is_some_and(|table| table.header);
+            || line.table_row.as_ref().is_some_and(|table| table.header)
+            || line.table_header;
         partition(fragment.clone(), boundaries)
             .into_iter()
             .map(|range| {
@@ -184,9 +185,10 @@ impl LineShaper for WindowShaper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::line::presented_block;
+    use crate::line::{presented_block, presented_block_with_table_projection};
     use crate::view::EditorView;
-    use hane_editor::Editor;
+    use hane_document::SourceOffset;
+    use hane_editor::{Editor, Selection};
     use hane_markdown::BlockIndex;
 
     /// Issue #101 / PR #120 review: the earlier regression test asserted only
@@ -256,6 +258,48 @@ mod tests {
                     .map(|run| run.font.weight)
                     .collect::<Vec<_>>(),
                 "CJK and ASCII bold must request the same FontWeight"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn disclosed_table_header_uses_the_same_semibold_metrics_as_painted_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+
+        cx.update(|window, _| {
+            let shaper = WindowShaper::new(window, 1.0);
+            let source = "| Header | body |\n| --- | --- |\n| value | cell |";
+            let mut editor = Editor::new(source);
+            editor
+                .set_selection(Selection::caret(SourceOffset(
+                    source.find("Header").expect("header cell"),
+                )))
+                .expect("selection is inside the document");
+            let index = BlockIndex::from_buffer(editor.document());
+            let block = index.blocks().next().expect("one table block");
+            let visual = presented_block_with_table_projection(
+                &editor,
+                &block,
+                &(0..usize::MAX),
+                None,
+                None,
+                None,
+                index.table_projection(&block),
+                26.0,
+            )
+            .expect("table block presents");
+            let line = &visual.lines[0];
+            assert!(line.table_header);
+            assert!(line.table_row.is_none());
+
+            let runs = shaper.runs(line, 0..line.visual_text.len());
+            assert!(!runs.is_empty());
+            assert!(
+                runs.iter()
+                    .all(|run| run.font.weight == FontWeight::SEMIBOLD),
+                "disclosed header shaping must use the painted semibold metrics"
             );
         });
     }

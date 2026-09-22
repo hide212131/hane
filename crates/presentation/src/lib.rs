@@ -770,6 +770,9 @@ pub struct VisualLine {
     pub quote_marker_source_ranges: Vec<SourceRange>,
     /// Cell-level metadata for an inactive structured table row.
     pub table_row: Option<TableRowDisplay>,
+    /// Whether this line is a projected table header while its raw Markdown
+    /// presentation is disclosed for editing.
+    pub table_header: bool,
 }
 
 impl VisualLine {
@@ -1396,6 +1399,7 @@ fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -1553,6 +1557,7 @@ fn present_rule_line(
         quote_marker_visual_ranges,
         quote_marker_source_ranges,
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -2589,6 +2594,7 @@ fn present_markdown_from_parse(
         quote_marker_visual_ranges,
         quote_marker_source_ranges,
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -3738,6 +3744,7 @@ fn present_polished_line_with_fence(
         )
     };
     block.context = context;
+    block.table_header = table_header;
     block
 }
 
@@ -3881,6 +3888,7 @@ fn present_fenced_code_opening_line(
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -3945,6 +3953,7 @@ fn present_fenced_code_closing_line(
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -4057,6 +4066,7 @@ fn present_image(
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
         table_row: None,
+        table_header: false,
     }
 }
 
@@ -4328,6 +4338,7 @@ fn present_table_line(
             quote_marker_visual_ranges: Vec::new(),
             quote_marker_source_ranges: Vec::new(),
             table_row: None,
+            table_header: false,
         };
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
@@ -4481,6 +4492,7 @@ fn present_table_line(
             column_count,
             cells,
         }),
+        table_header: header,
     }
 }
 
