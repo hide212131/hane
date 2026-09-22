@@ -399,6 +399,51 @@ fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
 }
 
 #[test]
+fn table_layout_keeps_shared_columns_when_the_widest_row_is_being_edited() {
+    let source = "| h | short |\n| --- | --- |\n| a | the widest cell |\n| b | x |";
+    let inactive = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let active_offset = source.find("the widest").expect("active cell");
+    let active = present(source, Some(active_offset));
+    let active = active
+        .iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("active table block");
+    let inactive_layout = layout_block(&inactive, 120.0, &shaper());
+    let active_layout = layout_block(active, 120.0, &shaper());
+
+    let inactive_header = inactive_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("inactive header row");
+    let active_header = active_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("active header row");
+    let active_widest = active
+        .lines
+        .iter()
+        .find(|line| line.line_id == 2)
+        .expect("active widest row");
+
+    assert!(active_widest.table_row.is_none(), "the editing row stays raw");
+    assert_eq!(
+        active_header.table_cells[1].x,
+        inactive_header.table_cells[1].x,
+        "editing a cell must not move the shared column boundary"
+    );
+    assert_eq!(
+        active_header.table_cells[1].width,
+        inactive_header.table_cells[1].width,
+        "editing a cell must not change the shared column width"
+    );
+}
+
+#[test]
 fn table_layout_distributes_available_width_between_minimum_and_preferred() {
     let (_block, layout) = present("| abc def | x |\n| --- | --- |\n| a | b |", None)
         .into_iter()
