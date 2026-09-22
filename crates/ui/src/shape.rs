@@ -294,7 +294,7 @@ mod tests {
             assert!(line.table_header);
             assert!(line.table_row.is_none());
 
-            let runs = shaper.runs(line, 0..line.visual_text.len());
+            let runs = shaper.runs(line, &(0..line.visual_text.len()));
             assert!(!runs.is_empty());
             assert!(
                 runs.iter()
