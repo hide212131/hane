@@ -4162,26 +4162,30 @@ fn present_table_line(
                 Visibility::Visible,
                 None,
             );
-            cells.push(TableCellDisplay {
-                column,
-                source_range: SourceRange::new(base + cursor, base + index),
-                visual_range: VisualRange::new(visual_start, visual.len()),
-                alignment: alignments
-                    .get(column)
-                    .copied()
-                    .unwrap_or(TableAlignment::Default),
-            });
+            if alignments.is_empty() || column < alignments.len() {
+                cells.push(TableCellDisplay {
+                    column,
+                    source_range: SourceRange::new(base + cursor, base + index),
+                    visual_range: VisualRange::new(visual_start, visual.len()),
+                    alignment: alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(TableAlignment::Default),
+                });
+            }
             column += 1;
         } else if index != opening_pipe {
-            cells.push(TableCellDisplay {
-                column,
-                source_range: SourceRange::empty(base + cursor),
-                visual_range: VisualRange::new(visual.len(), visual.len()),
-                alignment: alignments
-                    .get(column)
-                    .copied()
-                    .unwrap_or(TableAlignment::Default),
-            });
+            if alignments.is_empty() || column < alignments.len() {
+                cells.push(TableCellDisplay {
+                    column,
+                    source_range: SourceRange::empty(base + cursor),
+                    visual_range: VisualRange::new(visual.len(), visual.len()),
+                    alignment: alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(TableAlignment::Default),
+                });
+            }
             column += 1;
         }
         let at = visual.len();
@@ -4204,15 +4208,18 @@ fn present_table_line(
             Visibility::Visible,
             None,
         );
-        cells.push(TableCellDisplay {
-            column,
-            source_range: SourceRange::new(base + cursor, base + content_end),
-            visual_range: VisualRange::new(visual_start, visual.len()),
-            alignment: alignments
-                .get(column)
-                .copied()
-                .unwrap_or(TableAlignment::Default),
-        });
+        if alignments.is_empty() || column < alignments.len() {
+            cells.push(TableCellDisplay {
+                column,
+                source_range: SourceRange::new(base + cursor, base + content_end),
+                visual_range: VisualRange::new(visual_start, visual.len()),
+                alignment: alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Default),
+            });
+        }
+        column += 1;
     }
     if content_end < source.len() {
         append_segment(
@@ -4224,6 +4231,23 @@ fn present_table_line(
             Visibility::Visible,
             None,
         );
+    }
+    let column_count = if alignments.is_empty() {
+        column
+    } else {
+        alignments.len()
+    };
+    while cells.len() < column_count {
+        let column = cells.len();
+        cells.push(TableCellDisplay {
+            column,
+            source_range: SourceRange::empty(base + content_end),
+            visual_range: VisualRange::new(visual.len(), visual.len()),
+            alignment: alignments
+                .get(column)
+                .copied()
+                .unwrap_or(TableAlignment::Default),
+        });
     }
     let visual_len = visual.len();
     VisualLine {
@@ -4249,7 +4273,7 @@ fn present_table_line(
         quote_marker_source_ranges: Vec::new(),
         table_row: Some(TableRowDisplay {
             header,
-            column_count: alignments.len().max(cells.len()),
+            column_count,
             cells,
         }),
     }
@@ -7172,8 +7196,40 @@ mod tests {
             &[TableAlignment::Default, TableAlignment::Right],
         );
         assert_eq!(
-            sparse.table_row.expect("sparse table row").column_count,
+            sparse
+                .table_row
+                .as_ref()
+                .expect("sparse table row")
+                .column_count,
             2
+        );
+        let sparse_cells = sparse
+            .table_row
+            .as_ref()
+            .expect("sparse table row cells")
+            .cells
+            .as_slice();
+        assert_eq!(
+            sparse_cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(sparse_cells[1].visual_range.start == sparse_cells[1].visual_range.end);
+        let excess = present_table_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| a | 2 |\n".len()),
+            "| a | 2 |\n",
+            26.0,
+            false,
+            &[TableAlignment::Default],
+        );
+        let excess_table = excess.table_row.as_ref().expect("excess table row");
+        assert_eq!(excess_table.column_count, 1);
+        assert_eq!(excess_table.cells.len(), 1);
+        assert_eq!(
+            &excess.visual_text[excess_table.cells[0].visual_range.start.0
+                ..excess_table.cells[0].visual_range.end.0],
+            " a "
         );
         let active = present_polished_line(
             1,
