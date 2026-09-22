@@ -318,6 +318,33 @@ fn every_editable_source_offset_round_trips_through_the_layout() {
 }
 
 #[test]
+fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
+    let source = "| Name | Count |\n|:-----|------:|\n| Hane | 3 |";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].table_cells.len(), 2);
+    assert_eq!(rows[1].table_cells.len(), 2);
+    assert_eq!(rows[0].table_cells[0].x, rows[1].table_cells[0].x);
+    assert_eq!(rows[0].table_cells[0].width, rows[1].table_cells[0].width);
+    assert!(rows[0].table_cells[1].x > rows[0].table_cells[0].x);
+
+    let count_offset = SourceOffset(source.find("Count").expect("Count cell"));
+    let point = layout
+        .point_for_source(&block, count_offset, &shaper())
+        .expect("cell source maps to a point");
+    assert_eq!(point.row, 0);
+    assert!(point.x >= rows[0].table_cells[1].text_x);
+}
+
+#[test]
 fn soft_wrapped_rows_tile_their_line_and_keep_the_break_kind() {
     let (block, layout) = laid_out(WRAPPED).into_iter().next().expect("one block");
     let rows: Vec<_> = layout

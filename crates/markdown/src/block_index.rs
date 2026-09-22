@@ -26,11 +26,12 @@ use crate::block_store::BlockStore;
 use crate::{
     FenceHeightProjection, ListProjection, ListProjectionItem, ListProjectionList,
     ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind,
-    QuoteProjection, markdown_lines, parse_document,
+    QuoteProjection, TableAlignment, markdown_lines, parse_document, is_table_delimiter,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Bytes a single incremental update may re-parse while hunting for a
@@ -88,6 +89,15 @@ pub struct IndexedBlock {
     /// tiling starts at byte zero; keeping the offset in the index lets the UI
     /// locate a fenced block's opening line without rescanning those blanks.
     pub leading_content_lines: usize,
+}
+
+/// Compact table metadata used by presentation for rows outside the current
+/// viewport. It intentionally carries no cell text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableProjection {
+    pub source_range: SourceRange,
+    pub delimiter_range: Option<SourceRange>,
+    pub alignments: Arc<[TableAlignment]>,
 }
 
 impl IndexedBlock {
@@ -613,6 +623,50 @@ fn build_list_projections(
         .collect()
 }
 
+fn build_table_projections(
+    parsed: &MarkdownParse,
+    blocks: &[TiledBlock],
+    range: SourceRange,
+    source: &str,
+) -> HashMap<BlockId, TableProjection> {
+    let block_ranges = blocks
+        .iter()
+        .scan(range.start.0, |start, (_, length, _, _)| {
+            let block = SourceRange::new(*start, *start + *length);
+            *start = block.end.0;
+            Some(block)
+        })
+        .collect::<Vec<_>>();
+    parsed
+        .table_parses
+        .iter()
+        .filter_map(|table| {
+            let node = parsed.tree.node(table.node)?;
+            let ordinal = block_ranges.iter().position(|block| {
+                block.start <= node.source_range.start && node.source_range.start < block.end
+            })?;
+            let block_range = block_ranges[ordinal];
+            let delimiter_range = source_line_ranges_in(range, block_range, source)
+                .into_iter()
+                .find(|line| {
+                    let relative = line.start.0.saturating_sub(range.start.0);
+                    let end = line.end.0.saturating_sub(range.start.0);
+                    source
+                        .get(relative..end)
+                        .is_some_and(is_table_delimiter)
+                });
+            Some((
+                BlockId(ordinal as u64),
+                TableProjection {
+                    source_range: node.source_range,
+                    delimiter_range,
+                    alignments: table.alignments.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Tiles one parsed slice into block spans covering `range` exactly: each
 /// top-level block runs from its own start to the next block's start, the first
 /// starts at `range.start`, and the last ends at `range.end`. Returns no block
@@ -671,6 +725,9 @@ pub struct BlockIndex {
     /// incremental parses so editing never has to wait for formal list semantics
     /// merely to keep virtualized heights stable.
     fence_height_projections: HashMap<BlockId, FenceHeightProjection>,
+    /// Formal table metadata; cleared by incremental edits and repopulated by
+    /// the next formal parse so stale alignment cannot reach the renderer.
+    table_projections: HashMap<BlockId, TableProjection>,
     /// First ordinal of the conservatively invalidated tail, if any. Invalidation
     /// always covers a suffix, so one ordinal answers "is this block provisional"
     /// in constant time instead of writing a flag into every affected block.
@@ -685,6 +742,7 @@ impl BlockIndex {
         let parsed = parse_document(revision, range, source);
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
+        let table_projections = build_table_projections(&parsed, &blocks, range, source);
         let fence_height_by_ordinal =
             build_fence_height_projections(&parsed, &blocks, range, source);
         let fence_height_projections = fence_height_by_ordinal
@@ -715,6 +773,7 @@ impl BlockIndex {
             next_id,
             list_projections,
             fence_height_projections,
+            table_projections,
             provisional_from: None,
         }
     }
@@ -824,6 +883,17 @@ impl BlockIndex {
             .flatten()
     }
 
+    /// Formal table metadata for a current block. Provisional/stale values are
+    /// deliberately withheld; presentation can safely fall back to raw source.
+    pub fn table_projection(&self, block: &IndexedBlock) -> Option<&TableProjection> {
+        let current = self.block(block.ordinal)?;
+        (current.id == block.id
+            && current.source_range == block.source_range
+            && current.confidence == Confidence::Formal)
+            .then(|| self.table_projections.get(&block.id))
+            .flatten()
+    }
+
     /// Every block in document order.
     pub fn blocks(&self) -> impl Iterator<Item = IndexedBlock> + '_ {
         self.blocks_from(0)
@@ -879,6 +949,7 @@ impl BlockIndex {
             return finish(self, 0, 0, 0, 0, 0, true);
         }
         self.list_projections.clear();
+        self.table_projections.clear();
         // Only a document with no block at all indexes to nothing, so this
         // rebuild parses a blank (hence tiny) document.
         if self.is_empty() {

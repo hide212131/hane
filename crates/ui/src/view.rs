@@ -28,7 +28,7 @@ use crate::line::presented_block;
 use crate::line::{
     BODY_FONT_SIZE, CARET_MODE_BADGE_HEIGHT, block_element, block_fits_sync_join_budget,
     expected_block_disclosures, presented_block_with_list_projection,
-    presented_block_with_projections, row_element,
+    presented_block_with_projections, presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
@@ -4283,13 +4283,17 @@ impl EditorView {
         let fence_height_projection = self
             .current_index()
             .and_then(|index| index.fence_height_projection(&indexed));
-        let visual = presented_block_with_projections(
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
+        let visual = presented_block_with_table_projection(
             self.editor(),
             &indexed,
             &window,
             joined.map(|cached| &cached.parse),
             list_projection,
             fence_height_projection,
+            table_projection,
             self.line_height(),
         )?;
         let layout = layout_block(&visual, self.content_width, shaper);
@@ -5174,13 +5178,17 @@ impl EditorView {
         let fence_height_projection = self
             .current_index()
             .and_then(|index| index.fence_height_projection(block));
-        let mut presented = presented_block_with_projections(
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(block));
+        let mut presented = presented_block_with_table_projection(
             self.sessions.active().editor(),
             block,
             visible,
             joined.map(|cached| &cached.parse),
             list_projection,
             fence_height_projection,
+            table_projection,
             self.line_height(),
         )?;
         self.block_cache.insert(block.id, presented.clone());

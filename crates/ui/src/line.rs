@@ -15,13 +15,13 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection};
+use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
-    VisualLine,
+    TableAlignment, VisualLine,
     VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
-    expected_disclosures, present_block_with_list_projection, trailing_blank_lines,
+    expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -149,6 +149,29 @@ pub(crate) fn presented_block_with_projections(
     fence_height_projection: Option<&FenceHeightProjection>,
     line_height: f32,
 ) -> Option<VisualBlock> {
+    presented_block_with_table_projection(
+        editor,
+        block,
+        visible,
+        joined,
+        list_projection,
+        fence_height_projection,
+        None,
+        line_height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn presented_block_with_table_projection(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
+    table_projection: Option<&TableProjection>,
+    line_height: f32,
+) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
@@ -162,7 +185,7 @@ pub(crate) fn presented_block_with_projections(
     )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
-    Some(present_block_with_list_projection(
+    Some(present_block_with_table_projection(
         block,
         document.revision(),
         &BlockWindow {
@@ -178,6 +201,7 @@ pub(crate) fn presented_block_with_projections(
         },
         line_height,
         list_projection,
+        table_projection,
     ))
 }
 
@@ -574,6 +598,23 @@ pub(crate) fn row_element(
         );
     }
 
+    if let Some(table) = &line.table_row
+        && !row.table_cells.is_empty()
+    {
+        return table_row_element(
+            editor,
+            block,
+            line,
+            row,
+            table,
+            layout,
+            row_index,
+            display,
+            theme,
+            zoom,
+        );
+    }
+
     let cursor = editor.selection().active;
     let is_final_line = row.line_id as usize + 1 == editor.document().line_count();
     let visual_cursor = if line_owns_cursor(line.source_range, cursor, is_final_line) {
@@ -661,6 +702,103 @@ pub(crate) fn row_element(
     )
     .children(quote_bar(row, theme, zoom))
     .children(elements)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_row_element(
+    editor: &Editor,
+    block: &VisualBlock,
+    line: &VisualLine,
+    row: &LayoutLine,
+    table: &hane_presentation::TableRowDisplay,
+    layout: &BlockLayout,
+    row_index: usize,
+    display: BlockDisplay,
+    theme: Theme,
+    zoom: f32,
+) -> Div {
+    let selection = editor.selection().range();
+    let marked = editor.ime().map(|ime| ime.marked_range);
+    let selected_visual = layout.visual_range_on_row(block, row_index, selection);
+    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
+    for cell_layout in &row.table_cells {
+        let Some(cell) = table
+            .cells
+            .iter()
+            .find(|cell| cell.column == cell_layout.column)
+        else {
+            continue;
+        };
+        let text = line.visual_text[cell_layout.visual_range.clone()].to_owned();
+        let selected = selected_visual.as_ref().is_some_and(|range| {
+            range.start < cell_layout.visual_range.end
+                && cell_layout.visual_range.start < range.end
+        });
+        let marked = marked.is_some_and(|range| range.intersects(cell.source_range));
+        let mut text_element = div()
+            .w_full()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .text_ellipsis()
+            .when(selected, |element| {
+                element.bg(rgb(theme.selection_background))
+            })
+            .when(marked, |element| element.underline())
+            .when(table.header, |element| {
+                element.font_weight(FontWeight::SEMIBOLD)
+            })
+            .child(text);
+        text_element = match cell.alignment {
+            TableAlignment::Center => text_element.text_center(),
+            TableAlignment::Right => text_element.text_right(),
+            TableAlignment::Default | TableAlignment::Left => text_element.text_left(),
+        };
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cell_layout.x * zoom))
+                .top(px(0.0))
+                .w(px(cell_layout.width * zoom))
+                .h(px(row.height))
+                .flex()
+                .items_center()
+                .px(px(8.0 * zoom))
+                .overflow_hidden()
+                .child(text_element),
+        );
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + cell_layout.x * zoom))
+                .top(px(0.0))
+                .w(px(1.0 * zoom))
+                .h(px(row.height))
+                .bg(rgb(theme.table_border)),
+        );
+    }
+    elements.push(
+        div()
+            .absolute()
+            .left(px(theme.line_horizontal_padding))
+            .right(px(theme.line_horizontal_padding))
+            .bottom(px(0.0))
+            .h(px(1.0 * zoom))
+            .bg(rgb(theme.table_border)),
+    );
+    styled_block(
+        div()
+            .relative()
+            .h(px(row.height))
+            .w_full()
+            .overflow_hidden()
+            .children(elements),
+        display,
+        theme,
+        zoom,
+    )
+    .when(table.header, |element| {
+        element.bg(rgb(theme.table_header_background))
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -952,6 +1090,7 @@ mod tests {
             marker_body_gap: 0.0,
             body_gap: 0.0,
             quote_bar_x_origin: None,
+            table_cells: Vec::new(),
         }
     }
 

@@ -33,7 +33,7 @@ mod block_store;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
-    PublishOutcome,
+    PublishOutcome, TableProjection,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
@@ -160,6 +160,23 @@ pub struct MarkdownNode {
     pub depth: usize,
 }
 
+/// Alignment declared by a GFM pipe-table delimiter row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableAlignment {
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+/// Table-level parser metadata kept beside the syntax tree so the alignment
+/// vector from pulldown-cmark is not lost when `Tag::Table` becomes `NodeKind`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableParse {
+    pub node: NodeId,
+    pub alignments: Arc<[TableAlignment]>,
+}
+
 /// Block/inline node tree for one parsed source slice: parent/child structure,
 /// document order, and a source range on every node.
 ///
@@ -255,6 +272,8 @@ pub struct MarkdownParse {
     pub revision: Revision,
     pub source_range: SourceRange,
     pub tree: MarkdownTree,
+    /// Alignment metadata for each parsed table node, keyed by its tree node.
+    pub table_parses: Vec<TableParse>,
     /// Sorted, non-overlapping source ranges of the syntactic markers (heading
     /// hashes, quote/list prefixes, fence delimiters, emphasis/code delimiters,
     /// link brackets). Derived here so presentation and UI never re-lex markup.
@@ -1796,8 +1815,12 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 /// pairs push and pop; every other event becomes a leaf under the open
 /// container. Unmodeled tags still push a node so the stack stays balanced and
 /// their source range remains reachable.
-fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<ParsedCodeSpan>) {
+fn build_tree(
+    source_range: SourceRange,
+    source: &str,
+) -> (MarkdownTree, Vec<ParsedCodeSpan>, Vec<TableParse>) {
     let mut codes = Vec::new();
+    let mut tables = Vec::new();
     let mut nodes = vec![MarkdownNode {
         kind: NodeKind::Document,
         source_range,
@@ -1830,6 +1853,21 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
         match event {
             Event::Start(tag) => {
                 let id = push(&mut nodes, &open, node_kind_for_tag(&tag), range);
+                if let Tag::Table(alignments) = &tag {
+                    tables.push(TableParse {
+                        node: id,
+                        alignments: alignments
+                            .iter()
+                            .map(|alignment| match alignment {
+                                pulldown_cmark::Alignment::None => TableAlignment::Default,
+                                pulldown_cmark::Alignment::Left => TableAlignment::Left,
+                                pulldown_cmark::Alignment::Center => TableAlignment::Center,
+                                pulldown_cmark::Alignment::Right => TableAlignment::Right,
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    });
+                }
                 open.push(id);
             }
             Event::End(_) => {
@@ -1878,7 +1916,7 @@ fn build_tree(source_range: SourceRange, source: &str) -> (MarkdownTree, Vec<Par
             }
         }
     }
-    (MarkdownTree { nodes }, codes)
+    (MarkdownTree { nodes }, codes, tables)
 }
 
 /// Parses a source slice into a node tree and retains the byte range of every
@@ -1890,7 +1928,7 @@ pub fn parse_document(
     source: &str,
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let (tree, codes) = build_tree(source_range, source);
+    let (tree, codes, table_parses) = build_tree(source_range, source);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
@@ -1899,6 +1937,7 @@ pub fn parse_document(
         revision,
         source_range,
         tree,
+        table_parses,
         markers: markers.markers,
         fence_markers: markers.fence_markers,
         fence_marker_edges: markers.fence_marker_edges,
@@ -2136,6 +2175,32 @@ mod tests {
                 "each row has two cells"
             );
         }
+    }
+
+    #[test]
+    fn table_parse_retains_delimiter_alignments() {
+        let source = "| left | center | right | default |\n|:---|:---:|---:|---|\n| a | b | c | d |";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
+        assert_eq!(parsed.table_parses.len(), 1);
+        assert_eq!(
+            parsed.table_parses[0].alignments.as_ref(),
+            &[
+                TableAlignment::Left,
+                TableAlignment::Center,
+                TableAlignment::Right,
+                TableAlignment::Default,
+            ]
+        );
+    }
+
+    #[test]
+    fn formal_block_index_exposes_compact_table_projection() {
+        let source = "| left | right |\n|:---|---:|\n| a | b |";
+        let index = BlockIndex::build(Revision(1), source);
+        let block = index.block(0).expect("table block");
+        let projection = index.table_projection(&block).expect("table projection");
+        assert_eq!(projection.delimiter_range, Some(SourceRange::new(17, 29)));
+        assert_eq!(projection.alignments.as_ref(), &[TableAlignment::Left, TableAlignment::Right]);
     }
 
     #[test]
