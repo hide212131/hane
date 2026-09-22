@@ -30,10 +30,15 @@
 
 mod block_index;
 mod block_store;
+mod list_editing;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
     PublishOutcome, TableProjection, TableProjectionCell, TableProjectionRow,
+};
+pub use list_editing::{
+    ListEditIntent, ListEditItem, ListEditPlanResult, ListEditProjection, ListMarker,
+    MarkdownEditPlan, SourceSelection, build_list_edit_projection, plan_list_edit,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
@@ -469,8 +474,12 @@ impl FenceHeightProjection {
             range.start.0.saturating_sub(block_range.start.0),
             range.end.0.saturating_sub(block_range.start.0),
         );
-        let start = self.rows.partition_point(|row| row.range.end <= relative.start);
-        let end = self.rows.partition_point(|row| row.range.start < relative.end);
+        let start = self
+            .rows
+            .partition_point(|row| row.range.end <= relative.start);
+        let end = self
+            .rows
+            .partition_point(|row| row.range.start < relative.end);
         self.inactive_rows_in_indices(block_range, start..end, disclosure, block_is_final)
     }
 
@@ -497,9 +506,7 @@ impl FenceHeightProjection {
     /// visible fence row without enumerating the block's off-screen fences.
     pub fn is_fence_row_line(&self, line: usize) -> bool {
         let start = self.rows.partition_point(|row| row.line < line);
-        self.rows
-            .get(start)
-            .is_some_and(|row| row.line == line)
+        self.rows.get(start).is_some_and(|row| row.line == line)
     }
 
     fn inactive_rows_in_indices(
@@ -536,12 +543,11 @@ impl FenceHeightProjection {
                     || (block_is_final && caret_absolute == block_range.end.0),
             );
             let direct_active = usize::from(active_row.is_some());
-            let direct_already_counted = active_row.is_some_and(|row| {
-                self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]
-            });
-            return rows
-                .len()
-                .saturating_sub(quote_active + direct_active - usize::from(direct_already_counted));
+            let direct_already_counted = active_row
+                .is_some_and(|row| self.quote_row_prefix[row + 1] > self.quote_row_prefix[row]);
+            return rows.len().saturating_sub(
+                quote_active + direct_active - usize::from(direct_already_counted),
+            );
         }
         // A non-empty selection only discloses the part of a block that it
         // actually intersects. Do this test before converting to block-
@@ -552,9 +558,17 @@ impl FenceHeightProjection {
             return rows.len();
         }
         let disclosure = SourceRange::new(
-            disclosure.start.0.max(block_range.start.0).min(block_range.end.0)
+            disclosure
+                .start
+                .0
+                .max(block_range.start.0)
+                .min(block_range.end.0)
                 - block_range.start.0,
-            disclosure.end.0.min(block_range.end.0).max(block_range.start.0)
+            disclosure
+                .end
+                .0
+                .min(block_range.end.0)
+                .max(block_range.start.0)
                 - block_range.start.0,
         );
         let active_start = rows.partition_point(|row| row.range.end <= disclosure.start);
@@ -563,9 +577,8 @@ impl FenceHeightProjection {
         let direct_already_counted = self.quote_row_prefix[indices.start + active_end]
             .saturating_sub(self.quote_row_prefix[indices.start + active_start]);
         let quote_active = self.active_quote_rows_in(indices, disclosure, false);
-        rows.len().saturating_sub(
-            quote_active + direct_active - direct_already_counted,
-        )
+        rows.len()
+            .saturating_sub(quote_active + direct_active - direct_already_counted)
     }
 
     fn active_quote_rows_in(
@@ -585,11 +598,9 @@ impl FenceHeightProjection {
                 .partition_point(|entry| entry.owner.start < disclosure.end)
         };
         let owner_start = if disclosure.is_empty() {
-            self.quote_owner_max_end[..owner_end]
-                .partition_point(|end| *end < disclosure.start)
+            self.quote_owner_max_end[..owner_end].partition_point(|end| *end < disclosure.start)
         } else {
-            self.quote_owner_max_end[..owner_end]
-                .partition_point(|end| *end <= disclosure.start)
+            self.quote_owner_max_end[..owner_end].partition_point(|end| *end <= disclosure.start)
         };
         self.quote_owner_rows[owner_start..owner_end]
             .iter()
@@ -1537,7 +1548,8 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                     // so the block's real last logical line — not a
                     // prefix-contaminated lookalike such as `"> ```"` — is
                     // what gets checked against the opening fence.
-                    let containers = ancestor_containers(tree, id, range, source).unwrap_or_default();
+                    let containers =
+                        ancestor_containers(tree, id, range, source).unwrap_or_default();
                     let mut line_start = node_start + opening_line.len();
                     let mut last_logical: Option<(usize, &str)> = None;
                     for line in markdown_lines(&source[line_start..node_end]) {
@@ -1546,8 +1558,10 @@ fn derive_markers(tree: &MarkdownTree, range: SourceRange, source: &str) -> Deri
                         let logical_start =
                             consume_containers(&containers, this_line_start, line.as_bytes())
                                 .map_or(this_line_start, |cursor| this_line_start + cursor.byte);
-                        last_logical =
-                            Some((logical_start, &source[logical_start..this_line_start + line.len()]));
+                        last_logical = Some((
+                            logical_start,
+                            &source[logical_start..this_line_start + line.len()],
+                        ));
                     }
                     // A closing-shaped last line only really closes the fence
                     // when it repeats the opening's own marker character at
@@ -2179,7 +2193,8 @@ mod tests {
 
     #[test]
     fn table_parse_retains_delimiter_alignments() {
-        let source = "| left | center | right | default |\n|:---|:---:|---:|---|\n| a | b | c | d |";
+        let source =
+            "| left | center | right | default |\n|:---|:---:|---:|---|\n| a | b | c | d |";
         let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
         assert_eq!(parsed.table_parses.len(), 1);
         assert_eq!(
@@ -2200,7 +2215,10 @@ mod tests {
         let block = index.block(0).expect("table block");
         let projection = index.table_projection(&block).expect("table projection");
         assert_eq!(projection.delimiter_range, Some(SourceRange::new(17, 29)));
-        assert_eq!(projection.alignments.as_ref(), &[TableAlignment::Left, TableAlignment::Right]);
+        assert_eq!(
+            projection.alignments.as_ref(),
+            &[TableAlignment::Left, TableAlignment::Right]
+        );
         assert_eq!(projection.rows.len(), 2);
         assert!(projection.rows[0].header);
         assert_eq!(

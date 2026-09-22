@@ -258,7 +258,6 @@ impl EntityInputHandler for EditorView {
         } else if self.sidebar_filter_is_focused() {
             self.commit_sidebar_filter_composition(cx);
         } else {
-            self.clear_pending_list_editing();
             self.editor_mut().commit_composition();
         }
     }
@@ -282,13 +281,9 @@ impl EntityInputHandler for EditorView {
             self.insert_text(new_text, cx);
             return;
         }
-        let indentation = self.pending_list_indentation();
-        self.clear_pending_list_editing();
-        let mut replacement = indentation;
-        replacement.push_str(new_text);
         let result = self
             .editor_mut()
-            .commit_text(range_utf16, &replacement)
+            .commit_text(range_utf16, new_text)
             .map(|_| ());
         if let Err(error) = result {
             self.report_error("text input", error);
@@ -322,14 +317,10 @@ impl EntityInputHandler for EditorView {
             );
             return;
         }
-        let indentation = self.pending_list_indentation();
-        self.clear_pending_list_editing();
-        if let Err(error) = self.editor_mut().replace_and_mark_text_with_prefix(
-            range_utf16,
-            &indentation,
-            new_text,
-            new_selected_range_utf16,
-        ) {
+        if let Err(error) =
+            self.editor_mut()
+                .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)
+        {
             self.report_error("IME update", error);
         }
         self.after_input(cx);

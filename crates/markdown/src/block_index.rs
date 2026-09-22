@@ -24,9 +24,10 @@
 
 use crate::block_store::BlockStore;
 use crate::{
-    FenceHeightProjection, ListProjection, ListProjectionItem, ListProjectionList,
-    ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree, NodeKind,
-    QuoteProjection, TableAlignment, markdown_lines, parse_document, is_table_delimiter,
+    FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
+    ListProjectionList, ListProjectionPrefix, ListProjectionRow, MarkdownParse, MarkdownTree,
+    NodeKind, QuoteProjection, TableAlignment, build_list_edit_projection, is_table_delimiter,
+    markdown_lines, parse_document,
 };
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use std::collections::HashMap;
@@ -286,8 +287,7 @@ fn build_fence_height_projection(
     let mut rows = Vec::new();
     for (marker, edge) in fence_markers {
         let line_index = line_ranges.partition_point(|line| line.end <= marker.start);
-        let line = line_ranges
-            .get(line_index);
+        let line = line_ranges.get(line_index);
         let Some(line) = line else {
             continue;
         };
@@ -623,10 +623,10 @@ fn build_list_projections(
                 .fence_marker_edges
                 .partition_point(|(marker, _)| marker.start < block_range.end);
             let block_fence_markers = parsed.fence_marker_edges[fence_start..fence_end].to_vec();
-            let container_start = container_markers
-                .partition_point(|(marker, _, _)| marker.end <= block_range.start);
-            let container_end = container_markers
-                .partition_point(|(marker, _, _)| marker.start < block_range.end);
+            let container_start =
+                container_markers.partition_point(|(marker, _, _)| marker.end <= block_range.start);
+            let container_end =
+                container_markers.partition_point(|(marker, _, _)| marker.start < block_range.end);
             let block_container_markers =
                 container_markers[container_start..container_end].to_vec();
             let block_quotes = std::mem::take(&mut quotes_by_block[block]);
@@ -675,9 +675,7 @@ fn build_table_projections(
                 .find(|line| {
                     let relative = line.start.0.saturating_sub(range.start.0);
                     let end = line.end.0.saturating_sub(range.start.0);
-                    source
-                        .get(relative..end)
-                        .is_some_and(is_table_delimiter)
+                    source.get(relative..end).is_some_and(is_table_delimiter)
                 });
             let rows = parsed
                 .tree
@@ -700,12 +698,11 @@ fn build_table_projections(
                         .filter_map(|(column, cell_id)| {
                             let cell = parsed.tree.node(*cell_id)?;
                             (cell.kind == NodeKind::TableCell
-                                && (table.alignments.is_empty()
-                                    || column < table.alignments.len()))
-                                .then_some(TableProjectionCell {
-                                    column,
-                                    source_range: cell.source_range,
-                                })
+                                && (table.alignments.is_empty() || column < table.alignments.len()))
+                            .then_some(TableProjectionCell {
+                                column,
+                                source_range: cell.source_range,
+                            })
                         })
                         .collect::<Vec<_>>()
                         .into();
@@ -932,13 +929,28 @@ impl BlockIndex {
             .flatten()
     }
 
+    /// Builds the exact-current-revision list editing projection for the block
+    /// containing `offset`. This is intentionally synchronous and local to the
+    /// caret's block: the input path must be able to apply Enter and then Tab
+    /// without waiting for the background formal projection.
+    pub fn list_edit_projection_at(
+        &self,
+        buffer: &RopeBuffer,
+        offset: SourceOffset,
+    ) -> Option<ListEditProjection> {
+        if self.revision != buffer.revision() {
+            return None;
+        }
+        let block = self.block_at(offset)?;
+        let source = buffer.text(block.source_range).ok()?;
+        let parsed = parse_document(buffer.revision(), block.source_range, &source);
+        Some(build_list_edit_projection(&parsed, &source))
+    }
+
     /// Height-only fenced-code projection. Unlike list semantics this remains
     /// available after an incremental parse, as long as the block itself is not
     /// in the conservatively invalidated tail.
-    pub fn fence_height_projection(
-        &self,
-        block: &IndexedBlock,
-    ) -> Option<&FenceHeightProjection> {
+    pub fn fence_height_projection(&self, block: &IndexedBlock) -> Option<&FenceHeightProjection> {
         let current = self.block(block.ordinal)?;
         (current.id == block.id
             && current.source_range == block.source_range
@@ -1691,7 +1703,10 @@ mod tests {
         assert!(update.resynchronized);
 
         let after = index.blocks().next().expect("updated list block");
-        assert_eq!(after.id, before.id, "ordinary typing keeps the block identity");
+        assert_eq!(
+            after.id, before.id,
+            "ordinary typing keeps the block identity"
+        );
         assert!(
             index.list_projection(&after).is_none(),
             "incremental parsing intentionally drops formal list semantics"
@@ -1710,7 +1725,10 @@ mod tests {
         let source = "> ```\n> one\n> ```\n\nplain\n\n> ```\n> two\n> ```\n";
         let mut index = BlockIndex::build(Revision(1), source);
         let blocks = index.blocks().collect::<Vec<_>>();
-        assert!(blocks.len() >= 3, "fixture has separate quote/paragraph blocks");
+        assert!(
+            blocks.len() >= 3,
+            "fixture has separate quote/paragraph blocks"
+        );
         let removed = blocks.last().expect("last quote block").id;
         assert!(
             index.fence_height_projections.contains_key(&removed),
@@ -1887,9 +1905,7 @@ mod tests {
         let source = "> outer\n> > inner\n";
         let index = BlockIndex::build(Revision(1), source);
         let block = index.block(0).expect("quote block");
-        let projection = index
-            .list_projection(&block)
-            .expect("quote projection");
+        let projection = index.list_projection(&block).expect("quote projection");
         let outer_line = SourceRange::new(0, "> outer\n".len());
         let inner_start = "> outer\n".len();
         let inner_line = SourceRange::new(inner_start, source.len());
@@ -1925,16 +1941,12 @@ mod tests {
         assert_eq!(first.quotes_in(blocks[0].source_range).count(), 1);
         assert_eq!(second.quotes_in(blocks[1].source_range).count(), 1);
         assert_eq!(
-            first
-                .quotes_in(blocks[1].source_range)
-                .count(),
+            first.quotes_in(blocks[1].source_range).count(),
             0,
             "the first block must not retain quote projections from later blocks"
         );
         assert_eq!(
-            second
-                .quotes_in(blocks[0].source_range)
-                .count(),
+            second.quotes_in(blocks[0].source_range).count(),
             0,
             "the second block must not retain quote projections from earlier blocks"
         );

@@ -42,9 +42,9 @@ pub mod testing;
 pub use hane_markdown::TableAlignment;
 
 pub use layout::{
-    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap,
-    QUOTE_BAR_GAP, QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, VerticalMove, layout_block,
-    line_visual_start, TableCellLayout,
+    BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, QUOTE_BAR_GAP,
+    QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, TableCellLayout, VerticalMove, layout_block,
+    line_visual_start,
 };
 
 use hane_document::{
@@ -54,8 +54,7 @@ use hane_markdown::{
     BlockId, BlockIndex, Confidence, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection,
     ListProjectionItem, ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId,
     NodeKind, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
-    has_delimiter_markers, is_table_delimiter,
-    parse_document,
+    has_delimiter_markers, is_table_delimiter, parse_document,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -509,37 +508,6 @@ pub struct ListOwnerMetadata {
     pub alignment: ListAlignment,
 }
 
-/// The horizontal column where a list-aware newline places the next caret.
-/// This is an editing hint only; it does not add source bytes or visual text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ListCaretOrigin {
-    /// Start at the semantic marker column so the next source bytes can form a
-    /// sibling or child marker.
-    Marker,
-    /// Start at the list item's body column for an explicit body continuation.
-    Body,
-}
-
-/// Transient presentation context for the empty line created by a list-aware
-/// newline. The document remains the source of truth: this context only
-/// carries the existing semantic owner into the empty line's layout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ListEditingContext {
-    pub offset: SourceOffset,
-    pub owner: ListOwnerMetadata,
-    pub caret_origin: ListCaretOrigin,
-    /// Bytes owned by the physical line that is empty except for an existing
-    /// line ending. A newline inserted before that ending creates a new line
-    /// whose source range is non-empty even though its editable content is
-    /// empty. Zero means the new line is the document's zero-length final
-    /// line.
-    pub line_ending_len: usize,
-    /// Source indentation before the current item's marker. It is inserted
-    /// ahead of the first text typed on the new line, so Enter itself does not
-    /// commit a Markdown structure before the user chooses a marker or text.
-    pub indentation: String,
-}
-
 /// The marker a row currently displays. `visual_range` points at either the
 /// synthesized inactive label or the disclosed source marker. In both cases
 /// `anchor` is the real source marker start; no synthetic edit position is
@@ -573,12 +541,6 @@ pub struct ListRowMetadata {
     /// presentation. Phase 2 may replace this source-derived visual padding
     /// with absolute layout geometry while retaining the same semantic owner.
     pub body_visual_start: VisualOffset,
-    /// Set only on the empty line immediately created by a list-aware newline.
-    /// It changes caret geometry, never the source map or visual text.
-    pub empty_caret_origin: Option<ListCaretOrigin>,
-    /// Source range containing the current item's leading container prefix.
-    /// It is used by the editor to carry exact spaces/tabs into the next line.
-    pub source_prefix: Option<SourceRange>,
 }
 
 /// Formal quote context for one physical line. The depth comes from the
@@ -612,14 +574,6 @@ impl ListRowMetadata {
                     return false;
                 };
                 prefix.source_range = range;
-            }
-        }
-        if let Some(source_prefix) = &mut self.source_prefix {
-            for delta in deltas {
-                let Some(range) = delta.transform_range(*source_prefix) else {
-                    return false;
-                };
-                *source_prefix = range;
             }
         }
         true
@@ -958,33 +912,6 @@ impl VisualBlock {
     }
 }
 
-/// Applies a list-aware caret position to the empty source line created by an
-/// edit. The line keeps its original source map and empty visual text; only
-/// the semantic owner and layout hint are carried across the newline.
-pub fn apply_list_editing_context(block: &mut VisualBlock, context: &ListEditingContext) -> bool {
-    let empty_line_range = SourceRange::new(
-        context.offset.0,
-        context.offset.0.saturating_add(context.line_ending_len),
-    );
-    let Some(line) = block
-        .lines
-        .iter_mut()
-        .find(|line| line.source_range == empty_line_range)
-    else {
-        return false;
-    };
-    line.list = Some(ListRowMetadata {
-        owner: context.owner.clone(),
-        role: ListRowRole::Continuation,
-        marker: None,
-        structural_prefixes: Vec::new(),
-        body_visual_start: VisualOffset(0),
-        empty_caret_origin: Some(context.caret_origin),
-        source_prefix: None,
-    });
-    true
-}
-
 /// Physical source lines a block covers.
 ///
 /// A block ends where the next one begins, so its last byte is the newline of
@@ -1171,14 +1098,7 @@ pub fn present_block_with_list_projection(
     line_height: f32,
     list_projection: Option<&ListProjection>,
 ) -> VisualBlock {
-    present_block_with_table_projection(
-        block,
-        revision,
-        window,
-        line_height,
-        list_projection,
-        None,
-    )
+    present_block_with_table_projection(block, revision, window, line_height, list_projection, None)
 }
 
 /// Presents a block with document-wide list and table metadata. The compact
@@ -1333,8 +1253,8 @@ pub fn present_block_with_table_projection(
     }
     for line in window.clipped_fence_lines {
         let collapsed = if context == LineContext::FencedCode {
-            fence_line_role(line.line, content_end, line.text, fence_opening)
-                .is_some_and(|fence_role| {
+            fence_line_role(line.line, content_end, line.text, fence_opening).is_some_and(
+                |fence_role| {
                     present_fenced_code_line(
                         line.line as u64,
                         revision,
@@ -1346,7 +1266,8 @@ pub fn present_block_with_table_projection(
                     )
                     .height()
                         == 0.0
-                })
+                },
+            )
         } else {
             false
         };
@@ -1824,22 +1745,21 @@ fn marker_is_disclosed(
     }
     nodes.intersecting(marker).into_iter().any(|id| {
         let span = parsed.tree.node(*id).expect("indexed node");
-        let owns_marker = if has_delimiter_markers(span.kind)
-            && !matches!(span.kind, NodeKind::CodeBlock)
-        {
-            span.source_range.start <= marker.start && marker.end <= span.source_range.end
-        } else if matches!(span.kind, NodeKind::Heading(_)) {
-            (marker.start == span.source_range.start
-                || (matches!(span.kind, NodeKind::Heading(_))
-                    && span
-                        .children
-                        .last()
-                        .and_then(|id| parsed.tree.node(*id))
-                        .is_none_or(|child| child.source_range.end <= marker.start)))
-                && marker.end <= span.source_range.end
-        } else {
-            false
-        };
+        let owns_marker =
+            if has_delimiter_markers(span.kind) && !matches!(span.kind, NodeKind::CodeBlock) {
+                span.source_range.start <= marker.start && marker.end <= span.source_range.end
+            } else if matches!(span.kind, NodeKind::Heading(_)) {
+                (marker.start == span.source_range.start
+                    || (matches!(span.kind, NodeKind::Heading(_))
+                        && span
+                            .children
+                            .last()
+                            .and_then(|id| parsed.tree.node(*id))
+                            .is_none_or(|child| child.source_range.end <= marker.start)))
+                    && marker.end <= span.source_range.end
+            } else {
+                false
+            };
         owns_marker && range_touches(span.source_range, disclosure)
     })
 }
@@ -2001,9 +1921,7 @@ fn quote_marker_ranges(
 ) -> (Vec<VisualRange>, Vec<SourceRange>) {
     markers_on_line
         .iter()
-        .filter(|marker| {
-            marker.quote_owner.is_some() || marker.formal_quote_owner.is_some()
-        })
+        .filter(|marker| marker.quote_owner.is_some() || marker.formal_quote_owner.is_some())
         .filter_map(|marker| {
             segments
                 .iter()
@@ -2265,21 +2183,17 @@ fn present_markdown_from_parse(
         }
         projected_markers.retain(|marker| {
             (marker.fence
-                && shared
-                    .list_projection
-                    .is_some_and(|projection| {
-                        marker.fence_edge.is_none()
-                            || projection.fence_marker_edge(marker.range).is_some()
-                    }))
+                && shared.list_projection.is_some_and(|projection| {
+                    marker.fence_edge.is_none()
+                        || projection.fence_marker_edge(marker.range).is_some()
+                }))
                 || marker.formal_container
         });
     }
     if kind == BlockKind::CodeBlock {
         let opening_fences = projected_markers
             .iter()
-            .filter(|marker| {
-                marker.fence && marker.fence_edge == Some(MarkerEdge::Opening)
-            })
+            .filter(|marker| marker.fence && marker.fence_edge == Some(MarkerEdge::Opening))
             .map(|marker| marker.range)
             .collect::<Vec<_>>();
         for fence_range in opening_fences {
@@ -2554,12 +2468,15 @@ fn present_markdown_from_parse(
         shared.list_projection,
     );
     let has_hidden_fence = kind == BlockKind::CodeBlock
-        && markers_on_line.iter().filter(|marker| marker.fence).any(|marker| {
-            source_map.segments.iter().any(|segment| {
-                segment.source_range == marker.range
-                    && segment.visibility == Visibility::HiddenMarkup
-            })
-        });
+        && markers_on_line
+            .iter()
+            .filter(|marker| marker.fence)
+            .any(|marker| {
+                source_map.segments.iter().any(|segment| {
+                    segment.source_range == marker.range
+                        && segment.visibility == Visibility::HiddenMarkup
+                })
+            });
     let line_estimated_height = if kind == BlockKind::CodeBlock {
         fenced_line_height(
             &visual,
@@ -3354,15 +3271,6 @@ fn list_row_metadata(
             })
         })
         .collect::<Vec<_>>();
-    let source_prefix = opening
-        .map(|planned| SourceRange::new(range.start.0, planned.range.start.0))
-        .filter(|range| !range.is_empty())
-        .or_else(|| {
-            projected.map(|projected| {
-                SourceRange::new(projected.item_range.start.0, projected.marker_range.start.0)
-            })
-        })
-        .filter(|range| !range.is_empty());
     let body_visual_start = markers_on_line
         .iter()
         .filter(|planned| {
@@ -3414,8 +3322,6 @@ fn list_row_metadata(
         marker,
         structural_prefixes,
         body_visual_start,
-        empty_caret_origin: None,
-        source_prefix,
     })
 }
 
@@ -3588,7 +3494,8 @@ fn present_joined_run_with_list_projection(
                 line.text,
                 line_height,
                 image,
-                list_projection.and_then(|projection| formal_quote_metadata(line.range, projection)),
+                list_projection
+                    .and_then(|projection| formal_quote_metadata(line.range, projection)),
             ),
             None => present_markdown_from_parse(
                 line.line as u64,
@@ -3703,7 +3610,15 @@ fn present_polished_line_with_fence(
     // so it stays a code block regardless of cursor position and wins over image
     // and table recognition that would otherwise mis-read the literal text.
     let mut block = if context == LineContext::FencedCode {
-        present_fenced_code_line(line_id, revision, range, source, line_height, disclosure, fence_role)
+        present_fenced_code_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+            fence_role,
+        )
     } else if let Some(image) = inactive_standalone_image(source, range, disclosure) {
         present_image(
             line_id,
@@ -3756,12 +3671,22 @@ fn present_fenced_code_line(
     fence_role: Option<FenceLine>,
 ) -> VisualLine {
     match fence_role {
-        Some(FenceLine::Opening) => {
-            present_fenced_code_opening_line(line_id, revision, range, source, line_height, disclosure)
-        }
-        Some(FenceLine::Closing) => {
-            present_fenced_code_closing_line(line_id, revision, range, source, line_height, disclosure)
-        }
+        Some(FenceLine::Opening) => present_fenced_code_opening_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+        ),
+        Some(FenceLine::Closing) => present_fenced_code_closing_line(
+            line_id,
+            revision,
+            range,
+            source,
+            line_height,
+            disclosure,
+        ),
         None => present_fenced_code_content_line(line_id, revision, range, source, line_height),
     }
 }
@@ -3813,9 +3738,8 @@ fn present_fenced_code_opening_line(
     let delimiter_end = (indent + delimiter.len).min(content_end);
     let base = range.start.0;
     let delimiter_range = SourceRange::new(base, base + delimiter_end);
-    let expanded = disclosure.is_some_and(|active| {
-        disclosure_owns_physical_line(range, source, active)
-    });
+    let expanded =
+        disclosure.is_some_and(|active| disclosure_owns_physical_line(range, source, active));
     let mut visual = String::new();
     let mut segments = Vec::new();
     append_segment(
@@ -3855,13 +3779,12 @@ fn present_fenced_code_opening_line(
     } else {
         Vec::new()
     };
-    let line_estimated_height =
-        fenced_line_height(
-            &visual,
-            !expanded,
-            disclosure.is_some_and(|active| range_touches(range, active)),
-            line_height,
-        );
+    let line_estimated_height = fenced_line_height(
+        &visual,
+        !expanded,
+        disclosure.is_some_and(|active| range_touches(range, active)),
+        line_height,
+    );
     VisualLine {
         line_id,
         source_range: range,
@@ -3902,7 +3825,11 @@ fn present_fenced_code_closing_line(
     } else {
         Visibility::HiddenMarkup
     };
-    let visual_text = if expanded { source.to_owned() } else { String::new() };
+    let visual_text = if expanded {
+        source.to_owned()
+    } else {
+        String::new()
+    };
     let styled_len = visual_text.trim_end_matches(['\r', '\n']).len();
     let style_runs = if styled_len > 0 {
         vec![StyleRun {
@@ -3912,13 +3839,12 @@ fn present_fenced_code_closing_line(
     } else {
         Vec::new()
     };
-    let line_estimated_height =
-        fenced_line_height(
-            &visual_text,
-            !expanded,
-            disclosure.is_some_and(|active| range_touches(range, active)),
-            line_height,
-        );
+    let line_estimated_height = fenced_line_height(
+        &visual_text,
+        !expanded,
+        disclosure.is_some_and(|active| range_touches(range, active)),
+        line_height,
+    );
     VisualLine {
         line_id,
         source_range: range,
@@ -4087,13 +4013,10 @@ fn table_row_from_projection(
     alignments: &[TableAlignment],
 ) -> Option<TableRowDisplay> {
     let projected = projection.and_then(|projection| {
-        projection
-            .rows
-            .iter()
-            .find(|row| {
-                row.source_range == range
-                    || (row.source_range.start < range.end && range.start < row.source_range.end)
-            })
+        projection.rows.iter().find(|row| {
+            row.source_range == range
+                || (row.source_range.start < range.end && range.start < row.source_range.end)
+        })
     });
     let projected_header = projected.map(|row| row.header).unwrap_or(header);
     let cells = if let Some(projected) = projected {
@@ -4167,9 +4090,7 @@ fn table_cells_from_visual_mapping(
     let leading_indent = pipes
         .first()
         .copied()
-        .filter(|index| {
-            *index <= 3 && line.visual_text[..*index].bytes().all(|byte| byte == b' ')
-        })
+        .filter(|index| *index <= 3 && line.visual_text[..*index].bytes().all(|byte| byte == b' '))
         .unwrap_or(0);
     let opening_pipe = pipes.first().copied().unwrap_or(leading_indent);
     let source_for_pipe = |visual: usize| {
@@ -4184,10 +4105,10 @@ fn table_cells_from_visual_mapping(
     for pipe in pipes {
         let pipe_source = source_for_pipe(pipe)?;
         if cursor < pipe {
-            let source_start = previous_pipe
-                .map_or(SourceOffset(line.source_range.start.0 + leading_indent), |source| {
-                    SourceOffset(source.0.saturating_add(1))
-                });
+            let source_start = previous_pipe.map_or(
+                SourceOffset(line.source_range.start.0 + leading_indent),
+                |source| SourceOffset(source.0.saturating_add(1)),
+            );
             if alignments.is_empty() || column < alignments.len() {
                 cells.push(TableCellDisplay {
                     column,
@@ -4203,10 +4124,9 @@ fn table_cells_from_visual_mapping(
         } else if pipe != opening_pipe {
             if alignments.is_empty() || column < alignments.len() {
                 let source = SourceOffset(
-                    previous_pipe
-                        .map_or(line.source_range.start.0 + leading_indent, |source| {
-                            source.0.saturating_add(1)
-                        }),
+                    previous_pipe.map_or(line.source_range.start.0 + leading_indent, |source| {
+                        source.0.saturating_add(1)
+                    }),
                 );
                 cells.push(TableCellDisplay {
                     column,
@@ -4224,10 +4144,10 @@ fn table_cells_from_visual_mapping(
         previous_pipe = Some(pipe_source);
     }
     if cursor < content_end {
-        let source_start = previous_pipe
-            .map_or(SourceOffset(line.source_range.start.0 + leading_indent), |source| {
-                SourceOffset(source.0.saturating_add(1))
-            });
+        let source_start = previous_pipe.map_or(
+            SourceOffset(line.source_range.start.0 + leading_indent),
+            |source| SourceOffset(source.0.saturating_add(1)),
+        );
         let source_end = line
             .source_map
             .segments
@@ -4235,7 +4155,10 @@ fn table_cells_from_visual_mapping(
             .filter(|segment| {
                 !segment.source_range.is_empty()
                     && segment.visual_range.start.0 == content_end
-                    && matches!(segment.visibility, Visibility::Visible | Visibility::ExpandedMarkup)
+                    && matches!(
+                        segment.visibility,
+                        Visibility::Visible | Visibility::ExpandedMarkup
+                    )
             })
             .map(|segment| segment.source_range.start)
             .next()
@@ -4335,9 +4258,7 @@ fn present_table_line(
     let leading_indent = pipes
         .first()
         .copied()
-        .filter(|index| {
-            *index <= 3 && source[..*index].bytes().all(|byte| byte == b' ')
-        })
+        .filter(|index| *index <= 3 && source[..*index].bytes().all(|byte| byte == b' '))
         .unwrap_or(0);
     let opening_pipe = pipes.first().copied().unwrap_or(leading_indent);
     let mut visual = String::new();
@@ -4747,12 +4668,8 @@ mod tests {
         let inactive = block_heights(&document, &index, 26.0);
         assert_eq!(inactive, vec![0.0]);
 
-        let editing = block_heights_with_disclosure(
-            &document,
-            &index,
-            26.0,
-            Some(SourceRange::empty(1)),
-        );
+        let editing =
+            block_heights_with_disclosure(&document, &index, 26.0, Some(SourceRange::empty(1)));
         assert_eq!(
             editing,
             vec![26.0],
@@ -4775,12 +4692,8 @@ mod tests {
         );
         let inactive = block_heights(&document, &index, 26.0);
         let selection_before_block = SourceRange::new(0, quote_block.source_range.start.0);
-        let disclosed = block_heights_with_disclosure(
-            &document,
-            &index,
-            26.0,
-            Some(selection_before_block),
-        );
+        let disclosed =
+            block_heights_with_disclosure(&document, &index, 26.0, Some(selection_before_block));
 
         assert_eq!(
             disclosed, inactive,
@@ -4818,12 +4731,8 @@ mod tests {
         let index = BlockIndex::from_buffer(&document);
         let after = source.rfind('\n').expect("following list row") + 1;
         let inactive = block_heights(&document, &index, 26.0);
-        let disclosed = block_heights_with_disclosure(
-            &document,
-            &index,
-            26.0,
-            Some(SourceRange::empty(after)),
-        );
+        let disclosed =
+            block_heights_with_disclosure(&document, &index, 26.0, Some(SourceRange::empty(after)));
 
         assert_eq!(inactive.len(), 1, "the fixture must stay in one list block");
         assert_eq!(disclosed, vec![26.0 * 4.0]);
@@ -4892,15 +4801,19 @@ mod tests {
                 disclosed_depth: 0,
             })
         );
-        assert!(visual.lines[1]
-            .style_runs
-            .iter()
-            .any(|run| run.kind == StyleKind::Bold));
-        assert!(visual.lines[1]
-            .source_map
-            .segments
-            .iter()
-            .any(|segment| segment.visibility == Visibility::HiddenMarkup));
+        assert!(
+            visual.lines[1]
+                .style_runs
+                .iter()
+                .any(|run| run.kind == StyleKind::Bold)
+        );
+        assert!(
+            visual.lines[1]
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::HiddenMarkup)
+        );
         let layout = layout_block(&visual, 400.0, &testing::FixedAdvanceShaper::default());
         assert_eq!(layout.lines[0].text_x_origin, QUOTE_DEPTH_INDENT);
         assert_eq!(layout.lines[1].text_x_origin, QUOTE_DEPTH_INDENT * 2.0);
@@ -5002,7 +4915,10 @@ mod tests {
         ] {
             let parsed = parse_document(Revision(1), SourceRange::new(0, source.len()), source);
             assert_eq!(
-                parsed.tree.iter().any(|(_, node)| node.kind == NodeKind::Rule),
+                parsed
+                    .tree
+                    .iter()
+                    .any(|(_, node)| node.kind == NodeKind::Rule),
                 is_rule,
                 "Rule must follow parser context for {source:?}"
             );
@@ -5101,7 +5017,10 @@ mod tests {
             let inactive = rule_line(false);
             assert_eq!(inactive.kind, BlockKind::Rule, "source: {source:?}");
             assert!(inactive.visual_text.is_empty(), "source: {source:?}");
-            let list = inactive.list.as_ref().expect("nested rule keeps list metadata");
+            let list = inactive
+                .list
+                .as_ref()
+                .expect("nested rule keeps list metadata");
             assert_eq!(list.body_visual_start, VisualOffset(0));
             let hidden_prefix_bytes = inactive
                 .source_map
@@ -5121,11 +5040,13 @@ mod tests {
             assert_eq!(active.kind, BlockKind::Rule, "source: {source:?}");
             assert_eq!(
                 active.visual_text,
-                source[line_start..]
-                    .trim_end_matches(['\r', '\n']),
+                source[line_start..].trim_end_matches(['\r', '\n']),
                 "source: {source:?}"
             );
-            let active_list = active.list.as_ref().expect("active rule keeps list metadata");
+            let active_list = active
+                .list
+                .as_ref()
+                .expect("active rule keeps list metadata");
             assert_eq!(
                 active_list.body_visual_start,
                 VisualOffset(rule_start - line_start)
@@ -5142,12 +5063,14 @@ mod tests {
                 .map(|segment| segment.source_range.len_bytes())
                 .sum::<usize>();
             assert_eq!(expanded_prefix_bytes, rule_start - line_start);
-            assert!(active
-                .source_map
-                .segments
-                .iter()
-                .all(|segment| segment.source_range.is_empty()
-                    || segment.visibility == Visibility::ExpandedMarkup));
+            assert!(
+                active
+                    .source_map
+                    .segments
+                    .iter()
+                    .all(|segment| segment.source_range.is_empty()
+                        || segment.visibility == Visibility::ExpandedMarkup)
+            );
         }
     }
 
@@ -6276,230 +6199,8 @@ mod tests {
         assert_eq!(sibling_meta.role, ListRowRole::Opening);
     }
 
-    fn empty_list_editing_block(
-        owner: ListOwnerMetadata,
-        offset: usize,
-    ) -> (VisualBlock, SourceMap) {
-        let opening = present_plain(0, Revision(1), SourceRange::empty(0), "");
-        let empty = present_plain(1, Revision(1), SourceRange::empty(offset), "");
-        let source_map = empty.source_map.clone();
-        let mut block = VisualBlock {
-            id: BlockId(0),
-            kind: BlockKind::Paragraph,
-            source_range: SourceRange::new(0, offset),
-            revision: Revision(1),
-            confidence: Confidence::Formal,
-            span: 0..2,
-            lines: vec![opening, empty],
-            table_projection: None,
-            lines_before: 0,
-            lines_after: 0,
-            zero_height_lines_before: 0,
-            zero_height_lines_after: 0,
-            line_height: 26.0,
-        };
-        let context = ListEditingContext {
-            offset: SourceOffset(offset),
-            owner,
-            caret_origin: ListCaretOrigin::Marker,
-            line_ending_len: 0,
-            indentation: String::new(),
-        };
-        assert!(apply_list_editing_context(&mut block, &context));
-        (block, source_map)
-    }
-
-    #[test]
-    fn list_editing_context_preserves_source_mapping_and_places_marker_caret() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(1),
-            item_id: ListItemId(1),
-            marker_kind: ListMarkerKind::Bullet,
-            start: None,
-            ordinal: 0,
-            depth: 2,
-            alignment: ListAlignment {
-                max_marker_label: "• ".to_owned(),
-                max_marker_columns: 2,
-                marker_labels: vec!["• ".to_owned()].into(),
-            },
-        };
-        let (mut block, original_source_map) = empty_list_editing_block(owner.clone(), 6);
-        let line = &block.lines[1];
-        assert!(line.visual_text.is_empty());
-        assert_eq!(line.source_map, original_source_map);
-        assert_eq!(
-            line.source_map
-                .source_to_visual(SourceOffset(6), Bias::After)
-                .map(|candidate| candidate.visual_offset),
-            Some(VisualOffset(0))
-        );
-        assert_eq!(line.list.as_ref().unwrap().owner, owner);
-
-        let marker_layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let marker_point = marker_layout
-            .point_for_source(
-                &block,
-                SourceOffset(6),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("empty list line owns the caret");
-        assert_eq!(marker_point.x, LIST_DEPTH_INDENT);
-        assert_eq!(
-            marker_layout.source_for_point(
-                &block,
-                marker_point.x,
-                marker_point.y,
-                &testing::FixedAdvanceShaper::default()
-            ),
-            Some(SourceOffset(6))
-        );
-
-        block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(ListCaretOrigin::Body);
-        let body_layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let body_point = body_layout
-            .point_for_source(
-                &block,
-                SourceOffset(6),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("body list line owns the caret");
-        assert_eq!(body_point.x, LIST_DEPTH_INDENT + 16.0);
-        assert_eq!(
-            body_layout.source_for_point(
-                &block,
-                body_point.x,
-                body_point.y,
-                &testing::FixedAdvanceShaper::default()
-            ),
-            Some(SourceOffset(6))
-        );
-    }
-
-    #[test]
-    fn list_editing_context_owns_existing_line_ending_without_losing_source_bytes() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(1),
-            item_id: ListItemId(1),
-            marker_kind: ListMarkerKind::Bullet,
-            start: None,
-            ordinal: 0,
-            depth: 2,
-            alignment: ListAlignment {
-                max_marker_label: "• ".to_owned(),
-                max_marker_columns: 2,
-                marker_labels: vec!["• ".to_owned()].into(),
-            },
-        };
-
-        for ending in ["\n", "\r\n", "\r"] {
-            let offset = 6;
-            let mut empty = present_plain(
-                1,
-                Revision(1),
-                SourceRange::new(offset, offset + ending.len()),
-                ending,
-            );
-            let original_source_map = empty.source_map.clone();
-            // `presented_block` trims line-ending bytes from visual text while
-            // retaining them in the source map. Mirror that render contract
-            // in this focused range/geometry test.
-            empty.visual_text.clear();
-            let mut block = VisualBlock {
-                id: BlockId(0),
-                kind: BlockKind::Paragraph,
-                source_range: SourceRange::new(0, offset + ending.len()),
-                revision: Revision(1),
-                confidence: Confidence::Formal,
-                span: 0..2,
-                lines: vec![
-                    present_plain(0, Revision(1), SourceRange::empty(0), ""),
-                    empty,
-                ],
-                table_projection: None,
-                lines_before: 0,
-                lines_after: 0,
-                zero_height_lines_before: 0,
-                zero_height_lines_after: 0,
-                line_height: 26.0,
-            };
-            let context = ListEditingContext {
-                offset: SourceOffset(offset),
-                owner: owner.clone(),
-                caret_origin: ListCaretOrigin::Marker,
-                line_ending_len: ending.len(),
-                indentation: String::new(),
-            };
-
-            assert!(apply_list_editing_context(&mut block, &context));
-            let line = &block.lines[1];
-            assert_eq!(
-                line.source_range,
-                SourceRange::new(offset, offset + ending.len())
-            );
-            assert_eq!(line.source_map, original_source_map);
-            assert_eq!(
-                line.source_map
-                    .source_to_visual(SourceOffset(offset), Bias::After)
-                    .map(|candidate| candidate.visual_offset),
-                Some(VisualOffset(0))
-            );
-
-            for (origin, expected_x) in [
-                (ListCaretOrigin::Marker, LIST_DEPTH_INDENT),
-                (ListCaretOrigin::Body, LIST_DEPTH_INDENT + 16.0),
-            ] {
-                block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(origin);
-                let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-                let point = layout
-                    .point_for_source(
-                        &block,
-                        SourceOffset(offset),
-                        &testing::FixedAdvanceShaper::default(),
-                    )
-                    .expect("line ending-only row owns the caret");
-                assert_eq!(point.x, expected_x, "line ending bytes: {ending:?}");
-                assert_eq!(
-                    layout.source_for_point(
-                        &block,
-                        point.x,
-                        point.y,
-                        &testing::FixedAdvanceShaper::default(),
-                    ),
-                    Some(SourceOffset(offset)),
-                    "line ending bytes: {ending:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn list_editing_context_uses_actual_multi_digit_marker_width() {
-        let owner = ListOwnerMetadata {
-            list_id: ListId(10),
-            item_id: ListItemId(10),
-            marker_kind: ListMarkerKind::Ordered,
-            start: Some(10),
-            ordinal: 0,
-            depth: 1,
-            alignment: ListAlignment {
-                max_marker_label: "10. ".to_owned(),
-                max_marker_columns: 4,
-                marker_labels: vec!["10. ".to_owned()].into(),
-            },
-        };
-        let (mut block, _) = empty_list_editing_block(owner, 5);
-        block.lines[1].list.as_mut().unwrap().empty_caret_origin = Some(ListCaretOrigin::Body);
-        let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
-        let point = layout
-            .point_for_source(
-                &block,
-                SourceOffset(5),
-                &testing::FixedAdvanceShaper::default(),
-            )
-            .expect("ordered empty line owns the caret");
-        assert_eq!(point.x, 32.0);
-    }
+    // The old transient list-editing geometry tests were superseded by the
+    // source-first planner and UI contract tests.
 
     #[test]
     fn list_row_metadata_distinguishes_continuation_and_loose_paragraphs() {
@@ -6839,9 +6540,7 @@ mod tests {
             .source_map
             .segments
             .iter()
-            .find(|segment| {
-                segment.source_range == SourceRange::new(fence_start, fence_start + 3)
-            })
+            .find(|segment| segment.source_range == SourceRange::new(fence_start, fence_start + 3))
             .expect("fence mapping");
         assert_eq!(fence.visibility, Visibility::HiddenMarkup);
         assert_ne!(fence.visibility, Visibility::ExpandedMarkup);
@@ -7347,11 +7046,13 @@ mod tests {
         assert_eq!(table.cells.len(), 2);
         assert_eq!(table.cells[0].source_range, SourceRange::new(51, 59));
         assert_eq!(table.cells[1].source_range, SourceRange::new(60, 65));
-        assert!(!block
-            .source_map
-            .segments
-            .iter()
-            .any(|segment| segment.visibility == Visibility::Synthesized));
+        assert!(
+            !block
+                .source_map
+                .segments
+                .iter()
+                .any(|segment| segment.visibility == Visibility::Synthesized)
+        );
         let empty = present_polished_line(
             1,
             Revision(3),
@@ -7361,9 +7062,17 @@ mod tests {
             None,
             LineContext::Table,
         );
-        let empty_cells = empty.table_row.as_ref().expect("empty table row").cells.as_slice();
+        let empty_cells = empty
+            .table_row
+            .as_ref()
+            .expect("empty table row")
+            .cells
+            .as_slice();
         assert_eq!(
-            empty_cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            empty_cells
+                .iter()
+                .map(|cell| cell.column)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
         assert!(empty_cells[1].visual_range.start == empty_cells[1].visual_range.end);
@@ -7418,7 +7127,10 @@ mod tests {
             .cells
             .as_slice();
         assert_eq!(
-            sparse_cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            sparse_cells
+                .iter()
+                .map(|cell| cell.column)
+                .collect::<Vec<_>>(),
             vec![0, 1]
         );
         assert!(sparse_cells[1].visual_range.start == sparse_cells[1].visual_range.end);
@@ -7521,7 +7233,10 @@ mod tests {
         );
     }
 
-    fn fence_block_lines(source: &'static str, base: usize) -> (IndexedBlock, Vec<BlockLine<'static>>) {
+    fn fence_block_lines(
+        source: &'static str,
+        base: usize,
+    ) -> (IndexedBlock, Vec<BlockLine<'static>>) {
         let mut offset = base;
         let lines = source
             .split_inclusive('\n')
@@ -7603,9 +7318,13 @@ mod tests {
         );
         assert_eq!(disclosed.lines[0].visual_text, "```rust");
         assert_eq!(disclosed.lines[0].height(), 26.0);
-        assert!(disclosed.lines[0].source_map.segments.iter().all(|segment| {
-            segment.visibility == Visibility::ExpandedMarkup
-        }));
+        assert!(
+            disclosed.lines[0]
+                .source_map
+                .segments
+                .iter()
+                .all(|segment| { segment.visibility == Visibility::ExpandedMarkup })
+        );
 
         let content = &visual.lines[1];
         assert_eq!(content.visual_text, "let answer = 42;");
@@ -7646,7 +7365,10 @@ mod tests {
             block_disclosure: None,
         };
         let visual = present_block(&block, Revision(1), &window, 26.0);
-        assert_eq!(visual.lines[0].visual_text, "", "the real opening collapses");
+        assert_eq!(
+            visual.lines[0].visual_text, "",
+            "the real opening collapses"
+        );
         assert_eq!(visual.lines[1].visual_text, "code");
         let last = &visual.lines[2];
         assert_eq!(last.visual_text, "```");
