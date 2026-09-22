@@ -634,7 +634,7 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
         .lines
         .iter()
         .filter_map(|line| line.table_row.as_ref())
-        .map(|row| row.cells.len())
+        .map(|row| row.column_count)
         .max()
         .unwrap_or(0);
     let column_width = if columns == 0 {

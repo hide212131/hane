@@ -309,6 +309,7 @@ pub struct TableCellDisplay {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableRowDisplay {
     pub header: bool,
+    pub column_count: usize,
     pub cells: Vec<TableCellDisplay>,
 }
 
@@ -4230,7 +4231,11 @@ fn present_table_line(
         quote: None,
         quote_marker_visual_ranges: Vec::new(),
         quote_marker_source_ranges: Vec::new(),
-        table_row: Some(TableRowDisplay { header, cells }),
+        table_row: Some(TableRowDisplay {
+            header,
+            column_count: alignments.len().max(cells.len()),
+            cells,
+        }),
     }
 }
 
@@ -7114,6 +7119,19 @@ mod tests {
             vec![0, 1, 2]
         );
         assert!(empty_cells[1].visual_range.start == empty_cells[1].visual_range.end);
+        let sparse = present_table_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "| only |\n".len()),
+            "| only |\n",
+            26.0,
+            false,
+            &[TableAlignment::Default, TableAlignment::Right],
+        );
+        assert_eq!(
+            sparse.table_row.expect("sparse table row").column_count,
+            2
+        );
         let active = present_polished_line(
             1,
             Revision(3),
