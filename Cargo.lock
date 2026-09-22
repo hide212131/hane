@@ -2393,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "hane"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "gpui",
  "hane-document",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "hane-benchmark"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hane-document",
  "hane-editor",
@@ -2419,14 +2419,14 @@ dependencies = [
 
 [[package]]
 name = "hane-document"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "ropey",
 ]
 
 [[package]]
 name = "hane-editor"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hane-document",
  "hane-metrics",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "hane-markdown"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hane-document",
  "pulldown-cmark",
@@ -2444,14 +2444,14 @@ dependencies = [
 
 [[package]]
 name = "hane-metrics"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "hane-presentation"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hane-document",
  "hane-markdown",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "hane-session"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "hane-document",
  "hane-editor",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "hane-ui"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "gpui",
  "hane-document",
