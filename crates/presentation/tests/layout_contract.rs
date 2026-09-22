@@ -400,7 +400,7 @@ fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
 
 #[test]
 fn table_layout_distributes_available_width_between_minimum_and_preferred() {
-    let (block, layout) = present("| abc def | x |\n| --- | --- |\n| a | b |", None)
+    let (_block, layout) = present("| abc def | x |\n| --- | --- |\n| a | b |", None)
         .into_iter()
         .find(|block| block.kind == BlockKind::TableRow)
         .map(|block| {
