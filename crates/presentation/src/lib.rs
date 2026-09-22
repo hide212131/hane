@@ -865,6 +865,10 @@ pub struct VisualBlock {
     pub span: Range<usize>,
     /// The presented run of lines, a contiguous slice of `span`.
     pub lines: Vec<VisualLine>,
+    /// Formal table source metadata shared by every viewport of this block.
+    /// `None` is retained for provisional/local presentations, which fall back
+    /// to the rows they have in hand.
+    pub table_projection: Option<TableProjection>,
     /// Lines of `span` clipped above and below the presented run.
     pub lines_before: usize,
     pub lines_after: usize,
@@ -929,6 +933,11 @@ impl VisualBlock {
     /// delta cannot be transformed, which is the caller's signal to re-present
     /// rather than to display a block whose mapping no longer holds.
     pub fn rebase(&mut self, deltas: &[RevisionDelta], current: Revision) -> bool {
+        // Formal table rows retain source text from the parsed revision. Do not
+        // carry stale off-screen intrinsic metrics across an edit to the table.
+        if self.table_projection.is_some() && !deltas.is_empty() {
+            return false;
+        }
         let mut range = self.source_range;
         for delta in deltas {
             let Some(next) = delta.transform_range(range) else {
@@ -1261,6 +1270,10 @@ pub fn present_block_with_table_projection(
         let fence_role = (line_context == LineContext::FencedCode)
             .then(|| fence_line_role(line.line, content_end, line.text, fence_opening))
             .flatten();
+        let table_header = table_projection
+            .and_then(|projection| projection.delimiter_range)
+            .is_some_and(|delimiter| line.range.end <= delimiter.start)
+            || table_delimiter_line.is_some_and(|delimiter| line.line < delimiter);
         let mut presented = present_polished_line_with_fence(
             line.line as u64,
             revision,
@@ -1271,10 +1284,7 @@ pub fn present_block_with_table_projection(
             line_context,
             list_projection,
             fence_role,
-            table_projection
-                .and_then(|projection| projection.delimiter_range)
-                .is_some_and(|delimiter| line.range.end <= delimiter.start)
-                || table_delimiter_line.is_some_and(|delimiter| line.line < delimiter),
+            table_header,
             &table_alignments,
         );
         while presented.visual_text.ends_with(['\r', '\n']) {
@@ -1350,6 +1360,7 @@ pub fn present_block_with_table_projection(
         confidence: block.confidence,
         span: window.span.clone(),
         lines,
+        table_projection: table_projection.cloned(),
         lines_before,
         lines_after,
         zero_height_lines_before,
@@ -4068,6 +4079,196 @@ fn table_alignments(source: &str) -> Vec<TableAlignment> {
         .collect()
 }
 
+fn table_row_from_projection(
+    line: &VisualLine,
+    projection: Option<&TableProjection>,
+    range: SourceRange,
+    header: bool,
+    alignments: &[TableAlignment],
+) -> Option<TableRowDisplay> {
+    let projected = projection.and_then(|projection| {
+        projection
+            .rows
+            .iter()
+            .find(|row| {
+                row.source_range == range
+                    || (row.source_range.start < range.end && range.start < row.source_range.end)
+            })
+    });
+    let projected_header = projected.map(|row| row.header).unwrap_or(header);
+    let cells = if let Some(projected) = projected {
+        let formal_cells = projected
+            .cells
+            .iter()
+            .map(|cell| {
+                let start = line
+                    .source_map
+                    .source_to_visual(cell.source_range.start, Bias::After)?
+                    .visual_offset
+                    .0;
+                let end = line
+                    .source_map
+                    .source_to_visual(cell.source_range.end, Bias::Before)?
+                    .visual_offset
+                    .0;
+                let start = start.min(line.visual_text.len());
+                let end = end.min(line.visual_text.len()).max(start);
+                Some(TableCellDisplay {
+                    column: cell.column,
+                    source_range: cell.source_range,
+                    visual_range: VisualRange::new(start, end),
+                    alignment: alignments
+                        .get(cell.column)
+                        .copied()
+                        .unwrap_or(TableAlignment::Default),
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        match formal_cells {
+            Some(cells) if cells.len() == projected.cells.len() => cells,
+            _ => table_cells_from_visual_mapping(line, alignments)?,
+        }
+    } else {
+        table_cells_from_visual_mapping(line, alignments)?
+    };
+    let column_count = if alignments.is_empty() {
+        cells
+            .iter()
+            .map(|cell| cell.column.saturating_add(1))
+            .max()
+            .unwrap_or(0)
+    } else {
+        alignments.len()
+    };
+    Some(TableRowDisplay {
+        header: projected_header,
+        column_count,
+        cells,
+    })
+}
+
+/// Reconstructs table cells from the line's existing source↔visual map when a
+/// provisional/local presentation has no formal row projection. Pipes are
+/// already visible in a disclosed raw row; unlike reparsing `visual_text`,
+/// mapping their positions back to source keeps hidden inline markers inside
+/// the real source cell range.
+fn table_cells_from_visual_mapping(
+    line: &VisualLine,
+    alignments: &[TableAlignment],
+) -> Option<Vec<TableCellDisplay>> {
+    if line.context != LineContext::Table || is_table_delimiter(&line.visual_text) {
+        return None;
+    }
+    let content_end = line.visual_text.trim_end_matches(['\r', '\n']).len();
+    let pipes = unescaped_table_pipes(&line.visual_text, content_end);
+    let leading_indent = pipes
+        .first()
+        .copied()
+        .filter(|index| {
+            *index <= 3 && line.visual_text[..*index].bytes().all(|byte| byte == b' ')
+        })
+        .unwrap_or(0);
+    let opening_pipe = pipes.first().copied().unwrap_or(leading_indent);
+    let source_for_pipe = |visual: usize| {
+        line.source_map
+            .visual_to_source(VisualOffset(visual), Bias::Before)
+            .map(|candidate| candidate.source_offset)
+    };
+    let mut cells = Vec::new();
+    let mut cursor = leading_indent;
+    let mut column = 0;
+    let mut previous_pipe = None;
+    for pipe in pipes {
+        let pipe_source = source_for_pipe(pipe)?;
+        if cursor < pipe {
+            let source_start = previous_pipe
+                .map_or(SourceOffset(line.source_range.start.0 + leading_indent), |source| {
+                    SourceOffset(source.0.saturating_add(1))
+                });
+            if alignments.is_empty() || column < alignments.len() {
+                cells.push(TableCellDisplay {
+                    column,
+                    source_range: SourceRange::new(source_start.0, pipe_source.0),
+                    visual_range: VisualRange::new(cursor, pipe),
+                    alignment: alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(TableAlignment::Default),
+                });
+            }
+            column += 1;
+        } else if pipe != opening_pipe {
+            if alignments.is_empty() || column < alignments.len() {
+                let source = SourceOffset(
+                    previous_pipe
+                        .map_or(line.source_range.start.0 + leading_indent, |source| {
+                            source.0.saturating_add(1)
+                        }),
+                );
+                cells.push(TableCellDisplay {
+                    column,
+                    source_range: SourceRange::empty(source.0),
+                    visual_range: VisualRange::new(cursor, cursor),
+                    alignment: alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(TableAlignment::Default),
+                });
+            }
+            column += 1;
+        }
+        cursor = pipe + 1;
+        previous_pipe = Some(pipe_source);
+    }
+    if cursor < content_end {
+        let source_start = previous_pipe
+            .map_or(SourceOffset(line.source_range.start.0 + leading_indent), |source| {
+                SourceOffset(source.0.saturating_add(1))
+            });
+        let source_end = line
+            .source_map
+            .segments
+            .iter()
+            .filter(|segment| {
+                !segment.source_range.is_empty()
+                    && segment.visual_range.start.0 == content_end
+                    && matches!(segment.visibility, Visibility::Visible | Visibility::ExpandedMarkup)
+            })
+            .map(|segment| segment.source_range.start)
+            .next()
+            .unwrap_or(line.source_range.end);
+        if alignments.is_empty() || column < alignments.len() {
+            cells.push(TableCellDisplay {
+                column,
+                source_range: SourceRange::new(source_start.0, source_end.0),
+                visual_range: VisualRange::new(cursor, content_end),
+                alignment: alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(TableAlignment::Default),
+            });
+        }
+    }
+    let column_count = if alignments.is_empty() {
+        column + usize::from(cursor < content_end)
+    } else {
+        alignments.len()
+    };
+    while cells.len() < column_count {
+        let column = cells.len();
+        cells.push(TableCellDisplay {
+            column,
+            source_range: SourceRange::empty(line.source_range.end.0),
+            visual_range: VisualRange::new(content_end, content_end),
+            alignment: alignments
+                .get(column)
+                .copied()
+                .unwrap_or(TableAlignment::Default),
+        });
+    }
+    Some(cells)
+}
+
 fn unescaped_table_pipes(source: &str, content_end: usize) -> Vec<usize> {
     let bytes = source.as_bytes();
     let mut pipes = Vec::new();
@@ -5735,6 +5936,7 @@ mod tests {
             confidence: Confidence::Formal,
             span: 0..3,
             lines: vec![opening, body, closing],
+            table_projection: None,
             lines_before: 0,
             lines_after: 0,
             zero_height_lines_before: 0,
@@ -6086,6 +6288,7 @@ mod tests {
             confidence: Confidence::Formal,
             span: 0..2,
             lines: vec![opening, empty],
+            table_projection: None,
             lines_before: 0,
             lines_after: 0,
             zero_height_lines_before: 0,
@@ -6210,6 +6413,7 @@ mod tests {
                     present_plain(0, Revision(1), SourceRange::empty(0), ""),
                     empty,
                 ],
+                table_projection: None,
                 lines_before: 0,
                 lines_after: 0,
                 zero_height_lines_before: 0,

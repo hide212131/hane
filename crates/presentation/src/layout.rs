@@ -22,7 +22,7 @@ use crate::{
     VisualRange,
 };
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
-use hane_markdown::{BlockId, TableAlignment, is_table_delimiter};
+use hane_markdown::{BlockId, TableAlignment, TableProjection, is_table_delimiter};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -64,6 +64,7 @@ pub struct TableCellLayout {
     pub column: usize,
     pub visual_range: Range<usize>,
     pub source_range: SourceRange,
+    pub alignment: TableAlignment,
     pub x: f32,
     pub width: f32,
     pub text_x: f32,
@@ -154,6 +155,24 @@ impl LayoutLine {
                     cell.visual_range.clone(),
                     visual.clamp(cell.visual_range.start, cell.visual_range.end),
                 );
+        }
+        if let Some(first) = self.table_cells.first()
+            && visual < first.visual_range.start
+        {
+            return first.x;
+        }
+        if let Some(next) = self
+            .table_cells
+            .windows(2)
+            .find(|cells| visual < cells[1].visual_range.start)
+            .map(|cells| &cells[1])
+        {
+            return next.x;
+        }
+        if let Some(last) = self.table_cells.last()
+            && visual >= last.visual_range.end
+        {
+            return last.x + last.width;
         }
         let visual = visual.clamp(self.line_visual_range.start, self.line_visual_range.end);
         if let Some(body) = self.body_visual_start
@@ -637,7 +656,7 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
     }
 }
 
-/// Lays out visible table rows on shared intrinsic-width columns.
+/// Lays out presented table rows on shared intrinsic-width columns.
 ///
 /// Each column is measured across the currently presented header/body cells,
 /// including a raw row that is being edited. The formal rows remain
@@ -651,19 +670,26 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
 /// same safe geometry without making the table widen the editor viewport.
 fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) -> BlockLayout {
     let formal_columns = block
-        .lines
-        .iter()
-        .filter_map(|line| line.table_row.as_ref().map(|row| row.column_count))
-        .max();
+        .table_projection
+        .as_ref()
+        .map(|projection| projection.alignments.len())
+        .filter(|columns| *columns > 0)
+        .or_else(|| {
+            block
+                .lines
+                .iter()
+                .filter_map(|line| line.table_row.as_ref().map(|row| row.column_count))
+                .max()
+        });
     let columns = formal_columns.unwrap_or_else(|| {
         block
             .lines
             .iter()
             .filter_map(|line| {
-                editing_table_cells(line).map(|cells| {
+                editing_table_cells(line, block.table_projection.as_ref()).map(|cells| {
                     cells
                         .iter()
-                        .map(|(column, _)| column.saturating_add(1))
+                        .map(|cell| cell.column.saturating_add(1))
                         .max()
                         .unwrap_or(0)
                 })
@@ -682,6 +708,39 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
         if line.table_row.is_none() {
+            if let Some(cells) = editing_table_cells(line, block.table_projection.as_ref()) {
+                let block_start = line_visual_start(block, index);
+                let height = line.height();
+                lines.push(LayoutLine {
+                    line: index,
+                    line_id: line.line_id,
+                    fragment: 0,
+                    wrap: LineWrap::Hard,
+                    line_visual_range: 0..line.visual_text.len(),
+                    visual_range: VisualRange::new(block_start, block_start + line.visual_text.len()),
+                    source_range: line.source_range,
+                    y,
+                    height,
+                    text_x_origin: 0.0,
+                    body_x_origin: 0.0,
+                    effective_width: width.max(MIN_EFFECTIVE_WRAP_WIDTH),
+                    marker_x_origin: None,
+                    body_visual_start: None,
+                    marker_visual_range: None,
+                    marker_body_gap: 0.0,
+                    body_gap: 0.0,
+                    quote_bar_x_origin: None,
+                    table_cells: table_cell_layouts(
+                        line,
+                        cells,
+                        &column_offsets,
+                        &column_widths,
+                        shaper,
+                    ),
+                });
+                y += height;
+                continue;
+            }
             let block_start = line_visual_start(block, index);
             let height = line.height();
             let line_geometry = line_geometry(line, width, shaper, &marker_widths);
@@ -736,30 +795,13 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
             continue;
         }
         let cells = line.table_row.as_ref().map_or_else(Vec::new, |row| {
-            row.cells
-                .iter()
-                .map(|cell| {
-                    let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
-                    let x = column_offsets.get(cell.column).copied().unwrap_or(0.0);
-                    let column_width = column_widths.get(cell.column).copied().unwrap_or(0.0);
-                    let inner_width = (column_width - TABLE_CELL_HORIZONTAL_PADDING).max(0.0);
-                    let text_width =
-                        shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
-                    let text_x = x + TABLE_CELL_PADDING + match cell.alignment {
-                        TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
-                        TableAlignment::Right => (inner_width - text_width).max(0.0),
-                        TableAlignment::Default | TableAlignment::Left => 0.0,
-                    };
-                    TableCellLayout {
-                        column: cell.column,
-                        visual_range,
-                        source_range: cell.source_range,
-                        x,
-                        width: column_width,
-                        text_x,
-                    }
-                })
-                .collect()
+            table_cell_layouts(
+                line,
+                row.cells.clone(),
+                &column_offsets,
+                &column_widths,
+                shaper,
+            )
         });
         let block_start = line_visual_start(block, index);
         let height = line.height();
@@ -796,8 +838,42 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
     }
 }
 
-/// Measures the intrinsic widths of the columns shared by all visible rows of
-/// one table block and clamps their allocation to the available text column.
+fn table_cell_layouts(
+    line: &VisualLine,
+    cells: Vec<crate::TableCellDisplay>,
+    column_offsets: &[f32],
+    column_widths: &[f32],
+    shaper: &dyn LineShaper,
+) -> Vec<TableCellLayout> {
+    cells
+        .into_iter()
+        .map(|cell| {
+            let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+            let x = column_offsets.get(cell.column).copied().unwrap_or(0.0);
+            let column_width = column_widths.get(cell.column).copied().unwrap_or(0.0);
+            let inner_width = (column_width - TABLE_CELL_HORIZONTAL_PADDING).max(0.0);
+            let text_width = shaper.x_for_offset(line, visual_range.clone(), visual_range.end);
+            let text_x = x + TABLE_CELL_PADDING + match cell.alignment {
+                TableAlignment::Center => ((inner_width - text_width).max(0.0)) / 2.0,
+                TableAlignment::Right => (inner_width - text_width).max(0.0),
+                TableAlignment::Default | TableAlignment::Left => 0.0,
+            };
+            TableCellLayout {
+                column: cell.column,
+                visual_range,
+                source_range: cell.source_range,
+                alignment: cell.alignment,
+                x,
+                width: column_width,
+                text_x,
+            }
+        })
+        .collect()
+}
+
+/// Measures the intrinsic widths of one table block and clamps their allocation
+/// to the available text column. A formal projection contributes rows outside
+/// the current presentation window as well.
 fn table_column_widths(
     block: &VisualBlock,
     columns: usize,
@@ -814,18 +890,14 @@ fn table_column_widths(
         let cells = line
             .table_row
             .as_ref()
-            .map(|table| {
-                table
-                    .cells
-                    .iter()
-                    .map(|cell| (cell.column, cell.visual_range.start.0..cell.visual_range.end.0))
-                    .collect::<Vec<_>>()
-            })
-            .or_else(|| editing_table_cells(line));
+            .map(|table| table.cells.clone())
+            .or_else(|| editing_table_cells(line, block.table_projection.as_ref()));
         let Some(cells) = cells else {
             continue;
         };
-        for (column, visual_range) in cells {
+        for cell in cells {
+            let column = cell.column;
+            let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
             let Some((preferred_text, minimum_text)) =
                 table_cell_intrinsic_widths(line, visual_range, shaper)
             else {
@@ -841,6 +913,44 @@ fn table_column_widths(
                 *minimum_column = (*minimum_column).max(
                     TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0),
                 );
+            }
+        }
+    }
+
+    // A formal table projection owns every row, including rows clipped out of
+    // the current presentation window. Measure those rows through the same
+    // inactive table presenter used for visible rows, so source ranges,
+    // alignment and the raw inline text all follow one geometry contract.
+    if let Some(projection) = &block.table_projection {
+        for row in &projection.rows {
+            let metric = crate::present_table_line(
+                0,
+                block.revision,
+                row.source_range,
+                row.source.as_ref(),
+                block.line_height,
+                row.header,
+                &projection.alignments,
+            );
+            let Some(table) = metric.table_row.as_ref() else {
+                continue;
+            };
+            for cell in &table.cells {
+                let visual_range = cell.visual_range.start.0..cell.visual_range.end.0;
+                let Some((preferred_text, minimum_text)) =
+                    table_cell_intrinsic_widths(&metric, visual_range, shaper)
+                else {
+                    continue;
+                };
+                let Some(preferred_column) = preferred.get_mut(cell.column) else {
+                    continue;
+                };
+                *preferred_column =
+                    (*preferred_column).max(TABLE_CELL_HORIZONTAL_PADDING + preferred_text.max(0.0));
+                if let Some(minimum_column) = minimum.get_mut(cell.column) {
+                    *minimum_column =
+                        (*minimum_column).max(TABLE_CELL_HORIZONTAL_PADDING + minimum_text.max(0.0));
+                }
             }
         }
     }
@@ -891,53 +1001,20 @@ fn table_column_widths(
 }
 
 /// Returns cell ranges for a table row that is currently disclosed for
-/// editing. Such a row intentionally keeps its raw Markdown presentation, so
-/// it has no [`TableRowDisplay`]. Reuse the table presenter only to recover its
-/// source cell boundaries, then map those boundaries through the row's own
-/// source map before measuring its displayed text.
-fn editing_table_cells(line: &VisualLine) -> Option<Vec<(usize, Range<usize>)>> {
+/// editing. Formal rows use the parser-owned source ranges; provisional rows
+/// use the existing source↔visual map. In both cases inline marker bytes stay
+/// in the source range while the displayed cell range follows the shortened
+/// visual text.
+fn editing_table_cells(
+    line: &VisualLine,
+    projection: Option<&TableProjection>,
+) -> Option<Vec<crate::TableCellDisplay>> {
     if line.context != LineContext::Table || is_table_delimiter(&line.visual_text) {
         return None;
     }
-
-    let source_range = SourceRange::new(
-        line.source_range.start.0,
-        line.source_range
-            .start
-            .0
-            .saturating_add(line.visual_text.len()),
-    );
-    let presented = crate::present_table_line(
-        line.line_id,
-        line.revision,
-        source_range,
-        &line.visual_text,
-        line.height(),
-        false,
-        &[],
-    );
-    let table = presented.table_row.as_ref()?;
-    table
-        .cells
-        .iter()
-        .map(|cell| {
-            let start = line
-                .source_map
-                .source_to_visual(cell.source_range.start, Bias::After)?
-                .visual_offset
-                .0;
-            let end = line
-                .source_map
-                .source_to_visual(cell.source_range.end, Bias::Before)?
-                .visual_offset
-                .0;
-            (start <= end
-                && end <= line.visual_text.len()
-                && line.visual_text.is_char_boundary(start)
-                && line.visual_text.is_char_boundary(end))
-                .then_some((cell.column, start..end))
-        })
-        .collect()
+    let alignments = projection.map_or(&[][..], |projection| projection.alignments.as_ref());
+    crate::table_row_from_projection(line, projection, line.source_range, false, alignments)
+        .map(|table| table.cells)
 }
 
 /// Keeps the floating-point allocation inside the main panel even when the
