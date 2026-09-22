@@ -33,7 +33,7 @@ mod block_store;
 
 pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
-    PublishOutcome, TableProjection,
+    PublishOutcome, TableProjection, TableProjectionCell, TableProjectionRow,
 };
 
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
@@ -2201,6 +2201,14 @@ mod tests {
         let projection = index.table_projection(&block).expect("table projection");
         assert_eq!(projection.delimiter_range, Some(SourceRange::new(17, 29)));
         assert_eq!(projection.alignments.as_ref(), &[TableAlignment::Left, TableAlignment::Right]);
+        assert_eq!(projection.rows.len(), 2);
+        assert!(projection.rows[0].header);
+        assert_eq!(
+            projection.rows[0].source.trim_end_matches(['\r', '\n']),
+            "| left | right |"
+        );
+        assert_eq!(projection.rows[0].cells.len(), 2);
+        assert!(!projection.rows[1].header);
     }
 
     #[test]

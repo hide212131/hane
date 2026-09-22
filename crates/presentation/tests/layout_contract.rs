@@ -17,8 +17,8 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_list_projection,
-    trailing_blank_lines,
+    VisualBlock, VisualOffset, block_line_span, layout_block,
+    present_block_with_table_projection, trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -237,7 +237,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                         .map(SourceRange::empty),
                 })
                 .collect::<Vec<_>>();
-            present_block_with_list_projection(
+            present_block_with_table_projection(
                 &block,
                 buffer.revision(),
                 &BlockWindow {
@@ -253,9 +253,54 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                 },
                 LINE_HEIGHT,
                 index.list_projection(&block),
+                index.table_projection(&block),
             )
         })
         .collect()
+}
+
+fn present_table_window(source: &str, render: Range<usize>) -> VisualBlock {
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.blocks().next().expect("table block");
+    let span = block_line_span(&buffer, &block).expect("table span");
+    let ranges = render
+        .clone()
+        .map(|line| buffer.line_range(LineId(line)).expect("line in range"))
+        .collect::<Vec<_>>();
+    let texts = ranges
+        .iter()
+        .map(|range| buffer.text(*range).expect("line text"))
+        .collect::<Vec<_>>();
+    let lines = render
+        .clone()
+        .zip(&ranges)
+        .zip(&texts)
+        .map(|((line, range), text)| BlockLine {
+            line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    present_block_with_table_projection(
+        &block,
+        buffer.revision(),
+        &BlockWindow {
+            trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+            span,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            render,
+            joined: None,
+            block_disclosure: None,
+        },
+        LINE_HEIGHT,
+        index.list_projection(&block),
+        index.table_projection(&block),
+    )
 }
 
 fn laid_out(source: &str) -> Vec<(VisualBlock, BlockLayout)> {
@@ -362,6 +407,272 @@ fn table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local() {
         "point {:?} should be inside right cell text origin {}",
         right_point,
         aligned_row.table_cells[1].text_x
+    );
+}
+
+#[test]
+fn table_layout_uses_intrinsic_column_widths_without_filler_space() {
+    let (block, layout) = present("| a | wide |\n| --- | --- |\n| bb | x |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 400.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let rows = layout
+        .lines
+        .iter()
+        .filter(|row| !row.table_cells.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].table_cells[0].width, 48.0);
+    assert_eq!(rows[0].table_cells[1].width, 64.0);
+    assert_eq!(rows[0].table_cells[1].x, 48.0);
+    assert_eq!(rows[1].table_cells[0].width, 48.0);
+    assert_eq!(rows[1].table_cells[1].x, 48.0);
+    assert_eq!(
+        rows[0].table_cells[1].x + rows[0].table_cells[1].width,
+        112.0
+    );
+    assert!(
+        rows[0].table_cells[1].x + rows[0].table_cells[1].width < 400.0,
+        "preferred columns must not absorb unused table width"
+    );
+    assert_eq!(block.lines[0].table_row.as_ref().unwrap().column_count, 2);
+    assert_eq!(block.lines[2].table_row.as_ref().unwrap().column_count, 2);
+}
+
+#[test]
+fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
+    let source = "| h | short |\n| --- | --- |\n| a | x |";
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let delimiter = block
+        .lines
+        .iter()
+        .find(|line| line.kind == BlockKind::TableDelimiter)
+        .expect("table delimiter line");
+    assert!(delimiter.visual_text.is_empty());
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let delimiter_row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == delimiter.line_id)
+        .expect("table delimiter layout row");
+    assert!(
+        delimiter_row.table_cells.is_empty(),
+        "hidden delimiter rows must not become editing table rows"
+    );
+}
+
+#[test]
+fn table_layout_keeps_shared_columns_when_the_widest_row_is_being_edited() {
+    let source = "| h | short |\n| --- | --- |\n| a | the widest cell |\n| b | x |";
+    let inactive = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let active_offset = source.find("the widest").expect("active cell");
+    let active = present(source, Some(active_offset));
+    let active = active
+        .iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("active table block");
+    let inactive_layout = layout_block(&inactive, 120.0, &shaper());
+    let active_layout = layout_block(active, 120.0, &shaper());
+
+    let inactive_header = inactive_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("inactive header row");
+    let active_header = active_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("active header row");
+    let active_widest = active
+        .lines
+        .iter()
+        .find(|line| line.line_id == 2)
+        .expect("active widest row");
+
+    assert!(
+        active_widest.table_row.is_none(),
+        "the editing row remains the raw Markdown presentation"
+    );
+    assert_eq!(
+        active_header.table_cells[1].x,
+        inactive_header.table_cells[1].x,
+        "editing a cell must not move the shared column boundary"
+    );
+    assert_eq!(
+        active_header.table_cells[1].width,
+        inactive_header.table_cells[1].width,
+        "editing a cell must not change the shared column width"
+    );
+}
+
+#[test]
+fn table_layout_restores_formal_cell_boundaries_for_shortened_inline_markup() {
+    let source = "| h | short |\n| --- | --- |\n| **the widest** | x |\n| b | y |";
+    let inactive = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("inactive table block");
+    let active = present(source, Some(source.find('x').expect("active cell")))
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("active table block");
+    let inactive_line = inactive
+        .lines
+        .iter()
+        .find(|line| line.line_id == 2)
+        .expect("inactive widest row");
+    let active_line = active
+        .lines
+        .iter()
+        .find(|line| line.line_id == 2)
+        .expect("active widest row");
+    assert_eq!(
+        active_line.visual_text,
+        "| the widest | x |",
+        "the active row keeps the inline marker collapsed in the visual text"
+    );
+    assert_eq!(
+        active_line.table_row,
+        None,
+        "the active row remains raw while layout receives its shared cells"
+    );
+
+    let inactive_layout = layout_block(&inactive, 160.0, &shaper());
+    let active_layout = layout_block(&active, 160.0, &shaper());
+    let inactive_row = inactive_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 2)
+        .expect("inactive layout row");
+    let active_row = active_layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 2)
+        .expect("active layout row");
+    assert_eq!(active_row.table_cells.len(), 2);
+    assert_eq!(
+        active_row.table_cells[0].source_range,
+        inactive_line.table_row.as_ref().unwrap().cells[0].source_range,
+        "layout keeps the formal source cell, including hidden markers"
+    );
+    assert!(
+        active_row.table_cells[0].source_range.end.0
+            - active_row.table_cells[0].source_range.start.0
+            > active_row.table_cells[0].visual_range.end
+                - active_row.table_cells[0].visual_range.start,
+        "the source cell retains hidden inline markers while its visual range is shortened"
+    );
+    assert_eq!(active_row.table_cells[1].x, inactive_row.table_cells[1].x);
+    assert_eq!(active_row.table_cells[1].width, inactive_row.table_cells[1].width);
+
+    let widest = SourceOffset(source.find("the widest").expect("widest text"));
+    let point = active_layout
+        .point_for_source(&active, widest, &shaper())
+        .expect("active cell caret point");
+    assert!(point.x >= active_row.table_cells[0].text_x);
+    let selected_layout_row = active_layout
+        .visual_range_on_row(
+            &active,
+            active_layout
+                .lines
+                .iter()
+                .position(|row| row.line_id == 2)
+                .expect("active layout row index"),
+            SourceRange::new(widest.0, widest.0 + "the widest".len()),
+        )
+        .expect("selection/IME cell range");
+    let ime_layout_row = active_layout
+        .visual_range_on_row(
+            &active,
+            active_layout
+                .lines
+                .iter()
+                .position(|row| row.line_id == 2)
+                .expect("active layout row index"),
+            SourceRange::new(widest.0, widest.0 + "the widest".len()),
+        )
+        .expect("IME cell range");
+    assert_eq!(selected_layout_row, ime_layout_row);
+    assert!(
+        selected_layout_row.start >= active_row.table_cells[0].visual_range.start
+            && selected_layout_row.end <= active_row.table_cells[0].visual_range.end,
+        "selection and IME ranges stay inside the same formal cell"
+    );
+}
+
+#[test]
+fn table_layout_uses_formal_rows_outside_each_render_window() {
+    let source = "| h | short |\n| --- | --- |\n| a | x |\n| b | the widest cell outside the first window |";
+    let top = present_table_window(source, 0..1);
+    let bottom = present_table_window(source, 3..4);
+    let top_layout = layout_block(&top, 160.0, &shaper());
+    let bottom_layout = layout_block(&bottom, 160.0, &shaper());
+    let top_row = &top_layout.lines[0];
+    let bottom_row = &bottom_layout.lines[0];
+    assert_eq!(top_row.table_cells[1].x, bottom_row.table_cells[1].x);
+    assert_eq!(top_row.table_cells[1].width, bottom_row.table_cells[1].width);
+    assert_eq!(
+        top.table_projection.as_ref().unwrap().rows.len(),
+        3,
+        "the formal projection retains header and every body row"
+    );
+}
+
+#[test]
+fn table_layout_distributes_available_width_between_minimum_and_preferred() {
+    let (_block, layout) = present("| abc def | x |\n| --- | --- |\n| a | b |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 100.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("header row");
+    assert_eq!(row.table_cells[0].width, 67.0);
+    assert_eq!(row.table_cells[1].width, 33.0);
+    assert_eq!(row.table_cells[1].x, 67.0);
+    assert_eq!(row.table_cells[1].x + row.table_cells[1].width, 100.0);
+}
+
+#[test]
+fn table_layout_compresses_overflowing_minimums_without_widening_the_panel() {
+    let (_, layout) = present("| abcdef | ghijkl |\n| --- | --- |\n| 1 | 2 |", None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 100.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line_id == 0)
+        .expect("header row");
+    assert_eq!(row.table_cells[0].width, 50.0);
+    assert_eq!(row.table_cells[1].x, 50.0);
+    assert!(
+        row.table_cells
+            .iter()
+            .all(|cell| cell.x + cell.width <= 100.0),
+        "compressed table geometry must stay inside the available column"
     );
 }
 

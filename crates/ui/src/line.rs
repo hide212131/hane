@@ -19,7 +19,7 @@ use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TablePr
 use hane_presentation::{
     BlockDisplay, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap, VisualBlock,
-    TableAlignment, VisualLine,
+    TableAlignment, TableCellDisplay, TableRowDisplay, VisualLine,
     VisualOffset, QUOTE_BAR_WIDTH, block_is_joinable, block_line_context, block_line_span,
     expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
 };
@@ -619,6 +619,63 @@ pub(crate) fn row_element(
         );
     }
 
+    // A disclosed table row deliberately keeps its shortened/raw Markdown
+    // presentation rather than becoming an inactive table row. Layout still
+    // gives it the formal cell geometry, so caret, selection and IME painting
+    // must use the same cell renderer to stay on those shared boundaries.
+    if line.table_row.is_none() && !row.table_cells.is_empty() {
+        let header = block
+            .table_projection
+            .as_ref()
+            .and_then(|projection| {
+                projection
+                    .rows
+                    .iter()
+                    .find(|projected| {
+                        projected.source_range == line.source_range
+                            || (projected.source_range.start < line.source_range.end
+                                && line.source_range.start < projected.source_range.end)
+                    })
+            })
+            .is_some_and(|projected| projected.header);
+        let table = TableRowDisplay {
+            header,
+            column_count: row
+                .table_cells
+                .iter()
+                .map(|cell| cell.column.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            cells: row
+                .table_cells
+                .iter()
+                .map(|cell| TableCellDisplay {
+                    column: cell.column,
+                    source_range: cell.source_range,
+                    visual_range: hane_presentation::VisualRange::new(
+                        cell.visual_range.start,
+                        cell.visual_range.end,
+                    ),
+                    alignment: cell.alignment,
+                })
+                .collect(),
+        };
+        return table_row_element(
+            editor,
+            block,
+            line,
+            row,
+            &table,
+            layout,
+            row_index,
+            shaper,
+            display,
+            theme,
+            zoom,
+            caret_input_mode,
+        );
+    }
+
     let cursor = editor.selection().active;
     let is_final_line = row.line_id as usize + 1 == editor.document().line_count();
     let visual_cursor = if line_owns_cursor(line.source_range, cursor, is_final_line) {
@@ -733,6 +790,7 @@ fn table_row_element(
         .filter(|point| point.row == row_index)
         .map(|point| point.x);
     let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
+    let editing = line.table_row.is_none();
     for cell_layout in &row.table_cells {
         let Some(cell) = table
             .cells
@@ -741,6 +799,18 @@ fn table_row_element(
         else {
             continue;
         };
+        if editing {
+            elements.push(
+                div()
+                    .absolute()
+                    .left(px(theme.line_horizontal_padding + cell_layout.x))
+                    .top(px(0.0))
+                    .h(px(row.height))
+                    .flex()
+                    .items_center()
+                    .child("|"),
+            );
+        }
         let cell_range = cell_layout.visual_range.clone();
         let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
         let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
@@ -830,6 +900,18 @@ fn table_row_element(
                 .w(px(1.0))
                 .h(px(row.height))
                 .bg(rgb(theme.table_border)),
+        );
+    }
+    if editing && let Some(last) = row.table_cells.last() {
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + last.x + last.width))
+                .top(px(0.0))
+                .h(px(row.height))
+                .flex()
+                .items_center()
+                .child("|"),
         );
     }
     elements.push(
