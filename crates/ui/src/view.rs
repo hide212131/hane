@@ -2454,7 +2454,9 @@ impl EditorView {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Command::new("code").arg(path)
+            let mut command = Command::new("code");
+            command.arg(path);
+            command
         }
     }
 
