@@ -17,8 +17,8 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block,
-    present_block_with_table_projection, trailing_blank_lines,
+    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_table_projection,
+    trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -506,13 +506,11 @@ fn table_layout_keeps_shared_columns_when_the_widest_row_is_being_edited() {
         "the editing row remains the raw Markdown presentation"
     );
     assert_eq!(
-        active_header.table_cells[1].x,
-        inactive_header.table_cells[1].x,
+        active_header.table_cells[1].x, inactive_header.table_cells[1].x,
         "editing a cell must not move the shared column boundary"
     );
     assert_eq!(
-        active_header.table_cells[1].width,
-        inactive_header.table_cells[1].width,
+        active_header.table_cells[1].width, inactive_header.table_cells[1].width,
         "editing a cell must not change the shared column width"
     );
 }
@@ -539,13 +537,11 @@ fn table_layout_restores_formal_cell_boundaries_for_shortened_inline_markup() {
         .find(|line| line.line_id == 2)
         .expect("active widest row");
     assert_eq!(
-        active_line.visual_text,
-        "| the widest | x |",
+        active_line.visual_text, "| the widest | x |",
         "the active row keeps the inline marker collapsed in the visual text"
     );
     assert_eq!(
-        active_line.table_row,
-        None,
+        active_line.table_row, None,
         "the active row remains raw while layout receives its shared cells"
     );
 
@@ -575,7 +571,10 @@ fn table_layout_restores_formal_cell_boundaries_for_shortened_inline_markup() {
         "the source cell retains hidden inline markers while its visual range is shortened"
     );
     assert_eq!(active_row.table_cells[1].x, inactive_row.table_cells[1].x);
-    assert_eq!(active_row.table_cells[1].width, inactive_row.table_cells[1].width);
+    assert_eq!(
+        active_row.table_cells[1].width,
+        inactive_row.table_cells[1].width
+    );
 
     let widest = SourceOffset(source.find("the widest").expect("widest text"));
     let point = active_layout
@@ -614,7 +613,8 @@ fn table_layout_restores_formal_cell_boundaries_for_shortened_inline_markup() {
 
 #[test]
 fn table_layout_uses_formal_rows_outside_each_render_window() {
-    let source = "| h | short |\n| --- | --- |\n| a | x |\n| b | the widest cell outside the first window |";
+    let source =
+        "| h | short |\n| --- | --- |\n| a | x |\n| b | the widest cell outside the first window |";
     let top = present_table_window(source, 0..1);
     let bottom = present_table_window(source, 3..4);
     let top_layout = layout_block(&top, 160.0, &shaper());
@@ -622,7 +622,10 @@ fn table_layout_uses_formal_rows_outside_each_render_window() {
     let top_row = &top_layout.lines[0];
     let bottom_row = &bottom_layout.lines[0];
     assert_eq!(top_row.table_cells[1].x, bottom_row.table_cells[1].x);
-    assert_eq!(top_row.table_cells[1].width, bottom_row.table_cells[1].width);
+    assert_eq!(
+        top_row.table_cells[1].width,
+        bottom_row.table_cells[1].width
+    );
     assert_eq!(
         top.table_projection.as_ref().unwrap().rows.len(),
         3,
@@ -1387,7 +1390,12 @@ fn inactive_quote_wrap_width_reserves_semantic_inset() {
         .next()
         .expect("the plain block is presented");
     let plain_layout = layout_block(&plain_block, 80.0, &shaper());
-    assert!(plain_layout.lines.iter().all(|row| row.effective_width == 80.0));
+    assert!(
+        plain_layout
+            .lines
+            .iter()
+            .all(|row| row.effective_width == 80.0)
+    );
 }
 
 #[test]
@@ -1494,14 +1502,18 @@ fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
         let line_start = source[..rule_start]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
-        let rule_line = source[..line_start].bytes().filter(|byte| *byte == b'\n').count();
+        let rule_line = source[..line_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
         let quoted = source.starts_with('>');
         let inactive_block = present(source, None)
             .into_iter()
             .find(|block| {
-                block.lines.iter().any(|line| {
-                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
-                })
+                block
+                    .lines
+                    .iter()
+                    .any(|line| line.line_id as usize == rule_line && line.kind == BlockKind::Rule)
             })
             .expect("the nested rule block is presented");
         let inactive_layout = layout_block(&inactive_block, 160.0, &shaper());
@@ -1522,9 +1534,10 @@ fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
         let active_block = present(source, Some(rule_start + 1))
             .into_iter()
             .find(|block| {
-                block.lines.iter().any(|line| {
-                    line.line_id as usize == rule_line && line.kind == BlockKind::Rule
-                })
+                block
+                    .lines
+                    .iter()
+                    .any(|line| line.line_id as usize == rule_line && line.kind == BlockKind::Rule)
             })
             .expect("the active nested rule block is presented");
         let active_line = active_block
@@ -1549,8 +1562,7 @@ fn nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed() {
         let expected_active_body = (rule_start - line_start) as f32 * 8.0;
         assert_eq!(active_row.text_x_origin, 0.0, "source: {source:?}");
         assert_eq!(
-            active_row.body_x_origin,
-            expected_active_body,
+            active_row.body_x_origin, expected_active_body,
             "source: {source:?}"
         );
         assert_eq!(active_row.quote_bar_x_origin, None);

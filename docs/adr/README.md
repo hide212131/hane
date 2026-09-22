@@ -33,6 +33,7 @@
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
 | [ADR-0024](0024-local-gui-validation.md) | GUI 検証を独立した観測手段とし、ローカル CLI と trusted hosted entrypoint を使う trust boundary（AADW orchestration は ADR-0027 で改訂） |
 | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | AADW v2 を ChatGPT Commander + GitHub facts で運用する |
+| [ADR-0029](0029-source-first-list-editing.md) | Markdown source を唯一の Model とする list editing と同期 ListEditProjection |
 
 ## Superseded / amended
 
