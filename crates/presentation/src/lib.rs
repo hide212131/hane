@@ -4128,11 +4128,27 @@ fn present_table_line(
     }
     let content_end = source.trim_end_matches(['\r', '\n']).len();
     let pipes = unescaped_table_pipes(source, content_end);
+    let leading_indent = pipes
+        .first()
+        .copied()
+        .filter(|index| {
+            *index <= 3 && source[..*index].bytes().all(|byte| byte == b' ')
+        })
+        .unwrap_or(0);
+    let opening_pipe = pipes.first().copied().unwrap_or(leading_indent);
     let mut visual = String::new();
     let mut segments = Vec::new();
     let mut cells = Vec::new();
     let base = range.start.0;
-    let mut cursor = 0;
+    if leading_indent > 0 {
+        segments.push(MappingSegment {
+            source_range: SourceRange::new(base, base + leading_indent),
+            visual_range: VisualRange::new(0, 0),
+            visibility: Visibility::HiddenMarkup,
+            marker_edge: None,
+        });
+    }
+    let mut cursor = leading_indent;
     let mut column = 0;
     for index in pipes {
         if cursor < index {
@@ -4156,7 +4172,7 @@ fn present_table_line(
                     .unwrap_or(TableAlignment::Default),
             });
             column += 1;
-        } else if index > 0 {
+        } else if index != opening_pipe {
             cells.push(TableCellDisplay {
                 column,
                 source_range: SourceRange::empty(base + cursor),
@@ -7119,6 +7135,23 @@ mod tests {
             vec![0, 1, 2]
         );
         assert!(empty_cells[1].visual_range.start == empty_cells[1].visual_range.end);
+        let indented = present_table_line(
+            1,
+            Revision(3),
+            SourceRange::new(0, "  | a | b |\n".len()),
+            "  | a | b |\n",
+            26.0,
+            false,
+            &[TableAlignment::Left, TableAlignment::Right],
+        );
+        let indented_cells = indented
+            .table_row
+            .as_ref()
+            .expect("indented table row")
+            .cells
+            .as_slice();
+        assert_eq!(indented_cells.len(), 2);
+        assert_eq!(indented_cells[0].source_range.start, SourceOffset(3));
         let sparse = present_table_line(
             1,
             Revision(3),

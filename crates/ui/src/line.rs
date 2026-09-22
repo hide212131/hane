@@ -723,8 +723,10 @@ fn table_row_element(
     caret_input_mode: Option<KeyboardInputMode>,
 ) -> Div {
     let selection = editor.selection().range();
-    let marked = editor.ime().map(|ime| ime.marked_range);
     let selected_visual = layout.visual_range_on_row(block, row_index, selection);
+    let marked_visual = editor
+        .ime()
+        .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
     let cursor_x = layout
         .point_for_source(block, editor.selection().active, shaper)
         .filter(|point| point.row == row_index)
@@ -738,29 +740,74 @@ fn table_row_element(
         else {
             continue;
         };
-        let text = line.visual_text[cell_layout.visual_range.clone()].to_owned();
-        let selected = selected_visual.as_ref().is_some_and(|range| {
-            range.start < cell_layout.visual_range.end
-                && cell_layout.visual_range.start < range.end
-        });
-        let marked = marked.is_some_and(|range| range.intersects(cell.source_range));
-        let mut text_element = div()
-            .w_full()
-            .whitespace_nowrap()
-            .overflow_hidden()
-            .text_ellipsis()
-            .when(selected, |element| {
-                element.bg(rgb(theme.selection_background))
+        let cell_range = cell_layout.visual_range.clone();
+        let cell_selected = clip_visual_range(selected_visual.as_ref(), cell_range.clone());
+        let cell_marked = clip_visual_range(marked_visual.as_ref(), cell_range.clone());
+        let text = line.visual_text[cell_range.clone()].to_owned();
+        let cell_elements = if cell_selected.is_none() && cell_marked.is_none() {
+            let mut text_element = div()
+                .w_full()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .when(table.header, |element| {
+                    element.font_weight(FontWeight::SEMIBOLD)
+                })
+                .child(text);
+            text_element = match cell.alignment {
+                TableAlignment::Center => text_element.text_center(),
+                TableAlignment::Right => text_element.text_right(),
+                TableAlignment::Default | TableAlignment::Left => text_element.text_left(),
+            };
+            vec![text_element]
+        } else {
+            line_segments(
+                cell_range.clone(),
+                None,
+                cell_selected,
+                cell_marked,
+                &line.style_runs,
+                None,
+            )
+            .into_iter()
+            .filter(|segment| !segment.visual_range.is_empty())
+            .map(|segment| {
+                let x = cell_layout.text_x - cell_layout.x
+                    + shaper.x_for_offset(
+                        line,
+                        cell_range.clone(),
+                        segment.visual_range.start,
+                    );
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(0.0))
+                    .h(px(row.height))
+                    .flex()
+                    .items_center()
+                    .whitespace_nowrap()
+                    .when(segment.selected, |element| {
+                        element.bg(rgb(theme.selection_background))
+                    })
+                    .when(segment.marked || segment.display.underline, |element| {
+                        element.underline()
+                    })
+                    .when(table.header, |element| {
+                        element.font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(segment.display.bold, |element| {
+                        element.font_weight(FontWeight::BOLD)
+                    })
+                    .when(segment.display.italic, |element| element.italic())
+                    .when(segment.display.strikethrough, |element| {
+                        element.line_through()
+                    })
+                    .when(segment.display.monospace, |element| {
+                        element.font_family("ui-monospace")
+                    })
+                    .child(line.visual_text[segment.visual_range].to_owned())
             })
-            .when(marked, |element| element.underline())
-            .when(table.header, |element| {
-                element.font_weight(FontWeight::SEMIBOLD)
-            })
-            .child(text);
-        text_element = match cell.alignment {
-            TableAlignment::Center => text_element.text_center(),
-            TableAlignment::Right => text_element.text_right(),
-            TableAlignment::Default | TableAlignment::Left => text_element.text_left(),
+            .collect::<Vec<_>>()
         };
         elements.push(
             div()
@@ -769,11 +816,10 @@ fn table_row_element(
                 .top(px(0.0))
                 .w(px(cell_layout.width))
                 .h(px(row.height))
-                .flex()
-                .items_center()
+                .relative()
                 .px(px(8.0))
                 .overflow_hidden()
-                .child(text_element),
+                .children(cell_elements),
         );
         elements.push(
             div()
@@ -856,6 +902,12 @@ pub(crate) fn inline_display_for(
 /// Splits one row's stretch of visual text where the caret, the selection, the
 /// IME underline or an inline style begins or ends. Everything is clamped into
 /// `bounds`, so a construct that spans a soft wrap contributes to both rows.
+fn clip_visual_range(source: Option<&Range<usize>>, bounds: Range<usize>) -> Option<Range<usize>> {
+    let source = source?;
+    let clipped = source.start.max(bounds.start)..source.end.min(bounds.end);
+    (!clipped.is_empty()).then_some(clipped)
+}
+
 fn line_segments(
     bounds: Range<usize>,
     cursor: Option<usize>,
