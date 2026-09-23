@@ -14,6 +14,7 @@
 | ADR | 内容 |
 |---|---|
 | [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
+| [ADR-0030](0030-gpui-kit-incremental-local-adoption.md) | gpui-kit / gpui-base の段階的・局所的採用方針 |
 
 ## Active
 
