@@ -69,7 +69,7 @@ mod windows {
     const FILE_MENU_KEY: &str = r"Software\Classes\*\shell\Hane.OpenFile";
     const MENU_LABEL: &str = "Haneで開く";
 
-    pub(super) fn register(exe: &Path) -> io::Result<()> {
+    pub fn register(exe: &Path) -> io::Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (shell_key, _) = hkcu.create_subkey(FOLDER_MENU_KEY)?;
         shell_key.set_value("MUIVerb", &MENU_LABEL)?;
@@ -79,7 +79,7 @@ mod windows {
         Ok(())
     }
 
-    pub(super) fn unregister() -> io::Result<()> {
+    pub fn unregister() -> io::Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         match hkcu.delete_subkey_all(FOLDER_MENU_KEY) {
             Ok(()) => Ok(()),
@@ -88,7 +88,7 @@ mod windows {
         }
     }
 
-    pub(super) fn inspect(exe: &Path) -> FileContextMenuState {
+    pub fn inspect(exe: &Path) -> FileContextMenuState {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         inspect_at(&hkcu, exe)
     }
@@ -148,7 +148,7 @@ mod windows {
             .unwrap_or(false)
     }
 
-    pub(super) fn register_file(exe: &Path) -> io::Result<()> {
+    pub fn register_file(exe: &Path) -> io::Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         if let Ok(existing) = hkcu.open_subkey(FILE_MENU_KEY)
             && !is_owned(&existing)
@@ -168,7 +168,7 @@ mod windows {
         Ok(())
     }
 
-    pub(super) fn unregister_file() -> io::Result<()> {
+    pub fn unregister_file() -> io::Result<()> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         match hkcu.open_subkey(FILE_MENU_KEY) {
             Ok(existing) if is_owned(&existing) => {
@@ -195,7 +195,7 @@ mod windows {
         // open even if the notification API is unavailable.
         unsafe {
             windows_sys::Win32::UI::Shell::SHChangeNotify(
-                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED,
+                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED as i32,
                 windows_sys::Win32::UI::Shell::SHCNF_IDLIST,
                 std::ptr::null(),
                 std::ptr::null(),
