@@ -970,6 +970,45 @@ fn rebase_ordinal_after_splice(
         .map_or(replaced.start.min(new_len - 1), |at| replaced.start + at)
 }
 
+/// Computes the arithmetic seed for one block without walking the index.
+///
+/// This mirrors `block_heights_with_disclosure` for the input path, where an
+/// incremental index update must only touch the blocks in its replacement
+/// window. The final block may own the document's empty line after a trailing
+/// newline even though `line_count` deliberately excludes that line.
+fn block_height_with_disclosure(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    block: &IndexedBlock,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+) -> f32 {
+    let block_is_final = block.ordinal + 1 == index.len();
+    let collapsed_fence_rows = index
+        .fence_height_projection(block)
+        .map_or(0, |projection| {
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                disclosure,
+                block_is_final,
+            )
+        });
+    let collapsed_table_delimiter = index
+        .table_projection(block)
+        .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
+        .map_or(0, |_| 1);
+    let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
+    let trailing_empty_lines = block_is_final
+        .then(|| {
+            block_line_span(document, block)
+                .map_or(0, |span| span.len().saturating_sub(block.line_count))
+        })
+        .unwrap_or(0);
+    line_height * block.line_count.saturating_sub(collapsed) as f32
+        + line_height * trailing_empty_lines as f32
+}
+
 #[derive(Clone, Debug)]
 struct LayoutCacheEntry {
     layout: BlockLayout,
@@ -5109,16 +5148,19 @@ impl EditorView {
         {
             return false;
         }
-        let next = (first..first + update.inserted_blocks)
-            .filter_map(|ordinal| index.block(ordinal))
+        let Some(inserted) = (first..first + update.inserted_blocks)
+            .map(|ordinal| index.block(ordinal))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        let next = inserted
+            .iter()
             .map(|block| HeightBlock {
                 id: block.id,
                 line_count: block.line_count,
             })
             .collect::<Vec<_>>();
-        if next.len() != update.inserted_blocks {
-            return false;
-        }
         if self.height_blocks.range_eq(first..old_end, &next) {
             return true;
         }
@@ -5129,17 +5171,20 @@ impl EditorView {
             (id, ordinal, intra)
         });
         let line_height = self.line_height();
-        let initial_heights = block_heights_with_disclosure(
-            self.editor().document(),
-            index,
-            line_height,
-            self.active_height_disclosure(),
-        );
-        self.heights.splice(
-            first..old_end,
-            (first..first + update.inserted_blocks)
-                .filter_map(|ordinal| initial_heights.get(ordinal).copied()),
-        );
+        let disclosure = self.active_height_disclosure();
+        let initial_heights = inserted
+            .iter()
+            .map(|block| {
+                block_height_with_disclosure(
+                    self.editor().document(),
+                    index,
+                    block,
+                    line_height,
+                    disclosure,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.heights.splice(first..old_end, initial_heights);
         self.height_blocks.splice(first..old_end, &next);
 
         if let Some((id, old_ordinal, intra)) = old_top {
@@ -11043,6 +11088,175 @@ mod tests {
         assert!(blocks.range_eq(0..flat.len(), &flat));
         assert_eq!(blocks.get(126), flat.get(126).copied());
         assert_eq!(blocks.get(130), flat.get(130).copied());
+    }
+
+    #[test]
+    fn local_block_height_seed_matches_the_full_disclosure_projection() {
+        let source =
+            "before\n\n| head | value |\n| --- | --- |\n| body | cell |\n\n```\ncode\n```\n\nafter\n";
+        let document = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&document);
+        let table_delimiter = source.find("| ---").expect("table delimiter") + 2;
+        let fence_opening = source.find("```").expect("fence opening") + 1;
+        let disclosures = [
+            None,
+            Some(SourceRange::empty(table_delimiter)),
+            Some(SourceRange::empty(fence_opening)),
+            Some(SourceRange::empty(source.len())),
+        ];
+
+        for disclosure in disclosures {
+            let expected = block_heights_with_disclosure(
+                &document,
+                &index,
+                26.0,
+                disclosure,
+            );
+            let actual = index
+                .blocks()
+                .map(|block| {
+                    block_height_with_disclosure(&document, &index, &block, 26.0, disclosure)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "disclosure {disclosure:?}");
+        }
+
+        let inactive = block_heights_with_disclosure(&document, &index, 26.0, None);
+        let table = index
+            .blocks()
+            .find(|block| index.table_projection(block).is_some())
+            .expect("table block");
+        let table_disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(table_delimiter)),
+        );
+        assert!(table_disclosed[table.ordinal] > inactive[table.ordinal]);
+        let fence = index
+            .blocks()
+            .find(|block| index.fence_height_projection(block).is_some())
+            .expect("fence block");
+        let fence_disclosed = block_heights_with_disclosure(
+            &document,
+            &index,
+            26.0,
+            Some(SourceRange::empty(fence_opening)),
+        );
+        assert!(fence_disclosed[fence.ordinal] > inactive[fence.ordinal]);
+
+        let final_block = index.blocks().last().expect("final block");
+        let final_span = block_line_span(&document, &final_block).expect("final block span");
+        assert_eq!(
+            final_span.len(),
+            final_block.line_count + 1,
+            "the final block owns the empty line after the trailing newline"
+        );
+
+        let empty_document = RopeBuffer::from_text("");
+        let empty_index = BlockIndex::from_buffer(&empty_document);
+        assert_eq!(
+            block_heights_with_disclosure(&empty_document, &empty_index, 26.0, None),
+            Vec::<f32>::new()
+        );
+        assert_eq!(
+            empty_index
+                .blocks()
+                .map(|block| {
+                    block_height_with_disclosure(&empty_document, &empty_index, &block, 26.0, None)
+                })
+                .collect::<Vec<_>>(),
+            Vec::<f32>::new()
+        );
+
+        let no_trailing_newline = RopeBuffer::from_text("plain");
+        let no_trailing_index = BlockIndex::from_buffer(&no_trailing_newline);
+        assert_eq!(
+            no_trailing_index
+                .blocks()
+                .map(|block| {
+                    block_height_with_disclosure(
+                        &no_trailing_newline,
+                        &no_trailing_index,
+                        &block,
+                        26.0,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            block_heights_with_disclosure(&no_trailing_newline, &no_trailing_index, 26.0, None)
+        );
+    }
+
+    #[gpui::test]
+    fn incremental_height_splice_preserves_measured_height_outside_the_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "one\n\ntwo\n\nthree\n\nfour\n\nlast\n";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(source, "Untitled", cx));
+
+        view.update(cx, |view, _cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+            let old_len = view.height_blocks.len();
+
+            let edit_at = document.len_bytes().0.saturating_sub(1);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(edit_at)))
+                .unwrap();
+            view.editor_mut().insert_text("\nnew").unwrap();
+            let document = view.editor().document().clone();
+            let update = view
+                .block_index
+                .apply_edits(&document)
+                .expect("incremental index update");
+            assert!(update.inserted_blocks > 0);
+
+            let old_end = update
+                .first_replaced_block
+                .saturating_add(update.replaced_blocks);
+            let outside_old = if old_end < old_len {
+                Some(old_end)
+            } else {
+                (update.first_replaced_block > 0).then_some(update.first_replaced_block - 1)
+            }
+            .expect("fixture must leave an untouched block");
+            let measured = 987.0;
+            view.heights.update(outside_old, measured);
+
+            assert!(view.apply_height_index_update(&update));
+
+            let index = view.current_index().expect("current incremental index");
+            let expected = block_heights_with_disclosure(
+                &document,
+                index,
+                view.line_height(),
+                view.active_height_disclosure(),
+            );
+            for ordinal in update.first_replaced_block
+                ..update.first_replaced_block + update.inserted_blocks
+            {
+                assert_eq!(view.heights.height(ordinal), expected.get(ordinal).copied());
+            }
+
+            let outside_new = if outside_old < update.first_replaced_block {
+                outside_old
+            } else {
+                outside_old - update.replaced_blocks + update.inserted_blocks
+            };
+            assert_eq!(view.heights.height(outside_new), Some(measured));
+        });
     }
 
     fn draft_test_root(label: &str) -> PathBuf {
