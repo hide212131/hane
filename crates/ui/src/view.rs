@@ -6699,6 +6699,7 @@ impl Render for EditorView {
                                     let line = row.line_id as usize;
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
+                                    let table_row = !row.table_cells.is_empty();
                                     row_element(
                                         editor,
                                         &visual,
@@ -6714,7 +6715,16 @@ impl Render for EditorView {
                                     // painted window bounds via `VisualTestContext::debug_bounds`
                                     // instead of duplicating the render-time offset math. A
                                     // no-op outside test builds.
-                                    .debug_selector(move || format!("row-{line}-{row_index}"))
+                                    // The layout row index is dense over painted rows, so an
+                                    // inactive table delimiter makes the body row at physical
+                                    // line 2 become layout row 1. Keep the test/debug identity
+                                    // tied to the source line for table rows; otherwise callers
+                                    // cannot address the row that was actually painted through
+                                    // the same physical-line identity used by hit testing.
+                                    .debug_selector(move || {
+                                        let debug_row = if table_row { line } else { row_index };
+                                        format!("row-{line}-{debug_row}")
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |view, event, window, cx| {
@@ -13035,6 +13045,42 @@ mod tests {
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn hidden_table_delimiter_maps_physical_lines_to_visible_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "| header | value |\n| --- | --- |\n| body | cell |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+
+        view.read_with(cx, |view, _| {
+            let index = view.current_index().expect("table index is ready");
+            let block = index.block(0).expect("table block").clone();
+
+            // Physical lines 0, 1 and 2 are header, hidden delimiter and body;
+            // the delimiter owns source bytes but no visual row or height.
+            assert_eq!(view.visible_line_prefix(&block, 0), 0);
+            assert_eq!(view.visible_line_prefix(&block, 1), 1);
+            assert_eq!(view.visible_line_prefix(&block, 2), 1);
+            assert_eq!(
+                view.physical_line_prefix_for_visible_rows(&block, 3, 1),
+                1
+            );
+            assert_eq!(
+                view.physical_line_prefix_for_visible_rows(&block, 3, 2),
+                3
+            );
+
+            let blocks = [block];
+            let window = view.visible_line_window(&blocks, &(0..1));
+            assert!(
+                window.contains(&2),
+                "the first body line must remain in the virtualized source window: {window:?}"
+            );
+        });
+
+        assert!(root.is_none());
     }
 
     #[gpui::test]

@@ -849,9 +849,13 @@ fn table_row_element(
                             element.font_weight(FontWeight::SEMIBOLD)
                         })
                         .debug_selector({
+                            // Table rows can have a hidden delimiter before them, so the
+                            // layout row index is not their physical source-line index. Keep
+                            // this selector keyed by the physical line just like the row
+                            // selector above.
                             let selector = format!(
                                 "table-cell-text-{}-{}-{}-{}",
-                                line.line_id, row_index, cell_layout.column, fragment_index
+                                line.line_id, line.line_id, cell_layout.column, fragment_index
                             );
                             move || selector.clone()
                         })
