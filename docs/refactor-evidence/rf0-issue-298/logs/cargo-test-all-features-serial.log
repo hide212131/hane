@@ -1,0 +1,817 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.59s
+     Running unittests src/main.rs (target/debug/deps/hane-553c1d92c6b86202)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_benchmark-9f60caaf0f78d55f)
+
+running 1 test
+test tests::percentiles_use_nearest_rank ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/hane_bench-2456af2045926858)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_document-a90572e5168f762a)
+
+running 13 tests
+test tests::anchors_follow_insert_bias_and_deletion ... ok
+test tests::bare_cr_is_a_line_break_but_unicode_line_separators_are_not ... ok
+test tests::deleting_the_lf_of_a_crlf_leaves_a_bare_cr_break ... ok
+test tests::inserting_lf_after_a_bare_cr_turns_it_into_one_crlf_break ... ok
+test tests::lines_preserve_crlf_but_exclude_it_from_columns ... ok
+test tests::mixed_lf_cr_and_crlf_line_endings_each_count_as_one_break ... ok
+test tests::non_overlapping_range_can_rebase ... ok
+test tests::reader_builds_rope_without_intermediate_document_string ... ok
+test tests::rejects_non_character_boundaries ... ok
+test tests::source_bytes_stay_exact_across_a_bare_cr_edit ... ok
+test tests::two_bare_crs_in_a_row_make_an_empty_line_between_them ... ok
+test tests::unicode_edit_and_inverse_are_byte_based ... ok
+test tests::utf16_offsets_convert_without_flattening_the_rope ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_editor-8ae8b6afc89426a2)
+
+running 18 tests
+test tests::bare_cr_is_its_own_undo_transaction_like_lf ... ok
+test tests::characterwise_selection_replacement_is_one_undo_transaction ... ok
+test tests::consecutive_backspace_and_delete_are_grouped ... ok
+test tests::consecutive_typing_is_one_undo_transaction ... ok
+test tests::crlf_inserted_as_one_string_is_its_own_undo_transaction ... ok
+test tests::grapheme_movement_keeps_combining_sequence_together ... ok
+test tests::home_and_end_are_line_boundaries ... ok
+test tests::home_and_end_treat_a_bare_cr_as_a_line_boundary_like_lf_and_crlf ... ok
+test tests::ime_cancel_restores_original_selection_and_text ... ok
+test tests::ime_updates_form_one_undo_transaction ... ok
+test tests::ime_updates_replace_previous_marked_text_and_commit ... ok
+test tests::new_edit_after_undo_discards_redo ... ok
+test tests::newline_replaces_selection_and_is_its_own_undo_transaction ... ok
+test tests::recorded_range_replacement_is_one_undoable_structural_transaction ... ok
+test tests::selection_replacement_does_not_remerge_after_caret_round_trip ... ok
+test tests::selection_replacement_does_not_remerge_after_undo_redo ... ok
+test tests::selection_replacement_restores_text_and_selection ... ok
+test tests::utf16_conversion_handles_surrogate_pairs ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cursor_boundaries.rs (target/debug/deps/cursor_boundaries-292cdf7a99b682ac)
+
+running 6 tests
+test every_arrow_is_a_no_op_in_an_empty_document ... ok
+test horizontal_arrows_at_line_and_document_boundaries ... ok
+test horizontal_arrows_visit_every_grapheme_boundary ... ok
+test vertical_arrows_at_line_ends ... ok
+test vertical_arrows_at_line_starts ... ok
+test vertical_arrows_map_every_line_column ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/editor_scenarios.rs (target/debug/deps/editor_scenarios-f9e162695bab84f1)
+
+running 2 tests
+test moving_down_then_inserting_text_edits_the_expected_column ... ok
+test vertical_movement_keeps_the_preferred_column_across_a_short_line ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ime_contract.rs (target/debug/deps/ime_contract-34d3965e67c9d82c)
+
+running 5 tests
+test every_utf8_character_boundary_round_trips_through_utf16 ... ok
+test extended_vertical_selection_remains_on_source_boundaries ... ok
+test ime_commit_on_ordered_list_row_inserts_once_at_expected_offset ... ok
+test ime_composition_does_not_inject_structural_prefixes ... ok
+test ime_marked_range_selection_commit_and_undo_share_one_source_contract ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_markdown-f8c8f4596ec1ee3c)
+
+running 74 tests
+test block_index::tests::a_background_parse_that_finished_late_is_rebased_onto_the_edits ... ok
+test block_index::tests::a_blank_document_holds_no_block_and_recovers_when_typed_into ... ok
+test block_index::tests::an_incremental_edit_before_the_last_quote_uses_the_current_document_end ... ok
+test block_index::tests::an_unterminated_fence_invalidates_the_tail_conservatively ... ok
+test block_index::tests::batched_edits_are_absorbed_in_one_update ... ok
+test block_index::tests::blocks_in_range_returns_only_overlapping_blocks ... ok
+test block_index::tests::blocks_tile_the_document_and_resolve_by_offset ... ok
+test block_index::tests::caret_at_a_quote_owner_end_inside_a_block_restores_fence_rows ... ok
+test block_index::tests::closing_a_fence_resynchronizes_the_following_blocks ... ok
+test block_index::tests::disclosed_quote_prefix_keeps_nested_fence_rows_at_normal_height ... ok
+test block_index::tests::document_end_caret_restores_a_final_nested_closing_fence ... ok
+test block_index::tests::fence_height_projection_counts_only_inactive_visually_empty_rows ... ok
+test block_index::tests::formal_projection_keeps_nested_quote_depth_for_viewport_rows ... ok
+test block_index::tests::formal_quote_projection_stays_with_its_own_block ... ok
+test block_index::tests::incremental_list_edit_keeps_fence_height_projection_current ... ok
+test block_index::tests::incremental_updates_match_a_full_parse_across_mixed_edits ... ok
+test block_index::tests::merging_blocks_drops_fence_height_projections_for_removed_ids ... ok
+test block_index::tests::publish_prefers_newer_revisions_and_formal_parses ... ok
+test block_index::tests::splitting_and_merging_blocks_keeps_the_index_equal_to_a_full_parse ... ok
+test block_index::tests::the_first_fenced_block_remembers_its_leading_blank_lines ... ok
+test block_index::tests::top_level_fenced_code_does_not_build_a_list_projection ... ok
+test block_index::tests::typing_inside_a_block_reparses_only_its_neighborhood ... ok
+test block_store::tests::an_emptied_store_reports_nothing ... ok
+test block_store::tests::lookups_agree_with_a_flat_model_across_chunk_boundaries ... ok
+test block_store::tests::splices_and_length_changes_keep_the_store_consistent ... ok
+test list_editing::tests::empty_nested_backspace_outdents_and_top_level_backspace_removes_marker ... ok
+test list_editing::tests::empty_nested_enter_outdents_and_top_level_enter_removes_marker ... ok
+test list_editing::tests::enter_commits_same_level_item ... ok
+test list_editing::tests::first_item_tab_is_a_noop ... ok
+test list_editing::tests::ordered_enter_preserves_marker_width_for_two_digit_items ... ok
+test list_editing::tests::ordered_enter_uses_next_semantic_number ... ok
+test list_editing::tests::shift_enter_continues_the_current_item_body ... ok
+test list_editing::tests::shift_tab_moves_a_nested_subtree_to_its_parent_level ... ok
+test list_editing::tests::structural_planner_does_not_claim_multi_selection ... ok
+test list_editing::tests::tab_moves_item_and_subtree_under_previous_sibling ... ok
+test list_editing::tests::task_enter_creates_unchecked_item ... ok
+test tests::an_unterminated_fences_closing_lookalike_last_line_stays_unhidden ... ok
+test tests::code_padding_tracks_semantic_spaces_instead_of_container_bytes ... ok
+test tests::commonmark_ranges_remain_absolute_for_unicode_and_nested_styles ... ok
+test tests::fence_height_projection_answers_physical_line_prefixes ... ok
+test tests::formal_block_index_exposes_compact_table_projection ... ok
+test tests::four_space_indent_is_an_indented_code_block_not_a_list_item ... ok
+test tests::list_item_markers_cover_bullet_and_ordered_delimiters_exactly ... ok
+test tests::list_item_ordinal_reports_owner_and_sibling_position ... ok
+test tests::list_structural_prefixes_account_for_leading_spaces_and_marker_padding ... ok
+test tests::list_structural_prefixes_are_empty_for_a_lazy_paragraph_continuation ... ok
+test tests::list_structural_prefixes_are_empty_for_an_empty_item ... ok
+test tests::list_structural_prefixes_are_owned_separately_from_the_quote_prefix_sharing_a_line ... ok
+test tests::list_structural_prefixes_cover_a_loose_items_second_and_third_paragraph ... ok
+test tests::list_structural_prefixes_cover_every_line_of_an_items_heading_and_fenced_code ... ok
+test tests::list_structural_prefixes_cover_opening_marker_padding_up_to_the_body ... ok
+test tests::list_structural_prefixes_follow_commonmark_line_endings_with_raw_offsets ... ok
+test tests::list_structural_prefixes_split_ownership_for_a_nested_child_then_parent_paragraph ... ok
+test tests::list_structural_prefixes_use_column_width_across_a_tab_and_a_two_digit_marker ... ok
+test tests::local_index_agrees_with_the_formal_index_on_the_visible_window ... ok
+test tests::local_index_covers_only_the_scanned_window ... ok
+test tests::local_index_remembers_leading_blank_lines_for_the_first_fenced_block ... ok
+test tests::local_index_resolves_gfm_pipe_tables ... ok
+test tests::local_index_sees_a_fence_that_opens_inside_the_lookback_window ... ok
+test tests::markdown_line_scan_preserves_bytes_and_does_not_split_crlf ... ok
+test tests::markers_cover_block_prefixes_for_heading_quote_and_list ... ok
+test tests::markers_cover_inline_open_and_close_delimiters ... ok
+test tests::nested_fence_markers_skip_the_quotes_own_prefix_on_every_line ... ok
+test tests::ordered_list_start_value_is_preserved_losslessly ... ok
+test tests::parses_fenced_code_as_a_code_block ... ok
+test tests::quote_markers_follow_commonmark_line_endings_with_raw_offsets ... ok
+test tests::quote_markers_follow_each_lines_actual_container_prefixes ... ok
+test tests::quote_markers_follow_list_ancestors_without_hiding_literal_greater_than ... ok
+test tests::quote_markers_follow_list_items_with_an_empty_opening_line ... ok
+test tests::table_parse_retains_delimiter_alignments ... ok
+test tests::tables_nest_rows_and_cells_under_the_table ... ok
+test tests::task_list_items_carry_their_checkbox_state ... ok
+test tests::ten_digit_ordered_marker_exceeds_commonmarks_limit_and_is_not_a_list ... ok
+test tests::tree_nests_children_inside_their_parent_source_ranges ... ok
+
+test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/atx_conformance.rs (target/debug/deps/atx_conformance-c0a875e16a8b117c)
+
+running 3 tests
+test atx_tab_closers_use_parser_semantics ... ok
+test commonmark_0312_atx_examples_match_html_and_hane_tree ... ok
+test setext_content_beginning_with_hashes_is_not_an_atx_marker ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/block_index_contract.rs (target/debug/deps/block_index_contract-f3a9796f536605c3)
+
+running 6 tests
+test a_stale_parse_never_replaces_what_is_already_published ... ok
+test an_edit_whose_effect_reaches_far_marks_the_tail_provisional_instead_of_guessing ... ok
+test bare_cr_splits_blocks_and_counts_lines_like_lf ... ok
+test block_identity_survives_editing_so_caches_stay_warm ... ok
+test block_line_counts_tile_the_document_through_edits ... ok
+test local_editing_costs_the_same_in_a_small_and_a_large_document ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/document_contract.rs (target/debug/deps/document_contract-15b58f62d37be4e0)
+
+running 5 tests
+test block_kinds_follow_document_revisions ... ok
+test multiline_commonmark_fixtures_keep_structural_ranges ... ok
+test opening_fence_edit_changes_far_context_and_removal_restores_it ... ok
+test reference_links_and_escaped_markers_have_unambiguous_parse_contracts ... ok
+test stale_background_result_cannot_match_the_current_revision ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/line_breaks.rs (target/debug/deps/line_breaks-4771c70c8670194d)
+
+running 8 tests
+test blank_lines_split_paragraphs_and_ordinary_line_endings_stay_soft_breaks ... ok
+test hard_break_can_sit_inside_an_emphasis_span ... ok
+test hard_break_ignores_tabs_when_counting_trailing_spaces ... ok
+test hard_break_needs_two_or_more_trailing_spaces_or_a_backslash ... ok
+test hard_break_never_forms_inside_code_spans_html_tags_or_at_block_end ... ok
+test hard_break_syntax_is_derived_without_consuming_the_line_ending ... ok
+test line_break_padding_hides_insignificant_spaces_around_breaks_only ... ok
+test line_break_padding_hides_insignificant_spaces_on_lazy_continuation_lines ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_metrics-185d46fe7c4e1965)
+
+running 3 tests
+test tests::duration_distribution_reports_all_required_statistics ... ok
+test tests::percentile_uses_nearest_rank ... ok
+test tests::rolling_window_evicts_oldest_sample ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_presentation-f96dfe6fc109ebcb)
+
+running 62 tests
+test tests::a_bare_cr_hard_break_hides_its_syntax_without_touching_the_line_ending ... ok
+test tests::an_ordinary_bare_cr_soft_break_keeps_each_physical_line_its_own_visible_text ... ok
+test tests::average_line_height_ignores_collapsed_fence_rows ... ok
+test tests::cached_hundred_thousand_line_quote_projects_only_viewport_markers ... ok
+test tests::caret_at_a_quote_owner_end_discloses_fence_rows_before_following_list_text ... ok
+test tests::caret_at_the_next_block_start_does_not_disclose_the_previous_quote ... ok
+test tests::chunked_height_index_matches_a_flat_model_across_boundaries ... ok
+test tests::code_fence_disclosure_only_expands_the_touched_fence_marker ... ok
+test tests::code_padding_inside_containers_preserves_shared_projection_and_source ... ok
+test tests::disclosed_ordered_marker_metadata_keeps_leading_zero_and_delimiter ... ok
+test tests::disclosure_expands_only_the_active_inline_construct ... ok
+test tests::disclosure_on_one_line_of_a_shared_construct_reaches_every_line_that_carries_it ... ok
+test tests::fenced_code_context_styles_the_line_as_code_without_hiding_markup ... ok
+test tests::fenced_code_rows_use_the_normal_line_height ... ok
+test tests::fenwick_updates_and_finds_visible_blocks ... ok
+test tests::formal_quote_owner_wins_over_same_depth_viewport_owner_at_large_boundary ... ok
+test tests::formal_quote_projection_carries_lazy_continuation_depth ... ok
+test tests::height_splice_preserves_measurements_outside_the_changed_blocks ... ok
+test tests::hidden_unicode_boundaries_normalize_with_affinity ... ok
+test tests::image_estimated_height_scales_with_the_zoomed_line_height ... ok
+test tests::inactive_table_delimiter_does_not_reserve_virtual_height ... ok
+test tests::initial_block_heights_keep_the_caret_owned_fence_row_visible ... ok
+test tests::inline_and_fenced_code_keep_distinct_inline_background_policies ... ok
+test tests::italic_and_bold_style_runs_fully_cover_cjk_text ... ok
+test tests::large_ordered_list_viewport_labels_reuse_one_shared_parse_at_middle_and_tail ... ok
+test tests::line_break_padding_hides_insignificant_spaces_from_rendered_presentation ... ok
+test tests::line_break_padding_hides_lazy_continuation_indentation_from_rendered_presentation ... ok
+test tests::list_item_boundary_discloses_only_the_item_that_starts_there ... ok
+test tests::list_item_label_returns_none_when_the_ordinal_table_omits_the_item ... ok
+test tests::list_marker_discloses_for_every_ancestor_whose_source_range_the_caret_enters ... ok
+test tests::list_row_metadata_distinguishes_continuation_and_loose_paragraphs ... ok
+test tests::list_rows_expose_semantic_geometry_policy_without_reparsing_in_layout ... ok
+test tests::list_structural_prefix_synthesizes_columns_and_discloses_the_owning_items_raw_bytes ... ok
+test tests::nested_code_block_kind_wins_over_its_enclosing_quote ... ok
+test tests::nested_delimiter_runs_do_not_duplicate_visual_or_source_segments ... ok
+test tests::nested_lists_number_independently_of_their_ancestors_and_siblings ... ok
+test tests::nested_rule_projects_container_prefixes_into_source_map_and_layout_metadata ... ok
+test tests::one_physical_line_render_window_with_cached_joined_parse_matches_a_wider_window ... ok
+test tests::opening_list_marker_padding_is_hidden_but_disclosed_with_the_item ... ok
+test tests::opening_list_structural_prefix_uses_source_mapping_without_fake_text ... ok
+test tests::ordered_list_labels_use_owner_start_plus_sibling_position ... ok
+test tests::ordered_row_metadata_uses_inactive_labels_for_shared_alignment ... ok
+test tests::phase3_presentation_hides_markers_without_changing_source ... ok
+test tests::phase4_image_keeps_source_and_exposes_lazy_destination ... ok
+test tests::plain_presentation_preserves_markdown_source_bytes ... ok
+test tests::present_block_hides_fence_delimiters_and_info_string_when_inactive ... ok
+test tests::present_block_keeps_an_unterminated_fences_closing_lookalike_line_literal ... ok
+test tests::quote_depth_and_inline_style_come_from_the_shared_parse ... ok
+test tests::quote_disclosure_does_not_expand_inactive_nested_quote_or_inline_markers ... ok
+test tests::quote_disclosure_uses_prefix_ownership_across_viewports ... ok
+test tests::raw_source_fallback_preserves_every_byte_as_plain_text ... ok
+test tests::selection_outside_a_quote_fence_block_does_not_disclose_its_rows ... ok
+test tests::shared_heading_kinds_follow_each_physical_lines_source_range ... ok
+test tests::source_index_skips_offscreen_spans_under_a_long_enclosing_construct ... ok
+test tests::stale_non_overlapping_block_rebases ... ok
+test tests::standalone_image_line_does_not_split_a_run_with_distant_delimiters ... ok
+test tests::standalone_image_line_inside_a_run_does_not_split_the_shared_parse ... ok
+test tests::table_rows_expose_cells_without_fake_separator_offsets ... ok
+test tests::the_last_block_stays_visible_across_a_chunk_boundary ... ok
+test tests::the_last_block_stays_visible_when_the_viewport_reaches_the_end ... ok
+test tests::thematic_break_parser_tree_preserves_list_and_quote_ancestors ... ok
+test tests::thematic_break_uses_parser_kind_and_discloses_its_source ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+     Running tests/atx_headings.rs (target/debug/deps/atx_headings-3fee352ec88dc446)
+
+running 1 test
+test atx_headings_preserve_display_disclosure_positions_and_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/layout_contract.rs (target/debug/deps/layout_contract-ad8b85cd2d54c5d8)
+
+running 66 tests
+test a_caret_at_a_wrap_point_renders_at_the_start_of_the_next_row ... ok
+test a_long_marker_stays_intact_before_the_body_when_the_column_is_narrow ... ok
+test a_long_unbroken_ascii_token_wraps_instead_of_widening_the_column ... ok
+test a_non_list_dash_prefix_keeps_plain_text_coordinates ... ok
+test a_short_row_clamps_the_caret_without_losing_the_preferred_x ... ok
+test aligned_table_hit_testing_uses_the_selected_fragment_origin ... ok
+test caret_on_the_following_line_does_not_disclose_the_previous_rule_body ... ok
+test clipped_table_delimiter_does_not_restore_virtual_space ... ok
+test collapsed_nested_rule_keeps_the_disclosed_quote_body_gap ... ok
+test deeply_nested_or_narrow_lists_keep_a_positive_effective_width ... ok
+test disclosed_continuation_prefix_does_not_readd_marker_width ... ok
+test disclosed_empty_long_marker_stays_in_one_opening_row ... ok
+test disclosed_empty_markers_put_the_terminal_caret_after_raw_source ... ok
+test disclosed_list_prefix_is_subtracted_only_on_the_first_wrap_fragment ... ok
+test disclosed_markers_use_their_source_visible_width_without_a_virtual_gap ... ok
+test disclosed_outer_quote_prefix_keeps_hidden_nested_quote_inset ... ok
+test disclosed_outer_quote_prefix_precedes_nested_list_geometry ... ok
+test disclosed_prefix_and_marker_stay_intact_before_the_body_when_the_column_is_narrow ... ok
+test disclosed_prefix_marker_uses_raw_width_in_the_opening_budget ... ok
+test disclosed_quote_prefix_does_not_consume_list_prefix_as_quote ... ok
+test disclosed_quote_prefix_uses_quote_marker_after_leading_indent ... ok
+test disclosed_quote_prefix_uses_source_width_without_semantic_inset ... ok
+test disclosed_quote_prefix_width_is_included_in_list_body_geometry ... ok
+test disclosed_structural_prefix_width_is_included_in_list_body_geometry ... ok
+test disclosed_table_headers_keep_the_projected_header_state ... ok
+test disclosing_a_short_ordered_marker_drops_only_the_inactive_alignment_gap ... ok
+test empty_table_cells_keep_a_visible_row_for_editing ... ok
+test eof_caret_discloses_only_an_unterminated_table_delimiter ... ok
+test every_editable_source_offset_round_trips_through_the_layout ... ok
+test inactive_list_quote_places_inset_after_the_list_prefix ... ok
+test inactive_quote_wrap_width_reserves_semantic_inset ... ok
+test inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote ... ok
+test issue_14_table_example_reaches_every_visible_grid_row ... ok
+test lazy_continuation_image_keeps_quote_geometry ... ok
+test list_body_columns_are_shared_by_inactive_ordered_labels ... ok
+test list_body_columns_use_the_widest_actual_marker_label ... ok
+test list_continuations_and_wrapped_fragments_start_at_the_body_column ... ok
+test list_marker_body_gap_clicks_clamp_to_the_body_boundary ... ok
+test list_marker_body_gap_counts_against_the_opening_wrap_budget ... ok
+test list_marker_widths_cache_each_font_scale_once ... ok
+test long_japanese_text_without_spaces_wraps_at_the_column ... ok
+test long_wrapped_lines_reuse_all_boundaries_from_one_shape ... ok
+test mixed_script_and_emoji_wrap_without_panicking_or_splitting_a_char_boundary ... ok
+test multi_line_constructs_lay_out_one_row_per_source_line_when_they_fit ... ok
+test narrowing_the_column_rewraps_without_changing_the_source_it_covers ... ok
+test nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden ... ok
+test nested_rule_keeps_list_and_quote_geometry_when_collapsed_or_disclosed ... ok
+test opening_list_wrap_counts_the_marker_only_in_the_first_row_budget ... ok
+test readme_shortcut_table_keeps_text_in_all_three_columns ... ok
+test selection_is_painted_per_row ... ok
+test soft_wrapped_rows_tile_their_line_and_keep_the_break_kind ... ok
+test table_cell_fragments_wrap_visible_text_within_shared_columns ... ok
+test table_delimiter_ownership_is_half_open_at_the_first_body_byte ... ok
+test table_delimiter_stays_editable_and_restores_a_layout_row_when_disclosed ... ok
+test table_layout_compresses_overflowing_minimums_without_widening_the_panel ... ok
+test table_layout_distributes_available_width_between_minimum_and_preferred ... ok
+test table_layout_does_not_restore_cells_for_hidden_delimiter_rows ... ok
+test table_layout_keeps_shared_columns_when_the_widest_row_is_being_edited ... ok
+test table_layout_moves_directly_between_header_and_first_body_row ... ok
+test table_layout_restores_formal_cell_boundaries_for_shortened_inline_markup ... ok
+test table_layout_shares_cell_geometry_and_keeps_cell_hit_testing_local ... ok
+test table_layout_uses_formal_rows_outside_each_render_window ... ok
+test table_layout_uses_intrinsic_column_widths_without_filler_space ... ok
+test table_rows_use_fragment_y_for_caret_hit_testing_and_vertical_movement ... ok
+test the_first_and_last_row_report_the_block_edge ... ok
+test vertical_movement_follows_rows_and_keeps_the_preferred_x ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/line_break_whitespace.rs (target/debug/deps/line_break_whitespace-372e25cc82537ee2)
+
+running 1 test
+test commonmark_line_break_whitespace_preserves_source_and_container_semantics ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/markdown_features.rs (target/debug/deps/markdown_features-e40ecdb9304690a1)
+
+running 1 test
+test markdown_features_satisfy_the_shared_display_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/source_map_contract.rs (target/debug/deps/source_map_contract-fc8c1a02a80cf22d)
+
+running 9 tests
+test adjacent_hidden_list_and_heading_markers_normalize_stably ... ok
+test code_span_padding_hides_on_display_and_discloses_with_the_span ... ok
+test code_span_padding_is_left_alone_when_only_one_side_has_a_space ... ok
+test current_revision_local_presentation_wins_while_formal_context_is_stale ... ok
+test every_editable_source_boundary_round_trips_when_its_construct_is_disclosed ... ok
+test hidden_and_synthesized_positions_normalize_idempotently ... ok
+test table_body_terminal_boundary_discloses_the_body_without_disclosing_the_delimiter ... ok
+test unsupported_and_edge_constructs_never_lose_source ... ok
+test visual_click_and_drag_endpoints_produce_a_source_selection ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_session-d9a6fbe2b51ddcc8)
+
+running 106 tests
+test date_badge::tests::a_calendar_invalid_date_is_not_recognized ... ok
+test date_badge::tests::a_calendar_invalid_single_digit_hyphenated_date_is_not_recognized ... ok
+test date_badge::tests::a_compact_date_at_the_end_of_the_name_is_found ... ok
+test date_badge::tests::a_compact_date_at_the_start_of_the_name_is_found ... ok
+test date_badge::tests::a_date_embedded_in_a_longer_digit_run_is_not_recognized ... ok
+test date_badge::tests::a_date_in_the_middle_of_the_name_is_found ... ok
+test date_badge::tests::a_day_past_the_end_of_its_month_is_invalid ... ok
+test date_badge::tests::a_different_day_in_the_current_month_shows_day_and_weekday ... ok
+test date_badge::tests::a_different_month_in_the_current_year_shows_month_slash_day ... ok
+test date_badge::tests::a_file_name_without_a_date_is_not_recognized ... ok
+test date_badge::tests::a_hyphenated_date_at_the_end_of_the_name_is_found ... ok
+test date_badge::tests::a_hyphenated_date_at_the_start_of_the_name_is_found ... ok
+test date_badge::tests::a_hyphenated_date_with_single_digit_month_and_day_is_found ... ok
+test date_badge::tests::a_hyphenated_date_with_single_digit_month_and_two_digit_day_is_found ... ok
+test date_badge::tests::a_hyphenated_date_with_two_digit_month_and_day_is_found ... ok
+test date_badge::tests::a_hyphenated_date_with_two_digit_month_and_single_digit_day_is_found ... ok
+test date_badge::tests::a_leap_day_is_valid_only_in_a_leap_year ... ok
+test date_badge::tests::a_longer_month_digit_run_is_not_truncated_into_a_shorter_field ... ok
+test date_badge::tests::a_recent_past_date_across_the_year_boundary_shows_a_short_year_and_weekday ... ok
+test date_badge::tests::a_recent_past_date_in_the_previous_month_shows_month_slash_day_and_weekday ... ok
+test date_badge::tests::a_run_of_separators_around_the_date_is_trimmed_from_both_sides ... ok
+test date_badge::tests::a_single_digit_hyphenated_date_at_the_end_of_the_name_is_found ... ok
+test date_badge::tests::a_single_digit_hyphenated_date_in_the_middle_of_the_name_is_found ... ok
+test date_badge::tests::a_two_digit_day_is_not_truncated_into_a_one_digit_prefix ... ok
+test date_badge::tests::a_two_digit_day_prefix_that_would_be_calendar_invalid_alone_is_still_read_in_full ... ok
+test date_badge::tests::an_old_date_in_another_year_uses_a_short_year_without_a_weekday ... ok
+test date_badge::tests::date_badge_range_handles_month_year_and_other_buckets ... ok
+test date_badge::tests::date_badge_range_keeps_a_cross_month_calendar_week_together ... ok
+test date_badge::tests::date_badge_range_keeps_a_cross_year_calendar_week_together ... ok
+test date_badge::tests::date_badge_range_uses_monday_to_sunday_week ... ok
+test date_badge::tests::future_dates_never_show_a_weekday ... ok
+test date_badge::tests::known_reference_dates_land_on_their_known_weekday ... ok
+test date_badge::tests::month_end_boundary_clamps_to_the_previous_month_end ... ok
+test date_badge::tests::the_one_calendar_month_boundary_is_inclusive ... ok
+test date_badge::tests::the_remainder_joins_a_middle_date_split_with_a_single_space ... ok
+test date_badge::tests::the_remainder_joins_a_trailing_extension_directly_without_a_space ... ok
+test date_badge::tests::the_remainder_of_a_leading_date_is_just_the_rest_of_the_name ... ok
+test date_badge::tests::today_is_labeled_as_such ... ok
+test draft::tests::a_draft_that_fails_to_read_is_counted_as_failed_without_losing_the_others ... ok
+test draft::tests::a_folder_with_no_recovery_directory_recovers_to_nothing ... ok
+test draft::tests::a_written_draft_round_trips_through_recover ... ok
+test draft::tests::generated_ids_are_distinct_even_back_to_back ... ok
+test draft::tests::removing_a_draft_drops_it_from_recovery ... ok
+test draft::tests::removing_a_draft_that_was_never_written_is_not_an_error ... ok
+test draft::tests::rewriting_a_draft_keeps_one_file_with_the_latest_text ... ok
+test draft::tests::stray_non_draft_files_are_ignored_on_recovery ... ok
+test identity::tests::a_move_keeps_the_document_and_changes_only_the_path ... ok
+test identity::tests::different_files_never_match ... ok
+test identity::tests::spellings_of_one_path_share_an_identity ... ok
+test identity::tests::stamps_classify_external_changes ... ok
+test naming::tests::a_brand_new_note_with_a_title_creates_a_named_file ... ok
+test naming::tests::a_brand_new_note_with_no_title_yet_does_nothing ... ok
+test naming::tests::a_closing_atx_sequence_is_stripped ... ok
+test naming::tests::a_drifted_filename_stops_auto_management_instead_of_renaming ... ok
+test naming::tests::a_hash_glued_to_a_word_is_kept_not_treated_as_closing ... ok
+test naming::tests::a_non_auto_managed_existing_file_is_never_renamed ... ok
+test naming::tests::a_very_long_title_is_truncated ... ok
+test naming::tests::an_auto_managed_note_follows_its_h1 ... ok
+test naming::tests::an_empty_or_whitespace_only_document_has_no_title ... ok
+test naming::tests::an_unchanged_title_needs_no_rename ... ok
+test naming::tests::collision_resolution_is_a_no_op_when_the_plain_name_is_free ... ok
+test naming::tests::collision_resolution_picks_the_first_free_numbered_name ... ok
+test naming::tests::deleting_the_h1_keeps_the_current_name ... ok
+test naming::tests::dot_and_dotdot_titles_are_rejected ... ok
+test naming::tests::headings_inside_fenced_code_are_ignored ... ok
+test naming::tests::level_two_and_deeper_headings_are_not_titles ... ok
+test naming::tests::only_the_first_of_several_h1s_counts ... ok
+test naming::tests::path_separators_and_reserved_characters_are_replaced ... ok
+test naming::tests::the_first_h1_is_extracted_regardless_of_leading_blank_lines ... ok
+test naming::tests::unicode_and_emoji_titles_are_kept_as_is ... ok
+test resource::tests::an_untitled_document_does_not_borrow_the_working_directory ... ok
+test resource::tests::relative_destinations_resolve_against_the_document_directory ... ok
+test service::tests::a_case_only_file_rename_keeps_the_requested_spelling ... ok
+test service::tests::a_case_only_file_rename_works_on_case_insensitive_filesystems ... ok
+test service::tests::a_case_only_folder_rename_keeps_the_requested_spelling ... ok
+test service::tests::a_folder_rename_moves_descendants_without_replacing_an_existing_folder ... ok
+test service::tests::a_guarded_save_recreates_a_file_that_was_deleted ... ok
+test service::tests::a_guarded_save_refuses_to_overwrite_a_file_that_moved_on ... ok
+test service::tests::a_non_ascii_case_only_file_rename_keeps_the_requested_spelling ... ok
+test service::tests::a_rename_moves_the_file_on_the_real_filesystem ... ok
+test service::tests::a_rename_refuses_to_overwrite_an_existing_destination ... ok
+test service::tests::atomic_document_save_preserves_markdown_bytes ... ok
+test service::tests::japanese_filenames_and_paths_round_trip_on_the_real_filesystem ... ok
+test service::tests::round_trip_through_the_real_filesystem_keeps_identity_and_stamp ... ok
+test store::tests::default_folder_is_absent_until_set ... ok
+test store::tests::recent_files_are_deduplicated_and_bounded ... ok
+test store::tests::recent_files_follow_a_folder_rename_for_descendants_only ... ok
+test store::tests::recent_files_follow_renames_and_drop_deletions ... ok
+test store::tests::recent_path_escaping_round_trips ... ok
+test store::tests::settings_survive_a_store_reload ... ok
+test store::tests::stores_outlive_the_component_that_wrote_them ... ok
+test workfolder::tests::a_file_root_is_reported_as_an_error ... ok
+test workfolder::tests::a_missing_root_is_reported_as_an_error ... ok
+test workfolder::tests::an_empty_directory_scans_to_an_empty_work_folder ... ok
+test workfolder::tests::dotfile_directories_other_than_the_root_recovery_journal_are_still_scanned ... ok
+test workfolder::tests::empty_folders_are_discovered_and_kept_in_the_tree ... ok
+test workfolder::tests::inserting_a_folder_creates_missing_intermediate_folders ... ok
+test workfolder::tests::inserting_a_new_note_adds_it_in_sorted_position_without_a_rescan ... ok
+test workfolder::tests::inserting_an_already_present_path_does_not_duplicate_it ... ok
+test workfolder::tests::markdown_files_are_discovered_and_non_markdown_files_are_ignored ... ok
+test workfolder::tests::nested_files_appear_under_their_folder_node ... ok
+test workfolder::tests::renaming_a_folder_moves_its_descendant_paths_and_resorts_the_tree ... ok
+test workfolder::tests::renaming_a_folder_the_tree_was_not_scanned_with_is_a_no_op ... ok
+test workfolder::tests::renaming_a_path_the_folder_was_not_scanned_with_is_a_no_op ... ok
+test workfolder::tests::renaming_an_entry_follows_the_note_to_its_new_path_and_resorts ... ok
+test workfolder::tests::the_root_recovery_journal_directory_is_not_scanned ... ok
+
+test result: ok. 106 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/atx_editing.rs (target/debug/deps/atx_editing-881d2cd5a4886c8d)
+
+running 4 tests
+test changing_heading_levels_keeps_large_document_updates_local ... ok
+test heading_drag_selection_ime_and_save_reopen_preserve_spelling ... ok
+test normal_list_edit_ime_undo_redo_and_save_reopen_preserve_source ... ok
+test typing_and_removing_atx_markers_reparses_through_undo_and_redo ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/conflict_rules.rs (target/debug/deps/conflict_rules-b46f0492a97a1941)
+
+running 22 tests
+test a_delete_keeps_the_unsaved_document_and_a_save_recreates_the_file ... ok
+test a_failed_load_leaves_the_session_untouched ... ok
+test a_folder_rename_moves_only_the_open_sessions_under_it ... ok
+test a_rename_moves_the_session_without_touching_the_document ... ok
+test a_save_refuses_to_clobber_an_external_edit_until_the_user_says_so ... ok
+test a_write_that_outlives_its_document_is_dropped ... ok
+test an_external_edit_is_reloadable_only_while_the_session_has_nothing_to_lose ... ok
+test an_h1_driven_rename_carries_the_auto_title_and_leaves_the_document_untouched ... ok
+test an_untitled_session_never_autosaves_and_asks_for_a_path ... ok
+test autosave_only_fires_for_the_edit_that_armed_it ... ok
+test closing_refuses_to_drop_unsaved_work_and_never_empties_the_window ... ok
+test create_new_gives_an_untitled_note_its_first_h1_derived_name ... ok
+test create_new_refuses_to_overwrite_a_name_that_already_exists ... ok
+test events_for_other_files_leave_every_session_alone ... ok
+test h1_create_defers_while_a_manual_save_as_is_still_in_flight ... ok
+test one_write_runs_at_a_time_and_a_burst_collapses_to_the_last_target ... ok
+test opening_a_clean_session_reuses_it_and_invalidates_derived_state ... ok
+test opening_a_file_into_a_dirty_session_is_refused ... ok
+test opening_a_file_that_is_already_open_switches_instead_of_reloading ... ok
+test save_as_to_a_new_target_does_not_need_the_stamp_of_the_old_file ... ok
+test stopping_auto_naming_clears_the_tracked_title ... ok
+test switching_sessions_keeps_each_documents_own_state ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/work_folder_sidebar.rs (target/debug/deps/work_folder_sidebar-cc06b8380e4fb340)
+
+running 3 tests
+test a_sidebar_entry_not_yet_open_loads_into_a_session_of_its_own ... ok
+test reselecting_an_already_open_sidebar_entry_switches_without_reloading ... ok
+test switching_to_a_sidebar_entry_never_discards_a_dirty_session_elsewhere ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/hane_ui-55fa97e440e2a86a)
+
+running 199 tests
+test line::tests::a_bare_cr_paragraph_boundary_renders_its_own_blank_line_like_lf ... ok
+test line::tests::a_byte_large_low_line_count_paragraph_does_not_sync_parse_the_whole_block ... ok
+test line::tests::a_cached_whole_span_parse_resolves_a_huge_paragraphs_markers_regardless_of_scroll_position ... ok
+test line::tests::a_deeply_scrolled_huge_fenced_block_still_validates_its_closing_fence ... ok
+test line::tests::a_fenced_block_hides_its_delimiters_and_info_string ... ok
+test line::tests::a_fenced_block_presents_every_line_as_literal_code ... ok
+test line::tests::a_huge_joinable_paragraph_presents_only_its_visible_window_without_a_cached_parse ... ok
+test line::tests::a_leading_blank_line_before_the_first_block_does_not_misidentify_the_opening_fence ... ok
+test line::tests::a_marker_pair_far_apart_resolves_regardless_of_the_visible_window ... ok
+test line::tests::a_row_paints_only_its_own_stretch_of_the_line ... ok
+test line::tests::a_selected_code_segment_shows_the_selection_not_the_code_background ... ok
+test line::tests::a_selection_crossing_into_a_code_span_marks_the_overlap_as_both ... ok
+test line::tests::an_unselected_code_segment_keeps_its_code_background ... ok
+test line::tests::body_gap_is_inserted_before_terminal_caret_when_body_is_empty ... ok
+test line::tests::body_gap_is_inserted_once_when_body_has_multiple_paint_segments ... ok
+test line::tests::caret_mode_glyph_maps_known_modes_and_hides_unknown_state ... ok
+test line::tests::cjk_emphasis_is_italic_through_the_same_render_policy_as_ascii ... ok
+test line::tests::clipped_inactive_fences_do_not_reserve_virtual_space ... ok
+test line::tests::clipped_nested_fences_do_not_reserve_virtual_space ... ok
+test line::tests::document_end_belongs_to_the_final_line ... ok
+test line::tests::inactive_bare_fence_rows_have_zero_height_and_editing_restores_it ... ok
+test line::tests::list_body_boundary_splits_paint_segments_without_adding_text ... ok
+test line::tests::next_line_start_does_not_restore_the_previous_nested_fence_height ... ok
+test line::tests::only_a_break_the_source_makes_owns_the_caret_past_the_last_character ... ok
+test line::tests::phase3_line_discloses_only_the_active_construct ... ok
+test line::tests::quote_bar_insets_join_matching_visual_rows_only ... ok
+test line::tests::quote_bar_layout_joins_soft_wraps_but_not_a_quote_depth_change ... ok
+test line::tests::quote_bar_layout_keeps_separate_list_item_quotes_separate ... ok
+test line::tests::selection_and_ime_boundaries_split_only_the_affected_text ... ok
+test line::tests::shared_line_boundary_belongs_only_to_the_following_line ... ok
+test line::tests::trailing_empty_line_exclusively_owns_document_end ... ok
+test ranges::tests::clamps_deduplicates_and_discards_empty_ranges ... ok
+test ranges::tests::partitions_soft_wrapped_style_ranges_on_utf8_byte_boundaries ... ok
+test shape::tests::cjk_and_ascii_emphasis_produce_the_same_font_style_at_the_shape_rs_boundary ... ok
+test shape::tests::disclosed_table_header_uses_the_same_semibold_metrics_as_painted_text ... ok
+test view::panel_layout_tests::editor_scrollbar_drag_preserves_document_end_badge_clearance ... ok
+test view::panel_layout_tests::scrollbar_is_hidden_when_content_fits ... ok
+test view::panel_layout_tests::scrollbar_thumb_tracks_scroll_fraction ... ok
+test view::panel_layout_tests::sidebar_width_drag_respects_panel_limits ... ok
+test view::tests::a_block_taller_than_the_viewport_presents_only_the_visible_lines ... ok
+test view::tests::a_dirty_background_session_blocks_opening_a_different_folder ... ok
+test view::tests::a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped ... ok
+test view::tests::a_draft_recovery_warning_survives_opening_the_first_named_note ... ok
+test view::tests::a_large_list_viewport_keeps_formal_numbering_and_nesting ... ok
+test view::tests::a_late_list_code_row_keeps_formal_code_display ... ok
+test view::tests::a_late_list_code_row_keeps_literal_list_marker_visible ... ok
+test view::tests::a_late_list_code_row_keeps_literal_shorter_fence_visible ... ok
+test view::tests::a_late_list_continuation_keeps_formal_owner_and_structural_indent ... ok
+test view::tests::a_late_list_quote_code_row_keeps_the_formal_quote_owner ... ok
+test view::tests::a_late_nested_list_fence_uses_formal_markers_when_viewport_parse_misses_it ... ok
+test view::tests::a_late_quote_code_row_uses_formal_code_projection ... ok
+test view::tests::a_new_notes_first_h1_names_its_file ... ok
+test view::tests::a_new_notes_first_h1_names_its_file_inside_the_selected_folder ... ok
+test view::tests::a_new_work_folder_note_reveals_its_active_file_tab ... ok
+test view::tests::a_new_work_folder_note_starts_with_a_local_date_heading_and_caret_after_it ... ok
+test view::tests::a_newly_loaded_work_folder_file_reveals_its_active_file_tab ... ok
+test view::tests::a_partial_draft_recovery_failure_is_surfaced_while_readable_drafts_still_recover ... ok
+test view::tests::a_presented_block_carries_all_of_its_lines ... ok
+test view::tests::a_recovered_active_draft_reveals_its_file_tab ... ok
+test view::tests::a_same_line_multi_level_list_fence_uses_the_deepest_formal_marker ... ok
+test view::tests::a_same_line_nested_list_fence_keeps_the_formal_child_marker ... ok
+test view::tests::a_save_failure_after_a_draft_recovery_warning_is_still_visible ... ok
+test view::tests::a_second_new_folder_with_the_same_name_does_not_collide ... ok
+test view::tests::a_sibling_boundary_does_not_disclose_the_previous_formal_prefix ... ok
+test view::tests::a_stale_new_session_read_from_a_replaced_work_folder_is_discarded ... ok
+test view::tests::active_file_tab_foreground_is_readable_in_both_themes ... ok
+test view::tests::adjacent_links_boundary_lands_after_the_second_links_opening_marker ... ok
+test view::tests::an_existing_files_h1_is_never_auto_renamed ... ok
+test view::tests::apply_sidebar_date_badge_today_notifies_only_when_the_date_actually_changes ... ok
+test view::tests::background_collapse_snapshot_retries_when_caret_moves ... ok
+test view::tests::background_formal_parse_keeps_the_caret_owned_fence_block_visible ... ok
+test view::tests::background_formal_parse_rebuilds_heights_when_disclosure_moves_during_parse ... ok
+test view::tests::background_height_snapshot_must_match_the_current_line_height ... ok
+test view::tests::background_selection_height_snapshot_collapses_middle_blocks_when_selection_ends ... ok
+test view::tests::background_selection_height_snapshot_covers_the_selected_fence_range ... ok
+test view::tests::background_selection_snapshot_preserves_measured_height_and_cached_presentation ... ok
+test view::tests::block_context_rejects_stale_revision ... ok
+test view::tests::byte_large_low_line_count_block_receives_background_shared_semantics ... ok
+test view::tests::cache_invalidation_only_marks_intersecting_lines ... ok
+test view::tests::cached_block_reuses_a_joined_runs_presentation_across_frames ... ok
+test view::tests::caret_at_a_block_boundary_resolves_to_the_following_paragraph ... ok
+test view::tests::caret_moves_during_a_background_parse_shrink_each_previous_fence_endpoint ... ok
+test view::tests::clamp_and_snap_zoom_clamps_to_the_supported_range_and_snaps_the_100_percent_band ... ok
+test view::tests::clicking_active_draft_after_root_selection_restores_draft_focus ... ok
+test view::tests::clicking_inside_an_inline_rename_moves_the_caret_to_that_text_position ... ok
+test view::tests::clipped_nested_fence_window_uses_the_non_collapsed_source_prefix ... ok
+test view::tests::ctrl_wheel_zooms_while_plain_wheel_only_scrolls ... ok
+test view::tests::date_badge_palette_has_visible_steps_and_readable_light_text ... ok
+test view::tests::disclosures_are_current_reuses_a_joined_runs_shared_disclosure ... ok
+test view::tests::document_replacement_cancels_text_selection_autoscroll ... ok
+test view::tests::draft_save_survives_switching_sessions_within_the_debounce_window ... ok
+test view::tests::drag_selection_across_lines_keeps_the_original_anchor_with_sidebar_open ... ok
+test view::tests::drag_selection_autoscrolls_across_soft_wrapped_rows_in_one_source_line ... ok
+test view::tests::drag_selection_autoscrolls_down_while_held_near_the_bottom_edge_and_stops_on_mouse_up ... ok
+test view::tests::drag_selection_autoscrolls_up_toward_the_document_start_and_then_stops ... ok
+test view::tests::drag_selection_from_row_middle_extends_in_either_direction_with_sidebar_open ... ok
+test view::tests::drag_selection_from_row_start_lands_on_the_clicked_character_with_sidebar_open ... ok
+test view::tests::drag_selection_from_row_start_lands_on_the_clicked_character_without_a_sidebar ... ok
+test view::tests::drag_selection_lands_on_the_second_row_of_a_soft_wrapped_line_with_sidebar_open ... ok
+test view::tests::drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open ... ok
+test view::tests::editing_an_auto_managed_h1_keeps_the_note_in_its_own_folder ... ok
+test view::tests::editing_an_auto_managed_h1_renames_the_file ... ok
+test view::tests::empty_work_folder_has_no_active_sidebar_row ... ok
+test view::tests::every_line_resolves_to_its_markdown_block ... ok
+test view::tests::file_tab_context_menu_closes_with_escape_and_outside_click ... ok
+test view::tests::file_tab_context_menu_handles_an_untitled_session_without_spawning ... ok
+test view::tests::file_tabs_switch_sessions_and_keep_rear_tabs_reachable ... ok
+test view::tests::flush_pending_drafts_writes_immediately_without_waiting_for_the_debounce ... ok
+test view::tests::folder_rename_moves_open_file_and_save_follows_the_new_path ... ok
+test view::tests::folder_rename_path_rebasing_preserves_unrelated_ui_paths ... ok
+test view::tests::folder_rename_waits_for_an_unnamed_drafts_scheduled_title_sync ... ok
+test view::tests::footer_status_line_combines_warning_and_status_without_dropping_either ... ok
+test view::tests::height_anchor_rebases_without_scanning_untouched_blocks ... ok
+test view::tests::height_block_metadata_splices_across_chunk_boundaries ... ok
+test view::tests::height_remeasurement_cannot_leave_scroll_position_below_new_bottom ... ok
+test view::tests::hidden_closing_marker_boundary_lands_before_the_marker_across_a_joined_multiline_span ... ok
+test view::tests::hidden_closing_marker_boundary_lands_before_the_marker_not_after_it ... ok
+test view::tests::hidden_heading_marker_boundary_lands_after_the_marker_even_when_indented ... ok
+test view::tests::hidden_image_opening_marker_boundary_lands_after_the_marker ... ok
+test view::tests::hidden_list_marker_boundary_lands_after_the_marker_even_when_indented ... ok
+test view::tests::hidden_opening_marker_boundary_inside_a_quote_lands_after_the_marker ... ok
+test view::tests::hidden_opening_marker_boundary_lands_after_the_marker_not_before_it ... ok
+test view::tests::hidden_table_delimiter_maps_physical_lines_to_visible_rows ... ok
+test view::tests::incremental_height_splice_preserves_measured_height_outside_the_update ... ok
+test view::tests::initial_line_heights_become_block_heights_when_parse_publishes_after_caret_move ... ok
+test view::tests::inline_rename_enter_commits_ime_composition_before_the_rename ... ok
+test view::tests::inline_rename_escape_cancels_ime_composition_before_the_rename ... ok
+test view::tests::inline_rename_ime_selection_is_relative_to_the_inserted_text ... ok
+test view::tests::inline_rename_ime_selection_is_relative_to_the_marked_replacement ... ok
+test view::tests::inline_rename_keeps_markdown_extensions_out_of_the_editable_text ... ok
+test view::tests::inline_rename_movement_uses_grapheme_boundaries ... ok
+test view::tests::inline_rename_refuses_non_utf8_names_instead_of_replacing_bytes ... ok
+test view::tests::inline_rename_rejects_names_that_escape_the_parent_directory ... ok
+test view::tests::inline_rename_shift_home_and_end_extend_from_the_active_caret ... ok
+test view::tests::issue_14_table_example_paints_the_header_and_both_body_rows ... ok
+test view::tests::joined_parse_completion_does_not_clear_another_snapshots_pending_job ... ok
+test view::tests::joined_parse_completion_rejects_an_old_revision_without_evicting_current_rows ... ok
+test view::tests::joined_parse_completion_requires_the_current_block_identity_and_range ... ok
+test view::tests::joined_parse_work_is_bounded_across_scrolling_and_document_switches ... ok
+test view::tests::layout_cache_key_rejects_each_geometry_input_independently ... ok
+test view::tests::layout_click_mapping_preserves_collapsed_marker_affinity ... ok
+test view::tests::local_block_height_seed_matches_the_full_disclosure_projection ... ok
+test view::tests::local_fallback_resolves_the_fenced_block_before_a_formal_index_exists ... ok
+test view::tests::moving_away_from_a_hidden_fence_shrinks_the_previous_height ... ok
+test view::tests::moving_away_from_a_wrapped_fence_removes_all_measured_fragments ... ok
+test view::tests::moving_away_from_a_wrapped_table_delimiter_removes_all_measured_fragments ... ok
+test view::tests::moving_down_past_a_block_lands_on_the_first_row_of_the_next ... ok
+test view::tests::moving_down_through_forty_lines_leaves_room_for_the_caret_mode_badge ... ok
+test view::tests::moving_down_through_forty_lines_scrolls_cursor_to_viewport_bottom ... ok
+test view::tests::moving_into_a_hidden_closing_fence_rechecks_scroll_after_height_expands ... ok
+test view::tests::moving_into_a_joinable_neighbor_beyond_the_sync_budget_uses_the_cached_parse ... ok
+test view::tests::moving_to_document_end_leaves_room_for_the_caret_mode_badge_after_render ... ok
+test view::tests::moving_up_from_after_a_header_only_table_lands_on_the_header ... ok
+test view::tests::moving_up_from_after_a_table_preserves_its_trailing_blank_line ... ok
+test view::tests::moving_up_past_a_block_lands_on_its_last_row ... ok
+test view::tests::new_work_folder_folder_creates_a_folder_and_adds_it_to_the_tree_expanded ... ok
+test view::tests::one_block_covers_every_physical_line_of_its_construct ... ok
+test view::tests::opening_a_file_and_selecting_a_folder_never_both_show_selected ... ok
+test view::tests::pending_folder_rename_blocks_opening_an_old_child_path ... ok
+test view::tests::pending_inline_rename_blocks_file_tab_activation ... ok
+test view::tests::readme_shortcut_table_paints_text_in_all_three_columns ... ok
+test view::tests::reset_zoom_keystroke_restores_100_percent_after_zooming ... ok
+test view::tests::right_clicking_a_file_tab_targets_that_session_without_activating_it ... ok
+test view::tests::save_as_on_an_unnamed_note_starts_in_the_active_work_folder ... ok
+test view::tests::scroll_y_for_zoom_anchor_keeps_the_anchored_point_at_the_same_window_offset ... ok
+test view::tests::selecting_the_work_folder_root_after_a_subfolder_restores_it_as_the_target ... ok
+test view::tests::set_zoom_clamps_snaps_and_reset_zoom_restores_100_percent ... ok
+test view::tests::sidebar_click_during_pending_folder_rename_does_not_start_a_load ... ok
+test view::tests::sidebar_file_and_folder_double_click_start_inline_rename_but_root_does_not ... ok
+test view::tests::sidebar_file_f2_escape_and_enter_rename_without_touching_the_extension ... ok
+test view::tests::sidebar_file_filter_keeps_drafts_and_opens_a_visible_match ... ok
+test view::tests::sidebar_file_filter_reveals_matches_without_changing_normal_expansion ... ok
+test view::tests::sidebar_folder_f2_starts_inline_rename ... ok
+test view::tests::sidebar_scrollbar_element_is_hidden_at_rest_and_shown_during_a_drag ... ok
+test view::tests::sidebar_scrollbar_thumb_shows_on_scroll_and_hides_after_the_delay ... ok
+test view::tests::sidebar_scrolls_rows_without_moving_fixed_controls ... ok
+test view::tests::small_pinch_deltas_accumulate_before_the_100_percent_snap ... ok
+test view::tests::soft_wrap_boundary_at_a_collapsed_marker_resolves_by_the_clicked_row ... ok
+test view::tests::source_first_list_editing_commits_enter_and_immediate_tab ... ok
+test view::tests::source_first_list_editing_exits_list_after_empty_marker_backspace ... ok
+test view::tests::switch_to_work_folder_discards_previous_sessions_and_opens_the_new_root ... ok
+test view::tests::table_delimiter_stays_collapsed_at_the_first_body_byte ... ok
+test view::tests::table_mouse_hit_testing_uses_the_clicked_cell_fragment_y ... ok
+test view::tests::table_vertical_extension_skips_the_hidden_delimiter_row ... ok
+test view::tests::text_autoscroll_uses_the_nearest_edge_when_zones_overlap ... ok
+test view::tests::text_column_width_subtracts_sidebar_and_both_paddings ... ok
+test view::tests::the_date_badge_renders_before_the_remainder_only_on_the_left ... ok
+test view::tests::the_document_edges_have_no_neighbor_row ... ok
+test view::tests::trackpad_pinch_changes_zoom_and_clamps_extreme_input ... ok
+test view::tests::two_new_folder_clicks_before_the_first_completes_still_pick_different_names ... ok
+test view::tests::undo_is_blocked_while_inline_rename_is_active ... ok
+test view::tests::unresolved_mouse_down_does_not_start_text_selection_drag ... ok
+test view::tests::view_up_respects_table_neighbor_rows_and_trailing_blank_lines ... ok
+test view::tests::visible_line_prefix_inversion_skips_a_long_collapsed_fence_prefix ... ok
+test view::tests::visual_click_positions_map_back_to_source_offsets ... ok
+test view::tests::vscode_launch_command_keeps_the_path_as_one_argument ... ok
+test view::tests::zoom_factor_for_wheel_treats_pixel_deltas_as_lines_scaled_by_line_height ... ok
+test view::tests::zoom_factor_for_wheel_zooms_in_toward_the_document_start_and_out_the_other_way ... ok
+test view::tests::zoom_scales_the_painted_row_height ... ok
+
+test result: ok. 199 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.83s
+
+   Doc-tests hane_benchmark
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_document
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_editor
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_markdown
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_metrics
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_presentation
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_session
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests hane_ui
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

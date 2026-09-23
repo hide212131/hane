@@ -230,21 +230,21 @@ refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任
 
 ### 9.4 変更前の検証と残件
 
-検証対象は上記 `f82ecef...`、ローカルはmacOS Darwin 25.6.0 arm64、Rust 1.93.1（Homebrew）、Python 3.14.3。ローカル原ログは作業環境の `work/rf0-logs/` に保存した。ローカル実行結果はGitHub CIと区別する。
+検証対象は上記 `f82ecef0a64b9a728c97aa9048db4606f399d549`、ローカルはmacOS 26.6.2 (25G83) / Darwin 25.6.0 arm64、Rust/Cargo 1.93.1（Homebrew）、Python 3.14.3。[保存した検証証拠とコマンド・終了コード・除外情報の一覧](refactor-evidence/rf0-issue-298/README.md)を参照。2026年9月23日の元ログは作業環境の `work/rf0-logs/` にあり、リンク先は個人の絶対パスを除いた静的コピーである。この補完でテストを再実行していない。ローカル実行結果はGitHub CIと区別する。
 
 | 対象・コマンド | 結果と証拠 / 適用範囲 |
 |---|---|
-| `cargo test --workspace --all-features` | **失敗**。`hane-ui`より前の各suiteは成功したが、`hane-ui --lib`の199件が完走する前にSIGABRT（exit 101）。assert失敗はログにない。`cargo-test-all-features.log`。同コミットの`cargo test -p hane-ui --lib --all-features`も並列で再現（`hane-ui-parallel-repeat.log`）。macOSのcrash reportは両回ともHIToolboxの「Text Input Sources / Text Services Manager APIが複数threadから同時に呼ばれた」というabortを記録し、stackはGPUIの`mac_active_input_source_is_ascii_capable`→`EditorView::from_sessions`を指す。テスト並列性と製品動作の切り分けは未完。#298で追う。 |
-| `cargo test -p hane-ui --lib --all-features -- --test-threads=1` | **成功**、199件。`hane-ui-serial.log`。上の並列SIGABRTを解消した証拠ではない。 |
-| `cargo test --workspace --all-features -- --test-threads=1` | **成功**、workspace全suiteとdoc tests。`cargo-test-all-features-serial.log`。単一スレッド構成のみ。 |
-| `cargo test --workspace --locked -- --test-threads=1` | **成功**、通常featureのworkspace全suiteとdoc tests。`cargo-test-default-serial.log`。単一スレッド構成のみ。 |
-| CIのPython 6入口（`ci.yml`記載順） | **成功**。各コマンドexit 0、`test_rust_ci_path_filter.log`、`test_aadw_gui_command.log`、`test_hosted_code_block_gui.log`、`test_claude_failure_diagnostic.log`、`test_codex_usage_limit_fallback.log`、`test_release_version.log`。`test_codex_usage_limit_fallback.py`は成功時に出力しない。 |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **成功**。`cargo-clippy-all-features.log`。macOS all-targets/all-featuresの静的検査であり、Windows実行結果ではない。 |
-| vendor GPUI: `cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::text_system::tests` とCIの入力ソース切替テスト（`--exact`） | **成功**、前者7件、後者1件。`vendor-gpui-text-system.log`、`vendor-gpui-ime-source.log`。macOS native testだが実アプリでの日本語IME操作は別。 |
-| vendor pulldown-cmark: `cargo test --manifest-path vendor/pulldown-cmark/Cargo.toml --test errors` | repo内での直接実行は**実行環境の構成で失敗**（exit 101、workspace member/excludeではないためCargoが拒否）。同じvendor内容をrepo外の一時ディレクトリに複製して同じ`--test errors`を実行すると**25件成功**。`vendor-pulldown-errors.log`、`vendor-pulldown-isolated-errors.log`。workspace側の回帰テストも上のworkspace実行に含まれる。 |
-| release build、Windows実機/CI、実GUI・実IME、#23の性能測定 | **未実施**。macOS単体テストから実OS GUI・Windows・release性能を推定しない。担当は#298/#23/#313、変更領域で必要になる前。文書だけの本PRではGUI全件を提出条件にしない。 |
+| `cargo test --workspace --all-features` | **失敗、exit 101**。[全workspaceログ](refactor-evidence/rf0-issue-298/logs/cargo-test-all-features.log)では`hane-ui --lib`の199件が完走する前にSIGABRT。別実行の`cargo test -p hane-ui --lib --all-features`も**exit 101**で[再現](refactor-evidence/rf0-issue-298/logs/hane-ui-parallel-repeat.log)。対応するmacOS[最初のcrash抜粋](refactor-evidence/rf0-issue-298/crash/workspace-all-features.json)と[再現時の抜粋](refactor-evidence/rf0-issue-298/crash/ui-parallel-repeat.json)はHIToolboxの入力ソースAPI同時呼出、GPUI→`EditorView::from_sessions`のstackを記録。assert失敗ではなく、テスト並列性と製品動作の切り分けは未完。#298で追う。 |
+| `cargo test -p hane-ui --lib --all-features -- --test-threads=1` | **成功、exit 0、199件**。[UI単体ログ](refactor-evidence/rf0-issue-298/logs/hane-ui-serial.log)。単一スレッド条件であり、並列SIGABRTの解消とは扱わない。 |
+| `cargo test --workspace --all-features -- --test-threads=1` | **成功、exit 0**。[all-features単一スレッドログ](refactor-evidence/rf0-issue-298/logs/cargo-test-all-features-serial.log)にworkspace全suiteとdoc tests。 |
+| `cargo test --workspace --locked -- --test-threads=1` | **成功、exit 0**。[通常feature単一スレッドログ](refactor-evidence/rf0-issue-298/logs/cargo-test-default-serial.log)にworkspace全suiteとdoc tests。 |
+| CIのPython 6入口（`ci.yml`記載順） | ローカル実行は各**exit 0**。[path filter](refactor-evidence/rf0-issue-298/logs/test_rust_ci_path_filter.log)、[GUI command](refactor-evidence/rf0-issue-298/logs/test_aadw_gui_command.log)、[code block手順](refactor-evidence/rf0-issue-298/logs/test_hosted_code_block_gui.log)、[Claude診断](refactor-evidence/rf0-issue-298/logs/test_claude_failure_diagnostic.log)、[Codex fallback](refactor-evidence/rf0-issue-298/logs/test_codex_usage_limit_fallback.log)、[release version](refactor-evidence/rf0-issue-298/logs/test_release_version.log)。Codex fallbackの元ログは0 bytesで成功出力はない。コマンド全文と独立した[PR CIのPython job](https://github.com/hide212131/hane/actions/runs/35848315415/job/107139720924)は証拠一覧を参照。 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **成功、exit 0**。[clippyログ](refactor-evidence/rf0-issue-298/logs/cargo-clippy-all-features.log)。macOS all-targets/all-featuresの静的検査であり、Windows実行結果ではない。 |
+| vendor GPUI: macOS text system testと入力ソース切替test（コマンド全文は証拠一覧） | **成功、各exit 0**。[text system 7件](refactor-evidence/rf0-issue-298/logs/vendor-gpui-text-system.log)、[入力ソース切替1件](refactor-evidence/rf0-issue-298/logs/vendor-gpui-ime-source.log)。実アプリでの日本語IME操作は別。 |
+| vendor pulldown-cmark: repo内の`--test errors`と隔離コピーでの同test（コマンド全文は証拠一覧） | repo内直接実行はCargoのworkspace構成によりテスト起動前に**exit 101**。[直接実行ログ](refactor-evidence/rf0-issue-298/logs/vendor-pulldown-errors.log)。同じvendor内容のrepo外コピーでは**exit 0、25件**。[隔離実行ログ](refactor-evidence/rf0-issue-298/logs/vendor-pulldown-isolated-errors.log)。両結果を同一視しない。 |
+| release build、Windows実機/CI、実GUI・実IME、#23の性能測定 | **未実施、ログなし**。[証拠一覧の不足欄](refactor-evidence/rf0-issue-298/README.md#除外した情報と範囲)と[#23](https://github.com/hide212131/hane/issues/23)を参照。macOS単体テストからこれらを推定しない。担当は#298/#23/#313、変更領域で必要になる前。文書だけの本PRではGUI全件を提出条件にしない。 |
 
-`ci.yml`のRust jobは文書だけのPRではpath filterによりskipされ得る。本PRのCI全体が緑でも、この表のRust失敗や未実施を成功へ変更しない。PRのcurrent headとbaseをCI runで確認し、結果をIssueへ関連付ける。
+`ci.yml`のRust jobは文書だけのPRではpath filterによりskipされ得る。[PR #319の文書CI run](https://github.com/hide212131/hane/actions/runs/35848315415)はhead `2eeb94d92c85c99259c3becfab9902b79a34035d`、base `f82ecef0a64b9a728c97aa9048db4606f399d549`を対象にPython/path filterが成功し、macOS/WindowsのRust jobは**skip**された。この補完後のheadに対するCIは別のrunとして確認する。CI全体の緑をRust成功へ読み替えず、この表の失敗や未実施を変更しない。
 
 ### 9.5 #23へ渡す性能条件と限定引き渡し
 

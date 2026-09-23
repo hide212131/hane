@@ -1,0 +1,70 @@
+{
+  "source_report_sha256": "2111a31bc355ab8d5a43bc8cde6c9a616e520249ff54229ccbf85d32a50f077b",
+  "reported_at": "2026-09-23 19:15:55.00 +0900",
+  "os_version": "macOS 26.6.2 (25G83)",
+  "exception_type": "EXC_CRASH",
+  "signal": "SIGABRT",
+  "abort_message": [
+    "ABORT -> Text Input Sources or Text Services Manager API is being called in two threads concurrently. If you are a UI application, you must call TIS/TSM API on the main thread. If you are a non-UI application (such as a cmd-line tool or a launchagent that does not run an event loop), you must not call TIS/TSM API from multiple threads concurrently."
+  ],
+  "faulting_thread_frames": [
+    {
+      "symbol": "__pthread_kill"
+    },
+    {
+      "symbol": "pthread_kill"
+    },
+    {
+      "symbol": "abort"
+    },
+    {
+      "symbol": "islGetInputSourceListWithAdditions.cold.3"
+    },
+    {
+      "symbol": "islGetInputSourceListWithAdditions"
+    },
+    {
+      "symbol": "_HaveOnlyOneKeyboardInputSource"
+    },
+    {
+      "symbol": "isCreateCurrentKeyboardInputSourceRef.cold.1"
+    },
+    {
+      "symbol": "isCreateCurrentKeyboardInputSourceRef"
+    },
+    {
+      "symbol": "TSMCurrentKeyboardInputSourceRefCreate"
+    },
+    {
+      "symbol": "gpui::platform::mac::keyboard::mac_active_input_source_is_ascii_capable::h5b6e47014376d380"
+    },
+    {
+      "symbol": "gpui::platform::active_keyboard_input_mode::hccbad8b79132301b"
+    },
+    {
+      "symbol": "hane_ui::view::EditorView::from_sessions::h15f922718594b1d8",
+      "sourceFile": "view.rs",
+      "sourceLine": 2140
+    },
+    {
+      "symbol": "hane_ui::view::tests::a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped::__a_draft_recovery_failure_is_surfaced_instead_of_silently_dropped::_$u7b$$u7b$closure$u7d$$u7d$::h114ab8a9d09cfd59",
+      "sourceFile": "view.rs",
+      "sourceLine": 11684
+    },
+    {
+      "symbol": "_$LT$gpui..app..App$u20$as$u20$gpui..AppContext$GT$::new::_$u7b$$u7b$closure$u7d$$u7d$::hfe03b9a14dab83af",
+      "sourceFile": "app.rs",
+      "sourceLine": 2117
+    },
+    {
+      "symbol": "gpui::app::App::update::hf6a929cf52163c65",
+      "sourceFile": "app.rs",
+      "sourceLine": 761
+    },
+    {
+      "symbol": "_$LT$gpui..app..App$u20$as$u20$gpui..AppContext$GT$::new::h433e558f618da01d",
+      "sourceFile": "app.rs",
+      "sourceLine": 2114
+    }
+  ]
+}
