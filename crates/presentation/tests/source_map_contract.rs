@@ -1,6 +1,7 @@
 use hane_document::{Bias, Revision, SourceOffset, SourceRange};
 use hane_presentation::{
-    LineContext, Visibility, VisualOffset, present_markdown_with_disclosure, present_polished_line,
+    BlockKind, LineContext, Visibility, VisualOffset, present_markdown_with_disclosure,
+    present_polished_line,
 };
 
 fn char_boundaries(text: &str) -> impl Iterator<Item = usize> + '_ {
@@ -48,6 +49,49 @@ fn every_editable_source_boundary_round_trips_when_its_construct_is_disclosed() 
             );
         }
     }
+}
+
+#[test]
+fn table_body_terminal_boundary_discloses_the_body_without_disclosing_the_delimiter() {
+    let delimiter = "|:---|---:|\n";
+    let delimiter_range = SourceRange::new(17, 17 + delimiter.len());
+    let delimiter_line = present_polished_line(
+        1,
+        Revision(1),
+        delimiter_range,
+        delimiter,
+        26.0,
+        Some(SourceRange::empty(delimiter_range.end.0)),
+        LineContext::Table,
+    );
+    assert_eq!(delimiter_line.kind, BlockKind::TableDelimiter);
+
+    let body = "| 羽 | 3 |";
+    let body_range = SourceRange::new(delimiter_range.end.0, delimiter_range.end.0 + body.len());
+    let body_line = present_polished_line(
+        2,
+        Revision(1),
+        body_range,
+        body,
+        26.0,
+        Some(SourceRange::empty(body_range.end.0)),
+        LineContext::Table,
+    );
+    assert_eq!(body_line.visual_text, body);
+
+    let visual = body_line
+        .source_map
+        .source_to_visual(body_range.end, Bias::After)
+        .expect("the body terminal boundary must remain mapped")
+        .visual_offset;
+    assert_eq!(
+        body_line
+            .source_map
+            .visual_to_source(visual, Bias::After)
+            .expect("the body terminal visual boundary must remain mapped")
+            .source_offset,
+        body_range.end,
+    );
 }
 
 #[test]

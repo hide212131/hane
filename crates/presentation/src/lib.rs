@@ -3692,7 +3692,7 @@ fn present_polished_line_with_fence(
             list_projection.and_then(|projection| formal_quote_metadata(range, projection)),
         )
     } else if context == LineContext::Table
-        && disclosure.is_none_or(|active| !table_delimiter_is_disclosed(range, active))
+        && disclosure.is_none_or(|active| !disclosure_owns_physical_line(range, source, active))
     {
         present_table_line(
             line_id,
