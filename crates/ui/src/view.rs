@@ -13054,6 +13054,15 @@ mod tests {
         let text = "| header | value |\n| --- | --- |\n| body | cell |";
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
 
+        view.update(cx, |view, _| {
+            let document = view.editor().document().clone();
+            view.block_index.publish(
+                BlockIndex::from_buffer(&document),
+                IndexSource::Formal,
+                &document,
+            );
+        });
+
         view.read_with(cx, |view, _| {
             let index = view.current_index().expect("table index is ready");
             let block = index.block(0).expect("table block").clone();
