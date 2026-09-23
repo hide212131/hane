@@ -1,5 +1,7 @@
 name: AADW Claude Fix
 
+run-name: 'PR #${{ github.event.issue.number }} — ${{ github.event.issue.title }}'
+
 on:
   issue_comment:
     types: [created]
