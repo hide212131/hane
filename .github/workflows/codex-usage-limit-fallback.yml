@@ -1,6 +1,6 @@
 name: AADW Codex Usage Limit Fallback
 
-run-name: AADW Codex fallback for Claude run ${{ github.event.workflow_run.id }} attempt ${{ github.event.workflow_run.run_attempt }}
+run-name: 'Codex fallback — ${{ github.event.workflow_run.display_title }}'
 
 on:
   workflow_run:
