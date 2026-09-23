@@ -2264,7 +2264,10 @@ fn present_markdown_from_parse(
     }
     if let Some(projection) = shared.list_projection {
         for quote in projection.quotes_in(range) {
-            if quote.depth > quote_depth {
+            // A bounded viewport parse may already have selected a different
+            // owner at this depth. The formal projection is document-wide,
+            // so its owner is canonical even when the depth ties.
+            if quote.depth >= quote_depth {
                 quote_depth = quote.depth;
                 quote_owner = Some(quote.source_range);
             }
@@ -2277,7 +2280,9 @@ fn present_markdown_from_parse(
         let Some(depth) = marker.formal_quote_depth else {
             continue;
         };
-        if depth > quote_depth {
+        // Formal marker metadata has the same canonical-owner priority as the
+        // document-wide quote projection above.
+        if depth >= quote_depth {
             quote_depth = depth;
             quote_owner = Some(owner);
         }
@@ -4904,6 +4909,107 @@ mod tests {
                 .map(|quote| (quote.depth, quote.disclosed_depth)),
             Some((1, 0))
         );
+    }
+
+    #[test]
+    fn formal_quote_owner_wins_over_same_depth_viewport_owner_at_large_boundary() {
+        const SYNC_LINE_BUDGET: usize = 4_096;
+        const SYNC_BYTE_BUDGET: usize = 256 * 1024;
+
+        let cases = [
+            (
+                "line-large",
+                format!(
+                    "> opening\n{}> boundary\n![alt](dest)\n",
+                    "> filler\n".repeat(SYNC_LINE_BUDGET - 2)
+                ),
+            ),
+            (
+                "byte-large",
+                format!(
+                    "> opening\n> {}\n> boundary\n![alt](dest)\n",
+                    "x".repeat(SYNC_BYTE_BUDGET)
+                ),
+            ),
+        ];
+
+        for (case, source) in cases {
+            assert!(
+                source.lines().count() > SYNC_LINE_BUDGET
+                    || source.len() > SYNC_BYTE_BUDGET,
+                "{case} fixture must exceed a synchronous join budget"
+            );
+            let index = BlockIndex::build(Revision(1), &source);
+            let block = index.block(0).expect("quote block");
+            let projection = index
+                .list_projection(&block)
+                .expect("formal quote projection");
+
+            let image_start = source.rfind("![alt](dest)\n").expect("image line");
+            let boundary_start = source[..image_start]
+                .rfind("> boundary\n")
+                .expect("boundary line");
+            let boundary_line = source[..boundary_start]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+            let image_line = boundary_line + 1;
+            let boundary_range = SourceRange::new(boundary_start, image_start);
+            let image_range = SourceRange::new(image_start, source.len());
+            let lines = [
+                BlockLine {
+                    line: boundary_line,
+                    range: boundary_range,
+                    text: &source[boundary_start..image_start],
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: image_line,
+                    range: image_range,
+                    text: &source[image_start..],
+                    disclosure: None,
+                },
+            ];
+            let formal_owner = projection
+                .quotes_in(boundary_range)
+                .max_by_key(|quote| quote.depth)
+                .expect("formal owner for the boundary")
+                .source_range;
+            assert!(
+                formal_owner.start.0 < boundary_start,
+                "{case} must distinguish the document-wide owner from the viewport parse"
+            );
+            let visual = present_block_with_list_projection(
+                &block,
+                Revision(1),
+                &BlockWindow {
+                    span: 0..block.line_count,
+                    trailing_blank_lines: 0,
+                    lines: &lines,
+                    clipped_fence_lines: &[],
+                    zero_height_fence_rows_before: 0,
+                    zero_height_fence_rows_after: 0,
+                    render: boundary_line..image_line + 1,
+                    joined: None,
+                    block_disclosure: None,
+                },
+                26.0,
+                Some(projection),
+            );
+
+            assert_eq!(visual.lines.len(), 2, "{case} viewport lines");
+            assert_eq!(visual.lines[1].kind, BlockKind::Image, "{case} image line");
+            assert_eq!(
+                visual.lines[0].quote.map(|quote| quote.owner),
+                Some(formal_owner),
+                "{case} normal quote line must use the formal owner"
+            );
+            assert_eq!(
+                visual.lines[1].quote.map(|quote| quote.owner),
+                Some(formal_owner),
+                "{case} lazy continuation image must share the formal owner"
+            );
+        }
     }
 
     #[test]
