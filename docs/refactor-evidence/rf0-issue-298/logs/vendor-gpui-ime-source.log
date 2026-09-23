@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.57s
+     Running unittests src/gpui.rs (vendor/gpui/target/debug/deps/gpui-40c6b7d1afaa42b9)
+
+running 1 test
+test platform::mac::platform::tests::keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.05s
+

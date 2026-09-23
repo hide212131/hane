@@ -1,0 +1,41 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+     Running unittests src/lib.rs (target/debug/deps/hane_ui-0bb2952e4a9d6f06)
+
+running 199 tests
+test line::tests::a_bare_cr_paragraph_boundary_renders_its_own_blank_line_like_lf ... ok
+test line::tests::a_fenced_block_hides_its_delimiters_and_info_string ... ok
+test line::tests::a_leading_blank_line_before_the_first_block_does_not_misidentify_the_opening_fence ... ok
+test line::tests::a_fenced_block_presents_every_line_as_literal_code ... ok
+test line::tests::a_row_paints_only_its_own_stretch_of_the_line ... ok
+test line::tests::a_selected_code_segment_shows_the_selection_not_the_code_background ... ok
+test line::tests::a_selection_crossing_into_a_code_span_marks_the_overlap_as_both ... ok
+test line::tests::an_unselected_code_segment_keeps_its_code_background ... ok
+test line::tests::body_gap_is_inserted_before_terminal_caret_when_body_is_empty ... ok
+test line::tests::caret_mode_glyph_maps_known_modes_and_hides_unknown_state ... ok
+test line::tests::body_gap_is_inserted_once_when_body_has_multiple_paint_segments ... ok
+test line::tests::document_end_belongs_to_the_final_line ... ok
+test line::tests::list_body_boundary_splits_paint_segments_without_adding_text ... ok
+test line::tests::only_a_break_the_source_makes_owns_the_caret_past_the_last_character ... ok
+test line::tests::phase3_line_discloses_only_the_active_construct ... ok
+test line::tests::next_line_start_does_not_restore_the_previous_nested_fence_height ... ok
+test line::tests::clipped_inactive_fences_do_not_reserve_virtual_space ... ok
+test line::tests::cjk_emphasis_is_italic_through_the_same_render_policy_as_ascii ... ok
+test line::tests::quote_bar_layout_keeps_separate_list_item_quotes_separate ... ok
+test line::tests::quote_bar_layout_joins_soft_wraps_but_not_a_quote_depth_change ... ok
+test line::tests::inactive_bare_fence_rows_have_zero_height_and_editing_restores_it ... ok
+test line::tests::clipped_nested_fences_do_not_reserve_virtual_space ... ok
+test line::tests::quote_bar_insets_join_matching_visual_rows_only ... ok
+test line::tests::selection_and_ime_boundaries_split_only_the_affected_text ... ok
+test line::tests::shared_line_boundary_belongs_only_to_the_following_line ... ok
+test line::tests::trailing_empty_line_exclusively_owns_document_end ... ok
+test ranges::tests::clamps_deduplicates_and_discards_empty_ranges ... ok
+test ranges::tests::partitions_soft_wrapped_style_ranges_on_utf8_byte_boundaries ... ok
+test view::panel_layout_tests::scrollbar_is_hidden_when_content_fits ... ok
+test view::panel_layout_tests::editor_scrollbar_drag_preserves_document_end_badge_clearance ... ok
+test view::panel_layout_tests::scrollbar_thumb_tracks_scroll_fraction ... ok
+test view::panel_layout_tests::sidebar_width_drag_respects_panel_limits ... ok
+test line::tests::a_marker_pair_far_apart_resolves_regardless_of_the_visible_window ... ok
+error: test failed, to rerun pass `-p hane-ui --lib`
+
+Caused by:
+  process didn't exit successfully: `<repo>/target/debug/deps/hane_ui-0bb2952e4a9d6f06` (signal: 6, SIGABRT: process abort signal)

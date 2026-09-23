@@ -1,0 +1,56 @@
+    Updating crates.io index
+     Locking 22 packages to latest compatible versions
+      Adding bincode v1.3.3 (available: v3.0.0)
+ Downloading crates ...
+  Downloaded bincode v1.3.3
+  Downloaded bitflags v2.13.2
+   Compiling memchr v2.8.3
+   Compiling serde_core v1.0.229
+   Compiling unicode-width v0.2.2
+   Compiling pulldown-cmark v0.13.4 (<isolated-vendor-copy>)
+   Compiling serde v1.0.229
+   Compiling zmij v1.0.23
+   Compiling bitflags v2.13.2
+   Compiling pulldown-cmark-escape v0.11.0
+   Compiling regex-syntax v0.8.11
+   Compiling unicase v2.9.0
+   Compiling serde_json v1.0.151
+   Compiling itoa v1.0.18
+   Compiling lazy_static v1.5.0
+   Compiling getopts v0.2.24
+   Compiling aho-corasick v1.1.5
+   Compiling regex-automata v0.4.18
+   Compiling bincode v1.3.3
+   Compiling regex v1.13.1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.15s
+     Running tests/errors.rs (<isolated-vendor-copy>/target/debug/deps/errors-e697316b5f8c0f6b)
+
+running 25 tests
+test code_span_line_endings_normalize_once_and_preserve_source_offsets ... ok
+test hard_break_needs_two_trailing_spaces_not_tabs ... ok
+test test_bad_slice_a ... ok
+test test_bad_slice_unicode ... ok
+test test_fuzzer_input_1 ... ok
+test test_bad_slice_b ... ok
+test test_fuzzer_input_10 ... ok
+test test_fuzzer_input_11 ... ok
+test test_fuzzer_input_12 ... ok
+test test_fuzzer_input_13 ... ok
+test test_fuzzer_input_2 ... ok
+test test_fuzzer_input_3 ... ok
+test test_fuzzer_input_4 ... ok
+test test_fuzzer_input_5 ... ok
+test test_fuzzer_input_6 ... ok
+test test_fuzzer_input_7 ... ok
+test test_fuzzer_input_8 ... ok
+test test_fuzzer_input_9 ... ok
+test test_html_tag ... ok
+test test_infinite_loop ... ok
+test test_lists_inside_code_spans ... ok
+test test_simd_wrapping_shr_issue_651 ... ok
+test test_unterminated_autolink ... ok
+test test_unterminated_link ... ok
+test test_wrong_code_block ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
