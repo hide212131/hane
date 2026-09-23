@@ -438,6 +438,8 @@ impl BlockLayout {
 
     /// Height of the rows one presented line occupies. A wrapped line is taller
     /// than one row, which is what the line-granularity height index needs.
+    /// A zero result means the physical line is inactive structural markup
+    /// (for example a fence or table delimiter), not a visual row.
     pub fn line_height_of(&self, line: usize) -> f32 {
         self.lines
             .iter()
@@ -762,13 +764,20 @@ impl BlockLayout {
 
 /// Block-local visual offset the presented line at `index` starts at.
 ///
-/// Each line contributes its visual text plus one position for the break that
-/// follows it, so a block-local offset names a position in the block without
-/// naming a line, and offsets stay ordered across lines.
+/// Each visible line contributes its visual text plus one position for the
+/// break that follows it. An inactive table delimiter contributes neither, so
+/// a block-local offset names a position in the visual block without naming a
+/// hidden source row, and offsets stay ordered across visible lines.
 pub fn line_visual_start(block: &VisualBlock, index: usize) -> usize {
     block.lines[..index.min(block.lines.len())]
         .iter()
-        .map(|line| line.visual_text.len() + 1)
+        .map(|line| {
+            if line.kind == BlockKind::TableDelimiter {
+                0
+            } else {
+                line.visual_text.len() + 1
+            }
+        })
         .sum()
 }
 
@@ -899,6 +908,9 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
+        if line.kind == BlockKind::TableDelimiter {
+            continue;
+        }
         if line.table_row.is_none() {
             if let Some(cells) = editing_table_cells(line, block.table_projection.as_ref()) {
                 let block_start = line_visual_start(block, index);

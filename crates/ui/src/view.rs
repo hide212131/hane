@@ -58,7 +58,8 @@ use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_heights_with_disclosure, block_is_joinable, block_line_span,
-    code_line_height, layout_block, parse_joined_span, trailing_blank_lines,
+    code_line_height, layout_block, parse_joined_span, table_delimiter_is_collapsed,
+    trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -4329,7 +4330,40 @@ impl EditorView {
     ) -> Option<(VisualBlock, BlockLayout)> {
         let indexed = self.block_at_offset(offset)?;
         let line = self.editor().document().line_for_offset(offset).ok()?.0;
-        let window = line.saturating_sub(1)..line + 2;
+        let mut window_start = line.saturating_sub(1);
+        let mut window_end = line + 2;
+        if let Some(table) = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed))
+        {
+            let header_line = table
+                .rows
+                .iter()
+                .find(|row| row.header)
+                .and_then(|row| {
+                    self.editor()
+                        .document()
+                        .line_for_offset(row.source_range.start)
+                        .ok()
+                })
+                .map(|line| line.0);
+            let first_body_line = table
+                .rows
+                .iter()
+                .find(|row| !row.header)
+                .and_then(|row| {
+                    self.editor()
+                        .document()
+                        .line_for_offset(row.source_range.start)
+                        .ok()
+                })
+                .map(|line| line.0);
+            if header_line == Some(line) || first_body_line == Some(line) {
+                window_start = window_start.min(header_line.unwrap_or(line));
+                window_end = window_end.max(first_body_line.map_or(line + 1, |line| line + 1));
+            }
+        }
+        let window = window_start..window_end;
         let drawn = self
             .block_cache
             .get(&indexed.id)
@@ -4562,11 +4596,11 @@ impl EditorView {
         }
     }
 
-    /// Keeps the active endpoint's fence block in the height index before the
-    /// caret-scroll calculation runs. A caret move does not change the block
-    /// count, so `resync_heights` quite deliberately keeps its measured index;
-    /// that fast path must still expand a zero-height block that was just made
-    /// editable or it can disappear from the next virtualization window.
+    /// Keeps the active endpoint's structural rows in the height index before
+    /// the caret-scroll calculation runs. A caret move does not change the
+    /// block count, so `resync_heights` quite deliberately keeps its measured
+    /// index; that fast path must still expand a zero-height row that was just
+    /// made editable or it can disappear from the next virtualization window.
     ///
     /// A non-empty selection is different: its complete disclosure is rebuilt
     /// by the coalesced background parse. Updating every block it spans here
@@ -4625,43 +4659,73 @@ impl EditorView {
             .into_iter()
             .filter_map(|ordinal| {
                 let block = index.block(ordinal)?;
-                let projection = index.fence_height_projection(&block)?;
                 let block_is_final = ordinal + 1 == index.len();
-                let collapsed = projection.inactive_rows_in(
-                    block.source_range,
-                    block.source_range,
-                    Some(disclosure),
-                    block_is_final,
-                );
+                let fence_projection = index.fence_height_projection(&block);
+                let table_projection = index.table_projection(&block);
+                if fence_projection.is_none() && table_projection.is_none() {
+                    return None;
+                }
+                let collapsed_fence = fence_projection.map_or(0, |projection| {
+                    projection.inactive_rows_in(
+                        block.source_range,
+                        block.source_range,
+                        Some(disclosure),
+                        block_is_final,
+                    )
+                });
+                let collapsed_table = table_projection
+                    .filter(|projection| {
+                        table_delimiter_is_collapsed(projection, Some(disclosure))
+                    })
+                    .map_or(0, |_| 1);
+                let collapsed = collapsed_fence + collapsed_table;
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
                 let current = self.heights.height(ordinal)?;
                 let target = previous.map_or_else(
                     || current.max(minimum),
                     |previous| {
-                        let previous_collapsed = projection.inactive_rows_in(
-                            block.source_range,
-                            block.source_range,
-                            Some(previous),
-                            block_is_final,
-                        );
+                        let previous_collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(previous),
+                                block_is_final,
+                            )
+                        });
+                        let previous_collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(previous))
+                            })
+                            .map_or(0, |_| 1);
                         // `current` may be a measured layout height: a code
                         // row is taller than the plain line-height seed. Move
-                        // only the fence-row delta between disclosures so the
+                        // only the structural-row delta between disclosures so
                         // measured body rows stay measured instead of being
                         // replaced by an arithmetic lower bound.
-                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
-                        let fence_height_delta = self.fence_height_delta(
-                            &block,
-                            projection,
-                            Some(previous),
-                            Some(disclosure),
-                            collapsed_delta,
-                            line_height,
-                        );
+                        let fence_height_delta = fence_projection.map_or(0.0, |projection| {
+                            self.fence_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_fence as f32 - previous_collapsed_fence as f32,
+                                line_height,
+                            )
+                        });
+                        let table_height_delta = table_projection.map_or(0.0, |projection| {
+                            self.table_delimiter_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_table as f32 - previous_collapsed_table as f32,
+                                line_height,
+                            )
+                        });
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            fence_height_delta,
+                            fence_height_delta + table_height_delta,
                         )
                     },
                 );
@@ -4763,10 +4827,86 @@ impl EditorView {
         baseline + correction
     }
 
+    /// Returns the amount of height that changes when the table delimiter's
+    /// disclosure changes. The arithmetic projection supplies one ordinary
+    /// line as the bounded fallback, while a cached layout from the expanded
+    /// state supplies the delimiter's actual wrapped height when available.
+    fn table_delimiter_height_delta(
+        &self,
+        block: &IndexedBlock,
+        projection: &TableProjection,
+        previous: Option<SourceRange>,
+        current: Option<SourceRange>,
+        collapsed_delta: f32,
+        line_height: f32,
+    ) -> f32 {
+        let baseline = line_height * collapsed_delta;
+        let Some(delimiter_range) = projection.delimiter_range else {
+            return baseline;
+        };
+        let Some(visual) = self.block_cache.get(&block.id) else {
+            return baseline;
+        };
+        let Some(layout) = self.layout_cache.get(&block.id) else {
+            return baseline;
+        };
+        if !layout.is_valid(
+            self.content_width,
+            self.layout_font_revision,
+            self.editor().document().revision(),
+        ) {
+            return baseline;
+        }
+        let Some(block_lines) = block_line_span(self.editor().document(), block) else {
+            return baseline;
+        };
+        let Some(delimiter_line) = self
+            .editor()
+            .document()
+            .line_for_offset(delimiter_range.start)
+            .ok()
+            .map(|line| line.0)
+        else {
+            return baseline;
+        };
+        let first_presented_line = visual.span.start + visual.lines_before;
+        let Some(measured) = layout
+            .layout
+            .lines
+            .iter()
+            .find(|row| {
+                first_presented_line + row.line == delimiter_line
+                    && delimiter_line >= block_lines.start
+                    && delimiter_line < block_lines.end
+            })
+            .map(|row| layout.layout.line_height_of(row.line))
+            .filter(|height| *height > 0.0)
+        else {
+            return baseline;
+        };
+        let was_collapsed = previous.is_none_or(|active| {
+            table_delimiter_is_collapsed(projection, Some(active))
+        });
+        let is_collapsed = current.is_none_or(|active| {
+            table_delimiter_is_collapsed(projection, Some(active))
+        });
+        if was_collapsed == is_collapsed {
+            return baseline;
+        }
+        let measured_delta = measured - line_height;
+        baseline
+            + if is_collapsed {
+                measured_delta
+            } else {
+                -measured_delta
+            }
+    }
+
     /// Applies a disclosure-only height snapshot without replacing measured
     /// block geometry. The formal index is already current when this runs, so
-    /// the old and new fence projections describe the same block ids; only the
-    /// structural fence-row delta needs to move each measured height. The
+    /// the old and new structural projections describe the same block ids; only the
+    /// structural fence or table-delimiter delta needs to move each measured
+    /// height. The
     /// snapshot itself supplies the arithmetic minimum for blocks that have
     /// not been laid out yet.
     fn install_disclosure_heights_preserving_measurements(
@@ -4802,46 +4942,58 @@ impl EditorView {
                     || current.max(minimum),
                     |previous| {
                         let block_is_final = ordinal + 1 == index.len();
-                        let collapsed =
-                            index
-                                .fence_height_projection(&block)
-                                .map_or(0, |projection| {
-                                    projection.inactive_rows_in(
-                                        block.source_range,
-                                        block.source_range,
-                                        Some(disclosure),
-                                        block_is_final,
-                                    )
-                                });
-                        let previous_collapsed =
-                            index
-                                .fence_height_projection(&block)
-                                .map_or(0, |projection| {
-                                    projection.inactive_rows_in(
-                                        block.source_range,
-                                        block.source_range,
-                                        Some(previous),
-                                        block_is_final,
-                                    )
-                                });
-                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
-                        let fence_height_delta = index.fence_height_projection(&block).map_or(
-                            code_line_height(line_height) * collapsed_delta,
-                            |projection| {
-                                self.fence_height_delta(
-                                    &block,
-                                    projection,
-                                    Some(previous),
-                                    Some(disclosure),
-                                    collapsed_delta,
-                                    line_height,
-                                )
-                            },
-                        );
+                        let fence_projection = index.fence_height_projection(&block);
+                        let table_projection = index.table_projection(&block);
+                        let collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(disclosure),
+                                block_is_final,
+                            )
+                        });
+                        let previous_collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(previous),
+                                block_is_final,
+                            )
+                        });
+                        let collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(disclosure))
+                            })
+                            .map_or(0, |_| 1);
+                        let previous_collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(previous))
+                            })
+                            .map_or(0, |_| 1);
+                        let fence_height_delta = fence_projection.map_or(0.0, |projection| {
+                            self.fence_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_fence as f32 - previous_collapsed_fence as f32,
+                                line_height,
+                            )
+                        });
+                        let table_height_delta = table_projection.map_or(0.0, |projection| {
+                            self.table_delimiter_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_table as f32 - previous_collapsed_table as f32,
+                                line_height,
+                            )
+                        });
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            fence_height_delta,
+                            fence_height_delta + table_height_delta,
                         )
                     },
                 );
@@ -4977,10 +5129,16 @@ impl EditorView {
             (id, ordinal, intra)
         });
         let line_height = self.line_height();
+        let initial_heights = block_heights_with_disclosure(
+            self.editor().document(),
+            index,
+            line_height,
+            self.active_height_disclosure(),
+        );
         self.heights.splice(
             first..old_end,
-            next.iter()
-                .map(|block| line_height * block.line_count as f32),
+            (first..first + update.inserted_blocks)
+                .filter_map(|ordinal| initial_heights.get(ordinal).copied()),
         );
         self.height_blocks.splice(first..old_end, &next);
 
@@ -5051,23 +5209,40 @@ impl EditorView {
     }
 
     /// Number of non-collapsed physical lines before `physical_line` inside a
-    /// block. Fence rows are answered by the formal projection's prefix index;
-    /// the render path never enumerates the block's off-screen fences.
+    /// block. Fence rows are answered by the formal projection's prefix index,
+    /// and an inactive table delimiter is omitted from the same visual prefix;
+    /// the render path never enumerates off-screen structural rows.
     fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
         let Some(index) = self.current_index() else {
             return physical_line;
         };
-        let Some(projection) = index.fence_height_projection(block) else {
-            return physical_line;
-        };
         let block_is_final = block.ordinal + 1 == index.len();
-        let collapsed = projection.inactive_rows_before_line(
-            block.source_range,
-            physical_line,
-            self.active_height_disclosure(),
-            block_is_final,
-        );
-        physical_line.saturating_sub(collapsed)
+        let collapsed_fence_rows = index
+            .fence_height_projection(block)
+            .map_or(0, |projection| {
+                projection.inactive_rows_before_line(
+                    block.source_range,
+                    physical_line,
+                    self.active_height_disclosure(),
+                    block_is_final,
+                )
+            });
+        let delimiter_line = index
+            .table_projection(block)
+            .and_then(|projection| projection.delimiter_range)
+            .and_then(|range| self.editor().document().line_for_offset(range.start).ok())
+            .and_then(|line| {
+                block_line_span(self.editor().document(), block)
+                    .map(|span| line.0.saturating_sub(span.start))
+            });
+        let collapsed_table_delimiter = index
+            .table_projection(block)
+            .filter(|projection| {
+                table_delimiter_is_collapsed(projection, self.active_height_disclosure())
+            })
+            .filter(|_| delimiter_line.is_some_and(|delimiter| delimiter < physical_line))
+            .map_or(0, |_| 1);
+        physical_line.saturating_sub(collapsed_fence_rows + collapsed_table_delimiter)
     }
 
     /// Inverts [`Self::visible_line_prefix`] for a visual row count. The
@@ -5363,7 +5538,19 @@ fn neighbor_block_window(
     let window = if down {
         span.start..span.start + 1
     } else {
-        span.end.saturating_sub(1)..span.end
+        // A table's formal delimiter is a source line but not a visual row
+        // while inactive. When the table has no body rows, the physical last
+        // line is therefore the only hidden delimiter and laying out that
+        // one-line window leaves no target at all. The formal projection owns
+        // the visible table rows, so use its last row for upward movement;
+        // this also avoids landing on tiled trailing blank lines.
+        let last_visible_table_line = index
+            .and_then(|index| index.table_projection(&indexed))
+            .and_then(|projection| projection.rows.last())
+            .and_then(|row| document.line_for_offset(row.source_range.start).ok())
+            .map(|line| line.0);
+        let line = last_visible_table_line.unwrap_or_else(|| span.end.saturating_sub(1));
+        line..line + 1
     };
     Some((indexed, window))
 }
@@ -6512,6 +6699,7 @@ impl Render for EditorView {
                                     let line = row.line_id as usize;
                                     let fragment = row.line_visual_range.clone();
                                     let dragged = fragment.clone();
+                                    let table_row = !row.table_cells.is_empty();
                                     row_element(
                                         editor,
                                         &visual,
@@ -6527,7 +6715,16 @@ impl Render for EditorView {
                                     // painted window bounds via `VisualTestContext::debug_bounds`
                                     // instead of duplicating the render-time offset math. A
                                     // no-op outside test builds.
-                                    .debug_selector(move || format!("row-{line}-{row_index}"))
+                                    // The layout row index is dense over painted rows, so an
+                                    // inactive table delimiter makes the body row at physical
+                                    // line 2 become layout row 1. Keep the test/debug identity
+                                    // tied to the source line for table rows; otherwise callers
+                                    // cannot address the row that was actually painted through
+                                    // the same physical-line identity used by hit testing.
+                                    .debug_selector(move || {
+                                        let debug_row = if table_row { line } else { row_index };
+                                        format!("row-{line}-{debug_row}")
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |view, event, window, cx| {
@@ -8012,6 +8209,39 @@ mod tests {
     }
 
     #[test]
+    fn table_delimiter_stays_collapsed_at_the_first_body_byte() {
+        let source = "| header | value |\n| --- | --- |\n| body | cell |";
+        let mut editor = Editor::new(source);
+        let body_start = source.find("| body").expect("body row");
+        editor
+            .set_selection(Selection::caret(SourceOffset(body_start)))
+            .unwrap();
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("table block");
+        let span = block_line_span(editor.document(), &block).expect("table span");
+        let projection = index.table_projection(&block).expect("table projection");
+        let visual = presented_block_with_table_projection(
+            &editor,
+            &block,
+            &span,
+            None,
+            None,
+            None,
+            Some(projection),
+            DEFAULT_LINE_HEIGHT,
+        )
+        .expect("table presentation");
+        let delimiter = visual
+            .lines
+            .iter()
+            .find(|line| line.line_id == 1)
+            .expect("delimiter line");
+
+        assert_eq!(delimiter.kind, BlockKind::TableDelimiter);
+        assert!(delimiter.visual_text.is_empty());
+    }
+
+    #[test]
     fn visual_click_positions_map_back_to_source_offsets() {
         let editor = Editor::new("ab🙂\n\n**bold**");
         let lines = presented_lines(&editor);
@@ -8650,6 +8880,101 @@ mod tests {
             assert!(
                 (actual - expected).abs() < 0.001,
                 "all wrapped fence fragments must be removed: actual {actual}, expected {expected}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn moving_away_from_a_wrapped_table_delimiter_removes_all_measured_fragments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let delimiter_cell = "-".repeat(96);
+        let text = format!(
+            "| header | value |\n| {delimiter_cell} | {delimiter_cell} |\n| body | cell |\n\nplain"
+        );
+        let delimiter_offset = text
+            .find(delimiter_cell.as_str())
+            .expect("table delimiter")
+            + 1;
+        let plain = text.find("plain").expect("tail paragraph");
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
+
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(delimiter_offset)))
+                .unwrap();
+            let block = view
+                .current_index()
+                .and_then(|index| index.block_at(SourceOffset(delimiter_offset)))
+                .expect("table block");
+            let span = block_line_span(&document, &block).expect("table block lines");
+            let projection = view
+                .current_index()
+                .and_then(|index| index.table_projection(&block))
+                .expect("table projection");
+            let width = 80.0;
+            let visual = presented_block_with_table_projection(
+                view.editor(),
+                &block,
+                &span,
+                None,
+                None,
+                None,
+                Some(projection),
+                view.line_height(),
+            )
+            .expect("active table presentation");
+            let layout = layout_block(&visual, width, &FixedAdvanceShaper::new(8.0));
+            let delimiter_line = visual
+                .lines
+                .iter()
+                .position(|line| {
+                    line.source_range.start <= SourceOffset(delimiter_offset)
+                        && SourceOffset(delimiter_offset) < line.source_range.end
+                })
+                .expect("disclosed delimiter line");
+            let measured_delimiter_height = layout.line_height_of(delimiter_line);
+            assert!(
+                measured_delimiter_height > view.line_height(),
+                "the long disclosed delimiter must occupy multiple wrapped rows"
+            );
+            let measured_block_height = layout.height();
+
+            view.content_width = width;
+            view.block_cache.insert(block.id, visual);
+            view.layout_cache.insert(
+                block.id,
+                LayoutCacheEntry {
+                    layout,
+                    font_revision: view.layout_font_revision,
+                },
+            );
+            let active = block_heights_with_disclosure(
+                &document,
+                view.current_index().unwrap(),
+                view.line_height(),
+                Some(SourceRange::empty(delimiter_offset)),
+            );
+            view.install_heights(Granularity::Blocks, HeightIndex::new(active));
+            view.heights.update(block.ordinal, measured_block_height);
+
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(plain)))
+                .unwrap();
+            view.after_input(cx);
+
+            let expected = measured_block_height - measured_delimiter_height;
+            let actual = view
+                .heights
+                .height(block.ordinal)
+                .expect("updated block height");
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "all wrapped table delimiter fragments must be removed: actual {actual}, expected {expected}"
             );
         });
     }
@@ -10413,6 +10738,91 @@ mod tests {
             (0, x),
             "the caret lands on the first row of the next block, at the x it was aiming at"
         );
+    }
+
+    #[test]
+    fn table_vertical_extension_skips_the_hidden_delimiter_row() {
+        let source = "| h | v |\n| --- | --- |\n| b | c |";
+        let mut editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (block, layout) = laid_out(&editor, &index, 0, &shaper);
+        let header = SourceOffset(source.find("h").expect("header cell"));
+        let body = SourceOffset(source.find("b").expect("body cell"));
+        let header_point = layout
+            .point_for_source(&block, header, &shaper)
+            .expect("header point");
+        let body_point = layout
+            .point_for_source(&block, body, &shaper)
+            .expect("body point");
+        let VerticalMove::To(down) =
+            layout.vertical_target(&block, header, true, header_point.x, &shaper)
+        else {
+            panic!("shift-down from the header must enter the first body row");
+        };
+        assert_eq!(
+            layout
+                .row_for_source(down)
+                .map(|row| layout.lines[row].line_id),
+            Some(2)
+        );
+        editor
+            .set_selection(Selection::caret(header))
+            .expect("header selection");
+        editor
+            .move_vertical_to(down, true, header_point.x)
+            .expect("shift-down target");
+        assert_eq!(editor.selection().active, down);
+        assert_eq!(editor.selection().range(), SourceRange::new(header.0, down.0));
+
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(body))
+            .expect("body selection");
+        let VerticalMove::To(up) =
+            layout.vertical_target(&block, body, false, body_point.x, &shaper)
+        else {
+            panic!("shift-up from the first body row must enter the header");
+        };
+        assert_eq!(
+            layout
+                .row_for_source(up)
+                .map(|row| layout.lines[row].line_id),
+            Some(0)
+        );
+        editor
+            .move_vertical_to(up, true, body_point.x)
+            .expect("shift-up target");
+        assert_eq!(editor.selection().active, up);
+        assert_eq!(editor.selection().range(), SourceRange::new(up.0, body.0));
+    }
+
+    #[test]
+    fn moving_up_from_after_a_header_only_table_lands_on_the_header() {
+        let source = "| header | value |\n| --- | --- |\n\nfollowing";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let table = index.block(0).expect("header-only table");
+        let (following, _) = laid_out(&editor, &index, 1, &shaper);
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &following,
+            false,
+            0.0,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("the table above must have a visible row");
+        let (table_visual, table_layout) = laid_out(&editor, &index, table.ordinal, &shaper);
+        let target_row = table_layout
+            .point_for_source(&table_visual, target, &shaper)
+            .and_then(|point| table_layout.lines.get(point.row))
+            .expect("the target must resolve inside the table layout");
+
+        assert_eq!(target_row.line_id, 0, "up must skip the hidden delimiter");
     }
 
     #[test]
@@ -12635,6 +13045,60 @@ mod tests {
         if let Some(root) = root {
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn hidden_table_delimiter_maps_physical_lines_to_visible_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "| header | value |\n| --- | --- |\n| body | cell |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+
+        view.update(cx, |view, _| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    view.current_index().expect("table index is ready"),
+                    view.line_height(),
+                    None,
+                )),
+            );
+            view.viewport_height = view.line_height() * 2.0;
+            view.scroll_y = 0.0;
+        });
+
+        view.read_with(cx, |view, _| {
+            let index = view.current_index().expect("table index is ready");
+            let block = index.block(0).expect("table block").clone();
+
+            // Physical lines 0, 1 and 2 are header, hidden delimiter and body;
+            // the delimiter owns source bytes but no visual row or height.
+            assert_eq!(view.visible_line_prefix(&block, 0), 0);
+            assert_eq!(view.visible_line_prefix(&block, 1), 1);
+            assert_eq!(view.visible_line_prefix(&block, 2), 1);
+            assert_eq!(
+                view.physical_line_prefix_for_visible_rows(&block, 3, 1),
+                1
+            );
+            assert_eq!(
+                view.physical_line_prefix_for_visible_rows(&block, 3, 2),
+                3
+            );
+
+            let blocks = [block];
+            let window = view.visible_line_window(&blocks, &(0..1));
+            assert!(
+                window.contains(&2),
+                "the first body line must remain in the virtualized source window: {window:?}"
+            );
+        });
+
+        assert!(root.is_none());
     }
 
     #[gpui::test]
