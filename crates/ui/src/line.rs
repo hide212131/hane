@@ -1388,15 +1388,15 @@ mod tests {
 
     #[test]
     fn quote_bar_layout_joins_soft_wraps_but_not_a_quote_depth_change() {
-        let source = "> one two three four five six seven eight nine\n> > nested\n";
-        let mut editor = Editor::new(source);
-        editor
-            .set_selection(Selection::caret(SourceOffset(
-                source.find("one").expect("quoted text") + 1,
-            )))
-            .expect("caret moves into quoted text");
+        let source = "outside\n\n> one two three four five six seven eight nine\n> > nested\n";
+        // Keep the quote inactive: a caret in the first quote discloses its
+        // prefix, intentionally changing that row's bar geometry.
+        let editor = Editor::new(source);
         let index = BlockIndex::from_buffer(editor.document());
-        let block = index.blocks().next().expect("quote block");
+        let block = index
+            .blocks()
+            .find(|block| block.kind == hane_markdown::NodeKind::Quote)
+            .expect("quote block");
         let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
             .expect("quote block presents");
         let layout = hane_presentation::layout_block(
