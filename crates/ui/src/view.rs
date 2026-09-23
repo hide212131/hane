@@ -4161,7 +4161,16 @@ impl EditorView {
         self.raw_zoom = (self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let target = clamp_and_snap_zoom(self.raw_zoom);
         if target == self.zoom {
-            self.wheel_zoom_animation = None;
+            if self.wheel_zoom_animation.take().is_some() {
+                // Reversing a wheel gesture can move its target back onto the
+                // currently painted zoom before the interpolation naturally
+                // settles. Intermediate frames intentionally keep offscreen
+                // height estimates from the previous zoom, so cancelling here
+                // must perform the same one-time finalization as a normally
+                // completed animation.
+                self.rebuild_height_estimates();
+                cx.notify();
+            }
             return;
         }
 
@@ -13223,6 +13232,29 @@ mod tests {
         assert_eq!(zoom, 1.0);
         assert!(target > zoom, "{target}");
         assert!(animating);
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_target_onto_painted_zoom_finalizes_document_wide_heights(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\n", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.zoom = 1.1;
+            view.raw_zoom = 1.2;
+            view.heights = HeightIndex::new([123.0, 456.0]);
+            view.wheel_zoom_animation = Some(WheelZoomAnimation {
+                window_offset: 0.0,
+                last_frame: Instant::now(),
+            });
+
+            view.queue_wheel_zoom_factor(1.1 / 1.2, 0.0, cx);
+
+            assert!((view.raw_zoom - 1.1).abs() < 1e-6, "{}", view.raw_zoom);
+            assert_eq!(view.zoom, 1.1);
+            assert!(view.wheel_zoom_animation.is_none());
+            assert_ne!(view.heights.height(0), Some(123.0));
+        });
     }
 
     #[gpui::test]
