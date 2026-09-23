@@ -308,6 +308,10 @@ pub(crate) trait Platform: 'static {
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+    /// Returns the current input source mode without bypassing the platform instance.
+    fn active_keyboard_input_mode(&self) -> Option<KeyboardInputMode> {
+        None
+    }
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 }
 

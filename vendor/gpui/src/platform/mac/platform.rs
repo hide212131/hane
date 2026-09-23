@@ -2,7 +2,7 @@ use super::{
     BoolExt, MacKeyboardLayout, MacKeyboardMapper,
     attributed_string::{NSAttributedString, NSMutableAttributedString},
     events::key_to_native,
-    renderer,
+    mac_active_input_source_is_ascii_capable, renderer,
 };
 use crate::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem, ClipboardString,
@@ -909,6 +909,14 @@ impl Platform for MacPlatform {
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
         self.0.lock().keyboard_mapper.clone()
+    }
+
+    fn active_keyboard_input_mode(&self) -> Option<crate::KeyboardInputMode> {
+        Some(if mac_active_input_source_is_ascii_capable() {
+            crate::KeyboardInputMode::Ascii
+        } else {
+            crate::KeyboardInputMode::Native
+        })
     }
 
     fn app_path(&self) -> Result<PathBuf> {
