@@ -13056,11 +13056,20 @@ mod tests {
 
         view.update(cx, |view, _| {
             let document = view.editor().document().clone();
-            view.block_index.publish(
-                BlockIndex::from_buffer(&document),
-                IndexSource::Formal,
-                &document,
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index, IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    view.current_index().expect("table index is ready"),
+                    view.line_height(),
+                    None,
+                )),
             );
+            view.viewport_height = view.line_height() * 2.0;
+            view.scroll_y = 0.0;
         });
 
         view.read_with(cx, |view, _| {
