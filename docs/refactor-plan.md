@@ -1,425 +1,349 @@
-# Hane 全面リファクタリング計画
-
-Phase 0〜4 の段階的開発で蓄積した重複・実験遺物・計測スキャフォールドを除去し、
-RFP（`docs/rfp.md`）が本来要求する構造へ寄せるための計画。コードは全読了済み。
-
-今後、ファイラーと Markdown 機能を継続追加する前提で、機能追加後に変更すると手戻りが
-大きくなる境界を優先する。優先度は次の意味で使う。
-
-- **P0（機能追加前に必須）**: 後回しにすると新機能が現行の行単位モデルや `EditorView` へ密結合する。
-- **P1（初期機能追加と並行可）**: 性能と保守性に重要だが、限定的な機能追加を直ちに止めるものではない。
-- **P2（後回し可）**: 整理価値はあるが、ファイラー/Markdown 機能の設計を直接左右しない。
-
----
-
-## 0. 現状診断（実測に基づく無駄の棚卸し）
-
-### A. アーキテクチャ上の負債（最重要）
-
-1. **「1物理行 = 1 VisualBlock」になっており、RFP §9 のブロックモデルではない。**
-   - `presentation::present_polished_line` / `paragraph_blocks`、`ui::line::presented_line` は
-     すべて物理行単位。コードフェンス・表・リスト項目・引用など複数行にまたがる構造を
-     ブロックとして持てない。
-   - その穴埋めとして、行ごとに文脈フラグ（`fenced_code_context` / `table_context`）を
-     毎フレーム再計算する仕組みが増殖している：
-     `ui::view::render` 内のフェンス走査ループ、`fence_before_line`（最大2048行を都度走査）、
-     `local_table_context`（最大256行を都度走査）、`cached_line` のブロック種別整合チェック。
-   - RFP §9「変更されたブロックだけレイアウトを破棄・他は再利用」「§20 Document→Block→Line→Run
-     で影響範囲を狭める」が、行単位モデルのため成立しにくい。**これが下記重複の根本原因。**
-
-2. **Markdown 解析器が二重化している。**
-   - `hane-markdown::parse_document` は pulldown-cmark の `into_offset_iter()` で
-     ブロック/インライン範囲を正しく取得（RFP §7 準拠）。
-   - 一方 `presentation::marker_ranges`（lib.rs:478-584）は `#` / `> ` / `- ` / フェンス /
-     `**` / `` ` `` / リンクを**手書きで再走査**してマーカ範囲を再導出している。
-     同じ情報を別ロジックで2回計算しており、乖離バグの温床。
-
-3. **表・フェンス判定ヘルパの重複定義。**
-   - `is_pipe_row` / `is_table_delimiter` が `markdown`（73-87行）と `presentation`（864-874行）に
-     二重定義。
-   - フェンス追跡ロジックが3か所に散在：`markdown::parse_block_context`、
-     `ui::view::fence_before_line`、`ui::view::render` 内インラインループ。
-
-### B. Phase 実験の遺物（製品パスに残存）
-
-4. **`present_bold` + `parse_bold`** は Phase 0 の「太字だけ」実験。`present_markdown` に
-   完全に置換済みだが、`app/main.rs` の `HANE_PHASE0_BACKGROUND_PRESENTATION`
-   合成負荷生成でのみ生存（product 描画には未使用）。
-
-5. **`line_spans` + `LineSpan`**（presentation lib.rs:240-300）は製品未使用（確認済み）。
-   UI は `ui::line::line_segments` を使う。テストのみが参照する死蔵コード。
-
-### C. 計測スキャフォールドが製品コードに混入
-
-6. `benchmark::process_memory_bytes` は `metrics::process_memory_bytes` をそのまま呼ぶだけの
-   無意味な間接層。`app` はこの1関数のためだけに `hane-benchmark` へ依存。
-   `metrics` と `benchmark` は `Distribution`/`percentile` 系も重複気味。
-
-7. `EditorView` に計測専用メソッドが多数寄生：
-   `set_cursor_offset_for_measurement` / `move_cursor_down_for_development` /
-   `enable_display_linked_scroll_measurement` / `apply_phase1_scroll_frame` /
-   `apply_phase0_background_presentation` / `record_phase0_idle_memory` / `arm_startup_timing`。
-   `phase0_metrics.rs` と併せ、製品型に計測関心が張り付いている。
-
-8. `app/main.rs` が **20種以上の `HANE_*` 環境変数分岐**で埋まっている
-   （PHASE0/1/2_AUTOSCROLL の別名エイリアス、MEASUREMENT_*, DEV_CURSOR_*, NO_FOCUS,
-   BACKGROUND_PRESENTATION 等）。
-
-9. **フェーズ別スクリプト/ドキュメントの複製**：
-   `capture_phase2/3/4.sh`、`measure_phase1..4{,_memory}.sh`（ほぼ同一を phase 数だけ複製）、
-   ADR 18本のうち 0010/0012/0015/0016/0017 は各フェーズの実装計画（歴史的）、
-   `docs/phase0..4/report.md` 5本。
-
----
-
-## リファクタリング方針
-
-- **各フェーズ独立でコミット可能／リリース可能**にする。高リスクな構造変更は
-  R3.5 と R4A〜R4C に分割し、各段階で動作する状態を保つ。
-- **すべてのフェーズを R0 のテスト+ベンチ基準線で回帰ゲートする。** RFP §16-18 の
-  `keystroke_to_paint` p95/p99 を最重要指標として、前後で悪化させない。
-- 低リスク（削除・統合）→ 高リスク（構造変更）の順。R1〜R3 は BlockIndex と描画移行を
-  安全にするための地ならし。
-- Markdown の正式解析は pulldown-cmark を唯一の意味解析器とする。ただし、イベントの
-  source range だけでは得られない開閉マーカ位置は、イベント範囲内に限定した字句解析で補う。
-- 背景解析が現在 revision に追いついていない間も入力を止めない。正式 BlockIndex と、
-  active block 周辺の暫定表示経路を分けて設計する。
-
----
-
-## Phase R0 — 基準線の確立（P0・変更なし・安全網）
-
-**目的**: 後続の全変更を測るための不変の物差しを作る。
-
-- [x] `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` が緑であることを確認・記録。
-      結果と実行環境は `docs/baseline/README.md` に保存。
-- [x] 現行の性能数値（1/10/100 MB, 10万段落）を当時の `measure_phase*` で採取し
-      `docs/refactor-plan.md` の付録か `docs/baseline/` に固定保存（回帰比較の原本）。
-- [x] 10万段落 fixture を UI 性能シナリオへ追加し、先頭・中央・末尾での入力、
-      スクロール、入力しながらのスクロールを採取する。
-      AC接続条件の集計結果を `docs/baseline/ui-results.md` に保存。
-- [x] `file_open_time` / `local_parse_time` / `full_parse_time` / `layout_time` /
-      cache hit/miss / block-index update time を記録し、回帰原因を切り分けられるようにする。
-      現行の計測値と未実装項目を `docs/baseline/README.md` に明記し、構造導入時に追加する。
-- [x] 測定機、電源状態、refresh rate、build profile、サンプル数を固定し、
-      「完全不変」ではなく許容回帰率とばらつきの判定方法を明記する。
-      条件と判定方法は `docs/baseline/README.md` に定義。
-- [x] 現行の公開 API 一覧（`cargo public-api` 等）をスナップショット。
-      `docs/baseline/public-api.md` に保存。
-- [x] 基準タグ `refactor-baseline` を打つ（`0111cdc`）。
-
-**完了条件**: 以降のフェーズで参照する「緑のテスト・性能原本・APIスナップショット」が揃う。
-
----
-
-## Phase R0.5 — 編集・表示契約テストの固定（P0・安全網）
-
-**目的**: ブロック境界や描画実装を変更しても守るべき振る舞いを、構造変更より先に固定する。
-
-- [x] 文書内の全編集可能 source offset について、`source → visual → source` の往復を検証する。
-      ASCII、日本語、絵文字、結合文字、サロゲートペア相当の UTF-16 変換を含める。
-- [x] 複数行の quote/list/code/table、Setext heading、`1)` 形式の番号付きリスト、
-      reference link、escape 済みマーカを golden fixture として追加する。
-- [x] 開きフェンスの追加・削除により遠方のブロック境界が変化するケースを追加する。
-- [x] 背景 parse 中の連続編集、stale revision の破棄、正式解析待ちの暫定表示をテストする。
-- [x] カーソル上下移動、クリック、ドラッグ選択、IME marked range を、複数行ブロックでも
-      検証できる UI 非依存の契約テスト API を用意する。
-
-契約テストは `crates/markdown/tests/document_contract.rs`、
-`crates/presentation/tests/source_map_contract.rs`、`crates/editor/tests/ime_contract.rs` に置く。
-現行モデルで未対応の期待値は `docs/baseline/unsupported-markdown.md` に固定する。
-
-**完了条件**: R4 系フェーズで内部型を置換しても再利用できる契約テストが緑。既知の未対応構文は
-期待値を曖昧にせず、明示的な pending/unsupported 一覧へ分離されている。
-
----
-
-## Phase R1 — 死蔵・重複コードの削除（P0・低リスク）
-
-**目的**: 誰も使っていない／二重定義のコードを消し、以降の見通しを上げる。
-
-- [x] `presentation::present_bold` / `markdown::parse_bold` を削除。
-      `app/main.rs` の Phase 0 合成負荷は、現在の背景解析を代表する `parse_document` /
-      `present_markdown` workload として再定義する。旧 `present_bold` と処理量が異なるため、
-      このシナリオだけは R1 で新しい基準線を取り、以後の比較原本とする。
-      新基準は `docs/baseline/r1-background-workload.md` に保存。
-- [x] `presentation::line_spans` / `LineSpan` と関連テストを削除（製品未使用を確認済み）。
-- [x] `is_pipe_row` / `is_table_delimiter` を `markdown` に一本化し `pub` 化。
-      `presentation` / `ui` はそれを import。`presentation` 側の重複定義と
-      `is_alignment_cell` を削除。
-- [x] `benchmark::process_memory_bytes` の間接層を削除。`app` は `hane-metrics` に直接依存。
-      `gpui_baseline` example も直接参照へ変更し、`Cargo.toml` から不要になった
-      `hane-benchmark` 依存を除去。
-
-**完了条件**: R0 のテストが緑で、再定義した背景 workload 以外は性能が許容範囲内。
-ワークスペースの LOC と重複関数が明確に減少。
-
----
-
-## Phase R2 — 計測ハーネスを製品コードから分離（P1/P2・低〜中リスク）
-
-**目的**: 「速さの証明」に必要な計測を残しつつ、製品型・製品バイナリから計測関心を剥がす。
-
-- [x] 計測専用の入口を集約：`EditorView` の `*_for_measurement` / `*_for_development` /
-      `phase0/1` 系メソッド、CSV 出力、合成入力、自動スクロールを feature フラグ
-      `instrument` 配下へ隔離。UI 側は `crates/ui/src/instrument.rs`（計測状態・CSV・env 解釈）と
-      `EditorView` の `#[cfg(feature="instrument")]` impl に集約し、製品ビルドは no-op stub のみ。
-      app 側の合成入力ハーネスは `crates/app/src/instrument.rs` へ分離。既定 `cargo build -p hane`
-      には CSV・合成入力・開発操作 API が含まれない（optional 依存 markdown/metrics/presentation/document
-      も instrument 配下）。
-- [x] `keystroke_to_paint` 等の低オーバーヘッド timing hook は製品と同じ入力・paint 経路に残す。
-      instrument on/off の差を R0 基準線で測り、計測ビルドだけ別の挙動にならないことを確認する。
-      `timing-probe`（CSV観測のみ）と `instrument`（合成入力等を含む）を同一入力で2回比較し、
-      一時的な15%超過は逆順の再測定で再現しなかったため、R0の判定規則により回帰なしとした。
-- [x] `HANE_*` 環境変数を1か所（`ui::instrument::InstrumentationConfig::from_environment`）で解釈するよう集約。
-      `PHASE0/1/2_AUTOSCROLL` → `HANE_AUTOSCROLL`、`PHASE0_BACKGROUND_PRESENTATION` → `HANE_BACKGROUND_PRESENTATION`、
-      `PHASE0_NO_FOCUS` → `HANE_NO_FOCUS` に統一。`scripts/` も追従（計測ビルドは `--features instrument`）。
-- [x] `metrics` と `benchmark` の役割を再定義：ランタイム計測=`metrics`、
-      オフライン集計/フィクスチャ=`benchmark` に線引きし、重複 `Distribution`/`percentile` を統合。
-      `benchmark::Distribution` は `metrics::DurationDistribution` の type alias とし、percentile 計算は
-      `metrics::duration_distribution` の1実装だけを使う。
-- [x] **P1** スクリプトを引数化して統合：`scripts/measure.sh <scenario>` /
-      `scripts/capture.sh <scenario>` の2本に集約し、`measure_phase*` / `capture_phase*` を廃止。
-- [x] **P2** 歴史的ドキュメントを整理：`docs/phase*/report.md` と実装計画 ADR を
-      `docs/history/` へ移動し、`docs/adr/README.md` に「現行 vs 歴史」の索引を明記。
-
-**完了条件**: 既定 `cargo build -p hane` に合成入力・CSV・開発操作用 API が含まれない。
-同じ timing hook を通る製品ビルドと instrument ビルドの性能差が、R0 で定めた許容範囲内。
-
----
-
-## Phase R3 — Markdown 解析の単一化（P0・中リスク）
-
-**目的**: Markdown の意味解析を pulldown-cmark に統一し、マーカ導出を `hane-markdown` の
-構文イベント連動 lexer に集約する（RFP §6.1/§7）。
-
-- [x] `hane-markdown` を拡張し、pulldown-cmark のイベントと source range を正として、
-      その範囲内だけを字句解析する。見出し、引用、リスト、フェンス、強調、コード、リンクの
-      開閉マーカを `MarkdownParse.markers` として返す（`derive_markers`）。
-- [x] `presentation::marker_ranges` と関連手書きロジックを削除し、
-      `hane-markdown` の `markers` を消費するだけにする。`fence_delimiter` 依存も除去。
-- [~] CommonMark/GFM fixture を追加。ATX heading、`1.`、inline link、強調/コード/取り消し線/
-      引用/箇条書きの開閉マーカ、異なる delimiter run を検証済み。
-      Setext heading、`1)`、reference link、autolink、escape は現行導出のまま未網羅
-      （挙動は移設前と不変。R3.25 の構造化ノード導入時に fixture を拡充する）。
-- [x] フェンス/表文脈を `hane-markdown` の有界同期フォールバック（`local_block_context`）へ一元化。
-      `ui::view::fence_before_line` / `local_table_context` / `render` 内インラインフェンスループを
-      廃止し、背景 `BlockContextIndex` ＋1か所だけのフォールバックに統一。
-      （R4A でこの行走査そのものを廃止し、`BlockIndex` / `local_block_index` の
-      ブロック種別へ置き換えた。）
-
-**完了条件**: Markdown の意味解析が pulldown-cmark の1経路、マーカ字句解析が
-`hane-markdown` の1経路のみ。R0.5 の往復・構文 fixture が緑。解析は依然バックグラウンドで、
-入力は待たない。
-
----
-
-## Phase R3.25 — Markdown 機能拡張用の解析・表示契約（P0・中リスク）
-
-**目的**: Markdown 機能を追加するたびに parser/presentation/ui の型と分岐を個別増築せずに済む
-境界を、追加機能の実装前に確定する。
-
-- [x] `MarkdownParse` の flat な `blocks` / `spans` を `MarkdownTree`（block/inline node ツリー）へ置換。
-      全ノードが parent / children / document 順 / depth / source range を持ち、list→item→paragraph、
-      quote→paragraph、table→head/row→cell、task list の checkbox 状態を表現できる。
-      未モデル構文は `NodeKind::Unsupported` として range を保持する。
-- [x] parser が返す構文種別（`markdown::NodeKind`）、presentation が返す表示種別
-      （`presentation::BlockKind` / `StyleKind`）、UI の描画方針（`BlockDisplay` / `InlineDisplay`）を
-      3層に分離。UI crate に `NodeKind` / `BlockKind` / `StyleKind` の出現はなく、文字列判定もない。
-- [x] `Unsupported` / raw-source fallback を正式な表示契約に含める。未実装構文でも source を失わず、
-      編集・保存・カーソル移動が継続できるようにする。
-- [x] Markdown feature ごとの fixture を共通形式（`presentation/tests/support`）にし、parse tree、
-      marker ranges、SourceMap、disclosure、保存後 source bytes を同じケースで検証する。
-- [x] 初期の拡張対象（task list、nested list、複数行 quote/code、image、table、link）で API を試し、
-      feature 固有の情報が `EditorView` へ漏れないことを確認した（UI crate の変更は不要）。
-
-**完了条件**: 新しい Markdown 構文を追加するときの主な変更先が `markdown` と `presentation` の
-feature 実装・fixture に限定され、既存構文の共通 SourceMap/編集経路を複製しない。
-
----
-
-## Phase R3.5 — revision 付き BlockIndex の導入（P0・中〜高リスク）
-
-**目的**: UI をブロック描画へ移す前に、Markdown ブロック境界と編集差分を管理する土台を作る。
-
-- [x] `BlockIndex` に stable block ID、kind、source range、revision を保持し、
-      byte offset ↔ block、block ordinal ↔ source range を対数時間または同等の計算量で引けるようにする。
-      block は文書を tile し（block 間の空行は上の block に属する）、絶対 offset ではなく byte 長を
-      chunk 単位の Fenwick tree で保持する。ADR-0018。
-- [x] 編集時の再解析開始点と、旧ブロック列へ再同期したと判定する条件を定義する。
-      フェンス等で再同期できない場合は、後続を保守的に invalidation する。
-      窓 = dirty run の前後1 block、再同期 = 窓の最後の block が既存の終端 block と同じ
-      開始位置・種別で終わること、打ち切り = 256 KiB / 512 block。
-- [x] 非交差ブロックを revision delta で rebase し、影響ブロックだけを置換する API を実装する。
-      （`BlockIndex::update`。byte 長保持のため非交差 block は書き込みなしで移動する）
-- [x] 背景の正式解析結果、active block 周辺の暫定解析結果、現在 document revision の
-      publish 優先順位を定義し、stale result が表示を上書きしないようにする。
-      （`BlockIndexState::publish` / `apply_edits`）
-- [x] BlockIndex 更新時間、再解析バイト数、invalidated block 数を計測する。
-      （`BlockIndexUpdate` → metrics CSV の `block_index` record と `hane-bench` シナリオ）
-
-**完了条件**: UI はまだ行描画のままでも、各行が所属する正式/暫定 block を BlockIndex から取得できる。
-遠方へ影響する編集を含む R0.5 テストが緑で、通常の局所編集が文書サイズ比例の同期処理を発生させない。
-
-**完了（2026-08-27）**: `EditorView::block_at_line` が行→block を返し、背景 job が Formal 索引を
-publish、入力経路が増分更新する。100k block の文書で打鍵 median 2.5 µs / p95 4.2 µs、
-block 分割 median 5.4 µs / p95 6.4 µs、1編集あたりの再解析は 1 KiB 未満。
-
----
-
-## Phase R3.75 — DocumentSession と FileService の分離（P0・中リスク）
-
-**目的**: ファイラー追加前に、ファイル状態・永続化・最近使ったファイルを描画主体の
-`EditorView` から分離し、複数ファイル/選択切替へ拡張できるようにする。
-
-- [x] `DocumentSession`（document/editor、path、dirty/saved revision、save generation、表示状態）と
-      `EditorView`（GPUI 入出力・描画）を分離する。
-- [x] open/save/save-as/autosave/atomic write を `FileService` または同等の I/O 境界へ集約し、
-      UI は request/result を扱うだけにする。ファイル I/O は入力処理を待たせない。
-- [x] canonical path と表示名を分離し、同一ファイル判定、rename/move、削除、外部変更、
-      読み込み失敗を表現できる `FileIdentity` を定義する。
-- [x] Recent Files と将来の filer tree state を分け、永続設定が `EditorView` のライフサイクルに
-      依存しない repository/store API にする。
-- [x] 画像等の相対 resource 解決を `EditorView` の `document_directory` 計算から分離し、
-      session/file identity を基準に解決する `ResourceResolver` を用意する。
-- [x] filer が発行する open/rename/move/delete と、未保存 session、autosave、外部変更の競合規則を
-      UI 非依存テストで固定する。
-
-**完了条件**: `EditorView` が `PathBuf`、atomic save、recent-files 永続化を直接所有しない。
-単一 session の現行挙動を保ったまま、複数 `DocumentSession` を保持・切替できる API が成立する。
-
----
-
-## Phase R4A — ブロック単位の仮想化と描画（P0・高リスク）
-
-**目的**: R3.5 の BlockIndex を使い、「1物理行=1ブロック」を Markdown ブロック単位へ移す。
-
-- [x] `VisualBlock` を Markdown ブロック（Heading/Paragraph/List/Quote/Code/Image/Table）単位に。
-      1ブロックが**複数行にまたがる source_range** を保持し、
-      `style_runs` / `revision` を保持（RFP §9）。
-      従来の1行単位の型は `VisualLine` へ改名し、`VisualBlock.lines` として内側に入れた。
-- [x] `EditorView::render` / `cached_line` を「行イテレート」から「ブロックイテレート」へ改修。
-      `HeightIndex` はブロック高さで駆動。可変高さ仮想スクロールをブロック粒度で実装（RFP §10）。
-      正式 `BlockIndex` が無い起動直後だけ行粒度で高さを持ち、粒度切替は viewport 上端の
-      source offset を掛け直して行う。
-- [x] UI の `fenced_code_context` / `table_context` / `local_table_context` を撤廃し、
-      正式/暫定 BlockIndex の block kind だけを消費する。表示文脈の決定は
-      `presentation::block_line_context` の1か所。行走査版の `parse_block_context` /
-      `local_block_context` は削除し、境界付きの `local_block_index` へ置き換えた。
-- [x] block source range 内の物理行を描画する互換レイヤを設け、R4A ではカーソル・選択・IME の
-      既存挙動を維持したまま仮想化の単位だけを変更する。
-- [x] ブロックには大きさの上限が無い（空行の無い文書は1段落）ため、`present_block` は
-      viewport と交差する行だけを構築し、残りは行数として高さに算入する。
-- [x] ブロックの行数を `IndexedBlock::line_count` としてタイル化時に数える。高さ索引の
-      再構築が rope 走査を伴わなくなり、10万ブロックで 21.1 ms → 0.635 ms。
-- [x] 正式索引公開時の高さ索引構築（100 MB で約 39 ms）を全文解析と同じ背景 job へ移す。
-
-**完了条件**: 画面外の GPUI 要素が block 数に比例して生成されない。100 MB / 10万段落で
-入力遅延とスクロールが R0 の許容範囲内。R0.5 の既存編集契約がすべて緑。
-
-**達成状況**: 要素生成は可視ブロック数（ブロック内では可視行数）に比例する。R0.5 を含む
-`cargo test --workspace` と `cargo clippy --workspace --all-targets -- -D warnings` は緑。
-`hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致（画面キャプチャ比較）。
-GUI の `keystroke_to_paint` / scroll interval の master 比較は、window が前面でない環境では
-OS 側の throttle に支配されるため未実施。R2のinstrument比較とは別に、R4のGUI確認として残す。
-アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下だった。
-
-## Phase R4B — Block → LayoutLine → Run レイアウト（P0・高リスク）
-
-**目的**: 複数行ブロックと折り返しを、カーソル・選択・IME と整合する表示座標系へ移す。
-
-- [x] `LayoutLine` に block-local visual range、source mapping、y/height、shape result を保持する。
-      （`hane_presentation::layout`。shape result 自体は `LineShaper` 経由で都度引き、
-      行が持つのは折り返し位置・範囲・座標。shape 結果のキャッシュは R4C）
-- [x] source offset ↔ block/LayoutLine/x/y の双方向変換を実装する。
-- [x] 上下移動を物理行の grapheme column 依存から、layout 上の preferred x へ移行する。
-      （`Editor::move_vertical_to` + `EditorView::move_vertical`。索引が無い間は
-      `EditorCommand::MoveUp` / `MoveDown` がフォールバック）
-- [x] クリック、ドラッグ選択、複数 LayoutLine をまたぐ選択、IME marked range、カーソル矩形を
-      新しい座標変換へ統一する。
-- [x] soft wrap と明示改行を区別し、block 内の source↔visual 往復を R0.5 テストへ追加する。
-      （`crates/presentation/tests/layout_contract.rs`）
-
-**完了条件**: 複数行 quote/list/code/table と折り返し段落で、上下移動・クリック・選択・IME が成立。
-全編集可能 source offset の往復テストが緑。
-
----
-
-## Phase R4C — レイアウトキャッシュと差分更新（P1・高リスク）
-
-**目的**: RFP §9/§20 の「変更されたブロックだけ再レイアウト」を実際の描画経路で成立させる。
-
-- [x] VisualBlock または別の cache entry に layout result、幅、theme/font revision、document revision を保持する。
-- [x] 編集、viewport 幅、theme/font、画像高さの変化ごとに invalidation 条件を明文化する。
-      （ADR-0022）
-- [x] 非交差ブロックは BlockIndex とともに rebase し、shape/layout result を再利用する。
-- [x] 実測高さ更新時の HeightIndex 差分更新と scroll anchoring を実装する。
-      `BlockIndexUpdate` の置換区間だけを同期し、HeightIndex は 128 block chunk 単位で splice する。
-      10万 block の中央 split/join は median 0.002 ms / p95 0.003 ms。
-- [x] cache hit/miss、再レイアウト block 数、`keystroke_to_paint` を CI/定期性能試験で比較する。
-      instrument CSV に3指標を追加。cached `ShapedLine` の custom paint は入力 p95 を
-      5.47 ms → 21.49 ms に悪化させたため棄却し、GPUI native text element を維持する（ADR-0022）。
-      最終版の独立2回の 100 MB p95/p99 は 3.55/4.41 ms と 4.58/4.60 msで、R0 の
-      4.98/7.65 ms と再採取 R4B の 7.33/7.38 ms の双方以下。絶対 16/33 ms gateも通過。
-
-**完了条件**: 非交差ブロックの編集で画面内の無関係な shape/layout が再実行されない。
-100 MB / 10万段落の p95/p99 とメモリが R0 の許容範囲内。
-
-> リスク管理：R4A〜R4C はそれぞれ独立コミット可能にする。R0 の性能原本と R0.5 の契約テストを
-> ゲートにし、悪化時は次段階へ進まない。変更対象には presentation/ui に加えて、visual 上下移動を
-> 担う editor API も含む。
-
----
-
-## Phase R5 — 型・API 表面の整理（P1/P2・低リスク・仕上げ）
-
-**目的**: 重複語彙とボイラープレートを削り、公開面を最小化。
-
-- [x] `markdown::NodeKind` と `presentation::BlockKind` / `StyleKind` の3層分離は維持し、
-      presentation 内の構文→block/style/context 変換を1つの非公開変換表へ集約する。
-      delimiter 判定の命名と、UI の空文書 fallback に残る `NodeKind` 参照も整理する。
-- [x] `ui::line::line_segments` / `ui::shape::WindowShaper::runs` のスタイル境界収集を、
-      `ui` 内の1つの非公開 range 分割 helper へ統合する。
-- [x] clippy pedantic を既定 feature / all-features の workspace・all-targets で通し、`pub` 過多・
-      未使用エクスポートを整理する（R0 の API スナップショットと理由付き diff）。
-- [x] 現行 architecture 文書を追加し、README / ADR index と陳腐化した ADR の現行化注記を更新する。
-
-**完了条件**: 公開 API が意図的に絞られ、clippy pedantic 緑、ドキュメントが実装と一致。
-
----
-
-## フェーズ依存関係とリスク
-
-```
-R0 基準線 ─ R0.5 契約テスト
-  └─ R1 削除
-       ├─ R3 解析単一化 ─ R3.25 Markdown契約 ─ R3.5 BlockIndex
-       │                                             └─ R4A ブロック描画
-       │                                                  └─ R4B 複数行レイアウト
-       │                                                       └─ R4C 差分キャッシュ
-       ├─ R3.75 DocumentSession/FileService
-       └─ R2 計測分離
-
-  P0/P1 の必要経路完了 ─ R5 仕上げ
+# Hane 全域リファクタリング計画 — 第2サイクル
+
+調査日: 2026年9月23日  
+対象: `hide212131/hane`  
+調査基準: `main` の `ef9356c52bae06dee6cf49fa7b1a59ce004b52a0`
+
+## 1. 結論と計画の位置付け
+
+全リポジトリを対象にするが、一括で書き直さない。不要物の除去、責務の分離、判断・状態の重複解消、計測に基づく最適化を、それぞれ検証可能なPRに分けて進める。
+
+目標は、単に行数やファイルサイズを減らすことではない。「同じ仕様を複数箇所で判断する」「関連する状態を複数の所有者が更新する」「一つの修正のために別経路も追いかけて修正する」という構造を減らすことである。
+
+既存の `docs/refactor-execution-plan.md` は、2026年8月29日の更新で旧R0〜R5を完了としている。今回の計画はそのやり直しではなく、現在の実装を起点にした第2サイクルとする。既に導入済みの `BlockIndex`、`DocumentSession`、`FileService`、ブロック仮想化などを再設計・再実装することを前提にしない。[S1] [S2]
+
+今回の調査は、対象SHAの主要実装、設計文書、ワークフロー、進行中PRの静的確認である。全ファイルの精査、未使用性の完全な証明、テスト実行、GUI検証、性能測定は実施していない。以下では確認済みの構造と、実施時に立証する削除・最適化候補を区別する。ローカルの未コミット変更は調査対象に含まれない。
+
+## 2. 現状から見た優先順位
+
+| 対象 | 確認できた事実 | 計画上の扱い |
+|---|---|---|
+| `crates/ui/src/view.rs` | 563,504 bytes。入力、サイドバー、ファイル操作の調停、非同期処理、表示キャッシュなどの状態を所有する。 | 最優先で責務を切り分ける。ただし単なるファイル分割で完了にはしない。 |
+| `crates/presentation/src/lib.rs` | 281,063 bytes。位置対応、表示型、表示方針などを含む。 | 位置対応・表示方針・projectionなどの境界を明確にする。 |
+| `crates/markdown/src/lib.rs` | 121,646 bytes。構文型、解析、projection関連の実装を含む。 | 意味解析の正本を保ったまま、公開APIと内部責務を整理する。 |
+| `crates/ui/src/actions.rs` | 多くのキー操作で、フィルタ・rename・本文の入力先分岐を繰り返している。 | 入力先決定と対象固有動作を分離する。 |
+| `.github/scripts/` | 旧final judge関連のスクリプトとテストが残っている。 | 現行入口からの到達性を調べ、未使用が証明できた単位で削除する。 |
+| 設計・測定資料 | 旧リファクタリングは完了扱いだが、現行の起動・メモリ再測定を扱うIssue #23はopen。 | 計画・現行設計・性能原本を整合させる。 |
+
+サイズはGitのblobサイズであり、コメントや同居テストを含む。無駄なコードの量や製品LOCを表してはいない。[S3] [S4] [S5] [S6] [S7] [S22] [S23]
+
+### 削除対象と混同してはいけないもの
+
+`EditorView` にあるrevision、document identity、work-folder generation、保存ticket、非同期job identityは、それぞれ異なる寿命や競合を扱っている。これらを「似たカウンタだから」という理由で一つにまとめない。
+
+また、`JoinedParse` のstrict-match検証と、`BlockIndexState` の安全に条件を満たした場合のrebaseは異なる契約である。表示用の `ListProjection` と同期編集用の `ListEditProjection` も目的が異なる。暫定解析、巨大ブロックのバックグラウンド処理、sourceを失わないfallbackは、削除に先立って同等の安全性と性能を示す必要がある。[S8] [S9] [S10]
+
+## 3. 対象範囲と非目標
+
+対象は、製品コード、テスト、examples、計測コード、scripts、GitHub Actions、設定、assets、設計・運用文書、vendorのHane固有パッチである。全領域を棚卸しするが、問題がない領域まで変更しない。
+
+既存の9-crate構成と、`document` / `editor` / `markdown` / `presentation` / `session` / `ui` / `app` の依存方向を原則として維持する。`benchmark` / `metrics` も既存の目的を起点に見直す。[S2] [S11]
+
+今回のリファクタリングには、新しいMarkdown構文対応、サイドバー新機能、全面的なUI変更、汎用プラグイン基盤、新しい非同期ランタイム、独自イベントバス、DIフレームワーク、AADW用の状態DBを含めない。依存ライブラリの大型更新も、必要性が確認できた場合の独立変更とする。
+
+永続化形式を変えない。Markdown本文、設定、draftについて既存の利用データを読める状態を維持する。内部整理のために既存文書を一括変換・正規化しない。
+
+## 4. 完成後の責務配置
+
+| 層 | 一か所に集約する責務 | 持たせない責務 |
+|---|---|---|
+| `document` | source、位置単位、revision、編集差分 | Markdownの意味やGPUI |
+| `editor` | 汎用編集、selection、IME、undo/redo transaction | リストなどの構文固有ルール |
+| `markdown` | 構文解析、sourceに基づく編集計画、用途別projection | pixel座標やUIの見た目 |
+| `presentation` | source↔visual、表示方針、layoutと座標計算 | ファイルI/O、アプリ操作の判断 |
+| `session` | session/file identity、保存・draft・renameに関する状態と判断 | GPUIの描画やイベントループ |
+| `ui` | 入力の接続、非同期要求の実行、表示、画面状態 | sourceにない文書構造の捏造、保存規則の別実装 |
+| `app` | 起動と依存オブジェクトの組み立て | 編集・描画・保存ロジック |
+
+`ui` 内部は、サイドバー、短い入力欄、本文入力、viewport、render、非同期要求の接続などへ整理する。`presentation` は位置対応、表示方針、projection、layout、高さ索引を見分けられる配置にする。
+
+これらは責務の境界案であり、最終的な型名・ファイル名の固定指示ではない。実装担当はcurrent codeと呼び出し関係から最小の分割を選ぶ。小さな具象structや既存moduleで足りるなら、新crateや汎用trait群を作らない。
+
+## 5. フェーズ全体
+
+| フェーズ | 目的 | 主な完了条件 |
+|---|---|---|
+| RF0 | 現状・契約・測定原本を固定する | 対象、既知問題、テスト、性能比較条件が明確になる。 |
+| RF1 | 不要物と旧実行経路を除去する | 削除根拠があり、現行入口と参照が整合する。 |
+| RF2 | 巨大ファイルを責務ごとに分ける | 振る舞いを変えず、後続の責務移譲が小さな差分で行える。 |
+| RF3 | 入力先と編集処理を整理する | 入力先決定が集約され、IMEとtransactionの契約を保つ。 |
+| RF4 | 解析とprojectionの契約を整理する | 同一snapshotを使うべき経路が一致し、目的の違うprojectionは混同しない。 |
+| RF5 | layout・描画・キャッシュ管理を整理する | 座標の正本と無効化責任が明確になり、処理量の上限を保つ。 |
+| RF6 | 保存・draft・renameの調停を整理する | 状態の所有者が明確になり、I/Oの失敗や遅延で文書を失わない。 |
+| RF7 | 現行の開発・検証・リリース基盤を簡素化する | 重複は減るが、権限境界と検証・リリース条件は維持する。 |
+| RF8 | 計測で示された無駄を最適化し、全域を受け入れる | 正しさ・性能・保守性の証拠が揃い、移行用コードが残らない。 |
+
+番号は旧計画のR0〜R5と区別するためのものである。
+
+## RF0 — 現状と変更してはいけない契約を固定する
+
+### 作業
+
+**棚卸しを作る。** 各候補について、対象パス、問題の根拠、呼び出し元、削除／統合／責務分離／維持／未判断、危険性、回帰テスト、依存するPR、完了条件を記録する。リストは既存の実施計画で管理し、専用管理システムを追加しない。
+
+未使用性はテキスト検索だけで判断しない。Rustのfeature・platform条件、macroやasset参照、Python/Shellからの呼び出し、workflow_dispatch、文書化されたCLI、runner上の外部設定も確認する。テストしか呼ばないことは調査の入口にはなるが、それだけで削除の根拠にはしない。
+
+**既存テストと不具合を分ける。** 自動テスト、GUI、性能測定の実行条件と結果をcurrent SHAに結び付ける。既存の失敗は再現条件と影響を記録し、望ましい仕様として固定しない。データ損失・誤編集などの問題が出た場合は、構造変更に紛れ込ませず、原因ごとに修正する。
+
+**性能の原本を更新する。** Issue #23を利用して、起動、空・1/10/100 MB文書、長大な単一段落、1k/10k件のwork folder、訪問済みsession増加、長時間の切替・編集を測定する。機種、OS、電源、refresh rate、profile、fixture、サンプル数を記録する。旧レポートの数値をcurrentの実測として扱わない。[S7]
+
+**文書の正本を整える。** `docs/refactor-plan.md` は目標・契約・範囲、`docs/refactor-execution-plan.md` は実施順と進捗とする。完了した旧サイクルの記録を区別し、第三の競合する恒久計画を増やさない。ADRは記載状態と実装・検証証拠を照合する。実装があるだけで「提案」を自動的に「検証済み」へ変更しない。
+
+### PRの単位と完了条件
+
+棚卸し・文書整理と、追加する契約テスト・測定結果は差分を分けられる。削除やAPI変更はまだ混ぜない。
+
+対象範囲、保護する振る舞い、既知の未完事項、測定条件が明確になり、後続の変更を同じ物差しで判定できれば完了とする。製品に影響しない独立した整理に、不要な全GUI検証を毎回要求しない。
+
+## RF1 — 使われないコードと旧実行経路を除去する
+
+### 作業
+
+**AADW旧経路を到達性で判定する。** 最初の調査候補は、`.github/scripts/final_pipeline.py`、`final_policy.py`、`final_fix_bridge.py`、`final_judge_probe.py`、対応テストである。旧final pipelineの参照は旧設計資料、関連スクリプト、テストで確認できるが、この時点では未使用を確定していない。[S6]
+
+現行workflow、CLI、import、手動実行手順、runner連携まで確認して、使用していない実行経路をひとまとまりで削除する。現行機能が再利用する部品は巻き込まない。まだ入口が動いている場合は、代替・停止・確認・削除の順に移す。旧経路そのものを検査するテストは、本体とともに削除できるが、現行契約を守るテストは残す。
+
+**製品側の未使用候補を精査する。** 呼ばれない公開API、互換alias、終了済み実験、設定、fixture、assetを確認する。platform限定コード、feature限定コード、安全なraw-source fallback、計測に使うコードを一律に消さない。
+
+`ui/line.rs` の `presented_block` 系の一部wrapperは `#[cfg(test)]` であり、製品の複数実行経路と数えない。テストの読みやすさに役立つなら残してよい。[S12]
+
+### PRの単位と完了条件
+
+一つの廃止機能・到達不能な依存群を一つのPR単位とする。関係のない製品コード削除とworkflow整理を同居させない。
+
+削除した各対象に根拠があり、現行入口・設定・文書に切れた参照がなく、関連するbuild/testが通れば完了とする。「検索で出なかった」だけでは完了にしない。復旧は削除PRのrevertで可能な状態にする。
+
+## RF2 — 巨大ファイルを機械的に分割する
+
+### 作業
+
+**`view.rs` を責務別の配置へ移す。** サイドバー表示、フィルタ・rename、scroll/zoom、保存要求の接続、background parse、cache、描画の組み立て、テストを見分けられるmoduleへ移す。この段階では処理順や条件判定を変えない。
+
+**`presentation/lib.rs` と `markdown/lib.rs` を整理する。** 前者はsource map、表示型と表示方針、projection、高さ索引、layoutとの境界を分ける。後者は構文型、parser、marker導出、用途別projection、編集plannerの境界を明確にする。既存の `block_index.rs`、`block_store.rs`、`list_editing.rs` を無意味に再分割しない。
+
+**公開APIを維持する。** まず既存の外部呼び出しが通るように移動し、不要な公開範囲の縮小は別の差分で行う。分割の都合でフィールドや関数を広範囲に `pub` 化しない。大量の整形変更、命名変更、アルゴリズム変更を同時に行わない。
+
+### PRの単位と完了条件
+
+一つの責務の移動を一つのPR単位とする。テストは責務別に移すが、回帰ケースを減らさない。
+
+既存の外部動作が変わらず、移動と意味変更をレビューで区別できれば、このフェーズは完了とする。ただし `impl EditorView` を複数ファイルに移しただけでは全体リファクタリングは完了しない。状態の所有権と更新APIの改善はRF3〜RF6で行う。
+
+## RF3 — 入力先の決定と編集処理を整理する
+
+### 作業
+
+**入力先を一度だけ決める。** `actions.rs` で繰り返している、sidebar filter → inline rename → documentという分岐を、入力先の解決と対象別dispatchへ整理する。例えば小さな `InputTarget` enumを用いるが、キー操作の用途差を消すことを目的にはしない。[S5]
+
+**短い入力欄の重複を除く。** フィルタとrenameで共通する文字列、selection、grapheme境界移動、range replacement、UTF-16変換などを小さな具象モデルにまとめる。renameの確定・取消・I/O待ちと、フィルタの検索条件更新は対象固有処理として残す。本文エディタ全体を両者へ組み込んだり、第二の汎用IME基盤を作ったりしない。
+
+**本文編集の契約を守る。** selection、IME、undo/redoは既存Editorの責任を維持する。リスト編集はADR-0029のsource-firstを維持し、Markdown層が編集計画を返し、Editorが汎用range replacementをrecorded transactionとして適用する。入力途中のリスト構造をViewだけに持たせる旧方式を復活させない。[S10]
+
+**挙動変更を混ぜない。** sidebar treeの新しいキーボード操作、複数selectionのリスト編集、新しいショートカットなどはこのフェーズの目的に含めない。
+
+### 検証と完了条件
+
+本文・フィルタ・renameそれぞれで、文字入力、左右移動、選択、削除、clipboard、Enter/Escape、focus切替、IME commit/cancelを確認する。日本語、絵文字、結合文字、UTF-8とUTF-16の境界を含める。リストでは一操作が期待する一transactionとなり、undo/redoでsourceとselectionが戻ることを確認する。
+
+ネイティブIMEの正しさはunit testだけでは判定せず、変更が影響するmacOS/Windowsの実入力経路でfocused GUI検証を行う。入力先決定の正本が一か所になり、同じ操作が入力欄間で不整合に実装されず、既存の対象別仕様が維持されれば完了とする。
+
+## RF4 — Markdown解析とprojectionの契約を整理する
+
+### 作業
+
+**各データの目的と鮮度を明文化する。**
+
+| データ | 主な目的 | 維持する契約 |
+|---|---|---|
+| `BlockIndexState` | sourceのブロック境界と正式・暫定状態 | 条件を満たすrebaseとpublish優先順位を維持する。 |
+| `JoinedParse` | 複数物理行にまたがる意味解析snapshot | revision・block identity・rangeの厳密一致を維持する。 |
+| `ListProjection` | 表示用のリスト構造 | 表示の都合を編集の唯一の根拠にしない。 |
+| `ListEditProjection` | current sourceに対する同期編集判断 | 背景の正式解析待ちで編集を止めない。 |
+
+これらは異なる目的の派生データであり、型が似ているという理由だけでは統合しない。[S9] [S10]
+
+**同じ意味計算の重複を減らす。** 同一snapshotについて、通常描画、1行だけの描画、上下移動、隣接block移動、hit test、marker disclosureが別の意味解析へ分岐していないか調べる。同じsnapshotを共有すべき経路は共通projectionを使う。viewportの大小によってMarkdownの意味が変わらない構造にする。[S9]
+
+**引数の増殖を止める。** `presented_block_with_table_projection` のような、多数のprojectionと表示条件を受け取るAPIを確認する。関連入力を具象のrequest/contextへまとめ、互換wrapperを不要になった時点で撤去する。ただし、巨大で内容不明な「何でもcontext」に置き換えない。snapshot identityやrevision検証を省略しない。[S12]
+
+**fallbackを役割別に整理する。** 未対応構文のsource保持、正式解析待ちの暫定表示、入力途中の編集planner用回復処理を区別する。異なる保証を持つfallbackを一つの曖昧な成功経路にしない。
+
+### 検証と完了条件
+
+複数行の強調・コード・引用・リスト、画面外の閉じmarker、同一blockを異なるviewportで見る場合、遅れて届く結果、正式結果と暫定結果の競合を検証する。行数が少なくbyte数が巨大なblockも必須とする。
+
+意味解析の正本、projectionごとの入力・出力・寿命が明確になり、同条件の表示・navigationの意味が一致すれば完了とする。すべての解析を同期化して「経路を一本化」する変更は認めない。
+
+## RF5 — layout・描画・キャッシュの責任を整理する
+
+### 作業
+
+**座標の正本を維持する。** `BlockLayout` を中心に、描画、hit test、caret、selection、IME候補位置、上下移動が同じgeometryを使うように接続を整理する。UIで独自の幅・高さ補正を増やさない。表・引用などの表示修正が異なる経路で食い違わないよう、契約テストを共用する。[S2]
+
+**キャッシュごとに責任者を決める。** `block_cache`、`layout_cache`、`joined_parse_cache`、`line_owners`、高さ索引について、key、所有者、更新入口、無効化条件、上限、文書切替時の破棄を明示する。すべてを汎用cache engineへ統合するのではなく、関連する状態をまとめて更新する小さなAPIにする。[S8]
+
+source編集、selection/IMEによるdisclosure変更、width/font/zoom変更、画像の高さ確定、session切替を区別する。caret位置が変わってdisclosureも変わる場合はlayout変化が必要になり得る。一方、同じsource・style・disclosure・width・fontでcaretの表示だけが変わる場合は、文字geometryを変えない。
+
+**上限と寿命を保つ。** 現在の同期join判定は4,096行と256 KiBの両方を使い、background joined parseは文書切替をまたいだ実行数も管理している。閾値はまず維持し、変更する場合は独立した計測と根拠を示す。古い結果が新しいjobのin-flight状態を消さないことも維持する。[S8] [S12]
+
+**SourceMapの検証を正しく定義する。** hidden/synthesized要素があるため、source↔visualを無条件の一対一対応として検査しない。Bias/affinityを含む正規化された往復と、編集可能な境界の契約を確認する。
+
+### 進行中PRとの関係
+
+調査時点では、引用バーのPR #292とtable delimiterのPR #295がopenである。関連するlayout・描画の整理は、これらの修正が受け入れられた基準へ追従してから行う。計画の都合だけでmergeしたり、同じ修正を新しいPRで再実装したりしない。無関係な入力欄・運用整理まで止める必要はない。[S13] [S14]
+
+### 検証と完了条件
+
+可変行高、soft wrap、tableセル、非表示delimiter、入れ子quote、zoom、画像読み込み、選択中のscroll、文書切替を確認する。計測が必要な区間では再parse、再shape、再layoutの回数も観測する。
+
+geometryの正本、cache無効化、stale結果の扱いが一貫し、局所編集の処理量が不要に文書全体へ広がらなければ完了とする。
+
+## RF6 — session・保存・draft・renameの調停を整理する
+
+### 作業
+
+**既存のI/O境界を利用する。** `session` には既に `service.rs`、`session.rs`、`draft.rs`、`identity.rs`、`naming.rs`、`store.rs`、`workfolder.rs` がある。新しいFileServiceを作るのではなく、Viewに残る判断と状態を適切な所有者へ移す。[S15]
+
+`FileService` は同期traitであり、呼び出し側が入力経路外のexecutorで動かす設計になっている。この境界を保ち、整理のためだけにasync traitや新しいruntimeを導入しない。GPUIのtask起動はadapterに残し、要求を作る判断と結果を受け入れる判断をUI非依存で検査できる形にする。[S16]
+
+**セッション単位の関連状態をまとめる。** Viewの `title_sync_pending`、`title_sync_in_flight`、`title_sync_scheduled`、`title_sync_deferred` などを対象に、関連状態と更新操作をセッション単位の小さな型へまとめる。ただし、独立して同時に成立する状態まで一つの排他的enumへ押し込めない。[S8]
+
+**操作identityを維持する。** loading path、latest open target、work-folder generation、document revision、SaveTicketを混同しない。フォルダ切替後の遅いread、rename中のautosave、古いH1 debounce、終了時draft flushが現在の文書・パスへ誤適用されないようにする。
+
+**保持方針は計測して決める。** 訪問済みsessionの保持を明文化する。evictionはIssue #23の測定で実害が確認された場合に限り検討し、導入する場合もdirty/IME/save中の扱いを先に契約化する。単にメモリ表示を小さくするための複雑な退避機構は追加しない。[S7]
+
+### 検証と完了条件
+
+保存失敗、外部変更、保存の連続要求、保存とrenameの競合、名前衝突、work-folder切替、draft復旧、case-only rename、日本語ファイル名を確認する。遅延や失敗を注入できる既存テスト境界を利用し、macOS/Windowsで異なるfilesystem動作は実OSで確認する。
+
+原文と未保存編集を失わず、結果の受理・破棄が操作identityに基づき、保存・命名規則がViewとsessionに二重実装されていなければ完了とする。書込みの原子性と電源断時の永続性は同じ保証ではないため、確認できた範囲を明記する。
+
+## RF7 — 開発・検証・リリース基盤を簡素化する
+
+### 作業
+
+**現行GUI検証の重複を確認して統合する。** 日付バッジ、sidebar chrome、汎用GUI validationなどのworkflowについて、共通のcheckout、build、scenario実行、artifact収集を比較する。共通部分が実際に重複している場合だけ、既存runnerや小さな共通部品へ寄せる。scenario固有の再現操作・期待値は残す。[S17]
+
+**権限と判断を統合しない。** trustedなorchestrationとPRコード、reviewとimplementation、GUI観測とmerge判断を分けたままにする。exact-head guard、必要なbase context、認証情報の分離、`unknown` を成功にしない扱いを維持する。AADW v2の判断をworkerやworkflowへコピーしない。[S18]
+
+**CIを整理し、弱めない。** 現行のmacOS/Windowsのworkspace testsとclippy、必要なvendor/GPUIテストを保つ。Python/ShellとRustの変更範囲に対する検証対応を明確にし、path filterの判定失敗を安全側に倒す動作を維持する。通常buildとinstrument buildのどちらも、必要な確認範囲に含める。[S19]
+
+**既存リリースを壊さない。** `windows-release.yml` には、mainのCargo.toml変更、version tag、手動実行によるリリース経路と、Cargo versionとの整合確認がある。新しいrelease機構を作らず、この経路を維持する。リファクタリングPRに意図しないversion更新やtag作成を混ぜない。[S20]
+
+**依存とvendorは別の根拠で整理する。** 未使用依存、不要feature、計測用依存の製品混入、重複versionを確認する。Hane固有vendor patchは、目的、適用先、再現テスト、上流での対応状況、解除条件を記録する。同等修正を確認せずに「vendorが大きい」という理由で消さない。[S11] [S19]
+
+### PRの単位と完了条件
+
+workflowの共通化、CI整理、release整理、依存整理は別PRとする。製品の構造変更と同じPRに入れない。
+
+通常経路、代表的失敗、stale head、権限不一致、artifact不足を確認し、誤った成功・危険な実行が起こらないことを示す。重複する実装・不要な実行が減り、同じ手順を一つの正本から辿れれば完了とする。新しい管理基盤を作っただけでは完了にしない。
+
+## RF8 — 測定で示された無駄を最適化し、完了判定する
+
+### 作業
+
+**局所最適化はプロファイルを根拠に行う。** 例えば `SourceMap::visual_to_source` には候補Vecの構築、sort、可視候補Vecの構築がある。これは調査候補であり、測定前にボトルネックとは断定しない。実際にhot pathなら、Bias・可視候補優先・同順位の扱いを固定したテストの下で、allocationやsortを避けられるか検討する。[S21]
+
+同様に、繰り返されるprojection生成、clone、rowごとの走査、過剰なcache無効化、session保持を計測する。最適化ごとに、変更前後の処理量、時間、allocationやRSSを記録する。計測対象を移しただけで速く見せない。
+
+**同じ条件で全体を比較する。** Issue #23にあるreference macOS環境の初期契約を起点とする。warm startupは150 ms以下を目標、cold startupは400 ms以下、空editor RSSは65 MiB未満、10 MB文書は120 MB未満、100 MB文書は350 MB未満である。これらは今回の実測結果ではない。同条件で10%超の悪化が出た場合は再測定する既存方針を継承し、Windowsへ同じ絶対時間を無条件には適用しない。[S7]
+
+入力とscrollでは、既存のp95/p99契約に加えて、巨大単一blockと大きなwork folderを確認する。平均値だけで長い停止を見落とさない。cold/warm状態、MB/MiB、サンプル条件を明示する。
+
+**移行の残骸を除く。** 一時adapter、旧名のalias、二重経路、temporary feature flagを撤去する。旧経路が必要なら理由を確認し、未完の移行を「互換性のため」として放置しない。現行設計と運用手順を実装に合わせる。
+
+### 最終受入条件
+
+| 項目 | 完了の判断 |
+|---|---|
+| 棚卸し | 全対象領域を確認し、候補ごとに削除・統合・修正・根拠付き維持の判断がある。対象内の未判断を完了扱いしない。 |
+| 所有権 | 入力先、文書意味、位置計算、保存判断、cache無効化の責任者が明確になっている。 |
+| 削除 | 確定した不要物と移行用旧経路が取り除かれ、参照・設定・文書も整合している。 |
+| 正しさ | source、selection、IME、undo/redo、保存・復旧の契約が維持されている。 |
+| 性能 | 同条件の前後比較があり、関連する回帰が未解決のまま残っていない。 |
+| 運用 | current headに対するCI・review・必要なGUI証拠があり、権限境界とrelease経路を保っている。 |
+| 保守性 | 同じルールを複数箇所に追加しなくても変更できることを、代表的な既存修正の追跡で説明できる。 |
+
+LOC、公開API数、重複分岐数、workflow数、build時間などは前後を報告するが、「何%削減」を先に成功条件にはしない。テストを消した量や単なるファイル移動は改善量として数えない。
+
+## 6. 実施順とPR運用
+
+基本順は `RF0 → RF1 → RF2 → RF3/RF4/RF6 → RF5 → RF8` とする。RF7は、RF0で現行入口を固定した後、製品変更と競合しない範囲で進められる。RF1の旧経路除去とRF7の現行基盤の改善は目的を分ける。
+
+同じ巨大ファイル・同じ状態を変更する作業は重ねない。一方、無関係な変更まで全面的に直列化したり、mainを長期間凍結したりしない。target branchの進展は変更内容への影響で判断し、`behind > 0` だけで毎回同期しない。[S18]
+
+### 各PRの共通ルール
+
+- 一つの責務・一つのroot-cause clusterを扱う。移動、意味変更、最適化、機能追加を混ぜない。
+- 着手時に対象head、current main、対象Issue、関連ADR、関連PRを再確認する。この文書のパスや判断が現行実装と食い違う場合は、根拠を示して修正する。
+- before/afterで守る契約、削除理由、変更対象外、テスト、必要なGUI・性能確認、revert方法をPRに記載する。
+- headが変われば古いCI・review・GUIをcurrent証拠として扱わない。base変更は採用する証拠の主張への影響を確認する。
+- データ損失、誤編集、権限問題、通常経路の明確な不具合、受入条件を満たさない変更は通さない。根拠不足のunknownも通さない。
+- 無関係な改善まで全件修正することは要求しない。ただし、今回解消すると定めた対象内の負債をfollow-upへ移しただけで全体を完了にしない。
+
+merge前にはexpected head、必要なbase context、required CI、必要なGUI、mergeabilityを確認する。review指摘件数をゼロにすること自体は目的にしない。[S18]
+
+### 検証コマンドと適用範囲
+
+Rust製品変更では、現在のCIの主要条件を保つ。
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-- **Markdown 機能追加の開始条件**: R0〜R1、R3、R3.25、R3.5 が完了していること。
-  複数行表示や折り返しを伴う機能は R4A〜R4B 完了後に追加する。
-- **ファイラー実装の開始条件**: R0〜R1 と R3.75 が完了していること。filer UI は
-  `FileService` / `DocumentSession` の利用者とし、ファイル I/O を直接実装しない。
-- R0.5 は構造変更前の振る舞いを固定する。R1〜R3 は BlockIndex 導入前の重複と責務を整理する。
-- R3.25 で Markdown 拡張契約、R3.5 で source 上のブロック境界、R3.75 でファイル境界を確定する。
-- R4A で仮想化、R4B で visual 座標、R4C で再利用を順に成立させる。
-- どのフェーズも R0 のテスト+性能原本で回帰ゲートする。特に `keystroke_to_paint` を死守。
-- R4A〜R4C は高リスクだが、各段階で動作する状態を維持し、問題の所在を切り分けられるようにする。
+通常feature構成とrelease成果物に影響する変更では、既存のrelease側の条件も確認する。
 
-## 機能追加前の実行優先順
+```sh
+cargo test --workspace --locked
+cargo build --release --locked -p hane
+```
 
-1. **P0共通基盤**: R0 → R0.5 → R1
-2. **Markdown先行基盤**: R3 → R3.25 → R3.5 → R4A → R4B
-3. **ファイラー先行基盤**: R3.75（R1後、Markdown系と並行可能）
-4. **性能仕上げ**: R4C
-5. **整理作業**: R2 の残作業 → R5
+macOSのGPUI patchに影響する場合は、workspace外のvendorテストを省略しない。
 
-各機能に対応する P0 開始条件の完了前は、その新規 feature/UI を本実装しない。必要な調査・spike は
-許可するが、製品経路へ新しい文字列判定、`EditorView` のファイル状態、物理行前提の表示分岐を追加しない。
+```sh
+cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::text_system::tests
+cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::platform::tests::keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders -- --exact
+```
+
+これらは今回実行したコマンドではなく、実施時の検証条件である。Python/Shell/workflowの変更は、現行CIにある関連テストと変更した実行入口を検証する。Rustに影響しない変更に全製品GUI試験を機械的に追加しない。一方、native IME、画面geometry、filesystemの挙動は、対応するunit test成功だけで実OS検証の代わりにしない。[S19] [S20]
+
+### 最初のPR単位
+
+| 順番 | 内容 | 混ぜないもの |
+|---|---|---|
+| 1 | 旧計画と現行実装の照合、対象台帳、契約テストと性能測定の不足整理 | 製品の意味変更や新機能 |
+| 2 | 到達性を確認できた旧AADW実行経路の削除 | 現行GUI基盤の全面再設計 |
+| 3 | `view.rs` のサイドバーなど、競合しない一責務の機械的分離 | 条件分岐の修正や保存規則の変更 |
+| 4 | 入力先決定の集約と、短い入力欄の所有状態の整理を適切な差分に分けて実施 | 本文Editorやnative IMEの全面置換 |
+
+この後、進行中の描画修正を取り込んだ基準からRF4〜RF5を進める。計画の核心は「削れるものを先に削り、責務を分け、正本と寿命を整理してから、残った無駄を測って除く」ことである。
+
+## 調査資料
+
+以下は調査基準SHAまたは調査時点のGitHub情報である。実施時にはcurrent factsを再取得する。
+
+[S1]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/docs/refactor-execution-plan.md
+[S2]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/docs/architecture.md
+[S3]: https://api.github.com/repos/hide212131/hane/git/trees/74b79215fbefeff86c57ec3fa9e0a05bb60e30b4?recursive=1
+[S4]: https://api.github.com/repos/hide212131/hane/git/trees/12d6ba1710541e35a4566835d6f32f59fdfa8a50?recursive=1
+[S5]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/crates/ui/src/actions.rs
+[S6]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/.github/scripts/final_judge_probe.py
+[S7]: https://github.com/hide212131/hane/issues/23
+[S8]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/crates/ui/src/view.rs
+[S9]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/docs/adr/0025-shared-parse-for-multiline-inline-presentation.md
+[S10]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/docs/adr/0029-source-first-list-editing.md
+[S11]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/Cargo.toml
+[S12]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/crates/ui/src/line.rs
+[S13]: https://github.com/hide212131/hane/pull/292
+[S14]: https://github.com/hide212131/hane/pull/295
+[S15]: https://api.github.com/repos/hide212131/hane/git/trees/dcbbc8967ca13a37d83934e072a0d3dea6136f5e?recursive=1
+[S16]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/crates/session/src/service.rs
+[S17]: https://api.github.com/repos/hide212131/hane/git/trees/7645b356ac342012d2210930506859c0fef4c3a8
+[S18]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/docs/aadw-command-policy.md
+[S19]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/.github/workflows/ci.yml
+[S20]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/.github/workflows/windows-release.yml
+[S21]: https://github.com/hide212131/hane/blob/ef9356c52bae06dee6cf49fa7b1a59ce004b52a0/crates/presentation/src/lib.rs
+
+[S22]: https://api.github.com/repos/hide212131/hane/git/trees/b2b5b8278300e26e5679907ed09b084eb6ba4064
+[S23]: https://api.github.com/repos/hide212131/hane/git/trees/d0cfef526821c1dfe799eb5956e891303b527d12?recursive=1

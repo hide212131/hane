@@ -1,440 +1,156 @@
-# Hane リファクタリング実施計画
+# Hane リファクタリング実施計画 — 第2サイクル
 
-`docs/refactor-plan.md` に定義された各フェーズを、依存関係と手戻りの少なさを基準に並べた
-実施計画。フェーズ番号順ではなく、後続作業の前提を先に確定できる順序を採用する。
+作成日: 2026年9月23日  
+親Issue: [#297](https://github.com/hide212131/hane/issues/297)  
+詳細計画: [refactor-plan.md](refactor-plan.md)
 
-## 進捗ステータス（最終更新: 2026-08-29）
+## 1. 文書の役割と現在地
 
-**現在地: R5 完了。**
+詳細計画は目標・範囲・契約を定め、この文書は実行Issue、依存関係、要件の割当、提出物を定める。各Issue本文は担当範囲の具体的手順・非目標・検証・受入条件を持つ。計画の調査基準は `ef9356c52bae06dee6cf49fa7b1a59ce004b52a0` であり、着手時にはcurrent codeと関連Issue/PR/ADRを読み直す。
 
-| 実施順 | フェーズ | 状態 |
+**登録時点: 親Issue 1件、実行Issue 18件を作成。RF5-BのIssue作成だけはAPIに拒否され、未作成である。本文を第7節に保持する。実装・製品テスト・GUI検証・性能測定は未着手であり、RF0を含めて完了したフェーズはない。**
+
+文書保存ブランチは `docs/refactor-cycle-2-20260923`。文書PRのmerge前はそのブランチの第2サイクル文書を参照する。mainへの反映前に旧R0〜R5の文書を第2サイクルと取り違えない。Issueの現在の状態と実装PRの証拠はGitHubを正とし、この登録時点の説明を実行状態として使わない。
+
+策定済み詳細計画は全文を変更せず保存した。元ファイル名は `hane-refactor-plan-2026-09-23.md`、35,652 bytes、Git blobは `06ac2536674e13fd59f637f95b4fc6e950b1e336`、SHA-256は `0889f7c0ec0354c1f50c2b8f36e2e7d579f8d520994d20be29b6bd509d6ed8e7`。今後の意図した変更は通常のGit履歴で追跡し、元の調査日・根拠を現行実測へ書き換えない。
+
+旧R0〜R5の計画と実施記録は [第1サイクルの履歴](history/refactor-cycle-1/README.md) に原文のまま保存する。旧計画の「完了」は今回の完了を意味しない。
+
+## 2. Issue一覧と依存関係
+
+以下の依存は単なる番号順ではなく、受け入れ済みの契約・変更領域を示す。同じ責務を変える作業を重ねず、無関係なmainの更新や別領域の作業は止めない。
+
+| 作業ID | 実行Issue | 担当範囲 | 開始前に必要なもの |
+|---|---|---|---|
+| RF0 | [#298](https://github.com/hide212131/hane/issues/298) | 全域台帳、保護契約、既知問題、テスト不足、文書照合 | 本計画の確認。最初に着手する。 |
+| RF0-P | [#23（既存）](https://github.com/hide212131/hane/issues/23) | 起動・入力/scroll・RSS・work folder・session保持の基準 | #298と条件をそろえ、比較対象を変える前に測定する。 |
+| RF1-A | [#299](https://github.com/hide212131/hane/issues/299) | 旧AADW経路を到達性で確認して削除 | #298の現行入口・台帳・契約 |
+| RF1-B | [#300](https://github.com/hide212131/hane/issues/300) | 製品側未使用API、実験、設定、fixture/assets | #298の対象台帳・構成別利用確認 |
+| RF2-A | [#301](https://github.com/hide212131/hane/issues/301) | EditorViewの責務別機械的分割 | #298と#300の当該領域。描画競合は第3節も確認。 |
+| RF2-B | [#302](https://github.com/hide212131/hane/issues/302) | presentationの機械的分割 | #298と#300の当該領域。公開APIを維持。 |
+| RF2-C | [#303](https://github.com/hide212131/hane/issues/303) | Markdownの機械的分割 | #298と#300の当該領域。公開APIを維持。 |
+| RF3-A | [#304](https://github.com/hide212131/hane/issues/304) | 本文/filter/renameの入力先判定 | #301の入力境界と#298の操作契約 |
+| RF3-B | [#305](https://github.com/hide212131/hane/issues/305) | 短い入力欄の文字列・selection操作 | #301/#304の受入済み境界 |
+| RF4 | [#306](https://github.com/hide212131/hane/issues/306) | snapshot、解析/projection経路、引数、fallback | #301/#302/#303の該当分割、第3節の競合確認 |
+| RF5-A | [#307](https://github.com/hide212131/hane/issues/307) | BlockLayoutを正とするgeometry接続 | #306、関連するRF3/RF6の接続、第3節 |
+| RF5-B | **未作成（第7節に本文）** | cache/高さ索引/background jobの所有者と寿命 | #301/#302/#306、#309の文書切替境界、#23の基準。#307と競合させない。 |
+| RF6-A | [#308](https://github.com/hide212131/hane/issues/308) | H1命名/renameの状態と調停 | #301の保存/rename分割、#298の保護契約 |
+| RF6-B | [#309](https://github.com/hide212131/hane/issues/309) | open/save/draft、要求と結果受理 | #301/#298、#308と共有する状態の受入済み境界 |
+| RF7-A | [#310](https://github.com/hide212131/hane/issues/310) | 現行GUI検証の重複整理 | #298の入口。#299と共有する部分はその整理後。 |
+| RF7-B | [#311](https://github.com/hide212131/hane/issues/311) | CIと変更範囲、構成別検証 | #298。#299/#310と同じ入口は受入境界を先に調整。 |
+| RF7-C | [#312](https://github.com/hide212131/hane/issues/312) | 既存release/version整合と手順 | #298。#311と共有checkを変更する場合は調整。 |
+| RF7-D | [#313](https://github.com/hide212131/hane/issues/313) | 依存/feature/vendor patchと解除条件 | #298/#300の利用根拠 |
+| RF8-A | [#314](https://github.com/hide212131/hane/issues/314) | 実測で立証した局所最適化 | #23の基準、対象に関係するRF1〜RF7の受入 |
+| RF8-B | [#315](https://github.com/hide212131/hane/issues/315) | 移行残骸撤去、全要件の最終証拠、文書整合 | 全対象Issueと#23、未作成RF5-Bを含む全範囲の受入 |
+
+原則の順序は `RF0 → RF1 → RF2 → RF3/RF4/RF6 → RF5 → RF8`。RF7はRF0の現行入口確認後、製品と競合しない範囲で進める。RF0全体が未完でも、独立領域について台帳・契約・必要な検証条件を受け入れた部分引き渡しはできる。その範囲と残件をIssueに明記し、RF0全体を完了にしない。性能を変え得る実装は、該当する変更前測定を省略しない。
+
+一つのIssueが複数PRになることは許容する。一責務の移動、意味変更、最適化、機能追加を一つのPRに混ぜない。未完の大規模移行を抱えた長期ブランチは作らず、各PRで検証可能な状態を保つ。
+
+## 3. 既存作業との関係
+
+| 既存対象 | 本計画での扱い |
+|---|---|
+| #23 | 性能測定の既存担当として再利用する。同目的の新Issueを作らず、変更前基準と最終比較を関連付ける。 |
+| #292（引用バー）、#295（table delimiter） | 登録確認時点ではopen。RF2の該当移動とRF4/RF5は、受入済み修正のcurrent mainへの反映と証拠を確認してから進める。未反映時は重ならない範囲だけ扱い、計画の都合でmerge/再実装しない。 |
+| #20/#21/#19 | caret点滅、新フォント方針、新spacing等の機能追加は今回へ混ぜない。既存geometry契約の整理と分ける。 |
+| #22/#230 | 実OS/IMEの既知問題を現行証拠で確認する。基盤/既存不具合と新しい回帰を混同せず、未検証を成功にしない。 |
+| #15/#18/#97/#236/#237 | 新しいMarkdown対応やsidebar操作など、既存の機能開発は別の目的として維持する。今回の全域完了のために無関係な機能を実装しない。 |
+
+この表は開始時の整理であり、担当者は各Issueのcurrent bodyと状態を再確認する。既存不具合の修正が今回の契約成立を直接妨げる場合は、同じ原因の独立修正として明示し、機械的移動へ紛れ込ませない。
+
+## 4. 計画要件から実行Issueへの対応
+
+| 詳細計画の要件 | 実行担当 | 主な証拠 |
 |---|---|---|
-| 1 | R0 基準線の確立 | ✅ 完了（タグ `refactor-baseline` = `0111cdc`） |
-| 2 | R0.5 契約テスト固定 | ✅ 完了 |
-| 3 | R1 死蔵・重複コード削除 | ✅ 完了 |
-| 4 | R2 前半（計測ハーネス分離） | ✅ 完了 |
-| 5 | R3 Markdown 解析の単一化 | ✅ 完了（fixture 一部は R3.25 で拡充） |
-| 6 | R3.25 Markdown 拡張契約 | ✅ 完了 |
-| 7 | R3.5 revision 付き BlockIndex | ✅ 完了 |
-| 8 | R3.75 DocumentSession / FileService | ✅ 完了 |
-| 9 | R4A ブロック仮想化・描画 | ✅ 完了 |
-| 10 | R4B Block→LayoutLine→Run | ✅ 完了 |
-| 11 | R4C レイアウトキャッシュ・差分更新 | ✅ 完了 |
-| 12 | R2 後半（スクリプト統合・文書整理） | ✅ 完了 |
-| 13 | R5 型・API・ドキュメント整理 | ✅ 完了 |
+| 全領域棚卸し、既知問題と契約の分離、文書正本 | #298 | 対象台帳、構成別の現状結果、契約→テスト表、ADR照合 |
+| 性能原本、測定条件、長時間/大量文書 | #23、#298、#314、#315 | 対象SHAとfixture付きraw data/集計、同条件比較 |
+| 未使用性の立証、旧AADW/製品の不要物削除 | #299、#300 | 実行入口と依存関係、削除/維持根拠、現行入口の結果 |
+| UI/presentation/Markdownの機械的分割 | #301、#302、#303 | 旧→新パス/シンボル表、公開API比較、同じ契約テスト |
+| 入力先の正本、短い入力欄、本文IME/transaction | #304、#305 | 操作表、Unicode/範囲テスト、native入力証拠 |
+| strict-matchとrebaseの区別、用途別projection、fallback | #306 | 経路図、snapshot契約表、viewport/stale/巨大blockテスト |
+| geometry正本、正規化往復、描画/入力の整合 | #307 | deterministic座標テスト、実GUI/IME、入力/scroll比較 |
+| cache無効化、局所更新、上限、jobと文書の寿命 | RF5-B（未作成）、#309 | 所有者表、競合テスト、処理量とRSS/遅延 |
+| 命名・保存・draft・操作identity・互換性 | #308、#309 | 状態所有表、遅延/失敗注入、実OS保存/復旧 |
+| 現行GUI/CIの簡素化、権限/品質条件維持 | #310、#311 | 重複比較、入口/構成対応、代表run/artifact |
+| 既存release/versionと依存/vendor | #312、#313 | 発行しないversionテスト、構成build、patch根拠/解除条件 |
+| 実測最適化と移行残骸の撤去、最終受入 | #314、#315 | before/after、台帳全件判断、全要件の最終証拠対応 |
 
-### R3.25 の完了内容
+RF0の精査でパスや候補が変わった場合は、根拠と移管先をこの表・対象台帳・Issueへ記録する。関数名や候補の存在は実装担当が再確認する。本文で指定していない型名・ファイル名を強制しない。必要な対象を担当不在にしたり、未判断をfollow-upへ移して全体完了にしたりしない。
 
-- ✅ 表示契約の漏れ解消（第一段）: fenced-code の表示決定を `presentation::present_polished_line`
-  へ集約し、UI 側（`ui::line`）の `block.kind = CodeBlock` 直接パッチと style run 手注入を撤去。
-  UI へ渡す block 文脈を型付き `LineContext`（Normal/FencedCode/Table）に統一。
-- ✅ `Unsupported` / raw-source fallback を正式な表示契約に含める（未実装構文でも source を失わない）。
-  `presentation::BlockKind::Unsupported` と `present_raw_source` を追加し、`present_markdown_with_disclosure`
-  は marker 導出が source range を tile できない場合に raw-source へ降格。契約テスト
-  `unsupported_and_edge_constructs_never_lose_source`（raw HTML / autolink / footnote 参照 /
-  task list / escape / entity）で source 復元と往復を固定。
-- ✅ parser 構文種別 / presentation 表示種別 / UI 描画方針の型を3層に分離。
-  `markdown::NodeKind`（構文のみ）→ `presentation::BlockKind` / `StyleKind`（表示種別）→
-  `presentation::BlockDisplay` / `InlineDisplay`（描画方針: font scale・weight・surface/tint role・
-  monospace 等）。UI は `BlockDisplay` / `InlineDisplay` だけを適用し、`BlockKind` を一切 match しない
-  （`crates/ui` `crates/app` に `NodeKind` / `BlockKind` / `StyleKind` の出現なし）。
-  `visual_offset_at_x` の shape 経路と描画経路も `inline_display_for` の1経路に統合。
-- ✅ flat `blocks`/`spans` を `markdown::MarkdownTree`（block/inline node ツリー）へ置換。
-  親子・document 順・depth・source range を全ノードが保持し、list→item→paragraph、quote→paragraph、
-  table→head/row→cell、task list の checkbox 状態（`ListItem { task }`）、nested list の
-  `list_depth` を表現できる。未モデル構文は `NodeKind::Unsupported` として range を保持し、
-  event stream を取りこぼさない。`Options::ENABLE_TABLES` を有効化し parser 設定は `parser_options()` の1か所。
-- ✅ Markdown feature 共通 fixture 形式（`crates/presentation/tests/support/mod.rs`）。
-  1 fixture が parse tree のチェーン・marker range・表示種別・visual text・全カーソル位置での
-  SourceMap 往復と正規化の冪等性・保存後 bytes を同時に検証する。harness は `EditorView` と同じ
-  3 呼び出し（`parse_block_context` → `LineContext::from_document_context` → `present_polished_line`）
-  だけを行い feature 固有分岐を持たないため、fixture が通ること自体が UI 非依存の証明になる。
-- ✅ 初期拡張対象（task list、nested list、複数行 quote、複数行 fenced code、image、table、link）で
-  API 試行（`crates/presentation/tests/markdown_features.rs`）。UI crate の変更は不要だった。
-  副産物として、文書全体 parse 時に fenced code の marker がコードブロック全体を飲み込む
-  marker 導出のバグを発見・修正（開始/終了 fence 行のみを marker とする）。
+## 5. 担当者の開始・提出・完了手順
 
-### R3.5 の完了内容
+開始時には対象Issueと詳細計画の対応節、current code、関連ADR、先行Issueの証拠と現在の競合を読む。計画の仮説が現行実装と違う場合は、その根拠と変更範囲を先にPRへ示す。製品コードの実装・レビュー・GUI・次工程判断の役割は、default branchの [Commander Policy](aadw-command-policy.md) と [AGENTS.md](../AGENTS.md) に従い、この文書で別の判断規則を設けない。
 
-- ✅ `hane_markdown::BlockIndex`。top-level block が文書を tile し（block 間の空行は上の block に
-  属する）、stable `BlockId`・構文種別・解析 revision・`Confidence`（Formal/Provisional）を持つ。
-  絶対 offset ではなく byte 長を保持し、chunk（128 block）単位の合計だけを Fenwick tree に載せる
-  ため、block 内編集は1つの長さ更新で済み、後続 block へ書き込みが発生しない。設計判断は
-  ADR-0018。
-- ✅ 増分更新（`BlockIndex::update`）。編集はそれを含む block に吸収し、再解析の窓は
-  dirty run の前後1 block。窓の最後の block が既存の終端 block と同じ開始位置・種別で
-  終わったときに再同期成立とみなす（CommonMark の継続規則を再実装しない）。不一致なら
-  窓を後ろへ伸ばし、256 KiB / 512 block で打ち切って後続を保守的に `Provisional` へ落とす。
-  invalidation は必ず接尾辞なので開始 ordinal を1つ持つだけで表現する。
-- ✅ publish 優先順位（`BlockIndexState`）。新しい revision 優先、同一 revision では Formal が
-  Provisional に勝ち、逆は起きない。古い候補は破棄、受理した候補は現在 revision へ持ち上げてから
-  publish し、履歴が無く rebase できない候補は stale のまま publish しない。遅れて到着した
-  背景 job の結果は ADR-0005 の部分 publish 規則どおり rebase して publish する。
-- ✅ UI 配線。`EditorView` が `BlockIndexState` を持ち、入力経路で増分更新、背景 job（旧
-  `schedule_block_context` を `schedule_document_parse` へ改称）が line context と Formal 索引を
-  同時に生成する。`EditorView::block_at_line` で各行の正式/暫定 block を取得できる。
-  副産物として、前の文書向けに走っていた背景 job が新しい文書へ publish しうる問題を
-  document generation で塞いだ。
-- ✅ 計測。`BlockIndexUpdate` が更新時間・再解析 byte 数・invalidate block 数を返し、
-  instrument build は metrics CSV の `block_index` record（3列追加）へ出力する。
-  `hane-bench` に再現シナリオを追加。100k block の文書で打鍵 median 2.5 µs / p95 4.2 µs、
-  block 分割 median 5.4 µs / p95 6.4 µs、1編集の再解析は 1 KiB 未満、invalidate 0。
+各実装PRには次の内容を記載する。
 
-### R3.75 の完了内容
+| 提出欄 | 内容 |
+|---|---|
+| 対象 | Issue、作業ID、台帳候補ID、計画の対応節 |
+| 原因と範囲 | current codeから確認した問題、変更する責務、変更しない挙動 |
+| 構造 | before/afterの呼出関係・状態所有者・公開API・削除/維持根拠 |
+| 検証 | 対象head、必要なbase context、コマンド/scenario、結果、ログ/run/artifact URL、未実施と理由 |
+| 性能 | 影響がある場合の変更前基準・同条件比較・raw dataと集計 |
+| 復旧 | revert単位と依存順、外部設定変更の有無、永続形式を変えていない確認 |
+| 引き渡し | 満たした受入条件と証拠、残件、受け入れた後続境界、文書更新 |
 
-- ✅ 新 crate `hane-session`（GPUI 非依存、`document` / `editor` のみに依存）。ファイル状態・
-  永続化・I/O 境界をここへ集約した。設計判断は ADR-0019。
-- ✅ `FileIdentity`。読み書きに使う path と同一性判定用の canonical path を分離し、表示名は
-  判定に関与しない。`.` / `..` の正規化は fs に触れずに行うため、存在しない Save As 先も
-  同一ファイル判定に載る。rename/move は path だけを差し替え、削除・外部変更は
-  `FileStamp`（長さ + 更新時刻）比較の `ExternalChange` として表す。
-- ✅ `FileService`（`load` / `save` / `stamp`）が唯一のファイル境界。atomic write（一時ファイル +
-  rename）はここだけが行う。上書き可否は `OverwriteGuard` を job が運び、`ExpectStamp` は
-  書き込み直前に disk を確認して不一致なら書かずに `ExternalChange` を返す。起動時の初回読み込み
-  以外の open / save はすべて background executor へ出すため、入力処理がファイル I/O を待たない。
-- ✅ `DocumentSession`。editor・`FileState`・保存済み revision・autosave 世代・実行中/待機中の
-  保存を持ち、I/O はせず要求（`SaveDecision` / `OpenDecision` / `FileEventOutcome`）を返す。
-  document 差し替えごとに増える `generation` で、派生状態と実行中 job の有効性を判定する。
-  保存は同時に1つで、実行中の追加要求は最後の1つだけを queue する。`SaveTicket` に一致しない
-  結果は `Superseded` として捨てる。外部変更・削除は自動解決せず、dirty な session の内容を
-  失わない。
-- ✅ `SessionSet`。open 要求を「既に開いている → 切替」「clean な active → 差し替え」
-  「dirty な active → 拒否」へ振り分ける。同じファイルを開き直しても未保存編集は破棄しない。
-  最後の1 session を閉じると untitled へ置き換わり、window が空にならない。
-- ✅ 永続設定を `SettingsRepository` / `RecentFilesRepository` の2 trait に分け、`StateStores`
-  が `Arc` handle として渡す。store は view より長生きしてよく、view の生成・破棄に従属しない。
-  filer tree state は3つ目の repository として足せる。
-- ✅ `ResourceResolver`。相対画像の解決を `EditorView::document_directory` の計算から外し、
-  session の file identity を基準に行う。untitled 文書は base を持たず working directory を借りない。
-- ✅ UI 配線。`EditorView` は `sessions: SessionSet` と `files: Arc<dyn FileService>` を持ち、
-  `PathBuf` フィールド・atomic save・recent-files 永続化を所有しない。`crates/ui` から
-  `storage.rs` を撤去し、`editor` フィールドは `editor()` / `editor_mut()` 経由になった。
-  `activate_session` で scroll 位置を持ち回しながら session を切り替えられる。
-- ✅ 競合規則の UI 非依存テスト（`crates/session/tests/conflict_rules.rs`、16 本）。
-  未保存時の open 拒否、既に開いているファイルの切替、保存の直列化と queue 畳み込み、
-  document 差し替え後の結果破棄、autosave の世代・revision 判定、外部変更時の上書き拒否と
-  確認後の上書き、rename/delete の追従、読み込み失敗、close 拒否、session 切替時の状態保持。
-- ✅ 性能。`hane-bench buffer` は R3.5 記録と同水準（打鍵時 block index median 3 µs / p95 4 µs、
-  block 分割 median 5 µs / p95 7 µs、再解析 980 bytes 以下、invalidate 0）。
+Issueを閉じる前に、受入条件ごとに証拠を照合する。PRを作った、テストを移した、レビュー指摘が減ったというだけで完了にしない。必要な証拠が未実施/取得不能ならその範囲は未完である。維持が適切な候補は調査結果をもって維持と判断できるが、確認不能とは区別する。
 
-### R4A の完了内容
+## 6. 共通の検証範囲
 
-- ✅ 型を「ブロック」と「行」に分離。従来の1行単位 `VisualBlock` を `VisualLine` へ改名し、
-  `VisualBlock` を Markdown ブロックの単位として作り直した。`BlockId`・表示種別・複数行に
-  またがる `source_range`・revision・`Confidence` と、その中の `VisualLine` を持つ。
-  R4A の互換レイヤはこの `lines` で、カーソル・選択・IME・クリックは物理行を指したまま。
-  設計判断は ADR-0020。
-- ✅ 表示文脈をブロック種別だけから決める。`presentation::block_line_context` が唯一の判定点で、
-  `BlockContextIndex` / `parse_block_context` / `LocalBlockContext` / `local_block_context` と
-  行走査（`scan_block_context` / `is_pipe_row`）を削除。`crates/ui` はフェンスもパイプも見ない。
-  ブロック末尾の空行列（タイル化が上のブロックへ寄せた分）だけは Normal で描くため、
-  閉じ fence 直後の空行はコード背景にならず、コードブロック内部の空行はコードのまま。
-- ✅ 正式 `BlockIndex` が無い間の境界を `hane_markdown::local_block_index` に置き換え。
-  viewport の上に固定行数の lookback を取った窓を `parse_document` で解析してタイル化する。
-  100 MB 文書で 1 回 0.25〜0.44 ms、全ブロック `Provisional`。
-- ✅ ブロック単位の仮想化。`render` はブロックを反復し、`HeightIndex` は 1 エントリ 1 ブロック。
-  正式索引が無い起動直後だけ行粒度で持ち、粒度切替は viewport 上端の source offset を
-  掛け直すので読んでいる位置が動かない。
-- ✅ 可視行でのクリップ。ブロックに大きさの上限は無く、空行を含まない文書は1段落になる
-  （`paragraphs_100k.md` は10万行で1ブロック）。`present_block` は viewport と交差する行だけを
-  構築し、上下の行数を `lines_before` / `lines_after` として高さに算入する。
-- ✅ ブロックの行数を索引が持つ（`IndexedBlock::line_count`）。タイル化時に数えるので
-  高さ索引の再構築が rope 走査を伴わない。10万ブロックで 21.1 ms → 0.635 ms（行単位だった
-  従来の再構築 20万行 約1.5 ms より速い）。`hane-bench buffer` に
-  `block height index rebuild` シナリオを追加。
-- ✅ 正式索引公開時の高さ索引構築（100 MB・約265万ブロックで約 39 ms）を全文解析と同じ
-  背景 job へ移し、main thread は差し替えるだけにした。
-- ✅ 契約。`block_line_counts_tile_the_document_through_edits`（増分更新後も行数が文書を
-  タイルする）、`a_block_taller_than_the_viewport_presents_only_the_visible_lines`、
-  `one_block_covers_every_physical_line_of_its_construct` を追加。R3.25 の fixture harness は
-  `BlockIndex` → `present_block` の 2 呼び出しへ更新し、`EditorView` と同じ経路を保った。
-  fixture の期待値は変更していない。
-- ✅ 検証。`cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` 緑。
-  `hane-bench buffer` は R3.5 と同水準。同一文書の本文領域の描画は master と一致
-  （画面キャプチャ比較。100 MB / 10万段落・1ブロック文書でも正しく描画される）。
+Rust製品変更では、詳細計画にある次の基準を維持する。
 
-### R4B の完了内容
-
-- ✅ ブロックと run の間に「画面上の1行」`LayoutLine` を入れた（`hane_presentation::layout`）。
-  物理行1本、または折り返された物理行の1断片で、行ローカル/ブロックローカルの visual range・
-  受け持つ source range・`y`/`height`・`Hard`/`Soft` の切れ目を持つ。行はその物理行の source を
-  タイルし、物理行はブロックをタイルするので、source の1 byte は必ず1つの行に属する。
-  設計判断は ADR-0021。
-- ✅ フォントに聞くのは折り返し位置と x だけにした（`LineShaper` の3メソッド）。UI は window の
-  text system（`ui::shape::WindowShaper`、`shape_text` の wrap boundary と `shape_line` の
-  `x_for_index` / `closest_index_for_x`）、テストは1文字固定幅の
-  `hane_presentation::testing::FixedAdvanceShaper` で実装する。行の始端・終端・受け持つ source・
-  位置はレイアウト側が決めるため、座標契約が window 無しでテストできる。
-- ✅ カーソルの質問を `BlockLayout` の1か所へ集約。`row_for_source` / `point_for_source` /
-  `source_for_point` / `source_at_x` / `vertical_target` / `visual_range_on_row` /
-  `row_bounds_for_source`。soft の切れ目の offset は次の行の先頭に属し、行末位置を持てるのは
-  `Hard` で終わる行だけ、という規則で caret の描画位置とヒットテストが一致する。
-- ✅ 上下移動を preferred grapheme column から preferred x へ移行。`Editor::preferred_visual_x` と
-  `move_vertical_to` が入口で、移動先の決定は `EditorView::move_vertical` が caret のブロック
-  （前後1行を含む）をレイアウトして行う。ブロックの端に達したときだけ隣のブロックの1行を
-  present する。索引がまだ無い起動直後は `EditorCommand::MoveUp` / `MoveDown` がフォールバック。
-- ✅ クリック・ドラッグは行断片の中だけを測る（`offset_at_row_x`）。折り返し行の右端より先を
-  クリックしても次の行のテキストへは届かない。選択と IME 下線は `visual_range_on_row` で
-  行ごとに切り出すので、折り返しをまたぐ選択が両方の行に出る。
-- ✅ 高さと caret 矩形をレイアウトから取るようにした。`HeightIndex` の更新値は
-  `BlockLayout::height()`（行粒度では `line_height_of`）で、折り返した行はその行数分の高さを
-  占める。`bounds_for_range` は最後のフレームが描いた caret 矩形（`CaretGeometry`）を返すため、
-  IME 候補ウィンドウがカーソル位置に出る。
-- ✅ レイアウトをブロック単位でキャッシュ（`layout_cache`、保持規則は `block_cache` と同じ）。
-  presentation を再利用できたフレームでは幅と revision が一致する限りレイアウトも再利用し、
-  ブロックに触れない編集では `BlockLayout::rebase` で source range だけを移送する。
-  上下移動も、caret のブロックが直前のフレームで描かれていれば parse も shape もしない。
-- ✅ 契約テスト `crates/presentation/tests/layout_contract.rs`（8本）。折り返し段落・引用・
-  リスト・コード・表を含む文書の全 source offset で「source → 点 → source」が同じ offset に
-  戻ること（source map が隠す offset は編集可能位置ではないため対象外）、行が物理行の source と
-  visual text をタイルすること、`Soft`/`Hard` の区別、折り返し位置の caret が次の行の先頭に
-  出ること、短い行を通過しても preferred x が戻ること、ブロック端が `PastEdge` を返すこと。
-  UI 側にはブロックをまたぐ上下移動（`neighbor_row_target`）と行断片の描画範囲のテストを追加。
-- ✅ 計測。`hane-bench buffer` に `viewport block layout` を追加（10万ブロック文書の viewport
-  14 ブロックを present + layout、固定幅シェイパで median 0.048 ms / p95 0.051 ms）。
-  既存シナリオは R4A・R3.5 と同水準（打鍵時 block index median 3 µs / p95 4 µs、block 分割
-  median 6 µs / p95 8 µs、再解析 980 bytes 以下、invalidate 0、block height index rebuild 0.647 ms）。
-- ✅ 検証。`cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings` 緑。
-  instrument build を 100 MB 文書と `paragraphs_100k.md` で起動し、新しい描画経路で
-  `hane_ready` とペイントまで到達することを確認した。
-
-### R4B の残メモ
-
-- 🔶 可視行の二重 shape 解消として cached `ShapedLine` の custom paint を試したが、100 MB
-  入力 p95 が 5.47 ms → 21.49 ms に悪化したため棄却。GPUI native text element を維持する。
-- 🔶 GUI の画面キャプチャ比較と `keystroke_to_paint` 実測は未実施。この環境では window を
-  前面にできず、`CGWindowListCopyWindowInfo` も screen recording 権限が無いため window を
-  取得できなかった（25 秒の autoscroll で paint record 2 件）。折り返し・caret・選択の目視確認と
-  ともに、R4のGUI確認として回収する。
-- 🔶 `HeightIndex` の初期値は折り返しを知らない（`block_heights` は行数 × 行高）。描画された
-  ブロックから実測値へ置き換わるので、スクロール範囲は読み進めるにつれて正確になる。
-  ブロック内の可視行の見積もりは、そのブロックを一度描いていれば実測の平均行高を使う。
-
-### R4C の実施済み・残メモ
-
-- ✅ `LayoutCacheEntry` に layout result と font revision を持たせ、幅・document revision と合わせた
-  再利用キーを1か所にした。theme/font、幅、編集、画像高さの invalidation 規則は ADR-0022。
-- ✅ 非交差 block の presentation/layout rebase を維持し、block split/join 時は stable id と
-  `line_count` を `BlockIndexUpdate` の置換区間だけ比較する。通常文字入力は高さ索引を更新せず、
-  split/join 時だけ同じ区間を `HeightIndex::splice` する。外側の実測高さは残る。
-- ✅ `HeightIndex` と UI の `HeightBlock` メタデータ列を 128 block chunk に変更。10万 block 中央の
-  local splice は median 0.002 ms / p95 0.003 ms、全体構築も p95 0.177 ms（旧 0.671 ms）。
-- ✅ splice は viewport 上端 id を挿入小区間だけで解決し、可視 block の実測高さ更新は同じ ordinal
-  で anchor する。どちらも全 block の id 検索を行わない。
-- ✅ instrument CSV に `layout_cache_hits` / `layout_cache_misses` / `relayout_blocks` を追加。
-- ✅ 10 MB autoscroll で 293 paint、cache hit 5,772 / miss 438。layout median 1.27 ms、
-  p95 1.77 ms。100 MB は RSS 282.8 MB で 350 MB gate 内、再描画は 18 hit / 0 relayout。
-- ✅ cached `ShapedLine` custom paint の性能回帰を同一 R4B build と比較して特定し、棄却した。
-  native text element 復帰後、入力ごとの全 `BlockIndex` 走査も検出して置換区間同期へ修正した。
-- ✅ 最終版の独立2回の 100 MB・30 ASCII入力は p95/p99 3.55/4.41 ms と 4.58/4.60 ms。
-  R0 4.98/7.65 ms と再採取 R4B 7.33/7.38 ms の双方以下。100 MB 改行入力10回も
-  1.97/1.97 ms。15% 相対 gate、16/33 ms 絶対 gate とも Pass。
-
-### R4A の残メモ
-
-- 🔶 GUI の `keystroke_to_paint` / scroll frame interval の master 比較は未実施。window が
-  前面でない環境では OS 側の throttle に支配され、frame 数が同条件で 145〜1304 と振れるため
-  判定に使えなかった。アプリ内計測の `layout_ms` は 100 MB / 10万段落とも master 以下
-  （中央値 0.16〜0.20 ms 対 0.24〜0.26 ms）。R4のGUI確認として回収する。
-- ✅ ブロック内の行位置とスクロール位置の対応は R4B の `LayoutLine` が持つようになった
-  （描画済みブロックは実測の平均行高、未描画は行高一定の見積もり）。
-- ✅ ブロック数が変わる編集の `HeightIndex` 差分 splice と scroll anchoring は R4C で実装した。
-
-### R3.75 の残メモ
-
-- 🔶 Session機能を含むGUI経由の `keystroke_to_paint` 実測は未実施。R2のinstrument比較とは別に、
-  session/filer作業時のGUI確認として回収する。
-- 🔶 外部変更の検出は `FileEvent` を受け取る API までで、ファイル監視そのものは未実装。
-  filer 実装時に watcher を足す。
-
-### R3.5 の残メモ
-
-- ✅ ブロック境界の二重管理は R4A で解消した（`BlockContextIndex` 系を削除）。
-- 🔶 背景の全文解析は `full_text()` の String を作る。100 MB 文書での CPU / RSS 影響は
-  R4C 前の実測で確認する。R4A 時点の実測では `BlockIndex::from_buffer` が 100 MB で
-  約 1.16 秒（背景 job・1回）。
-
-### R2 前半の完了確認
-
-- ✅ `keystroke_to_paint` timing hook の instrument on/off 実測比較。CSV観測のみの
-  `timing-probe` と完全な `instrument` を同じ外部入力で比較した。1回目の normal ASCII p95
-  は +17.1% だったが、逆順の2回目は -36.8% で再現せず、100 MB p95 は +14.3% / -1.4%。
-  100 MB p99 の1回目 +341.8% も2回目は +2.9% であり、R0の「同条件で2回連続」の回帰条件を満たさない。
-
-### R2 後半に回すタスク（計画上 R4C 完了後）
-
-- ✅ `metrics` と `benchmark` の役割再定義・`Distribution`/`percentile` 統合。
-  runtime の rolling window・percentile・duration distribution・RSS は `hane-metrics`、fixture・
-  benchmark scenario・環境採取・report 描画は `hane-benchmark`。benchmark 独自 `Distribution` と
-  percentile 計算を削除し、`DurationDistribution` の type alias に統一した。
-- ✅ スクリプト引数化統合。`scripts/measure.sh` は `all` / `startup` / `input` / `memory`、
-  `scripts/capture.sh` は `editor` / `cursor-boundary` / `cursor-scroll` を引数で選ぶ。
-- ✅ 歴史文書を `docs/history/` へ移動し、`docs/adr/README.md` に現行・歴史の索引を整備。
-
-### R5 の調査・方針決定（2026-08-29）
-
-この節は実装前の調査記録であり、R5 のチェック項目を完了扱いにはしない。R5 実装はこの方針を
-入力として別作業で行い、その後の最終レビューもさらに分ける。
-
-#### 1. 型と変換責務
-
-- 計画作成時の `markdown::BlockKind` / `InlineKind` は既に `markdown::NodeKind` へ統合済み。
-  現在は `NodeKind`（構文）、`presentation::BlockKind` / `StyleKind`（表示種別）、
-  `BlockDisplay` / `InlineDisplay`（描画方針）の3層であり、この分離は維持する。parser と
-  presentation の型を再統合したり、UI へ構文種別を渡したりしない。
-- 現在の変換点は `block_line_context`、`block_display_kind`、`presentation_block_kind`、
-  `presentation_style_kind` に分散している。presentation 内部に非公開の変換表
-  （構文 node の block 表示、indexed top-level block の表示、inline style、line context）を1つ置き、
-  各経路はそこを参照する。table/list の container と表示対象 node の違いは変換表の別フィールドで
-  明示し、無理に同じ `Option<BlockKind>` へ潰さない。
-- delimiter の有無は parser の字句契約なので markdown 側に残す。ただし
-  `is_delimited_inline` は `CodeBlock` も含むため、実態に合う `has_delimiter_markers` 相当へ改名する。
-- UI の製品コードに `NodeKind` が1か所あるが、Markdown 分岐ではなく、空文書を描くために
-  `IndexedBlock` を手組みする fallback である。fallback block の生成を markdown API 側へ寄せ、
-  UI から `NodeKind` の参照を無くす。UI の test-only assertion は構文索引の契約確認なので許容する。
-
-#### 2. style 境界分割
-
-- 計画にある `visual_offset_at_x` は R4B で `BlockLayout` / `LineShaper` に置換済みで、現存しない。
-  現在の重複は `ui::line::line_segments` と `ui::shape::WindowShaper::runs` がそれぞれ
-  style run の始終端を収集・clamp・sort・dedup している部分である。
-- 共有 helper は presentation の公開 API には追加せず、`ui` の非公開 module に置く。入力範囲と
-  境界 offset 群を受け、UTF-8 byte range を clamp・整列・重複除去して連続 range へ分割するだけの
-  helper とする。描画側は selection / IME / caret の境界も渡し、shape 側は style 境界だけを渡す。
-  各 range の選択状態や `InlineDisplay`、GPUI `TextRun` への変換はそれぞれの利用側に残す。
-- helper 単体で、範囲外境界、同一境界、空 range、soft-wrap で切られた style run、UTF-8 文字境界を
-  固定する。R4B の source↔point 契約テストも回帰ゲートにする。
-
-#### 3. pedantic と公開 API
-
-- `cargo clippy --workspace --all-targets --all-features -- -W clippy::pedantic` の調査結果は
-  warning diagnostic 360行（lib/test の重複を含む）。多い順に `must_use` 178件
-  （method 149 + function 29）、`# Errors` 36件、数値変換、float 比較、`# Panics` 13件など。
-  crate別 diagnostic は document 30 / metrics 19 / markdown 42 / editor 33 /
-  presentation 75 / session 67 / benchmark 21 / ui 73。既定 feature と all-features で件数は同じ。
-- 完了ゲートは既定 feature と all-features の両方について
-  `cargo clippy --workspace --all-targets [--all-features] -- -D warnings -W clippy::pedantic` とする。
-  workspace/crate 全体の `allow(clippy::pedantic)` は使わない。機械的な `must_use`・doc・表記は修正し、
-  数値変換、float 比較、bool をまとめた表示 policy など、表現を変える方が契約を曖昧にする箇所だけ
-  理由付きの最小範囲 `allow` を認める。`cargo clippy --fix` の一括適用はしない。
-- R0 の API snapshot は互換性維持リストではなく差分の比較元として使う。R3〜R4 で追加された
-  `BlockIndex` / session / layout の crate 間 API は必要なため維持し、内部専用・未使用だけを削る。
-  調査時点で確定した削減候補は次のとおり。
-  - markdown: 外部利用のない `RESYNC_*` / `LOCAL_BLOCK_LOOKBACK` の再 export と、
-    `LocalBlockIndex` の外部未使用 accessor。
-  - presentation: 二重到達経路になっている公開 `layout` module（root re-export は維持）、
-    製品・benchmark から利用されない `present_plain` / `present_raw_source` / `paragraph_blocks`、
-    内部化できる変換関数。直接呼び出している integration test は公開入口経由の契約テストへ移す。
-  - session: session 内部だけが使う `atomic_write_bytes` と、未使用の `untitled_target`。
-  - `testing` module は integration test と benchmark が crate 境界越しに利用しているため今回は維持する。
-- 実装前、実装後の公開宣言一覧を `docs/baseline/public-api.md` と同じ方法で採取し、各削除と追加に
-  理由を付ける。`cargo-public-api` はこの環境に未導入なので、R5 の必須条件には追加しない。
-
-#### 4. 文書
-
-- README は利用者向け機能を保ち、開発者向けに現行 crate 構造、標準検証 command、統合済み
-  `scripts/measure.sh` / `scripts/capture.sh`、基準線・ADR・リファクタリング計画への入口を追加する。
-- ADR は過去の判断本文を現行実装に合わせて無言で書き換えない。`docs/architecture.md` に現在の
-  crate 依存、`DocumentSession → BlockIndex → VisualBlock → BlockLayout → LayoutLine → run` の流れ、
-  cache / revision 境界をまとめ、README と ADR index から参照する。
-- ADR index は「現行」一括ではなく active / superseded・amended / history を区別する。少なくとも
-  ADR-0002（crate graph）、0004（`VisualBlock` の旧形）、0006（Phase 0 block model）、
-  0008（full-text snapshot と現行 BlockIndex）、0009（metrics/benchmark と統合 script）に
-  現行化注記と後続 ADR / architecture 文書へのリンクを足す。0020〜0022 の現行判断は維持する。
-
-#### 実装順とゲート
-
-1. 公開 API の実装前一覧を固定する。
-2. 構文→表示変換と UI fallback を整理し、Markdown feature / source-map 契約を通す。
-3. 非公開の境界分割 helper を導入し、layout / UI 契約を通す。
-4. 明確な内部 API を private 化・削除し、全 workspace test を通す。
-5. pedantic を crate ごとに解消し、既定 feature / all-features の両ゲートを通す。
-6. 現行 architecture 文書、README、ADR index / 注記、API 差分を更新する。
-
-R5 は型名の大規模変更や挙動変更を含めない。各段階で `cargo test --workspace` と
-`cargo test --workspace --all-features`、通常の `clippy -D warnings` を維持し、最後に R0.5 契約、
-API diff、pedantic をまとめて確認する。
-
-### R5 実装内容（2026-08-29）
-
-- ✅ 構文→表示の変換を presentation 内部の `SyntaxDisplay` 表に集約。`NodeKind` / `BlockKind` /
-  `StyleKind` の3層分離を維持し、delimiter 判定を `has_delimiter_markers` に改名した。
-- ✅ UI fallback は `IndexedBlock::provisional_paragraph` を利用し、製品コードから `NodeKind` の
-  直接参照を除去した。
-- ✅ `ui::ranges::partition` に style/selection/IME/caret の境界分割を集約し、範囲外・重複・空範囲・
-  UTF-8 byte offset を単体テストで固定した。
-- ✅ 公開面を縮小（markdown の parser budget export、presentation の二重 `layout` module と内部
-  presenter、session の内部 atomic-write helper / unused helper）。理由は
-  `docs/baseline/public-api.md` の R5 diff に記録した。
-- ✅ `docs/architecture.md`、README、ADR index と ADR-0002/0004/0006/0008/0009 の現行化注記を追加。
-- ✅ 実装ゲート: default / all-features の workspace・all-targets で pedantic clippy を含む
-  `-D warnings` は成功。pedantic の設計上意図的な例外は、各責務境界に `reason` 付きで局所化した。
-
-> 各フェーズの詳細チェックボックスは `docs/refactor-plan.md` が正。
-> このステータス欄はフェーズを着手・完了するたびに更新する（状態と「最終更新」日付、
-> 「現在地」行を必ず直す）。`refactor-plan.md` のチェックボックスと本表の状態が
-> 食い違ったら本表を修正して同期する。
-
-## 推奨実施順
-
-1. **R0 — 性能・API基準線の確立**
-2. **R0.5 — source↔visual、IME、複数行構文の契約テスト追加**
-3. **R1 — 死蔵コード・重複ヘルパの削除**
-4. **R2 前半 — timing hookを残し、合成入力・CSV・開発APIだけ分離**
-5. **R3 — Markdown解析とマーカ導出を `hane-markdown` に統合**
-6. **R3.25 — Markdown機能拡張用の解析・表示APIを確定**
-7. **R3.5 — revision付き `BlockIndex` を導入**
-8. **R3.75 — `DocumentSession` / `FileService` を `EditorView` から分離**
-9. **R4A — ブロック単位の仮想化・描画へ移行**（完了）
-10. **R4B — `Block → LayoutLine → Run` とvisual座標移動を実装**（完了）
-11. **R4C — レイアウトキャッシュと差分更新を実装**
-12. **R2 後半 — スクリプト統合、環境変数整理、歴史文書移動**
-13. **R5 — 型、公開API、ドキュメントの最終整理**
-
-## 実施方針
-
-- R0とR0.5で性能・公開API・編集表示契約を固定し、以降の全フェーズの回帰ゲートにする。
-- R1で不要コードと重複を減らしてから、責務境界やデータモデルの変更に着手する。
-- R2は前半と後半に分割する。前半では製品経路に必要な低オーバーヘッドのtiming hookを残し、
-  合成入力、CSV出力、開発専用APIを隔離する。スクリプトや歴史文書の整理は、構造変更後の
-  実態に合わせられるようR4C完了後に行う。
-- R3からR3.5までで、Markdown解析・表示契約・ブロック境界を順に確定する。
-- R3.75でファイル状態と永続化を描画責務から分離し、ファイラー実装の土台を作る。
-- R4AからR4Cは、仮想化、visual座標系、差分キャッシュの順に独立して導入する。R4Aで
-  ブロック境界が唯一の表示文脈になり、要素生成が可視ブロック数（ブロック内では可視行数）に
-  比例するようになった。R4Bでカーソル・選択・IME・クリック・上下移動が同じ座標変換
-  （`BlockLayout`）を通るようになり、折り返しが表示・入力の両方で成立している。
-- R5は構造変更が完了した後の実装を正として、型、公開API、ドキュメントを整理する。
-
-## 依存関係
-
-```text
-R0 → R0.5 → R1 → R2前半 → R3 → R3.25 → R3.5 → R4A → R4B → R4C
-               └────────────────────────→ R3.75
-
-R4C → R2後半 → R5
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-R3.5とR3.75は並行実施できる。順番に進める場合は、ブロック境界の基盤を先に確定できる
-`BlockIndex → DocumentSession / FileService` の順とする。
+通常feature/release成果物に影響する場合は次も確認する。
 
-## 機能追加の開始条件
+```sh
+cargo test --workspace --locked
+cargo build --release --locked -p hane
+```
 
-| 機能追加の種類 | 開始できる地点 | 理由 |
-|---|---|---|
-| ファイラー | R3.75完了後 | ファイル状態とI/Oを `EditorView` に再び密結合させずに実装できる |
-| 単純なインラインMarkdown機能 | R3.5完了後 | 解析・表示APIとrevision付きブロック境界が確定している |
-| リスト、引用、コード、表などの複数行機能 | R4B完了後 | 複数行ブロックのレイアウトとvisual座標移動が成立している |
-| 大規模な機能追加 | R4C完了後を推奨 | レイアウトキャッシュと差分更新を含む最終的な性能構造が安定している |
+vendor/GPUI変更では、詳細計画第6節に記載したworkspace外の実字形・入力ソーステストを省略しない。Python/Shell/workflow変更はcurrent CIの該当テストと変更入口を確認する。native IME、geometry、filesystemの保証はunit成功だけでは代替しない。逆に製品へ影響しない文書/運用整理に全GUIを機械的に課さない。
 
-開始条件に達する前でも調査やspikeは実施できる。ただし、製品経路に暫定的な文字列判定、
-物理行前提の表示分岐、`EditorView` が直接所有するファイル状態を追加しない。
+本書保存時点でこれらは未実行である。性能基準は #23 を使用し、古い計測値やこの計画の予算値をcurrent実測として報告しない。実行やmergeの採否はcurrent Commander Policyに従う。
 
-## 各段階のゲート
+## 7. RF5-B — 未作成Issueの保持本文
 
-各フェーズは独立してコミット・検証できる単位とし、次の条件を満たしてから次段階へ進む。
+Issue作成APIが拒否したため、この作業は未登録である。別の番号を推測してリンクせず、対象外にも変更しない。親 #297 と最終受入 #315 で未登録・未完として追跡する。
 
-- R0で固定したテスト、性能原本、公開APIスナップショットとの差分を確認する。
-- R0.5で追加したsource↔visual、IME、複数行構文の契約テストを通す。
-- `keystroke_to_paint` p95/p99などの主要指標が、定義した許容回帰率を超えていないことを確認する。
-- 回帰がある場合は次フェーズで吸収せず、原因を当該フェーズ内で特定して解消する。
+### タイトル
+
+refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任と寿命を整理する
+
+### 目的・依存
+
+#301/#302 と #306 の当該境界、#309 の文書/session切替境界を受け入れた後に着手する。#307 と同じlayout状態を同時に変更しない。#23 の変更前基準が必要である。
+
+### 作業
+
+1. `block_cache`、`layout_cache`、`joined_parse_cache`、`line_owners`、HeightIndex/height_blocksとbackground jobについて、key・所有者・更新入口・無効化理由・容量/実行数上限・文書切替時処理を表にする。
+2. source編集、disclosure、width/font/zoom、画像高さ、session切替を区別し、関連状態を整合して更新する小さなAPIに集約する。全cacheを汎用engineへ統合しない。
+3. `JoinedParse` のstrict-matchとBlockIndexの条件付きrebaseを維持する。遅い結果が新しいjobのin-flightを消さないこと、旧文書のdetached jobも実行数に含めることを固定する。
+4. 同期joinの行数/byte上限（計画基準では4,096行・256 KiB）と実行数管理をまず維持する。無関係なblockのcache/高さ測定を残し、局所編集で全体走査や過剰な再parse/shape/layoutを増やさない。
+
+### 受入条件
+
+- [ ] cache・索引・jobごとの責任者と無効化条件が明示され、複数箇所のばらばらな更新を整理している。
+- [ ] 文書/フォルダ切替、遅い完了、新旧job競合、disclosure往復、split/joinを回帰テストしている。
+- [ ] 巨大単一blockを同期全文処理せず、処理上限と文書切替をまたぐ実行数制限を維持する。
+- [ ] parse/shape/layout回数と局所編集の処理量、入力/scroll/RSSを #23 の同条件基準と比較し、関連回帰を解消している。
+- [ ] workspace tests/clippy、必要なfocused GUI、所有権表とbefore/after証拠を対象SHA付きで提出している。
+
+### 対象外・PR・検証・復旧
+
+閾値変更、cache algorithm最適化、session eviction、新runtimeは混ぜない。必要性が実測された変更はRF8で独立PRにする。cache種別または同じ無効化原因ごとにPRを分ける。
+
+`cargo test --workspace --all-features`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`。巨大文書/小文書切替と画像遅延はfocused GUIも実施。各PRの戻し方と後続依存を明記し、計測対象の移動だけで改善としない。
+
+## 8. 次に着手する作業
+
+最初の実装依頼は #298 とする。現行範囲・契約・検証条件を整え、#23 の変更前基準を確認する。その後は #299/#300 の根拠ある削除、#301〜#303 の機械的分割へ進む。文書/Issueの保存だけでは製品改修を開始していない。
+
+全体の完了判断は #315 に集約する。RF5-Bの登録/実施/証拠が未完のまま、親 #297 を完了にしてはならない。
