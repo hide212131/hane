@@ -979,7 +979,7 @@ pub fn block_heights_with_disclosure(
         .map(|block| {
             counted += block.line_count;
             let block_is_final = block.ordinal + 1 == index.len();
-            let collapsed = index
+            let collapsed_fence_rows = index
                 .fence_height_projection(&block)
                 .map_or(0, |projection| {
                     projection.inactive_rows_in(
@@ -989,6 +989,11 @@ pub fn block_heights_with_disclosure(
                         block_is_final,
                     )
                 });
+            let collapsed_table_delimiter = index
+                .table_projection(&block)
+                .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
+                .map_or(0, |_| 1);
+            let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
             line_height * block.line_count.saturating_sub(collapsed) as f32
         })
         .collect::<Vec<_>>();
@@ -1041,6 +1046,10 @@ pub struct BlockWindow<'a> {
     /// not materialize off-screen source rows merely to account for height.
     pub zero_height_fence_rows_before: usize,
     pub zero_height_fence_rows_after: usize,
+    /// Absolute document line number of a formal table delimiter. This is
+    /// supplied even when the delimiter is outside `lines`, so clipped table
+    /// rows do not regain a virtual height.
+    pub table_delimiter_line: Option<usize>,
     /// The subset of `lines` (by document line number) to actually turn into
     /// presented [`VisualLine`]s. Lines in `lines` outside this range are
     /// parsing context only and are not drawn.
@@ -1126,14 +1135,17 @@ pub fn present_block_with_table_projection(
                 .map(|line| line.line)
         })
         .flatten();
-    let table_delimiter_line = table_projection
-        .and_then(|projection| projection.delimiter_range)
-        .and_then(|delimiter| {
-            window
-                .lines
-                .iter()
-                .find(|line| line.range == delimiter)
-                .map(|line| line.line)
+    let table_delimiter_range = table_projection.and_then(|projection| projection.delimiter_range);
+    let table_delimiter_line = window
+        .table_delimiter_line
+        .or_else(|| {
+            table_delimiter_range.and_then(|delimiter| {
+                window
+                    .lines
+                    .iter()
+                    .find(|line| line.range == delimiter)
+                    .map(|line| line.line)
+            })
         })
         .or(local_table_delimiter_line);
     let table_alignments = table_projection.map_or_else(
@@ -1275,6 +1287,20 @@ pub fn present_block_with_table_projection(
             false
         };
         record_collapsed(line.line, collapsed);
+    }
+    let table_delimiter_collapsed = table_delimiter_line.is_some_and(|delimiter| {
+        table_delimiter_range.map_or_else(
+            || {
+                lines
+                    .iter()
+                    .find(|line| line.line_id as usize == delimiter)
+                    .is_some_and(|line| line.kind == BlockKind::TableDelimiter)
+            },
+            |range| table_delimiter_is_collapsed_range(range, window.block_disclosure),
+        )
+    });
+    if table_delimiter_collapsed {
+        record_collapsed(table_delimiter_line.unwrap_or_default(), true);
     }
     VisualBlock {
         id: block.id,
@@ -1581,7 +1607,7 @@ fn estimated_height(kind: BlockKind, line_height: f32) -> f32 {
         BlockKind::Heading(_) => line_height * 1.1,
         BlockKind::CodeBlock => line_height,
         BlockKind::Image => IMAGE_ROW_HEIGHT_AT_BASE_ZOOM * line_height / BASE_LINE_HEIGHT,
-        BlockKind::TableDelimiter => 8.0,
+        BlockKind::TableDelimiter => 0.0,
         _ => line_height,
     }
 }
@@ -1617,6 +1643,24 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
     } else {
         range.intersects(disclosure)
     }
+}
+
+fn table_delimiter_is_collapsed_range(
+    range: SourceRange,
+    disclosure: Option<SourceRange>,
+) -> bool {
+    disclosure.is_none_or(|active| !range_touches(range, active))
+}
+
+/// Whether a formal table's delimiter is hidden from the inactive visual
+/// projection. The source range remains available for disclosure and editing.
+pub fn table_delimiter_is_collapsed(
+    projection: &TableProjection,
+    disclosure: Option<SourceRange>,
+) -> bool {
+    projection
+        .delimiter_range
+        .is_some_and(|range| table_delimiter_is_collapsed_range(range, disclosure))
 }
 
 fn disclosure_owns_physical_line(
@@ -4690,6 +4734,29 @@ mod tests {
     }
 
     #[test]
+    fn inactive_table_delimiter_does_not_reserve_virtual_height() {
+        let document = RopeBuffer::from_text("| head | value |\n| --- | --- |\n| body | cell |");
+        let index = BlockIndex::from_buffer(&document);
+        let block = index.blocks().next().expect("table block");
+        let delimiter = index
+            .table_projection(&block)
+            .and_then(|projection| projection.delimiter_range)
+            .expect("table delimiter");
+
+        assert_eq!(block_heights(&document, &index, 26.0), vec![52.0]);
+        assert_eq!(
+            block_heights_with_disclosure(
+                &document,
+                &index,
+                26.0,
+                Some(SourceRange::empty(delimiter.start.0 + 2)),
+            ),
+            vec![78.0],
+            "disclosing the delimiter must restore its editable source row"
+        );
+    }
+
+    #[test]
     fn selection_outside_a_quote_fence_block_does_not_disclose_its_rows() {
         let source = "before\n\n> ```\n> code\n> ```";
         let document = RopeBuffer::from_text(source);
@@ -4790,6 +4857,7 @@ mod tests {
                 clipped_fence_lines: &[],
                 zero_height_fence_rows_before: 0,
                 zero_height_fence_rows_after: 0,
+                table_delimiter_line: None,
                 render: 0..lines.len(),
                 joined: Some(&joined),
                 block_disclosure: None,
@@ -4858,6 +4926,7 @@ mod tests {
                 clipped_fence_lines: &[],
                 zero_height_fence_rows_before: 0,
                 zero_height_fence_rows_after: 0,
+                table_delimiter_line: None,
                 render: 1..2,
                 joined: None,
                 block_disclosure: None,
@@ -5797,6 +5866,7 @@ mod tests {
                 clipped_fence_lines: &[],
                 zero_height_fence_rows_before: 0,
                 zero_height_fence_rows_after: 0,
+                table_delimiter_line: None,
                 render: 0..lines.len(),
                 joined: Some(&joined),
                 block_disclosure: None,
@@ -6481,6 +6551,7 @@ mod tests {
                 clipped_fence_lines: &[],
                 zero_height_fence_rows_before: 0,
                 zero_height_fence_rows_after: 0,
+                table_delimiter_line: None,
                 render: 0..2,
                 joined: Some(&joined),
                 block_disclosure: Some(disclosure),
@@ -6601,6 +6672,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: 0..2,
             joined: None,
             block_disclosure: None,
@@ -6686,6 +6758,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: 0..3,
             joined: None,
             block_disclosure: None,
@@ -6782,6 +6855,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: 0..2,
             joined: Some(&joined),
             block_disclosure: None,
@@ -6796,6 +6870,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: 0..1,
             joined: Some(&joined),
             block_disclosure: None,
@@ -6883,6 +6958,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: 0..lines.len(),
             joined: None,
             block_disclosure: None,
@@ -7288,6 +7364,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             joined: None,
             block_disclosure: None,
         };
@@ -7373,6 +7450,7 @@ mod tests {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             joined: None,
             block_disclosure: None,
         };

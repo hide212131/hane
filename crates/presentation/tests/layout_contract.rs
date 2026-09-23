@@ -248,6 +248,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     clipped_fence_lines: &[],
                     zero_height_fence_rows_before: 0,
                     zero_height_fence_rows_after: 0,
+                    table_delimiter_line: None,
                     joined: None,
                     block_disclosure: None,
                 },
@@ -283,6 +284,11 @@ fn present_table_window(source: &str, render: Range<usize>) -> VisualBlock {
             disclosure: None,
         })
         .collect::<Vec<_>>();
+    let table_delimiter_line = index
+        .table_projection(&block)
+        .and_then(|projection| projection.delimiter_range)
+        .and_then(|range| buffer.line_for_offset(range.start).ok())
+        .map(|line| line.0);
     present_block_with_table_projection(
         &block,
         buffer.revision(),
@@ -293,6 +299,7 @@ fn present_table_window(source: &str, render: Range<usize>) -> VisualBlock {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line,
             render,
             joined: None,
             block_disclosure: None,
@@ -609,15 +616,82 @@ fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
     assert!(delimiter.visual_text.is_empty());
 
     let layout = layout_block(&block, 160.0, &shaper());
-    let delimiter_row = layout
-        .lines
-        .iter()
-        .find(|row| row.line_id == delimiter.line_id)
-        .expect("table delimiter layout row");
     assert!(
-        delimiter_row.table_cells.is_empty(),
-        "hidden delimiter rows must not become editing table rows"
+        layout
+            .lines
+            .iter()
+            .all(|row| row.line_id != delimiter.line_id),
+        "hidden delimiter rows must not become layout rows"
     );
+}
+
+#[test]
+fn clipped_table_delimiter_does_not_restore_virtual_space() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let header = present_table_window(source, 0..1);
+    let body = present_table_window(source, 2..3);
+
+    assert_eq!(header.trailing_space(), LINE_HEIGHT);
+    assert_eq!(body.leading_space(), LINE_HEIGHT);
+}
+
+#[test]
+fn table_layout_moves_directly_between_header_and_first_body_row() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let (block, layout) = laid_out(source)
+        .into_iter()
+        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    assert_eq!(
+        layout.lines.iter().map(|row| row.line_id).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(layout.lines[1].y, layout.lines[0].bottom());
+
+    let header_offset = SourceOffset(source.find("header").expect("header cell"));
+    let body_offset = SourceOffset(source.find("body").expect("body cell"));
+    let header_point = layout
+        .point_for_source(&block, header_offset, &shaper())
+        .expect("header point");
+    let body_point = layout
+        .point_for_source(&block, body_offset, &shaper())
+        .expect("body point");
+    let down = layout.vertical_target(&block, header_offset, true, header_point.x, &shaper());
+    let VerticalMove::To(down_offset) = down else {
+        panic!("down from the header must enter the first body row: {down:?}");
+    };
+    let down_point = layout
+        .point_for_source(&block, down_offset, &shaper())
+        .expect("down target point");
+    assert_eq!(down_point.row, body_point.row);
+    assert_eq!(down_point.x, header_point.x);
+
+    let up = layout.vertical_target(&block, body_offset, false, body_point.x, &shaper());
+    let VerticalMove::To(up_offset) = up else {
+        panic!("up from the first body row must enter the header: {up:?}");
+    };
+    let up_point = layout
+        .point_for_source(&block, up_offset, &shaper())
+        .expect("up target point");
+    assert_eq!(up_point.row, header_point.row);
+    assert_eq!(up_point.x, body_point.x);
+}
+
+#[test]
+fn table_delimiter_stays_editable_and_restores_a_layout_row_when_disclosed() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let delimiter_offset = source.find("---").expect("delimiter");
+    let block = present(source, Some(delimiter_offset))
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let delimiter = block.lines.iter().find(|line| line.line_id == 1).unwrap();
+    assert_ne!(delimiter.kind, BlockKind::TableDelimiter);
+    assert!(delimiter.visual_text.contains("---"));
+    assert!(delimiter.height() > 0.0);
+
+    let layout = layout_block(&block, WIDTH, &shaper());
+    assert!(layout.lines.iter().any(|row| row.line_id == 1));
 }
 
 #[test]

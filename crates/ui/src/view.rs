@@ -58,7 +58,8 @@ use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_heights_with_disclosure, block_is_joinable, block_line_span,
-    code_line_height, layout_block, parse_joined_span, trailing_blank_lines,
+    code_line_height, layout_block, parse_joined_span, table_delimiter_is_collapsed,
+    trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -4329,7 +4330,40 @@ impl EditorView {
     ) -> Option<(VisualBlock, BlockLayout)> {
         let indexed = self.block_at_offset(offset)?;
         let line = self.editor().document().line_for_offset(offset).ok()?.0;
-        let window = line.saturating_sub(1)..line + 2;
+        let mut window_start = line.saturating_sub(1);
+        let mut window_end = line + 2;
+        if let Some(table) = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed))
+        {
+            let header_line = table
+                .rows
+                .iter()
+                .find(|row| row.header)
+                .and_then(|row| {
+                    self.editor()
+                        .document()
+                        .line_for_offset(row.source_range.start)
+                        .ok()
+                })
+                .map(|line| line.0);
+            let first_body_line = table
+                .rows
+                .iter()
+                .find(|row| !row.header)
+                .and_then(|row| {
+                    self.editor()
+                        .document()
+                        .line_for_offset(row.source_range.start)
+                        .ok()
+                })
+                .map(|line| line.0);
+            if header_line == Some(line) || first_body_line == Some(line) {
+                window_start = window_start.min(header_line.unwrap_or(line));
+                window_end = window_end.max(first_body_line.map_or(line + 1, |line| line + 1));
+            }
+        }
+        let window = window_start..window_end;
         let drawn = self
             .block_cache
             .get(&indexed.id)
@@ -4562,11 +4596,11 @@ impl EditorView {
         }
     }
 
-    /// Keeps the active endpoint's fence block in the height index before the
-    /// caret-scroll calculation runs. A caret move does not change the block
-    /// count, so `resync_heights` quite deliberately keeps its measured index;
-    /// that fast path must still expand a zero-height block that was just made
-    /// editable or it can disappear from the next virtualization window.
+    /// Keeps the active endpoint's structural rows in the height index before
+    /// the caret-scroll calculation runs. A caret move does not change the
+    /// block count, so `resync_heights` quite deliberately keeps its measured
+    /// index; that fast path must still expand a zero-height row that was just
+    /// made editable or it can disappear from the next virtualization window.
     ///
     /// A non-empty selection is different: its complete disclosure is rebuilt
     /// by the coalesced background parse. Updating every block it spans here
@@ -4625,43 +4659,65 @@ impl EditorView {
             .into_iter()
             .filter_map(|ordinal| {
                 let block = index.block(ordinal)?;
-                let projection = index.fence_height_projection(&block)?;
                 let block_is_final = ordinal + 1 == index.len();
-                let collapsed = projection.inactive_rows_in(
-                    block.source_range,
-                    block.source_range,
-                    Some(disclosure),
-                    block_is_final,
-                );
+                let fence_projection = index.fence_height_projection(&block);
+                let table_projection = index.table_projection(&block);
+                if fence_projection.is_none() && table_projection.is_none() {
+                    return None;
+                }
+                let collapsed_fence = fence_projection.map_or(0, |projection| {
+                    projection.inactive_rows_in(
+                        block.source_range,
+                        block.source_range,
+                        Some(disclosure),
+                        block_is_final,
+                    )
+                });
+                let collapsed_table = table_projection
+                    .filter(|projection| {
+                        table_delimiter_is_collapsed(projection, Some(disclosure))
+                    })
+                    .map_or(0, |_| 1);
+                let collapsed = collapsed_fence + collapsed_table;
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
                 let current = self.heights.height(ordinal)?;
                 let target = previous.map_or_else(
                     || current.max(minimum),
                     |previous| {
-                        let previous_collapsed = projection.inactive_rows_in(
-                            block.source_range,
-                            block.source_range,
-                            Some(previous),
-                            block_is_final,
-                        );
+                        let previous_collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(previous),
+                                block_is_final,
+                            )
+                        });
+                        let previous_collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(previous))
+                            })
+                            .map_or(0, |_| 1);
                         // `current` may be a measured layout height: a code
                         // row is taller than the plain line-height seed. Move
-                        // only the fence-row delta between disclosures so the
+                        // only the structural-row delta between disclosures so
                         // measured body rows stay measured instead of being
                         // replaced by an arithmetic lower bound.
-                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
-                        let fence_height_delta = self.fence_height_delta(
-                            &block,
-                            projection,
-                            Some(previous),
-                            Some(disclosure),
-                            collapsed_delta,
-                            line_height,
-                        );
+                        let fence_height_delta = fence_projection.map_or(0.0, |projection| {
+                            self.fence_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_fence as f32 - previous_collapsed_fence as f32,
+                                line_height,
+                            )
+                        });
+                        let table_height_delta = line_height
+                            * (collapsed_table as f32 - previous_collapsed_table as f32);
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            fence_height_delta,
+                            fence_height_delta + table_height_delta,
                         )
                     },
                 );
@@ -4802,46 +4858,50 @@ impl EditorView {
                     || current.max(minimum),
                     |previous| {
                         let block_is_final = ordinal + 1 == index.len();
-                        let collapsed =
-                            index
-                                .fence_height_projection(&block)
-                                .map_or(0, |projection| {
-                                    projection.inactive_rows_in(
-                                        block.source_range,
-                                        block.source_range,
-                                        Some(disclosure),
-                                        block_is_final,
-                                    )
-                                });
-                        let previous_collapsed =
-                            index
-                                .fence_height_projection(&block)
-                                .map_or(0, |projection| {
-                                    projection.inactive_rows_in(
-                                        block.source_range,
-                                        block.source_range,
-                                        Some(previous),
-                                        block_is_final,
-                                    )
-                                });
-                        let collapsed_delta = collapsed as f32 - previous_collapsed as f32;
-                        let fence_height_delta = index.fence_height_projection(&block).map_or(
-                            code_line_height(line_height) * collapsed_delta,
-                            |projection| {
-                                self.fence_height_delta(
-                                    &block,
-                                    projection,
-                                    Some(previous),
-                                    Some(disclosure),
-                                    collapsed_delta,
-                                    line_height,
-                                )
-                            },
-                        );
+                        let fence_projection = index.fence_height_projection(&block);
+                        let table_projection = index.table_projection(&block);
+                        let collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(disclosure),
+                                block_is_final,
+                            )
+                        });
+                        let previous_collapsed_fence = fence_projection.map_or(0, |projection| {
+                            projection.inactive_rows_in(
+                                block.source_range,
+                                block.source_range,
+                                Some(previous),
+                                block_is_final,
+                            )
+                        });
+                        let collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(disclosure))
+                            })
+                            .map_or(0, |_| 1);
+                        let previous_collapsed_table = table_projection
+                            .filter(|projection| {
+                                table_delimiter_is_collapsed(projection, Some(previous))
+                            })
+                            .map_or(0, |_| 1);
+                        let fence_height_delta = fence_projection.map_or(0.0, |projection| {
+                            self.fence_height_delta(
+                                &block,
+                                projection,
+                                Some(previous),
+                                Some(disclosure),
+                                collapsed_fence as f32 - previous_collapsed_fence as f32,
+                                line_height,
+                            )
+                        });
+                        let table_height_delta = line_height
+                            * (collapsed_table as f32 - previous_collapsed_table as f32);
                         preserve_measured_height_after_fence_delta(
                             current,
                             minimum,
-                            fence_height_delta,
+                            fence_height_delta + table_height_delta,
                         )
                     },
                 );
@@ -4977,10 +5037,16 @@ impl EditorView {
             (id, ordinal, intra)
         });
         let line_height = self.line_height();
+        let initial_heights = block_heights_with_disclosure(
+            self.editor().document(),
+            index,
+            line_height,
+            self.active_height_disclosure(),
+        );
         self.heights.splice(
             first..old_end,
-            next.iter()
-                .map(|block| line_height * block.line_count as f32),
+            (first..first + update.inserted_blocks)
+                .filter_map(|ordinal| initial_heights.get(ordinal).copied()),
         );
         self.height_blocks.splice(first..old_end, &next);
 
@@ -5051,23 +5117,40 @@ impl EditorView {
     }
 
     /// Number of non-collapsed physical lines before `physical_line` inside a
-    /// block. Fence rows are answered by the formal projection's prefix index;
-    /// the render path never enumerates the block's off-screen fences.
+    /// block. Fence rows are answered by the formal projection's prefix index,
+    /// and an inactive table delimiter is omitted from the same visual prefix;
+    /// the render path never enumerates off-screen structural rows.
     fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
         let Some(index) = self.current_index() else {
             return physical_line;
         };
-        let Some(projection) = index.fence_height_projection(block) else {
-            return physical_line;
-        };
         let block_is_final = block.ordinal + 1 == index.len();
-        let collapsed = projection.inactive_rows_before_line(
-            block.source_range,
-            physical_line,
-            self.active_height_disclosure(),
-            block_is_final,
-        );
-        physical_line.saturating_sub(collapsed)
+        let collapsed_fence_rows = index
+            .fence_height_projection(block)
+            .map_or(0, |projection| {
+                projection.inactive_rows_before_line(
+                    block.source_range,
+                    physical_line,
+                    self.active_height_disclosure(),
+                    block_is_final,
+                )
+            });
+        let delimiter_line = index
+            .table_projection(block)
+            .and_then(|projection| projection.delimiter_range)
+            .and_then(|range| self.editor().document().line_for_offset(range.start).ok())
+            .and_then(|line| {
+                block_line_span(self.editor().document(), block)
+                    .map(|span| line.0.saturating_sub(span.start))
+            });
+        let collapsed_table_delimiter = index
+            .table_projection(block)
+            .filter(|projection| {
+                table_delimiter_is_collapsed(projection, self.active_height_disclosure())
+            })
+            .filter(|_| delimiter_line.is_some_and(|delimiter| delimiter < physical_line))
+            .map_or(0, |_| 1);
+        physical_line.saturating_sub(collapsed_fence_rows + collapsed_table_delimiter)
     }
 
     /// Inverts [`Self::visible_line_prefix`] for a visual row count. The
@@ -10413,6 +10496,63 @@ mod tests {
             (0, x),
             "the caret lands on the first row of the next block, at the x it was aiming at"
         );
+    }
+
+    #[test]
+    fn table_vertical_extension_skips_the_hidden_delimiter_row() {
+        let source = "| header | value |\n| --- | --- |\n| body | cell |";
+        let mut editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (block, layout) = laid_out(&editor, &index, 0, &shaper);
+        let header = SourceOffset(source.find("header").expect("header cell"));
+        let body = SourceOffset(source.find("body").expect("body cell"));
+        let header_point = layout
+            .point_for_source(&block, header, &shaper)
+            .expect("header point");
+        let body_point = layout
+            .point_for_source(&block, body, &shaper)
+            .expect("body point");
+        let VerticalMove::To(down) =
+            layout.vertical_target(&block, header, true, header_point.x, &shaper)
+        else {
+            panic!("shift-down from the header must enter the first body row");
+        };
+        assert_eq!(
+            layout
+                .row_for_source(down)
+                .map(|row| layout.lines[row].line_id),
+            Some(2)
+        );
+        editor
+            .set_selection(Selection::caret(header))
+            .expect("header selection");
+        editor
+            .move_vertical_to(down, true, header_point.x)
+            .expect("shift-down target");
+        assert_eq!(editor.selection().active, down);
+        assert_eq!(editor.selection().range(), SourceRange::new(header.0, down.0));
+
+        let mut editor = Editor::new(source);
+        editor
+            .set_selection(Selection::caret(body))
+            .expect("body selection");
+        let VerticalMove::To(up) =
+            layout.vertical_target(&block, body, false, body_point.x, &shaper)
+        else {
+            panic!("shift-up from the first body row must enter the header");
+        };
+        assert_eq!(
+            layout
+                .row_for_source(up)
+                .map(|row| layout.lines[row].line_id),
+            Some(0)
+        );
+        editor
+            .move_vertical_to(up, true, body_point.x)
+            .expect("shift-up target");
+        assert_eq!(editor.selection().active, up);
+        assert_eq!(editor.selection().range(), SourceRange::new(up.0, body.0));
     }
 
     #[test]
