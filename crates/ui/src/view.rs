@@ -111,6 +111,16 @@ const ZOOM_SNAP_RANGE: (f32, f32) = (0.98, 1.02);
 /// Multiplicative zoom change per wheel "line" of Ctrl/Cmd+wheel input, i.e.
 /// `zoom *= 2f32.powf(ZOOM_STEP_PER_LINE)` per line of scroll.
 const ZOOM_STEP_PER_LINE: f32 = 0.08;
+/// The time constant for display-linked wheel zoom interpolation. The visible
+/// zoom covers about 95% of the remaining distance in roughly 105 ms while
+/// still reacting on the first animation frame.
+const WHEEL_ZOOM_TIME_CONSTANT: Duration = Duration::from_millis(35);
+/// GPUI's test executor can deliver animation frames without wall-clock time
+/// advancing. Treat such frames as 120 Hz so the same interpolation converges
+/// deterministically in tests and on high-refresh displays.
+const WHEEL_ZOOM_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
+/// Stop scheduling frames once the remaining zoom error is below 0.1%.
+const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
 const SCROLLBAR_TRACK_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 28.0;
@@ -273,6 +283,21 @@ fn zoom_factor_for_wheel(delta: ScrollDelta, line_height: f32) -> f32 {
     2f32.powf(lines * ZOOM_STEP_PER_LINE)
 }
 
+/// Advances one display-linked wheel-zoom frame toward `target`. Exponential
+/// convergence keeps the response independent of whether the display runs at
+/// 60 Hz or 120 Hz and never overshoots the target.
+fn eased_wheel_zoom_step(current: f32, target: f32, elapsed: Duration) -> f32 {
+    let elapsed = elapsed.max(WHEEL_ZOOM_MIN_FRAME_TIME).as_secs_f32();
+    let response = WHEEL_ZOOM_TIME_CONSTANT.as_secs_f32();
+    let alpha = 1.0 - (-elapsed / response).exp();
+    let next = current + (target - current) * alpha;
+    if (target - next).abs() <= WHEEL_ZOOM_SETTLE_EPSILON {
+        target
+    } else {
+        next
+    }
+}
+
 fn height_snapshot_matches_line_height(current: f32, snapshot: f32) -> bool {
     current.to_bits() == snapshot.to_bits()
 }
@@ -298,6 +323,16 @@ struct PendingZoomAnchor {
     /// The gesture's position, in content-local window coordinates (window
     /// y minus the header height), that `fraction` should keep resolving to.
     window_offset: f32,
+}
+
+/// State that exists only while a discrete Ctrl/Cmd+wheel target is being
+/// interpolated across display frames. `raw_zoom` remains the accumulated
+/// target; this state only remembers where to anchor it and when the previous
+/// animation frame was rendered.
+#[derive(Clone, Copy, Debug)]
+struct WheelZoomAnimation {
+    window_offset: f32,
+    last_frame: Instant,
 }
 
 /// Identifies the document a background job was started for. A result that
@@ -728,6 +763,10 @@ pub struct EditorView {
     /// crosses the snap band; keeping the raw value prevents small deltas from
     /// being discarded one event at a time.
     raw_zoom: f32,
+    /// Discrete wheel input updates `raw_zoom` immediately, while the painted
+    /// `zoom` converges to it once per animation frame. Pinch and reset paths
+    /// bypass this state and remain directly coupled to their input.
+    wheel_zoom_animation: Option<WheelZoomAnimation>,
     /// Set by a zoom-changing gesture, consumed after the visible blocks have
     /// been remeasured for the new zoom. See `PendingZoomAnchor`.
     pending_zoom_anchor: Option<PendingZoomAnchor>,
@@ -2166,6 +2205,7 @@ impl EditorView {
             layout_font_revision: 0,
             zoom: 1.0,
             raw_zoom: 1.0,
+            wheel_zoom_animation: None,
             pending_zoom_anchor: None,
             caret_geometry: None,
             pending_caret_visibility_after_layout: false,
@@ -4055,6 +4095,7 @@ impl EditorView {
     fn set_zoom_from_raw(&mut self, raw: f32, window_offset: f32, cx: &mut Context<Self>) {
         let raw = raw.clamp(MIN_ZOOM, MAX_ZOOM);
         self.raw_zoom = raw;
+        self.wheel_zoom_animation = None;
         let next = clamp_and_snap_zoom(raw);
         if next == self.zoom {
             return;
@@ -4070,6 +4111,66 @@ impl EditorView {
 
     fn apply_zoom_factor(&mut self, factor: f32, window_offset: f32, cx: &mut Context<Self>) {
         self.set_zoom_from_raw(self.raw_zoom * factor, window_offset, cx);
+    }
+
+    /// Records a new discrete wheel target without jumping the painted zoom to
+    /// it. Repeated wheel events extend the same target stream and only update
+    /// its anchor; the render loop consumes at most one interpolation step per
+    /// display frame.
+    fn queue_wheel_zoom_factor(
+        &mut self,
+        factor: f32,
+        window_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.raw_zoom = (self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let target = clamp_and_snap_zoom(self.raw_zoom);
+        if target == self.zoom {
+            self.wheel_zoom_animation = None;
+            return;
+        }
+
+        if let Some(animation) = self.wheel_zoom_animation.as_mut() {
+            animation.window_offset = window_offset;
+        } else {
+            self.wheel_zoom_animation = Some(WheelZoomAnimation {
+                window_offset,
+                last_frame: Instant::now(),
+            });
+        }
+        cx.notify();
+    }
+
+    /// Runs before layout for each requested animation frame. The new zoom is
+    /// installed before shaping, so every frame has one internally consistent
+    /// geometry generation; the existing pending anchor is then resolved after
+    /// visible blocks have been remeasured later in the same render.
+    fn step_wheel_zoom_animation(&mut self, window: &Window) {
+        let Some(mut animation) = self.wheel_zoom_animation else {
+            return;
+        };
+        let target = clamp_and_snap_zoom(self.raw_zoom);
+        if target == self.zoom {
+            self.wheel_zoom_animation = None;
+            return;
+        }
+
+        let now = Instant::now();
+        let next = eased_wheel_zoom_step(
+            self.zoom,
+            target,
+            now.saturating_duration_since(animation.last_frame),
+        );
+        self.pending_zoom_anchor = self.zoom_anchor_at(animation.window_offset);
+        self.zoom = next;
+
+        if next == target {
+            self.wheel_zoom_animation = None;
+        } else {
+            animation.last_frame = now;
+            self.wheel_zoom_animation = Some(animation);
+            window.request_animation_frame();
+        }
     }
 
     /// Resets zoom to 100%, anchored at the viewport's vertical center since
@@ -4095,7 +4196,7 @@ impl EditorView {
         if event.modifiers.secondary() {
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
             let window_offset = f32::from(event.position.y) - self.theme.header_height;
-            self.apply_zoom_factor(factor, window_offset, cx);
+            self.queue_wheel_zoom_factor(factor, window_offset, cx);
             return;
         }
         let delta = event.delta.pixel_delta(px(self.line_height()));
@@ -6375,6 +6476,7 @@ impl Render for EditorView {
             let heights = HeightIndex::new(self.item_heights());
             self.install_heights(granularity, heights);
         }
+        self.step_wheel_zoom_animation(window);
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
@@ -9066,6 +9168,18 @@ mod tests {
             line_height,
         );
         assert!((one_line_in_lines - one_line_in_pixels).abs() < 1e-4);
+    }
+
+    #[test]
+    fn eased_wheel_zoom_step_moves_monotonically_without_overshooting() {
+        let zoom_in = eased_wheel_zoom_step(1.0, 1.2, Duration::from_millis(16));
+        assert!(zoom_in > 1.0 && zoom_in < 1.2, "{zoom_in}");
+
+        let zoom_out = eased_wheel_zoom_step(1.2, 0.8, Duration::from_millis(16));
+        assert!(zoom_out < 1.2 && zoom_out > 0.8, "{zoom_out}");
+
+        let settled = eased_wheel_zoom_step(1.1995, 1.2, Duration::from_millis(16));
+        assert_eq!(settled, 1.2);
     }
 
     #[gpui::test]
@@ -13010,6 +13124,42 @@ mod tests {
 
     // Issue #228: continuous 50%-300% zoom via Ctrl/Cmd+wheel, trackpad
     // pinch, and Ctrl/Cmd+0 reset.
+
+    #[gpui::test]
+    fn wheel_zoom_queues_a_target_before_display_frames_converge_to_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        view.update(cx, |view, cx| {
+            view.queue_wheel_zoom_factor(
+                zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 3.0)), view.line_height()),
+                240.0,
+                cx,
+            );
+        });
+
+        let (before, target, animating) = view.read_with(cx, |view, _| {
+            (
+                view.zoom,
+                clamp_and_snap_zoom(view.raw_zoom),
+                view.wheel_zoom_animation.is_some(),
+            )
+        });
+        assert_eq!(before, 1.0);
+        assert!(target > before, "{target}");
+        assert!(animating);
+
+        cx.run_until_parked();
+        let (after, target, animating) = view.read_with(cx, |view, _| {
+            (
+                view.zoom,
+                clamp_and_snap_zoom(view.raw_zoom),
+                view.wheel_zoom_animation.is_some(),
+            )
+        });
+        assert_eq!(after, target);
+        assert!(!animating);
+    }
 
     #[gpui::test]
     fn ctrl_wheel_zooms_while_plain_wheel_only_scrolls(cx: &mut gpui::TestAppContext) {
