@@ -4213,6 +4213,13 @@ impl EditorView {
     /// `gpui::MagnifyEvent`), so it is applied directly as a multiplicative
     /// factor rather than accumulated first.
     fn on_magnify(&mut self, event: &MagnifyEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A pinch is direct manipulation. If it starts while a discrete wheel
+        // target is still being interpolated, discard that future target and
+        // continue from what is actually painted under the user's fingers.
+        if self.wheel_zoom_animation.is_some() {
+            self.raw_zoom = self.zoom;
+            self.wheel_zoom_animation = None;
+        }
         let factor = (1.0 + event.magnification).max(0.1);
         let window_offset = f32::from(event.position.y) - self.theme.header_height;
         self.apply_zoom_factor(factor, window_offset, cx);
@@ -13193,6 +13200,36 @@ mod tests {
         cx.run_until_parked();
         let zoomed = view.read_with(cx, |view, _| view.zoom);
         assert!(zoomed > 1.0, "{zoomed}");
+    }
+
+    #[gpui::test]
+    fn pinch_during_wheel_animation_continues_from_the_painted_zoom(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update(cx, |view, cx| {
+            view.queue_wheel_zoom_factor(
+                zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 5.0)), view.line_height()),
+                240.0,
+                cx,
+            );
+        });
+        let wheel_target = view.read_with(cx, |view, _| view.raw_zoom);
+        assert!(wheel_target > 1.2, "{wheel_target}");
+
+        cx.simulate_event(gpui::MagnifyEvent {
+            position,
+            magnification: 0.01,
+            modifiers: gpui::Modifiers::none(),
+            phase: gpui::TouchPhase::Moved,
+        });
+        let (zoom, raw_zoom, animating) =
+            view.read_with(cx, |view, _| (view.zoom, view.raw_zoom, view.wheel_zoom_animation.is_some()));
+        assert_eq!(zoom, 1.0);
+        assert!((raw_zoom - 1.01).abs() < 1e-4, "{raw_zoom}");
+        assert!(!animating);
     }
 
     #[gpui::test]
