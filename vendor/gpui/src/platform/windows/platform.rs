@@ -391,6 +391,10 @@ impl Platform for WindowsPlatform {
         Rc::new(WindowsKeyboardMapper::new())
     }
 
+    fn active_keyboard_input_mode(&self) -> Option<KeyboardInputMode> {
+        windows_active_keyboard_input_mode()
+    }
+
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
         self.inner
             .state

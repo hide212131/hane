@@ -2080,7 +2080,7 @@ impl EditorView {
         // GPUI already refreshes its keyboard mapper from — no separate
         // polling.
         let input_mode_subscription = cx.on_keyboard_layout_change(|view: &mut Self, cx| {
-            view.caret_input_mode = gpui::active_keyboard_input_mode();
+            view.caret_input_mode = cx.active_keyboard_input_mode();
             cx.notify();
         });
         // Re-observes the local date on a timer so the sidebar's `本日`
@@ -2137,7 +2137,7 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
-            caret_input_mode: gpui::active_keyboard_input_mode(),
+            caret_input_mode: cx.active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
             draft_recovery_warning: None,
@@ -6362,7 +6362,7 @@ impl Render for EditorView {
             let focus_handle = self.focus_handle.clone();
             self._input_mode_focus_subscription =
                 Some(cx.on_focus(&focus_handle, window, |view, _, cx| {
-                    view.caret_input_mode = gpui::active_keyboard_input_mode();
+                    view.caret_input_mode = cx.active_keyboard_input_mode();
                     cx.notify();
                 }));
         }
@@ -7940,6 +7940,16 @@ mod tests {
         select_inline_rename_to(&mut reversed, 6);
         assert_eq!(reversed.selected_range, 4..6);
         assert!(!reversed.selection_reversed);
+    }
+
+    #[gpui::test]
+    fn editor_view_uses_the_test_platform_for_input_mode(cx: &mut gpui::TestAppContext) {
+        let (view, _) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.caret_input_mode),
+            None,
+            "test views must not query the host OS input source"
+        );
     }
 
     #[gpui::test]
