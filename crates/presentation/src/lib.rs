@@ -551,6 +551,11 @@ pub struct ListRowMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuoteRowMetadata {
     pub depth: usize,
+    /// Source range of the deepest formal quote container owning this row.
+    /// Unlike a physical line or marker range, this remains stable across
+    /// soft-wrapped rows and distinguishes adjacent quote containers at the
+    /// same depth.
+    pub owner: SourceRange,
     /// Number of this row's formal quote prefixes that are visible as source
     /// bytes. Layout keeps semantic inset only for the remaining hidden quote
     /// depth, so disclosed prefixes do not consume the same space twice.
@@ -2233,27 +2238,55 @@ fn present_markdown_from_parse(
         projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
     }
     let markers_on_line = projected_markers.as_slice();
-    let quote_depth = nodes
-        .iter()
-        .filter_map(|id| parsed.tree.node(**id))
-        .filter(|node| node.kind == NodeKind::Quote)
-        .count()
-        .max(
-            shared
-                .list_projection
-                .into_iter()
-                .flat_map(|projection| projection.quotes_in(range))
-                .map(|quote| quote.depth)
-                .max()
-                .unwrap_or(0),
-        )
-        .max(
-            projected_markers
-                .iter()
-                .filter_map(|marker| marker.formal_quote_depth)
-                .max()
-                .unwrap_or(0),
-        );
+    let mut quote_owner = None;
+    let mut quote_depth = 0;
+    for id in &nodes {
+        let Some(node) = parsed.tree.node(**id) else {
+            continue;
+        };
+        if node.kind != NodeKind::Quote {
+            continue;
+        }
+        let depth = parsed
+            .tree
+            .ancestors(**id)
+            .filter(|ancestor| {
+                parsed
+                    .tree
+                    .node(*ancestor)
+                    .is_some_and(|node| node.kind == NodeKind::Quote)
+            })
+            .count();
+        if depth > quote_depth {
+            quote_depth = depth;
+            quote_owner = Some(node.source_range);
+        }
+    }
+    if let Some(projection) = shared.list_projection {
+        for quote in projection.quotes_in(range) {
+            // A bounded viewport parse may already have selected a different
+            // owner at this depth. The formal projection is document-wide,
+            // so its owner is canonical even when the depth ties.
+            if quote.depth >= quote_depth {
+                quote_depth = quote.depth;
+                quote_owner = Some(quote.source_range);
+            }
+        }
+    }
+    for marker in &projected_markers {
+        let Some(owner) = marker.formal_quote_owner else {
+            continue;
+        };
+        let Some(depth) = marker.formal_quote_depth else {
+            continue;
+        };
+        // Formal marker metadata has the same canonical-owner priority as the
+        // document-wide quote projection above.
+        if depth >= quote_depth {
+            quote_depth = depth;
+            quote_owner = Some(owner);
+        }
+    }
     let disclosed_quote_depth = markers_on_line
         .iter()
         .filter(|planned| {
@@ -2268,8 +2301,9 @@ fn present_markdown_from_parse(
         })
         .count()
         .min(quote_depth);
-    let quote = (quote_depth > 0).then_some(QuoteRowMetadata {
+    let quote = quote_owner.map(|owner| QuoteRowMetadata {
         depth: quote_depth,
+        owner,
         disclosed_depth: disclosed_quote_depth,
     });
     if quote_depth > 0 && kind == BlockKind::Paragraph {
@@ -2537,13 +2571,12 @@ fn formal_quote_metadata(
     range: SourceRange,
     projection: &ListProjection,
 ) -> Option<QuoteRowMetadata> {
-    let depth = projection
+    let quote = projection
         .quotes_in(range)
-        .map(|quote| quote.depth)
-        .max()
-        .unwrap_or(0);
-    (depth > 0).then_some(QuoteRowMetadata {
-        depth,
+        .max_by_key(|quote| quote.depth)?;
+    Some(QuoteRowMetadata {
+        depth: quote.depth,
+        owner: quote.source_range,
         disclosed_depth: 0,
     })
 }
@@ -4800,18 +4833,20 @@ mod tests {
         assert_eq!(visual.lines[0].visual_text, "outer");
         assert_eq!(visual.lines[1].visual_text, "inner");
         assert_eq!(
-            visual.lines[0].quote,
-            Some(QuoteRowMetadata {
-                depth: 1,
-                disclosed_depth: 0,
-            })
+            visual.lines[0]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((1, 0))
         );
         assert_eq!(
-            visual.lines[1].quote,
-            Some(QuoteRowMetadata {
-                depth: 2,
-                disclosed_depth: 0,
-            })
+            visual.lines[1]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((2, 0))
+        );
+        assert_ne!(
+            visual.lines[0].quote.map(|quote| quote.owner),
+            visual.lines[1].quote.map(|quote| quote.owner)
         );
         assert!(
             visual.lines[1]
@@ -4869,12 +4904,112 @@ mod tests {
         assert_eq!(visual.lines[0].visual_text, "continuation");
         assert_eq!(visual.lines[0].kind, BlockKind::Quote);
         assert_eq!(
-            visual.lines[0].quote,
-            Some(QuoteRowMetadata {
-                depth: 1,
-                disclosed_depth: 0,
-            })
+            visual.lines[0]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((1, 0))
         );
+    }
+
+    #[test]
+    fn formal_quote_owner_wins_over_same_depth_viewport_owner_at_large_boundary() {
+        const SYNC_LINE_BUDGET: usize = 4_096;
+        const SYNC_BYTE_BUDGET: usize = 256 * 1024;
+
+        let cases = [
+            (
+                "line-large",
+                format!(
+                    "> opening\n{}> boundary\n![alt](dest)\n",
+                    "> filler\n".repeat(SYNC_LINE_BUDGET - 2)
+                ),
+            ),
+            (
+                "byte-large",
+                format!(
+                    "> opening\n> {}\n> boundary\n![alt](dest)\n",
+                    "x".repeat(SYNC_BYTE_BUDGET)
+                ),
+            ),
+        ];
+
+        for (case, source) in cases {
+            assert!(
+                source.lines().count() > SYNC_LINE_BUDGET
+                    || source.len() > SYNC_BYTE_BUDGET,
+                "{case} fixture must exceed a synchronous join budget"
+            );
+            let index = BlockIndex::build(Revision(1), &source);
+            let block = index.block(0).expect("quote block");
+            let projection = index
+                .list_projection(&block)
+                .expect("formal quote projection");
+
+            let image_start = source.rfind("![alt](dest)\n").expect("image line");
+            let boundary_start = source[..image_start]
+                .rfind("> boundary\n")
+                .expect("boundary line");
+            let boundary_line = source[..boundary_start]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+            let image_line = boundary_line + 1;
+            let boundary_range = SourceRange::new(boundary_start, image_start);
+            let image_range = SourceRange::new(image_start, source.len());
+            let lines = [
+                BlockLine {
+                    line: boundary_line,
+                    range: boundary_range,
+                    text: &source[boundary_start..image_start],
+                    disclosure: None,
+                },
+                BlockLine {
+                    line: image_line,
+                    range: image_range,
+                    text: &source[image_start..],
+                    disclosure: None,
+                },
+            ];
+            let formal_owner = projection
+                .quotes_in(boundary_range)
+                .max_by_key(|quote| quote.depth)
+                .expect("formal owner for the boundary")
+                .source_range;
+            assert!(
+                formal_owner.start.0 < boundary_start,
+                "{case} must distinguish the document-wide owner from the viewport parse"
+            );
+            let visual = present_block_with_list_projection(
+                &block,
+                Revision(1),
+                &BlockWindow {
+                    span: 0..block.line_count,
+                    trailing_blank_lines: 0,
+                    lines: &lines,
+                    clipped_fence_lines: &[],
+                    zero_height_fence_rows_before: 0,
+                    zero_height_fence_rows_after: 0,
+                    render: boundary_line..image_line + 1,
+                    joined: None,
+                    block_disclosure: None,
+                },
+                26.0,
+                Some(projection),
+            );
+
+            assert_eq!(visual.lines.len(), 2, "{case} viewport lines");
+            assert_eq!(visual.lines[1].kind, BlockKind::Image, "{case} image line");
+            assert_eq!(
+                visual.lines[0].quote.map(|quote| quote.owner),
+                Some(formal_owner),
+                "{case} normal quote line must use the formal owner"
+            );
+            assert_eq!(
+                visual.lines[1].quote.map(|quote| quote.owner),
+                Some(formal_owner),
+                "{case} lazy continuation image must share the formal owner"
+            );
+        }
     }
 
     #[test]
