@@ -4190,6 +4190,24 @@ impl EditorView {
         }
     }
 
+    /// Invalidates shaped/layout caches for a new font generation. During an
+    /// intermediate wheel-animation frame, keep the existing document-wide
+    /// height estimates and let the visible blocks replace only their measured
+    /// entries later in this render. Rebuilding every estimate here would make
+    /// each animation frame O(document). The final frame has no active wheel
+    /// animation, so it rebuilds the full estimate index once at the settled
+    /// zoom and restores globally correct scroll geometry.
+    fn invalidate_layout_font_revision(&mut self, font_revision: u64) {
+        self.layout_font_revision = font_revision;
+        self.block_cache.clear();
+        self.layout_cache.clear();
+        if self.wheel_zoom_animation.is_none() {
+            let (granularity, _) = self.desired_layout();
+            let heights = HeightIndex::new(self.item_heights());
+            self.install_heights(granularity, heights);
+        }
+    }
+
     /// Resets zoom to 100%, anchored at the viewport's vertical center since
     /// (unlike a wheel or pinch gesture) this has no pointer position of its
     /// own.
@@ -6519,16 +6537,13 @@ impl Render for EditorView {
         let shaper = WindowShaper::new(window, self.zoom);
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
-            self.layout_font_revision = font_revision;
             // `VisualLine::estimated_height` is part of the presentation, not
-            // just the shaped layout. Reusing it across zoom generations
-            // leaves the new glyphs with the old row height until a later
-            // cache miss, which can clip or overlap text.
-            self.block_cache.clear();
-            self.layout_cache.clear();
-            let (granularity, _) = self.desired_layout();
-            let heights = HeightIndex::new(self.item_heights());
-            self.install_heights(granularity, heights);
+            // just the shaped layout. Reusing cached presentation/layout rows
+            // across zoom generations can clip or overlap text. During wheel
+            // interpolation the document-wide height estimates are deliberately
+            // retained until the settled frame; visible entries are remeasured
+            // below using the new zoom.
+            self.invalidate_layout_font_revision(font_revision);
         }
         self.scroll_y = clamp_scroll_y(
             self.scroll_y,
@@ -9197,6 +9212,27 @@ mod tests {
 
         let settled = eased_wheel_zoom_step(1.1995, 1.2, Duration::from_millis(16));
         assert_eq!(settled, 1.2);
+    }
+
+    #[gpui::test]
+    fn intermediate_wheel_zoom_keeps_document_wide_height_estimates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\n", "Untitled", cx));
+        view.update(cx, |view, _| {
+            view.heights = HeightIndex::new([123.0, 456.0]);
+            view.wheel_zoom_animation = Some(WheelZoomAnimation {
+                window_offset: 0.0,
+                last_frame: Instant::now(),
+            });
+            view.invalidate_layout_font_revision(42);
+            assert_eq!(view.heights.height(0), Some(123.0));
+            assert_eq!(view.heights.height(1), Some(456.0));
+
+            view.wheel_zoom_animation = None;
+            view.invalidate_layout_font_revision(43);
+            assert_ne!(view.heights.height(0), Some(123.0));
+        });
     }
 
     #[gpui::test]
