@@ -5070,6 +5070,7 @@ mod tests {
                     clipped_fence_lines: &[],
                     zero_height_fence_rows_before: 0,
                     zero_height_fence_rows_after: 0,
+                    table_delimiter_line: None,
                     render: boundary_line..image_line + 1,
                     joined: None,
                     block_disclosure: None,
