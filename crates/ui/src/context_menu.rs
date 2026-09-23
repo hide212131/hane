@@ -30,7 +30,7 @@ pub fn current_file_context_menu_state() -> FileContextMenuState {
         let Ok(exe) = std::env::current_exe() else {
             return FileContextMenuState::Unknown("現在のHane.exeを確認できません".to_owned());
         };
-        return inspect(&exe);
+        inspect(&exe)
     }
     #[cfg(not(windows))]
     {
