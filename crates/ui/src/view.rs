@@ -13074,7 +13074,7 @@ mod tests {
 
         view.read_with(cx, |view, _| {
             let index = view.current_index().expect("table index is ready");
-            let block = index.block(0).expect("table block").clone();
+            let block = index.block(0).expect("table block");
 
             // Physical lines 0, 1 and 2 are header, hidden delimiter and body;
             // the delimiter owns source bytes but no visual row or height.
