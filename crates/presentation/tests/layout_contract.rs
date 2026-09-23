@@ -1789,11 +1789,9 @@ fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
 
     assert_eq!(line.visual_text, "> ");
     assert_eq!(
-        line.quote,
-        Some(hane_presentation::QuoteRowMetadata {
-            depth: 1,
-            disclosed_depth: 1,
-        })
+        line.quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((1, 1))
     );
     assert!(line.source_map.segments.iter().any(|segment| {
         segment.source_range == SourceRange::new(rule_line_start, rule_line_start + 2)
@@ -2076,11 +2074,9 @@ fn lazy_continuation_image_keeps_quote_geometry() {
 
     assert_eq!(image.kind, BlockKind::Image);
     assert_eq!(
-        image.quote,
-        Some(hane_presentation::QuoteRowMetadata {
-            depth: 1,
-            disclosed_depth: 0,
-        })
+        image.quote
+            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        Some((1, 0))
     );
     let layout = layout_block(&block, 160.0, &shaper());
     let row = layout

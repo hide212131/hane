@@ -551,6 +551,11 @@ pub struct ListRowMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuoteRowMetadata {
     pub depth: usize,
+    /// Source range of the deepest formal quote container owning this row.
+    /// Unlike a physical line or marker range, this remains stable across
+    /// soft-wrapped rows and distinguishes adjacent quote containers at the
+    /// same depth.
+    pub owner: SourceRange,
     /// Number of this row's formal quote prefixes that are visible as source
     /// bytes. Layout keeps semantic inset only for the remaining hidden quote
     /// depth, so disclosed prefixes do not consume the same space twice.
@@ -2233,27 +2238,50 @@ fn present_markdown_from_parse(
         projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
     }
     let markers_on_line = projected_markers.as_slice();
-    let quote_depth = nodes
-        .iter()
-        .filter_map(|id| parsed.tree.node(**id))
-        .filter(|node| node.kind == NodeKind::Quote)
-        .count()
-        .max(
-            shared
-                .list_projection
-                .into_iter()
-                .flat_map(|projection| projection.quotes_in(range))
-                .map(|quote| quote.depth)
-                .max()
-                .unwrap_or(0),
-        )
-        .max(
-            projected_markers
-                .iter()
-                .filter_map(|marker| marker.formal_quote_depth)
-                .max()
-                .unwrap_or(0),
-        );
+    let mut quote_owner = None;
+    let mut quote_depth = 0;
+    for id in &nodes {
+        let Some(node) = parsed.tree.node(**id) else {
+            continue;
+        };
+        if node.kind != NodeKind::Quote {
+            continue;
+        }
+        let depth = parsed
+            .tree
+            .ancestors(**id)
+            .filter(|ancestor| {
+                parsed
+                    .tree
+                    .node(*ancestor)
+                    .is_some_and(|node| node.kind == NodeKind::Quote)
+            })
+            .count();
+        if depth > quote_depth {
+            quote_depth = depth;
+            quote_owner = Some(node.source_range);
+        }
+    }
+    if let Some(projection) = shared.list_projection {
+        for quote in projection.quotes_in(range) {
+            if quote.depth > quote_depth {
+                quote_depth = quote.depth;
+                quote_owner = Some(quote.source_range);
+            }
+        }
+    }
+    for marker in &projected_markers {
+        let Some(owner) = marker.formal_quote_owner else {
+            continue;
+        };
+        let Some(depth) = marker.formal_quote_depth else {
+            continue;
+        };
+        if depth > quote_depth {
+            quote_depth = depth;
+            quote_owner = Some(owner);
+        }
+    }
     let disclosed_quote_depth = markers_on_line
         .iter()
         .filter(|planned| {
@@ -2268,8 +2296,9 @@ fn present_markdown_from_parse(
         })
         .count()
         .min(quote_depth);
-    let quote = (quote_depth > 0).then_some(QuoteRowMetadata {
+    let quote = quote_owner.map(|owner| QuoteRowMetadata {
         depth: quote_depth,
+        owner,
         disclosed_depth: disclosed_quote_depth,
     });
     if quote_depth > 0 && kind == BlockKind::Paragraph {
@@ -2537,13 +2566,12 @@ fn formal_quote_metadata(
     range: SourceRange,
     projection: &ListProjection,
 ) -> Option<QuoteRowMetadata> {
-    let depth = projection
+    let quote = projection
         .quotes_in(range)
-        .map(|quote| quote.depth)
-        .max()
-        .unwrap_or(0);
-    (depth > 0).then_some(QuoteRowMetadata {
-        depth,
+        .max_by_key(|quote| quote.depth)?;
+    Some(QuoteRowMetadata {
+        depth: quote.depth,
+        owner: quote.source_range,
         disclosed_depth: 0,
     })
 }
@@ -4800,18 +4828,20 @@ mod tests {
         assert_eq!(visual.lines[0].visual_text, "outer");
         assert_eq!(visual.lines[1].visual_text, "inner");
         assert_eq!(
-            visual.lines[0].quote,
-            Some(QuoteRowMetadata {
-                depth: 1,
-                disclosed_depth: 0,
-            })
+            visual.lines[0]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((1, 0))
         );
         assert_eq!(
-            visual.lines[1].quote,
-            Some(QuoteRowMetadata {
-                depth: 2,
-                disclosed_depth: 0,
-            })
+            visual.lines[1]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((2, 0))
+        );
+        assert_ne!(
+            visual.lines[0].quote.map(|quote| quote.owner),
+            visual.lines[1].quote.map(|quote| quote.owner)
         );
         assert!(
             visual.lines[1]
@@ -4869,11 +4899,10 @@ mod tests {
         assert_eq!(visual.lines[0].visual_text, "continuation");
         assert_eq!(visual.lines[0].kind, BlockKind::Quote);
         assert_eq!(
-            visual.lines[0].quote,
-            Some(QuoteRowMetadata {
-                depth: 1,
-                disclosed_depth: 0,
-            })
+            visual.lines[0]
+                .quote
+                .map(|quote| (quote.depth, quote.disclosed_depth)),
+            Some((1, 0))
         );
     }
 

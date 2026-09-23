@@ -514,12 +514,15 @@ const QUOTE_BAR_EDGE_INSET: f32 = 4.0;
 struct QuoteBarIdentity {
     x_origin: f32,
     depth: usize,
+    owner: SourceRange,
 }
 
 fn quote_bar_identity(row: &LayoutLine, line: &VisualLine) -> Option<QuoteBarIdentity> {
+    let quote = line.quote?;
     Some(QuoteBarIdentity {
         x_origin: row.quote_bar_x_origin?,
-        depth: line.quote?.depth,
+        depth: quote.depth,
+        owner: quote.owner,
     })
 }
 
@@ -1353,10 +1356,12 @@ mod tests {
         let first_depth = QuoteBarIdentity {
             x_origin: 14.0,
             depth: 1,
+            owner: SourceRange::new(0, 10),
         };
         let nested_depth = QuoteBarIdentity {
             x_origin: 30.0,
             depth: 2,
+            owner: SourceRange::new(10, 20),
         };
 
         assert_eq!(
@@ -1415,6 +1420,10 @@ mod tests {
         let second = quote_bar_identity(&soft_wrap[1], &visual.lines[soft_wrap[1].line]);
         assert!(first.is_some() && second.is_some());
         assert_eq!(
+            first.map(|identity| identity.owner),
+            second.map(|identity| identity.owner)
+        );
+        assert_eq!(
             quote_bar_insets(first, None, second),
             (QUOTE_BAR_EDGE_INSET, 0.0),
             "the bar remains continuous across a soft-wrap boundary"
@@ -1438,6 +1447,44 @@ mod tests {
             quote_bar_insets(current, previous, None).0,
             QUOTE_BAR_EDGE_INSET,
             "a changed quote depth starts a new bar"
+        );
+    }
+
+    #[test]
+    fn quote_bar_layout_keeps_separate_list_item_quotes_separate() {
+        let source = "- > first\n- > second\n";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index
+            .blocks()
+            .find(|block| matches!(block.kind, hane_markdown::NodeKind::List { .. }))
+            .expect("list block");
+        let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
+            .expect("list block presents");
+        let layout = hane_presentation::layout_block(
+            &visual,
+            160.0,
+            &hane_presentation::testing::FixedAdvanceShaper::default(),
+        );
+        let quoted_rows = layout
+            .lines
+            .iter()
+            .filter_map(|row| {
+                visual
+                    .lines
+                    .get(row.line)
+                    .and_then(|line| quote_bar_identity(row, line))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(quoted_rows.len(), 2, "each list item contributes one quote row");
+        assert_eq!(quoted_rows[0].depth, quoted_rows[1].depth);
+        assert_eq!(quoted_rows[0].x_origin, quoted_rows[1].x_origin);
+        assert_ne!(quoted_rows[0].owner, quoted_rows[1].owner);
+        assert_eq!(
+            quote_bar_insets(Some(quoted_rows[0]), None, Some(quoted_rows[1])),
+            (QUOTE_BAR_EDGE_INSET, QUOTE_BAR_EDGE_INSET),
+            "separate quote owners must keep both bar edges"
         );
     }
 
