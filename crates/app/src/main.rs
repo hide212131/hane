@@ -10,9 +10,6 @@ use hane_session::StateStores;
 use hane_ui::{EditorView, WorkFolderIcons, register_key_bindings};
 use std::path::PathBuf;
 
-#[cfg(target_os = "windows")]
-mod context_menu;
-
 #[cfg(feature = "instrument")]
 mod instrument;
 
@@ -22,11 +19,11 @@ const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
     if flag == "--register-context-menu" {
         let exe = std::env::current_exe().expect("resolve current exe path");
-        context_menu::register(&exe).expect("register Explorer context menu");
+        hane_ui::context_menu::register(&exe).expect("register Explorer context menu");
         println!("Registered \"Haneで開く\" in Explorer's folder context menu.");
         true
     } else if flag == "--unregister-context-menu" {
-        context_menu::unregister().expect("unregister Explorer context menu");
+        hane_ui::context_menu::unregister().expect("unregister Explorer context menu");
         println!("Removed \"Haneで開く\" from Explorer's folder context menu.");
         true
     } else {
@@ -87,6 +84,7 @@ fn main() {
     Application::new()
         .with_assets(WorkFolderIcons)
         .run(move |cx: &mut App| {
+            hane_ui::init_components(cx);
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
             let window = cx

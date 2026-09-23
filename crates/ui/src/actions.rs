@@ -17,6 +17,9 @@ macro_rules! command_actions {
                     window: &mut Window,
                     cx: &mut Context<Self>,
                 ) {
+                    if self.settings_open() && stringify!($action) != "CancelComposition" {
+                        return;
+                    }
                     let $view = self;
                     let $window = window;
                     let $cx = cx;
@@ -246,6 +249,10 @@ command_actions! {
         }
     },
     CancelComposition ("escape") => cancel_composition |view, _window, cx| {
+        if view.settings_open() {
+            view.close_settings(_window, cx);
+            return;
+        }
         if view.dismiss_file_tab_context_menu(cx) {
             return;
         }

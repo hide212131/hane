@@ -17,6 +17,7 @@
 
 use crate::actions::install_action_listeners;
 use crate::capture::InputCapture;
+use crate::context_menu::{self, FileContextMenuState};
 use crate::icons;
 use crate::input::{InlineRenameInput, shape_inline_rename_line};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -42,6 +43,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, div, point,
     prelude::FluentBuilder, px, rgb,
 };
+use gpui_component::Disableable;
+use gpui_component::IconName;
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
@@ -91,6 +96,8 @@ const SIDEBAR_TOOLBAR_HEIGHT: f32 = 28.0;
 const SIDEBAR_TOOLBAR_GAP: f32 = 4.0;
 const SIDEBAR_FILTER_HEIGHT: f32 = 28.0;
 const SIDEBAR_FILTER_GAP: f32 = 4.0;
+const SIDEBAR_SETTINGS_HEIGHT: f32 = 36.0;
+const SIDEBAR_SETTINGS_GAP: f32 = 4.0;
 const SIDEBAR_PADDING: f32 = 8.0;
 const SIDEBAR_ROW_HORIZONTAL_PADDING: f32 = 4.0;
 /// How often `_date_badge_refresh_task` re-observes the local calendar date
@@ -525,6 +532,10 @@ pub struct EditorView {
     files: Arc<dyn FileService>,
     stores: StateStores,
     settings: Settings,
+    settings_open: bool,
+    file_context_menu_state: FileContextMenuState,
+    file_context_menu_busy: bool,
+    settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
@@ -2103,6 +2114,10 @@ impl EditorView {
             files,
             stores,
             settings,
+            settings_open: false,
+            file_context_menu_state: FileContextMenuState::NotChecked,
+            file_context_menu_busy: false,
+            settings_error: None,
             recent,
             work_folder: None,
             draft_store: Arc::new(OsDraftStore),
@@ -3613,6 +3628,224 @@ impl EditorView {
         self.store_settings();
         self.schedule_autosave(cx);
         cx.notify();
+    }
+
+    pub(crate) fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor().ime().is_some() {
+            self.status = Some("入力変換を確定または取り消してから設定を開いてください".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.sidebar_filter_has_composition() || self.inline_rename_has_composition() {
+            self.status =
+                Some("未確定文字を確定または取り消してから設定を開いてください".to_owned());
+            cx.notify();
+            return;
+        }
+        if !self.cancel_inline_rename(cx) {
+            return;
+        }
+        self.blur_sidebar_filter(cx);
+        self.settings_open = true;
+        self.settings_error = None;
+        self.file_context_menu_busy = false;
+        self.file_context_menu_state = context_menu::current_file_context_menu_state();
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
+        self.file_context_menu_busy = false;
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn set_file_context_menu(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.file_context_menu_busy {
+            return;
+        }
+        if matches!(
+            self.file_context_menu_state,
+            FileContextMenuState::Unsupported | FileContextMenuState::Conflict
+        ) {
+            return;
+        }
+        self.file_context_menu_busy = true;
+        self.settings_error = None;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { context_menu::set_file_context_menu(enabled) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.file_context_menu_busy = false;
+                view.file_context_menu_state = context_menu::current_file_context_menu_state();
+                if let Err(error) = result {
+                    view.settings_error = Some(error.to_string());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn file_context_menu_status(&self) -> &'static str {
+        match &self.file_context_menu_state {
+            FileContextMenuState::NotChecked => "状態を確認しています…",
+            FileContextMenuState::Unsupported => "この設定はWindowsで利用できます。",
+            FileContextMenuState::Unregistered => "未登録",
+            FileContextMenuState::Registered => "登録済み",
+            FileContextMenuState::Stale => {
+                "以前のHane.exeを指す登録があります。ONにして更新できます。"
+            }
+            FileContextMenuState::Conflict => "別の登録内容があるため変更していません。",
+            FileContextMenuState::Unknown(_) => {
+                "登録状態を確認できません。もう一度お試しください。"
+            }
+        }
+    }
+
+    fn settings_screen_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let view = cx.entity();
+        let back = Button::new("settings-back")
+            .icon(IconName::ArrowLeft)
+            .label("アプリに戻る")
+            .ghost()
+            .tooltip("アプリに戻る")
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| view.close_settings(window, cx));
+            });
+
+        let unsupported = matches!(
+            self.file_context_menu_state,
+            FileContextMenuState::Unsupported
+        );
+        let checked = self.file_context_menu_state.is_checked();
+        let busy = self.file_context_menu_busy;
+        let view = cx.entity();
+        let checkbox = Checkbox::new("settings-file-context-menu")
+            .checked(checked)
+            .disabled(unsupported || busy)
+            .label("ファイルを右クリックでHaneで開けるよう登録")
+            .on_click(move |checked, _window, app| {
+                view.update(app, |view, cx| view.set_file_context_menu(*checked, cx));
+            });
+        let error = self.settings_error.as_ref().map(|error| {
+            div()
+                .id("settings-file-context-menu-error")
+                .text_color(rgb(0xb42318))
+                .child(format!("登録に失敗しました: {error}"))
+        });
+        let content = div()
+            .id("settings-content")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(760.0))
+                    .px(px(32.0))
+                    .py(px(28.0))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(px(22.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("一般"),
+                    )
+                    .child(
+                        div()
+                            .pt(px(16.0))
+                            .border_t_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("Windowsとの連携"),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-file-context-menu-card")
+                                    .w_full()
+                                    .px(px(16.0))
+                                    .py(px(14.0))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(self.theme.sidebar_active_background))
+                                    .bg(rgb(self.theme.code_background))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(checkbox)
+                                    .child(
+                                        div()
+                                            .pl(px(28.0))
+                                            .text_color(rgb(self.theme.quote_foreground))
+                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では「その他のオプションを確認」内に表示されます。"),
+                                    )
+                                    .child(
+                                        div()
+                                            .pl(px(28.0))
+                                            .text_color(rgb(self.theme.quote_foreground))
+                                            .child(if busy {
+                                                "反映しています…"
+                                            } else {
+                                                self.file_context_menu_status()
+                                            }),
+                                    )
+                                    .children(error),
+                            ),
+                    ),
+            );
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(rgb(self.theme.editor_background))
+            .text_color(rgb(self.theme.foreground))
+            .key_context("HaneEditor")
+            .track_focus(&self.focus_handle(cx));
+        let sidebar = div()
+            .id("settings-sidebar")
+            .debug_selector(|| "settings-sidebar".to_owned())
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .px(px(16.0))
+            .py(px(16.0))
+            .bg(rgb(self.theme.sidebar_background))
+            .child(back)
+            .child(
+                div()
+                    .id("settings-category-general")
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded_sm()
+                    .bg(rgb(self.theme.sidebar_active_background))
+                    .child("一般"),
+            );
+        install_action_listeners(root.child(sidebar).child(content), cx)
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -6375,6 +6608,9 @@ impl Render for EditorView {
             let heights = HeightIndex::new(self.item_heights());
             self.install_heights(granularity, heights);
         }
+        if self.settings_open {
+            return self.settings_screen_element(cx);
+        }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
             - self.theme.header_height
@@ -7291,7 +7527,12 @@ impl EditorView {
             } else {
                 0.0
             };
-        let list_viewport_height = (sidebar_viewport_height - list_top - SIDEBAR_PADDING).max(0.0);
+        let list_viewport_height = (sidebar_viewport_height
+            - list_top
+            - SIDEBAR_SETTINGS_GAP
+            - SIDEBAR_SETTINGS_HEIGHT
+            - SIDEBAR_PADDING)
+            .max(0.0);
         let scrollbar = self.sidebar_scrollbar(list_top, list_viewport_height, content_height, cx);
         let list = div()
             .id("work-folder-sidebar-list")
@@ -7304,6 +7545,37 @@ impl EditorView {
             .children(tree)
             .children(empty_filter)
             .children(drafts);
+        let view = cx.entity();
+        let settings_button = div()
+            .id("sidebar-settings")
+            .w_full()
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+            .child(
+                gpui::svg()
+                    .path(icons::ICON_SETTINGS)
+                    .size_4()
+                    .flex_none()
+                    .text_color(rgb(self.theme.sidebar_foreground)),
+            )
+            .child("設定")
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| view.open_settings(window, cx));
+            });
+        let settings_footer = div()
+            .id("sidebar-settings-footer")
+            .debug_selector(|| "sidebar-settings-footer".to_owned())
+            .h(px(SIDEBAR_SETTINGS_HEIGHT))
+            .mt(px(SIDEBAR_SETTINGS_GAP))
+            .flex_none()
+            .child(settings_button);
         Some(
             div()
                 .id("work-folder-panel")
@@ -7328,7 +7600,8 @@ impl EditorView {
                         .text_size(px(BODY_FONT_SIZE))
                         .child(toolbar)
                         .children(filter)
-                        .child(list),
+                        .child(list)
+                        .child(settings_footer),
                 )
                 .children(scrollbar),
         )
@@ -7591,6 +7864,34 @@ impl EditorView {
                     .on_click(cx.listener(move |view, _, _, cx| view.open_path(&path, cx)))
             })
             .collect::<Vec<_>>();
+        let settings_button = if self.work_folder.is_none() {
+            let view = cx.entity();
+            Some(
+                div()
+                    .id("footer-settings")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+                    .child(
+                        gpui::svg()
+                            .path(icons::ICON_SETTINGS)
+                            .size_4()
+                            .flex_none()
+                            .text_color(rgb(self.theme.foreground)),
+                    )
+                    .child("設定")
+                    .on_click(move |_, window, app| {
+                        view.update(app, |view, cx| view.open_settings(window, cx));
+                    }),
+            )
+        } else {
+            None
+        };
         let controls = div()
             .h_full()
             .flex_none()
@@ -7599,6 +7900,7 @@ impl EditorView {
             .gap_2()
             .px_3()
             .text_size(px(11.0))
+            .children(settings_button)
             .child(
                 div()
                     .id("footer-autosave")
@@ -8187,6 +8489,7 @@ mod tests {
         let toolbar_before = cx.debug_bounds("sidebar-toolbar").unwrap();
         let filter_before = cx.debug_bounds("sidebar-filter").unwrap();
         let list_before = cx.debug_bounds("sidebar-list").unwrap();
+        let settings_before = cx.debug_bounds("sidebar-settings-footer").unwrap();
         let root_before = cx.debug_bounds("sidebar-root").unwrap();
 
         cx.simulate_event(ScrollWheelEvent {
@@ -8200,12 +8503,37 @@ mod tests {
         assert_eq!(cx.debug_bounds("sidebar-toolbar").unwrap(), toolbar_before);
         assert_eq!(cx.debug_bounds("sidebar-filter").unwrap(), filter_before);
         assert_eq!(cx.debug_bounds("sidebar-list").unwrap(), list_before);
+        assert_eq!(
+            cx.debug_bounds("sidebar-settings-footer").unwrap(),
+            settings_before
+        );
         assert!(cx.debug_bounds("sidebar-root").unwrap().top() < root_before.top());
         view.read_with(cx, |view, _| {
             assert!(view.sidebar_scroll.offset().y < px(0.0));
         });
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn settings_screen_replaces_editor_and_escape_returns_to_it(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+        assert!(cx.debug_bounds("settings-sidebar").is_some());
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, _| view.settings_open));
+        assert!(cx.debug_bounds("editor-footer").is_some());
     }
 
     #[test]

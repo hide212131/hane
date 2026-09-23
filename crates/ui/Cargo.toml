@@ -17,7 +17,12 @@ hane-markdown.workspace = true
 hane-presentation.workspace = true
 hane-session.workspace = true
 gpui.workspace = true
+gpui-component.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }

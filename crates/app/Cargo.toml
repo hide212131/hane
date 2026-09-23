@@ -25,9 +25,6 @@ hane-session.workspace = true
 hane-ui.workspace = true
 gpui.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-winreg = "0.55"
-
 [[example]]
 name = "gpui_baseline"
 required-features = ["instrument"]
