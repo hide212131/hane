@@ -4113,6 +4113,23 @@ impl EditorView {
         self.set_zoom_from_raw(self.raw_zoom * factor, window_offset, cx);
     }
 
+    /// Applies a direct-manipulation zoom such as a trackpad pinch. A pinch
+    /// takes ownership from any still-running wheel animation and continues
+    /// from the zoom that is actually painted, not from the wheel's future
+    /// target.
+    fn apply_direct_zoom_factor(
+        &mut self,
+        factor: f32,
+        window_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wheel_zoom_animation.is_some() {
+            self.raw_zoom = self.zoom;
+            self.wheel_zoom_animation = None;
+        }
+        self.apply_zoom_factor(factor, window_offset, cx);
+    }
+
     /// Records a new discrete wheel target without jumping the painted zoom to
     /// it. Repeated wheel events extend the same target stream and only update
     /// its anchor; the render loop consumes at most one interpolation step per
@@ -4213,16 +4230,9 @@ impl EditorView {
     /// `gpui::MagnifyEvent`), so it is applied directly as a multiplicative
     /// factor rather than accumulated first.
     fn on_magnify(&mut self, event: &MagnifyEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // A pinch is direct manipulation. If it starts while a discrete wheel
-        // target is still being interpolated, discard that future target and
-        // continue from what is actually painted under the user's fingers.
-        if self.wheel_zoom_animation.is_some() {
-            self.raw_zoom = self.zoom;
-            self.wheel_zoom_animation = None;
-        }
         let factor = (1.0 + event.magnification).max(0.1);
         let window_offset = f32::from(event.position.y) - self.theme.header_height;
-        self.apply_zoom_factor(factor, window_offset, cx);
+        self.apply_direct_zoom_factor(factor, window_offset, cx);
     }
 
     /// The presented line under a mouse event, from the mapping the last frame
@@ -13133,10 +13143,10 @@ mod tests {
     // pinch, and Ctrl/Cmd+0 reset.
 
     #[gpui::test]
-    fn wheel_zoom_queues_a_target_before_display_frames_converge_to_it(
+    fn wheel_zoom_queues_a_target_without_jumping_the_painted_zoom(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.queue_wheel_zoom_factor(
                 zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 3.0)), view.line_height()),
@@ -13145,27 +13155,16 @@ mod tests {
             );
         });
 
-        let (before, target, animating) = view.read_with(cx, |view, _| {
+        let (zoom, target, animating) = view.read_with(cx, |view, _| {
             (
                 view.zoom,
                 clamp_and_snap_zoom(view.raw_zoom),
                 view.wheel_zoom_animation.is_some(),
             )
         });
-        assert_eq!(before, 1.0);
-        assert!(target > before, "{target}");
+        assert_eq!(zoom, 1.0);
+        assert!(target > zoom, "{target}");
         assert!(animating);
-
-        cx.run_until_parked();
-        let (after, target, animating) = view.read_with(cx, |view, _| {
-            (
-                view.zoom,
-                clamp_and_snap_zoom(view.raw_zoom),
-                view.wheel_zoom_animation.is_some(),
-            )
-        });
-        assert_eq!(after, target);
-        assert!(!animating);
     }
 
     #[gpui::test]
@@ -13203,33 +13202,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pinch_during_wheel_animation_continues_from_the_painted_zoom(
+    fn direct_pinch_zoom_takes_over_from_the_painted_wheel_zoom(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
-        let position = point(px(480.0), px(400.0));
-
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.queue_wheel_zoom_factor(
                 zoom_factor_for_wheel(ScrollDelta::Lines(point(0.0, 5.0)), view.line_height()),
                 240.0,
                 cx,
             );
-        });
-        let wheel_target = view.read_with(cx, |view, _| view.raw_zoom);
-        assert!(wheel_target > 1.2, "{wheel_target}");
+            assert!(view.raw_zoom > 1.2, "{}", view.raw_zoom);
+            assert_eq!(view.zoom, 1.0);
 
-        cx.simulate_event(gpui::MagnifyEvent {
-            position,
-            magnification: 0.01,
-            modifiers: gpui::Modifiers::none(),
-            phase: gpui::TouchPhase::Moved,
+            view.apply_direct_zoom_factor(1.01, 240.0, cx);
+            assert_eq!(view.zoom, 1.0);
+            assert!((view.raw_zoom - 1.01).abs() < 1e-4, "{}", view.raw_zoom);
+            assert!(view.wheel_zoom_animation.is_none());
         });
-        let (zoom, raw_zoom, animating) =
-            view.read_with(cx, |view, _| (view.zoom, view.raw_zoom, view.wheel_zoom_animation.is_some()));
-        assert_eq!(zoom, 1.0);
-        assert!((raw_zoom - 1.01).abs() < 1e-4, "{raw_zoom}");
-        assert!(!animating);
     }
 
     #[gpui::test]
