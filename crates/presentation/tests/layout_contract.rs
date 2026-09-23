@@ -17,7 +17,7 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block,
+    VisualBlock, VisualOffset, block_heights_with_disclosure, block_line_span, layout_block,
     present_block_with_table_projection, table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use std::cell::Cell;
@@ -641,9 +641,7 @@ fn table_delimiter_ownership_is_half_open_at_the_first_body_byte() {
     let buffer = RopeBuffer::from_text(source);
     let index = BlockIndex::from_buffer(&buffer);
     let block = index.blocks().next().expect("table block");
-    let projection = index
-        .table_projection(&block)
-        .expect("table projection");
+    let projection = index.table_projection(&block).expect("table projection");
     let delimiter = projection.delimiter_range.expect("table delimiter");
     let body_start = SourceOffset(source.find("| body").expect("body row"));
 
@@ -656,6 +654,40 @@ fn table_delimiter_ownership_is_half_open_at_the_first_body_byte() {
         projection,
         Some(SourceRange::empty(delimiter.start.0 + 2))
     ));
+}
+
+#[test]
+fn eof_caret_discloses_only_an_unterminated_table_delimiter() {
+    for (source, should_disclose) in [
+        ("| header | value |\n| --- | --- |", true),
+        ("| header | value |\n| --- | --- |\n", false),
+        ("| header | value |\r\n| --- | --- |", true),
+        ("| header | value |\r\n| --- | --- |\r\n", false),
+        ("| header | value |\r| --- | --- |", true),
+        ("| header | value |\r| --- | --- |\r", false),
+    ] {
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let block = index.blocks().next().expect("table block");
+        let projection = index.table_projection(&block).expect("table projection");
+        let delimiter = projection.delimiter_range.expect("table delimiter");
+        let eof = SourceRange::empty(source.len());
+
+        assert_eq!(delimiter.end, eof.start);
+        assert_eq!(
+            !table_delimiter_is_collapsed(projection, Some(eof)),
+            should_disclose,
+            "EOF ownership for source ending {source:?}"
+        );
+
+        let inactive = hane_presentation::block_heights(&buffer, &index, LINE_HEIGHT);
+        let active = block_heights_with_disclosure(&buffer, &index, LINE_HEIGHT, Some(eof));
+        assert_eq!(
+            active[block.ordinal] - inactive[block.ordinal],
+            if should_disclose { LINE_HEIGHT } else { 0.0 },
+            "height disclosure must match the delimiter's EOF ownership"
+        );
+    }
 }
 
 #[test]

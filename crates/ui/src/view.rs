@@ -57,9 +57,9 @@ use hane_metrics::FrameMetrics;
 use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
-    VisualBlock, VisualLine, block_heights_with_disclosure, block_is_joinable, block_line_span,
-    code_line_height, layout_block, parse_joined_span, table_delimiter_is_collapsed,
-    trailing_blank_lines,
+    VisualBlock, VisualLine, block_height_with_disclosure, block_heights_with_disclosure,
+    block_is_joinable, block_line_span, code_line_height, layout_block, parse_joined_span,
+    table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -968,45 +968,6 @@ fn rebase_ordinal_after_splice(
     anchor_id
         .and_then(|id| inserted.iter().position(|block| block.id == id))
         .map_or(replaced.start.min(new_len - 1), |at| replaced.start + at)
-}
-
-/// Computes the arithmetic seed for one block without walking the index.
-///
-/// This mirrors `block_heights_with_disclosure` for the input path, where an
-/// incremental index update must only touch the blocks in its replacement
-/// window. The final block may own the document's empty line after a trailing
-/// newline even though `line_count` deliberately excludes that line.
-fn block_height_with_disclosure(
-    document: &RopeBuffer,
-    index: &BlockIndex,
-    block: &IndexedBlock,
-    line_height: f32,
-    disclosure: Option<SourceRange>,
-) -> f32 {
-    let block_is_final = block.ordinal + 1 == index.len();
-    let collapsed_fence_rows = index
-        .fence_height_projection(block)
-        .map_or(0, |projection| {
-            projection.inactive_rows_in(
-                block.source_range,
-                block.source_range,
-                disclosure,
-                block_is_final,
-            )
-        });
-    let collapsed_table_delimiter = index
-        .table_projection(block)
-        .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
-        .map_or(0, |_| 1);
-    let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
-    let trailing_empty_lines = block_is_final
-        .then(|| {
-            block_line_span(document, block)
-                .map_or(0, |span| span.len().saturating_sub(block.line_count))
-        })
-        .unwrap_or(0);
-    line_height * block.line_count.saturating_sub(collapsed) as f32
-        + line_height * trailing_empty_lines as f32
 }
 
 #[derive(Clone, Debug)]
@@ -5583,18 +5544,35 @@ fn neighbor_block_window(
     let window = if down {
         span.start..span.start + 1
     } else {
-        // A table's formal delimiter is a source line but not a visual row
-        // while inactive. When the table has no body rows, the physical last
-        // line is therefore the only hidden delimiter and laying out that
-        // one-line window leaves no target at all. The formal projection owns
-        // the visible table rows, so use its last row for upward movement;
-        // this also avoids landing on tiled trailing blank lines.
-        let last_visible_table_line = index
+        let last_line = span.end.saturating_sub(1);
+        let disclosure = editor
+            .ime()
+            .map(|ime| ime.current_range)
+            .or_else(|| Some(editor.selection().range()));
+        // Preserve tiled trailing blank lines as navigable rows. Only fall
+        // back to the table's last formal row when the physical last line is
+        // itself a collapsed delimiter (the header-only table edge case).
+        let hidden_delimiter_is_last_line = index
             .and_then(|index| index.table_projection(&indexed))
-            .and_then(|projection| projection.rows.last())
-            .and_then(|row| document.line_for_offset(row.source_range.start).ok())
-            .map(|line| line.0);
-        let line = last_visible_table_line.unwrap_or_else(|| span.end.saturating_sub(1));
+            .and_then(|projection| {
+                let delimiter_line = projection
+                    .delimiter_range
+                    .and_then(|range| document.line_for_offset(range.start).ok())?
+                    .0;
+                (delimiter_line == last_line
+                    && table_delimiter_is_collapsed(projection, disclosure))
+                .then_some(())
+            })
+            .is_some();
+        let line = if hidden_delimiter_is_last_line {
+            index
+                .and_then(|index| index.table_projection(&indexed))
+                .and_then(|projection| projection.rows.last())
+                .and_then(|row| document.line_for_offset(row.source_range.start).ok())
+                .map_or(last_line, |line| line.0)
+        } else {
+            last_line
+        };
         line..line + 1
     };
     Some((indexed, window))
@@ -10844,11 +10822,45 @@ mod tests {
 
     #[test]
     fn moving_up_from_after_a_header_only_table_lands_on_the_header() {
+        for following_source in ["# heading", "```text\ncode\n```"] {
+            let source = format!("| header | value |\n| --- | --- |\n{following_source}");
+            let editor = Editor::new(&source);
+            let index = BlockIndex::from_buffer(editor.document());
+            let shaper = FixedAdvanceShaper::new(8.0);
+            let table = index.block(0).expect("header-only table");
+            let following = index.block(1).expect("following block");
+            let (following_visual, _) = laid_out(&editor, &index, following.ordinal, &shaper);
+            let target = neighbor_row_target(
+                &editor,
+                Some(&index),
+                &following_visual,
+                false,
+                0.0,
+                TEST_WIDTH,
+                &shaper,
+                None,
+            )
+            .expect("the table above must have a visible row");
+            let (table_visual, table_layout) = laid_out(&editor, &index, table.ordinal, &shaper);
+            let target_row = table_layout
+                .point_for_source(&table_visual, target, &shaper)
+                .and_then(|point| table_layout.lines.get(point.row))
+                .expect("the target must resolve inside the table layout");
+
+            assert_eq!(
+                target_row.line_id, 0,
+                "up must skip the hidden delimiter before {following_source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_up_from_after_a_table_preserves_its_trailing_blank_line() {
         let source = "| header | value |\n| --- | --- |\n\nfollowing";
         let editor = Editor::new(source);
         let index = BlockIndex::from_buffer(editor.document());
         let shaper = FixedAdvanceShaper::new(8.0);
-        let table = index.block(0).expect("header-only table");
+        let table = index.block(0).expect("table block");
         let (following, _) = laid_out(&editor, &index, 1, &shaper);
         let target = neighbor_row_target(
             &editor,
@@ -10860,14 +10872,70 @@ mod tests {
             &shaper,
             None,
         )
-        .expect("the table above must have a visible row");
+        .expect("the trailing blank line must be a neighbor row");
         let (table_visual, table_layout) = laid_out(&editor, &index, table.ordinal, &shaper);
         let target_row = table_layout
             .point_for_source(&table_visual, target, &shaper)
             .and_then(|point| table_layout.lines.get(point.row))
-            .expect("the target must resolve inside the table layout");
+            .expect("the target must resolve inside the table block");
 
-        assert_eq!(target_row.line_id, 0, "up must skip the hidden delimiter");
+        assert_eq!(
+            target_row.line_id, 2,
+            "up must first land on the blank line"
+        );
+    }
+
+    #[gpui::test]
+    fn view_up_respects_table_neighbor_rows_and_trailing_blank_lines(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let source = "| A | B |\n| --- | --- |\n# One\n\n| C | D |\n| --- | --- |\n\n# Two";
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, source, false);
+        view.update(cx, |view, _| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+        });
+        for (heading, selector, expected_line, context) in [
+            ("# One", "row-2-0", 0, "hidden delimiter fallback"),
+            ("# Two", "row-7-0", 6, "tiled trailing blank line"),
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "heading row is painted"
+            );
+            view.update(cx, |view, _| {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(
+                        source.find(heading).expect("heading source"),
+                    )))
+                    .expect("caret at following heading");
+            });
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.move_vertical(false, false, window, cx));
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                let line = view
+                    .editor()
+                    .document()
+                    .line_for_offset(view.editor().selection().active)
+                    .expect("moved caret line")
+                    .0;
+                assert_eq!(line, expected_line, "unexpected Up target: {context}");
+            });
+        }
     }
 
     #[test]

@@ -958,9 +958,10 @@ pub fn trailing_blank_lines(document: &RopeBuffer, span: &Range<usize>) -> usize
 /// Initial height of every block in the index, from the line height alone.
 ///
 /// Seeds the [`HeightIndex`] at block granularity, and is re-run whenever the
-/// block count changes, so it must not touch the rope: the index already counted
-/// each block's lines while it tiled them, and this is arithmetic over those
-/// counts. Measured heights replace these as blocks are drawn.
+/// block count changes. It uses the same block-local calculation as incremental
+/// updates; only the final block needs a bounded line-span lookup to account
+/// for a trailing empty caret line. Measured heights replace these as blocks
+/// are drawn.
 pub fn block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32) -> Vec<f32> {
     block_heights_with_disclosure(document, index, line_height, None)
 }
@@ -978,38 +979,47 @@ pub fn block_heights_with_disclosure(
     line_height: f32,
     disclosure: Option<SourceRange>,
 ) -> Vec<f32> {
-    let mut counted = 0;
-    let mut heights = index
+    index
         .blocks()
-        .map(|block| {
-            counted += block.line_count;
-            let block_is_final = block.ordinal + 1 == index.len();
-            let collapsed_fence_rows = index
-                .fence_height_projection(&block)
-                .map_or(0, |projection| {
-                    projection.inactive_rows_in(
-                        block.source_range,
-                        block.source_range,
-                        disclosure,
-                        block_is_final,
-                    )
-                });
-            let collapsed_table_delimiter = index
-                .table_projection(&block)
-                .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
-                .map_or(0, |_| 1);
-            let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
-            line_height * block.line_count.saturating_sub(collapsed) as f32
-        })
-        .collect::<Vec<_>>();
-    // A document ending in a newline has one physical line more than its blocks
-    // account for — the empty last line, which the block above owns because that
-    // is where the caret goes.
-    if let Some(last) = heights.last_mut() {
-        let extra = document.line_count().saturating_sub(counted);
-        *last += line_height * extra as f32;
-    }
-    heights
+        .map(|block| block_height_with_disclosure(document, index, &block, line_height, disclosure))
+        .collect()
+}
+
+/// Initial height for one block, shared by full snapshots and incremental
+/// height-index splices. The calculation reads only this block's projections;
+/// the final block's line-span lookup accounts for an empty line after a
+/// trailing newline without scanning the document.
+pub fn block_height_with_disclosure(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    block: &IndexedBlock,
+    line_height: f32,
+    disclosure: Option<SourceRange>,
+) -> f32 {
+    let block_is_final = block.ordinal + 1 == index.len();
+    let collapsed_fence_rows = index
+        .fence_height_projection(block)
+        .map_or(0, |projection| {
+            projection.inactive_rows_in(
+                block.source_range,
+                block.source_range,
+                disclosure,
+                block_is_final,
+            )
+        });
+    let collapsed_table_delimiter = index
+        .table_projection(block)
+        .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
+        .map_or(0, |_| 1);
+    let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
+    let trailing_empty_lines = if block_is_final {
+        block_line_span(document, block)
+            .map_or(0, |span| span.len().saturating_sub(block.line_count))
+    } else {
+        0
+    };
+    line_height * block.line_count.saturating_sub(collapsed) as f32
+        + line_height * trailing_empty_lines as f32
 }
 
 /// One physical source line handed to [`present_block`].
@@ -1301,7 +1311,13 @@ pub fn present_block_with_table_projection(
                     .find(|line| line.line_id as usize == delimiter)
                     .is_some_and(|line| line.kind == BlockKind::TableDelimiter)
             },
-            |range| table_delimiter_is_collapsed_range(range, window.block_disclosure),
+            |range| {
+                table_delimiter_is_collapsed_range(
+                    range,
+                    table_projection.is_some_and(|projection| projection.delimiter_has_line_ending),
+                    window.block_disclosure,
+                )
+            },
         )
     });
     if table_delimiter_collapsed {
@@ -1652,18 +1668,27 @@ fn range_touches(range: SourceRange, disclosure: SourceRange) -> bool {
 
 fn table_delimiter_is_collapsed_range(
     range: SourceRange,
+    delimiter_has_line_ending: bool,
     disclosure: Option<SourceRange>,
 ) -> bool {
-    disclosure.is_none_or(|active| !table_delimiter_is_disclosed(range, active))
+    disclosure.is_none_or(|active| {
+        !table_delimiter_is_disclosed(range, delimiter_has_line_ending, active)
+    })
 }
 
 /// A caret at the first byte of the line after a table delimiter belongs to
-/// that body line, not to the delimiter. The delimiter range includes its
-/// trailing line ending, so its empty-disclosure ownership is half-open at
-/// `range.end`; non-empty selections retain the ordinary intersection rule.
-fn table_delimiter_is_disclosed(range: SourceRange, disclosure: SourceRange) -> bool {
+/// that body line, not to the delimiter. The range includes its line ending,
+/// so its end is excluded unless the delimiter is the unterminated final line
+/// and the caret is at EOF. Non-empty selections retain intersection ownership.
+fn table_delimiter_is_disclosed(
+    range: SourceRange,
+    delimiter_has_line_ending: bool,
+    disclosure: SourceRange,
+) -> bool {
     if disclosure.is_empty() {
-        range.start <= disclosure.start && disclosure.start < range.end
+        range.start <= disclosure.start
+            && (disclosure.start < range.end
+                || (!delimiter_has_line_ending && disclosure.start == range.end))
     } else {
         range.intersects(disclosure)
     }
@@ -1675,9 +1700,9 @@ pub fn table_delimiter_is_collapsed(
     projection: &TableProjection,
     disclosure: Option<SourceRange>,
 ) -> bool {
-    projection
-        .delimiter_range
-        .is_some_and(|range| table_delimiter_is_collapsed_range(range, disclosure))
+    projection.delimiter_range.is_some_and(|range| {
+        table_delimiter_is_collapsed_range(range, projection.delimiter_has_line_ending, disclosure)
+    })
 }
 
 fn disclosure_owns_physical_line(

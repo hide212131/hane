@@ -121,6 +121,10 @@ pub struct TableProjectionRow {
 pub struct TableProjection {
     pub source_range: SourceRange,
     pub delimiter_range: Option<SourceRange>,
+    /// Whether the delimiter's physical source line ends with a line ending.
+    /// A caret at `delimiter_range.end` belongs to the delimiter only when
+    /// this is false and that offset is the document EOF.
+    pub delimiter_has_line_ending: bool,
     pub alignments: Arc<[TableAlignment]>,
     pub rows: Arc<[TableProjectionRow]>,
 }
@@ -677,6 +681,13 @@ fn build_table_projections(
                     let end = line.end.0.saturating_sub(range.start.0);
                     source.get(relative..end).is_some_and(is_table_delimiter)
                 });
+            let delimiter_has_line_ending = delimiter_range.is_some_and(|delimiter| {
+                let relative = delimiter.start.0.saturating_sub(range.start.0);
+                let end = delimiter.end.0.saturating_sub(range.start.0);
+                source
+                    .get(relative..end)
+                    .is_some_and(|text| text.ends_with(['\n', '\r']))
+            });
             let rows = parsed
                 .tree
                 .children(table.node)
@@ -720,6 +731,7 @@ fn build_table_projections(
                 TableProjection {
                     source_range: node.source_range,
                     delimiter_range,
+                    delimiter_has_line_ending,
                     alignments: table.alignments.clone(),
                     rows,
                 },
