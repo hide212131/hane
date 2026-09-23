@@ -187,6 +187,10 @@ pub(crate) fn presented_block_with_table_projection(
     )?;
     let lines = block_lines(editor, &ctx);
     let clipped_fence_lines = clipped_fence_lines(editor, &ctx);
+    let table_delimiter_line = table_projection
+        .and_then(|projection| projection.delimiter_range)
+        .and_then(|range| document.line_for_offset(range.start).ok())
+        .map(|line| line.0);
     Some(present_block_with_table_projection(
         block,
         document.revision(),
@@ -197,6 +201,7 @@ pub(crate) fn presented_block_with_table_projection(
             clipped_fence_lines: &clipped_fence_lines,
             zero_height_fence_rows_before: ctx.zero_height_fence_rows_before,
             zero_height_fence_rows_after: ctx.zero_height_fence_rows_after,
+            table_delimiter_line,
             render,
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -236,6 +241,7 @@ pub(crate) fn expected_block_disclosures(
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
             render: render.clone(),
             joined,
             block_disclosure: ctx.block_disclosure,
@@ -927,9 +933,13 @@ fn table_row_element(
                             element.font_weight(FontWeight::SEMIBOLD)
                         })
                         .debug_selector({
+                            // Table rows can have a hidden delimiter before them, so the
+                            // layout row index is not their physical source-line index. Keep
+                            // this selector keyed by the physical line just like the row
+                            // selector above.
                             let selector = format!(
                                 "table-cell-text-{}-{}-{}-{}",
-                                line.line_id, row_index, cell_layout.column, fragment_index
+                                line.line_id, line.line_id, cell_layout.column, fragment_index
                             );
                             move || selector.clone()
                         })

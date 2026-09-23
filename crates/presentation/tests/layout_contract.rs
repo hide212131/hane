@@ -17,8 +17,8 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_table_projection,
-    trailing_blank_lines,
+    VisualBlock, VisualOffset, block_heights_with_disclosure, block_line_span, layout_block,
+    present_block_with_table_projection, table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -248,6 +248,7 @@ fn present(source: &str, cursor: Option<usize>) -> Vec<VisualBlock> {
                     clipped_fence_lines: &[],
                     zero_height_fence_rows_before: 0,
                     zero_height_fence_rows_after: 0,
+                    table_delimiter_line: None,
                     joined: None,
                     block_disclosure: None,
                 },
@@ -283,6 +284,11 @@ fn present_table_window(source: &str, render: Range<usize>) -> VisualBlock {
             disclosure: None,
         })
         .collect::<Vec<_>>();
+    let table_delimiter_line = index
+        .table_projection(&block)
+        .and_then(|projection| projection.delimiter_range)
+        .and_then(|range| buffer.line_for_offset(range.start).ok())
+        .map(|line| line.0);
     present_block_with_table_projection(
         &block,
         buffer.revision(),
@@ -293,6 +299,7 @@ fn present_table_window(source: &str, render: Range<usize>) -> VisualBlock {
             clipped_fence_lines: &[],
             zero_height_fence_rows_before: 0,
             zero_height_fence_rows_after: 0,
+            table_delimiter_line,
             render,
             joined: None,
             block_disclosure: None,
@@ -609,15 +616,144 @@ fn table_layout_does_not_restore_cells_for_hidden_delimiter_rows() {
     assert!(delimiter.visual_text.is_empty());
 
     let layout = layout_block(&block, 160.0, &shaper());
-    let delimiter_row = layout
-        .lines
-        .iter()
-        .find(|row| row.line_id == delimiter.line_id)
-        .expect("table delimiter layout row");
     assert!(
-        delimiter_row.table_cells.is_empty(),
-        "hidden delimiter rows must not become editing table rows"
+        layout
+            .lines
+            .iter()
+            .all(|row| row.line_id != delimiter.line_id),
+        "hidden delimiter rows must not become layout rows"
     );
+}
+
+#[test]
+fn clipped_table_delimiter_does_not_restore_virtual_space() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let header = present_table_window(source, 0..1);
+    let body = present_table_window(source, 2..3);
+
+    assert_eq!(header.trailing_space(), LINE_HEIGHT);
+    assert_eq!(body.leading_space(), LINE_HEIGHT);
+}
+
+#[test]
+fn table_delimiter_ownership_is_half_open_at_the_first_body_byte() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.blocks().next().expect("table block");
+    let projection = index.table_projection(&block).expect("table projection");
+    let delimiter = projection.delimiter_range.expect("table delimiter");
+    let body_start = SourceOffset(source.find("| body").expect("body row"));
+
+    assert_eq!(delimiter.end, body_start);
+    assert!(
+        table_delimiter_is_collapsed(projection, Some(SourceRange::empty(body_start.0))),
+        "the caret at the body line start must not disclose the delimiter"
+    );
+    assert!(!table_delimiter_is_collapsed(
+        projection,
+        Some(SourceRange::empty(delimiter.start.0 + 2))
+    ));
+}
+
+#[test]
+fn eof_caret_discloses_only_an_unterminated_table_delimiter() {
+    for (source, should_disclose) in [
+        ("| header | value |\n| --- | --- |", true),
+        ("| header | value |\n| --- | --- |\n", false),
+        ("| header | value |\r\n| --- | --- |", true),
+        ("| header | value |\r\n| --- | --- |\r\n", false),
+        ("| header | value |\r| --- | --- |", true),
+        ("| header | value |\r| --- | --- |\r", false),
+    ] {
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let block = index.blocks().next().expect("table block");
+        let projection = index.table_projection(&block).expect("table projection");
+        let delimiter = projection.delimiter_range.expect("table delimiter");
+        let eof = SourceRange::empty(source.len());
+
+        assert_eq!(delimiter.end, eof.start);
+        assert_eq!(
+            !table_delimiter_is_collapsed(projection, Some(eof)),
+            should_disclose,
+            "EOF ownership for source ending {source:?}"
+        );
+
+        let inactive = hane_presentation::block_heights(&buffer, &index, LINE_HEIGHT);
+        let active = block_heights_with_disclosure(&buffer, &index, LINE_HEIGHT, Some(eof));
+        assert_eq!(
+            active[block.ordinal] - inactive[block.ordinal],
+            if should_disclose { LINE_HEIGHT } else { 0.0 },
+            "height disclosure must match the delimiter's EOF ownership"
+        );
+    }
+}
+
+#[test]
+fn table_layout_moves_directly_between_header_and_first_body_row() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    // Keep this contract focused on skipping the hidden delimiter. Wrapped
+    // table-cell fragments are visual rows in their own right and are covered
+    // by `table_rows_use_fragment_y_for_caret_hit_testing_and_vertical_movement`.
+    let (block, layout) = present(source, None)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 200.0, &shaper());
+            (block, layout)
+        })
+        .expect("table block");
+    assert_eq!(
+        layout.lines.iter().map(|row| row.line_id).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(layout.lines[1].y, layout.lines[0].bottom());
+
+    let header_offset = SourceOffset(source.find("header").expect("header cell"));
+    let body_offset = SourceOffset(source.find("body").expect("body cell"));
+    let header_point = layout
+        .point_for_source(&block, header_offset, &shaper())
+        .expect("header point");
+    let body_point = layout
+        .point_for_source(&block, body_offset, &shaper())
+        .expect("body point");
+    let down = layout.vertical_target(&block, header_offset, true, header_point.x, &shaper());
+    let VerticalMove::To(down_offset) = down else {
+        panic!("down from the header must enter the first body row: {down:?}");
+    };
+    let down_point = layout
+        .point_for_source(&block, down_offset, &shaper())
+        .expect("down target point");
+    assert_eq!(down_point.row, body_point.row);
+    assert_eq!(down_point.x, header_point.x);
+
+    let up = layout.vertical_target(&block, body_offset, false, body_point.x, &shaper());
+    let VerticalMove::To(up_offset) = up else {
+        panic!("up from the first body row must enter the header: {up:?}");
+    };
+    let up_point = layout
+        .point_for_source(&block, up_offset, &shaper())
+        .expect("up target point");
+    assert_eq!(up_point.row, header_point.row);
+    assert_eq!(up_point.x, body_point.x);
+}
+
+#[test]
+fn table_delimiter_stays_editable_and_restores_a_layout_row_when_disclosed() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let delimiter_offset = source.find("---").expect("delimiter");
+    let block = present(source, Some(delimiter_offset))
+        .into_iter()
+        .find(|block| block.kind == BlockKind::TableRow)
+        .expect("table block");
+    let delimiter = block.lines.iter().find(|line| line.line_id == 1).unwrap();
+    assert_ne!(delimiter.kind, BlockKind::TableDelimiter);
+    assert!(delimiter.visual_text.contains("---"));
+    assert!(delimiter.height() > 0.0);
+
+    let layout = layout_block(&block, WIDTH, &shaper());
+    assert!(layout.lines.iter().any(|row| row.line_id == 1));
 }
 
 #[test]

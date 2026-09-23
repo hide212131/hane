@@ -183,6 +183,7 @@ fn present_document(buffer: &RopeBuffer, cursor: Option<usize>) -> Vec<VisualLin
                 clipped_fence_lines: &[],
                 zero_height_fence_rows_before: 0,
                 zero_height_fence_rows_after: 0,
+                table_delimiter_line: None,
                 joined: None,
                 block_disclosure: None,
             },
