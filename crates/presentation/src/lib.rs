@@ -1649,7 +1649,19 @@ fn table_delimiter_is_collapsed_range(
     range: SourceRange,
     disclosure: Option<SourceRange>,
 ) -> bool {
-    disclosure.is_none_or(|active| !range_touches(range, active))
+    disclosure.is_none_or(|active| !table_delimiter_is_disclosed(range, active))
+}
+
+/// A caret at the first byte of the line after a table delimiter belongs to
+/// that body line, not to the delimiter. The delimiter range includes its
+/// trailing line ending, so its empty-disclosure ownership is half-open at
+/// `range.end`; non-empty selections retain the ordinary intersection rule.
+fn table_delimiter_is_disclosed(range: SourceRange, disclosure: SourceRange) -> bool {
+    if disclosure.is_empty() {
+        range.start <= disclosure.start && disclosure.start < range.end
+    } else {
+        range.intersects(disclosure)
+    }
 }
 
 /// Whether a formal table's delimiter is hidden from the inactive visual
@@ -3680,7 +3692,7 @@ fn present_polished_line_with_fence(
             list_projection.and_then(|projection| formal_quote_metadata(range, projection)),
         )
     } else if context == LineContext::Table
-        && disclosure.is_none_or(|active| !range_touches(range, active))
+        && disclosure.is_none_or(|active| !table_delimiter_is_disclosed(range, active))
     {
         present_table_line(
             line_id,

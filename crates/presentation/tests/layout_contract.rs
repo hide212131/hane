@@ -17,8 +17,8 @@ use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
     BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
-    VisualBlock, VisualOffset, block_line_span, layout_block, present_block_with_table_projection,
-    trailing_blank_lines,
+    VisualBlock, VisualOffset, block_line_span, layout_block,
+    present_block_with_table_projection, table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -636,11 +636,41 @@ fn clipped_table_delimiter_does_not_restore_virtual_space() {
 }
 
 #[test]
+fn table_delimiter_ownership_is_half_open_at_the_first_body_byte() {
+    let source = "| header | value |\n| --- | --- |\n| body | cell |";
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.blocks().next().expect("table block");
+    let projection = index
+        .table_projection(&block)
+        .expect("table projection");
+    let delimiter = projection.delimiter_range.expect("table delimiter");
+    let body_start = SourceOffset(source.find("| body").expect("body row"));
+
+    assert_eq!(delimiter.end, body_start);
+    assert!(
+        table_delimiter_is_collapsed(projection, Some(SourceRange::empty(body_start.0))),
+        "the caret at the body line start must not disclose the delimiter"
+    );
+    assert!(!table_delimiter_is_collapsed(
+        projection,
+        Some(SourceRange::empty(delimiter.start.0 + 2))
+    ));
+}
+
+#[test]
 fn table_layout_moves_directly_between_header_and_first_body_row() {
     let source = "| header | value |\n| --- | --- |\n| body | cell |";
-    let (block, layout) = laid_out(source)
+    // Keep this contract focused on skipping the hidden delimiter. Wrapped
+    // table-cell fragments are visual rows in their own right and are covered
+    // by `table_rows_use_fragment_y_for_caret_hit_testing_and_vertical_movement`.
+    let (block, layout) = present(source, None)
         .into_iter()
-        .find(|(block, _)| block.kind == BlockKind::TableRow)
+        .find(|block| block.kind == BlockKind::TableRow)
+        .map(|block| {
+            let layout = layout_block(&block, 200.0, &shaper());
+            (block, layout)
+        })
         .expect("table block");
     assert_eq!(
         layout.lines.iter().map(|row| row.line_id).collect::<Vec<_>>(),
