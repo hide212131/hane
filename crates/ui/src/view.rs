@@ -4123,11 +4123,29 @@ impl EditorView {
         window_offset: f32,
         cx: &mut Context<Self>,
     ) {
-        if self.wheel_zoom_animation.is_some() {
+        let interrupted_wheel = self.wheel_zoom_animation.take().is_some();
+        if interrupted_wheel {
+            // A pinch takes over from what is actually painted, not from the
+            // wheel's future target. A neutral pinch-begin event must not snap
+            // an intermediate painted value back toward 100%.
             self.raw_zoom = self.zoom;
-            self.wheel_zoom_animation = None;
+            if factor == 1.0 {
+                self.rebuild_height_estimates();
+                cx.notify();
+                return;
+            }
         }
+
+        let previous_zoom = self.zoom;
         self.apply_zoom_factor(factor, window_offset, cx);
+        if interrupted_wheel && self.zoom == previous_zoom {
+            // The direct delta can land inside the 100% snap band and leave
+            // the effective zoom unchanged. There will then be no font
+            // revision on the next frame to finalize the document-wide height
+            // index that interpolation intentionally kept stale offscreen.
+            self.rebuild_height_estimates();
+            cx.notify();
+        }
     }
 
     /// Records a new discrete wheel target without jumping the painted zoom to
@@ -4197,14 +4215,18 @@ impl EditorView {
     /// each animation frame O(document). The final frame has no active wheel
     /// animation, so it rebuilds the full estimate index once at the settled
     /// zoom and restores globally correct scroll geometry.
+    fn rebuild_height_estimates(&mut self) {
+        let (granularity, _) = self.desired_layout();
+        let heights = HeightIndex::new(self.item_heights());
+        self.install_heights(granularity, heights);
+    }
+
     fn invalidate_layout_font_revision(&mut self, font_revision: u64) {
         self.layout_font_revision = font_revision;
         self.block_cache.clear();
         self.layout_cache.clear();
         if self.wheel_zoom_animation.is_none() {
-            let (granularity, _) = self.desired_layout();
-            let heights = HeightIndex::new(self.item_heights());
-            self.install_heights(granularity, heights);
+            self.rebuild_height_estimates();
         }
     }
 
@@ -13235,6 +13257,29 @@ mod tests {
         cx.run_until_parked();
         let zoomed = view.read_with(cx, |view, _| view.zoom);
         assert!(zoomed > 1.0, "{zoomed}");
+    }
+
+    #[gpui::test]
+    fn neutral_pinch_takeover_finalizes_document_wide_heights(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\n", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.zoom = 1.1;
+            view.raw_zoom = 1.4;
+            view.heights = HeightIndex::new([123.0, 456.0]);
+            view.wheel_zoom_animation = Some(WheelZoomAnimation {
+                window_offset: 0.0,
+                last_frame: Instant::now(),
+            });
+
+            view.apply_direct_zoom_factor(1.0, 0.0, cx);
+
+            assert_eq!(view.zoom, 1.1);
+            assert_eq!(view.raw_zoom, 1.1);
+            assert!(view.wheel_zoom_animation.is_none());
+            assert_ne!(view.heights.height(0), Some(123.0));
+        });
     }
 
     #[gpui::test]
