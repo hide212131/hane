@@ -25,7 +25,7 @@ GPUI 世代整合を更新理由として認める方針は本 ADR で決定す�
 ## 背景
 
 Hane の価値は、巨大な Markdown 文書でも入力と表示が止まらない「羽のような軽さ」にある。
-移行前のリモート `main`（2026-09-24、`afee9ad6`）は `gpui = "=0.2.2"` を固定し、さらに
+本 PR の基準となる `main`（2026-09-24、`383b166c`）は `gpui = "=0.2.2"` を固定し、さらに
 `[patch.crates-io]` で `vendor/gpui` を同じ `0.2.2` のローカル実装へ差し替えている。Hane 本体は、
 次の経路を分離している。
 
@@ -48,7 +48,7 @@ UI 部品がある。一方、異なる世代の GPUI を依存させると、�
 
 | 対象 | 確認した依存関係 | Hane との関係 |
 |---|---|---|
-| Hane 移行前 `main` `afee9ad6` | `gpui = "=0.2.2"`、`vendor/gpui` を `[patch.crates-io]` で使用 | 比較対象の型世代。`HANE-PATCH.md` に macOS の合成斜体と IME 再同期のパッチを記録している |
+| Hane 移行前 `main` `383b166c` | `gpui = "=0.2.2"`、`vendor/gpui` を `[patch.crates-io]` で使用 | 比較対象の型世代。`HANE-PATCH.md` に macOS の合成斜体と IME 再同期のパッチを記録している |
 | [`gpui-kit 0.6.6`](https://crates.io/crates/gpui-kit/0.6.6) | `gpui-base = 0.6.6`、`gpui-pre = "=0.3.6"`、`gpui-pre-platform = "=0.3.6"`、`gpui-pre-web = "=0.3.6"` | Hane の `gpui 0.2.2` とは別の GPUI 配布系列 |
 | [`gpui-base 0.6.6`](https://crates.io/crates/gpui-base/0.6.6) | `gpui-pre`、`gpui-pre-macros`、`gpui-pre-sum-tree` をいずれも `=0.3.6` に固定 | Tree 等の基盤部品を使う場合も `0.3.6` 世代が境界になる |
 
