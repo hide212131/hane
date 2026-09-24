@@ -132,18 +132,22 @@ jobs:
           $hasPfx = -not [string]::IsNullOrEmpty($env:HANE_MSIX_PFX_BASE64)
           $hasPassword = -not [string]::IsNullOrEmpty($env:HANE_MSIX_PFX_PASSWORD)
           if (-not $hasPfx -or -not $hasPassword) {
-            throw 'Both HANE_MSIX_PFX_BASE64 and HANE_MSIX_PFX_PASSWORD are required to keep the Hane package identity stable.'
+            throw 'Both HANE_MSIX_PFX_BASE64 and HANE_MSIX_PFX_PASSWORD are required to sign the Hane Explorer package.'
           }
           $pfx = Join-Path $env:RUNNER_TEMP 'hane-msix-signing.pfx'
           try {
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:HANE_MSIX_PFX_BASE64))
             $password = ConvertTo-SecureString $env:HANE_MSIX_PFX_PASSWORD -AsPlainText -Force
-            $expectedThumbprint = '9725B0DE9BCA812573A278059750E7C350CFCA8E'
             $pfxCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
               $pfx, $env:HANE_MSIX_PFX_PASSWORD,
               [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
-            if ($pfxCertificate.Thumbprint -ne $expectedThumbprint -or -not $pfxCertificate.HasPrivateKey) {
-              throw 'The configured PFX is not the previously validated Hane signing certificate.'
+            if ($pfxCertificate.Subject -ne 'CN=Hane Local Test 2026' -or
+                $pfxCertificate.Issuer -ne $pfxCertificate.Subject -or
+                -not $pfxCertificate.HasPrivateKey -or
+                $pfxCertificate.NotBefore -gt (Get-Date) -or
+                $pfxCertificate.NotAfter -le (Get-Date) -or
+                -not ($pfxCertificate.EnhancedKeyUsageList | Where-Object ObjectId -eq '1.3.6.1.5.5.7.3.3')) {
+              throw 'The configured PFX must contain a valid self-signed Hane code-signing certificate with its private key.'
             }
             $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password |
               Where-Object HasPrivateKey | Select-Object -First 1
@@ -151,8 +155,8 @@ jobs:
           finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
-          if (-not $certificate -or $certificate.Thumbprint -ne $expectedThumbprint) {
-            throw 'The configured PFX does not contain the previously validated Hane signing certificate.'
+          if (-not $certificate -or $certificate.Thumbprint -ne $pfxCertificate.Thumbprint) {
+            throw 'The imported Hane signing certificate does not match the configured PFX.'
           }
           Export-Certificate -Cert $certificate -FilePath 'target/release/Hane.ShellIntegration.cer' | Out-Null
           "HANE_MSIX_CERT_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
