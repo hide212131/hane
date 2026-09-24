@@ -122,14 +122,66 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked -p hane
 
+      - name: Prepare Windows Explorer package signing certificate
+        shell: pwsh
+        env:
+          HANE_MSIX_PFX_BASE64: ${{ secrets.HANE_MSIX_PFX_BASE64 }}
+          HANE_MSIX_PFX_PASSWORD: ${{ secrets.HANE_MSIX_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hasPfx = -not [string]::IsNullOrEmpty($env:HANE_MSIX_PFX_BASE64)
+          $hasPassword = -not [string]::IsNullOrEmpty($env:HANE_MSIX_PFX_PASSWORD)
+          if (-not $hasPfx -or -not $hasPassword) {
+            throw 'Both HANE_MSIX_PFX_BASE64 and HANE_MSIX_PFX_PASSWORD are required to keep the Hane package identity stable.'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'hane-msix-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:HANE_MSIX_PFX_BASE64))
+            $password = ConvertTo-SecureString $env:HANE_MSIX_PFX_PASSWORD -AsPlainText -Force
+            $expectedThumbprint = '9725B0DE9BCA812573A278059750E7C350CFCA8E'
+            $pfxCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $pfx, $env:HANE_MSIX_PFX_PASSWORD,
+              [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+            if ($pfxCertificate.Thumbprint -ne $expectedThumbprint -or -not $pfxCertificate.HasPrivateKey) {
+              throw 'The configured PFX is not the previously validated Hane signing certificate.'
+            }
+            $certificate = Import-PfxCertificate -FilePath $pfx -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password |
+              Where-Object HasPrivateKey | Select-Object -First 1
+          }
+          finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $certificate -or $certificate.Thumbprint -ne $expectedThumbprint) {
+            throw 'The configured PFX does not contain the previously validated Hane signing certificate.'
+          }
+          Export-Certificate -Cert $certificate -FilePath 'target/release/Hane.ShellIntegration.cer' | Out-Null
+          "HANE_MSIX_CERT_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Build and sign Windows Explorer extension
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./windows/shell-extension/build-package.ps1 `
+            -ExePath target/release/hane.exe -Architecture x64 `
+            -CertificateThumbprint $env:HANE_MSIX_CERT_THUMBPRINT
+
       - name: Package portable zip
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $staging = "staging/hane-windows-x64"
           New-Item -ItemType Directory -Path $staging -Force | Out-Null
-          Copy-Item target/release/hane.exe "$staging/hane.exe"
-          Copy-Item README.md "$staging/README.md"
+          foreach ($file in @('hane.exe', 'hane_shell_extension.dll', 'Hane.ShellIntegration.msix', 'Hane.ShellIntegration.cer')) {
+            Copy-Item -LiteralPath "target/release/$file" -Destination "$staging/$file" -ErrorAction Stop
+          }
+          Copy-Item -LiteralPath windows/shell-extension/Trust-HaneShellCertificate.ps1 -Destination "$staging/Trust-HaneShellCertificate.ps1"
+          Copy-Item -LiteralPath README.md -Destination "$staging/README.md"
           Copy-Item LICENSE "$staging/LICENSE" -ErrorAction SilentlyContinue
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new("$staging/Hane.ShellIntegration.cer")
+          $signature = Get-AuthenticodeSignature -LiteralPath "$staging/Hane.ShellIntegration.msix"
+          if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+            throw 'The packaged MSIX signature does not match its bundled public certificate.'
+          }
           Compress-Archive -Path "$staging/*" -DestinationPath "hane-windows-x64.zip" -Force
 
       - name: Upload portable build artifact
