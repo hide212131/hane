@@ -919,7 +919,7 @@ impl HeightBlocks {
         self.counts
             .extend(self.chunks.iter().map(|chunk| chunk.len()));
         for index in 1..self.counts.len() {
-            let parent = index + index.isolate_lowest_one();
+            let parent = index + (index & index.wrapping_neg());
             if parent < self.counts.len() {
                 self.counts[parent] += self.counts[index];
             }

@@ -34,7 +34,7 @@ impl SumTree {
         tree.push(0);
         tree.extend(values);
         for index in 1..tree.len() {
-            let parent = index + index.isolate_lowest_one();
+            let parent = index + (index & index.wrapping_neg());
             if parent < tree.len() {
                 tree[parent] += tree[index];
             }
@@ -60,7 +60,7 @@ impl SumTree {
         let mut node = index + 1;
         while node < self.tree.len() {
             self.tree[node] = self.tree[node].wrapping_add_signed(delta);
-            node += node.isolate_lowest_one();
+            node += node & node.wrapping_neg();
         }
     }
 

@@ -70,7 +70,7 @@ pub(crate) fn active_keyboard_input_mode() -> Option<KeyboardInputMode> {
         } else {
             let mut conversion = 0;
             let mut sentence = 0;
-            (ImmGetConversionStatus(context, &mut conversion, &mut sentence) != 0).then(|| {
+            (ImmGetConversionStatus(context, &mut conversion, &mut sentence) != 0).then_some({
                 if conversion & (IME_CMODE_NATIVE | IME_CMODE_NATIVESYMBOL) != 0 {
                     KeyboardInputMode::Native
                 } else {

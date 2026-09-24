@@ -4603,7 +4603,7 @@ impl HeightIndex {
         self.counts
             .extend(self.chunks.iter().map(|chunk| chunk.heights.len()));
         for index in 1..self.sums.len() {
-            let parent = index + index.isolate_lowest_one();
+            let parent = index + (index & index.wrapping_neg());
             if parent < self.sums.len() {
                 self.sums[parent] += self.sums[index];
                 self.counts[parent] += self.counts[index];
@@ -4662,7 +4662,7 @@ impl HeightIndex {
         let mut node = chunk + 1;
         while node < self.sums.len() {
             self.sums[node] += delta;
-            node += node.isolate_lowest_one();
+            node += node & node.wrapping_neg();
         }
     }
 
