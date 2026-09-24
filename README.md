@@ -22,7 +22,7 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 
 macOS 版は現在 Developer ID による署名と Apple の notarization には未対応です。そのため、ダウンロード後の初回起動時に macOS のセキュリティ警告が表示される場合があります。
 
-Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
+Windows版は [最新のGitHub Release](https://github.com/hide212131/hane/releases/latest) から `hane-windows-x64.zip` を取得し、ユーザーが書き込めるフォルダへ展開して `hane.exe` を実行します。設定と Recent Files は `%LOCALAPPDATA%\Hane` に保存されます（`HANE_STATE_DIR` で変更可能）。新しいZIPにはWindows 11のExplorer拡張も同梱しますが、現在公開中のv0.19.0のZIPにはまだ含まれません。CLI の使い方とエクスプローラーへの統合については [Windows CLI / Explorer 統合](#windows-cli--explorer-統合) を参照してください。
 
 > macOS で Metal Toolchain を別途導入しなくても動かせるよう、GPUI の `runtime_shaders` を使っています。
 
@@ -44,13 +44,19 @@ hane.exe --unregister-context-menu
 
 ファイルの右クリック登録は設定画面の「一般」→「Windowsとの連携」から切り替えます。Windows 11では `IExplorerCommand` を含む署名済みの疎パッケージを導入して、新しい右クリックメニューへ表示します。Windows 10では従来の右クリックメニューを使用します。ファイル登録を無効にしてもフォルダ登録は変更しません。
 
-Windows 11向けパッケージのビルド例（Windows SDK、MSVC、信頼済みコード署名証明書が必要）:
+Windows 11向けの新しい配布ZIPには `Hane.ShellIntegration.msix`、`hane_shell_extension.dll`、署名用の公開証明書 `Hane.ShellIntegration.cer`、`Trust-HaneShellCertificate.ps1` が `hane.exe` と同じフォルダに入ります。自己署名証明書のため、初回だけ配布先PCで次を行ってください。秘密鍵を配布先で作成する必要はありません。
+
+1. 配布ZIPを信頼できるGitHub Releaseから入手し、展開する。証明書を信頼する前に、ZIPの入手元を確認する。
+2. 管理者としてPowerShellを開き、展開したフォルダに移動する。`Unblock-File .\Trust-HaneShellCertificate.ps1` を実行し、続けて `.\Trust-HaneShellCertificate.ps1` を実行する。これは同梱の公開証明書だけをこのPCの `LocalMachine\TrustedPeople` に登録し、MSIXの署名を確認する。
+3. 通常権限で `hane.exe` を起動し、「一般」→「Windowsとの連携」でファイルの右クリック登録を有効にする。設定の無効化はメニュー項目を消しますが、証明書の信頼登録は残ります。
+
+ソースからWindows 11向けパッケージをビルドする例（Windows SDK、MSVC、署名証明書が必要）:
 
 ```powershell
 .\windows\shell-extension\build-package.ps1 -ExePath .\target\windows-x64-1.98.1\release\hane.exe -Architecture x64 -CertificateThumbprint <証明書の拇印>
 ```
 
-生成される `Hane.ShellIntegration.msix` と `hane_shell_extension.dll` は `hane.exe` と同じディレクトリに配置します。登録時にHaneが現在のユーザーへパッケージを導入します。証明書を指定しないビルドは未署名であり、Explorerでは使用できません。個人検証の自己署名証明書を使う場合は、公開証明書を端末の `TrustedPeople` に信頼登録する必要があります（管理者権限が必要）。
+生成される `Hane.ShellIntegration.msix` と `hane_shell_extension.dll` は `hane.exe` と同じディレクトリに配置します。登録時にHaneが現在のユーザーへパッケージを導入します。証明書を指定しないビルドは未署名であり、Explorerでは使用できません。配布用の署名秘密鍵はGitHub Actionsのシークレットにのみ設定し、ZIPやリポジトリには含めません。リリース担当者向けの設定手順は [Windows署名手順](docs/windows-release-signing.md) を参照してください。
 
 Windows 11 のメニュー表示状態は実行ファイルと同じディレクトリの `Hane.ShellIntegration.enabled`（ファイル）または `Hane.ShellIntegration.folder.enabled`（フォルダ）で管理します。パッケージ化された Explorer 拡張やそこから起動した Hane では通常の HKCU\Software\Classes キーが仮想化されるため、Windows 11 のファイル登録はこのキーを新規作成しません。旧版が作成した Hane 所有のキーが現在のプロセスから見える場合だけ削除します。無効化時には対応するマーカーを削除します。署名済みパッケージ自体は再有効化を速くするため残りますが、マーカーがない項目は Explorer に表示されません。パッケージを更新した直後に新しい項目が見えない場合は Explorer ウィンドウを開き直してください。
 

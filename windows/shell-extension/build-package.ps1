@@ -19,16 +19,32 @@ $verifiedStage = [System.IO.Path]::GetFullPath($stage)
 if ($verifiedStage -ne (Join-Path $verifiedOutput 'hane-shell-package-staging')) {
     throw 'Refusing to use a staging directory outside the requested output directory.'
 }
-$vsvars = 'C:\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'
-if (-not (Test-Path -LiteralPath $vsvars)) {
-    throw 'Visual Studio Build Tools vcvarsall.bat was not found.'
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path -LiteralPath $vswhere)) {
+    throw "Visual Studio Installer vswhere.exe was not found: $vswhere"
 }
-$sdk = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory |
+$component = if ($Architecture -eq 'x64') {
+    'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+} else {
+    'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+}
+$installation = & $vswhere -latest -products '*' -requires $component -property installationPath
+if (-not $installation) {
+    throw "Visual Studio C++ tools for $Architecture were not found."
+}
+$vsvars = Join-Path ($installation | Select-Object -First 1) 'VC\Auxiliary\Build\vcvarsall.bat'
+if (-not (Test-Path -LiteralPath $vsvars)) {
+    throw "Visual Studio vcvarsall.bat was not found: $vsvars"
+}
+$sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+$sdk = Get-ChildItem -LiteralPath $sdkRoot -Directory |
     Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
     Sort-Object Name -Descending | Select-Object -First 1
+if (-not $sdk) { throw "Windows SDK tools were not found: $sdkRoot" }
 $makeappx = Join-Path $sdk.FullName "$Architecture\makeappx.exe"
 $signtool = Join-Path $sdk.FullName "$Architecture\signtool.exe"
 if (-not (Test-Path -LiteralPath $makeappx)) { throw "Missing makeappx.exe: $makeappx" }
+if (-not (Test-Path -LiteralPath $signtool)) { throw "Missing signtool.exe: $signtool" }
 
 $certificate = $null
 if ($CertificateThumbprint) {
