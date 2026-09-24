@@ -139,10 +139,10 @@ mod windows {
     pub fn inspect(exe: &Path) -> FileContextMenuState {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         if is_windows_11() {
-            if let Ok(key) = hkcu.open_subkey(FILE_MENU_KEY) {
-                if !is_owned(&key) {
-                    return FileContextMenuState::Conflict;
-                }
+            if let Ok(key) = hkcu.open_subkey(FILE_MENU_KEY)
+                && !is_owned(&key)
+            {
+                return FileContextMenuState::Conflict;
             }
             return match marker_enabled(exe, FILE_ENABLED_MARKER) {
                 Ok(true) if package_installed() => FileContextMenuState::Registered,
