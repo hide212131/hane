@@ -535,6 +535,7 @@ pub struct EditorView {
     settings_open: bool,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
+    file_context_menu_generation: u64,
     settings_error: Option<String>,
     recent: RecentFiles,
     /// The Markdown index of the directory this window was opened onto, if
@@ -2117,6 +2118,7 @@ impl EditorView {
             settings_open: false,
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
+            file_context_menu_generation: 0,
             settings_error: None,
             recent,
             work_folder: None,
@@ -3472,6 +3474,17 @@ impl EditorView {
         self.begin_work_folder_scan(root, cx);
     }
 
+    /// Handles a path delivered by another Hane process from Explorer.
+    pub fn open_external_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        self.settings_error = None;
+        if path.is_dir() {
+            self.switch_to_work_folder(path.to_path_buf(), cx);
+        } else {
+            self.open_path(path, cx);
+        }
+    }
+
     /// Opens a path the way a filer will: the session set decides whether this
     /// is a switch, a load, or a refusal, and the read itself happens on a
     /// background thread so a large file never blocks typing.
@@ -3652,8 +3665,24 @@ impl EditorView {
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
         self.settings_error = None;
-        self.file_context_menu_busy = false;
-        self.file_context_menu_state = context_menu::current_file_context_menu_state();
+        self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
+        let generation = self.file_context_menu_generation;
+        self.file_context_menu_busy = true;
+        self.file_context_menu_state = FileContextMenuState::NotChecked;
+        cx.spawn(async move |view, cx| {
+            let state = cx
+                .background_executor()
+                .spawn(async { context_menu::current_file_context_menu_state() })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.settings_open && view.file_context_menu_generation == generation {
+                    view.file_context_menu_busy = false;
+                    view.file_context_menu_state = state;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -3664,6 +3693,7 @@ impl EditorView {
         }
         self.settings_open = false;
         self.file_context_menu_busy = false;
+        self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -3679,16 +3709,25 @@ impl EditorView {
             return;
         }
         self.file_context_menu_busy = true;
+        self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
+        let generation = self.file_context_menu_generation;
         self.settings_error = None;
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let (result, state) = cx
                 .background_executor()
-                .spawn(async move { context_menu::set_file_context_menu(enabled) })
+                .spawn(async move {
+                    let result = context_menu::set_file_context_menu(enabled);
+                    let state = context_menu::current_file_context_menu_state();
+                    (result, state)
+                })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                if !view.settings_open || view.file_context_menu_generation != generation {
+                    return;
+                }
                 view.file_context_menu_busy = false;
-                view.file_context_menu_state = context_menu::current_file_context_menu_state();
+                view.file_context_menu_state = state;
                 if let Err(error) = result {
                     view.settings_error = Some(error.to_string());
                 }
@@ -3705,7 +3744,7 @@ impl EditorView {
             FileContextMenuState::Unregistered => "未登録",
             FileContextMenuState::Registered => "登録済み",
             FileContextMenuState::Stale => {
-                "以前のHane.exeを指す登録があります。ONにして更新できます。"
+                "Explorer拡張が未導入、または以前のHane.exeを指しています。ONにして更新できます。"
             }
             FileContextMenuState::Conflict => "別の登録内容があるため変更していません。",
             FileContextMenuState::Unknown(_) => {
@@ -3798,7 +3837,7 @@ impl EditorView {
                                         div()
                                             .pl(px(28.0))
                                             .text_color(rgb(self.theme.quote_foreground))
-                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では「その他のオプションを確認」内に表示されます。"),
+                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
                                     )
                                     .child(
                                         div()
@@ -4907,9 +4946,7 @@ impl EditorView {
                     )
                 });
                 let collapsed_table = table_projection
-                    .filter(|projection| {
-                        table_delimiter_is_collapsed(projection, Some(disclosure))
-                    })
+                    .filter(|projection| table_delimiter_is_collapsed(projection, Some(disclosure)))
                     .map_or(0, |_| 1);
                 let collapsed = collapsed_fence + collapsed_table;
                 let minimum = line_height * block.line_count.saturating_sub(collapsed) as f32;
@@ -5117,12 +5154,10 @@ impl EditorView {
         else {
             return baseline;
         };
-        let was_collapsed = previous.is_none_or(|active| {
-            table_delimiter_is_collapsed(projection, Some(active))
-        });
-        let is_collapsed = current.is_none_or(|active| {
-            table_delimiter_is_collapsed(projection, Some(active))
-        });
+        let was_collapsed =
+            previous.is_none_or(|active| table_delimiter_is_collapsed(projection, Some(active)));
+        let is_collapsed =
+            current.is_none_or(|active| table_delimiter_is_collapsed(projection, Some(active)));
         if was_collapsed == is_collapsed {
             return baseline;
         }
@@ -9253,10 +9288,7 @@ mod tests {
         let text = format!(
             "| header | value |\n| {delimiter_cell} | {delimiter_cell} |\n| body | cell |\n\nplain"
         );
-        let delimiter_offset = text
-            .find(delimiter_cell.as_str())
-            .expect("table delimiter")
-            + 1;
+        let delimiter_offset = text.find(delimiter_cell.as_str()).expect("table delimiter") + 1;
         let plain = text.find("plain").expect("tail paragraph");
         let view = gpui::AppContext::new(cx, |cx| EditorView::new(&text, "Untitled", cx));
 
@@ -11134,7 +11166,10 @@ mod tests {
             .move_vertical_to(down, true, header_point.x)
             .expect("shift-down target");
         assert_eq!(editor.selection().active, down);
-        assert_eq!(editor.selection().range(), SourceRange::new(header.0, down.0));
+        assert_eq!(
+            editor.selection().range(),
+            SourceRange::new(header.0, down.0)
+        );
 
         let mut editor = Editor::new(source);
         editor
@@ -11498,8 +11533,7 @@ mod tests {
 
     #[test]
     fn local_block_height_seed_matches_the_full_disclosure_projection() {
-        let source =
-            "before\n\n| head | value |\n| --- | --- |\n| body | cell |\n\n```\ncode\n```\n\nafter\n";
+        let source = "before\n\n| head | value |\n| --- | --- |\n| body | cell |\n\n```\ncode\n```\n\nafter\n";
         let document = RopeBuffer::from_text(source);
         let index = BlockIndex::from_buffer(&document);
         let table_delimiter = source.find("| ---").expect("table delimiter") + 2;
@@ -11512,12 +11546,7 @@ mod tests {
         ];
 
         for disclosure in disclosures {
-            let expected = block_heights_with_disclosure(
-                &document,
-                &index,
-                26.0,
-                disclosure,
-            );
+            let expected = block_heights_with_disclosure(&document, &index, 26.0, disclosure);
             let actual = index
                 .blocks()
                 .map(|block| {
@@ -11650,8 +11679,8 @@ mod tests {
                 view.line_height(),
                 view.active_height_disclosure(),
             );
-            for ordinal in update.first_replaced_block
-                ..update.first_replaced_block + update.inserted_blocks
+            for ordinal in
+                update.first_replaced_block..update.first_replaced_block + update.inserted_blocks
             {
                 assert_eq!(view.heights.height(ordinal), expected.get(ordinal).copied());
             }
@@ -12287,17 +12316,14 @@ mod tests {
                 },
             );
             assert!(sessions.activate(SessionId(0)));
-            EditorView::from_sessions(
-                sessions,
-                Arc::new(OsFileService),
-                StateStores::memory(),
-                cx,
-            )
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
         });
         cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
         cx.run_until_parked();
 
-        let clicked_tab = cx.debug_bounds("file-tab-last").expect("second tab rendered");
+        let clicked_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
         cx.simulate_mouse_down(
             clicked_tab.center(),
             MouseButton::Right,
@@ -12330,7 +12356,9 @@ mod tests {
         cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
         cx.run_until_parked();
 
-        let tab = cx.debug_bounds("file-tab-first").expect("file tab rendered");
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("file tab rendered");
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.run_until_parked();
@@ -12338,10 +12366,11 @@ mod tests {
             .debug_bounds("file-tab-context-open-vscode")
             .expect("context menu item rendered");
         view.read_with(cx, |view, _| {
-            assert!(view
-                .file_tab_context_menu
-                .as_ref()
-                .is_some_and(|menu| menu.path.is_none()));
+            assert!(
+                view.file_tab_context_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.path.is_none())
+            );
         });
 
         cx.simulate_click(item.center(), gpui::Modifiers::none());
@@ -12356,15 +12385,15 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_tab_context_menu_closes_with_escape_and_outside_click(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn file_tab_context_menu_closes_with_escape_and_outside_click(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
         cx.run_until_parked();
 
-        let tab = cx.debug_bounds("file-tab-first").expect("file tab rendered");
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("file tab rendered");
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.run_until_parked();
@@ -13668,9 +13697,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn hidden_table_delimiter_maps_physical_lines_to_visible_rows(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn hidden_table_delimiter_maps_physical_lines_to_visible_rows(cx: &mut gpui::TestAppContext) {
         let text = "| header | value |\n| --- | --- |\n| body | cell |";
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
 
@@ -13701,14 +13728,8 @@ mod tests {
             assert_eq!(view.visible_line_prefix(&block, 0), 0);
             assert_eq!(view.visible_line_prefix(&block, 1), 1);
             assert_eq!(view.visible_line_prefix(&block, 2), 1);
-            assert_eq!(
-                view.physical_line_prefix_for_visible_rows(&block, 3, 1),
-                1
-            );
-            assert_eq!(
-                view.physical_line_prefix_for_visible_rows(&block, 3, 2),
-                3
-            );
+            assert_eq!(view.physical_line_prefix_for_visible_rows(&block, 3, 1), 1);
+            assert_eq!(view.physical_line_prefix_for_visible_rows(&block, 3, 2), 3);
 
             let blocks = [block];
             let window = view.visible_line_window(&blocks, &(0..1));

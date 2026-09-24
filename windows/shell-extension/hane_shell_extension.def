@@ -1,0 +1,4 @@
+LIBRARY hane_shell_extension
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow

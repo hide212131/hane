@@ -38,11 +38,21 @@ hane.exe --unregister-context-menu
 
 - `hane.exe`（引数なし）— 保存済みの既定フォルダを開きます。既定フォルダが未設定の場合（初回起動時など）は、起動後にフォルダ選択ダイアログが表示され、選んだフォルダが以後の既定フォルダとして保存されます。
 - `hane.exe path\to\document.md` — 指定した Markdown ファイルを開きます。
-- `hane.exe path\to\folder` — 指定したフォルダを、その起動時に限り Work folder mode で開きます。既定フォルダは読み書きされず、変更もされません。
-- `hane.exe --register-context-menu` — Windows エクスプローラーのフォルダ右クリックメニューに「Haneで開く」を追加します。現在のユーザーのみに登録され、管理者権限は不要です。追加後は、フォルダを右クリックして「Haneで開く」を選ぶと `hane.exe path\to\folder` と同様にそのフォルダを開けます。
+- `hane.exe path\to\folder` — 指定したフォルダを Work folder mode で開きます。既にHaneが起動していればそのウィンドウで切り替えます。既定フォルダは変更しません。
+- `hane.exe --register-context-menu` — Windows エクスプローラーのフォルダ右クリックメニューに「Haneで開く」を追加します。現在のユーザーのみに登録され、管理者権限は不要です。Windows 11では同じフォルダ内に署名済みの `Hane.ShellIntegration.msix` が必要です。
 - `hane.exe --unregister-context-menu` — 追加した「Haneで開く」をエクスプローラーのメニューから削除します。
 
-現在のエクスプローラー統合はフォルダのみが対象です。ファイルの右クリックメニューへの統合は本リリースの対象外です。
+ファイルの右クリック登録は設定画面の「一般」→「Windowsとの連携」から切り替えます。Windows 11では `IExplorerCommand` を含む署名済みの疎パッケージを導入して、新しい右クリックメニューへ表示します。Windows 10では従来の右クリックメニューを使用します。ファイル登録を無効にしてもフォルダ登録は変更しません。
+
+Windows 11向けパッケージのビルド例（Windows SDK、MSVC、信頼済みコード署名証明書が必要）:
+
+```powershell
+.\windows\shell-extension\build-package.ps1 -ExePath .\target\windows-x64-1.93.1\release\hane.exe -Architecture x64 -CertificateThumbprint <証明書の拇印>
+```
+
+生成される `Hane.ShellIntegration.msix` と `hane_shell_extension.dll` は `hane.exe` と同じディレクトリに配置します。登録時にHaneが現在のユーザーへパッケージを導入します。証明書を指定しないビルドは未署名であり、Explorerでは使用できません。個人検証の自己署名証明書を使う場合は、公開証明書を端末の `TrustedPeople` に信頼登録する必要があります（管理者権限が必要）。
+
+Windows 11 のメニュー表示状態は実行ファイルと同じディレクトリの `Hane.ShellIntegration.enabled`（ファイル）または `Hane.ShellIntegration.folder.enabled`（フォルダ）で管理します。パッケージ化された Explorer 拡張やそこから起動した Hane では通常の HKCU\Software\Classes キーが仮想化されるため、Windows 11 のファイル登録はこのキーを新規作成しません。旧版が作成した Hane 所有のキーが現在のプロセスから見える場合だけ削除します。無効化時には対応するマーカーを削除します。署名済みパッケージ自体は再有効化を速くするため残りますが、マーカーがない項目は Explorer に表示されません。パッケージを更新した直後に新しい項目が見えない場合は Explorer ウィンドウを開き直してください。
 
 ## インストールと起動
 
