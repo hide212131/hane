@@ -38,16 +38,19 @@ use crate::line::{
 use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, div, point,
-    prelude::FluentBuilder, px, rgb,
+    Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored,
+    div, point, prelude::FluentBuilder, px, rgb,
 };
 use gpui_component::Disableable;
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
+use gpui_component::hover_card::HoverCard;
+use gpui_component::tab::{Tab, TabBar};
+use gpui_component::{Sizable, h_flex};
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
@@ -145,6 +148,13 @@ const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 /// How long the sidebar's overlay scrollbar thumb stays shown after the most
 /// recent wheel/trackpad scroll or thumb drag before it fades back out.
 const SIDEBAR_SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(600);
+
+fn file_tab_display_name(name: &str) -> String {
+    name.strip_suffix(".md")
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(name)
+        .to_owned()
+}
 
 #[derive(Clone, Copy, Debug)]
 struct SidebarResizeDrag {
@@ -7987,11 +7997,12 @@ impl EditorView {
             .enumerate()
             .map(|(index, session)| {
                 let id = session.id();
-                let is_active = id == active_id;
+                let short_label = session.file().short_label();
+                let display_name = file_tab_display_name(&short_label);
                 let label = if session.is_dirty() {
-                    format!("{} *", session.label())
+                    format!("{display_name} *")
                 } else {
-                    session.label()
+                    display_name
                 };
                 let debug_selector = if index == 0 {
                     "file-tab-first"
@@ -8000,28 +8011,55 @@ impl EditorView {
                 } else {
                     "file-tab"
                 };
-                div()
-                    .id(("file-tab", index))
-                    .debug_selector(move || debug_selector.to_owned())
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .cursor_pointer()
-                    .whitespace_nowrap()
-                    .when(is_active, |element| {
-                        element
-                            .bg(rgb(self.theme.tab_active_background))
-                            .text_color(rgb(self.theme.tab_active_foreground))
-                    })
-                    .when(!is_active, |element| {
-                        element.text_color(rgb(self.theme.header_foreground))
-                    })
-                    .child(label)
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.activate_file_tab(id, cx);
-                    }))
+
+                let label_element = div().min_w_0().truncate().child(label.clone());
+                let tab_content = if session.path().is_some() {
+                    let full_path = session.label();
+                    HoverCard::new(format!("file-tab-path-{index}"))
+                        .anchor(Anchor::BottomCenter)
+                        .trigger(label_element)
+                        .content(move |_, _, _| {
+                            let path_for_copy = full_path.clone();
+                            let copy_button = Button::new(format!("copy-file-path-{index}"))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Copy)
+                                .tooltip("フルパスをコピー")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        path_for_copy.clone(),
+                                    ));
+                                });
+
+                            h_flex()
+                                .max_w(px(560.0))
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .whitespace_normal()
+                                        .child(full_path.clone()),
+                                )
+                                .child(copy_button)
+                        })
+                        .into_any_element()
+                } else {
+                    label_element.into_any_element()
+                };
+
+                Tab::default()
+                    .aria_label(label)
+                    .child(
+                        div()
+                            .id(("file-tab", index))
+                            .debug_selector(move || debug_selector.to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(tab_content),
+                    )
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |view, event: &MouseDownEvent, _, cx| {
@@ -8036,13 +8074,26 @@ impl EditorView {
             .debug_selector(|| "file-tabs".to_owned())
             .h(px(self.theme.header_height))
             .flex_none()
-            .flex()
-            .overflow_x_scroll()
-            .track_scroll(&self.file_tabs_scroll)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
             .bg(rgb(self.theme.header_background))
             .text_color(rgb(self.theme.header_foreground))
-            .children(tabs)
+            .child(
+                TabBar::new("file-tabs-tab-bar")
+                    .h_full()
+                    .w_full()
+                    .bg(rgb(self.theme.header_background))
+                    .text_color(rgb(self.theme.header_foreground))
+                    .selected_index(self.file_tab_index(active_id).unwrap_or_default())
+                    .max_width(px(220.0))
+                    .track_scroll(&self.file_tabs_scroll)
+                    .on_click(cx.listener(|view, index, _, cx| {
+                        let id = view.sessions().nth(*index).map(|session| session.id());
+                        if let Some(id) = id {
+                            view.activate_file_tab(id, cx);
+                        }
+                    }))
+                    .children(tabs),
+            )
     }
 
     fn footer_element(&self, status: String, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
