@@ -4593,6 +4593,7 @@ impl HeightIndex {
         self.len == 0
     }
 
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn retree(&mut self) {
         self.sums.clear();
         self.counts.clear();
@@ -4658,6 +4659,7 @@ impl HeightIndex {
         })
     }
 
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn add_sum(&mut self, chunk: usize, delta: f32) {
         let mut node = chunk + 1;
         while node < self.sums.len() {

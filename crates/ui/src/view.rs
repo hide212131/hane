@@ -913,6 +913,7 @@ impl FromIterator<HeightBlock> for HeightBlocks {
 }
 
 impl HeightBlocks {
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn retree(&mut self) {
         self.counts.clear();
         self.counts.push(0);
