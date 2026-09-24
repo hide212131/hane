@@ -28,6 +28,6 @@ GitHub の `hide212131/hane` → **Settings** → **Secrets and variables** → 
 
 ## リリース
 
-現在の `v0.19.0` は既にタグが存在するため、修正をmainへ取り込んだだけでは新しいZIPは公開されない。シークレット登録後、Cargoのパッケージバージョンを次の未使用バージョンへ更新してmainに反映するか、そのバージョンのタグを作成する。`Release builds` ワークフローがWindows/macOSをビルドし、両方成功した場合だけGitHub ReleaseのZIPを公開する。公開後、Windows ZIPに上記4ファイルがあり、MSIX署名の拇印が新しい証明書と一致することを確認する。
+新しいリリースではCargoのパッケージバージョンを未使用のバージョンへ更新してmainに反映するか、そのバージョンのタグを作成する。`Release builds` ワークフローがWindows/macOSをビルドし、両方成功した場合だけGitHub ReleaseのZIPを公開する。公開後、Windows ZIPに上記4ファイルがあり、MSIX署名の拇印が新しい証明書と一致することを確認する。
 
 自己署名証明書なので、配布先のWindows 11ではREADMEに従って**新しい公開証明書**を `LocalMachine\TrustedPeople` に信頼登録する必要がある。配布先で秘密鍵を作成・配布する必要はない。旧証明書の信頼や旧パッケージはこの作業で自動削除しない。
