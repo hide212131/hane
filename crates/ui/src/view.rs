@@ -2108,7 +2108,6 @@ impl EditorView {
     }
 
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
-        crate::init_components(cx);
         Self::from_sessions(
             SessionSet::with_untitled(text, file_label),
             Arc::new(OsFileService),
@@ -2123,6 +2122,7 @@ impl EditorView {
         stores: StateStores,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::init_components(cx);
         let theme = DEFAULT_THEME;
         let settings = stores.settings().load();
         let recent = stores.recent_files().load();
@@ -8076,6 +8076,18 @@ impl EditorView {
             .h(px(self.theme.header_height))
             .flex_none()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
+            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _, cx| {
+                let delta = event.delta.pixel_delta(px(40.0));
+                let delta_x = if delta.x == px(0.0) { delta.y } else { delta.x };
+                let offset = view.file_tabs_scroll.offset();
+                let max_offset = view.file_tabs_scroll.max_offset();
+                view.file_tabs_scroll.set_offset(point(
+                    (offset.x + delta_x).clamp(-max_offset.x, px(0.0)),
+                    offset.y,
+                ));
+                cx.stop_propagation();
+                cx.notify();
+            }))
             .bg(rgb(self.theme.header_background))
             .text_color(rgb(self.theme.header_foreground))
             .child(
@@ -8789,7 +8801,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
         cx.run_until_parked();
-        assert!(!cx.has_global::<crate::ComponentsInitialized>());
+        assert!(cx.has_global::<crate::ComponentsInitialized>());
 
         cx.update(|window, app| {
             view.update(app, |view, cx| view.open_settings(window, cx));
