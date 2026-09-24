@@ -3,7 +3,6 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(not(feature = "instrument"))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_session::StateStores;
