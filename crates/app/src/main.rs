@@ -118,7 +118,6 @@ fn main() {
     gpui_platform::application()
         .with_assets(WorkFolderIcons)
         .run(move |cx: &mut App| {
-            hane_ui::init_components(cx);
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
             let window = cx

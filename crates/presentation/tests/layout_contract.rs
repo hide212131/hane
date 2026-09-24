@@ -705,7 +705,11 @@ fn table_layout_moves_directly_between_header_and_first_body_row() {
         })
         .expect("table block");
     assert_eq!(
-        layout.lines.iter().map(|row| row.line_id).collect::<Vec<_>>(),
+        layout
+            .lines
+            .iter()
+            .map(|row| row.line_id)
+            .collect::<Vec<_>>(),
         vec![0, 2]
     );
     assert_eq!(layout.lines[1].y, layout.lines[0].bottom());
@@ -1166,13 +1170,9 @@ fn table_rows_use_fragment_y_for_caret_hit_testing_and_vertical_movement() {
             .map(|point| point.row),
         Some(wrapped_index + 1)
     );
-    let VerticalMove::To(up_source) = layout.vertical_target(
-        &block,
-        next_row_source,
-        false,
-        cell.text_x,
-        &shaper(),
-    ) else {
+    let VerticalMove::To(up_source) =
+        layout.vertical_target(&block, next_row_source, false, cell.text_x, &shaper())
+    else {
         panic!("moving up must enter the previous row's last fragment");
     };
     let up_point = layout
@@ -1925,8 +1925,7 @@ fn inactive_rule_discloses_a_quote_prefix_owned_by_the_active_quote() {
 
     assert_eq!(line.visual_text, "> ");
     assert_eq!(
-        line.quote
-            .map(|quote| (quote.depth, quote.disclosed_depth)),
+        line.quote.map(|quote| (quote.depth, quote.disclosed_depth)),
         Some((1, 1))
     );
     assert!(line.source_map.segments.iter().any(|segment| {
@@ -2210,7 +2209,8 @@ fn lazy_continuation_image_keeps_quote_geometry() {
 
     assert_eq!(image.kind, BlockKind::Image);
     assert_eq!(
-        image.quote
+        image
+            .quote
             .map(|quote| (quote.depth, quote.disclosed_depth)),
         Some((1, 0))
     );

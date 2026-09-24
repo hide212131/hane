@@ -53,7 +53,9 @@ pub(crate) fn apply(
             .expect("read Hane root entity")
             .downgrade();
         cx.spawn(async move |cx| {
-            cx.background_executor().timer(Duration::from_secs(30)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
             let rss = hane_metrics::process_memory_bytes();
             let _ = view.update(cx, |view, _| view.record_phase0_idle_memory(rss));
         })

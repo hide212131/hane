@@ -2145,7 +2145,9 @@ impl EditorView {
         // has been dropped) ends the loop instead of polling forever.
         let date_badge_refresh_task = cx.spawn(async move |view, cx| {
             loop {
-                cx.background_executor().timer(DATE_BADGE_REFRESH_INTERVAL).await;
+                cx.background_executor()
+                    .timer(DATE_BADGE_REFRESH_INTERVAL)
+                    .await;
                 if view
                     .update(cx, |view, cx| view.refresh_sidebar_date_badge_today(cx))
                     .is_err()
@@ -2648,7 +2650,9 @@ impl EditorView {
         };
         let id = session.id();
         cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let should_save = view
                 .read_with(cx, |view, _| {
                     view.sessions.active_id() == id
@@ -2691,7 +2695,9 @@ impl EditorView {
         let revision = self.sessions.active().revision();
         let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let text = view
                 .read_with(cx, |view, _| {
                     let session = view.sessions.get(id)?;
@@ -2747,7 +2753,9 @@ impl EditorView {
         let revision = self.sessions.active().revision();
         self.title_sync_scheduled.insert(id, revision);
         cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let _ = view.update(cx, |view, cx| {
                 if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
                     view.title_sync_scheduled.remove(&id);
@@ -3707,6 +3715,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        crate::init_components(cx);
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
         self.settings_error = None;
@@ -3991,7 +4000,9 @@ impl EditorView {
         }
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(Duration::from_millis(40)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(40))
+                .await;
             let current = view
                 .update(cx, |view, _| {
                     view.document_key() == key
@@ -6544,7 +6555,9 @@ impl EditorView {
     ) {
         cx.spawn_in(window, async move |view, cx| {
             loop {
-                cx.background_executor().timer(TEXT_SELECTION_AUTOSCROLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(TEXT_SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
                 let Ok(should_continue) = view.update_in(cx, |view, window, cx| {
                     view.step_text_autoscroll(direction, activity, window, cx)
                 }) else {
@@ -6615,7 +6628,9 @@ impl EditorView {
         self.sidebar_scrollbar_activity = self.sidebar_scrollbar_activity.wrapping_add(1);
         let activity = self.sidebar_scrollbar_activity;
         cx.spawn(async move |view, cx| {
-            cx.background_executor().timer(SIDEBAR_SCROLLBAR_HIDE_DELAY).await;
+            cx.background_executor()
+                .timer(SIDEBAR_SCROLLBAR_HIDE_DELAY)
+                .await;
             let _ = view.update(cx, |view, cx| {
                 if view.sidebar_scrollbar_activity == activity {
                     view.sidebar_scrollbar_visible = false;
@@ -8718,17 +8733,18 @@ mod tests {
 
     #[gpui::test]
     fn settings_screen_replaces_editor_and_escape_returns_to_it(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
         cx.run_until_parked();
+        assert!(!cx.has_global::<crate::ComponentsInitialized>());
 
         cx.update(|window, app| {
             view.update(app, |view, cx| view.open_settings(window, cx));
         });
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.settings_open));
+        assert!(cx.has_global::<crate::ComponentsInitialized>());
         assert!(cx.debug_bounds("settings-sidebar").is_some());
 
         cx.simulate_keystrokes("escape");

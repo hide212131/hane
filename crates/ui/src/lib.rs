@@ -28,8 +28,16 @@ pub use icons::WorkFolderIcons;
 pub use instrument::InstrumentationConfig;
 pub use view::EditorView;
 
-/// Initializes the optional component primitives used by the settings screen.
+/// Tracks the settings component setup once per GPUI application.
+pub(crate) struct ComponentsInitialized;
+impl gpui::Global for ComponentsInitialized {}
+
+/// Initializes settings components only when the settings screen is first opened.
 /// The editor and Markdown renderer remain Hane-owned GPUI code.
 pub fn init_components(cx: &mut gpui::App) {
+    if cx.has_global::<ComponentsInitialized>() {
+        return;
+    }
     gpui_component::init(cx);
+    cx.set_global(ComponentsInitialized);
 }

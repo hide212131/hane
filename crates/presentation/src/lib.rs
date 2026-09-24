@@ -5043,8 +5043,7 @@ mod tests {
 
         for (case, source) in cases {
             assert!(
-                source.lines().count() > SYNC_LINE_BUDGET
-                    || source.len() > SYNC_BYTE_BUDGET,
+                source.lines().count() > SYNC_LINE_BUDGET || source.len() > SYNC_BYTE_BUDGET,
                 "{case} fixture must exceed a synchronous join budget"
             );
             let index = BlockIndex::build(Revision(1), &source);
