@@ -2108,6 +2108,7 @@ impl EditorView {
     }
 
     pub fn new(text: &str, file_label: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        crate::init_components(cx);
         Self::from_sessions(
             SessionSet::with_untitled(text, file_label),
             Arc::new(OsFileService),

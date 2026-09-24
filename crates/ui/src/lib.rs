@@ -32,8 +32,7 @@ pub use view::EditorView;
 pub(crate) struct ComponentsInitialized;
 impl gpui::Global for ComponentsInitialized {}
 
-/// Initializes settings components only when the settings screen is first opened.
-/// The editor and Markdown renderer remain Hane-owned GPUI code.
+/// Initializes GPUI components used by the file tabs and settings screen.
 pub fn init_components(cx: &mut gpui::App) {
     if cx.has_global::<ComponentsInitialized>() {
         return;
