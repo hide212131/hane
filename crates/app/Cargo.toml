@@ -26,7 +26,7 @@ hane-ui.workspace = true
 gpui.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO"] }
 
 [[example]]
 name = "gpui_baseline"

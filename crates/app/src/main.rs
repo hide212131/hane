@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(not(feature = "instrument"))]
+#[cfg(any(target_os = "windows", not(feature = "instrument")))]
 use gpui::Focusable;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_session::StateStores;
@@ -11,7 +11,7 @@ use hane_ui::{EditorView, WorkFolderIcons, register_key_bindings};
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
-mod context_menu;
+mod open_request;
 
 #[cfg(feature = "instrument")]
 mod instrument;
@@ -22,11 +22,11 @@ const DEFAULT_DOCUMENT: &str = "# Hane Phase 4\n\n日本語IME、範囲選択、
 fn run_context_menu_flag(flag: &std::ffi::OsStr) -> bool {
     if flag == "--register-context-menu" {
         let exe = std::env::current_exe().expect("resolve current exe path");
-        context_menu::register(&exe).expect("register Explorer context menu");
+        hane_ui::context_menu::register(&exe).expect("register Explorer context menu");
         println!("Registered \"Haneで開く\" in Explorer's folder context menu.");
         true
     } else if flag == "--unregister-context-menu" {
-        context_menu::unregister().expect("unregister Explorer context menu");
+        hane_ui::context_menu::unregister().expect("unregister Explorer context menu");
         println!("Removed \"Haneで開く\" from Explorer's folder context menu.");
         true
     } else {
@@ -42,11 +42,42 @@ fn main() {
         return;
     }
 
-    // A path argument (typed manually, or supplied by Explorer's "Open with
-    // Hane") opens that folder for this launch only; it deliberately bypasses
-    // `default_folder` on both ends, so it neither reads nor overwrites the
-    // folder an ordinary launch opens.
-    let cli_path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Explorer and CLI path arguments open in the running editor when one is
+    // available. Otherwise this launch opens the path without changing the
+    // ordinary launch's saved default folder.
+    let cli_path = std::env::args_os().nth(1).map(PathBuf::from).map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
+        }
+    });
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = cli_path.as_deref() {
+            match open_request::forward(path) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("Could not forward Explorer open request: {error}");
+                    return;
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let open_requests = match open_request::listen() {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            // Another instance won the pipe-creation race. Forward the path
+            // there rather than opening a second editor with the wrong file.
+            if let Some(path) = cli_path.as_deref() {
+                let _ = open_request::forward(path);
+            }
+            eprintln!("Could not own Hane's open-request pipe: {error}");
+            return;
+        }
+    };
     // Without a CLI path, an ordinary launch opens the saved default folder;
     // `needs_default_prompt` is set when there isn't one yet (first run, or
     // the saved folder no longer exists), so the window can prompt for one
@@ -87,6 +118,7 @@ fn main() {
     Application::new()
         .with_assets(WorkFolderIcons)
         .run(move |cx: &mut App| {
+            hane_ui::init_components(cx);
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
             let window = cx
@@ -142,5 +174,24 @@ fn main() {
                     .expect("focus editor");
                 cx.activate(true);
             }
+            #[cfg(target_os = "windows")]
+            cx.spawn(async move |cx| {
+                loop {
+                    gpui::Timer::after(std::time::Duration::from_millis(40)).await;
+                    while let Ok(path) = open_requests.try_recv() {
+                        if window
+                            .update(cx, |view, window, cx| {
+                                view.open_external_path(&path, cx);
+                                window.activate_window();
+                                window.focus(&view.focus_handle(cx));
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
         });
 }

@@ -9,6 +9,7 @@
 
 mod actions;
 mod capture;
+pub mod context_menu;
 mod icons;
 mod input;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -25,3 +26,9 @@ pub use icons::WorkFolderIcons;
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use view::EditorView;
+
+/// Initializes the optional component primitives used by the settings screen.
+/// The editor and Markdown renderer remain Hane-owned GPUI code.
+pub fn init_components(cx: &mut gpui::App) {
+    gpui_component::init(cx);
+}

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+    xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+    xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+    xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+    xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap uap10 com desktop4 desktop5 desktop6 rescap">
+  <Identity Name="Hane.ShellIntegration" Publisher="@PUBLISHER@" Version="@VERSION@" ProcessorArchitecture="neutral" />
+  <Properties>
+    <DisplayName>Hane Shell Integration</DisplayName>
+    <PublisherDisplayName>Hane</PublisherDisplayName>
+    <Logo>Assets\HaneShellIntegration.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26200.0" />
+  </Dependencies>
+  <Resources><Resource Language="ja-JP" /></Resources>
+  <Applications>
+    <Application Id="Hane" Executable="hane.exe" uap10:RuntimeBehavior="win32App" uap10:TrustLevel="mediumIL">
+      <uap:VisualElements AppListEntry="none" DisplayName="Hane" Description="Hane Explorer integration"
+          BackgroundColor="transparent" Square150x150Logo="Assets\HaneShellIntegration.png" Square44x44Logo="Assets\HaneShellIntegration.png" />
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Hane Explorer command">
+              <com:Class Id="92b8fc05-dc63-44ed-9afc-fb10a36bee8a" Path="hane_shell_extension.dll" ThreadingModel="STA" />
+              <com:Class Id="a6aab9f1-298b-4a9b-9419-81938c993571" Path="hane_shell_extension.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*"><desktop5:Verb Id="HaneOpenFile" Clsid="92b8fc05-dc63-44ed-9afc-fb10a36bee8a" /></desktop5:ItemType>
+            <desktop5:ItemType Type="Directory"><desktop5:Verb Id="HaneOpenFolder" Clsid="a6aab9f1-298b-4a9b-9419-81938c993571" /></desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+</Package>
