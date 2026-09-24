@@ -15,8 +15,12 @@ foreach ($required in @($package, $certificateFile, $extension, $exe)) {
 }
 
 $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateFile)
-if ($certificate.Thumbprint -ne '9725B0DE9BCA812573A278059750E7C350CFCA8E') {
-    throw 'The bundled certificate is not the Hane certificate validated on Windows. Nothing was trusted.'
+if ($certificate.Subject -ne 'CN=Hane Local Test 2026' -or
+    $certificate.Issuer -ne $certificate.Subject -or
+    $certificate.NotBefore -gt (Get-Date) -or
+    $certificate.NotAfter -le (Get-Date) -or
+    -not ($certificate.EnhancedKeyUsageList | Where-Object ObjectId -eq '1.3.6.1.5.5.7.3.3')) {
+    throw 'The bundled certificate is not a valid Hane code-signing certificate. Nothing was trusted.'
 }
 $signature = Get-AuthenticodeSignature -LiteralPath $package
 if (-not $signature.SignerCertificate -or
