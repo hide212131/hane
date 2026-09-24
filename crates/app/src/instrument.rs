@@ -3,7 +3,7 @@
 //! sampling from a single [`InstrumentationConfig`]. None of this is present in
 //! the shipping binary.
 
-use gpui::{App, Focusable, Timer, WindowHandle};
+use gpui::{App, Focusable, WindowHandle};
 use hane_document::{Revision, SourceRange};
 use hane_markdown::parse_document;
 use hane_presentation::present_markdown;
@@ -35,7 +35,7 @@ pub(crate) fn apply(
     if !config.no_focus {
         window
             .update(cx, |view, window, cx| {
-                window.focus(&view.focus_handle(cx));
+                window.focus(&view.focus_handle(cx), cx);
             })
             .expect("focus editor");
     }
@@ -53,7 +53,7 @@ pub(crate) fn apply(
             .expect("read Hane root entity")
             .downgrade();
         cx.spawn(async move |cx| {
-            Timer::after(Duration::from_secs(30)).await;
+            cx.background_executor().timer(Duration::from_secs(30)).await;
             let rss = hane_metrics::process_memory_bytes();
             let _ = view.update(cx, |view, _| view.record_phase0_idle_memory(rss));
         })

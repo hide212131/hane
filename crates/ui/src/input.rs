@@ -180,8 +180,15 @@ impl Element for InlineRenameInput {
             window.paint_quad(selection);
         }
         if let Some(line) = prepaint.line.take() {
-            line.paint(bounds.origin, window.line_height(), window, cx)
-                .unwrap();
+            line.paint(
+                bounds.origin,
+                window.line_height(),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .unwrap();
         }
         let input_is_focused = {
             let input = self.input.read(cx);

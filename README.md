@@ -47,7 +47,7 @@ hane.exe --unregister-context-menu
 Windows 11向けパッケージのビルド例（Windows SDK、MSVC、信頼済みコード署名証明書が必要）:
 
 ```powershell
-.\windows\shell-extension\build-package.ps1 -ExePath .\target\windows-x64-1.93.1\release\hane.exe -Architecture x64 -CertificateThumbprint <証明書の拇印>
+.\windows\shell-extension\build-package.ps1 -ExePath .\target\windows-x64-1.98.1\release\hane.exe -Architecture x64 -CertificateThumbprint <証明書の拇印>
 ```
 
 生成される `Hane.ShellIntegration.msix` と `hane_shell_extension.dll` は `hane.exe` と同じディレクトリに配置します。登録時にHaneが現在のユーザーへパッケージを導入します。証明書を指定しないビルドは未署名であり、Explorerでは使用できません。個人検証の自己署名証明書を使う場合は、公開証明書を端末の `TrustedPeople` に信頼登録する必要があります（管理者権限が必要）。

@@ -5,7 +5,7 @@
 
 #[cfg(any(target_os = "windows", not(feature = "instrument")))]
 use gpui::Focusable;
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_session::StateStores;
 use hane_ui::{EditorView, WorkFolderIcons, register_key_bindings};
 use std::path::PathBuf;
@@ -115,7 +115,7 @@ fn main() {
     };
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
-    Application::new()
+    gpui_platform::application()
         .with_assets(WorkFolderIcons)
         .run(move |cx: &mut App| {
             hane_ui::init_components(cx);
@@ -156,7 +156,7 @@ fn main() {
             {
                 window
                     .update(cx, |view, window, cx| {
-                        window.focus(&view.focus_handle(cx));
+                        window.focus(&view.focus_handle(cx), cx);
                         // `Context::on_app_quit` (registered inside `EditorView`)
                         // only fires on an actual app-quit event, which closing
                         // this window does not always raise on its own; flushing
@@ -177,13 +177,15 @@ fn main() {
             #[cfg(target_os = "windows")]
             cx.spawn(async move |cx| {
                 loop {
-                    gpui::Timer::after(std::time::Duration::from_millis(40)).await;
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(40))
+                        .await;
                     while let Ok(path) = open_requests.try_recv() {
                         if window
                             .update(cx, |view, window, cx| {
                                 view.open_external_path(&path, cx);
                                 window.activate_window();
-                                window.focus(&view.focus_handle(cx));
+                                window.focus(&view.focus_handle(cx), cx);
                             })
                             .is_err()
                         {

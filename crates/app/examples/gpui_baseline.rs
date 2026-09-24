@@ -1,6 +1,6 @@
 use gpui::{
-    App, AppContext, Application, Bounds, IntoElement, Render, Styled, WindowBounds, WindowOptions,
-    div, px, size,
+    App, AppContext, Bounds, IntoElement, Render, Styled, WindowBounds, WindowOptions, div, px,
+    size,
 };
 
 struct BaselineView {
@@ -21,7 +21,7 @@ impl Render for BaselineView {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
         cx.open_window(
             WindowOptions {
