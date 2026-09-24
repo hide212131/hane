@@ -4,9 +4,12 @@
 
 提案
 
+GPUI 世代整合を更新理由として認める方針は本 ADR で決定する。基盤更新と部品採用は
+別 PR・別検証とし、両者の採用条件が満たされるまでは、部品採用の状態を「提案」のまま維持する。
+
 ## 日付
 
-2026-09-23
+2026-09-24
 
 ## 関連
 
@@ -22,8 +25,9 @@
 ## 背景
 
 Hane の価値は、巨大な Markdown 文書でも入力と表示が止まらない「羽のような軽さ」にある。
-現在の `main`（2026-09-23、`05e196c`）は `gpui = 0.2.2` を固定し、さらに
-`vendor/gpui` に Hane 固有のパッチを持つ。Hane 本体は、次の経路を分離している。
+本 PR の基準となる `main`（2026-09-24、`383b166c`）は `gpui = "=0.2.2"` を固定し、さらに
+`[patch.crates-io]` で `vendor/gpui` を同じ `0.2.2` のローカル実装へ差し替えている。Hane 本体は、
+次の経路を分離している。
 
 ```text
 Markdown source / RopeBuffer
@@ -38,6 +42,20 @@ visible rows の GPUI rendering
 `gpui-kit` と `gpui-base` には、Tree のような仮想化された階層リストや Tabs のような再利用可能な
 UI 部品がある。一方、異なる世代の GPUI を依存させると、同名でも互換性のない GPUI 型がプロセス内に
 入り、単一部品の導入が GPUI 本体の更新や Hane の描画経路の置換へ拡大する可能性がある。
+
+2026-09-24 に crates.io の公開メタデータとパッケージ manifest を再確認した結果、依存関係は次のとおり
+である。
+
+| 対象 | 確認した依存関係 | Hane との関係 |
+|---|---|---|
+| Hane 移行前 `main` `383b166c` | `gpui = "=0.2.2"`、`vendor/gpui` を `[patch.crates-io]` で使用 | 比較対象の型世代。`HANE-PATCH.md` に macOS の合成斜体と IME 再同期のパッチを記録している |
+| [`gpui-kit 0.6.6`](https://crates.io/crates/gpui-kit/0.6.6) | `gpui-base = 0.6.6`、`gpui-pre = "=0.3.6"`、`gpui-pre-platform = "=0.3.6"`、`gpui-pre-web = "=0.3.6"` | Hane の `gpui 0.2.2` とは別の GPUI 配布系列 |
+| [`gpui-base 0.6.6`](https://crates.io/crates/gpui-base/0.6.6) | `gpui-pre`、`gpui-pre-macros`、`gpui-pre-sum-tree` をいずれも `=0.3.6` に固定 | Tree 等の基盤部品を使う場合も `0.3.6` 世代が境界になる |
+
+したがって、gpui-kit の継続利用を選ぶ場合に必要なのは、`gpui 0.2.2` の数字だけを上げる変更ではなく、
+`gpui-pre` 一式を含む GPUI 世代の移行である。これは、gpui-kit を将来も利用可能にするための GPUI 基盤更新を
+正当化する十分な理由とする。ただし、その基盤更新は gpui-kit の Tree や Tabs などの採用とは別の PR・別の
+検証として実施する。
 
 したがって、見た目の改善を理由に最新の部品をまとめて導入するのではなく、Hane が所有する Model・編集・
 Markdown presentation・layout を維持したまま、性能と境界を確認できる部品だけを段階的に試す必要がある。
@@ -100,8 +118,13 @@ GPUI rendering
 
 - Hane の固定版、`vendor/gpui` のパッチ、候補部品の直接・推移依存を一覧化する。
 - `gpui` と `gpui-pre` など別系列の型を同一の Hane UI 境界へ持ち込まない。
-- GPUI の更新が必要な場合は、まず GPUI だけを更新する独立した変更として、Hane の性能基準を再測定する。
-  GPUI 更新と部品採用を一つの変更で同時に進めない。
+- gpui-kit を継続利用するために、その依存する GPUI 世代へ Hane を合わせる必要が生じた場合は、GPUI 更新の
+  正当な理由とする。その他の機能・修正上の理由による更新も同様に扱う。
+- GPUI を更新する場合は、まず GPUI 基盤だけを更新する独立した PR として、API 追随、依存グラフ、性能、
+  GUI、macOS/Windows の検証を完了する。GPUI 更新 PR と gpui-kit 部品採用 PR を一つの変更で同時に進めない。
+- `vendor/gpui/HANE-PATCH.md` に記録された macOS の合成斜体フォールバックと入力ソース切替後の IME 再同期を、
+  新しい GPUI 世代へ移植して再検証する。上流で修正済みと判断してパッチを削除する場合も、実字形と実 IME を
+  用いた同等の回帰確認を先に行う。
 - 同じ世代へ合わせられない候補は、性能を測る前に不採用とし、現在の Hane 実装を継続する。
 
 ### 4. ベンチマークを採用ゲートにする
@@ -129,10 +152,13 @@ candidate の結果、commit、環境、fixture、サンプル数を記録して
 実装は次の順序で進める。
 
 1. 現行 GPUI 0.2.2 のまま、Hane 側の見た目だけを改善する。
-2. GPUI 更新が別の理由で必要になった場合だけ、GPUI 単体の互換性・性能・メモリを測る。
-3. 世代が整った後、`gpui-base` Tree を小さな adapter と Hane の行 renderer 越しに検証する。
-4. Tree の結果が基準を通った場合だけ、Tabs を同じく局所的に検証する。
-5. コードハイライトは Editor の埋め込みとは独立に、Hane の visible-block presentation へ追加する。
+2. gpui-kit の継続利用のために世代整合が必要になった場合、または別の明確な理由で更新が必要になった場合は、
+   GPUI 基盤だけを更新する独立 PR を作る。ここでは gpui-kit の部品を導入しない。
+3. GPUI 基盤 PR で `gpui-pre` 一式への依存整合、`vendor/gpui` パッチの移植・再検証、性能・GUI・macOS/Windows
+   検証を完了し、現行 Hane の本文 Editor と Markdown 描画が成立することを確認する。
+4. 世代が整った後、別 PR で `gpui-base` Tree を小さな adapter と Hane の行 renderer 越しに検証する。
+5. Tree の結果が基準を通った場合だけ、別 PR で Tabs を同じく局所的に検証する。
+6. コードハイライトは Editor の埋め込みとは独立に、Hane の visible-block presentation へ追加する。
 
 各段階で既存経路を control として残し、候補部品を外しても Hane の Model・編集・表示が成立する構造にする。
 採用後に回帰が確認された場合は、対象 adapter または候補部品を撤回し、Hane の既存 renderer へ戻せることを
@@ -145,7 +171,7 @@ candidate の結果、commit、環境、fixture、サンプル数を記録して
 - Tree は仮想化の恩恵と Hane 固有の日付バッジ・行表示を両立できる可能性があるが、GPUI 世代整合後まで
   保留される。
 - Tabs はセッション管理を Hane に残したまま見た目を改善できる可能性がある。ただし Tabs のためだけに
-  GPUI 本体を更新しない。
+  GPUI 本体を更新する場合も、先に GPUI 基盤更新 PR として独立した検証を完了する。
 - コードハイライトは別 Editor の複製状態を増やさず、表示中のブロックだけを処理できる。
 - GPUI 更新、候補部品、Hane の既存実装のどれが性能へ影響したかを、段階ごとの control/candidate 比較で
   分離できる。
@@ -157,8 +183,14 @@ candidate の結果、commit、環境、fixture、サンプル数を記録して
 提案を採用済みに変更し、候補を実装へ進める前に、次を記録する。
 
 - GPUI と候補部品の正確な version / commit、`vendor/gpui` パッチとの互換性、重複 GPUI 型がないこと。
+- `vendor/gpui` の合成斜体について、macOS の実フォントで通常字形・斜体字形・字送り・キャッシュ分離・文字切れを
+  再確認すること。IME 再同期について、macOS の実 IME で入力ソース切替後の preedit と commit を確認すること。
+- macOS と Windows の release build、起動、ウィンドウ表示、キーボード入力、スクロール、対象 UI の GUI smoke
+  検証を、それぞれの実行環境または同等の CI 環境で記録すること。
 - Hane が Model、編集、session、presentation、layout、cache、行 renderer を引き続き所有すること。
 - control/candidate の測定条件、fixture、commit、サンプル数、median/p95/p99/max、RSS。
+- GPUI 基盤更新 PR と gpui-kit 部品採用 PR を分け、基盤更新単体の性能・メモリ回帰と、部品採用単体の回帰を
+  それぞれ識別できること。
 - 既存の test、clippy、source↔visual 契約、および対象 UI の必要な GUI 検証結果。
 - 候補部品を外して既存経路へ戻せる撤回手順。
 

@@ -20,6 +20,7 @@ use crate::capture::InputCapture;
 use crate::context_menu::{self, FileContextMenuState};
 use crate::icons;
 use crate::input::{InlineRenameInput, shape_inline_rename_line};
+use crate::input_mode::{KeyboardInputMode, active_keyboard_input_mode};
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
 use crate::instrument::{Instrumentation, log_summary};
 #[cfg(test)]
@@ -38,8 +39,8 @@ use crate::shape::WindowShaper;
 use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
 use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, MagnifyEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, PathPromptOptions, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathPromptOptions, PinchEvent, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, div, point,
     prelude::FluentBuilder, px, rgb,
 };
@@ -689,7 +690,7 @@ pub struct EditorView {
     /// The active keyboard input mode, when the platform can determine it.
     /// Drives the caret's small input-mode badge; refreshed by
     /// `_input_mode_subscription` so it updates without polling.
-    caret_input_mode: Option<gpui::KeyboardInputMode>,
+    caret_input_mode: Option<KeyboardInputMode>,
     /// Keeps the input-source change hook (see `caret_input_mode`)
     /// alive for the life of the view; dropping it would cancel the hook.
     _input_mode_subscription: Subscription,
@@ -912,6 +913,7 @@ impl FromIterator<HeightBlock> for HeightBlocks {
 }
 
 impl HeightBlocks {
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn retree(&mut self) {
         self.counts.clear();
         self.counts.push(0);
@@ -1582,7 +1584,7 @@ impl EditorView {
         let was_focused = self.sidebar_filter_focused;
         self.sidebar_filter_focused = true;
         self.sidebar_keyboard_focus = true;
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if was_focused {
             if let Some(index) =
                 self.sidebar_filter_character_index_for_point(event.position, window)
@@ -1832,7 +1834,7 @@ impl EditorView {
             composition: None,
             pending: false,
         });
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -2130,9 +2132,12 @@ impl EditorView {
         // about the document changes, so this reuses the same platform event
         // GPUI already refreshes its keyboard mapper from — no separate
         // polling.
-        let input_mode_subscription = cx.on_keyboard_layout_change(|view: &mut Self, cx| {
-            view.caret_input_mode = cx.active_keyboard_input_mode();
-            cx.notify();
+        let input_mode_view = cx.entity().downgrade();
+        let input_mode_subscription = cx.on_keyboard_layout_change(move |app| {
+            let _ = input_mode_view.update(app, |view, cx| {
+                view.caret_input_mode = active_keyboard_input_mode();
+                cx.notify();
+            });
         });
         // Re-observes the local date on a timer so the sidebar's `本日`
         // badge moves on even when the window sits open, focused, and
@@ -2140,7 +2145,9 @@ impl EditorView {
         // has been dropped) ends the loop instead of polling forever.
         let date_badge_refresh_task = cx.spawn(async move |view, cx| {
             loop {
-                gpui::Timer::after(DATE_BADGE_REFRESH_INTERVAL).await;
+                cx.background_executor()
+                    .timer(DATE_BADGE_REFRESH_INTERVAL)
+                    .await;
                 if view
                     .update(cx, |view, cx| view.refresh_sidebar_date_badge_today(cx))
                     .is_err()
@@ -2193,7 +2200,7 @@ impl EditorView {
             pending_new_folders: HashSet::new(),
             inline_rename_input_bounds: None,
             _quit_subscription: quit_subscription,
-            caret_input_mode: cx.active_keyboard_input_mode(),
+            caret_input_mode: active_keyboard_input_mode(),
             _input_mode_subscription: input_mode_subscription,
             _input_mode_focus_subscription: None,
             draft_recovery_warning: None,
@@ -2643,7 +2650,9 @@ impl EditorView {
         };
         let id = session.id();
         cx.spawn(async move |view, cx| {
-            gpui::Timer::after(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let should_save = view
                 .read_with(cx, |view, _| {
                     view.sessions.active_id() == id
@@ -2686,7 +2695,9 @@ impl EditorView {
         let revision = self.sessions.active().revision();
         let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
-            gpui::Timer::after(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let text = view
                 .read_with(cx, |view, _| {
                     let session = view.sessions.get(id)?;
@@ -2742,7 +2753,9 @@ impl EditorView {
         let revision = self.sessions.active().revision();
         self.title_sync_scheduled.insert(id, revision);
         cx.spawn(async move |view, cx| {
-            gpui::Timer::after(Duration::from_millis(750)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
             let _ = view.update(cx, |view, cx| {
                 if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
                     view.title_sync_scheduled.remove(&id);
@@ -3702,6 +3715,7 @@ impl EditorView {
         if !self.cancel_inline_rename(cx) {
             return;
         }
+        crate::init_components(cx);
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
         self.settings_error = None;
@@ -3723,7 +3737,7 @@ impl EditorView {
             });
         })
         .detach();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -3734,7 +3748,7 @@ impl EditorView {
         self.settings_open = false;
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -3986,7 +4000,9 @@ impl EditorView {
         }
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
-            gpui::Timer::after(Duration::from_millis(40)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(40))
+                .await;
             let current = view
                 .update(cx, |view, _| {
                     view.document_key() == key
@@ -4424,12 +4440,7 @@ impl EditorView {
     /// it. Repeated wheel events extend the same target stream and only update
     /// its anchor; the render loop consumes at most one interpolation step per
     /// display frame.
-    fn queue_wheel_zoom_factor(
-        &mut self,
-        factor: f32,
-        window_offset: f32,
-        cx: &mut Context<Self>,
-    ) {
+    fn queue_wheel_zoom_factor(&mut self, factor: f32, window_offset: f32, cx: &mut Context<Self>) {
         self.raw_zoom = (self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let target = clamp_and_snap_zoom(self.raw_zoom);
         if target == self.zoom {
@@ -4546,12 +4557,12 @@ impl EditorView {
         cx.notify();
     }
 
-    /// macOS trackpad pinch. `event.magnification` is the incremental scale
+    /// macOS trackpad pinch. `event.delta` is the incremental scale
     /// change since the previous event in the same gesture (see
-    /// `gpui::MagnifyEvent`), so it is applied directly as a multiplicative
+    /// `gpui::PinchEvent`), so it is applied directly as a multiplicative
     /// factor rather than accumulated first.
-    fn on_magnify(&mut self, event: &MagnifyEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let factor = (1.0 + event.magnification).max(0.1);
+    fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let factor = (1.0 + event.delta).max(0.1);
         let window_offset = f32::from(event.position.y) - self.theme.header_height;
         self.apply_direct_zoom_factor(factor, window_offset, cx);
     }
@@ -4637,7 +4648,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.text_selection_drag = false;
         self.set_text_autoscroll(None, window, cx);
         let Some(offset) = self.offset_at_row_x(
@@ -6544,7 +6555,9 @@ impl EditorView {
     ) {
         cx.spawn_in(window, async move |view, cx| {
             loop {
-                gpui::Timer::after(TEXT_SELECTION_AUTOSCROLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(TEXT_SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
                 let Ok(should_continue) = view.update_in(cx, |view, window, cx| {
                     view.step_text_autoscroll(direction, activity, window, cx)
                 }) else {
@@ -6615,7 +6628,9 @@ impl EditorView {
         self.sidebar_scrollbar_activity = self.sidebar_scrollbar_activity.wrapping_add(1);
         let activity = self.sidebar_scrollbar_activity;
         cx.spawn(async move |view, cx| {
-            gpui::Timer::after(SIDEBAR_SCROLLBAR_HIDE_DELAY).await;
+            cx.background_executor()
+                .timer(SIDEBAR_SCROLLBAR_HIDE_DELAY)
+                .await;
             let _ = view.update(cx, |view, cx| {
                 if view.sidebar_scrollbar_activity == activity {
                     view.sidebar_scrollbar_visible = false;
@@ -6797,7 +6812,7 @@ impl Render for EditorView {
             let focus_handle = self.focus_handle.clone();
             self._input_mode_focus_subscription =
                 Some(cx.on_focus(&focus_handle, window, |view, _, cx| {
-                    view.caret_input_mode = cx.active_keyboard_input_mode();
+                    view.caret_input_mode = active_keyboard_input_mode();
                     cx.notify();
                 }));
         }
@@ -7137,7 +7152,7 @@ impl Render for EditorView {
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
-                .on_magnify(cx.listener(Self::on_magnify))
+                .on_pinch(cx.listener(Self::on_pinch))
                 .child(InputCapture { input: cx.entity() })
                 .child(
                     div()
@@ -7493,7 +7508,7 @@ impl EditorView {
                     .child(work_folder_root_display_name(work_folder.root())),
             )
             .on_click(cx.listener(|view, _, window, cx| {
-                window.focus(&view.focus_handle);
+                window.focus(&view.focus_handle, cx);
                 view.select_work_folder_root(cx);
             }));
         let query = self.sidebar_filter.to_lowercase();
@@ -7557,7 +7572,7 @@ impl EditorView {
                                     .child(name),
                             )
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
-                                window.focus(&view.focus_handle);
+                                window.focus(&view.focus_handle, cx);
                                 if !event.is_keyboard() && event.click_count() >= 2 {
                                     view.sidebar_keyboard_focus = true;
                                     view.begin_inline_rename(
@@ -7571,7 +7586,7 @@ impl EditorView {
                                     .as_ref()
                                     .is_some_and(|rename| rename.from == path)
                                 {
-                                    window.focus(&view.focus_handle);
+                                    window.focus(&view.focus_handle, cx);
                                     if let Some(position) = event.mouse_position() {
                                         view.move_inline_rename_to_point(position, window, cx);
                                     }
@@ -7628,7 +7643,7 @@ impl EditorView {
                                     .child(name),
                             )
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
-                                window.focus(&view.focus_handle);
+                                window.focus(&view.focus_handle, cx);
                                 if !event.is_keyboard() && event.click_count() >= 2 {
                                     view.sidebar_keyboard_focus = true;
                                     view.begin_inline_rename(
@@ -7642,7 +7657,7 @@ impl EditorView {
                                     .as_ref()
                                     .is_some_and(|rename| rename.from == path)
                                 {
-                                    window.focus(&view.focus_handle);
+                                    window.focus(&view.focus_handle, cx);
                                     if let Some(position) = event.mouse_position() {
                                         view.move_inline_rename_to_point(position, window, cx);
                                     }
@@ -8582,7 +8597,7 @@ mod tests {
     }
 
     // Regression coverage for the sidebar's `本日` badge going stale across a
-    // local-midnight boundary while the window stays open: `gpui::Timer` is
+    // local-midnight boundary while the window stays open: GPUI's timer is
     // wall-clock in this codebase's tests (see
     // `draft_save_survives_switching_sessions_within_the_debounce_window`),
     // so waiting out `DATE_BADGE_REFRESH_INTERVAL` for real is not practical
@@ -8641,12 +8656,13 @@ mod tests {
             assert!(view.sidebar_scrollbar_visible);
         });
 
-        // `show_sidebar_scrollbar_briefly` debounces on a real `gpui::Timer`
+        // `show_sidebar_scrollbar_briefly` debounces on GPUI's real timer
         // (wall-clock, not the deterministic test dispatcher, see
         // `draft_save_survives_switching_sessions_within_the_debounce_window`),
         // so the test has to wait for real time to pass.
         cx.run_until_parked();
-        std::thread::sleep(SIDEBAR_SCROLLBAR_HIDE_DELAY + Duration::from_millis(200));
+        cx.executor()
+            .advance_clock(SIDEBAR_SCROLLBAR_HIDE_DELAY + Duration::from_millis(200));
         cx.run_until_parked();
 
         view.update(cx, |view, _cx| {
@@ -8717,17 +8733,18 @@ mod tests {
 
     #[gpui::test]
     fn settings_screen_replaces_editor_and_escape_returns_to_it(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(640.0), px(360.0)));
         cx.run_until_parked();
+        assert!(!cx.has_global::<crate::ComponentsInitialized>());
 
         cx.update(|window, app| {
             view.update(app, |view, cx| view.open_settings(window, cx));
         });
         cx.run_until_parked();
         assert!(view.read_with(cx, |view, _| view.settings_open));
+        assert!(cx.has_global::<crate::ComponentsInitialized>());
         assert!(cx.debug_bounds("settings-sidebar").is_some());
 
         cx.simulate_keystrokes("escape");
@@ -9284,7 +9301,7 @@ mod tests {
             view.after_input(cx);
         });
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         let (active, caret, pending, owner_ordinal) = view.read_with(cx, |view, _| {
@@ -9606,9 +9623,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn intermediate_wheel_zoom_keeps_document_wide_height_estimates(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn intermediate_wheel_zoom_keeps_document_wide_height_estimates(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\n", "Untitled", cx));
         view.update(cx, |view, _| {
             view.heights = HeightIndex::new([123.0, 456.0]);
@@ -10422,7 +10437,7 @@ mod tests {
 
         // `schedule_document_parse` deliberately debounces formal work by a
         // short real timer; let that job publish before inspecting the layout.
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10468,7 +10483,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10497,7 +10512,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10623,7 +10638,7 @@ mod tests {
         // Register the timer before sleeping so the test executor can observe
         // its wakeup, matching the formal-parse regression tests above.
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10668,7 +10683,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10718,7 +10733,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         let expanded_middle_height = view.read_with(cx, |view, _| {
@@ -10747,7 +10762,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         view.read_with(cx, |view, _| {
@@ -10796,7 +10811,7 @@ mod tests {
         });
 
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(100));
+        cx.executor().advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
 
         let expanded_middle_height = view.read_with(cx, |view, _| {
@@ -10836,7 +10851,7 @@ mod tests {
         // both the stale job and that retry to complete.
         for _ in 0..3 {
             cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(80));
+            cx.executor().advance_clock(Duration::from_millis(80));
             cx.run_until_parked();
         }
 
@@ -11946,13 +11961,13 @@ mod tests {
             view.on_document_replaced();
         });
 
-        // `schedule_draft_save` debounces on a real `gpui::Timer` (wall-clock,
+        // `schedule_draft_save` debounces on GPUI's real timer (wall-clock,
         // not the deterministic test dispatcher), so the test has to wait for
         // real time to pass rather than fast-forwarding a virtual clock. The
         // spawned task must run once first to reach its `Timer::after` await
         // and register with the real clock before that wait is worth doing.
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(900));
+        cx.executor().advance_clock(Duration::from_millis(900));
         cx.run_until_parked();
 
         let recovered = OsDraftStore.recover(&root).unwrap();
@@ -12786,11 +12801,11 @@ mod tests {
 
     /// Waits for the 750ms wall-clock debounce timers (`schedule_title_sync`
     /// and friends) to fire, the same way `draft_save_survives_switching_…`
-    /// above does: they run on a real `gpui::Timer`, not the deterministic
+    /// above does: they run on GPUI's real timer, not the deterministic
     /// test dispatcher, so real time has to pass.
     fn settle_debounce(cx: &mut gpui::TestAppContext) {
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(900));
+        cx.executor().advance_clock(Duration::from_millis(900));
         cx.run_until_parked();
     }
 
@@ -13567,9 +13582,7 @@ mod tests {
     // pinch, and Ctrl/Cmd+0 reset.
 
     #[gpui::test]
-    fn wheel_zoom_queues_a_target_without_jumping_the_painted_zoom(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn wheel_zoom_queues_a_target_without_jumping_the_painted_zoom(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.queue_wheel_zoom_factor(
@@ -13649,9 +13662,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn neutral_pinch_takeover_finalizes_document_wide_heights(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn neutral_pinch_takeover_finalizes_document_wide_heights(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\n", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.zoom = 1.1;
@@ -13672,9 +13683,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn direct_pinch_zoom_takes_over_from_the_painted_wheel_zoom(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn direct_pinch_zoom_takes_over_from_the_painted_wheel_zoom(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
         view.update(cx, |view, cx| {
             view.queue_wheel_zoom_factor(
@@ -13697,9 +13706,9 @@ mod tests {
         let (view, cx, _root) = open_view_for_mouse_tests(cx, "hello world", false);
         let position = point(px(480.0), px(400.0));
 
-        cx.simulate_event(gpui::MagnifyEvent {
+        cx.simulate_event(gpui::PinchEvent {
             position,
-            magnification: 0.2,
+            delta: 0.2,
             modifiers: gpui::Modifiers::none(),
             phase: gpui::TouchPhase::Moved,
         });
@@ -13709,9 +13718,9 @@ mod tests {
 
         // A pinch collapsing past zero must clamp instead of going negative
         // or producing a zero/degenerate zoom level.
-        cx.simulate_event(gpui::MagnifyEvent {
+        cx.simulate_event(gpui::PinchEvent {
             position,
-            magnification: -5.0,
+            delta: -5.0,
             modifiers: gpui::Modifiers::none(),
             phase: gpui::TouchPhase::Moved,
         });
@@ -13726,9 +13735,9 @@ mod tests {
         let position = point(px(480.0), px(400.0));
 
         for _ in 0..3 {
-            cx.simulate_event(gpui::MagnifyEvent {
+            cx.simulate_event(gpui::PinchEvent {
                 position,
-                magnification: 0.01,
+                delta: 0.01,
                 modifiers: gpui::Modifiers::none(),
                 phase: gpui::TouchPhase::Moved,
             });
@@ -14838,11 +14847,12 @@ mod tests {
             (view.editor().selection().active, view.scroll_y)
         });
 
-        // The autoscroll loop ticks on a real `gpui::Timer`, the same way the
+        // The autoscroll loop ticks on GPUI's real timer, the same way the
         // debounce timers `settle_debounce` waits on do: real time has to
         // pass for it to extend the selection and scroll further without the
         // pointer moving again.
-        std::thread::sleep(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
+        cx.executor()
+            .advance_clock(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
         cx.run_until_parked();
 
         let (active_after_ticks, scroll_after_ticks) = view.read_with(cx, |view, _| {
@@ -14858,7 +14868,8 @@ mod tests {
         });
 
         let active_after_stop = view.read_with(cx, |view, _| view.editor().selection().active);
-        std::thread::sleep(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
+        cx.executor()
+            .advance_clock(TEXT_SELECTION_AUTOSCROLL_INTERVAL * 3);
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection().active, active_after_stop);

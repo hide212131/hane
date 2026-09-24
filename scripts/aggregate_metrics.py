@@ -7,6 +7,7 @@ import argparse
 import csv
 import platform
 import subprocess
+import tomllib
 from collections import defaultdict
 from pathlib import Path
 
@@ -33,6 +34,14 @@ def command(*arguments: str) -> str:
         return subprocess.run(arguments, check=True, capture_output=True, text=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+
+
+def gpui_version() -> str:
+    manifest = Path(__file__).resolve().parent.parent / "Cargo.toml"
+    dependency = tomllib.loads(manifest.read_text(encoding="utf-8"))["workspace"]["dependencies"]["gpui"]
+    if isinstance(dependency, str):
+        return f"gpui {dependency.lstrip('=')}"
+    return f"{dependency.get('package', 'gpui')} {dependency['version'].lstrip('=')}"
 
 
 def percentile(sorted_values: list[float], quantile: float) -> float:
@@ -101,7 +110,7 @@ def main() -> None:
         f"- Git: `{command('git', 'rev-parse', 'HEAD')}`",
         f"- Profile: `{args.profile}`",
         f"- Rust: `{command('rustc', '--version')}`",
-        "- GPUI: `0.2.2`",
+        f"- GPUI: `{gpui_version()}`",
         f"- OS: `{platform.mac_ver()[0] or platform.platform()}`",
         f"- CPU: `{command('sysctl', '-n', 'machdep.cpu.brand_string')}`",
         f"- Input sources: `{', '.join(sorted(metadata['input_source']))}`",

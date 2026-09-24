@@ -67,8 +67,10 @@ fn read_path(pipe: &mut File) -> io::Result<PathBuf> {
     let mut bytes = vec![0; count * 2];
     pipe.read_exact(&mut bytes)?;
     let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk));
     Ok(std::ffi::OsString::from_wide(&units.collect::<Vec<_>>()).into())
 }
 

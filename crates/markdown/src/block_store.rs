@@ -29,6 +29,7 @@ struct SumTree {
 }
 
 impl SumTree {
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn build(values: impl Iterator<Item = usize>) -> Self {
         let mut tree = Vec::new();
         tree.push(0);
@@ -56,6 +57,7 @@ impl SumTree {
         self.prefix(self.tree.len().saturating_sub(1))
     }
 
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn add(&mut self, index: usize, delta: isize) {
         let mut node = index + 1;
         while node < self.tree.len() {

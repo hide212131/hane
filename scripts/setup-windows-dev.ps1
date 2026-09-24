@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $workspace = Split-Path -Parent $PSScriptRoot
-$toolchain = "1.93.1"
+$toolchain = "1.98.1"
 $resolvedArchitecture = if ($Architecture -eq "auto") {
     switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
         "X64" { "x64" }

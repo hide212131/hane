@@ -84,10 +84,10 @@ jobs:
         run: cargo test --workspace --all-features
 
       - name: Test macOS fallback glyph rasterization
-        run: cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::text_system::tests
+        run: cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml --features runtime_shaders,font-kit,test-support --lib hane_oblique
 
       - name: Test macOS input source reactivation
-        run: cargo test --manifest-path vendor/gpui/Cargo.toml --features runtime_shaders --lib platform::mac::platform::tests::keyboard_selection_change_reactivates_text_context_once_and_ignores_other_responders -- --exact
+        run: cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml --features runtime_shaders,font-kit,test-support --lib hane_input_source
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

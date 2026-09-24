@@ -4593,6 +4593,7 @@ impl HeightIndex {
         self.len == 0
     }
 
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn retree(&mut self) {
         self.sums.clear();
         self.counts.clear();
@@ -4658,6 +4659,7 @@ impl HeightIndex {
         })
     }
 
+    #[expect(clippy::manual_isolate_lowest_one, reason = "unstable on Rust 1.98.1")]
     fn add_sum(&mut self, chunk: usize, delta: f32) {
         let mut node = chunk + 1;
         while node < self.sums.len() {
@@ -5041,8 +5043,7 @@ mod tests {
 
         for (case, source) in cases {
             assert!(
-                source.lines().count() > SYNC_LINE_BUDGET
-                    || source.len() > SYNC_BYTE_BUDGET,
+                source.lines().count() > SYNC_LINE_BUDGET || source.len() > SYNC_BYTE_BUDGET,
                 "{case} fixture must exceed a synchronous join budget"
             );
             let index = BlockIndex::build(Revision(1), &source);

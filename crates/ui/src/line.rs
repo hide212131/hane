@@ -7,11 +7,12 @@
     reason = "line rendering keeps GPUI-facing arguments and run assembly together"
 )]
 
+use crate::input_mode::KeyboardInputMode;
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
-    Div, FontWeight, InteractiveElement, IntoElement, KeyboardInputMode, ObjectFit, ParentElement,
-    Styled, StyledImage, div, img, prelude::FluentBuilder, px, relative, rgb,
+    Div, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, Styled,
+    StyledImage, div, img, prelude::FluentBuilder, px, relative, rgb,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
@@ -1412,8 +1413,8 @@ mod tests {
             .blocks()
             .find(|block| block.kind == hane_markdown::NodeKind::Quote)
             .expect("quote block");
-        let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
-            .expect("quote block presents");
+        let visual =
+            presented_block(&editor, &block, &(0..usize::MAX), None).expect("quote block presents");
         let layout = hane_presentation::layout_block(
             &visual,
             80.0,
@@ -1469,8 +1470,8 @@ mod tests {
             .blocks()
             .find(|block| matches!(block.kind, hane_markdown::NodeKind::List { .. }))
             .expect("list block");
-        let visual = presented_block(&editor, &block, &(0..usize::MAX), None)
-            .expect("list block presents");
+        let visual =
+            presented_block(&editor, &block, &(0..usize::MAX), None).expect("list block presents");
         let layout = hane_presentation::layout_block(
             &visual,
             160.0,
@@ -1487,7 +1488,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(quoted_rows.len(), 2, "each list item contributes one quote row");
+        assert_eq!(
+            quoted_rows.len(),
+            2,
+            "each list item contributes one quote row"
+        );
         assert_eq!(quoted_rows[0].depth, quoted_rows[1].depth);
         assert_eq!(quoted_rows[0].x_origin, quoted_rows[1].x_origin);
         assert_ne!(quoted_rows[0].owner, quoted_rows[1].owner);
