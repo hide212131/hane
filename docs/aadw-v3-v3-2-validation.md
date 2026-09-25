@@ -10,3 +10,24 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
 - 不正JSON、回答欠落、型不一致、候補外、非有限値、範囲外、usage不正を拒否する。
 - CIの `Test AADW Jev contract` がcurrent headで実行される。
 - fixture成功を実サービス接続成功へ読み替えない。
+
+## 実装内容（Issue #341）
+
+- `scripts/aadw_jev_contract.py` に、2026-09-26確認の公式JavaScript SDK
+  （`@typesafe-ai/sdk` 0.6.0）契約に基づく固定データ検査器を追加した。
+  標準ライブラリのみを使い、Jev API・SDKへのネットワーク呼び出しは行わない。
+- 検査対象は System One の request（`state` / 非空の `questions` / 任意の
+  `model`）と result（非空の `model` / `questions` の key に対応する
+  `answers` / `usage`）の対応関係。Noul answer は `noul` が有限の0〜1、
+  Choice answer は `choice` がrequestのcriteria候補内、`confidence` と
+  `probabilities` の各値が有限の0〜1、`probabilities` のキー集合がcriteria
+  のキー集合と一致することを検査する。`usage.input_tokens` /
+  `output_tokens` は非負整数（bool値は整数として受理しない）を要求する。
+  Score はこの検査対象に含めない。
+- `scripts/tests/test_aadw_jev_contract.py` で、有効なChoice+Noulの組と、
+  上記の必須失敗条件（不正JSON、questions空、answer欠落、型不一致、
+  Noul/Choiceの範囲外・非有限値、Choiceの候補外・キー欠落/余分、model空、
+  usage不正）を確認する。JSON parserが非標準のNaN/Infinity相当を受理し得る
+  点を踏まえ、数値の有限性を明示的に検査するケースを含む。
+- この検査はfixtureレベルの契約検査であり、実サービスへの接続確認では
+  ない。実サービス接続の証拠はIssue #333側で別途記録する。
