@@ -24,10 +24,21 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   のキー集合と一致することを検査する。`usage.input_tokens` /
   `output_tokens` は非負整数（bool値は整数として受理しない）を要求する。
   Score はこの検査対象に含めない。
+- `request.state`、`questions[key].instructions`（存在する場合）、Choice
+  question の `criteria`（label -> 値、必須）、Noul question の `criteria`
+  （`null` または `true`/`false` の値、存在すれば任意）は、公式SDKの
+  `EntryType`（`string | JSON object | JSON array | null`）として検査する。
+  `EntryType` のトップレベル値としては number / bool を許可しないが、
+  object・array内部のJSON互換値（number/bool を含む）は許可する。
+  NaN/Infinity/-Infinity はJSON文字列経由・直接dict入力のどちらでも、
+  ネストの深さに関わらずfail closedで拒否する。
 - `scripts/tests/test_aadw_jev_contract.py` で、有効なChoice+Noulの組と、
   上記の必須失敗条件（不正JSON、questions空、answer欠落、型不一致、
   Noul/Choiceの範囲外・非有限値、Choiceの候補外・キー欠落/余分、model空、
   usage不正）を確認する。JSON parserが非標準のNaN/Infinity相当を受理し得る
-  点を踏まえ、数値の有限性を明示的に検査するケースを含む。
+  点を踏まえ、数値の有限性を明示的に検査するケースを含む。`instructions` /
+  `criteria` が省略・`null` でも有効な回帰と、number/bool instructions、
+  number state、不正なcriteria description、ネスト内非有限値など
+  `EntryType` 型不一致の拒否ケースも含む。
 - この検査はfixtureレベルの契約検査であり、実サービスへの接続確認では
   ない。実サービス接続の証拠はIssue #333側で別途記録する。

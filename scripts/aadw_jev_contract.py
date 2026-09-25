@@ -7,8 +7,17 @@ the correspondence between a request's questions and a result's answers. It
 does not call the Jev API or the @typesafe-ai/sdk package, and a passing check
 here is not evidence that a real service connection succeeds.
 
-Request shape: {"state": ..., "questions": {key: question, ...}, "model"?: str}
-  - question is {"type": "noul"} or {"type": "choice", "criteria": {label: ...}}
+EntryType (per the SDK): string | JSON object | JSON array | null. Values
+nested inside an EntryType object/array follow plain JSON value rules
+(string/number/boolean/null/array/object), so a number or bool is only valid
+inside a nested object/array, never as the EntryType value itself. NaN/
+Infinity/-Infinity are not JSON-compatible values anywhere in the structure.
+
+Request shape: {"state": EntryType, "questions": {key: question, ...}, "model"?: str}
+  - question is {"type": "noul", "instructions"?: EntryType,
+                  "criteria"?: {"true"?: EntryType, "false"?: EntryType} | null}
+    or {"type": "choice", "instructions"?: EntryType,
+        "criteria": {label: EntryType, ...}}
 Result shape: {"model": str, "answers": {key: answer, ...}, "usage": usage}
   - noul answer:   {"type": "noul", "noul": number in [0, 1]}
   - choice answer: {"type": "choice", "choice": label, "confidence": number in [0, 1],
@@ -53,6 +62,32 @@ def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _is_json_value(value: Any) -> bool:
+    # Plain JSON value: string/number/boolean/null/array/object, with NaN/
+    # Infinity/-Infinity excluded even though some JSON parsers accept them.
+    if value is None or isinstance(value, str) or isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return _is_finite_number(value)
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _is_entry_type(value: Any) -> bool:
+    # EntryType: string | JSON object | JSON array | null. A bare number or
+    # bool is not a valid EntryType value, only nested inside object/array.
+    if value is None or isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
 def parse_json(raw: Any, label: str) -> Any:
     if isinstance(raw, (str, bytes)):
         try:
@@ -66,6 +101,7 @@ def validate_request(raw: Any) -> dict:
     request = parse_json(raw, "request")
     _require(isinstance(request, dict), "request must be a JSON object")
     _require("state" in request, "request.state is missing")
+    _require(_is_entry_type(request.get("state")), "request.state must be an EntryType value")
     questions = request.get("questions")
     _require(isinstance(questions, dict) and len(questions) > 0,
              "request.questions must be a non-empty object")
@@ -74,13 +110,38 @@ def validate_request(raw: Any) -> dict:
         question_type = question.get("type")
         _require(question_type in ("noul", "choice"),
                  f"request.questions[{key!r}].type must be 'noul' or 'choice'")
-        if question_type == "choice":
-            criteria = question.get("criteria")
-            _require(isinstance(criteria, dict) and len(criteria) > 0,
-                     f"request.questions[{key!r}].criteria must be a non-empty object")
+        if "instructions" in question:
+            _require(_is_entry_type(question["instructions"]),
+                     f"request.questions[{key!r}].instructions must be an EntryType value when present")
+        if question_type == "noul":
+            _validate_noul_criteria(key, question)
+        else:
+            _validate_choice_criteria(key, question)
     if "model" in request:
         _require(isinstance(request["model"], str), "request.model must be a string when present")
     return request
+
+
+def _validate_noul_criteria(key: str, question: dict) -> None:
+    if "criteria" not in question:
+        return
+    criteria = question["criteria"]
+    _require(criteria is None or isinstance(criteria, dict),
+             f"request.questions[{key!r}].criteria must be an object or null when present")
+    if isinstance(criteria, dict):
+        for branch in ("true", "false"):
+            if branch in criteria:
+                _require(_is_entry_type(criteria[branch]),
+                         f"request.questions[{key!r}].criteria[{branch!r}] must be an EntryType value")
+
+
+def _validate_choice_criteria(key: str, question: dict) -> None:
+    criteria = question.get("criteria")
+    _require(isinstance(criteria, dict) and len(criteria) > 0,
+             f"request.questions[{key!r}].criteria must be a non-empty object")
+    for label, description in criteria.items():
+        _require(_is_entry_type(description),
+                 f"request.questions[{key!r}].criteria[{label!r}] must be an EntryType value")
 
 
 def validate_result(raw: Any) -> dict:

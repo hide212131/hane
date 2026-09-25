@@ -63,6 +63,30 @@ class ValidPairTests(unittest.TestCase):
         del request["model"]
         contract.check(request, valid_result())
 
+    def test_noul_question_without_instructions_or_criteria_passes(self):
+        # instructions and criteria are optional on NoulQuestion per the SDK.
+        request = valid_request()
+        self.assertNotIn("instructions", request["questions"]["sentiment"])
+        self.assertNotIn("criteria", request["questions"]["sentiment"])
+        contract.check(request, valid_result())
+
+    def test_noul_question_with_null_criteria_passes(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["criteria"] = None
+        contract.check(request, valid_result())
+
+    def test_noul_question_with_partial_criteria_branches_passes(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["criteria"] = {"true": "clearly positive"}
+        contract.check(request, valid_result())
+
+    def test_entry_type_instructions_and_state_shapes_pass(self):
+        request = valid_request()
+        request["state"] = {"topic": "example", "nested": [1, True, None, {"k": "v"}]}
+        request["questions"]["sentiment"]["instructions"] = None
+        request["questions"]["category"]["instructions"] = ["step one", "step two"]
+        contract.check(request, valid_result())
+
 
 class MalformedJsonTests(unittest.TestCase):
     def test_invalid_request_json_is_rejected(self):
@@ -112,6 +136,81 @@ class RequestShapeTests(unittest.TestCase):
         request["questions"]["sentiment"]["type"] = "score"
         with self.assertRaises(contract.ContractError):
             contract.check(request, valid_result())
+
+
+class EntryTypeShapeTests(unittest.TestCase):
+    def test_numeric_state_is_rejected(self):
+        request = valid_request()
+        request["state"] = 42
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_bool_state_is_rejected(self):
+        request = valid_request()
+        request["state"] = True
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_numeric_instructions_is_rejected(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["instructions"] = 1
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_bool_instructions_is_rejected(self):
+        request = valid_request()
+        request["questions"]["category"]["instructions"] = False
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_noul_criteria_wrong_type_is_rejected(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["criteria"] = "not an object"
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_noul_criteria_branch_with_invalid_entry_type_is_rejected(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["criteria"] = {"true": 1.0}
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_choice_criteria_description_wrong_type_is_rejected(self):
+        request = valid_request()
+        request["questions"]["category"]["criteria"]["positive"] = 3
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_choice_criteria_description_bool_is_rejected(self):
+        request = valid_request()
+        request["questions"]["category"]["criteria"]["positive"] = True
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_nested_nonfinite_value_in_state_is_rejected(self):
+        request = valid_request()
+        request["state"] = {"score": float("nan")}
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_nested_infinite_value_in_instructions_array_is_rejected(self):
+        request = valid_request()
+        request["questions"]["sentiment"]["instructions"] = [1, float("inf")]
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_nested_nonfinite_value_in_choice_criteria_is_rejected(self):
+        request = valid_request()
+        request["questions"]["category"]["criteria"]["positive"] = {"weight": float("-inf")}
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_nested_number_and_bool_are_allowed_inside_entry_type_object(self):
+        # Nested JsonValue rules permit number/bool inside an EntryType
+        # object/array; only the top-level EntryType itself excludes them.
+        request = valid_request()
+        request["state"] = {"count": 3, "enabled": True, "nested": [1, 2.5, False]}
+        contract.check(request, valid_result())
 
 
 class ResultShapeTests(unittest.TestCase):
