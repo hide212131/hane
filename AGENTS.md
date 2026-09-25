@@ -68,3 +68,9 @@ merge は意味判断だけで行わない。直前に expected head、current t
 AADW 専用の collector、wrapper、workflow、status、receipt、Gate は前提にしない。まず既存機能で運用し、複数 PR で同じ重複・高コスト・誤りが繰り返し確認された場合だけ、必要最小限の部品を検討する。
 
 新しい部品を追加する場合も、GitHub に既にある事実を別の persistent state として複製せず、Commander Policy の意味判断を worker や workflow に移さない。
+
+## 次期AADW v3の設計（運用未有効化）
+
+[AADW v3設計書](docs/agentic-development-workflow-v3.md)、[ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)、[実装・評価計画](docs/aadw-v3-execution-plan.md)は、Jevによる限定判断とCodex実装の分離を設計する文書である。
+
+設計Issue #332の完了や文書のmergeを、v3の稼働開始と解釈しない。実装・評価・有効化はIssue #333で追跡する。現行のCommander Policy、v2の役割、既存fallbackは変更しない。有効化PRで評価結果と適用範囲を示し、Commander Policyと本書を同時に更新するまでは、将来仕様を根拠に自動反復や権限委譲を開始しない。

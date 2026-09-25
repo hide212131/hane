@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-このディレクトリには現行実装に適用される判断を置く。現在の全体像は
+このディレクトリには現行実装の判断と、適用状態を明示した次期設計の判断を置く。現在の全体像は
 [architecture](../architecture.md) を参照する。完了した Phase 0–4 の実装計画は、判断の経緯として
 [`docs/history/adr/`](../history/adr/) に保存する。
 
@@ -15,6 +15,14 @@
 |---|---|
 | [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
 | [ADR-0030](0030-gpui-kit-incremental-local-adoption.md) | gpui-kit / gpui-base の段階的・局所的採用方針 |
+
+## Accepted design / implementation pending
+
+設計は採用するが、実装・運用への適用は未完了。文書のmergeだけでは現行の運用規則を置き換えない。
+
+| ADR | 内容 |
+|---|---|
+| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | Jevの限定判断・Codex実装・検証ツールを分離するAADW v3。現行v2を維持し、実装・有効化はIssue #333で追跡する |
 
 ## Active
 
