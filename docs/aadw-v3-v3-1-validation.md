@@ -13,3 +13,7 @@ Claude worker は、この節の直後に `worker-edit` という見出しを一
 - CI、review、GUI、merge の成功は worker の編集結果だけでは主張しないこと。
 
 ほかのファイルは変更しないでください。
+
+## worker-edit
+
+この変更は Issue #333 / V3-1 の既存 AADW v2 Claude 経路の確認用です。worker（Claude）自身は shell、test、git、push のいずれも実行していません。この worker 編集の完了は、CI、review、GUI、merge の成功を主張するものではありません。
