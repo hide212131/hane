@@ -31,7 +31,9 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   `EntryType` のトップレベル値としては number / bool を許可しないが、
   object・array内部のJSON互換値（number/bool を含む）は許可する。
   NaN/Infinity/-Infinity はJSON文字列経由・直接dict入力のどちらでも、
-  ネストの深さに関わらずfail closedで拒否する。
+  ネストの深さに関わらずfail closedで拒否する。この拒否はrequest/result
+  全体をJSON互換値として検査することで行うため、上記の既知fieldに限らず、
+  スキーマ上未走査の追加fieldに含まれる非有限値も同様に拒否する。
 - `scripts/tests/test_aadw_jev_contract.py` で、有効なChoice+Noulの組と、
   上記の必須失敗条件（不正JSON、questions空、answer欠落、型不一致、
   Noul/Choiceの範囲外・非有限値、Choiceの候補外・キー欠落/余分、model空、

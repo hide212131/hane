@@ -97,9 +97,18 @@ def parse_json(raw: Any, label: str) -> Any:
     return raw
 
 
+def _require_json_compatible(value: Any, label: str) -> None:
+    # Walks the entire structure, not just recognized fields, so an
+    # unexpected/unscanned field containing NaN/Infinity/-Infinity is
+    # rejected the same as a recognized one.
+    _require(_is_json_value(value),
+             f"{label} must be JSON-compatible (no NaN/Infinity/-Infinity anywhere, including unrecognized fields)")
+
+
 def validate_request(raw: Any) -> dict:
     request = parse_json(raw, "request")
     _require(isinstance(request, dict), "request must be a JSON object")
+    _require_json_compatible(request, "request")
     _require("state" in request, "request.state is missing")
     _require(_is_entry_type(request.get("state")), "request.state must be an EntryType value")
     questions = request.get("questions")
@@ -147,6 +156,7 @@ def _validate_choice_criteria(key: str, question: dict) -> None:
 def validate_result(raw: Any) -> dict:
     result = parse_json(raw, "result")
     _require(isinstance(result, dict), "result must be a JSON object")
+    _require_json_compatible(result, "result")
     model = result.get("model")
     _require(isinstance(model, str) and model != "", "result.model must be a non-empty string")
     _require(isinstance(result.get("answers"), dict), "result.answers must be an object")

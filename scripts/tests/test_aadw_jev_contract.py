@@ -212,6 +212,25 @@ class EntryTypeShapeTests(unittest.TestCase):
         request["state"] = {"count": 3, "enabled": True, "nested": [1, 2.5, False]}
         contract.check(request, valid_result())
 
+    def test_unscanned_request_field_with_nonfinite_value_is_rejected_as_dict(self):
+        # A field outside the recognized schema (state/questions/model) must
+        # still be rejected if it carries a non-JSON-compatible value.
+        request = valid_request()
+        request["unexpected"] = {"nested": float("nan")}
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
+
+    def test_unscanned_request_field_with_nonfinite_value_is_rejected_as_json_text(self):
+        # json.dumps emits the non-standard NaN/Infinity tokens by default,
+        # and json.loads accepts them back; the top-level field-wide scan
+        # must still catch this after the JSON text round trip.
+        request = valid_request()
+        request["unexpected"] = float("nan")
+        request_text = json.dumps(request)
+        self.assertIn("NaN", request_text)
+        with self.assertRaises(contract.ContractError):
+            contract.check(request_text, json.dumps(valid_result()))
+
 
 class ResultShapeTests(unittest.TestCase):
     def test_empty_model_is_rejected(self):
@@ -237,6 +256,27 @@ class ResultShapeTests(unittest.TestCase):
         result["answers"]["sentiment"]["type"] = "choice"
         with self.assertRaises(contract.ContractError):
             contract.check(valid_request(), result)
+
+
+class UnscannedResultFieldTests(unittest.TestCase):
+    def test_unscanned_result_field_with_nonfinite_value_is_rejected_as_dict(self):
+        # A field outside the recognized schema (model/answers/usage) must
+        # still be rejected if it carries a non-JSON-compatible value.
+        result = valid_result()
+        result["unexpected"] = [{"nested": float("inf")}]
+        with self.assertRaises(contract.ContractError):
+            contract.check(valid_request(), result)
+
+    def test_unscanned_result_field_with_nonfinite_value_is_rejected_as_json_text(self):
+        # json.dumps emits the non-standard NaN/Infinity tokens by default,
+        # and json.loads accepts them back; the top-level field-wide scan
+        # must still catch this after the JSON text round trip.
+        result = valid_result()
+        result["unexpected"] = float("inf")
+        result_text = json.dumps(result)
+        self.assertIn("Infinity", result_text)
+        with self.assertRaises(contract.ContractError):
+            contract.check(json.dumps(valid_request()), result_text)
 
 
 class UsageTests(unittest.TestCase):
