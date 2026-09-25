@@ -2,98 +2,110 @@
 
 ## 1. 適用状態と読み方
 
-設計Issue [#332](https://github.com/hide212131/hane/issues/332)、[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)の設計成果物である。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
+初版の設計Issue [#332](https://github.com/hide212131/hane/issues/332) / PR #334を、利用者の追加方針に従い[#335](https://github.com/hide212131/hane/issues/335)で改訂する。[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)を設計判断、[実行計画](aadw-v3-execution-plan.md)を実装・評価手順とする。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
 
-**この文書のmergeはv3の稼働開始ではない。現行は[v2](agentic-development-workflow-v2.md)と[Commander Policy](aadw-command-policy.md)のままとする。** 以下は有効化の際に満たす設計要件であり、現行のone-action規則やworker権限を読み替える根拠にはしない。
+**文書のmergeではv3を有効にしない。現行は[v2](agentic-development-workflow-v2.md)と[Commander Policy](aadw-command-policy.md)であり、Claude優先・利用上限時だけのCodex実装・Codexレビューを維持する。** 以下は将来の設計要件。有効化PRで委譲範囲をCommander Policyへ統合し、AGENTSと同時に更新する。今回の文書PRのレビューも現行経路で行う。
 
-判断規則の正本は引き続きCommander Policyとする。有効化PRで、この文書の委譲要件を同Policyに統合する。実行器は承認された規則とその版を参照し、独立した業務判断の正本にはならない。
+本書のChatGPTアプリは、利用者が「旧Codexアプリ」と呼ぶ操作窓口を指す。アプリ内のAIをCommanderと呼び、代替実装workerであるCodex CLI等とは区別する。特定のアプリ版・プランの機能を名称だけで利用可能と仮定しない。
 
-## 2. 記事から採る考え方とHaneで追加する条件
+## 2. 記事から採る考え方とHaneの選択
 
-記事は生成・判断・事実確認を分け、初期分類と実装の区切りでJevを呼び、必要なときだけ上位モデルへ切り替える。Haneでもこの分離を採る。全段階を必ず順番に試すのではなく、最初から十分な設定を選べるようにする。[S1]
+記事はCodexアプリの設定を入口に、生成をLuna/Sol、限定判断をJev、事実確認をテスト等に分離する。[S1] Haneでは分離を採り、利用者の方針に従って生成担当をClaude優先・条件付きCodexに、通常レビューをCodeRabbitに変更する。これは記事の実装そのものではなくHane独自の設計である。
 
-記事の「81%」「1タスク4〜6回」「confidence 0.95」は仮説・目安・例であり、Haneで確認した値ではない。月20ドル、トークン数、料金、モデルの利用可否も運用保証にしない。添付の表示年は2025年だが、この記事の日付自体を機能の利用可否の根拠にはしない。
+初版の「独立したCodex App Server実行器から始める」と「Luna/Solを通常の実装経路にする」は撤回する。アプリから使う既存GitHub接続と、Jevを呼ぶ小さな連携機能を出発点にする。独自画面、Hane製品への組込み、常駐司令塔、進行状態DBは初期必須にしない。
 
-Haneでは、証拠の鮮度、秘密情報と実行権限の隔離、予算、最終受入を追加条件とする。テスト成功は実行したテストの成功であり、要求全体の正しさの証明ではない。
+記事の81%、1タスク4〜6回、confidence 0.95、月20ドルは仮説・例でありHaneの保証値ではない。モデルID、可用性、料金、推論量を記事から固定しない。テスト成功は実行したテストの事実であり、要求全体の正しさの証明ではない。
 
-## 3. 一件分の実行構成
+## 3. アプリを中心にした一件の流れ
 
 ```text
-Commanderが目的・範囲・検証・予算を確定
-                  ↓
-GitHubのcurrent factsと作業領域を確認
-                  ↓
-Jevが許可済み実装設定を選択
-                  ↓
-Codexで調査・実装・テスト追加
-                  ↓
-隔離環境で検証し、実差分と結果を取得
-                  ↓
-Jevが狭い意味判断を返す
-                  ↓
-実行器が規則と回答から次の一手を実行
-      ├─ 調査・追加検証
-      ├─ 修正・許可済み上位設定への切替
-      ├─ 範囲変更・設計判断・不明な障害はCommanderへ
-      └─ 実装完了候補を最終受入へ提出
+利用者 → ChatGPTアプリ内Commander
+             ├─ 目的・範囲・受入条件・予算・検証を確定
+             ├─ GitHubのcurrent factsを取得
+             ├─ アプリから使える連携機能 → Jevの限定判断
+             │
+             ├─ 承認済み実装指示 → GitHub Actions → Claude Code
+             │                                    └─ 許可条件時だけCodex
+             │                         ↓ 変更を検査・反映
+             │                         CI / 必要なGUI検証
+             ├─ 安定したheadへレビュー指示 → CodeRabbit
+             │
+             └─ GitHubの結果を再観測 → Jevの限定判断を採用
+                       ├─ 同じ原因をまとめて現在の実装担当へ修正指示
+                       ├─ 追加証拠・検証を取得
+                       ├─ 範囲・設計変更、不明な障害はCommanderで判断
+                       └─ 完了候補 → Commanderが最終受入・merge
 ```
 
-一回の判断から実行するactionは一つとし、結果を観測して次の判断を行う。将来は承認済み作業内でこの反復を自動化するが、すべての工程を事前に連鎖する一般的な状態機械は作らない。
+矢印は役割間の受け渡しを示し、現行workflowが全工程を自動連鎖することを意味しない。一つのactionを実行したら結果を観測する。有効化後は、承認済み通常判断をJevへ委譲し、アプリ側の手順が許可されたactionへ結び付ける。毎回Commanderが同じ意味判断をやり直す構成にはしないが、例外・最終受入は委譲しない。
 
-最初は一件の実行、同一作業領域に一人のwriterとする。他のPRの並行開発を禁止する規則ではない。実行中に同じ対象へ別writerが現れたら、強制上書きで解決せず停止する。
+Actionsは承認済み依頼の実行場所であり、指示を考える主体ではない。CodeRabbitの指摘文をそのまま実行命令にしない。Jevはコードや修正指示の文章を生成せず、具体的な実装指示はCommanderが目的・制約・現在の証拠から作る。
 
-## 4. 実行入力と権限
+## 4. アプリからの指示、接続、待機と再開
 
-Commanderが承認する一件分の入力には、次を含める。これらはHaneの内部契約であり、Jev APIのフィールドではない。
+アプリ側の手順は、default branchのCommander Policyを読み、GitHub接続でIssue/PR、current head、target branch、CI、レビュー、run/artifactを必要な範囲で取得する。PRがない作業では先に承認された変更範囲を整理し、ブランチと差分を持つPRを用意する。現行Claude workflowはIssue単体のコメントでは起動しない。
 
-| 入力 | 内容 |
+現行の[Claude workflow](../.github/workflows/claude-fix.yml)は、PRの`issue_comment`にある`@claude`、独立した`AADW_COMMANDER_HANDOFF_V2`行、一つの`AADW_TARGET_HEAD: <40桁SHA>`行を検査する。write以上の依頼者、openなsame-repository PR、expected headの一致が必要。この既存契約を使う間は現在の形式を守り、v3という文書名だけで新しい起動markerを発行しない。
+
+アプリ側からのコメント投稿を初期の標準入口にする。Actionsから別Actionsを起動する必要が生じた場合、`GITHUB_TOKEN`で投稿したコメントの`issue_comment`は新しいworkflow runを作らない。[S9] 承認済みGitHub App認証、または明示的なdispatch等を採用する際は、起動先の対応、actor検査、expected head、権限を検証する。現行workflowがdispatchを受け付けるとは仮定しない。外部CodeRabbit Appへのコメント配送とは分けて試験する。
+
+再利用する手順はアプリのskill等に置けるが、skillは接続や権限そのものではない。[S5] Jevについては「アプリ→利用可能なツール/小さなhelper→Jev→型付き回答」という実呼出しを確認する。型・候補・鮮度を検査する部分だけをコードにし、巨大な制御サービスにしない。実装方式はアプリの対応機能と既存構成を調べて選ぶ。設定欄に「Jevを使う」と書いただけでは接続試験を通過しない。
+
+起動済みActionsの実行・既存の限定fallbackと、次の依頼を発行するアプリ側の処理は別。アプリ終了後に全工程が無人で進むとは保証しない。会話が終わる場合は対象PRとrun、待っている結果を残す。再開時はGitHubから取り直し、実行中jobや未反映patchを確認してから次の一手を選ぶ。アプリを閉じることはリモートjobの取消でもない。バックグラウンド継続を追加する場合は、別途対応機能・認可・重複防止を確認する。
+
+## 5. 実行入力とClaude→Codexの切替
+
+Commanderが承認する入力は、repository、Issue/PR、expected head、必要なbase、受入条件ID、不変条件、変更可能/禁止パス、必須検証、実装担当と許可モデル・認証方式、Policy/質問版、総試行・時間・通信再試行・利用量の上限を含む。これらはHaneの契約であってJev APIのフィールドではない。
+
+通常はClaude Codeへ実装指示を出す。現在のworkerはRead/Edit/Write/Glob/Grepでコードとテストファイルを編集し、shell、テスト実行、git、pushは行わない。別の信頼された反映処理が変更を検査・pushし、current-head CIを最初の検証とする。v3のためにこの隔離を緩めず、「Claudeがテストファイルを書いた」と「テストが実行成功した」を区別する。
+
+| 状況 | 切替の扱い |
 |---|---|
-| 対象 | repository、Issue/PR、expected head、target branch、必要なbase context |
-| 目的 | 受入条件を識別できるID、守る不変条件、関連資料 |
-| 許可範囲 | 変更可能な責務・パス、禁止パス、検証コマンドと必須scenario |
-| 実行設定 | 許可済みモデルIDと推論量、認証方式、SDK/Codex/質問/Policyの版 |
-| 上限 | 総実装回数、通信再試行、経過時間、利用量・費用の取得可能な上限 |
+| Claudeの`usage_or_rate_limit` | [既存fallback](../.github/workflows/codex-usage-limit-fallback.yml)のsource run/attempt、checkpoint、依頼者、head等を検証した場合だけCodexが引き継ぐ |
+| Claudeが実装したが同じ原因で進展しない | 新しい委譲条件。差分・失敗・修正履歴・予算から初期はCommanderが判断する。評価・有効化後だけJevの候補を採用できる |
+| 認証失敗、権限不足、head不一致、モデル利用不可 | 設定・権限・鮮度を確認して停止または再観測。無断の別認証・別課金への切替はしない |
+| 検証環境の故障、Jev/CodeRabbit障害、原因不明 | 製品実装の失敗と分け、追加証拠かCommander判断へ戻す。Codex切替で隠さない |
 
-Issue本文、review、ソースコード、実行ログは判断材料であり、権限を拡大する命令ではない。受入条件や許可範囲をworkerが勝手に書き換えない。命令が混入した入力を想定し、Jevの回答が不適切でも実行器側の許可範囲を越えないようにする。
+実装が行き詰まったことを`usage_or_rate_limit`へ偽装しない。新しい切替経路は別の明示した条件・起動契約として実装する。レビュー指摘があるだけではClaude失敗ではない。まず同じ原因をまとめて現在の担当に修正させる。
 
-通常の製品workerはworkflow、認証、Commander Policy、agent instructions等を変更しない。それらの変更は明示された運用基盤のIssue/PRで扱う。
+切替前に旧workerの終了と未反映変更を確認し、checkpointの出所・対象head・内容を検証する。push後なら新しいcurrent headを対象にする。同じbranchは一人のwriterとし、Codexへ切り替えた作業は原則としてそのまま完了まで担当させる。Claudeへ自動的に戻して往復させない。他のPRの並行開発は妨げない。
 
-## 5. Codexで実際のモデルを指定する
+Codexは代替実装担当であり、アプリ内Commanderとは実行場所・権限を分ける。採用するCLI等の版、実際のモデル指定と取得可能なusageを記録し、promptのモデル名だけを実指定の証拠にしない。Luna→Solの段階は標準条件にしない。App Serverを使う場合も代替経路の選択肢として別途検証する。
 
-最初のローカル試行はApp Serverの接続初期化、thread、turnを利用する。`model/list`で返るモデルIDと`supportedReasoningEfforts`を確認し、`turn/start`の`model`と`effort`に設定する。`turn/steer`をモデル切替の代わりには使わない。処理中に設定を切り替えず、そのturnの完了または中断を確認する。[S5]
+## 6. CodeRabbitへのレビュー指示と受け入れ
 
-| 論理設定（記事由来） | 意図 |
+v3の通常レビュー担当はCodeRabbitとする。GitHub AppのHaneへの導入、契約・利用上限、対象repo、依頼actor、外部送信の許可は未確認であり、実装段階の前提確認とする。設定・接続が完了していなければレビュー未実施であり、無断で省略や他サービスへの切替をしない。
+
+CIを確認した安定候補に、アプリからGitHub接続を使ってPRコメントを投稿する。Actionsに配送を任せる方式は追加選択肢であり、レビュー処理自体はCodeRabbit側が行う。初回は`@coderabbitai full review`、修正後の新しい差分は`@coderabbitai review`を使う。[S7] これらのコマンド自体にexpected headを固定する機能があるとは仮定せず、依頼前後と結果採用時に対象を照合する。
+
+設定は、自動レビューとpushごとの自動差分レビューを止め、明示的依頼を標準にする。labelや本文keyword等の別の自動起動条件、対象除外も確認する。[S10] 日本語レビュー、状態・検査範囲の表示、エラーの識別を設定時に確認する。自動修正・docstring/テスト生成・CI修正・競合解消などの変更機能を無効化し、自動承認を最終受入に使わない。[S8] 今回は`.coderabbit.yaml`やApp設定を変更しない。
+
+| 確認対象 | 受け入れるための条件 |
 |---|---|
-| Luna / low | 範囲と期待値が明確な小さな変更 |
-| Luna / medium | 限定された通常の機能・修正 |
-| Luna / high | 許可範囲内で追加の推論が必要な問題 |
-| Sol / high | 許可範囲内で上位モデルが必要な問題 |
+| 出所と対象 | 信頼するCodeRabbit Appの結果で、現在のheadとの対応が取れる。reviewのcommit IDやcheckのhead等、実際に取得できる情報を使う。依頼コメント内のSHAだけでは証明にならない |
+| 実行完了 | 待機・実行中・error・skipped・契約/上限による未実施を区別する。コメントがないことや緑の状態だけを「問題なし」にしない |
+| 検査範囲 | 変更ファイルの除外・省略・打切りを確認する。incremental reviewは新規差分の検査であり、それだけをPR全体の検査と扱わない |
+| 指摘 | 現在の未解決指摘を同じ原因ごとに整理し、blocker/follow-up/unknownをPolicyに沿って扱う。件数ゼロを目的にしない |
 
-この表はAPIモデルIDの一覧ではない。利用できない組合せは候補から外し、候補がなければ停止する。既定モデル、別provider、別課金方式へ黙って切り替えない。設定をpromptへ書いただけではモデル実指定の検証を通過しない。
+incremental後に現在のPR全体の確認を主張するには、最新結果からその範囲を裏付けられる必要がある。過去headのpassを自動的に継承せず、対応や範囲を証明できなければcurrent headのfull reviewを依頼する。重要なbase変更も同様に再評価する。識別方法やレスポンス形式はHaneの実PRで確認するまで未達とする。
 
-初期分類にはモデル候補のほか、`gather_evidence`と`return_to_commander`も用意する。情報不足や設計判断の必要性を、無理にモデルの大小へ分類しない。
+指摘の修正は現在の実装担当へ戻し、CodeRabbitには作らせない。CodeRabbitが終わったという事実と、受入条件を満たしたという判断は別である。通常のCodexレビューを外すのはCodeRabbit経路を実証した有効化PRからとし、本改訂では既存レビューを残す。
 
-実際のrequest、応答・イベントで確認できる設定、thread/turn識別子、利用量を記録する。要求と実行設定が一致しない、または確認できない場合は実装設定の検証を未達とする。再開やモデル変更後に設定が継承されると推測せず、採用バージョンで確認する。
+## 7. Jevの接続契約と小さな判断
 
-## 6. Jevの接続契約
+公式JavaScript SDKは`@typesafe-ai/sdk`、`TypeSafeClient.systemOne()`を提供し、`state`、`questions`、`model`を扱う。HTTPは`POST /v1/systemone`、結果は`model`、`answers`、`usage`を持つ。[S3][S4] APIキーはhelper等の秘密情報として扱い、アプリの会話・設定文・AGENTS・workerへ出さない。アプリの環境変数が必ず使えるとは仮定せず、採用するツールの安全な設定方法で確認する。
 
-確認した公式JavaScript SDKは`@typesafe-ai/sdk`、`TypeSafeClient.systemOne()`を提供する。`TYPESAFE_API_KEY`を読み、`state`、`questions`、`model`を扱う。HTTP契約は`POST /v1/systemone`。結果は`model`、`answers`、`usage`を持つ。[S3][S4]
-
-| 形式 | 出力の意味 | 初期用途 |
+| 形式 | 意味 | 初期用途 |
 |---|---|---|
-| Choice | 一つの選択、選択肢ごとの確率、confidence | 設定と許可済み次actionの選択 |
-| Noul | 「はい」の確率。別のconfidenceはない | 受入条件の裏付け、意味上の範囲、設計見直しの必要性 |
-| Score | 段階を定義した尺度の値と分布 | 初期実装では使わない |
+| Choice | 選択肢から一つ、各確率、confidence | 許可済みの継続・修正・追加検証・担当変更候補 |
+| Noul | 「はい」の確率。別のconfidenceはない | 受入条件ごとの裏付け、意味上の範囲、設計判断の必要性 |
+| Score | 定義した段階の評価値と分布 | 初期は使わない |
 
-Choice/Scoreのconfidenceは分布の集中度を要約するもので、処理全体の正しさや操作権限ではない。厳密な計算式は今回の確認範囲にない。Noulが0.5付近だからといって「中程度の問題」という意味にはしない。[S2][S3]
+confidenceは分布の集中度の要約で、全工程の正しさ・正答率・権限ではない。計算式は確認範囲にない。[S2] Noulの低値は証拠不足も含み、モデルを強くする根拠に直結しない。重大な問題を他の良い評価との平均で相殺しない。
 
-質問のキーはプログラム側の識別用であり、意味をキー名だけに書かない。判断内容は`instructions`、選択基準は`criteria`に記す。一つの質問は一つのまとまった意味判断にする。独立した質問は同じstateでまとめられるが、同じリクエストの他の回答を参照できない。先の回答から証拠や候補を作り直すときだけ次の呼び出しを行う。[S2]
+質問キーはモデルへの説明ではない。内容は`instructions`、基準は`criteria`に書く。同じstateの独立質問はまとめられるが、同じリクエスト内の他の回答は参照できない。先の回答で証拠や候補を作り直す場合だけ次の呼出しを行う。[S2]
 
-## 7. 判断の分割と組合せ
-
-受入条件ごとに「差分と検証結果が条件を裏付けるか」をNoulで判断する。低い値は実装の誤りとは限らず、証拠不足を含む。未実施検証はツール側で識別し、低い値だけを根拠に高価なモデルへ切り替えない。
-
-以下は質問形式の例であり、採用済みの閾値や実測済みpromptではない。
+次はHane向けの質問例であり、実測済みprompt・閾値ではない。
 
 ```json
 {
@@ -106,74 +118,68 @@ Choice/Scoreのconfidenceは分布の集中度を要約するもので、処理�
 }
 ```
 
-意味上の変更範囲と、承認済み設計の見直しが必要かは別の質問にする。複数条件を平均して、重大な問題を他の良い評価で相殺しない。
+アプリ側はCodeRabbit結果も出所・対象・指摘ID付きの判断材料として渡す。file readのたびにJevを呼ばず、実装・検証・レビューの区切りで、機械的確認の後に残る意味判断へ使う。コード生成、設計、任意のshellやGitHub操作をJevに生成させない。
 
-回答の組合せは次の優先順を設計要件とする。閾値は質問と結果の影響ごとに評価し、有効化時にCommander Policyで承認する。
+## 8. 回答の採用順序と鮮度
 
 | 優先 | 条件 | 扱い |
 |---|---|---|
-| 1 | 権限・禁止パス・予算・鮮度の不一致、回答の不正 | actionを実行しない。原因を残して停止または再観測 |
-| 2 | 既知の証拠欠落・古い検証 | 必要な調査・検証を取得する。成功や能力不足と解釈しない |
-| 3 | 範囲変更、設計の見直し、原因不明の障害 | Commanderへ戻す |
-| 4 | 製品不具合が確認され、範囲内で対処可能 | 同じ原因の問題をまとめ、修正または許可済み上位設定を選ぶ |
-| 5 | 必須検証を満たし、意味上の条件にも裏付けがある | 実装完了候補を提出する |
+| 1 | 権限・禁止パス・予算・鮮度不一致、不正回答 | 操作を発行せず停止または再観測 |
+| 2 | 既知の証拠欠落、未実施/古い検証・レビュー | 必要な証拠を取得。成功や実装担当の能力不足に読み替えない |
+| 3 | 範囲・設計変更、重大問題の扱い、原因不明障害 | Commanderへ戻す。Jevは免除しない |
+| 4 | 範囲内の製品不具合が確認される | 同じ原因をまとめて修正。切替条件を満たす場合だけCodexを候補にする |
+| 5 | 必須検証・レビューを満たし、意味上の裏付けがある | 完了候補をCommanderへ渡す |
 
-ここで判断が必要な複数の許可済みactionが残ればChoiceを使う。候補は実行器が現在の証拠と許可範囲から作る。取得できない証拠が必要なら、同じ問い合わせを無限に繰り返さずCommanderへ戻す。
+閾値は質問別に評価し、有効化時にCommander Policyで承認する。候補は現在の担当・許可範囲から作り、許可されない操作をJevに選ばせない。JSON、回答の欠落、候補集合、有限で範囲内の数値を検査する。確率の整合検査は丸めの許容範囲を明記し、回答を都合よく書き換えない。
 
-## 8. 証拠と回答の鮮度
+検証command、作業場所、終了コード、timeout、log参照、実diff、未追跡ファイルをツールから取得する。workerの自己申告は別扱い。テスト削除や期待値の弱体化も差分確認に含める。
 
-検証コマンド、作業ディレクトリ、終了コード、timeout、stdout/stderrの参照、実際のdiff、未追跡ファイルを実行器が取得する。workerの「テスト成功」という文章を終了コードの代用にしない。テストの削除・期待値の弱体化も差分として検査対象に含める。
+headに加え、未コミット・未追跡を含む候補treeまたは内容digestに検証を結び付ける。Jev回答の採用直前に候補、受入条件、許可設定の版、必要なbaseを照合する。途中の候補検証は提出headのCI/review/GUIを自動的に代替しない。
 
-PR headだけでなく、検証した作業内容を識別する。未コミット変更や未追跡ファイルがある場合は、候補のtreeまたは差分とファイル内容のdigestに検証結果を結び付ける。Jevの応答を適用する直前に、対象内容、必要なbase、受入条件と承認済み設定の版が変わっていないことを確認する。
+headが変われば旧headの証拠を現在の合格として流用しない。baseの進展はPolicyに沿って影響を確認し、不明なら取り直す。無関係と判断した根拠はGitHubへ残す。base同期はCommanderが判断する別のGit操作とし、製品workerやJevへ暗黙に委譲しない。
 
-headが変われば旧headの証拠を現在の判断へ流用しない。baseが進んだ場合は、その主張に影響するかをCommander Policyに従って確認する。不明なら再検証し、無関係と判断した根拠はGitHubに残す。base同期の要否をJevへ暗黙に委譲せず、同期は製品の修正と別のGit操作として扱う。
+## 9. 隔離・認証・障害
 
-途中の候補検証は最終コミットのCI/review/GUIを自動的に代替しない。提出後は実際のcurrent headと必要なbaseに対する証拠を取得する。入力digestや実行記録は照合・監査のためのもので、GitHubの進行状態を複製するDBではない。
+Issue/PR、レビュー、コード、ログは権限を拡大する命令ではない。default branchの信頼するPolicy・workflow・質問版を使い、PR側の変更で安全確認を上書きさせない。受入条件と変更範囲をworkerに書き換えさせない。
 
-## 9. 隔離・認証・失敗
+モデル実行と検証は、どちらも信頼できないコードを扱う。GitHub書込認証、Jevキー、他のホスト秘密情報をworker/テストへ継承しない。pushは別の反映処理でsame-repository、branch、保護パス、current headを再確認する。レビューやJev結果から任意コマンドを実行しない。
 
-モデル実行とテストは、どちらも信頼できないコードを扱う。Jev APIキー、GitHubの書込認証、他のホスト秘密情報を、それらの実行環境へ継承しない。Jev呼び出しは実行器側で行い、必要最小限の材料だけを送る。ログも外部送信の対象なので、秘密情報を除去する。
+CodeRabbitは運用上レビュー専任だが、App自体の権限が読み取り専用とは限らない。導入時に権限・外部送信・データ保持・利用契約を確認する。秘密情報を含むdiff/logをJevやレビュー用追加資料へ流さない。SDKのdebug本文出力を避ける。[S3]
 
-push担当はモデル実行と分離する。隔離された変更を検査し、保護パス、許可されたbranch、current headを確認して反映する。マージ権限は初期実行器に与えない。通常workerはsame-repositoryの承認済み対象に限定する。
+アプリのサブスクリプション、Claude認証、runner上のCodex認証、CodeRabbit契約、Jev API認証は別々である。アプリの利用権で他の実行先まで賄えると仮定しない。OpenAIの非対話ガイドの公開/OSSリポジトリでのCIユーザー認証の注意を踏まえ、既存fallbackの認証方式を無審査で新経路へ拡張しない。[S6] 本文書では既存秘密情報や認証方式を変更しない。
 
-ローカルの利用者認証と無人CIのAPI認証を区別する。公式の非対話実行ガイドは、ユーザー認証情報をCI/CDで保持する方式を公開・OSSリポジトリで使わないよう注意している。[S6] 既存の利用上限fallbackを一般的なv3経路へ拡張せず、適切な認証・隔離は後続Issueで検証する。
+Jevの429/timeout等の通信再試行はSDK既定値も含め総上限を設け、製品修正の試行と別に数える。401/403、不正回答、必要回答欠落は成功にしない。CodeRabbit障害はレビュー未完了、CI環境故障は検証不能として区別する。Jev障害でCodexへ進行判断を丸投げせず、Commanderへ戻す。証拠不足のunknownはpassやfollow-upに変えない。
 
-| 結果 | 扱い |
-|---|---|
-| 401/403、モデル利用不可、許可範囲外 | 設定・権限の問題として停止する。別課金へ切り替えない |
-| timeout、429、一時的通信障害 | 通信再試行を総上限内で行う。製品修正の試行とは別に数える |
-| 不正JSON、必要回答の欠落、候補外、範囲外の確率 | 判断として採用しない。成功やモデルの能力不足に変換しない |
-| 必須検証の失敗・未実施・実行不能 | 完了候補を出さない。製品・検証環境・証拠不足を区別する |
-| 同じ原因で進展しない、上限到達 | 無限修正や無限問い合わせを止め、未解決事項を返す |
+## 10. 最終受入と費用
 
-Jevの失敗を理由にCodexへ次工程の判断を丸投げしない。再開時はGitHubと作業内容を再取得し、実行済み操作を再照合する。停止中のturnが実行を続けたまま、次のworkerやpushを起動しない。
+Jevの`COMPLETE`は実装完了候補。CodeRabbitの完了・承認だけでもmergeしない。CommanderはIssueの目的、current head、必要なbase、current review/未解決指摘、required CI、必要なGUI、mergeabilityを確認し、expected headを指定してmergeする。保存・undo/redo・入力等の品質基準を下げない。必須検証をconfidenceで免除しない。
 
-## 10. 完了と費用
+呼出し/run単位で、担当・モデル・認証方式・質問/Policy版・取得可能な入出力/cache利用量・時間・結果を記録する。Jevのusageは請求金額ではない。[S3] 実費、サブスクリプション利用量、API単価の参考換算を分け、不明は`unknown`とする。失敗・中断・再試行・旧headを除外せず、親合計と子内訳を二重加算しない。
 
-`COMPLETE`は実装完了候補に限る。最終受入はCommanderがIssueの目的、current head/base、review、必要なGUI、CI、mergeabilityを確認する。expected headを指定するmerge手順は変えない。必須検証をモデルのconfidenceで免除しない。
+Commander、Claude、Codex、Jev、CodeRabbit、CI/GUIをどこまで計測できたか明示する。指標は受入完了あたりの費用・時間・再試行と誤完了。artifactと完了時の集計から始め、独自ダッシュボードや進行DBは作らない。
 
-呼出単位でモデル・認証方式・question/Policy版・入力/出力/取得できるcache利用量・時間・結果を残す。JevのSDKは入力/出力token数を返すが、SDKのusage自体は請求金額ではない。[S3]
+## 11. 実装・評価・移行
 
-実費、サブスクリプション利用量、API単価による参考換算額は別にする。不明な費用は`unknown`でありゼロではない。失敗・中断・再試行・旧headの費用も集計し、親の総量と子の内訳を二重加算しない。集計に含めたCommander、review、GUI、CIの範囲と未計測項目を示す。
+[実行計画](aadw-v3-execution-plan.md)をアプリ→既存Actions、CodeRabbit接続、Jevの接続・評価、限定有効化に改める。v3自体の実装もClaudeへ依頼できるが、workflow、agent instructions、Commander Policy等は通常workerの保護対象のまま、明示した運用基盤PRで扱う。
 
-指標は受入完了した作業あたりの費用・時間・再試行と、誤完了の割合とする。初期は実行artifactと完了時の集計で足り、専用ダッシュボードは作らない。
-
-## 11. 移行と未確認事項
-
-[実行計画](aadw-v3-execution-plan.md)のV3-1〜4を進める。文書mergeの時点では実API呼び出し、実行器、費用削減、精度評価を実施したことにしない。
-
-モデルIDと推論量の可用性、SDK/Codex固定版、実APIの応答、認証と隔離、質問ごとの閾値と予算、必要な検証環境は後続Issueの確認対象である。確認できるまで観測を超えた自動判断の適用を有効化しない。
+アプリからのJev実呼出し、CodeRabbit導入/契約/actor対応/対象head識別、実推論の評価、閾値と予算、認証・隔離は未確認。文書mergeで実装済みと報告しない。#333はopenのまま残し、必要な証拠とPolicy/AGENTS更新がそろうまで現行v2を維持する。
 
 <a id="sources"></a>
 ## 出典と確認範囲
 
-2026-09-25時点。記事の提案、公式資料の契約、Hane独自の設計要件を混同しない。
+2026-09-25確認。記事、公式の契約、利用者の方針に基づくHaneの改訂を区別する。アプリ中心・Claude優先・CodeRabbitという組合せの動作は未検証である。
 
-- [S1] Rahul氏の記事（利用者提供本文）: https://x.com/sairahul1/article/2102694818485096803 。本文を基に構成と例を整理した。全文を転載せず、数値を性能保証にしていない。
-- [S2] TypeSafe公式Skill: https://github.com/typesafe-ai/skills/blob/main/skills/typesafe-ai/SKILL.md 。確認したblob SHAは`0109513f9656917dc93cbc5ecddfca465a53ce66`。判断形式、質問の独立性、confidenceの説明を参照。
-- [S3] 公式JavaScript SDK型定義: https://github.com/typesafe-ai/typesafe-sdk-js/blob/66880ccded6cb642dc1809620c2b108c33730214/src/types.ts 。入出力、usage、既定値、再試行・ログの契約を参照。
-- [S4] 同SDK README: https://github.com/typesafe-ai/typesafe-sdk-js/blob/66880ccded6cb642dc1809620c2b108c33730214/README.md 。パッケージと呼び出し方法を参照。
-- [S5] OpenAI公式App Server: https://developers.openai.com/codex/app-server/ （取得時は https://learn.chatgpt.com/docs/app-server へ転送）。モデル発見、turn設定、イベント、SDKとの使い分けを参照。
-- [S6] OpenAI公式非対話実行: https://learn.chatgpt.com/docs/non-interactive-mode 。認証の注意事項を参照。
+| ID | 出典・確認範囲 |
+|---|---|
+| S1 | [Rahul氏の記事](https://x.com/sairahul1/article/2102694818485096803)。利用者提供本文。アプリ設定、分業、例・仮説を参照し、全文や性能保証は転載しない |
+| S2 | [TypeSafe公式Skill](https://github.com/typesafe-ai/skills/blob/main/skills/typesafe-ai/SKILL.md)。初版確認blob `0109513f9656917dc93cbc5ecddfca465a53ce66`。型付き判断、質問の独立性、confidenceの説明を継承 |
+| S3 | [公式JavaScript SDK型定義](https://github.com/typesafe-ai/typesafe-sdk-js/blob/66880ccded6cb642dc1809620c2b108c33730214/src/types.ts)。入出力、usage、再試行・ログの契約 |
+| S4 | [同SDK README](https://github.com/typesafe-ai/typesafe-sdk-js/blob/66880ccded6cb642dc1809620c2b108c33730214/README.md)。パッケージと呼出し方法 |
+| S5 | [OpenAI: Plugins in ChatGPT and Codex](https://help.openai.com/en/articles/20001256-plugins-in-chatgpt-and-codex)。skillと接続・権限の区別、利用条件。アプリの無人継続の保証には使わない |
+| S6 | [OpenAI: Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)。CI等の認証の注意。アプリ中心の構成とworker認証を分ける |
+| S7 | [CodeRabbit: Review commands](https://docs.coderabbit.ai/reference/review-commands)。manual full/incremental review。コマンド自体にexact-head指定があるとは主張しない |
+| S8 | [CodeRabbit: Configuration](https://docs.coderabbit.ai/reference/configuration)。状態表示、検査範囲、変更機能・自動承認の設定。導入時は実際の版と設定で再確認 |
+| S9 | [GitHub: Triggering a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。GITHUB_TOKEN由来のissue_commentと別workflow起動の制約 |
+| S10 | [CodeRabbit: Auto review](https://docs.coderabbit.ai/configuration/auto-review)。自動起動・差分レビュー・除外と手動依頼の関係 |
 
-指定された https://docs.typesafe.ai/introduction と関連ページの本文は今回の取得環境では直接取得できなかった。代わりに上記公式Skill/SDKで確認した範囲だけを仕様として採用した。実APIによる確認は未実施であり、文書上の契約確認と区別する。
+TypeSafe Introductionとconfidenceページの直接取得は本環境ではできなかった。初版で確認した公式Skill/SDKの契約を継承し、実API確認は未実施として扱う。製品の名称や機能の利用可否を記事の日付表示だけで判定しない。

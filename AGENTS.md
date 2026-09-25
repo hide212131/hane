@@ -71,6 +71,8 @@ AADW 専用の collector、wrapper、workflow、status、receipt、Gate は前�
 
 ## 次期AADW v3の設計（運用未有効化）
 
-[AADW v3設計書](docs/agentic-development-workflow-v3.md)、[ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)、[実装・評価計画](docs/aadw-v3-execution-plan.md)は、Jevによる限定判断とCodex実装の分離を設計する文書である。
+[AADW v3設計書](docs/agentic-development-workflow-v3.md)、[ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)、[実装・評価計画](docs/aadw-v3-execution-plan.md)は、ChatGPTアプリを操作・指揮の中心とし、GitHub Actions経由のClaude Code実装、条件付きCodex切替、CodeRabbitレビュー、Jevの限定判断を組み合わせる次期設計である。
 
-設計Issue #332の完了や文書のmergeを、v3の稼働開始と解釈しない。実装・評価・有効化はIssue #333で追跡する。現行のCommander Policy、v2の役割、既存fallbackは変更しない。有効化PRで評価結果と適用範囲を示し、Commander Policyと本書を同時に更新するまでは、将来仕様を根拠に自動反復や権限委譲を開始しない。
+設計Issue #332と改訂Issue #335の完了や文書のmergeを、v3の稼働開始と解釈しない。実装・評価・有効化はIssue #333で追跡する。現行のCommander Policy、v2の役割、既存fallbackは変更しない。有効化PRで評価結果と適用範囲を示し、Commander Policyと本書を同時に更新するまでは、将来仕様を根拠に自動反復や権限委譲を開始しない。
+
+現行のCodexレビューと利用上限時だけのCodex実装は、有効化PRで明示的に変更するまで維持する。アプリ内のCommanderと代替実装workerのCodexは別の役割である。独立したCodex App Server実行器やアプリ終了後の無人進行を、初期v3の前提にしない。

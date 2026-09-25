@@ -22,7 +22,7 @@
 
 | ADR | 内容 |
 |---|---|
-| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | Jevの限定判断・Codex実装・検証ツールを分離するAADW v3。現行v2を維持し、実装・有効化はIssue #333で追跡する |
+| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | ChatGPTアプリ中心・Actions経由のClaude優先/条件付きCodex・CodeRabbitレビュー・Jev限定判断によるAADW v3（#335で改訂）。現行v2を維持し、実装・有効化はIssue #333で追跡する |
 
 ## Active
 
