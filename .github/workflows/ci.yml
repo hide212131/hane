@@ -32,6 +32,10 @@ jobs:
       - name: Test code-block focused GUI procedure
         run: python3 scripts/tests/test_hosted_code_block_gui.py
 
+      - name: Test AADW Jev contract
+        if: ${{ hashFiles('scripts/tests/test_aadw_jev_contract.py') != '' }}
+        run: python3 scripts/tests/test_aadw_jev_contract.py
+
       - name: Test Claude failure diagnostics
         run: python3 .github/tests/test_claude_failure_diagnostic.py
 
