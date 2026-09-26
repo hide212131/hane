@@ -293,10 +293,21 @@ func findPathFragments(_ path: String, _ expectedNoWhitespace: String) {
         guard let candidate = observation.topCandidates(1).first else { continue }
         let stripped = String(candidate.string.filter { !$0.isWhitespace })
         if stripped.isEmpty { continue }
-        guard expectedNoWhitespace.contains(stripped) else { continue }
+
+        // HoverCard text is intentionally constrained by its max width, so a
+        // long absolute path may be rendered with a trailing ellipsis. OCR
+        // then sees a visible prefix such as ".../file-tabs-focu..." rather
+        // than the complete path. Strip only a trailing ellipsis for matching;
+        // the later clipboard check still proves the exact full path.
+        let visible = stripped
+            .replacingOccurrences(of: "…", with: "")
+            .replacingOccurrences(of: "...", with: "")
+        if visible.isEmpty { continue }
+        guard expectedNoWhitespace.contains(visible) else { continue }
+
         let fullRange = candidate.string.startIndex..<candidate.string.endIndex
         guard let box = try? candidate.boundingBox(for: fullRange) else { continue }
-        fragments.append((stripped, box.boundingBox))
+        fragments.append((visible, box.boundingBox))
     }
     guard !fragments.isEmpty else { fail("no OCR fragment matched the expected path") }
 
