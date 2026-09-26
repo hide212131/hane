@@ -49,3 +49,15 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   `EntryType` 型不一致の拒否ケースも含む。
 - この検査はfixtureレベルの契約検査であり、実サービスへの接続確認では
   ない。実サービス接続の証拠はIssue #333側で別途記録する。
+- current headのレビューで残ったfail-closed契約の不足2件を修正した。
+  CLIの入力読み込みで`UnicodeDecodeError`（invalid UTF-8）が
+  未捕捉だったため、request/resultどちらの読み込みでも捕捉して
+  `EXIT_VIOLATION`とcontract violationメッセージを返すようにした
+  （missing/unreadable fileの`EXIT_USAGE`は変更していない）。また
+  `_is_finite_number`がint/floatの両方に`math.isfinite`を適用しており、
+  任意精度の巨大int（例: `10**1000`）でfloat変換の`OverflowError`が
+  漏れていたため、intはfloat変換せず有限として扱い、`math.isfinite`は
+  floatのみに適用するよう修正した（boolは引き続き数値として拒否する）。
+  巨大intのNoul/confidence/probabilityは0〜1範囲外として`ContractError`に
+  なり、nested JSON value内の巨大intはJSON互換として許可されることを
+  回帰テストで確認した。

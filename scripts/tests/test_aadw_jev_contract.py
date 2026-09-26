@@ -212,6 +212,13 @@ class EntryTypeShapeTests(unittest.TestCase):
         request["state"] = {"count": 3, "enabled": True, "nested": [1, 2.5, False]}
         contract.check(request, valid_result())
 
+    def test_nested_huge_integer_in_state_is_allowed(self):
+        # An arbitrary-precision int nested in a JSON value is still a valid
+        # JSON number and must not raise (e.g. via math.isfinite overflow).
+        request = valid_request()
+        request["state"] = {"count": 10**1000}
+        contract.check(request, valid_result())
+
     def test_unscanned_request_field_with_nonfinite_value_is_rejected_as_dict(self):
         # A field outside the recognized schema (state/questions/model) must
         # still be rejected if it carries a non-JSON-compatible value.
@@ -331,6 +338,14 @@ class NoulAnswerTests(unittest.TestCase):
                 with self.assertRaises(contract.ContractError):
                     contract.check(json.dumps(valid_request()), result_text)
 
+    def test_huge_integer_noul_is_rejected_as_contract_error(self):
+        # An arbitrary-precision int (e.g. 10**1000) is a valid JSON number
+        # but is out of [0, 1] and must raise ContractError, not OverflowError.
+        result = valid_result()
+        result["answers"]["sentiment"]["noul"] = 10**1000
+        with self.assertRaises(contract.ContractError):
+            contract.check(valid_request(), result)
+
 
 class ChoiceAnswerTests(unittest.TestCase):
     def test_choice_outside_criteria_is_rejected(self):
@@ -413,6 +428,28 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             code = contract.main(["aadw_jev_contract.py", "missing-a.json", "missing-b.json"])
         self.assertEqual(code, contract.EXIT_USAGE)
+
+    def test_invalid_utf8_request_exits_as_violation_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            request_path = directory / "request.json"
+            request_path.write_bytes(b"\xff\xfe not valid utf-8")
+            result_path = self._write(directory, "result.json", valid_result())
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                code = contract.main(["aadw_jev_contract.py", str(request_path), result_path])
+        self.assertEqual(code, contract.EXIT_VIOLATION)
+        self.assertIn("contract violation", error.getvalue())
+
+    def test_invalid_utf8_result_exits_as_violation_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            request_path = self._write(directory, "request.json", valid_request())
+            result_path = directory / "result.json"
+            result_path.write_bytes(b"\xff\xfe not valid utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                code = contract.main(["aadw_jev_contract.py", request_path, str(result_path)])
+        self.assertEqual(code, contract.EXIT_VIOLATION)
+        self.assertIn("contract violation", error.getvalue())
 
     def test_unhashable_choice_exits_as_violation_not_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:

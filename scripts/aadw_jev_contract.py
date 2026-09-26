@@ -50,8 +50,17 @@ def _require(condition: bool, message: str) -> None:
 def _is_finite_number(value: Any) -> bool:
     # bool is an int subclass in Python and json permits NaN/Infinity as an
     # extension, so both must be excluded explicitly rather than relying on
-    # isinstance(value, (int, float)) or a bare math.isfinite call.
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    # isinstance(value, (int, float)) or a bare math.isfinite call. An
+    # arbitrary-precision int (e.g. 10**1000) is always finite and must not be
+    # passed to math.isfinite, whose internal float conversion raises
+    # OverflowError for magnitudes beyond float range.
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return False
 
 
 def _is_unit_interval(value: Any) -> bool:
@@ -228,6 +237,9 @@ def main(argv: list[str]) -> int:
     except OSError as exc:
         print(f"cannot read input: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    except UnicodeDecodeError as exc:
+        print(f"contract violation: input is not valid UTF-8: {exc}", file=sys.stderr)
+        return EXIT_VIOLATION
     try:
         check(request_raw, result_raw)
     except ContractError as exc:
