@@ -7,7 +7,7 @@
 use gpui::Focusable;
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use hane_session::StateStores;
-use hane_ui::{EditorView, WorkFolderIcons, register_key_bindings};
+use hane_ui::{AppAssets, EditorView, register_key_bindings};
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
@@ -116,7 +116,7 @@ fn main() {
     #[cfg(not(feature = "instrument"))]
     let untitled_source: &str = DEFAULT_DOCUMENT;
     gpui_platform::application()
-        .with_assets(WorkFolderIcons)
+        .with_assets(AppAssets)
         .run(move |cx: &mut App| {
             register_key_bindings(cx);
             let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);

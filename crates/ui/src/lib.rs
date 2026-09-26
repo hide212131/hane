@@ -23,7 +23,7 @@ mod theme;
 mod view;
 
 pub use actions::register_key_bindings;
-pub use icons::WorkFolderIcons;
+pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use view::EditorView;

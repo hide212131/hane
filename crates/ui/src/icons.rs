@@ -62,8 +62,9 @@ const CHECK_SVG: &[u8] = include_bytes!(concat!(
 ));
 
 /// Serves the work-folder sidebar icons from memory. Every other asset
-/// path (there are none yet, but a future one) resolves to `None`, the same
-/// as gpui's default no-op `AssetSource`.
+/// path falls through to `None`, the same as gpui's default no-op
+/// `AssetSource`; `AppAssets` is what composes this with `gpui-component`'s
+/// own icon set for paths Hane does not own.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkFolderIcons;
 
@@ -85,5 +86,75 @@ impl AssetSource for WorkFolderIcons {
 
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(vec![])
+    }
+}
+
+/// The `AssetSource` registered with the app via `Application::with_assets`.
+/// gpui only allows one asset source per app, but Hane's own sidebar icons
+/// (`WorkFolderIcons`) and `gpui-component`'s standard icon set (e.g. the
+/// `IconName::Copy` glyph used by the file tab `HoverCard`) are bundled
+/// separately, so this tries Hane's own icons first and falls back to
+/// `gpui-component`'s bundled assets for anything Hane does not own.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = WorkFolderIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_component::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut entries = WorkFolderIcons.list(path)?;
+        entries.extend(gpui_component::Assets.list(path)?);
+        Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_assets_serves_hane_icons_unchanged() {
+        for path in [
+            ICON_FILE,
+            ICON_FOLDER,
+            ICON_FILE_NEW,
+            ICON_FOLDER_NEW,
+            ICON_CHEVRON_RIGHT,
+            ICON_CHEVRON_DOWN,
+            ICON_SETTINGS,
+            ICON_ARROW_LEFT,
+            ICON_CHECK,
+        ] {
+            assert_eq!(
+                AppAssets.load(path).unwrap(),
+                WorkFolderIcons.load(path).unwrap(),
+                "AppAssets must keep serving Hane's own icon at {path} unchanged"
+            );
+        }
+    }
+
+    // gpui-component's own icon set, resolved through `gpui_component::Assets`
+    // rather than one of Hane's `ICON_*` constants. This is what
+    // `IconName::Copy` (the file tab HoverCard's copy button) needs to
+    // resolve to an actual SVG instead of gpui's default no-op AssetSource.
+    #[test]
+    fn app_assets_falls_back_to_component_copy_icon() {
+        let path = "icons/copy.svg";
+        assert!(
+            WorkFolderIcons.load(path).unwrap().is_none(),
+            "this path must not collide with one of Hane's own icons"
+        );
+        let resolved = AppAssets
+            .load(path)
+            .expect("gpui-component's Assets must not error for its own bundled copy icon");
+        assert!(
+            resolved.is_some(),
+            "expected gpui-component's bundled Assets to resolve {path} so IconName::Copy renders"
+        );
     }
 }
