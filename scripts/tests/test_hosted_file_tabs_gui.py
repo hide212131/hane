@@ -22,6 +22,10 @@ class ProcedureIdentityTests(unittest.TestCase):
         for label in ("System", "Light", "Dark"):
             self.assertRegex(f"Theme {label}", mod.THEME_PATTERN)
 
+    def test_visible_tab_label_uses_fixture_stem(self):
+        self.assertEqual(mod.FIXTURE_FILENAME, "file-tabs-focus.md")
+        self.assertEqual(mod.FIXTURE_TAB_LABEL, "file-tabs-focus")
+
 
 class ColorHelperTests(unittest.TestCase):
     def test_parse_hex_color_accepts_well_formed_value(self):

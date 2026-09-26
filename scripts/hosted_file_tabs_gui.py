@@ -38,6 +38,7 @@ EXIT_PASS = 0
 EXIT_NONPASS = 1
 
 FIXTURE_FILENAME = "file-tabs-focus.md"
+FIXTURE_TAB_LABEL = Path(FIXTURE_FILENAME).stem
 FIXTURE_CONTENT = (
     "# file tabs focused fixture\n"
     "\n"
@@ -260,7 +261,7 @@ def run_focused_scenario(
                 light_text = helper_json(interaction, helper, ["find-text", str(light_image), THEME_PATTERN], helper_timeout)
                 light_label = theme_label_from_text(light_text.get("matched_text", ""))
                 light_tab = helper_json(
-                    interaction, helper, ["tab-background", str(light_image), re.escape(FIXTURE_FILENAME)], helper_timeout
+                    interaction, helper, ["tab-background", str(light_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
                 )
                 light_background = light_tab.get("background_color")
                 steps.append(step(
@@ -282,7 +283,7 @@ def run_focused_scenario(
                     dark_text = helper_json(interaction, helper, ["find-text", str(dark_image), THEME_PATTERN], helper_timeout)
                     dark_label = theme_label_from_text(dark_text.get("matched_text", ""))
                     dark_tab = helper_json(
-                        interaction, helper, ["tab-background", str(dark_image), re.escape(FIXTURE_FILENAME)], helper_timeout
+                        interaction, helper, ["tab-background", str(dark_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
                     )
                     dark_background = dark_tab.get("background_color")
                     steps.append(step(
@@ -337,7 +338,7 @@ def run_focused_scenario(
                 try:
                     hover_evidence = helper_json(
                         interaction, helper,
-                        ["hover-text", str(pid), str(dark_image), re.escape(FIXTURE_FILENAME)], helper_timeout
+                        ["hover-text", str(pid), str(dark_image), re.escape(FIXTURE_TAB_LABEL)], helper_timeout
                     )
                     time.sleep(0.6)
                     hover_image = scenario_dir / "hover-path.png"
