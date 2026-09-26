@@ -299,9 +299,12 @@ func findPathFragments(_ path: String, _ expectedNoWhitespace: String) {
         // then sees a visible prefix such as ".../file-tabs-focu..." rather
         // than the complete path. Strip only a trailing ellipsis for matching;
         // the later clipboard check still proves the exact full path.
-        let visible = stripped
-            .replacingOccurrences(of: "…", with: "")
-            .replacingOccurrences(of: "...", with: "")
+        var visible = stripped
+        if visible.hasSuffix("…") {
+            visible.removeLast()
+        } else if visible.hasSuffix("...") {
+            visible.removeLast(3)
+        }
         if visible.isEmpty { continue }
         guard expectedNoWhitespace.contains(visible) else { continue }
 
