@@ -20,9 +20,7 @@
 
 設計は採用するが、実装・運用への適用は未完了。文書のmergeだけでは現行の運用規則を置き換えない。
 
-| ADR | 内容 |
-|---|---|
-| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | アプリ中心のAADW v3。Actions経由のClaude優先・条件付きCodex、CodeRabbitレビュー、Jevの限定判断、必要時GUI検証。改訂はIssue #336、実装・有効化はIssue #333。現行v2は維持する |
+現在は該当なし。
 
 ## Active
 
@@ -40,9 +38,9 @@
 | [ADR-0020](0020-block-virtualization.md) | ブロック単位の仮想化と描画 |
 | [ADR-0021](0021-layout-lines-and-visual-coordinates.md) | LayoutLine と visual 座標系 |
 | [ADR-0022](0022-layout-cache-invalidation.md) | レイアウトキャッシュの無効化と高さ差分更新 |
-| [ADR-0024](0024-local-gui-validation.md) | GUI 検証を独立した観測手段とし、ローカル CLI と trusted hosted entrypoint を使う trust boundary（AADW orchestration は ADR-0027 で改訂） |
-| [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | AADW v2 を ChatGPT Commander + GitHub facts で運用する |
+| [ADR-0024](0024-local-gui-validation.md) | GUI 検証を独立した観測手段とし、ローカル CLI と trusted hosted entrypoint を使う trust boundary（AADW orchestration は ADR-0031 で改訂） |
 | [ADR-0029](0029-source-first-list-editing.md) | Markdown source を唯一の Model とする list editing と同期 ListEditProjection |
+| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | アプリ中心のAADW v3。Actions経由のClaude優先・条件付きCodex、CodeRabbit通常レビュー、Jevの意味判断、必要時GUI検証 |
 
 ## Superseded / amended
 
@@ -53,8 +51,9 @@
 | [ADR-0006](0006-presentation-blocks-and-virtual-scroll.md) | [ADR-0020](0020-block-virtualization.md)、[ADR-0021](0021-layout-lines-and-visual-coordinates.md)、[ADR-0022](0022-layout-cache-invalidation.md) |
 | [ADR-0008](0008-markdown-parsing-strategy.md) | [ADR-0018](0018-block-index.md)、[architecture](../architecture.md) |
 | [ADR-0009](0009-performance-harness.md) | [architecture](../architecture.md)、[baseline](../baseline/README.md) |
-| [ADR-0023](0023-ai-agent-development-workflow.md) | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) |
-| [ADR-0026](0026-work-design-handoff.md) | [ADR-0027](0027-aadw-v2-chatgpt-commander.md) |
+| [ADR-0023](0023-ai-agent-development-workflow.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)（v1→v2の履歴はADR-0027） |
+| [ADR-0026](0026-work-design-handoff.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)（v1→v2の履歴はADR-0027） |
+| [ADR-0027](0027-aadw-v2-chatgpt-commander.md) | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) |
 
 ## History
 

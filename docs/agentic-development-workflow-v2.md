@@ -1,5 +1,8 @@
 # AI Agent Development Workflow v2 設計書
 
+> [!IMPORTANT]
+> この文書は v2 の設計記録である。現行の正本は [AADW v3 設計書](agentic-development-workflow-v3.md)、[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)、[Commander Policy](aadw-command-policy.md) とする。v3 は v2 の `Observe → Decide → Act → Observe` と GitHub facts を正本にする原則を引き継ぐ。
+
 ## 1. 位置づけ
 
 この文書は、Hane の AI Agent Development Workflow（AADW）を一から作り直すための v2 設計書である。

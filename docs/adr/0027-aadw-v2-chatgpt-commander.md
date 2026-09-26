@@ -2,7 +2,7 @@
 
 ## ステータス
 
-採用
+Superseded — [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) により現行の役割分担を置換。v2で導入した GitHub facts と `Observe → Decide → Act → Observe` の原則は v3 に引き継ぐ。
 
 ## 日付
 
@@ -83,4 +83,4 @@ ADR-0023 と ADR-0026 のうち、Copilot judge、GitHub Actions による状態
 
 ## 正本
 
-具体的な全体設計は [`docs/agentic-development-workflow-v2.md`](../agentic-development-workflow-v2.md)、Commander の判断ルールは [`docs/aadw-command-policy.md`](../aadw-command-policy.md) を正とする。この ADR に判断ルールを追加して重複させない。
+このADRが採用されていたv2当時の全体設計は [`docs/agentic-development-workflow-v2.md`](../agentic-development-workflow-v2.md) に記録する。現行の全体設計は [`docs/agentic-development-workflow-v3.md`](../agentic-development-workflow-v3.md) と [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)、Commander の判断ルールは [`docs/aadw-command-policy.md`](../aadw-command-policy.md) を正とする。
