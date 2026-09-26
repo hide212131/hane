@@ -88,6 +88,22 @@ class ValidPairTests(unittest.TestCase):
         contract.check(request, valid_result())
 
 
+class ParseIntTests(unittest.TestCase):
+    def test_parse_int_matches_builtin_conversion_across_chunk_boundaries(self):
+        # Exercise digit counts on both sides of the internal chunk size so
+        # the chunked reconstruction lines up correctly at the boundary.
+        for digit_count in (1, 3, contract._INT_CHUNK_DIGITS - 1, contract._INT_CHUNK_DIGITS,
+                             contract._INT_CHUNK_DIGITS + 1, contract._INT_CHUNK_DIGITS * 4 + 1):
+            with self.subTest(digit_count=digit_count):
+                digits = "".join(str((i % 9) + 1) for i in range(digit_count))
+                self.assertEqual(contract.parse_int(digits), int(digits))
+                self.assertEqual(contract.parse_int("-" + digits), -int(digits))
+
+    def test_parse_int_handles_zero(self):
+        self.assertEqual(contract.parse_int("0"), 0)
+        self.assertEqual(contract.parse_int("-0"), 0)
+
+
 class MalformedJsonTests(unittest.TestCase):
     def test_invalid_request_json_is_rejected(self):
         with self.assertRaises(contract.ContractError):
@@ -237,6 +253,55 @@ class EntryTypeShapeTests(unittest.TestCase):
         self.assertIn("NaN", request_text)
         with self.assertRaises(contract.ContractError):
             contract.check(request_text, json.dumps(valid_result()))
+
+
+class HugeIntegerAndDeepNestingJsonTextTests(unittest.TestCase):
+    # A 5000-digit literal, built without ever converting it to/from str via
+    # Python's own int<->str conversion (which is itself subject to the same
+    # digit limit this suite is regression-testing around).
+    BIG_DIGITS = "1" * 5000
+
+    def test_huge_integer_nested_in_state_json_text_is_allowed(self):
+        # A JSON *text* request (not a pre-built Python dict) with a
+        # 5000-digit integer nested inside state must still parse and pass:
+        # json.loads's default int() parse_int would raise ValueError here
+        # due to Python's int-from-string conversion digit limit.
+        request_text = json.dumps(valid_request()).replace(
+            '"topic": "example"', f'"topic": "example", "big": {self.BIG_DIGITS}')
+        contract.check(request_text, json.dumps(valid_result()))  # must not raise
+
+    def test_huge_integer_in_noul_field_json_text_is_rejected(self):
+        # The same huge integer in a 0..1 field must still be rejected as out
+        # of range, not crash while parsing or comparing it.
+        result_text = json.dumps(valid_result()).replace(
+            '"noul": 0.73', f'"noul": {self.BIG_DIGITS}')
+        with self.assertRaises(contract.ContractError):
+            contract.check(json.dumps(valid_request()), result_text)
+
+    def test_deeply_nested_json_text_fails_closed_without_recursion_error(self):
+        # A deeply nested JSON text must fail closed as ContractError. If
+        # RecursionError leaked instead, assertRaises(ContractError) below
+        # would fail with that RecursionError rather than pass.
+        nested_text = "[" * 3000 + "]" * 3000
+        request_text = json.dumps(valid_request()).replace(
+            '"topic": "example"', f'"topic": "example", "deep": {nested_text}')
+        with self.assertRaises(contract.ContractError):
+            contract.check(request_text, json.dumps(valid_result()))
+
+    def test_deeply_nested_state_object_fails_closed_without_recursion_error(self):
+        # Same as above but via a directly-passed Python object (bypassing
+        # parse_json/json.loads entirely), built iteratively so the fixture
+        # itself doesn't hit Python's recursion limit while being built.
+        # This exercises _require_json_compatible's own RecursionError guard.
+        nested: list = []
+        current = nested
+        for _ in range(3000):
+            current.append([])
+            current = current[0]
+        request = valid_request()
+        request["state"] = nested
+        with self.assertRaises(contract.ContractError):
+            contract.check(request, valid_result())
 
 
 class ResultShapeTests(unittest.TestCase):

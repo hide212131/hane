@@ -61,3 +61,19 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   巨大intのNoul/confidence/probabilityは0〜1範囲外として`ContractError`に
   なり、nested JSON value内の巨大intはJSON互換として許可されることを
   回帰テストで確認した。
+- current headのCodeRabbit/Codexレビューで残ったfail-closed契約の不足を
+  修正した。Python 3.11以降はint-from-string変換の桁数上限
+  （`sys.set_int_max_str_digits`、既定4300）があり、`parse_json()`が
+  `json.loads`の既定`parse_int`（組み込み`int()`）に依存していたため、
+  nested JSON value内の5000桁級integerを含むJSON *text*で`ValueError`が
+  未捕捉のまま漏れていた。桁数上限に依存せず小さいdigit chunkから算術で
+  組み立てる`parse_int`を追加し、`json.loads(..., parse_int=parse_int)`で
+  使うことで、既存契約（nested JSON value内の任意精度intは許可、
+  Noul/confidence/probabilityのような0〜1 fieldでの巨大intは拒否）を
+  変えずに桁数上限を回避した。また深くネストしたJSONで`json.loads`や
+  `_is_json_value`の再帰から`RecursionError`が漏れ得たため、
+  `parse_json()`と`_require_json_compatible()`の双方でfail closedに
+  `ContractError`へ変換するようにした。5000桁級integerがnested state
+  JSON textでは許可され0〜1 fieldでは拒否されること、深くネストしたJSON
+  text・直接dict入力の両方で`RecursionError`を漏らさず`ContractError`に
+  なること、既存テストが弱まっていないことを回帰テストで確認した。

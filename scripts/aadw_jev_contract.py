@@ -37,6 +37,11 @@ EXIT_OK = 0
 EXIT_VIOLATION = 1
 EXIT_USAGE = 2
 
+# Well under Python's default int<->str conversion digit limit (4300, and a
+# minimum of 640 if lowered via sys.set_int_max_str_digits), so building an
+# arbitrary-precision int chunk-by-chunk here never hits that limit itself.
+_INT_CHUNK_DIGITS = 200
+
 
 class ContractError(ValueError):
     """A request/result pair violates the fixed Jev/TypeSafe System One contract."""
@@ -97,11 +102,35 @@ def _is_entry_type(value: Any) -> bool:
     return False
 
 
+def parse_int(text: str) -> int:
+    """Parse a JSON integer literal into an arbitrary-precision int.
+
+    json.loads's default parse_int is the builtin int(), which enforces
+    Python's int-from-string conversion digit limit (sys.set_int_max_str_digits,
+    default 4300) and raises ValueError for a longer literal such as a
+    5000-digit integer nested in a JSON value. This builds the value from
+    small digit chunks via arithmetic (which has no such limit) instead of
+    ever converting the full-length digit string to int in one call.
+    """
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    value = 0
+    for start in range(0, len(digits), _INT_CHUNK_DIGITS):
+        chunk = digits[start:start + _INT_CHUNK_DIGITS]
+        value = value * (10 ** len(chunk)) + int(chunk)
+    return -value if negative else value
+
+
 def parse_json(raw: Any, label: str) -> Any:
     if isinstance(raw, (str, bytes)):
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError as exc:
+            return json.loads(raw, parse_int=parse_int)
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            # json.JSONDecodeError covers syntax errors; ValueError also covers
+            # any parser-internal digit-limit style failure; RecursionError
+            # covers deeply nested input exceeding the C/Python recursion
+            # depth while scanning. All must fail closed as ContractError
+            # rather than leak a raw traceback.
             raise ContractError(f"{label} is not valid JSON: {exc}") from exc
     return raw
 
@@ -110,7 +139,14 @@ def _require_json_compatible(value: Any, label: str) -> None:
     # Walks the entire structure, not just recognized fields, so an
     # unexpected/unscanned field containing NaN/Infinity/-Infinity is
     # rejected the same as a recognized one.
-    _require(_is_json_value(value),
+    try:
+        compatible = _is_json_value(value)
+    except RecursionError as exc:
+        # A directly-passed dict/list (not via parse_json) can still be
+        # deeply nested enough to exceed the recursion limit during this
+        # walk; fail closed instead of leaking RecursionError.
+        raise ContractError(f"{label} is nested too deeply to validate") from exc
+    _require(compatible,
              f"{label} must be JSON-compatible (no NaN/Infinity/-Infinity anywhere, including unrecognized fields)")
 
 
