@@ -16,6 +16,28 @@ pull requests.
 - Commander Policy / AGENTS changed: no
 - CodeRabbit autofix, fix-ci, merge, or unrelated write action requested: no
 
-The exact baseline PR head, CodeRabbit run ID, reviewed range, selected files,
-and completion result are recorded in the PR and parent issue after the live
-review completes.
+The baseline full review must record the exact PR head, CodeRabbit actor and run
+ID, reviewed base-to-head range, selected files, completion result, actionable
+result, and unresolved-thread count.
+
+## Incremental review
+
+After the baseline full review has completed, add exactly one small docs-only
+commit to this file and record its new exact head. Compare the baseline head to
+the new head and record the commit/file delta before requesting review.
+
+Invoke `@coderabbitai review` on the new head. Treat it as successful
+incremental evidence only when the CodeRabbit actor accepts and completes the
+request and the observed review range covers the post-baseline delta rather
+than re-running a full base-to-head review.
+
+Record separately from the baseline:
+
+- baseline head and new head;
+- trigger comment and CodeRabbit actor/run;
+- reviewed commit range and selected files;
+- actionable or no-actionable result;
+- unresolved review-thread count at the new head.
+
+If the observed run is a full review, or the reviewed delta/range cannot be
+established, the incremental acceptance remains unknown.
