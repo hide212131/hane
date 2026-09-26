@@ -1047,6 +1047,109 @@ impl LayoutCacheEntry {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod vscode_windows {
+    //! Resolves the actual `Code.exe` GUI executable for launching VS Code.
+    //!
+    //! `code` on PATH is a `.cmd` shim that Windows process creation does not
+    //! invoke directly, and a running GUI process is not guaranteed to see a
+    //! PATH refreshed after installation. VS Code's installer registers
+    //! `Code.exe` under the registry's App Paths key, which Microsoft
+    //! documents as an executable lookup that does not depend on PATH.
+    use std::env;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::HKEY;
+
+    const APP_PATHS_SUBKEY: &str =
+        r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
+
+    pub(super) fn resolve_executable() -> OsString {
+        resolve_from(&candidate_paths())
+    }
+
+    fn resolve_from(candidates: &[PathBuf]) -> OsString {
+        first_existing_file(candidates)
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|| OsString::from("code"))
+    }
+
+    fn candidate_paths() -> Vec<PathBuf> {
+        [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+            .into_iter()
+            .filter_map(app_paths_default_value)
+            .chain(default_install_paths())
+            .collect()
+    }
+
+    fn app_paths_default_value(root: HKEY) -> Option<PathBuf> {
+        let key = RegKey::predef(root).open_subkey(APP_PATHS_SUBKEY).ok()?;
+        let value = key.get_value::<String, _>("").ok()?;
+        Some(PathBuf::from(value))
+    }
+
+    fn default_install_paths() -> Vec<PathBuf> {
+        [
+            env::var_os("LOCALAPPDATA")
+                .map(|dir| Path::new(&dir).join(r"Programs\Microsoft VS Code\Code.exe")),
+            env::var_os("ProgramFiles")
+                .map(|dir| Path::new(&dir).join(r"Microsoft VS Code\Code.exe")),
+            env::var_os("ProgramFiles(x86)")
+                .map(|dir| Path::new(&dir).join(r"Microsoft VS Code\Code.exe")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn first_existing_file(candidates: &[PathBuf]) -> Option<PathBuf> {
+        candidates.iter().find(|path| path.is_file()).cloned()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn scratch_dir(label: &str) -> PathBuf {
+            let dir = env::temp_dir().join(format!(
+                "hane-vscode-windows-test-{label}-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            dir
+        }
+
+        #[test]
+        fn resolve_from_prefers_the_first_existing_candidate_in_order() {
+            let dir = scratch_dir("prefers-first");
+            let missing = dir.join("missing-code.exe");
+            let first_existing = dir.join("first-code.exe");
+            let second_existing = dir.join("second-code.exe");
+            fs::write(&first_existing, b"").unwrap();
+            fs::write(&second_existing, b"").unwrap();
+
+            let resolved = resolve_from(&[missing, first_existing.clone(), second_existing]);
+
+            assert_eq!(resolved, first_existing.into_os_string());
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn resolve_from_falls_back_to_the_path_shim_when_nothing_exists() {
+            let dir = scratch_dir("falls-back");
+            let candidates = vec![dir.join("a.exe"), dir.join("b.exe")];
+
+            let resolved = resolve_from(&candidates);
+
+            assert_eq!(resolved, OsString::from("code"));
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+}
+
 impl EditorView {
     pub(crate) fn inline_rename_active(&self) -> bool {
         self.inline_rename.is_some()
@@ -2528,7 +2631,13 @@ impl EditorView {
             command.args(["-b", "com.microsoft.VSCode"]).arg(path);
             command
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new(vscode_windows::resolve_executable());
+            command.arg(path);
+            command
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let mut command = Command::new("code");
             command.arg(path);
@@ -8421,9 +8530,16 @@ mod tests {
             ]
         );
 
-        #[cfg(not(target_os = "macos"))]
+        // Windows resolves a real executable path (an App Paths registration
+        // or a known VS Code install location) instead of a fixed literal,
+        // so only argument retention is pinned here; resolution order and
+        // fallback are covered by `vscode_windows::tests`.
+        #[cfg(target_os = "windows")]
+        assert_eq!(args, vec![path.as_os_str()]);
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(command.get_program(), std::ffi::OsStr::new("code"));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(args, vec![path.as_os_str()]);
     }
 
