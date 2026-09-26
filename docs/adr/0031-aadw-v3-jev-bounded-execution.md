@@ -2,7 +2,7 @@
 
 ## ステータス
 
-設計採用。初版はPR #334で採用し、Issue [#336](https://github.com/hide212131/hane/issues/336)で構成を改訂した。Jevの意味判断はCommander Policyへ反映済みであり、CodeRabbitの通常レビューはIssue #360の実run検証とIssue #373の切替で有効化する。残る実装・検証はIssue #333で追跡する。
+設計採用。初版はPR #334で採用し、Issue [#336](https://github.com/hide212131/hane/issues/336)で構成を改訂した。Jevの意味判断はCommander Policyへ反映済みであり、CodeRabbitの通常レビューはIssue #360の実run検証とIssue #373の切替で有効化した。残る実装・検証はIssue #333で追跡する。
 
 このADRはv3導入時の設計判断を記録する。Jevの意味判断とCodeRabbit通常レビューは、[Commander Policy](../aadw-command-policy.md)と[AGENTS.md](../../AGENTS.md)に従う現行運用である。その他のv3移行状態は個別のIssue/PRで確認する。
 
@@ -39,7 +39,7 @@ Commanderの文章生成・設計と、Jevの狭い判断を分ける。独立�
 
 ## レビュー・GUI・完了
 
-CodeRabbitの導入と権限、依頼受理、full/incremental reviewの範囲はIssue #360で実run確認した。Issue #373の切替ではAutomatic ReviewとAutomatic Incremental Reviewを有効にし、2 reviewed commitsで自動pauseする。通常の修正中レビューは自動増分を利用するが、最終候補はcurrent-head CI成功後にmanual full reviewを実行して全体を再確認する。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。Codexレビューは通常経路として要求しない。
+CodeRabbitの導入と権限、依頼受理、full/incremental reviewの範囲はIssue #360で実run確認した。Issue #373の切替でAutomatic ReviewとAutomatic Incremental Reviewを有効化し、2 reviewed commitsで自動pauseする運用にした。通常の修正中レビューは自動増分を利用するが、最終候補はcurrent-head CI成功後にmanual full reviewを実行して全体を再確認する。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。Codexレビューは通常経路として要求しない。
 
 GUIは[ADR-0024](0024-local-gui-validation.md)の既存Hosted/ローカル経路を継続する。Commanderが変更内容と受入条件に応じてfocused scenarioとOSを指定する。`/gui-validate head` / `/gui-validate merge`の起動、実行時のhead/base検査、procedureの対応範囲、run/artifactを確認する。起動・撮影だけで機能全体を検証済みとせず、macOSだけの成功をWindowsへ一般化しない。
 
@@ -61,4 +61,4 @@ GUIのfail/blocked/unknownは成功へ変換しない。既存不具合とする
 
 GitHubを進行状態の正本とし、監査・費用履歴と現在状態を区別する。アプリ・Claude・Codex・CodeRabbit・Jev・CI・GUIの費用とunknownを分け、失敗や中断も含めて評価する。
 
-[実装・評価計画](../aadw-v3-execution-plan.md)はアプリから既存Actionsへの依頼を出発点とする。Jevの通常判断は既にPolicyへ反映済みで、Issue #373ではPolicyとAGENTSを更新してCodeRabbitを通常レビューへ切り替える。Claude→Codexの既存fallbackとGUI経路は維持し、#333は残る実装・検証が完了するまで開いたままとする。
+[実装・評価計画](../aadw-v3-execution-plan.md)はアプリから既存Actionsへの依頼を出発点とする。Jevの通常判断は既にPolicyへ反映済みで、Issue #373でPolicyとAGENTSを更新し、CodeRabbitを通常レビューへ切り替えた。Claude→Codexの既存fallbackとGUI経路は維持し、#333は残る実装・検証が完了するまで開いたままとする。

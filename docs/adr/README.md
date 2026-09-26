@@ -20,7 +20,7 @@
 
 設計は採用するが、実装・運用への適用は未完了。文書のmergeだけでは現行の運用規則を置き換えない。
 
-現在は該当なし。
+| [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | 一部適用済み。AADW v3の通常運用は有効で、残る実装・検証は [Issue #333](https://github.com/hide212131/hane/issues/333) で追跡中 |
 
 ## Active
 

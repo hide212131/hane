@@ -1,6 +1,6 @@
 # AADW v3 実装・評価・移行計画
 
-運用更新: Jevの意味判断は [Commander Policy](aadw-command-policy.md) に従って通常作業へ導入済み。CodeRabbitはV3-3 / Issue #360でfull/incremental reviewを実run確認し、Issue #373で通常レビューへ正式移行する。利用者指定により、費用・性能の追加比較や閾値校正は有効化条件にしない。以下の計画は残る移行作業と過去の受入条件を記録する。
+運用更新: Jevの意味判断は [Commander Policy](aadw-command-policy.md) に従って通常作業へ導入済み。CodeRabbitはV3-3 / Issue #360でfull/incremental reviewを実run確認し、Issue #373でAutomatic Review + Automatic Incremental Reviewを含む通常レビューへ正式移行した。利用者指定により、費用・性能の追加比較や閾値校正は有効化条件にしない。以下の計画は残る移行作業と過去の受入条件を記録する。
 
 ## 適用範囲と改訂
 
@@ -32,9 +32,9 @@ Claude workerのRead/Edit/Write/Glob/Grep限定と別finalizerを維持する。
 
 ### CodeRabbit
 
-App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。Issue #373でAutomatic ReviewとAutomatic Incremental Reviewを有効にし、non-draft PRの初回とpush後の差分を自動レビューする。`auto_pause_after_reviewed_commits: 2` で過剰なレビューを抑え、必要なら `@coderabbitai review` / `resume` を使う。増分を最終候補全体のレビューへ読み替えず、最終current headはCI成功後に`@coderabbitai full review`で確認する。
+App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。Issue #373でAutomatic ReviewとAutomatic Incremental Reviewを有効化し、non-draft PRの初回とpush後の差分を自動レビューする。`auto_pause_after_reviewed_commits: 2` で過剰なレビューを抑え、必要なら `@coderabbitai review` / `resume` を使う。増分を最終候補全体のレビューへ読み替えず、最終current headはCI成功後に`@coderabbitai full review`で確認する。
 
-依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。対象不明や無応答を合格にしない。Automatic Review / Automatic Incremental Review以外の自動修正、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373でAutomatic + Incrementalを有効化する。Codexレビューを常時二重実行しない。
+依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。最終候補では、current headを対象にしたfull reviewが完了していること、reviewed rangeがcurrent headを含むこと、non-outdated unresolved findingsが受入を妨げないこと、current-head CIが成功していることを確認する。`Full review triggered`だけでは合格にしない。対象不明や無応答を合格にしない。Automatic Review / Automatic Incremental Review以外の自動修正、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373でAutomatic + Incrementalを有効化した。Codexレビューを常時二重実行しない。
 
 ### GUI
 
