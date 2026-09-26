@@ -1060,7 +1060,8 @@ mod vscode_windows {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use winreg::RegKey;
-    use winreg::enums::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::HKEY;
 
     const APP_PATHS_SUBKEY: &str =
         r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
