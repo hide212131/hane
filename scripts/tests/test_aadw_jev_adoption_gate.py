@@ -178,6 +178,12 @@ class EvidenceAndCiReviewTests(unittest.TestCase):
         decision = gate.evaluate_adoption(context)
         self.assertFalse(decision.adoptable)
 
+    def test_whitespace_only_acceptance_evidence_id_is_blocked(self):
+        context = valid_context()
+        context["acceptance_evidence_id"] = "   "
+        decision = gate.evaluate_adoption(context)
+        self.assertFalse(decision.adoptable)
+
     def test_ci_failure_or_blocked_or_unknown_is_blocked(self):
         for status in ("failure", "blocked", "unknown", "missing", "", None):
             with self.subTest(status=status):
@@ -332,6 +338,12 @@ class ActionLabelTests(unittest.TestCase):
         decision = gate.evaluate_adoption(context)
         self.assertFalse(decision.adoptable)
 
+    def test_whitespace_only_action_question_key_is_blocked(self):
+        context = valid_context()
+        context["action_question_key"] = "   "
+        decision = gate.evaluate_adoption(context)
+        self.assertFalse(decision.adoptable)
+
 
 class ContextShapeTests(unittest.TestCase):
     def test_non_dict_context_is_blocked(self):
@@ -341,6 +353,12 @@ class ContextShapeTests(unittest.TestCase):
     def test_missing_repository_is_blocked(self):
         context = valid_context()
         del context["repository"]
+        decision = gate.evaluate_adoption(context)
+        self.assertFalse(decision.adoptable)
+
+    def test_whitespace_only_repository_is_blocked(self):
+        context = valid_context()
+        context["repository"] = "   "
         decision = gate.evaluate_adoption(context)
         self.assertFalse(decision.adoptable)
 

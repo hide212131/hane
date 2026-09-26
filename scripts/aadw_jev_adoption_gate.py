@@ -80,7 +80,8 @@ def _require_sha(value: Any, label: str) -> str:
 
 
 def _require_non_empty_str(value: Any, label: str) -> str:
-    _require(isinstance(value, str) and value != "", f"{label} must be a non-empty string")
+    _require(isinstance(value, str) and value.strip() != "",
+              f"{label} must be a non-empty string")
     return value
 
 
