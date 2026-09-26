@@ -199,13 +199,15 @@ AiSettings
 
 保存済みキーは設定画面に再送しない。UIは「保存済み」と表示し、明示的な「変更」「削除」操作を持つ。空欄の意味を「保持」と「削除」で混同しない。
 
-資格情報の更新では、現在の`credential_ref`を上書きしない。新しいキーごとに新しいCredentialRefを作成し、次の順序で切り替える。
+資格情報の更新では、現在の`credential_ref`を上書きしない。新しいキーごとに新しいCredentialRefを作成し、削除予定の参照を再起動後も追跡できる永続cleanup journalを使う。journalにはCredentialRefなど削除に必要な識別子だけを保存し、秘密値は保存しない。
 
 1. 新しい資格情報を新規CredentialRefへ保存する。ここで旧CredentialRefと旧キーは変更しない。
-2. 新しいCredentialRefを参照する非秘密設定を一時ファイルへ書き、同一ファイルシステム上でatomic replaceする。失敗時は新規CredentialRefを削除し、旧設定と旧キーを維持する。
-3. 設定のatomic replaceが成功して永続化された後に、旧CredentialRefを削除する。削除失敗は設定切替を巻き戻さず、秘密を含まない診断と後続のgarbage collection対象として記録する。
+2. 旧CredentialRefを「設定切替成功後に削除する対象」としてcleanup journalへatomicに永続化する。journalの保存に失敗した場合は設定を切り替えない。
+3. 新しいCredentialRefを参照する非秘密設定を一時ファイルへ書き、同一ファイルシステム上でatomic replaceする。失敗時は新規CredentialRefを削除し、cleanup intentを取り消し、旧設定と旧キーを維持する。
+4. 設定のatomic replaceが成功して永続化された後に旧CredentialRefを削除し、削除成功後にcleanup journalから対象を除く。削除に失敗した場合やこの間にアプリが終了した場合はjournalを残す。
+5. Hane起動時にcleanup journalを処理する。各対象が現行設定から参照されていないことを再確認してから削除を再試行し、成功後にjournalから除く。現行設定が参照している対象は削除せず、矛盾として診断する。
 
-キー削除も同様に、先に`credential_ref`を外した非秘密設定をatomic replaceし、その成功後に旧資格情報を削除する。これによりBase URL・モデル・キーを同時変更しても、設定書込み失敗によって旧設定が新しいキーを参照する状態を作らない。設定エラーを黙ってデフォルト接続へ戻さない。
+キー削除も同様に、旧CredentialRefのcleanup intentを永続化してから`credential_ref`を外した非秘密設定をatomic replaceし、その成功後に資格情報を削除する。これによりBase URL・モデル・キーを同時変更した場合や、設定切替直後に異常終了した場合でも、旧設定が新しいキーを参照する状態や、削除対象の秘密を追跡不能にする状態を避ける。設定エラーを黙ってデフォルト接続へ戻さない。
 
 ## 8. 接続方式と保存領域の分離
 
@@ -253,9 +255,9 @@ App Serverは単なる文字生成プロキシとして扱わない。初期の�
 
 `approval_policy = "never"`は「ツールが無効」ではない。read-onlyも「任意の読み取りが起きない」保証とは区別する。接続確認のためにdanger-full-accessへ緩めない。shell、書込み、外部ツール等を無効化できたことを確認するまで本番のテスト送信を公開しない。設定・監視だけで保証が不足する場合は、プロセスレベルの隔離を追加する。[S3, S5]
 
-API key環境変数の子ツールへの継承を防ぐ。環境変数フィルタの設定名はCodexの版によって差があるため、固定名を前提にしない。同梱するCodex実行ファイルから生成したconfig schemaを正とし、strict configで起動確認する。2026-09-27時点の公開リファレンスでは新しい形式として`shell_environment_policy.filters`、旧形式として`shell_environment_policy.exclude` / `include_only`が記載されているが、同じ設定レイヤーで新旧形式を併用しない。[S3]
+API key環境変数の子ツールへの継承を防ぐ。環境変数フィルタの設定名はCodexの版によって差があるため、固定名を前提にしない。App Serverの`generate-json-schema`はRPCプロトコルのschema生成であり、config schemaの取得手段として扱わない。設定互換性の最終判定は、Haneへ実際に同梱するCodex実行ファイルを、生成した設定と`--strict-config`で起動する検証とする。2026-09-27時点の公開Config Referenceでは新しい形式として`shell_environment_policy.filters`、旧形式として`shell_environment_policy.exclude` / `include_only`が記載されているが、公開リファレンスが同梱版の受理範囲と一致するとは仮定せず、同じ設定レイヤーで新旧形式を併用しない。[S3]
 
-新しい形式を採用版が受理する場合は、例えば次のように明示的にCustom Providerの秘密を除外する。
+新しい形式を採用版がstrict configで受理する場合は、例えば次のように明示的にCustom Providerの秘密を除外する。
 
 ```toml
 [shell_environment_policy]
@@ -265,7 +267,7 @@ ignore_default_excludes = false
 "HANE_AI_PROVIDER_KEY" = "exclude"
 ```
 
-採用版が`filters`を受理せず旧形式だけを提供する場合は、その版のschemaに従って例えば次のように設定する。
+採用版が`filters`をstrict configで受理せず、旧形式を受理することを実起動で確認した場合は、例えば次のように設定する。
 
 ```toml
 [shell_environment_policy]
