@@ -14,3 +14,7 @@ The first commit establishes a docs-only baseline. A CodeRabbit full review must
 - CodeRabbit is used as a reviewer only. Autofix, CI fixes, merge-conflict fixes, generated tests, and merge delegation are outside this validation.
 - GUI validation is not required for this docs-only validation PR. Existing Hosted GUI route evidence is tracked separately in #346.
 - A later `@coderabbitai review` counts only if CodeRabbit reports an incremental range after the baseline review.
+
+## Incremental probe
+
+After the baseline full review completed on `b96761c7aad58487a8bf8729a2d32eaaebf97267`, this section was added as the only second-commit delta. The next review request must be `@coderabbitai review`, and the evidence must show that the reviewed commit range starts from the already-reviewed baseline rather than from the PR base.
