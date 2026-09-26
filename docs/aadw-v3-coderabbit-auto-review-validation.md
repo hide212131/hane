@@ -9,3 +9,9 @@ Tracking: #373
 - この初回commitでは、PR作成後に `@coderabbitai review` / `@coderabbitai full review` を投稿しない。
 - CodeRabbitが自動で初回レビューを開始・完了することをGitHub上の実結果で確認する。
 - GUI validationは不要。
+
+## Incremental probe
+
+- 初回Automatic Review完了後に、この節だけを2commit目として追加する。
+- レビュー要求コメントは投稿しない。
+- CodeRabbitが前回headからこの新headまでの追加差分をAutomatic Incremental Reviewとして自動レビューすることを確認する。
