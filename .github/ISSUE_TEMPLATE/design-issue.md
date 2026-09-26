@@ -1,13 +1,13 @@
 ---
-name: 設計・実装 Issue（AADW v2）
-about: 要求・設計判断・制約・受け入れ条件を整理し、AADW v2 で実装できる状態にするための Issue テンプレート
+name: 設計・実装 Issue（AADW v3）
+about: 要求・設計判断・制約・受け入れ条件を整理し、AADW v3 で実装できる状態にするための Issue テンプレート
 title: ""
 labels: ""
 assignees: ""
 ---
 
 <!--
-Hane の現行運用は docs/agentic-development-workflow-v2.md と docs/aadw-command-policy.md を正とします。
+Hane の現行運用は docs/agentic-development-workflow-v3.md、docs/adr/0031-aadw-v3-jev-bounded-execution.md、docs/aadw-command-policy.md を正とします。
 この Issue 自体は AADW の機械的な state を持ちません。ChatGPT Commander が GitHub 上の current facts と本文を読み、必要な次の一つの action を判断します。
 -->
 

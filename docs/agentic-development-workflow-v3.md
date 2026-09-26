@@ -6,7 +6,7 @@
 
 **ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストはv2の既存経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
 
-Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はv2のone-action規則を維持し、Codexレビュー、既存fallback、GUIの権限・判断規則はそれぞれの移行PRが完了するまで現状を維持する。
+Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はv2から引き継いだone-action規則を維持する。通常レビューはIssue #360の実run検証とIssue #373の切替後はCodeRabbitを使い、Codexは条件付き代替実装担当として残す。既存fallbackとGUIの権限・判断規則はそれぞれの既存契約を維持する。
 
 ## 2. 記事との関係と役割
 
@@ -59,7 +59,7 @@ App Serverは代替経路の実装で必要性が確認されたときの選択�
 
 ## 6. CodeRabbitによる通常レビュー
 
-CodeRabbit GitHub Appの導入、対象repository、契約・権限、実際の依頼受理を確認してから標準レビューへ切り替える。今回その導入・稼働を確認したことにはしない。未有効化の間はv2のCodexレビューを使い、CodeRabbitが応答しない状態を「指摘なし」と扱わない。
+CodeRabbit GitHub Appの導入、対象repository、契約・権限、full/incremental reviewの実際の依頼受理はV3-3 / Issue #360で確認済みである。Issue #373の切替後はCodeRabbitを標準レビューとする。CodeRabbitが応答しない、スキップした、対象が不明な状態を「指摘なし」と扱わない。
 
 | PRコメント | 用途 |
 |---|---|
@@ -145,7 +145,7 @@ GitHubを進行状態の正本とする。監査・費用履歴は残せるが�
 
 [実装・評価計画](aadw-v3-execution-plan.md)に従い、既存Actions、レビュー、GUIの移行を進める。Jevの意味判断は有効で、費用・性能の追加評価をその条件としない。通常コード・テストの実装担当と、運用基盤の変更担当は分ける。保護されたworkflow等まで通常workerへ一括依頼しない。
 
-残る作業には、CodeRabbit導入・契約・actor受理・レビュー範囲の対応付け、Codexの利用可能設定・認証、必要なGUI scenarioとOSの実行環境、停止・再開時の運用がある。未確認の実行経路や必須証拠を成功扱いしない。
+CodeRabbitの導入・actor受理・full/incremental reviewの範囲確認はV3-3で完了し、Issue #373で通常レビューへ切り替える。残る作業には、Codex代替実装経路の利用可能設定・認証、必要なGUI scenarioとOSの実行環境、停止・再開時の運用がある。未確認の実行経路や必須証拠を成功扱いしない。
 
 <a id="sources"></a>
 ## 出典と確認範囲
@@ -164,4 +164,4 @@ GitHubを進行状態の正本とする。監査・費用履歴は残せるが�
 - [S10] CodeRabbit自動レビュー: https://docs.coderabbit.ai/configuration/auto-review 。明示的依頼との関係を確認。
 - [S11] CodeRabbit設定: https://docs.coderabbit.ai/reference/configuration 。レビューと自動修正機能を区別。
 
-TypeSafeのIntroduction/confidence本文は取得環境で直接確認できなかったため、確認できた公式Skill/SDKの範囲を採用する。実API推論、CodeRabbit導入、費用・精度、GUIの実動作は今回の文書改訂では検証していない。
+TypeSafeのIntroduction/confidence本文は取得環境で直接確認できなかったため、確認できた公式Skill/SDKの範囲を採用する。CodeRabbitのfull/incremental review接続はIssue #360の実runで確認済みである。TypeSafeの追加仕様、費用・精度、個別機能のGUI実動作は各検証記録の範囲を超えて一般化しない。

@@ -1,6 +1,6 @@
 # AADW v3 実装・評価・移行計画
 
-運用更新: Jevの意味判断は [Commander Policy](aadw-command-policy.md) に従って通常作業へ導入済み。利用者指定により、費用・性能の追加比較や閾値校正は有効化条件にしない。以下の計画はJev判断以外の移行作業と過去の受入条件を記録する。
+運用更新: Jevの意味判断は [Commander Policy](aadw-command-policy.md) に従って通常作業へ導入済み。CodeRabbitはV3-3 / Issue #360でfull/incremental reviewを実run確認し、Issue #373で通常レビューへ正式移行する。利用者指定により、費用・性能の追加比較や閾値校正は有効化条件にしない。以下の計画は残る移行作業と過去の受入条件を記録する。
 
 ## 適用範囲と改訂
 
@@ -8,7 +8,7 @@
 
 **入口はChatGPTアプリ、実装はActions経由のClaude優先・条件付きCodex、通常レビューはCodeRabbit、GUIはv2と同じく必要時に実行する。** 独立したCodex App Server実行器を作ることからは始めない。
 
-文書のmergeでは稼働を切り替えない。[Commander Policy](aadw-command-policy.md)が現行運用の正本である。以下の段階は実装計画であって独自のworkflow stateではない。進捗はGitHubのIssue/PRと証拠で確認する。
+設計文書を置いただけでは稼働を切り替えない。[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)が現行運用の正本であり、Jev統合やCodeRabbit標準化のような運用切替は個別Issue/PRで正本を更新して有効化する。以下の段階は実装計画であって独自のworkflow stateではない。進捗はGitHubのIssue/PRと証拠で確認する。
 
 ## 1. V3-1: アプリから既存の実装経路を使う
 
@@ -34,7 +34,7 @@ Claude workerのRead/Edit/Write/Glob/Grep限定と別finalizerを維持する。
 
 App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。安定候補とCIの確認後に`@coderabbitai full review`を依頼し、修正途中は`@coderabbitai review`を利用できる。増分を最終候補全体のレビューへ読み替えない。初期は最終current headへfull reviewを行う。
 
-依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。対象不明や無応答を合格にしない。自動修正、CI修正、競合修正、テスト生成等を無効化し、残るApp権限を明記する。CodeRabbitを標準にする有効化前はv2のCodexレビューを維持する。
+依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。対象不明や無応答を合格にしない。自動修正、CI修正、競合修正、テスト生成等を無効化し、残るApp権限を明記する。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373の切替後は通常レビューをCodeRabbitとする。Codexレビューを常時二重実行しない。
 
 ### GUI
 
