@@ -253,3 +253,12 @@ refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任
 [`docs/baseline/README.md`](baseline/README.md)は2026年8月26日の旧R0測定原本で、製品基準commitは`a811425`。warm startup、10/100 MB RSS等の数値をこの `main` の結果とは呼ばない。現行の`hane-bench`はbuffer/file open/layout等の非GUI計測入口であり、#23が求めるprocess起動・work folder・訪問済みsessionの実測原本を代替しない。#23へ、release buildと静穏な同一機種/OS/電源/refresh rate/profileを記録し、fixtureと試行数を添えて、空/小/100 MB起動、空/1/10/100 MB RSS、巨大単一段落の入力/scroll、1k/10k件folder、10/100/1,000件訪問済みsession、長時間のfolder/文書切替・編集・画像表示を測る作業を残す。少なくとも起動は可能なら30回、相対10%/絶対gateを同条件で比較し、超過時は独立再測定する。計測に影響する#306/#307/RF5-B/#309/#314等より前に該当する変更前値を採る。
 
 このPRから渡せるのは、対象の所有関係、既存assert、未実施の境界を追える**調査記録**だけである。独立した文書照合や旧入口の読み取り調査は続けられる。削除、製品の責務移動、geometry/保存/cacheの意味変更、性能改善の着手可判定はまだ渡さない。#298全体の契約テスト・構成別検証・#23実測、ADR全件照合は残る。#299や#301以降の実装、#23/#298/#297のcloseは本記録の完了から自動で導かない。
+
+
+### 9.6 RF1-A: 旧 final 経路の到達性再確認（#299）
+
+2026年9月26日、main `94a15eff5fbe694a85e60674a0075a0280d2d40c` を基準に RF0-10 を再確認した。現行の `.github/workflows/` には final judge / final gate workflow がなく、`ci.yml`、`claude-fix.yml`、`codex-usage-limit-fallback.yml` を含む現行workflowから `final_pipeline.py`、`final_policy.py`、`final_fix_bridge.py`、`final_judge_probe.py` への参照はない。repo内の直接importはこの4本相互と専用 `.github/tests/test_final_gate.py` に閉じていた。現行文書の実行入口は Commander Policy と AADW v2 workflowであり、旧 final judge は `docs/history/aadw-v1/` に履歴として保持されている。
+
+このため #299 の最初の削除単位として、上記4 scriptと専用testだけを撤去する。現行経路が共有する `pipeline_api.py`、`gui_policy.py`、`claude_fix_state.py`、`aadw_notify.py`、observer/reconcile群は削除しない。これらには旧 `hane/final-judge` statusを履歴として認識する処理が残るが、旧scriptへの実行入口ではなく、現行機能と共有するため本削除単位の対象外とする。
+
+外部から旧scriptを直接起動するcurrentの文書化された手順・workflow入口はrepo内にない。self-hosted runnerのcurrent workflow入口はCodex usage-limit fallbackであり、旧 final 群を参照しない。削除後は current CI のPython検査を通し、検索で旧scriptの実行参照が履歴文書と本記録以外に残っていないことを確認する。問題時はこの削除PRをrevertし、旧経路を個別に再作成しない。
