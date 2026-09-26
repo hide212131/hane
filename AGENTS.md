@@ -16,14 +16,15 @@
 
 受け入れ済みの整理後の経路を使い、廃止予定の旧経路へ機能を足したり、新旧両方へ同じルールを実装したりしない。機能 Issue には関連する先行作業と待つ理由、または依存なしの根拠を短く残す。具体的な着手手順と計画範囲の扱いは上記の実行計画を参照し、review・GUI・merge の判断は引き続き Commander Policy に従う。
 
-## AADW v2 の正本
+## AADW v3 の正本
 
-Hane の現行の AI Agent Development Workflow（AADW）は v2 とする。
+Hane の現行の AI Agent Development Workflow（AADW）は v3 とする。段階導入で残る検証項目は Issue #333 で追跡するが、通常の意味判断とレビュー担当は v3 の役割分担を使う。
 
-- 全体設計: [AADW v2 設計書](docs/agentic-development-workflow-v2.md)
+- 全体設計: [AADW v3 設計書](docs/agentic-development-workflow-v3.md)
+- 設計判断: [ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)
 - Commander の判断ルール: [AADW Commander Policy](docs/aadw-command-policy.md)
 
-旧 [AI Agent Development Workflow](docs/agentic-development-workflow.md) は v1 の履歴資料であり、現行のトリガー、状態遷移、役割分担の根拠には使わない。
+[AADW v2 設計書](docs/agentic-development-workflow-v2.md) は v3 が引き継ぐ既存経路の参照資料として扱い、現行の役割分担の正本にはしない。旧 [AI Agent Development Workflow](docs/agentic-development-workflow.md) は v1 の履歴資料である。
 
 AADW は独立した workflow / state machine を持たない。ChatGPT が Commander として GitHub 上の current facts / evidence を読み、Jev に通常の意味判断を委ねる。Commander は選ばれた action の客観的な権限・鮮度・required evidence を確認して一つだけ実行し、その結果を再び観測する。
 
@@ -54,7 +55,8 @@ AADW の開発運用機能は、通常経路で Issue の目的・受入条件�
 - **Jev / TypeSafe**: Hane の通常の意味判断を担う。依頼・受入条件・範囲・原因・検証計画・次の action・継続/停止/完了候補を判断し、Choice / Noul / Score / filter と、利用可能な場合は既存handlerを選ぶfunction callingを適用する。既定接続は既存のlocal shell Jev CLIとTypeSafe設定であり、設定済み認証を保護する。Jev の意味判断を既定として使い、費用・性能の追加ベンチマークを有効化条件にしない。認証情報や任意操作の実行権限は渡さない。
 - **ChatGPT / Commander**: current facts を取得し、Jev に必要な範囲で渡す。Jev の意味判断を独自に重複評価せず、実行可能な権限・current head/base・CI/review/GUI等の客観条件を確認し、次の一 action を実行する。製品コードの変更担当にはならない。
 - **Claude Code**: trusted same-repository PR branch の製品コードを変更できる通常の実装担当。開始時と push 直前に対象 head を確認し、不一致なら push しない。次工程は決めない。
-- **Codex**: current PR context をレビューする。通常のコードレビューでは製品コードを変更せず、次工程を決めない。Claude Code が `usage_or_rate_limit` と分類された場合に限り、同じ trust boundary と exact-head guard の下で専用 self-hosted runner 上のローカル Codex CLI が実装を継続できる。このフォールバックも次工程を決めない。base の変更が review の主張に影響する場合は Commander の判断で current base context に対して再レビューする。
+- **CodeRabbit**: current PR の通常レビューを担当する。安定候補では `@coderabbitai full review`、途中修正では `@coderabbitai review` を明示的に依頼し、対象 head・範囲・完了状態を確認する。製品コードの修正、次工程の決定、merge は担当しない。
+- **Codex**: 通常レビュー担当にはしない。Claude Code が `usage_or_rate_limit` と分類された場合に限り、同じ trust boundary と exact-head guard の下で専用 self-hosted runner 上のローカル Codex CLI が実装を継続できる。このフォールバックも次工程を決めない。外部設定により Codex Review がPRへ投稿されても、AADW v3 の通常レビュー evidence として要求・採用しない。
 - **GUI Validator**: focused scenario を実行して観測事実と evidence を残す。製品コードを変更せず、結果の意味判断や次工程を決めない。
 - **CI**: 客観的な build / test / lint 結果を GitHub に残す。AADW の状態遷移や次工程を決めない。
 
@@ -76,4 +78,4 @@ AADW 専用の collector、wrapper、workflow、status、receipt、Gate は前�
 
 Jevは依頼解釈、作業範囲、原因分類、検証計画、次の action など通常の意味判断を担当し、利用可能な既存handlerがあればその選択も行う。ChatGPT Commander は GitHub の事実・権限・required evidence を確認し、選ばれた一 action を実行する。費用・性能の追加評価や事前閾値を Jev 利用の条件にしない。Issue #333 は残るv3導入作業を追跡し、この運用だけをもって Issue 全体を完了扱いにしない。
 
-GUIはv2のADR-0024と既存Hosted/ローカル経路を引き継ぎ、必須scenarioの未実施・fail・blocked・unknownを免除しない。アプリ終了後の無人継続や独立App Server実行器、CodeRabbit標準化など、Jev判断以外のv3機能の移行状態は個別のIssue/PRで確認する。
+GUIはv2のADR-0024と既存Hosted/ローカル経路を引き継ぎ、必須scenarioの未実施・fail・blocked・unknownを免除しない。CodeRabbitはIssue #360の実run検証とIssue #373の切替を経て通常レビュー担当とする。アプリ終了後の無人継続や独立App Server実行器など、残るv3機能の移行状態は個別のIssue/PRで確認する。

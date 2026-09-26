@@ -2,13 +2,13 @@
 
 ## ステータス
 
-設計採用。初版はPR #334で採用。本改訂はIssue [#336](https://github.com/hide212131/hane/issues/336)の文書PRで承認済み。Jevの意味判断はCommander Policyへ反映し、その他の実装・運用切替はIssue #333で追跡する。
+設計採用。初版はPR #334で採用し、Issue [#336](https://github.com/hide212131/hane/issues/336)で構成を改訂した。Jevの意味判断はCommander Policyへ反映済みであり、CodeRabbitの通常レビューはIssue #360の実run検証とIssue #373の切替で有効化する。残る実装・検証はIssue #333で追跡する。
 
-このADRはv3導入時の設計判断を記録する。Jevの意味判断は、利用者指定による運用更新として[Commander Policy](../aadw-command-policy.md)と[AGENTS.md](../../AGENTS.md)に従い現在の通常作業で有効である。その他のv3移行状態は個別のIssue/PRで確認する。
+このADRはv3導入時の設計判断を記録する。Jevの意味判断とCodeRabbit通常レビューは、[Commander Policy](../aadw-command-policy.md)と[AGENTS.md](../../AGENTS.md)に従う現行運用である。その他のv3移行状態は個別のIssue/PRで確認する。
 
 ## 日付と追跡先
 
-2026-09-25初版、2026-09-26改訂。初期設計: [#332](https://github.com/hide212131/hane/issues/332)。改訂: #336。実装・評価・有効化: [#333](https://github.com/hide212131/hane/issues/333)。
+2026-09-25初版、2026-09-26構成改訂、2026-09-27レビュー経路切替。初期設計: [#332](https://github.com/hide212131/hane/issues/332)。改訂: #336。CodeRabbit検証: #360。レビュー切替: #373。残る実装・評価: [#333](https://github.com/hide212131/hane/issues/333)。
 
 ## 背景と変更理由
 
@@ -39,7 +39,7 @@ Commanderの文章生成・設計と、Jevの狭い判断を分ける。独立�
 
 ## レビュー・GUI・完了
 
-CodeRabbitの導入と権限、依頼受理、current-headのレビュー完了・範囲を有効化前に検証する。増分レビューと最終候補の全体レビューを分ける。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。通常のCodexレビューは切替完了までは維持し、移行後の二重レビューは必要時だけ行う。
+CodeRabbitの導入と権限、依頼受理、full/incremental reviewの範囲はIssue #360で実run確認した。Issue #373の切替後は通常レビューをCodeRabbitへ一本化し、安定候補の全体レビューと修正途中の増分レビューを分ける。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。Codexレビューは通常経路として要求せず、必要な追加レビューを行う場合だけCommanderが理由を残す。
 
 GUIは[ADR-0024](0024-local-gui-validation.md)の既存Hosted/ローカル経路を継続する。Commanderが変更内容と受入条件に応じてfocused scenarioとOSを指定する。`/gui-validate head` / `/gui-validate merge`の起動、実行時のhead/base検査、procedureの対応範囲、run/artifactを確認する。起動・撮影だけで機能全体を検証済みとせず、macOSだけの成功をWindowsへ一般化しない。
 
@@ -61,4 +61,4 @@ GUIのfail/blocked/unknownは成功へ変換しない。既存不具合とする
 
 GitHubを進行状態の正本とし、監査・費用履歴と現在状態を区別する。アプリ・Claude・Codex・CodeRabbit・Jev・CI・GUIの費用とunknownを分け、失敗や中断も含めて評価する。
 
-[実装・評価計画](../aadw-v3-execution-plan.md)はアプリから既存Actionsへの依頼を出発点に改訂する。今回の文書PRはコード・workflow・秘密情報・現行Policy・既存fallbackを変更せず、#333を閉じない。実サービス試験、質問と切替条件の評価、GUIの対象範囲確認、停止・再開試験を経て、別PRでPolicyとAGENTSを更新して限定有効化する。
+[実装・評価計画](../aadw-v3-execution-plan.md)はアプリから既存Actionsへの依頼を出発点とする。Jevの通常判断は既にPolicyへ反映済みで、Issue #373ではPolicyとAGENTSを更新してCodeRabbitを通常レビューへ切り替える。Claude→Codexの既存fallbackとGUI経路は維持し、#333は残る実装・検証が完了するまで開いたままとする。

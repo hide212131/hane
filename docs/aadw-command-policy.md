@@ -4,7 +4,7 @@
 
 この文書は、Hane の AADW で ChatGPT が司令塔として Jev の判断を運用するときのルールを定める。工程管理は v2 の `Observe → Decide → Act → Observe` を保ち、意味判断には Jev を標準で使う。
 
-AADW v2 は workflow / state machine ではなく、次の反復である。
+AADW v3 は独立した workflow / state machine を増やさず、次の反復で運用する。
 
 ```text
 Observe → Decide → Act → Observe
@@ -20,7 +20,7 @@ Commander: 客観ガード確認と次の一 action
 
 ChatGPT はJevと同じ意味判断を毎回やり直さない。Jev の結論を既定の判断として採用し、権限・current facts・必須証拠など機械的に確認できる条件を満たすか確認して一つの action を実行する。
 
-current facts の取得方法や action の実行方法は固定しすぎない。まず既存の GitHub / Codex / Claude / GUI 機能を使い、重複や複雑さが実運用で確認された場合だけ専用 wrapper / collector を追加する。
+current facts の取得方法や action の実行方法は固定しすぎない。まず既存の GitHub / CodeRabbit / Claude / 条件付き Codex fallback / GUI 機能を使い、重複や複雑さが実運用で確認された場合だけ専用 wrapper / collector を追加する。
 
 ---
 
@@ -157,6 +157,8 @@ infrastructure failure など product code の問題と判断できない場合�
 
 ### 4.2 Review
 
+通常レビューはCodeRabbitを使う。安定候補とcurrent-head CIを確認した後は `@coderabbitai full review` で候補全体を確認し、修正途中の追加差分だけを確認するときは `@coderabbitai review` を使う。自動レビューは前提にせず、依頼した対象head・reviewed range・完了状態をGitHub上の実結果で確認する。Codex Reviewは通常経路として要求せず、外部設定で投稿されてもCodeRabbit reviewの代替証拠にはしない。
+
 current PR head の unresolved findings を一度に確認する。
 
 review の主張が PR diff / merge context に影響される場合は、review 後に target branch が進んでいないかを確認する。base が変わり、review が対象にした context を current と証明できない場合は無条件に再利用せず、必要なら current base context で review を取り直す。
@@ -271,7 +273,7 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 
 選んだ action は、まず既存機能で実行する。
 
-Codex、Claude、CI、GUI validation、GitHub merge は AADW の stage ではなく、その時点で必要なら使う道具である。
+CodeRabbit、Claude、条件付きCodex fallback、CI、GUI validation、GitHub merge は AADW の stage ではなく、その時点で必要なら使う道具である。
 
 worker は意味判断をしない。
 
@@ -295,7 +297,7 @@ action の結果が GitHub に残ったら、過去の判断をそのまま継�
 
 ## 7. Provider / infrastructure failure
 
-Claude、Codex、GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
+Claude、Codex、CodeRabbit、GUI runner などが provider / infrastructure 理由で失敗した場合、その失敗を product failure とみなさない。
 
 必要な evidence が得られなければ停止する。
 
