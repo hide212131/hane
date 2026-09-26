@@ -81,8 +81,41 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
 
 ## Issue #347: current context adoption gate
 
-この節は Issue #347 の実装 worker を起動するための最小の開始点であり、gate 実装やテスト成功を主張しない。
-
 この Issue では、Jev の request/result 契約が正しくても current head/base/evidence が stale・unknown・missing なら回答を採用しない、ネットワーク・secret・write 権限を持たない小さい adoption gate を追加する。
 
 実装対象は `scripts/aadw_jev_*.py`、`scripts/tests/test_aadw_jev_*.py` と必要最小限の fixture / 本記録に限定し、現行 Policy、`.github/`、認証、GUI workflow、fallback workflow は変更しない。
+
+### 実装内容（current head、テスト未実行）
+
+- `scripts/aadw_jev_adoption_gate.py` に `evaluate_adoption(context)` を追加した。
+  ネットワーク・GitHub API・Jev API を呼ばず、外部副作用を持たない
+  `AdoptionDecision(adoptable: bool, reason: str)` のみを返す decision-only な
+  関数であり、action の選択・routing・merge・fallback は行わない。
+- 検査する current context は `expected_head_sha` / `current_head_sha`
+  （40桁hex、不一致なら blocked）、`base_sensitive` が true の場合の
+  `expected_base_sha` / `current_base_sha`（同様に40桁hex必須・不一致なら
+  blocked。false の場合は base の変化自体では拒否しない）、非空の
+  `acceptance_evidence_id`、`ci_status` / `review_status`（`success` のみ
+  採用可、fail / blocked / unknown / missing は拒否）、`gui_required` と
+  `gui_status`（required なら `success` のみ、not_required なら未実施でも
+  他条件次第で採用可）、`jev_status`（`success` 以外は blocked とし、
+  Codex fallback や COMPLETE への読み替えを行わない）。
+- Jev の request/result 本体は既存の `aadw_jev_contract.py` の
+  `validate_request` / `validate_result` / `validate_pair` をそのまま再利用し、
+  malformed JSON、非有限値、answer 欠落・型不一致、候補外 choice を検査する
+  契約を弱めていない。
+- 採用する action の Choice は `action_question_key` で指定した質問の
+  `choice` type を要求し、選択された label が現在の
+  `current_allowed_action_labels`（空を許容しない）に含まれない場合、
+  および `requested_action_labels`（Jev 依頼時点の候補集合）と
+  `current_allowed_action_labels` が一致しない場合（候補集合が変化した
+  stale なケース）を区別してどちらも blocked にする。
+- `scripts/tests/test_aadw_jev_adoption_gate.py` に、exact head/base +
+  evidence success での採用可、head/base 不一致、CI/review の
+  fail・blocked・unknown、GUI required/not_required の区別、Jev failure が
+  fallback や COMPLETE を意味しないことの確認、候補外 choice、候補集合の
+  変化、Jev contract 違反（malformed・非有限値・answer 欠落）、不正な
+  context 形状（非 dict、SHA 形式不正、pr_number 不正）を含むテストを
+  追加した。このテストと gate 自体は本 worker の実行環境ではまだ実行して
+  いない。CI・レビュー・GUI 検証・実サービス接続の成功は別途 Commander が
+  観測する。
