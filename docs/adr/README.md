@@ -15,11 +15,14 @@
 |---|---|
 | [ADR-0025](0025-shared-parse-for-multiline-inline-presentation.md) | 複数行 inline presentation の revision-bound shared parse と projection の統一 |
 | [ADR-0030](0030-gpui-kit-incremental-local-adoption.md) | gpui-kit / gpui-base の段階的・局所的採用方針 |
+| [ADR-0032](0032-embedded-codex-app-server-ai-foundation.md) | HaneにCodex App Serverを同梱し、ChatGPT/CodexのOAuthとCustom ProviderのAPI keyを切り替えるAI連携基盤。設計案を記録し、実装・実機検証は未実施 |
 
 ## Accepted design / implementation pending
 
 設計は採用するが、実装・運用への適用は未完了。文書のmergeだけでは現行の運用規則を置き換えない。
 
+| ADR | 内容 |
+|---|---|
 | [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) | 一部適用済み。AADW v3の通常運用は有効で、残る実装・検証は [Issue #333](https://github.com/hide212131/hane/issues/333) で追跡中 |
 
 ## Active
