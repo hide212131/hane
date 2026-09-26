@@ -77,3 +77,12 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   JSON textでは許可され0〜1 fieldでは拒否されること、深くネストしたJSON
   text・直接dict入力の両方で`RecursionError`を漏らさず`ContractError`に
   なること、既存テストが弱まっていないことを回帰テストで確認した。
+
+
+## Issue #347: current context adoption gate
+
+この節は Issue #347 の実装 worker を起動するための最小の開始点であり、gate 実装やテスト成功を主張しない。
+
+この Issue では、Jev の request/result 契約が正しくても current head/base/evidence が stale・unknown・missing なら回答を採用しない、ネットワーク・secret・write 権限を持たない小さい adoption gate を追加する。
+
+実装対象は `scripts/aadw_jev_*.py`、`scripts/tests/test_aadw_jev_*.py` と必要最小限の fixture / 本記録に限定し、現行 Policy、`.github/`、認証、GUI workflow、fallback workflow は変更しない。
