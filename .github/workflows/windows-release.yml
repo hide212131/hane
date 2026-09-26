@@ -209,17 +209,29 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked -p hane
+      - name: Build macOS app bundle
+        shell: bash
+        run: ./scripts/bundle-macos.sh
 
-      - name: Package portable zip
+      - name: Verify macOS app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="target/release/bundle/osx/Hane.app"
+          test -d "$app"
+          test -x "$app/Contents/MacOS/hane"
+          /usr/bin/plutil -lint "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$app/Contents/Info.plist")" = "APPL"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "hane"
+
+      - name: Package macOS app zip
         shell: bash
         run: |
           set -euo pipefail
           staging="staging/hane-macos-arm64"
+          rm -rf "$staging"
           mkdir -p "$staging"
-          cp target/release/hane "$staging/hane"
-          chmod +x "$staging/hane"
+          ditto "target/release/bundle/osx/Hane.app" "$staging/Hane.app"
           cp README.md "$staging/README.md"
           if [ -f LICENSE ]; then
             cp LICENSE "$staging/LICENSE"
