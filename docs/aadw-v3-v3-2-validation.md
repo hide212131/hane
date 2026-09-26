@@ -19,9 +19,11 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
 - 検査対象は System One の request（`state` / 非空の `questions` / 任意の
   `model`）と result（非空の `model` / `questions` の key に対応する
   `answers` / `usage`）の対応関係。Noul answer は `noul` が有限の0〜1、
-  Choice answer は `choice` がrequestのcriteria候補内、`confidence` と
+  Choice answer は `choice` が文字列かつrequestのcriteria候補内、`confidence` と
   `probabilities` の各値が有限の0〜1、`probabilities` のキー集合がcriteria
-  のキー集合と一致することを検査する。`usage.input_tokens` /
+  のキー集合と一致することを検査する。`choice` がlist/dictなどの
+  非文字列・unhashable値の場合もdict membership判定前に文字列判定を行い、
+  `TypeError` を漏らさず `ContractError` として拒否する。`usage.input_tokens` /
   `output_tokens` は非負整数（bool値は整数として受理しない）を要求する。
   Score はこの検査対象に含めない。
 - `request.state`、`questions[key].instructions`（存在する場合）、Choice
@@ -36,8 +38,11 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   スキーマ上未走査の追加fieldに含まれる非有限値も同様に拒否する。
 - `scripts/tests/test_aadw_jev_contract.py` で、有効なChoice+Noulの組と、
   上記の必須失敗条件（不正JSON、questions空、answer欠落、型不一致、
-  Noul/Choiceの範囲外・非有限値、Choiceの候補外・キー欠落/余分、model空、
-  usage不正）を確認する。JSON parserが非標準のNaN/Infinity相当を受理し得る
+  Noul/Choiceの範囲外・非有限値、Choiceの候補外・キー欠落/余分、
+  Choiceがlist/dictなどのunhashable値の場合、model空、
+  usage不正）を確認する。unhashableなChoiceのケースはCLI経路でも
+  tracebackではなく非0の契約違反終了になることを確認する。
+  JSON parserが非標準のNaN/Infinity相当を受理し得る
   点を踏まえ、数値の有限性を明示的に検査するケースを含む。`instructions` /
   `criteria` が省略・`null` でも有効な回帰と、number/bool instructions、
   number state、不正なcriteria description、ネスト内非有限値など

@@ -339,6 +339,14 @@ class ChoiceAnswerTests(unittest.TestCase):
         with self.assertRaises(contract.ContractError):
             contract.check(valid_request(), result)
 
+    def test_unhashable_choice_is_rejected_as_contract_error(self):
+        for value in ([], {}):
+            with self.subTest(value=value):
+                result = valid_result()
+                result["answers"]["category"]["choice"] = value
+                with self.assertRaises(contract.ContractError):
+                    contract.check(valid_request(), result)
+
     def test_confidence_out_of_range_or_nonfinite_is_rejected(self):
         for value in (-0.1, 1.1, float("nan"), float("inf")):
             with self.subTest(value=value):
@@ -405,6 +413,18 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             code = contract.main(["aadw_jev_contract.py", "missing-a.json", "missing-b.json"])
         self.assertEqual(code, contract.EXIT_USAGE)
+
+    def test_unhashable_choice_exits_as_violation_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            broken_result = valid_result()
+            broken_result["answers"]["category"]["choice"] = []
+            request_path = self._write(directory, "request.json", valid_request())
+            result_path = self._write(directory, "result.json", broken_result)
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                code = contract.main(["aadw_jev_contract.py", request_path, result_path])
+        self.assertEqual(code, contract.EXIT_VIOLATION)
+        self.assertIn("contract violation", error.getvalue())
 
 
 if __name__ == "__main__":

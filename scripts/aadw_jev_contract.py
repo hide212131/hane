@@ -177,7 +177,8 @@ def _validate_noul_answer(key: str, answer: dict) -> None:
 
 
 def _validate_choice_answer(key: str, answer: dict, criteria: dict) -> None:
-    _require(answer.get("choice") in criteria,
+    choice = answer.get("choice")
+    _require(isinstance(choice, str) and choice in criteria,
              f"answers[{key!r}].choice must be one of the request criteria")
     _require(_is_unit_interval(answer.get("confidence")),
              f"answers[{key!r}].confidence must be a finite number in [0, 1]")
