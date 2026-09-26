@@ -1,0 +1,1525 @@
+--- source_file: memory_100mb/trial_1/hane.log ---
+hane_ready startup_time_ms=382.937 file_open_time_ms=232.137 rss_bytes=384565248
+
+--- source_file: memory_100mb/trial_2/hane.log ---
+hane_ready startup_time_ms=388.990 file_open_time_ms=229.632 rss_bytes=384843776
+
+--- source_file: memory_10mb/trial_1/hane.log ---
+hane_ready startup_time_ms=222.001 file_open_time_ms=88.981 rss_bytes=110493696
+2026-09-26 23:47:53.578 hane[44918:14936166] error messaging the mach port for IMKCFRunLoopWakeUpReliable
+
+--- source_file: memory_10mb/trial_2/hane.log ---
+hane_ready startup_time_ms=214.714 file_open_time_ms=90.533 rss_bytes=110477312
+
+--- source_file: memory_1mb/trial_1/hane.log ---
+hane_ready startup_time_ms=238.392 file_open_time_ms=79.737 rss_bytes=83656704
+
+--- source_file: memory_1mb/trial_2/hane.log ---
+hane_ready startup_time_ms=243.757 file_open_time_ms=80.260 rss_bytes=83755008
+
+--- source_file: memory_empty/trial_1/hane.log ---
+hane_ready startup_time_ms=189.347 file_open_time_ms=0.000 rss_bytes=71647232
+
+--- source_file: memory_empty/trial_2/hane.log ---
+hane_ready startup_time_ms=256.663 file_open_time_ms=0.000 rss_bytes=71794688
+
+--- source_file: memory_folder_10k/trial_1/hane.log ---
+hane_ready startup_time_ms=200.120 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=314.473 indexed_markdown_files=10000
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=406618112 session_count=1
+
+--- source_file: memory_folder_10k/trial_2/hane.log ---
+hane_ready startup_time_ms=189.650 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=733.429 indexed_markdown_files=10000
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=405569536 session_count=1
+
+--- source_file: memory_folder_1k/trial_1/hane.log ---
+hane_ready startup_time_ms=182.781 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=340.980 indexed_markdown_files=1000
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=124141568 session_count=1
+
+--- source_file: memory_folder_1k/trial_2/hane.log ---
+hane_ready startup_time_ms=204.624 file_open_time_ms=0.000 rss_bytes=71450624
+2026-09-26 23:51:35.002 hane[53596:14961042] error messaging the mach port for IMKCFRunLoopWakeUpReliable
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=433.725 indexed_markdown_files=1000
+hane_metrics keystroke_to_model_samples=1 keystroke_to_model_median_ms=0.001 keystroke_to_model_p95_ms=0.001 keystroke_to_model_p99_ms=0.001 keystroke_to_model_max_ms=0.001 keystroke_to_frame_samples=1 keystroke_to_frame_median_ms=61.901 keystroke_to_frame_p95_ms=61.901 keystroke_to_frame_p99_ms=61.901 keystroke_to_frame_max_ms=61.901 frame_interval_samples=4 frame_interval_median_ms=62.087 frame_interval_p95_ms=115.106 frame_interval_p99_ms=115.106 frame_interval_max_ms=115.106 layout_samples=5 layout_median_ms=0.082 layout_p95_ms=10.578 layout_p99_ms=10.578 layout_max_ms=10.578
+hane_metrics keystroke_to_model_samples=2 keystroke_to_model_median_ms=0.001 keystroke_to_model_p95_ms=0.001 keystroke_to_model_p99_ms=0.001 keystroke_to_model_max_ms=0.001 keystroke_to_frame_samples=2 keystroke_to_frame_median_ms=14.347 keystroke_to_frame_p95_ms=61.901 keystroke_to_frame_p99_ms=61.901 keystroke_to_frame_max_ms=61.901 frame_interval_samples=8 frame_interval_median_ms=22.638 frame_interval_p95_ms=115.106 frame_interval_p99_ms=115.106 frame_interval_max_ms=115.106 layout_samples=9 layout_median_ms=1.429 layout_p95_ms=10.578 layout_p99_ms=10.578 layout_max_ms=10.578
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=126615552 session_count=1
+
+--- source_file: memory_folder_empty/trial_1/hane.log ---
+hane_ready startup_time_ms=177.572 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=326.772 indexed_markdown_files=0
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=87818240 session_count=1
+
+--- source_file: memory_folder_empty/trial_2/hane.log ---
+hane_ready startup_time_ms=194.956 file_open_time_ms=0.000 rss_bytes=71598080
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=309.913 indexed_markdown_files=0
+hane_measurement_memory label=memory_work_folder_idle rss_bytes=76595200 session_count=1
+
+--- source_file: memory_large_then_small/trial_1/hane.log ---
+hane_ready startup_time_ms=196.324 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/large_then_small elapsed_ms=317.382 indexed_markdown_files=2
+hane_measurement_memory label=memory_after_2_notes rss_bytes=355090432 session_count=2
+
+--- source_file: memory_longrun/hane.log ---
+hane_ready startup_time_ms=189.097 file_open_time_ms=0.000 rss_bytes=71647232
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/switch_a elapsed_ms=270.433 indexed_markdown_files=2
+hane_metrics keystroke_to_model_samples=40 keystroke_to_model_median_ms=0.000 keystroke_to_model_p95_ms=0.001 keystroke_to_model_p99_ms=0.026 keystroke_to_model_max_ms=0.026 keystroke_to_frame_samples=40 keystroke_to_frame_median_ms=1.709 keystroke_to_frame_p95_ms=1.720 keystroke_to_frame_p99_ms=1.756 keystroke_to_frame_max_ms=1.756 frame_interval_samples=9 frame_interval_median_ms=14.447 frame_interval_p95_ms=69.518 frame_interval_p99_ms=69.518 frame_interval_max_ms=69.518 layout_samples=10 layout_median_ms=0.114 layout_p95_ms=0.735 layout_p99_ms=0.735 layout_max_ms=0.735
+hane_measurement_memory label=memory_longrun_cycle_1 rss_bytes=99106816 session_count=2
+hane_metrics keystroke_to_model_samples=80 keystroke_to_model_median_ms=0.000 keystroke_to_model_p95_ms=0.002 keystroke_to_model_p99_ms=0.026 keystroke_to_model_max_ms=0.026 keystroke_to_frame_samples=80 keystroke_to_frame_median_ms=1.756 keystroke_to_frame_p95_ms=3.682 keystroke_to_frame_p99_ms=3.716 keystroke_to_frame_max_ms=3.716 frame_interval_samples=24 frame_interval_median_ms=25.461 frame_interval_p95_ms=69.518 frame_interval_p99_ms=1000.233 frame_interval_max_ms=1000.233 layout_samples=25 layout_median_ms=0.203 layout_p95_ms=1.566 layout_p99_ms=1.870 layout_max_ms=1.870
+hane_measurement_memory label=memory_longrun_cycle_5 rss_bytes=109674496 session_count=2
+hane_metrics keystroke_to_model_samples=120 keystroke_to_model_median_ms=0.000 keystroke_to_model_p95_ms=0.002 keystroke_to_model_p99_ms=0.016 keystroke_to_model_max_ms=0.026 keystroke_to_frame_samples=120 keystroke_to_frame_median_ms=3.666 keystroke_to_frame_p95_ms=5.025 keystroke_to_frame_p99_ms=5.035 keystroke_to_frame_max_ms=5.061 frame_interval_samples=41 frame_interval_median_ms=43.124 frame_interval_p95_ms=69.518 frame_interval_p99_ms=1000.233 frame_interval_max_ms=1000.233 layout_samples=42 layout_median_ms=0.536 layout_p95_ms=1.703 layout_p99_ms=1.870 layout_max_ms=1.870
+hane_measurement_memory label=memory_longrun_cycle_10 rss_bytes=109723648 session_count=2
+hane_metrics keystroke_to_model_samples=160 keystroke_to_model_median_ms=0.000 keystroke_to_model_p95_ms=0.002 keystroke_to_model_p99_ms=0.016 keystroke_to_model_max_ms=0.026 keystroke_to_frame_samples=160 keystroke_to_frame_median_ms=2.268 keystroke_to_frame_p95_ms=5.023 keystroke_to_frame_p99_ms=5.035 keystroke_to_frame_max_ms=5.061 frame_interval_samples=60 frame_interval_median_ms=42.519 frame_interval_p95_ms=69.518 frame_interval_p99_ms=1000.233 frame_interval_max_ms=1000.233 layout_samples=61 layout_median_ms=0.808 layout_p95_ms=1.715 layout_p99_ms=1.870 layout_max_ms=1.870
+hane_measurement_memory label=memory_longrun_cycle_15 rss_bytes=109805568 session_count=2
+hane_metrics keystroke_to_model_samples=200 keystroke_to_model_median_ms=0.000 keystroke_to_model_p95_ms=0.002 keystroke_to_model_p99_ms=0.016 keystroke_to_model_max_ms=0.026 keystroke_to_frame_samples=200 keystroke_to_frame_median_ms=2.218 keystroke_to_frame_p95_ms=5.021 keystroke_to_frame_p99_ms=5.031 keystroke_to_frame_max_ms=5.061 frame_interval_samples=78 frame_interval_median_ms=43.124 frame_interval_p95_ms=990.560 frame_interval_p99_ms=1000.233 frame_interval_max_ms=1000.233 layout_samples=79 layout_median_ms=0.877 layout_p95_ms=1.787 layout_p99_ms=1.922 layout_max_ms=1.922
+hane_measurement_memory label=memory_longrun_cycle_20 rss_bytes=109871104 session_count=2
+hane_measurement_memory label=memory_longrun_idle rss_bytes=109166592 session_count=2
+hane_longrun_complete cycles=20
+
+--- source_file: memory_visits_1k/trial_1/hane.log ---
+hane_ready startup_time_ms=184.493 file_open_time_ms=0.000 rss_bytes=71532544
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=326.285 indexed_markdown_files=1000
+hane_measurement_memory label=memory_after_10_notes rss_bytes=133529600 session_count=10
+hane_measurement_memory label=memory_after_100_notes rss_bytes=143245312 session_count=100
+hane_measurement_memory label=memory_after_1000_notes rss_bytes=258473984 session_count=1000
+
+--- source_file: repeat2/startup_100mb/1.log ---
+hane_ready startup_time_ms=382.768 file_open_time_ms=238.298 rss_bytes=384794624
+
+--- source_file: repeat2/startup_100mb/10.log ---
+hane_ready startup_time_ms=375.273 file_open_time_ms=235.260 rss_bytes=384434176
+
+--- source_file: repeat2/startup_100mb/11.log ---
+hane_ready startup_time_ms=383.365 file_open_time_ms=235.762 rss_bytes=384581632
+
+--- source_file: repeat2/startup_100mb/12.log ---
+hane_ready startup_time_ms=385.679 file_open_time_ms=244.999 rss_bytes=384450560
+
+--- source_file: repeat2/startup_100mb/13.log ---
+hane_ready startup_time_ms=367.326 file_open_time_ms=234.868 rss_bytes=384548864
+
+--- source_file: repeat2/startup_100mb/14.log ---
+hane_ready startup_time_ms=370.642 file_open_time_ms=236.124 rss_bytes=384565248
+
+--- source_file: repeat2/startup_100mb/15.log ---
+hane_ready startup_time_ms=368.402 file_open_time_ms=231.844 rss_bytes=384483328
+
+--- source_file: repeat2/startup_100mb/16.log ---
+hane_ready startup_time_ms=372.127 file_open_time_ms=234.462 rss_bytes=384598016
+
+--- source_file: repeat2/startup_100mb/17.log ---
+hane_ready startup_time_ms=385.452 file_open_time_ms=235.473 rss_bytes=384663552
+
+--- source_file: repeat2/startup_100mb/18.log ---
+hane_ready startup_time_ms=369.437 file_open_time_ms=233.582 rss_bytes=384614400
+
+--- source_file: repeat2/startup_100mb/19.log ---
+hane_ready startup_time_ms=366.519 file_open_time_ms=233.078 rss_bytes=384532480
+
+--- source_file: repeat2/startup_100mb/2.log ---
+hane_ready startup_time_ms=375.316 file_open_time_ms=236.842 rss_bytes=384679936
+
+--- source_file: repeat2/startup_100mb/20.log ---
+hane_ready startup_time_ms=364.581 file_open_time_ms=231.658 rss_bytes=384483328
+
+--- source_file: repeat2/startup_100mb/21.log ---
+hane_ready startup_time_ms=376.877 file_open_time_ms=235.174 rss_bytes=384598016
+
+--- source_file: repeat2/startup_100mb/22.log ---
+hane_ready startup_time_ms=370.648 file_open_time_ms=232.783 rss_bytes=384614400
+
+--- source_file: repeat2/startup_100mb/23.log ---
+hane_ready startup_time_ms=363.466 file_open_time_ms=230.381 rss_bytes=384630784
+
+--- source_file: repeat2/startup_100mb/24.log ---
+hane_ready startup_time_ms=384.425 file_open_time_ms=245.168 rss_bytes=384614400
+
+--- source_file: repeat2/startup_100mb/25.log ---
+hane_ready startup_time_ms=382.067 file_open_time_ms=240.580 rss_bytes=384696320
+
+--- source_file: repeat2/startup_100mb/26.log ---
+hane_ready startup_time_ms=372.796 file_open_time_ms=248.879 rss_bytes=384483328
+
+--- source_file: repeat2/startup_100mb/27.log ---
+hane_ready startup_time_ms=371.899 file_open_time_ms=234.743 rss_bytes=384614400
+
+--- source_file: repeat2/startup_100mb/28.log ---
+hane_ready startup_time_ms=368.754 file_open_time_ms=235.503 rss_bytes=384450560
+
+--- source_file: repeat2/startup_100mb/29.log ---
+hane_ready startup_time_ms=369.666 file_open_time_ms=232.908 rss_bytes=384516096
+
+--- source_file: repeat2/startup_100mb/3.log ---
+hane_ready startup_time_ms=382.823 file_open_time_ms=241.337 rss_bytes=386695168
+
+--- source_file: repeat2/startup_100mb/30.log ---
+hane_ready startup_time_ms=371.068 file_open_time_ms=236.745 rss_bytes=384532480
+
+--- source_file: repeat2/startup_100mb/4.log ---
+hane_ready startup_time_ms=390.542 file_open_time_ms=241.380 rss_bytes=384630784
+
+--- source_file: repeat2/startup_100mb/5.log ---
+hane_ready startup_time_ms=383.268 file_open_time_ms=244.109 rss_bytes=386646016
+
+--- source_file: repeat2/startup_100mb/6.log ---
+hane_ready startup_time_ms=396.154 file_open_time_ms=238.957 rss_bytes=384630784
+
+--- source_file: repeat2/startup_100mb/7.log ---
+hane_ready startup_time_ms=390.278 file_open_time_ms=235.694 rss_bytes=384745472
+
+--- source_file: repeat2/startup_100mb/8.log ---
+hane_ready startup_time_ms=377.808 file_open_time_ms=237.863 rss_bytes=384434176
+
+--- source_file: repeat2/startup_100mb/9.log ---
+hane_ready startup_time_ms=383.160 file_open_time_ms=239.857 rss_bytes=384565248
+
+--- source_file: repeat2/startup_cold_unpurged/1.log ---
+hane_ready startup_time_ms=185.920 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_cold_unpurged/10.log ---
+hane_ready startup_time_ms=186.150 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: repeat2/startup_cold_unpurged/11.log ---
+hane_ready startup_time_ms=185.473 file_open_time_ms=0.000 rss_bytes=71614464
+
+--- source_file: repeat2/startup_cold_unpurged/12.log ---
+hane_ready startup_time_ms=190.139 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: repeat2/startup_cold_unpurged/13.log ---
+hane_ready startup_time_ms=186.741 file_open_time_ms=0.000 rss_bytes=71598080
+
+--- source_file: repeat2/startup_cold_unpurged/14.log ---
+hane_ready startup_time_ms=194.285 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: repeat2/startup_cold_unpurged/15.log ---
+hane_ready startup_time_ms=187.156 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: repeat2/startup_cold_unpurged/16.log ---
+hane_ready startup_time_ms=192.869 file_open_time_ms=0.000 rss_bytes=71516160
+
+--- source_file: repeat2/startup_cold_unpurged/17.log ---
+hane_ready startup_time_ms=192.683 file_open_time_ms=0.000 rss_bytes=71581696
+
+--- source_file: repeat2/startup_cold_unpurged/18.log ---
+hane_ready startup_time_ms=188.536 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: repeat2/startup_cold_unpurged/19.log ---
+hane_ready startup_time_ms=184.925 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: repeat2/startup_cold_unpurged/2.log ---
+hane_ready startup_time_ms=199.390 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: repeat2/startup_cold_unpurged/20.log ---
+hane_ready startup_time_ms=187.990 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_cold_unpurged/21.log ---
+hane_ready startup_time_ms=187.710 file_open_time_ms=0.000 rss_bytes=68419584
+
+--- source_file: repeat2/startup_cold_unpurged/22.log ---
+hane_ready startup_time_ms=189.278 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_cold_unpurged/23.log ---
+hane_ready startup_time_ms=219.527 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: repeat2/startup_cold_unpurged/24.log ---
+hane_ready startup_time_ms=201.662 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: repeat2/startup_cold_unpurged/25.log ---
+hane_ready startup_time_ms=185.457 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: repeat2/startup_cold_unpurged/26.log ---
+hane_ready startup_time_ms=189.425 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_cold_unpurged/27.log ---
+hane_ready startup_time_ms=182.086 file_open_time_ms=0.000 rss_bytes=71335936
+
+--- source_file: repeat2/startup_cold_unpurged/28.log ---
+hane_ready startup_time_ms=174.318 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_cold_unpurged/29.log ---
+hane_ready startup_time_ms=184.620 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_cold_unpurged/3.log ---
+hane_ready startup_time_ms=197.615 file_open_time_ms=0.000 rss_bytes=71516160
+
+--- source_file: repeat2/startup_cold_unpurged/30.log ---
+hane_ready startup_time_ms=185.172 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: repeat2/startup_cold_unpurged/4.log ---
+hane_ready startup_time_ms=231.465 file_open_time_ms=0.000 rss_bytes=71614464
+
+--- source_file: repeat2/startup_cold_unpurged/5.log ---
+hane_ready startup_time_ms=175.242 file_open_time_ms=0.000 rss_bytes=71352320
+
+--- source_file: repeat2/startup_cold_unpurged/6.log ---
+hane_ready startup_time_ms=183.256 file_open_time_ms=0.000 rss_bytes=71516160
+
+--- source_file: repeat2/startup_cold_unpurged/7.log ---
+hane_ready startup_time_ms=196.712 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: repeat2/startup_cold_unpurged/8.log ---
+hane_ready startup_time_ms=185.355 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: repeat2/startup_cold_unpurged/9.log ---
+hane_ready startup_time_ms=186.891 file_open_time_ms=0.000 rss_bytes=71352320
+
+--- source_file: repeat2/startup_folder_10k/1.log ---
+hane_ready startup_time_ms=183.615 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=656.555 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/10.log ---
+hane_ready startup_time_ms=190.177 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=667.626 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/11.log ---
+hane_ready startup_time_ms=180.818 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=644.407 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/12.log ---
+hane_ready startup_time_ms=186.968 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=640.724 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/13.log ---
+hane_ready startup_time_ms=179.046 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=643.715 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/14.log ---
+hane_ready startup_time_ms=188.906 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=650.678 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/15.log ---
+hane_ready startup_time_ms=185.456 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=630.816 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/16.log ---
+hane_ready startup_time_ms=186.838 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=626.837 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/17.log ---
+hane_ready startup_time_ms=184.240 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=625.507 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/18.log ---
+hane_ready startup_time_ms=193.733 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=656.883 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/19.log ---
+hane_ready startup_time_ms=182.780 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=631.643 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/2.log ---
+hane_ready startup_time_ms=199.801 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=698.175 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/20.log ---
+hane_ready startup_time_ms=187.141 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=635.635 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/21.log ---
+hane_ready startup_time_ms=185.084 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=648.457 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/22.log ---
+hane_ready startup_time_ms=189.703 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=647.155 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/23.log ---
+hane_ready startup_time_ms=182.789 file_open_time_ms=0.000 rss_bytes=71352320
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=646.099 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/24.log ---
+hane_ready startup_time_ms=189.618 file_open_time_ms=0.000 rss_bytes=71303168
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=647.231 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/25.log ---
+hane_ready startup_time_ms=189.084 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=648.955 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/26.log ---
+hane_ready startup_time_ms=182.442 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=643.209 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/27.log ---
+hane_ready startup_time_ms=183.616 file_open_time_ms=0.000 rss_bytes=71614464
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=636.743 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/28.log ---
+hane_ready startup_time_ms=181.751 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=645.898 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/29.log ---
+hane_ready startup_time_ms=184.192 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=649.783 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/3.log ---
+hane_ready startup_time_ms=204.975 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=688.646 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/30.log ---
+hane_ready startup_time_ms=187.310 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=644.562 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/4.log ---
+hane_ready startup_time_ms=182.248 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=663.265 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/5.log ---
+hane_ready startup_time_ms=184.401 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=639.934 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/6.log ---
+hane_ready startup_time_ms=185.212 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=665.124 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/7.log ---
+hane_ready startup_time_ms=188.021 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=649.001 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/8.log ---
+hane_ready startup_time_ms=185.478 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=642.645 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_10k/9.log ---
+hane_ready startup_time_ms=178.234 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=650.399 indexed_markdown_files=10000
+
+--- source_file: repeat2/startup_folder_1k/1.log ---
+hane_ready startup_time_ms=194.204 file_open_time_ms=0.000 rss_bytes=71598080
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=335.209 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/10.log ---
+hane_ready startup_time_ms=189.263 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=324.261 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/11.log ---
+hane_ready startup_time_ms=193.396 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=329.745 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/12.log ---
+hane_ready startup_time_ms=196.261 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=329.415 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/13.log ---
+hane_ready startup_time_ms=191.799 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=316.047 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/14.log ---
+hane_ready startup_time_ms=210.682 file_open_time_ms=0.000 rss_bytes=71614464
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=364.881 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/15.log ---
+hane_ready startup_time_ms=209.868 file_open_time_ms=0.000 rss_bytes=68485120
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=336.532 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/16.log ---
+hane_ready startup_time_ms=195.258 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=332.216 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/17.log ---
+hane_ready startup_time_ms=191.081 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=293.345 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/18.log ---
+hane_ready startup_time_ms=185.306 file_open_time_ms=0.000 rss_bytes=71303168
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=291.930 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/19.log ---
+hane_ready startup_time_ms=184.272 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=307.848 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/2.log ---
+hane_ready startup_time_ms=188.615 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=303.307 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/20.log ---
+hane_ready startup_time_ms=186.485 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=287.179 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/21.log ---
+hane_ready startup_time_ms=199.671 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=337.218 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/22.log ---
+hane_ready startup_time_ms=186.114 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=304.522 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/23.log ---
+hane_ready startup_time_ms=190.041 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=340.808 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/24.log ---
+hane_ready startup_time_ms=182.603 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=310.692 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/25.log ---
+hane_ready startup_time_ms=187.439 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=314.026 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/26.log ---
+hane_ready startup_time_ms=184.076 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=303.884 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/27.log ---
+hane_ready startup_time_ms=189.648 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=317.536 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/28.log ---
+hane_ready startup_time_ms=190.464 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=327.250 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/29.log ---
+hane_ready startup_time_ms=190.342 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=324.847 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/3.log ---
+hane_ready startup_time_ms=217.452 file_open_time_ms=0.000 rss_bytes=71303168
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=336.270 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/30.log ---
+hane_ready startup_time_ms=188.968 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=322.558 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/4.log ---
+hane_ready startup_time_ms=198.659 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=337.741 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/5.log ---
+hane_ready startup_time_ms=191.811 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=327.654 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/6.log ---
+hane_ready startup_time_ms=186.995 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=330.152 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/7.log ---
+hane_ready startup_time_ms=189.941 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=314.628 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/8.log ---
+hane_ready startup_time_ms=186.090 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=304.761 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_1k/9.log ---
+hane_ready startup_time_ms=185.887 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=320.694 indexed_markdown_files=1000
+
+--- source_file: repeat2/startup_folder_empty/1.log ---
+hane_ready startup_time_ms=189.449 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=329.332 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/10.log ---
+hane_ready startup_time_ms=187.767 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=300.712 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/11.log ---
+hane_ready startup_time_ms=183.913 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=292.041 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/12.log ---
+hane_ready startup_time_ms=188.431 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=310.313 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/13.log ---
+hane_ready startup_time_ms=183.011 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=300.017 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/14.log ---
+hane_ready startup_time_ms=180.383 file_open_time_ms=0.000 rss_bytes=71335936
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=297.344 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/15.log ---
+hane_ready startup_time_ms=190.810 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=268.400 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/16.log ---
+hane_ready startup_time_ms=207.231 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=345.894 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/17.log ---
+hane_ready startup_time_ms=192.106 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=340.329 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/18.log ---
+hane_ready startup_time_ms=198.761 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=318.067 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/19.log ---
+hane_ready startup_time_ms=181.527 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=298.756 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/2.log ---
+hane_ready startup_time_ms=192.524 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=313.139 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/20.log ---
+hane_ready startup_time_ms=186.459 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=309.257 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/21.log ---
+hane_ready startup_time_ms=191.012 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=305.919 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/22.log ---
+hane_ready startup_time_ms=188.444 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=316.282 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/23.log ---
+hane_ready startup_time_ms=192.357 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=315.212 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/24.log ---
+hane_ready startup_time_ms=214.452 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=335.694 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/25.log ---
+hane_ready startup_time_ms=235.544 file_open_time_ms=0.000 rss_bytes=71614464
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=356.369 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/26.log ---
+hane_ready startup_time_ms=212.555 file_open_time_ms=0.000 rss_bytes=71696384
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=333.358 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/27.log ---
+hane_ready startup_time_ms=184.082 file_open_time_ms=0.000 rss_bytes=71532544
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=309.874 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/28.log ---
+hane_ready startup_time_ms=188.318 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=260.844 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/29.log ---
+hane_ready startup_time_ms=185.781 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=268.795 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/3.log ---
+hane_ready startup_time_ms=184.809 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=308.292 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/30.log ---
+hane_ready startup_time_ms=181.203 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=256.704 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/4.log ---
+hane_ready startup_time_ms=192.071 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=299.807 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/5.log ---
+hane_ready startup_time_ms=188.967 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=263.562 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/6.log ---
+hane_ready startup_time_ms=191.122 file_open_time_ms=0.000 rss_bytes=71532544
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=315.300 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/7.log ---
+hane_ready startup_time_ms=191.066 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=313.211 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/8.log ---
+hane_ready startup_time_ms=204.700 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=318.222 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_folder_empty/9.log ---
+hane_ready startup_time_ms=186.332 file_open_time_ms=0.000 rss_bytes=71319552
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=313.067 indexed_markdown_files=0
+
+--- source_file: repeat2/startup_small/1.log ---
+hane_ready startup_time_ms=202.145 file_open_time_ms=74.499 rss_bytes=78872576
+
+--- source_file: repeat2/startup_small/10.log ---
+hane_ready startup_time_ms=202.779 file_open_time_ms=69.317 rss_bytes=78839808
+
+--- source_file: repeat2/startup_small/11.log ---
+hane_ready startup_time_ms=189.490 file_open_time_ms=70.083 rss_bytes=78856192
+
+--- source_file: repeat2/startup_small/12.log ---
+hane_ready startup_time_ms=203.383 file_open_time_ms=72.854 rss_bytes=78905344
+
+--- source_file: repeat2/startup_small/13.log ---
+hane_ready startup_time_ms=200.763 file_open_time_ms=72.101 rss_bytes=78905344
+
+--- source_file: repeat2/startup_small/14.log ---
+hane_ready startup_time_ms=202.305 file_open_time_ms=73.097 rss_bytes=78741504
+
+--- source_file: repeat2/startup_small/15.log ---
+hane_ready startup_time_ms=238.674 file_open_time_ms=71.451 rss_bytes=78954496
+
+--- source_file: repeat2/startup_small/16.log ---
+hane_ready startup_time_ms=226.158 file_open_time_ms=75.154 rss_bytes=79020032
+
+--- source_file: repeat2/startup_small/17.log ---
+hane_ready startup_time_ms=191.275 file_open_time_ms=64.070 rss_bytes=78921728
+
+--- source_file: repeat2/startup_small/18.log ---
+hane_ready startup_time_ms=199.145 file_open_time_ms=67.066 rss_bytes=78970880
+
+--- source_file: repeat2/startup_small/19.log ---
+hane_ready startup_time_ms=218.568 file_open_time_ms=72.271 rss_bytes=78987264
+
+--- source_file: repeat2/startup_small/2.log ---
+hane_ready startup_time_ms=206.586 file_open_time_ms=75.543 rss_bytes=78872576
+
+--- source_file: repeat2/startup_small/20.log ---
+hane_ready startup_time_ms=197.530 file_open_time_ms=71.100 rss_bytes=78823424
+
+--- source_file: repeat2/startup_small/21.log ---
+hane_ready startup_time_ms=193.888 file_open_time_ms=72.148 rss_bytes=78905344
+
+--- source_file: repeat2/startup_small/22.log ---
+hane_ready startup_time_ms=194.868 file_open_time_ms=71.179 rss_bytes=78856192
+
+--- source_file: repeat2/startup_small/23.log ---
+hane_ready startup_time_ms=199.097 file_open_time_ms=71.778 rss_bytes=78856192
+
+--- source_file: repeat2/startup_small/24.log ---
+hane_ready startup_time_ms=192.510 file_open_time_ms=71.104 rss_bytes=78807040
+
+--- source_file: repeat2/startup_small/25.log ---
+hane_ready startup_time_ms=199.633 file_open_time_ms=69.874 rss_bytes=78757888
+
+--- source_file: repeat2/startup_small/26.log ---
+hane_ready startup_time_ms=191.222 file_open_time_ms=71.320 rss_bytes=78856192
+
+--- source_file: repeat2/startup_small/27.log ---
+hane_ready startup_time_ms=235.326 file_open_time_ms=72.819 rss_bytes=78938112
+
+--- source_file: repeat2/startup_small/28.log ---
+hane_ready startup_time_ms=205.302 file_open_time_ms=74.895 rss_bytes=81231872
+
+--- source_file: repeat2/startup_small/29.log ---
+hane_ready startup_time_ms=198.362 file_open_time_ms=62.597 rss_bytes=78888960
+
+--- source_file: repeat2/startup_small/3.log ---
+hane_ready startup_time_ms=227.932 file_open_time_ms=72.909 rss_bytes=78938112
+
+--- source_file: repeat2/startup_small/30.log ---
+hane_ready startup_time_ms=199.998 file_open_time_ms=66.440 rss_bytes=78856192
+
+--- source_file: repeat2/startup_small/4.log ---
+hane_ready startup_time_ms=187.285 file_open_time_ms=75.106 rss_bytes=80887808
+
+--- source_file: repeat2/startup_small/5.log ---
+hane_ready startup_time_ms=207.591 file_open_time_ms=68.659 rss_bytes=78872576
+
+--- source_file: repeat2/startup_small/6.log ---
+hane_ready startup_time_ms=200.513 file_open_time_ms=65.022 rss_bytes=78970880
+
+--- source_file: repeat2/startup_small/7.log ---
+hane_ready startup_time_ms=209.024 file_open_time_ms=73.105 rss_bytes=79020032
+
+--- source_file: repeat2/startup_small/8.log ---
+hane_ready startup_time_ms=191.119 file_open_time_ms=69.201 rss_bytes=78839808
+
+--- source_file: repeat2/startup_small/9.log ---
+hane_ready startup_time_ms=190.203 file_open_time_ms=71.415 rss_bytes=78905344
+
+--- source_file: repeat2/startup_warm/1.log ---
+hane_ready startup_time_ms=208.747 file_open_time_ms=0.000 rss_bytes=71876608
+
+--- source_file: repeat2/startup_warm/10.log ---
+hane_ready startup_time_ms=192.425 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: repeat2/startup_warm/11.log ---
+hane_ready startup_time_ms=183.455 file_open_time_ms=0.000 rss_bytes=71548928
+
+--- source_file: repeat2/startup_warm/12.log ---
+hane_ready startup_time_ms=185.220 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: repeat2/startup_warm/13.log ---
+hane_ready startup_time_ms=194.178 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: repeat2/startup_warm/14.log ---
+hane_ready startup_time_ms=184.963 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_warm/15.log ---
+hane_ready startup_time_ms=186.012 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_warm/16.log ---
+hane_ready startup_time_ms=191.929 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: repeat2/startup_warm/17.log ---
+hane_ready startup_time_ms=186.815 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_warm/18.log ---
+hane_ready startup_time_ms=205.228 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: repeat2/startup_warm/19.log ---
+hane_ready startup_time_ms=198.504 file_open_time_ms=0.000 rss_bytes=71581696
+
+--- source_file: repeat2/startup_warm/2.log ---
+hane_ready startup_time_ms=183.246 file_open_time_ms=0.000 rss_bytes=71729152
+
+--- source_file: repeat2/startup_warm/20.log ---
+hane_ready startup_time_ms=217.524 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_warm/21.log ---
+hane_ready startup_time_ms=201.720 file_open_time_ms=0.000 rss_bytes=71680000
+
+--- source_file: repeat2/startup_warm/22.log ---
+hane_ready startup_time_ms=187.540 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_warm/23.log ---
+hane_ready startup_time_ms=183.938 file_open_time_ms=0.000 rss_bytes=71532544
+
+--- source_file: repeat2/startup_warm/24.log ---
+hane_ready startup_time_ms=182.218 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_warm/25.log ---
+hane_ready startup_time_ms=186.009 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: repeat2/startup_warm/26.log ---
+hane_ready startup_time_ms=188.887 file_open_time_ms=0.000 rss_bytes=71581696
+
+--- source_file: repeat2/startup_warm/27.log ---
+hane_ready startup_time_ms=184.813 file_open_time_ms=0.000 rss_bytes=71598080
+
+--- source_file: repeat2/startup_warm/28.log ---
+hane_ready startup_time_ms=197.176 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: repeat2/startup_warm/29.log ---
+hane_ready startup_time_ms=190.920 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: repeat2/startup_warm/3.log ---
+hane_ready startup_time_ms=281.837 file_open_time_ms=0.000 rss_bytes=71843840
+
+--- source_file: repeat2/startup_warm/30.log ---
+hane_ready startup_time_ms=190.228 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_warm/4.log ---
+hane_ready startup_time_ms=197.045 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: repeat2/startup_warm/5.log ---
+hane_ready startup_time_ms=185.995 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: repeat2/startup_warm/6.log ---
+hane_ready startup_time_ms=223.259 file_open_time_ms=0.000 rss_bytes=71630848
+
+--- source_file: repeat2/startup_warm/7.log ---
+hane_ready startup_time_ms=179.144 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: repeat2/startup_warm/8.log ---
+hane_ready startup_time_ms=189.001 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: repeat2/startup_warm/9.log ---
+hane_ready startup_time_ms=237.111 file_open_time_ms=0.000 rss_bytes=71729152
+
+--- source_file: startup_100mb/1.log ---
+hane_ready startup_time_ms=407.671 file_open_time_ms=238.892 rss_bytes=384532480
+
+--- source_file: startup_100mb/10.log ---
+hane_ready startup_time_ms=366.830 file_open_time_ms=229.324 rss_bytes=384483328
+
+--- source_file: startup_100mb/11.log ---
+hane_ready startup_time_ms=361.843 file_open_time_ms=227.867 rss_bytes=384401408
+
+--- source_file: startup_100mb/12.log ---
+hane_ready startup_time_ms=378.844 file_open_time_ms=238.283 rss_bytes=386564096
+
+--- source_file: startup_100mb/13.log ---
+hane_ready startup_time_ms=378.745 file_open_time_ms=233.895 rss_bytes=384663552
+
+--- source_file: startup_100mb/14.log ---
+hane_ready startup_time_ms=363.940 file_open_time_ms=231.927 rss_bytes=384598016
+
+--- source_file: startup_100mb/15.log ---
+hane_ready startup_time_ms=372.371 file_open_time_ms=237.015 rss_bytes=384532480
+
+--- source_file: startup_100mb/16.log ---
+hane_ready startup_time_ms=363.505 file_open_time_ms=229.574 rss_bytes=384499712
+
+--- source_file: startup_100mb/17.log ---
+hane_ready startup_time_ms=374.405 file_open_time_ms=233.020 rss_bytes=384647168
+
+--- source_file: startup_100mb/18.log ---
+hane_ready startup_time_ms=363.866 file_open_time_ms=229.339 rss_bytes=384532480
+
+--- source_file: startup_100mb/19.log ---
+hane_ready startup_time_ms=364.298 file_open_time_ms=230.584 rss_bytes=384532480
+
+--- source_file: startup_100mb/2.log ---
+hane_ready startup_time_ms=390.895 file_open_time_ms=244.397 rss_bytes=384827392
+
+--- source_file: startup_100mb/20.log ---
+hane_ready startup_time_ms=362.356 file_open_time_ms=228.691 rss_bytes=384516096
+
+--- source_file: startup_100mb/21.log ---
+hane_ready startup_time_ms=359.640 file_open_time_ms=226.510 rss_bytes=384663552
+
+--- source_file: startup_100mb/22.log ---
+hane_ready startup_time_ms=365.570 file_open_time_ms=233.202 rss_bytes=384417792
+
+--- source_file: startup_100mb/23.log ---
+hane_ready startup_time_ms=363.972 file_open_time_ms=228.241 rss_bytes=384598016
+
+--- source_file: startup_100mb/24.log ---
+hane_ready startup_time_ms=362.679 file_open_time_ms=229.766 rss_bytes=384696320
+
+--- source_file: startup_100mb/25.log ---
+hane_ready startup_time_ms=359.514 file_open_time_ms=228.836 rss_bytes=384679936
+
+--- source_file: startup_100mb/26.log ---
+hane_ready startup_time_ms=363.088 file_open_time_ms=229.178 rss_bytes=384548864
+
+--- source_file: startup_100mb/27.log ---
+hane_ready startup_time_ms=359.652 file_open_time_ms=226.068 rss_bytes=384581632
+
+--- source_file: startup_100mb/28.log ---
+hane_ready startup_time_ms=370.051 file_open_time_ms=233.121 rss_bytes=384598016
+
+--- source_file: startup_100mb/29.log ---
+hane_ready startup_time_ms=380.236 file_open_time_ms=239.145 rss_bytes=384761856
+
+--- source_file: startup_100mb/3.log ---
+hane_ready startup_time_ms=371.963 file_open_time_ms=234.904 rss_bytes=384581632
+
+--- source_file: startup_100mb/30.log ---
+hane_ready startup_time_ms=374.500 file_open_time_ms=239.326 rss_bytes=384647168
+
+--- source_file: startup_100mb/4.log ---
+hane_ready startup_time_ms=377.041 file_open_time_ms=238.333 rss_bytes=384548864
+
+--- source_file: startup_100mb/5.log ---
+hane_ready startup_time_ms=375.635 file_open_time_ms=237.816 rss_bytes=384499712
+
+--- source_file: startup_100mb/6.log ---
+hane_ready startup_time_ms=380.350 file_open_time_ms=236.777 rss_bytes=384598016
+
+--- source_file: startup_100mb/7.log ---
+hane_ready startup_time_ms=375.478 file_open_time_ms=236.101 rss_bytes=384647168
+
+--- source_file: startup_100mb/8.log ---
+hane_ready startup_time_ms=372.881 file_open_time_ms=240.334 rss_bytes=384401408
+
+--- source_file: startup_100mb/9.log ---
+hane_ready startup_time_ms=365.229 file_open_time_ms=234.862 rss_bytes=384516096
+
+--- source_file: startup_cold_unpurged/1.log ---
+hane_ready startup_time_ms=187.625 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_cold_unpurged/10.log ---
+hane_ready startup_time_ms=183.700 file_open_time_ms=0.000 rss_bytes=71303168
+
+--- source_file: startup_cold_unpurged/11.log ---
+hane_ready startup_time_ms=189.849 file_open_time_ms=0.000 rss_bytes=71532544
+
+--- source_file: startup_cold_unpurged/12.log ---
+hane_ready startup_time_ms=177.099 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_cold_unpurged/13.log ---
+hane_ready startup_time_ms=181.326 file_open_time_ms=0.000 rss_bytes=71352320
+
+--- source_file: startup_cold_unpurged/14.log ---
+hane_ready startup_time_ms=180.867 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_cold_unpurged/15.log ---
+hane_ready startup_time_ms=177.367 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_cold_unpurged/16.log ---
+hane_ready startup_time_ms=172.663 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: startup_cold_unpurged/17.log ---
+hane_ready startup_time_ms=180.911 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_cold_unpurged/18.log ---
+hane_ready startup_time_ms=180.894 file_open_time_ms=0.000 rss_bytes=71319552
+
+--- source_file: startup_cold_unpurged/19.log ---
+hane_ready startup_time_ms=190.180 file_open_time_ms=0.000 rss_bytes=71270400
+
+--- source_file: startup_cold_unpurged/2.log ---
+hane_ready startup_time_ms=181.974 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_cold_unpurged/20.log ---
+hane_ready startup_time_ms=179.746 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_cold_unpurged/21.log ---
+hane_ready startup_time_ms=180.564 file_open_time_ms=0.000 rss_bytes=71270400
+
+--- source_file: startup_cold_unpurged/22.log ---
+hane_ready startup_time_ms=180.169 file_open_time_ms=0.000 rss_bytes=71467008
+
+--- source_file: startup_cold_unpurged/23.log ---
+hane_ready startup_time_ms=179.296 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_cold_unpurged/24.log ---
+hane_ready startup_time_ms=172.581 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: startup_cold_unpurged/25.log ---
+hane_ready startup_time_ms=177.375 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_cold_unpurged/26.log ---
+hane_ready startup_time_ms=180.708 file_open_time_ms=0.000 rss_bytes=71483392
+
+--- source_file: startup_cold_unpurged/27.log ---
+hane_ready startup_time_ms=178.528 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_cold_unpurged/28.log ---
+hane_ready startup_time_ms=173.405 file_open_time_ms=0.000 rss_bytes=71335936
+
+--- source_file: startup_cold_unpurged/29.log ---
+hane_ready startup_time_ms=174.635 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_cold_unpurged/3.log ---
+hane_ready startup_time_ms=187.246 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_cold_unpurged/30.log ---
+hane_ready startup_time_ms=186.900 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_cold_unpurged/4.log ---
+hane_ready startup_time_ms=181.661 file_open_time_ms=0.000 rss_bytes=71548928
+
+--- source_file: startup_cold_unpurged/5.log ---
+hane_ready startup_time_ms=180.650 file_open_time_ms=0.000 rss_bytes=71335936
+
+--- source_file: startup_cold_unpurged/6.log ---
+hane_ready startup_time_ms=183.227 file_open_time_ms=0.000 rss_bytes=71335936
+
+--- source_file: startup_cold_unpurged/7.log ---
+hane_ready startup_time_ms=188.274 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: startup_cold_unpurged/8.log ---
+hane_ready startup_time_ms=183.526 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_cold_unpurged/9.log ---
+hane_ready startup_time_ms=187.597 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_folder_10k/1.log ---
+hane_ready startup_time_ms=192.935 file_open_time_ms=0.000 rss_bytes=68550656
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=270.493 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/10.log ---
+hane_ready startup_time_ms=184.386 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=618.329 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/11.log ---
+hane_ready startup_time_ms=189.742 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=633.966 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/12.log ---
+hane_ready startup_time_ms=211.875 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=666.260 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/13.log ---
+hane_ready startup_time_ms=177.059 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=615.416 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/14.log ---
+hane_ready startup_time_ms=178.586 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=626.680 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/15.log ---
+hane_ready startup_time_ms=180.391 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=619.792 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/16.log ---
+hane_ready startup_time_ms=188.279 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=645.378 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/17.log ---
+hane_ready startup_time_ms=191.271 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=662.559 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/18.log ---
+hane_ready startup_time_ms=206.757 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=658.740 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/19.log ---
+hane_ready startup_time_ms=193.152 file_open_time_ms=0.000 rss_bytes=71598080
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=646.577 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/2.log ---
+hane_ready startup_time_ms=186.474 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=673.394 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/20.log ---
+hane_ready startup_time_ms=176.038 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=615.058 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/21.log ---
+hane_ready startup_time_ms=175.851 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=638.614 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/22.log ---
+hane_ready startup_time_ms=191.790 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=658.987 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/23.log ---
+hane_ready startup_time_ms=187.074 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=638.054 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/24.log ---
+hane_ready startup_time_ms=187.873 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=673.656 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/25.log ---
+hane_ready startup_time_ms=193.210 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=640.020 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/26.log ---
+hane_ready startup_time_ms=194.698 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=648.826 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/27.log ---
+hane_ready startup_time_ms=185.902 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=641.667 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/28.log ---
+hane_ready startup_time_ms=183.349 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=618.145 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/29.log ---
+hane_ready startup_time_ms=199.294 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=655.368 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/3.log ---
+hane_ready startup_time_ms=195.356 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=666.881 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/30.log ---
+hane_ready startup_time_ms=203.016 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=681.726 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/4.log ---
+hane_ready startup_time_ms=229.663 file_open_time_ms=0.000 rss_bytes=71352320
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=694.131 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/5.log ---
+hane_ready startup_time_ms=191.321 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=634.081 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/6.log ---
+hane_ready startup_time_ms=192.809 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=658.612 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/7.log ---
+hane_ready startup_time_ms=192.178 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=651.846 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/8.log ---
+hane_ready startup_time_ms=176.949 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=622.129 indexed_markdown_files=10000
+
+--- source_file: startup_folder_10k/9.log ---
+hane_ready startup_time_ms=189.040 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_10k elapsed_ms=655.744 indexed_markdown_files=10000
+
+--- source_file: startup_folder_1k/1.log ---
+hane_ready startup_time_ms=180.376 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=302.348 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/10.log ---
+hane_ready startup_time_ms=180.891 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=316.166 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/11.log ---
+hane_ready startup_time_ms=179.479 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=293.219 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/12.log ---
+hane_ready startup_time_ms=187.833 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=304.708 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/13.log ---
+hane_ready startup_time_ms=189.432 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=309.106 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/14.log ---
+hane_ready startup_time_ms=210.459 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=334.894 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/15.log ---
+hane_ready startup_time_ms=219.488 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=296.800 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/16.log ---
+hane_ready startup_time_ms=204.046 file_open_time_ms=0.000 rss_bytes=71680000
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=305.183 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/17.log ---
+hane_ready startup_time_ms=192.457 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=332.689 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/18.log ---
+hane_ready startup_time_ms=178.037 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=295.670 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/19.log ---
+hane_ready startup_time_ms=181.456 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=298.593 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/2.log ---
+hane_ready startup_time_ms=185.821 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=301.534 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/20.log ---
+hane_ready startup_time_ms=185.652 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=290.580 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/21.log ---
+hane_ready startup_time_ms=207.946 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=337.048 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/22.log ---
+hane_ready startup_time_ms=206.290 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=284.569 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/23.log ---
+hane_ready startup_time_ms=192.137 file_open_time_ms=0.000 rss_bytes=71614464
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=312.885 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/24.log ---
+hane_ready startup_time_ms=203.383 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=342.468 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/25.log ---
+hane_ready startup_time_ms=185.568 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=300.344 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/26.log ---
+hane_ready startup_time_ms=182.049 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=304.720 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/27.log ---
+hane_ready startup_time_ms=182.965 file_open_time_ms=0.000 rss_bytes=71548928
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=308.588 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/28.log ---
+hane_ready startup_time_ms=181.075 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=289.813 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/29.log ---
+hane_ready startup_time_ms=180.336 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=298.496 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/3.log ---
+hane_ready startup_time_ms=185.652 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=306.022 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/30.log ---
+hane_ready startup_time_ms=192.094 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=308.969 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/4.log ---
+hane_ready startup_time_ms=183.696 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=311.718 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/5.log ---
+hane_ready startup_time_ms=192.080 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=308.641 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/6.log ---
+hane_ready startup_time_ms=207.265 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=343.680 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/7.log ---
+hane_ready startup_time_ms=188.327 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=320.954 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/8.log ---
+hane_ready startup_time_ms=208.297 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=332.667 indexed_markdown_files=1000
+
+--- source_file: startup_folder_1k/9.log ---
+hane_ready startup_time_ms=181.376 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_1k elapsed_ms=312.921 indexed_markdown_files=1000
+
+--- source_file: startup_folder_empty/1.log ---
+hane_ready startup_time_ms=183.529 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=306.573 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/10.log ---
+hane_ready startup_time_ms=194.400 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=313.847 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/11.log ---
+hane_ready startup_time_ms=188.969 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=304.801 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/12.log ---
+hane_ready startup_time_ms=190.979 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=314.298 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/13.log ---
+hane_ready startup_time_ms=195.487 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=311.486 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/14.log ---
+hane_ready startup_time_ms=179.216 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=305.271 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/15.log ---
+hane_ready startup_time_ms=187.984 file_open_time_ms=0.000 rss_bytes=71417856
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=324.848 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/16.log ---
+hane_ready startup_time_ms=180.270 file_open_time_ms=0.000 rss_bytes=71450624
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=295.927 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/17.log ---
+hane_ready startup_time_ms=219.016 file_open_time_ms=0.000 rss_bytes=71368704
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=345.781 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/18.log ---
+hane_ready startup_time_ms=188.149 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=279.910 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/19.log ---
+hane_ready startup_time_ms=187.834 file_open_time_ms=0.000 rss_bytes=71483392
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=310.670 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/2.log ---
+hane_ready startup_time_ms=180.708 file_open_time_ms=0.000 rss_bytes=71598080
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=307.538 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/20.log ---
+hane_ready startup_time_ms=187.127 file_open_time_ms=0.000 rss_bytes=71401472
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=302.099 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/21.log ---
+hane_ready startup_time_ms=183.629 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=261.391 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/22.log ---
+hane_ready startup_time_ms=183.729 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=306.569 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/23.log ---
+hane_ready startup_time_ms=190.788 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=306.681 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/24.log ---
+hane_ready startup_time_ms=183.945 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=306.322 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/25.log ---
+hane_ready startup_time_ms=192.098 file_open_time_ms=0.000 rss_bytes=71434240
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=275.308 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/26.log ---
+hane_ready startup_time_ms=186.512 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=301.369 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/27.log ---
+hane_ready startup_time_ms=215.670 file_open_time_ms=0.000 rss_bytes=71532544
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=342.096 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/28.log ---
+hane_ready startup_time_ms=186.542 file_open_time_ms=0.000 rss_bytes=71532544
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=327.108 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/29.log ---
+hane_ready startup_time_ms=191.035 file_open_time_ms=0.000 rss_bytes=71581696
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=318.301 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/3.log ---
+hane_ready startup_time_ms=179.774 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=303.944 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/30.log ---
+hane_ready startup_time_ms=188.269 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=305.759 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/4.log ---
+hane_ready startup_time_ms=190.374 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=305.688 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/5.log ---
+hane_ready startup_time_ms=205.046 file_open_time_ms=0.000 rss_bytes=71467008
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=336.364 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/6.log ---
+hane_ready startup_time_ms=192.627 file_open_time_ms=0.000 rss_bytes=71516160
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=308.777 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/7.log ---
+hane_ready startup_time_ms=185.500 file_open_time_ms=0.000 rss_bytes=71565312
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=303.912 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/8.log ---
+hane_ready startup_time_ms=194.015 file_open_time_ms=0.000 rss_bytes=71499776
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=307.835 indexed_markdown_files=0
+
+--- source_file: startup_folder_empty/9.log ---
+hane_ready startup_time_ms=189.105 file_open_time_ms=0.000 rss_bytes=71385088
+hane_work_folder_ready root=/Users/hide/Github/hane-issue23/target/fixtures/issue23/folder_empty elapsed_ms=310.664 indexed_markdown_files=0
+
+--- source_file: startup_small/1.log ---
+hane_ready startup_time_ms=186.701 file_open_time_ms=70.353 rss_bytes=78757888
+
+--- source_file: startup_small/10.log ---
+hane_ready startup_time_ms=193.309 file_open_time_ms=69.402 rss_bytes=78954496
+
+--- source_file: startup_small/11.log ---
+hane_ready startup_time_ms=187.659 file_open_time_ms=69.463 rss_bytes=78823424
+
+--- source_file: startup_small/12.log ---
+hane_ready startup_time_ms=189.480 file_open_time_ms=69.504 rss_bytes=78823424
+
+--- source_file: startup_small/13.log ---
+hane_ready startup_time_ms=189.144 file_open_time_ms=68.225 rss_bytes=78856192
+
+--- source_file: startup_small/14.log ---
+hane_ready startup_time_ms=194.832 file_open_time_ms=73.183 rss_bytes=78839808
+
+--- source_file: startup_small/15.log ---
+hane_ready startup_time_ms=204.045 file_open_time_ms=72.795 rss_bytes=78872576
+
+--- source_file: startup_small/16.log ---
+hane_ready startup_time_ms=195.533 file_open_time_ms=69.781 rss_bytes=78888960
+
+--- source_file: startup_small/17.log ---
+hane_ready startup_time_ms=198.664 file_open_time_ms=70.593 rss_bytes=78888960
+
+--- source_file: startup_small/18.log ---
+hane_ready startup_time_ms=199.348 file_open_time_ms=70.103 rss_bytes=78938112
+
+--- source_file: startup_small/19.log ---
+hane_ready startup_time_ms=192.524 file_open_time_ms=70.931 rss_bytes=78954496
+
+--- source_file: startup_small/2.log ---
+hane_ready startup_time_ms=196.710 file_open_time_ms=70.153 rss_bytes=78921728
+
+--- source_file: startup_small/20.log ---
+hane_ready startup_time_ms=190.789 file_open_time_ms=68.590 rss_bytes=78790656
+
+--- source_file: startup_small/21.log ---
+hane_ready startup_time_ms=185.708 file_open_time_ms=67.473 rss_bytes=78888960
+
+--- source_file: startup_small/22.log ---
+hane_ready startup_time_ms=196.986 file_open_time_ms=69.374 rss_bytes=78888960
+
+--- source_file: startup_small/23.log ---
+hane_ready startup_time_ms=187.607 file_open_time_ms=67.858 rss_bytes=78774272
+
+--- source_file: startup_small/24.log ---
+hane_ready startup_time_ms=192.011 file_open_time_ms=67.776 rss_bytes=78839808
+
+--- source_file: startup_small/25.log ---
+hane_ready startup_time_ms=191.390 file_open_time_ms=68.273 rss_bytes=78774272
+
+--- source_file: startup_small/26.log ---
+hane_ready startup_time_ms=190.983 file_open_time_ms=71.607 rss_bytes=78790656
+
+--- source_file: startup_small/27.log ---
+hane_ready startup_time_ms=193.391 file_open_time_ms=71.280 rss_bytes=78757888
+
+--- source_file: startup_small/28.log ---
+hane_ready startup_time_ms=191.729 file_open_time_ms=68.877 rss_bytes=78938112
+
+--- source_file: startup_small/29.log ---
+hane_ready startup_time_ms=215.031 file_open_time_ms=73.125 rss_bytes=78905344
+
+--- source_file: startup_small/3.log ---
+hane_ready startup_time_ms=194.865 file_open_time_ms=72.791 rss_bytes=80855040
+
+--- source_file: startup_small/30.log ---
+hane_ready startup_time_ms=211.218 file_open_time_ms=71.729 rss_bytes=78888960
+
+--- source_file: startup_small/4.log ---
+hane_ready startup_time_ms=192.238 file_open_time_ms=67.727 rss_bytes=78938112
+
+--- source_file: startup_small/5.log ---
+hane_ready startup_time_ms=230.610 file_open_time_ms=71.633 rss_bytes=78954496
+
+--- source_file: startup_small/6.log ---
+hane_ready startup_time_ms=202.209 file_open_time_ms=72.224 rss_bytes=78905344
+
+--- source_file: startup_small/7.log ---
+hane_ready startup_time_ms=215.207 file_open_time_ms=68.913 rss_bytes=78823424
+
+--- source_file: startup_small/8.log ---
+hane_ready startup_time_ms=214.853 file_open_time_ms=70.992 rss_bytes=78938112
+
+--- source_file: startup_small/9.log ---
+hane_ready startup_time_ms=194.971 file_open_time_ms=74.227 rss_bytes=78774272
+
+--- source_file: startup_warm/1.log ---
+hane_ready startup_time_ms=200.063 file_open_time_ms=0.000 rss_bytes=71581696
+
+--- source_file: startup_warm/10.log ---
+hane_ready startup_time_ms=184.980 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_warm/11.log ---
+hane_ready startup_time_ms=183.953 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_warm/12.log ---
+hane_ready startup_time_ms=186.627 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_warm/13.log ---
+hane_ready startup_time_ms=185.117 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_warm/14.log ---
+hane_ready startup_time_ms=182.578 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_warm/15.log ---
+hane_ready startup_time_ms=181.873 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_warm/16.log ---
+hane_ready startup_time_ms=185.984 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: startup_warm/17.log ---
+hane_ready startup_time_ms=186.447 file_open_time_ms=0.000 rss_bytes=71368704
+
+--- source_file: startup_warm/18.log ---
+hane_ready startup_time_ms=204.308 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_warm/19.log ---
+hane_ready startup_time_ms=190.769 file_open_time_ms=0.000 rss_bytes=71532544
+
+--- source_file: startup_warm/2.log ---
+hane_ready startup_time_ms=172.190 file_open_time_ms=0.000 rss_bytes=71647232
+
+--- source_file: startup_warm/20.log ---
+hane_ready startup_time_ms=193.893 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_warm/21.log ---
+hane_ready startup_time_ms=199.740 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: startup_warm/22.log ---
+hane_ready startup_time_ms=186.698 file_open_time_ms=0.000 rss_bytes=71401472
+
+--- source_file: startup_warm/23.log ---
+hane_ready startup_time_ms=185.295 file_open_time_ms=0.000 rss_bytes=71450624
+
+--- source_file: startup_warm/24.log ---
+hane_ready startup_time_ms=187.183 file_open_time_ms=0.000 rss_bytes=71434240
+
+--- source_file: startup_warm/25.log ---
+hane_ready startup_time_ms=182.699 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_warm/26.log ---
+hane_ready startup_time_ms=181.830 file_open_time_ms=0.000 rss_bytes=71499776
+
+--- source_file: startup_warm/27.log ---
+hane_ready startup_time_ms=186.464 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_warm/28.log ---
+hane_ready startup_time_ms=184.389 file_open_time_ms=0.000 rss_bytes=71335936
+
+--- source_file: startup_warm/29.log ---
+hane_ready startup_time_ms=192.514 file_open_time_ms=0.000 rss_bytes=71352320
+
+--- source_file: startup_warm/3.log ---
+hane_ready startup_time_ms=312.420 file_open_time_ms=0.000 rss_bytes=71860224
+
+--- source_file: startup_warm/30.log ---
+hane_ready startup_time_ms=190.131 file_open_time_ms=0.000 rss_bytes=71417856
+
+--- source_file: startup_warm/4.log ---
+hane_ready startup_time_ms=183.611 file_open_time_ms=0.000 rss_bytes=71548928
+
+--- source_file: startup_warm/5.log ---
+hane_ready startup_time_ms=191.854 file_open_time_ms=0.000 rss_bytes=71286784
+
+--- source_file: startup_warm/6.log ---
+hane_ready startup_time_ms=227.768 file_open_time_ms=0.000 rss_bytes=71516160
+
+--- source_file: startup_warm/7.log ---
+hane_ready startup_time_ms=184.739 file_open_time_ms=0.000 rss_bytes=71516160
+
+--- source_file: startup_warm/8.log ---
+hane_ready startup_time_ms=193.562 file_open_time_ms=0.000 rss_bytes=71385088
+
+--- source_file: startup_warm/9.log ---
+hane_ready startup_time_ms=209.260 file_open_time_ms=0.000 rss_bytes=71565312

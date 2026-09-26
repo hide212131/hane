@@ -6278,6 +6278,62 @@ impl EditorView {
         }
     }
 
+    /// Returns the scanned work-folder root and its indexed Markdown paths for
+    /// the release-only measurement harness.
+    #[cfg(feature = "instrument")]
+    pub fn measurement_work_folder_state(&self) -> Option<(PathBuf, usize)> {
+        self.work_folder
+            .as_ref()
+            .map(|folder| (folder.root().to_path_buf(), folder.len()))
+    }
+
+    #[cfg(feature = "instrument")]
+    pub fn measurement_work_folder_note_paths(&self) -> Option<Vec<PathBuf>> {
+        self.work_folder.as_ref().map(|folder| {
+            folder
+                .entries()
+                .into_iter()
+                .map(|entry| entry.path().to_path_buf())
+                .collect()
+        })
+    }
+
+    #[cfg(feature = "instrument")]
+    pub fn measurement_note_is_loaded(&self, path: &Path) -> bool {
+        !self.loading_paths.contains(path)
+            && self
+                .sessions
+                .sessions()
+                .any(|session| session.path() == Some(path))
+    }
+
+    #[cfg(feature = "instrument")]
+    pub fn record_measurement_memory(&mut self, label: &str) -> (Option<u64>, usize) {
+        let rss_bytes = hane_metrics::process_memory_bytes();
+        let session_count = self.sessions.sessions().count();
+        if let Some(output) = &mut self.instrumentation.metrics_output
+            && let Err(error) = output.memory(label, rss_bytes)
+        {
+            eprintln!("could not write measurement memory metrics: {error}");
+        }
+        (rss_bytes, session_count)
+    }
+
+    #[cfg(feature = "instrument")]
+    pub fn measurement_elapsed_ms(&self) -> f64 {
+        self.instrumentation.process_started.elapsed().as_secs_f64() * 1_000.0
+    }
+
+    #[cfg(feature = "instrument")]
+    pub fn run_measurement_edit_cycles(&mut self, count: usize, cx: &mut Context<Self>) {
+        for _ in 0..count {
+            self.dispatch(EditorCommand::Insert("x"), cx);
+            self.dispatch(EditorCommand::Undo, cx);
+            self.dispatch(EditorCommand::Redo, cx);
+            self.dispatch(EditorCommand::Undo, cx);
+        }
+    }
+
     #[cfg(feature = "instrument")]
     pub fn apply_phase0_background_presentation(
         &mut self,
