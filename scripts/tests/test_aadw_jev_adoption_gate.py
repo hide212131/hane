@@ -304,6 +304,21 @@ class ActionLabelTests(unittest.TestCase):
         decision = gate.evaluate_adoption(context)
         self.assertFalse(decision.adoptable)
 
+    def test_requested_action_labels_not_matching_actual_request_criteria_is_blocked(self):
+        # The actual jev_request criteria has an extra candidate ("obsolete")
+        # that the context's requested/current declarations both omit, and
+        # Jev selected a label that is in the (understated) current allowed
+        # set. This must still be blocked: requested_action_labels must be
+        # verified against the real request criteria, not merely against
+        # current_allowed_action_labels.
+        context = valid_context()
+        context["jev_request"]["questions"]["action"]["criteria"]["obsolete"] = "obsolete description"
+        context["jev_result"]["answers"]["action"]["probabilities"]["obsolete"] = 0.0
+        # requested_action_labels and current_allowed_action_labels both
+        # under-report the real candidate set and still agree with each other.
+        decision = gate.evaluate_adoption(context)
+        self.assertFalse(decision.adoptable)
+
     def test_action_question_key_not_a_choice_question_is_blocked(self):
         context = valid_context()
         context["jev_request"]["questions"]["action"] = {"type": "noul"}

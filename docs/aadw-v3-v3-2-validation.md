@@ -105,20 +105,27 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   malformed JSON、非有限値、answer 欠落・型不一致、候補外 choice を検査する
   契約を弱めていない。
 - 採用する action の Choice は `action_question_key` で指定した質問の
-  `choice` type を要求し、選択された label が現在の
-  `current_allowed_action_labels`（空を許容しない）に含まれない場合、
-  および `requested_action_labels`（Jev 依頼時点の候補集合）と
-  `current_allowed_action_labels` が一致しない場合（候補集合が変化した
-  stale なケース）を区別してどちらも blocked にする。
+  `choice` type を要求し、その質問の `jev_request.questions[...].criteria`
+  の label 集合を request-time の候補集合の正本として扱う。
+  `requested_action_labels` はこの正本と厳密に一致することを必須にし、
+  一致しない場合（context の申告が実際の依頼内容とずれている stale な
+  ケース）を blocked にする。そのうえで正本の候補集合と
+  `current_allowed_action_labels`（空を許容しない）が一致しない場合
+  （候補集合が変化した stale なケース）、および選択された label が
+  `current_allowed_action_labels` に含まれない場合も、それぞれ区別して
+  blocked にする。
 - `scripts/tests/test_aadw_jev_adoption_gate.py` に、exact head/base +
   evidence success での採用可、head/base 不一致、CI/review の
   fail・blocked・unknown、GUI required/not_required の区別、Jev failure が
   fallback や COMPLETE を意味しないことの確認、候補外 choice、候補集合の
-  変化、Jev contract 違反（malformed・非有限値・answer 欠落）、不正な
-  context 形状（非 dict、SHA 形式不正、pr_number 不正）を含むテストを
-  追加した。このテストと gate 自体は本 worker の実行環境ではまだ実行して
-  いない。CI・レビュー・GUI 検証・実サービス接続の成功は別途 Commander が
-  観測する。
+  変化、`requested_action_labels` が実際の `jev_request` criteria とずれて
+  いても現在許可集合と選択 label が一致してしまう stale binding の回帰
+  （選択 label は現在許可集合の範囲内だが、実際の request criteria に
+  現在は許可されない余分な候補が1つ紛れているケース）、Jev contract 違反
+  （malformed・非有限値・answer 欠落）、不正な context 形状（非 dict、SHA
+  形式不正、pr_number 不正）を含むテストを追加した。このテストと gate
+  自体は本 worker の実行環境ではまだ実行していない。CI・レビュー・GUI
+  検証・実サービス接続の成功は別途 Commander が観測する。
 - CI の `Test AADW Jev contract` ステップは `.github/` 変更が禁止範囲のため
   引き続き `python3 scripts/tests/test_aadw_jev_contract.py` のみを実行する。
   このコマンドが `unittest.main()` に渡すのは自モジュール（`__main__`）の

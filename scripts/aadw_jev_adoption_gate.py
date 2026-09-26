@@ -141,11 +141,16 @@ def _check_action_labels(context: dict, request: dict, result: dict) -> None:
     answer = result["answers"][action_key]
     selected_label = answer["choice"]
 
+    request_criteria_labels = set(question["criteria"].keys())
+
     requested_labels = _require_label_list(context.get("requested_action_labels"),
                                             "requested_action_labels")
     current_labels = _require_label_list(context.get("current_allowed_action_labels"),
                                           "current_allowed_action_labels")
-    _require(set(requested_labels) == set(current_labels),
+    _require(set(requested_labels) == request_criteria_labels,
+              "requested_action_labels does not match the actual jev_request criteria "
+              "labels for this Jev decision")
+    _require(request_criteria_labels == set(current_labels),
               "current_allowed_action_labels no longer matches the candidate set "
               "recorded when this Jev decision was requested")
     _require(selected_label in current_labels,
