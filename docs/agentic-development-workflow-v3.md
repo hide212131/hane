@@ -104,7 +104,7 @@ GUI Validatorは観測のみを担当し、コード変更・次工程・merge�
 
 公式JavaScript SDKは`@typesafe-ai/sdk` / `TypeSafeClient.systemOne()`。HTTPは`POST /v1/systemone`で`state`、`questions`、`model`を受け、`model`、`answers`、`usage`を返す。[S3][S4] APIキーは`TYPESAFE_API_KEY`等の承認された秘密情報管理から連携部だけが取得する。
 
-Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは具体的な順序尺度で程度を評価する。既存handlerがある場合は、TypeSafeのfunction callingパターンで閉じたhandlerと引数を選び、Commanderまたはhandlerが実行する。質問内容に応じてこれらを利用し、費用・性能のベンチマークや閾値校正を追加の採用条件にしない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。[S2][S3]
+Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは具体的な順序尺度で程度を評価し、`filter`は複数候補の絞り込みに使う。既存handlerがある場合は、TypeSafeのfunction callingパターンで閉じたhandlerと引数を選び、Commanderまたはhandlerが実行する。繰り返す質問は承認済みspecとして再利用し、複数の独立質問は同じ要求へまとめる。質問内容に応じてこれらを利用し、費用・性能のベンチマークや閾値校正を追加の採用条件にしない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。[S2][S3]
 
 質問キーだけに意味を書かず、`instructions`と`criteria`で判断を説明する。同じstateの独立した質問はまとめられるが、互いの回答は参照できない。前の回答で追加証拠や選択肢が変わる場合だけ次のリクエストを使う。以下は未評価の質問例であり、採用済み閾値ではない。[S2]
 

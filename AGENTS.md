@@ -51,7 +51,7 @@ AADW の開発運用機能は、通常経路で Issue の目的・受入条件�
 
 ## 役割と Trust Boundary
 
-- **Jev / TypeSafe**: Hane の通常の意味判断を担う。依頼・受入条件・範囲・原因・検証計画・次の action・継続/停止/完了候補を判断し、Choice / Noul / Score と、利用可能な場合は既存handlerを選ぶfunction callingを適用する。既定接続は既存のlocal shell Jev CLIとTypeSafe設定であり、設定済み認証を保護する。Jev の意味判断を既定として使い、費用・性能の追加ベンチマークを有効化条件にしない。認証情報や任意操作の実行権限は渡さない。
+- **Jev / TypeSafe**: Hane の通常の意味判断を担う。依頼・受入条件・範囲・原因・検証計画・次の action・継続/停止/完了候補を判断し、Choice / Noul / Score / filter と、利用可能な場合は既存handlerを選ぶfunction callingを適用する。既定接続は既存のlocal shell Jev CLIとTypeSafe設定であり、設定済み認証を保護する。Jev の意味判断を既定として使い、費用・性能の追加ベンチマークを有効化条件にしない。認証情報や任意操作の実行権限は渡さない。
 - **ChatGPT / Commander**: current facts を取得し、Jev に必要な範囲で渡す。Jev の意味判断を独自に重複評価せず、実行可能な権限・current head/base・CI/review/GUI等の客観条件を確認し、次の一 action を実行する。製品コードの変更担当にはならない。
 - **Claude Code**: trusted same-repository PR branch の製品コードを変更できる通常の実装担当。開始時と push 直前に対象 head を確認し、不一致なら push しない。次工程は決めない。
 - **Codex**: current PR context をレビューする。通常のコードレビューでは製品コードを変更せず、次工程を決めない。Claude Code が `usage_or_rate_limit` と分類された場合に限り、同じ trust boundary と exact-head guard の下で専用 self-hosted runner 上のローカル Codex CLI が実装を継続できる。このフォールバックも次工程を決めない。base の変更が review の主張に影響する場合は Commander の判断で current base context に対して再レビューする。
