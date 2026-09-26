@@ -157,7 +157,7 @@ infrastructure failure など product code の問題と判断できない場合�
 
 ### 4.2 Review
 
-通常レビューはCodeRabbitを使う。安定候補とcurrent-head CIを確認した後は `@coderabbitai full review` で候補全体を確認し、修正途中の追加差分だけを確認するときは `@coderabbitai review` を使う。自動レビューは前提にせず、依頼した対象head・reviewed range・完了状態をGitHub上の実結果で確認する。Codex Reviewは通常経路として要求せず、外部設定で投稿されてもCodeRabbit reviewの代替証拠にはしない。
+通常レビューはCodeRabbitを使う。`.coderabbit.yaml` でnon-draft PRのAutomatic Reviewとpush後のAutomatic Incremental Reviewを有効にし、`auto_pause_after_reviewed_commits: 2` で過剰な再レビューを抑える。自動レビューはCommanderが発行するactionではなく、GitHubに現れたreview evidenceとして観測する。最終候補ではcurrent-head CI成功後に `@coderabbitai full review` を明示的に実行してPR全体を取り直す。途中で自動pauseした場合や追加確認が必要な場合だけ `@coderabbitai review` / `resume` を使う。対象head・reviewed range・完了状態をGitHub上の実結果で確認し、Codex Reviewは通常経路として要求せず、外部設定で投稿されてもCodeRabbit reviewの代替証拠にはしない。
 
 current PR head の unresolved findings を一度に確認する。
 

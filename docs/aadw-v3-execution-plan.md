@@ -32,9 +32,9 @@ Claude workerのRead/Edit/Write/Glob/Grep限定と別finalizerを維持する。
 
 ### CodeRabbit
 
-App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。安定候補とCIの確認後に`@coderabbitai full review`を依頼し、修正途中は`@coderabbitai review`を利用できる。増分を最終候補全体のレビューへ読み替えない。初期は最終current headへfull reviewを行う。
+App導入、対象repository、契約、投稿actorの受理、レビュー専任設定を確認する。Issue #373でAutomatic ReviewとAutomatic Incremental Reviewを有効にし、non-draft PRの初回とpush後の差分を自動レビューする。`auto_pause_after_reviewed_commits: 2` で過剰なレビューを抑え、必要なら `@coderabbitai review` / `resume` を使う。増分を最終候補全体のレビューへ読み替えず、最終current headはCI成功後に`@coderabbitai full review`で確認する。
 
-依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。対象不明や無応答を合格にしない。自動修正、CI修正、競合修正、テスト生成等を無効化し、残るApp権限を明記する。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373の切替後は通常レビューをCodeRabbitとする。Codexレビューを常時二重実行しない。
+依頼・完了・対象SHAとbaseに影響される範囲・対象外ファイル・未解決指摘を証明できることを受入条件にする。対象不明や無応答を合格にしない。Automatic Review / Automatic Incremental Review以外の自動修正、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。V3-3 / Issue #360でfull/incremental reviewの実runを確認済みであり、Issue #373でAutomatic + Incrementalを有効化する。Codexレビューを常時二重実行しない。
 
 ### GUI
 

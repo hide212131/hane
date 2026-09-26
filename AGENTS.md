@@ -55,7 +55,7 @@ AADW の開発運用機能は、通常経路で Issue の目的・受入条件�
 - **Jev / TypeSafe**: Hane の通常の意味判断を担う。依頼・受入条件・範囲・原因・検証計画・次の action・継続/停止/完了候補を判断し、Choice / Noul / Score / filter と、利用可能な場合は既存handlerを選ぶfunction callingを適用する。既定接続は既存のlocal shell Jev CLIとTypeSafe設定であり、設定済み認証を保護する。Jev の意味判断を既定として使い、費用・性能の追加ベンチマークを有効化条件にしない。認証情報や任意操作の実行権限は渡さない。
 - **ChatGPT / Commander**: current facts を取得し、Jev に必要な範囲で渡す。Jev の意味判断を独自に重複評価せず、実行可能な権限・current head/base・CI/review/GUI等の客観条件を確認し、次の一 action を実行する。製品コードの変更担当にはならない。
 - **Claude Code**: trusted same-repository PR branch の製品コードを変更できる通常の実装担当。開始時と push 直前に対象 head を確認し、不一致なら push しない。次工程は決めない。
-- **CodeRabbit**: current PR の通常レビューを担当する。安定候補では `@coderabbitai full review`、途中修正では `@coderabbitai review` を明示的に依頼し、対象 head・範囲・完了状態を確認する。製品コードの修正、次工程の決定、merge は担当しない。
+- **CodeRabbit**: current PR の通常レビューを担当する。non-draft PR の初回レビューと push 後の増分レビューは `.coderabbit.yaml` に従って自動実行し、2 reviewed commits で自動pauseする。最終候補では current-head CI 成功後に `@coderabbitai full review` を明示的に実行し、対象 head・範囲・完了状態を確認する。製品コードの修正、次工程の決定、merge は担当しない。
 - **Codex**: 通常レビュー担当にはしない。Claude Code が `usage_or_rate_limit` と分類された場合に限り、同じ trust boundary と exact-head guard の下で専用 self-hosted runner 上のローカル Codex CLI が実装を継続できる。このフォールバックも次工程を決めない。外部設定により Codex Review がPRへ投稿されても、AADW v3 の通常レビュー evidence として要求・採用しない。
 - **GUI Validator**: focused scenario を実行して観測事実と evidence を残す。製品コードを変更せず、結果の意味判断や次工程を決めない。
 - **CI**: 客観的な build / test / lint 結果を GitHub に残す。AADW の状態遷移や次工程を決めない。
@@ -78,4 +78,4 @@ AADW 専用の collector、wrapper、workflow、status、receipt、Gate は前�
 
 Jevは依頼解釈、作業範囲、原因分類、検証計画、次の action など通常の意味判断を担当し、利用可能な既存handlerがあればその選択も行う。ChatGPT Commander は GitHub の事実・権限・required evidence を確認し、選ばれた一 action を実行する。費用・性能の追加評価や事前閾値を Jev 利用の条件にしない。Issue #333 は残るv3導入作業を追跡し、この運用だけをもって Issue 全体を完了扱いにしない。
 
-GUIはv2のADR-0024と既存Hosted/ローカル経路を引き継ぎ、必須scenarioの未実施・fail・blocked・unknownを免除しない。CodeRabbitはIssue #360の実run検証とIssue #373の切替を経て通常レビュー担当とする。アプリ終了後の無人継続や独立App Server実行器など、残るv3機能の移行状態は個別のIssue/PRで確認する。
+GUIはv2のADR-0024と既存Hosted/ローカル経路を引き継ぎ、必須scenarioの未実施・fail・blocked・unknownを免除しない。CodeRabbitはIssue #360の実run検証とIssue #373の切替を経て通常レビュー担当とし、Automatic Review + Automatic Incremental Reviewを使う。最終受入は自動増分レビューだけで済ませず、current-headのmanual full reviewを確認する。アプリ終了後の無人継続や独立App Server実行器など、残るv3機能の移行状態は個別のIssue/PRで確認する。

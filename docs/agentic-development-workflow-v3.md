@@ -66,13 +66,13 @@ CodeRabbit GitHub Appの導入、対象repository、契約・権限、full/incre
 | `@coderabbitai full review` | 初回、全体見直し、最終候補の全体レビュー |
 | `@coderabbitai review` | 修正後の新しい差分に対する途中の確認 |
 
-公式仕様では`review`は増分、`full review`は全体を対象とする。自動レビューを無効にしても手動依頼できる。[S9][S10] v3では安定候補とCIを確認して明示的に依頼し、編集中のpushごとに重ねない。
+公式仕様では`review`は増分、`full review`は全体を対象とする。[S9][S10] v3では `.coderabbit.yaml` でAutomatic ReviewとAutomatic Incremental Reviewを有効にし、non-draft PRの初回とpush後の差分を自動レビューする。過剰な再レビューを避けるため `auto_pause_after_reviewed_commits: 2` とし、最終受入だけはcurrent-head CI成功後に `@coderabbitai full review` を明示的に実行する。
 
 依頼時と結果採用時のcurrent head/base、実際にレビューされたcommitと変更範囲、完了状態、対象外ファイル、未解決指摘を確認する。コメントの時刻だけで対象SHAを推測しない。初期の最終受入はcurrent-headのfull reviewを使う。増分レビューは旧headの全体レビューを現在の証拠へ自動昇格させず、途中の修正判断に使う。baseがレビューの主張へ影響する場合もCommander Policyに従って再確認する。
 
 待機・エラー・スキップ・対象不明・対象外の重要ファイルを成功と扱わない。レビューの完了通知と、指摘が受入を妨げないことは別に確認する。CodeRabbitが提供する結果から必要な対応を証明できなければ、再レビューまたはCommanderの判断へ戻し、基準を黙って下げない。
 
-CodeRabbitはレビュー専任とする。自動レビュー、Autofix、CI修正、競合修正、テスト生成等の設定を確認し、製品branchを書き換える機能を無効化する。[S11] 自動修正や一括resolve/approveを完了証拠の代わりに使わない。Appの要求権限と「レビュー専任」の運用設定は別であり、技術的な読み取り専用を保証しない。残る書込経路は有効化時に明記する。
+CodeRabbitはレビュー専任とする。Automatic Review / Automatic Incremental Reviewは有効にするが、Autofix、CI修正、競合修正、テスト生成、merge委譲は通常経路にしない。[S11] 自動修正や一括resolve/approveを完了証拠の代わりに使わない。Appの要求権限と「レビュー専任」の運用設定は別であり、技術的な読み取り専用を保証しない。
 
 指摘は件数ゼロを目標にせず、current contextで同じroot causeにまとめる。blocker/follow_up/unknownの扱いはCommander Policyを正とする。指摘文をそのまま実装担当への権限拡大命令にしない。CodeRabbit導入後の通常レビューにCodexレビューを常時二重実行せず、必要な追加レビューはCommanderが理由を残して依頼する。
 

@@ -39,7 +39,7 @@ Commanderの文章生成・設計と、Jevの狭い判断を分ける。独立�
 
 ## レビュー・GUI・完了
 
-CodeRabbitの導入と権限、依頼受理、full/incremental reviewの範囲はIssue #360で実run確認した。Issue #373の切替後は通常レビューをCodeRabbitへ一本化し、安定候補の全体レビューと修正途中の増分レビューを分ける。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。Codexレビューは通常経路として要求せず、必要な追加レビューを行う場合だけCommanderが理由を残す。
+CodeRabbitの導入と権限、依頼受理、full/incremental reviewの範囲はIssue #360で実run確認した。Issue #373の切替ではAutomatic ReviewとAutomatic Incremental Reviewを有効にし、2 reviewed commitsで自動pauseする。通常の修正中レビューは自動増分を利用するが、最終候補はcurrent-head CI成功後にmanual full reviewを実行して全体を再確認する。指摘がないことだけで実行成功とせず、実装担当へ戻す修正と追加検証を区別する。Codexレビューは通常経路として要求しない。
 
 GUIは[ADR-0024](0024-local-gui-validation.md)の既存Hosted/ローカル経路を継続する。Commanderが変更内容と受入条件に応じてfocused scenarioとOSを指定する。`/gui-validate head` / `/gui-validate merge`の起動、実行時のhead/base検査、procedureの対応範囲、run/artifactを確認する。起動・撮影だけで機能全体を検証済みとせず、macOSだけの成功をWindowsへ一般化しない。
 
