@@ -67,6 +67,10 @@ PATH_OCR_COVERAGE_MIN = 0.9
 # spanning most of the search band) rather than to assert an exact size.
 ICON_MIN_PIXELS = 3
 ICON_MAX_PIXELS = 60
+# An outline glyph can be sparse in any one column, so the Swift helper uses
+# a permissive per-column threshold and this aggregate guard rejects tiny
+# noise after the candidate rectangle has been found.
+ICON_MIN_CONTRAST_PIXELS = 12
 
 
 def load_module(control_dir: Path, relative: str, name: str):
@@ -169,6 +173,16 @@ def icon_probe_is_plausible(probe: dict) -> tuple[bool, str | None]:
     contrast_run = probe.get("contrast_run", 0)
     if not (isinstance(contrast_run, (int, float)) and not isinstance(contrast_run, bool) and contrast_run > 0):
         return False, "copy icon が背景と異なる pixel を持つ evidence がない"
+    contrast_pixels = probe.get("contrast_pixel_count", 0)
+    if not (
+        isinstance(contrast_pixels, (int, float))
+        and not isinstance(contrast_pixels, bool)
+        and contrast_pixels >= ICON_MIN_CONTRAST_PIXELS
+    ):
+        return False, (
+            "copy icon の contrast pixel 数が少なすぎる: "
+            f"{contrast_pixels} < {ICON_MIN_CONTRAST_PIXELS}"
+        )
     return True, None
 
 

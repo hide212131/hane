@@ -109,6 +109,7 @@ class IconProbePlausibilityTests(unittest.TestCase):
             "icon_pixel_rect": {"x0": 10, "y0": 10, "x1": 20, "y1": 20},
             "icon_center_fraction": {"x": 0.5, "y_from_top": 0.5},
             "contrast_run": 8,
+            "contrast_pixel_count": 32,
         }
         probe.update(overrides)
         return probe
@@ -139,6 +140,12 @@ class IconProbePlausibilityTests(unittest.TestCase):
 
     def test_rejects_zero_contrast_run(self):
         ok, _ = mod.icon_probe_is_plausible(self._probe(contrast_run=0))
+        self.assertFalse(ok)
+
+    def test_rejects_sparse_contrast_noise(self):
+        ok, _ = mod.icon_probe_is_plausible(
+            self._probe(contrast_pixel_count=mod.ICON_MIN_CONTRAST_PIXELS - 1)
+        )
         self.assertFalse(ok)
 
     def test_rejects_malformed_rect(self):

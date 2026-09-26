@@ -333,8 +333,9 @@ func findPathFragments(_ path: String, _ expectedNoWhitespace: String) {
 // Locates the copy icon by pixel contrast alone (never by asking the
 // target's own layout), immediately to the right of the absolute-path
 // text's pixel envelope: it samples the dominant background color of the
-// search band, then finds the contiguous run of columns whose pixels
-// depart from that background across a large share of the band's height.
+// search band, then finds a contiguous run of columns containing enough
+// contrasting pixels for an antialiased outline glyph. A separate aggregate
+// contrast count is returned so the Python policy can still reject tiny noise.
 func copyIconProbe(_ path: String, _ envX0: Int, _ envY0: Int, _ envX1: Int, _ envY1: Int) {
     let image = raster(path)
     let searchMargin = 220
@@ -348,7 +349,12 @@ func copyIconProbe(_ path: String, _ envX0: Int, _ envY0: Int, _ envX1: Int, _ e
 
     let background = dominantColor(image, x0: searchX0, x1: searchX1, y0: searchY0, y1: searchY1)
     let bandHeight = searchY1 - searchY0
-    let minColumnCount = max(1, Int(Double(bandHeight) * 0.3))
+    // The copy icon is an outline glyph: on the hosted screenshot its columns
+    // contain only a few non-background pixels even though the glyph is
+    // clearly visible. Requiring 30% of the entire padded band incorrectly
+    // rejects it. Ten percent keeps the columns connected while the aggregate
+    // contrast count and size checks reject isolated noise.
+    let minColumnCount = max(2, Int(Double(bandHeight) * 0.10))
 
     var columnCounts: [Int: Int] = [:]
     for x in searchX0..<searchX1 {
@@ -387,6 +393,13 @@ func copyIconProbe(_ path: String, _ envX0: Int, _ envY0: Int, _ envX1: Int, _ e
         iconY1 = searchY1
     }
 
+    var contrastPixelCount = 0
+    for x in iconX0..<iconX1 {
+        for y in iconY0..<iconY1 where maxChannelDistance(image.rgb(x, y), background) > contrastThreshold {
+            contrastPixelCount += 1
+        }
+    }
+
     let centerX = Double(iconX0 + iconX1) / 2.0
     let centerY = Double(iconY0 + iconY1) / 2.0
     jsonPrint([
@@ -394,6 +407,7 @@ func copyIconProbe(_ path: String, _ envX0: Int, _ envY0: Int, _ envX1: Int, _ e
         "icon_pixel_rect": ["x0": iconX0, "y0": iconY0, "x1": iconX1, "y1": iconY1],
         "icon_center_fraction": ["x": centerX / Double(image.width), "y_from_top": centerY / Double(image.height)],
         "contrast_run": bestRun.count,
+        "contrast_pixel_count": contrastPixelCount,
         "search_rect": ["x0": searchX0, "y0": searchY0, "x1": searchX1, "y1": searchY1],
     ])
 }
