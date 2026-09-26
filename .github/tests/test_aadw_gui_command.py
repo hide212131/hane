@@ -47,6 +47,8 @@ class ParseCommandTests(unittest.TestCase):
         self.assertIsNone(command.parse_command("/gui-validate sidebar-chrome merge"))
         self.assertIsNone(command.parse_command("/gui-validate code-block head"))
         self.assertIsNone(command.parse_command("/gui-validate code-block merge"))
+        self.assertIsNone(command.parse_command("/gui-validate file-tabs head"))
+        self.assertIsNone(command.parse_command("/gui-validate file-tabs merge"))
 
     def test_accepts_outer_whitespace_but_not_embedded_prose(self):
         self.assertEqual(command.parse_command(" \r\n/gui-validate merge\r\n "), "merge")
@@ -149,6 +151,24 @@ class ParseRouteTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_routes_file_tabs_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                expected = {
+                    "validation_kind": "file-tabs",
+                    "execution_context": context,
+                    "workflow_file": "aadw-gui-validation.yml",
+                    "procedure_path": "scripts/hosted_file_tabs_gui.py",
+                }
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate file-tabs {context}"),
+                    expected,
+                )
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate\tfile-tabs\t{context}"),
+                    expected,
+                )
+
     def test_sidebar_chrome_route_rejects_non_whitespace_separators(self):
         self.assertIsNone(command.parse_route("/gui-validatettsidebar-chromethead"))
         self.assertIsNone(command.parse_route(r"/gui-validate\sidebar-chrome\head"))
@@ -170,6 +190,10 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate code-block merge extra",
             "このPRは /gui-validate code-block merge してください",
             "/gui-validate code-block\nmerge",
+            "/gui-validate file-tabs",
+            "/gui-validate file-tabs merge extra",
+            "このPRは /gui-validate file-tabs merge してください",
+            "/gui-validate file-tabs\nmerge",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
