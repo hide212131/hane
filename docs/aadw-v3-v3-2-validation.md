@@ -77,3 +77,65 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   JSON textでは許可され0〜1 fieldでは拒否されること、深くネストしたJSON
   text・直接dict入力の両方で`RecursionError`を漏らさず`ContractError`に
   なること、既存テストが弱まっていないことを回帰テストで確認した。
+
+
+## Issue #347: current context adoption gate
+
+この Issue では、Jev の request/result 契約が正しくても current head/base/evidence が stale・unknown・missing なら回答を採用しない、ネットワーク・secret・write 権限を持たない小さい adoption gate を追加する。
+
+実装対象は `scripts/aadw_jev_*.py`、`scripts/tests/test_aadw_jev_*.py` と必要最小限の fixture / 本記録に限定し、現行 Policy、`.github/`、認証、GUI workflow、fallback workflow は変更しない。
+
+### 実装内容（current head、テスト未実行）
+
+- `scripts/aadw_jev_adoption_gate.py` に `evaluate_adoption(context)` を追加した。
+  ネットワーク・GitHub API・Jev API を呼ばず、外部副作用を持たない
+  `AdoptionDecision(adoptable: bool, reason: str)` のみを返す decision-only な
+  関数であり、action の選択・routing・merge・fallback は行わない。
+- 検査する current context は `expected_head_sha` / `current_head_sha`
+  （40桁hex、不一致なら blocked）、`base_sensitive` が true の場合の
+  `expected_base_sha` / `current_base_sha`（同様に40桁hex必須・不一致なら
+  blocked。false の場合は base の変化自体では拒否しない）、非空の
+  `acceptance_evidence_id`、`ci_status` / `review_status`（`success` のみ
+  採用可、fail / blocked / unknown / missing は拒否）、`gui_required` と
+  `gui_status`（required なら `success` のみ、not_required なら未実施でも
+  他条件次第で採用可）、`jev_status`（`success` 以外は blocked とし、
+  Codex fallback や COMPLETE への読み替えを行わない）。
+- Jev の request/result 本体は既存の `aadw_jev_contract.py` の
+  `validate_request` / `validate_result` / `validate_pair` をそのまま再利用し、
+  malformed JSON、非有限値、answer 欠落・型不一致、候補外 choice を検査する
+  契約を弱めていない。
+- 採用する action の Choice は `action_question_key` で指定した質問の
+  `choice` type を要求し、その質問の `jev_request.questions[...].criteria`
+  の label 集合を request-time の候補集合の正本として扱う。
+  `requested_action_labels` はこの正本と厳密に一致することを必須にし、
+  一致しない場合（context の申告が実際の依頼内容とずれている stale な
+  ケース）を blocked にする。そのうえで正本の候補集合と
+  `current_allowed_action_labels`（空を許容しない）が一致しない場合
+  （候補集合が変化した stale なケース）、および選択された label が
+  `current_allowed_action_labels` に含まれない場合も、それぞれ区別して
+  blocked にする。
+- `scripts/tests/test_aadw_jev_adoption_gate.py` に、exact head/base +
+  evidence success での採用可、head/base 不一致、CI/review の
+  fail・blocked・unknown、GUI required/not_required の区別、Jev failure が
+  fallback や COMPLETE を意味しないことの確認、候補外 choice、候補集合の
+  変化、`requested_action_labels` が実際の `jev_request` criteria とずれて
+  いても現在許可集合と選択 label が一致してしまう stale binding の回帰
+  （選択 label は現在許可集合の範囲内だが、実際の request criteria に
+  現在は許可されない余分な候補が1つ紛れているケース）、Jev contract 違反
+  （malformed・非有限値・answer 欠落）、不正な context 形状（非 dict、SHA
+  形式不正、pr_number 不正）を含むテストを追加した。このテストと gate
+  自体は本 worker の実行環境ではまだ実行していない。CI・レビュー・GUI
+  検証・実サービス接続の成功は別途 Commander が観測する。
+- CI の `Test AADW Jev contract` ステップは `.github/` 変更が禁止範囲のため
+  引き続き `python3 scripts/tests/test_aadw_jev_contract.py` のみを実行する。
+  このコマンドが `unittest.main()` に渡すのは自モジュール（`__main__`）の
+  namespace だけで、別ファイルの `test_aadw_jev_adoption_gate.py` は自動では
+  発見されないため、そのままでは adoption gate のテストが一件も実行されない
+  まま CI が成功し得た。`scripts/tests/test_aadw_jev_contract.py` の
+  `if __name__ == "__main__":` 側で `test_aadw_jev_adoption_gate` を import し、
+  両モジュールのテストを一つの `unittest.TestSuite` にまとめて同一プロセスで
+  実行してから終了コードを返すよう最小修正した。既存 contract テストは
+  減らさず、`python3 scripts/tests/test_aadw_jev_adoption_gate.py` 単体実行も
+  従来どおり成立する（そちらの `__main__` は変更していない）。この結合も
+  本 worker の実行環境では実行していない。CI・レビュー・GUI 検証・実サービス
+  接続の成功は別途 Commander が観測する。
