@@ -1,10 +1,10 @@
-# ADR-0031: アプリ中心のAADW v3で実装・レビュー・GUI検証・限定判断を分離する
+# ADR-0031: アプリ中心のAADW v3で実装・レビュー・GUI検証・意味判断を分離する
 
 ## ステータス
 
-設計採用。初版はPR #334で採用。本改訂はIssue [#336](https://github.com/hide212131/hane/issues/336)の文書PRのmergeで承認する。実装・運用切替は未実施。
+設計採用。初版はPR #334で採用。本改訂はIssue [#336](https://github.com/hide212131/hane/issues/336)の文書PRで承認済み。Jevの意味判断はCommander Policyへ反映し、その他の実装・運用切替はIssue #333で追跡する。
 
-現行運用は[ADR-0027](0027-aadw-v2-chatgpt-commander.md)と[Commander Policy](../aadw-command-policy.md)に従う。本ADRだけではv2を置き換えず、Jevへの委譲やCodeRabbitへのレビュー切替も有効にならない。
+このADRはv3導入時の設計判断を記録する。Jevの意味判断は、利用者指定による運用更新として[Commander Policy](../aadw-command-policy.md)と[AGENTS.md](../../AGENTS.md)に従い現在の通常作業で有効である。その他のv3移行状態は個別のIssue/PRで確認する。
 
 ## 日付と追跡先
 
@@ -20,10 +20,10 @@
 
 | 役割 | 採用する構成 |
 |---|---|
-| 操作と指揮 | ChatGPTアプリ（旧Codexアプリ）内のCommander。要求・設計・範囲・検証・予算、難しい例外、最終受入とmergeを担当する |
+| 操作と指揮 | ChatGPTアプリ（旧Codexアプリ）内のCommander。Jevへcurrent factsを渡し、Jevの意味判断に沿って客観的な権限・head/base・必須証拠を確認し、一つのactionを実行する |
 | 実装 | GitHub ActionsからClaude Codeへ依頼する。利用上限等の確認済み条件でCodexへ切り替える |
 | レビュー | CodeRabbitを通常担当とし、依頼と完了・対象head・範囲を確認する。自動修正やmergeは担当させない |
-| 限定判断 | JevのChoice/Noulを使う。許可範囲内の継続、修正、追加検証、切替候補、完了の裏付けを扱う |
+| 意味判断 | JevのChoice/Noul/Scoreを使い、依頼解釈、範囲、作業分解、次のaction、継続・修正・検証・切替候補を扱う。具体的な運用範囲はCommander Policyが正本 |
 | 事実確認 | CIと、必要に応じたGUI Validator。実行・観測に限定し、必須検証の免除や次工程は決めない |
 | 連携 | 既存GitHub接続と最小限のアプリ用手順・補助ツール。別の常駐司令塔や状態DBを前提にしない |
 

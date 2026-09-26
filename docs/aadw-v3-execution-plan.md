@@ -1,5 +1,7 @@
 # AADW v3 実装・評価・移行計画
 
+運用更新: Jevの意味判断は [Commander Policy](aadw-command-policy.md) に従って通常作業へ導入済み。利用者指定により、費用・性能の追加比較や閾値校正は有効化条件にしない。以下の計画はJev判断以外の移行作業と過去の受入条件を記録する。
+
 ## 適用範囲と改訂
 
 設計Issue [#332](https://github.com/hide212131/hane/issues/332) / PR #334を、利用者指定により[#336](https://github.com/hide212131/hane/issues/336)で改訂する。実装は[#333](https://github.com/hide212131/hane/issues/333)。[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)と[v3設計書](agentic-development-workflow-v3.md)を参照する。
@@ -44,13 +46,13 @@ head/baseの実行時再検査、merge parents、duplicate run抑制、scenario�
 
 Actions内から次のActionsへ送る場合は`GITHUB_TOKEN`のイベント制約と受信側actor検査を試験する。外部CodeRabbitの受理と内部Claude/GUI workflowの起動を混同しない。
 
-## 4. V3-4: 観測評価の後、別PRで限定運用を有効にする
+## 4. V3-4: 観測評価とJev判断の運用
 
-Jevの提案を記録するが実行判断に使わない観測運用から始める。比較はまず同じClaude優先・Codex切替・CodeRabbit・GUI条件でJevなし/ありを比べ、Jevの寄与を切り分ける。旧v2との比較ではレビュー担当等の差も記録し、すべての改善をJevの効果としない。Luna/Sol単独比較は必要時の追加調査にとどめる。
+観測比較はIssue #365で完了した。以降、Jevの意味判断をCommander Policyに従って通常作業へ適用し、同じ判断をChatGPTが毎回やり直す工程は設けない。費用・性能の追加比較は利用者指定で不要。停止・再開や残るv3移行作業は、それぞれの受入条件に必要な範囲で進める。
 
 同じ課題・初期commit・検証条件・予算をそろえ、前の試行のpatchを別条件へ持ち込まない。成功例に加えて証拠不足、範囲拡大、古い差分、誘導命令、同じ失敗の反復を含める。誤完了、無駄な切替、回数、時間、費用、未計測項目を記録し、少数例を一般的な精度保証にしない。
 
-有効化PRで対象作業、許可された質問・action・切替条件、質問別閾値、総実装回数・時間・通信再試行・取得可能な利用量上限、認証、必要なreview/GUI、停止・復帰方法を明記する。条件が空なら自動判断を適用しない。PolicyとAGENTSを同時に更新し、通常のJev判断を適用する範囲とCommanderが判断する範囲を一つの正本にする。
+運用Policyは対象作業、許可action、既存切替条件、認証、必要なreview/GUI、停止・復帰方法を明記する。質問別閾値・費用/性能条件によってJev判断を無効化しない。PolicyとAGENTSを一緒に更新し、通常のJev判断とCommanderの客観ガードを一つの正本にする。
 
 最初の有効化はアプリ内セッションからの承認済み作業と最終受入への提出まで。アプリ終了後の新規action発行、自動merge、権限拡大、設計変更、検証免除は含めない。保存・undo/redo・入力等の厳しい受入基準は維持する。
 
@@ -75,7 +77,7 @@ Jevの提案を記録するが実行判断に使わない観測運用から始�
 | T15 | GUI fail/blocked/unknown/古い証拠/画像欠落 | 製品・環境・証拠不足を分け、必要な証拠がなければmergeしない |
 | T16 | CI成功だが受入条件やGUIの裏付け不足 | 追加検証へ進めるか停止し、COMPLETEや検証免除にしない |
 | T17 | ActionsからClaude/GUI・外部CodeRabbitへ依頼 | 実認証・actor・イベントの受理を確認し、コメント成功だけで実行済みとしない |
-| T18 | 同じ原因の反復、回数/予算/時間超過 | 新しいactionを止め、未解決事項と全試行の利用量を返す |
+| T18 | 同じ原因の反復、明示された停止条件または提供側の上限到達 | 新しいactionを止め、未解決事項と全試行の利用量を返す。利用者が指定していない費用上限は設けない |
 | T19 | アプリ中断後の再開/v2への復帰 | 外部runの継続・終了とcurrent factsを確認し、二重writer/重複依頼を防ぐ |
 | T20 | COMPLETEだがreview/GUI/CIが不足 | 完了候補にとどめ、mergeしない |
 | T21 | 費用不明、途中失敗、親子usage | unknownをゼロにせず、失敗を除外せず、二重加算しない |
