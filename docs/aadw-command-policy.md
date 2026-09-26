@@ -2,7 +2,7 @@
 
 ## 1. 目的
 
-この文書は、AADW v2 において ChatGPT が司令塔として判断するときのルールを定める。
+この文書は、Hane の AADW で ChatGPT が司令塔として Jev の判断を運用するときのルールを定める。工程管理は v2 の `Observe → Decide → Act → Observe` を保ち、意味判断には Jev を標準で使う。
 
 AADW v2 は workflow / state machine ではなく、次の反復である。
 
@@ -10,20 +10,15 @@ AADW v2 は workflow / state machine ではなく、次の反復である。
 Observe → Decide → Act → Observe
 ```
 
-判断入力は原則として次の2つだけとする。
-
-1. この Commander Policy。
-2. GitHub から取得した current facts / evidence。
-
 ```text
-Commander Policy
-        +
-current facts / evidence
-        ↓
-      ChatGPT
-        ↓
-   next one action
+Commander Policy + current facts / evidence
+                  ↓
+       Jev: 構造化された意味判断
+                  ↓
+Commander: 客観ガード確認と次の一 action
 ```
+
+ChatGPT はJevと同じ意味判断を毎回やり直さない。Jev の結論を既定の判断として採用し、権限・current facts・必須証拠など機械的に確認できる条件を満たすか確認して一つの action を実行する。
 
 current facts の取得方法や action の実行方法は固定しすぎない。まず既存の GitHub / Codex / Claude / GUI 機能を使い、重複や複雑さが実運用で確認された場合だけ専用 wrapper / collector を追加する。
 
@@ -92,6 +87,16 @@ target branch の進展を PR branch に取り込む操作は、Issue の製品�
 - conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の変更を基準として取り込みつつ、current Issue の acceptance criteria と PR の root-cause 修正を保持する。両立できない場合は機械的に片側を採用せず、conflict の意味を再評価する。同期のために target branch の変更を別実装として複製しない。
 - product-fix worker は Issue の root-cause 修正を担当し、branch ancestry を更新する Git 操作の代替として使わない。
 
+### 2.8 Jev を意味判断の標準担当にする
+
+- 通常の Issue / PR 作業では、依頼の解釈、受入条件、作業範囲、原因分類、実装・検証計画、次の action、継続・停止・完了候補の判断に Jev を使う。
+- この環境の既定接続は既存の local shell `~/.local/bin/jev`、provider `typesafe`、model `jev-latest` とする。設定済み認証をそのまま使い、API keyを表示・workerへ渡さない。単一判断は適切なCLI primitiveを使い、一括の候補フィルタには `filter`、複数の独立質問には `raw`、承認済みの再利用可能な質問には `run` を使う。取得したJev応答だけを判断結果として扱う。
+- 現在の事実とこの Policy を必要な範囲で Jev に渡す。Choice は許可済み候補から次の action を一つ選ぶため、Noul は重要な条件を独立に判定するため、Score は具体的な順序尺度で程度を評価するために使う。既存 action 用のhandlerが利用できる場合はfunction calling形式でhandlerと閉じた引数を選ばせ、Commanderが通常の権限確認後に実行する。関係する独立質問は一回の System One 要求にまとめ、互いの回答を参照させない。
+- Jev の意味判断を標準結果として使う。ChatGPT が同じ意味判断を別途再採点・再評価する工程、性能・精度・費用の追加ベンチマーク、質問別の事前閾値は要求しない。利用者は費用・性能を採用判断の条件にしないと指定している。
+- Jev に渡す候補は、その時点で利用可能かつ許可された action から作る。Jev は認証情報や秘密情報を受け取らず、任意のshell・GitHub操作を直接実行しない。既存の明示的なhandlerがある場合は、閉じた選択肢と引数を選べる。handler/Commander は実行前に権限・current head/base・required CI/review/GUIを確認し、条件を満たさない action は実行しない。
+- Jev の返答が得られない場合は、作り上げた返答を使わず、既存 Policy と current facts から Commander が一つの action を決める。認証・権限・環境障害を誤って Codex fallback と分類しない。
+- 返答、選択肢、根拠、要求・実行モデル、取得可能な usage/latency は既存の実行記録に残せる範囲で記録する。費用や利用量は判断を止める閾値として使わない。
+
 ---
 
 ## 3. Observe
@@ -120,7 +125,7 @@ target branch の進展を PR branch に取り込む操作は、Issue の製品�
 
 ## 4. Decide
 
-ChatGPT は current facts とこの Policy から、次に必要な一つの action を決める。
+Jev は current facts とこの Policy から次に必要な一つの action を選ぶ。ChatGPT は候補が現在許可されていること、必要な事実が新しいこと、必須の客観条件を満たすことを確認して実行する。これらの確認は Jev の意味判断を二重評価する工程ではない。
 
 典型例:
 

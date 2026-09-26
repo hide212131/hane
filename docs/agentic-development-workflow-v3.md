@@ -4,9 +4,9 @@
 
 初期設計はIssue [#332](https://github.com/hide212131/hane/issues/332) / PR #334。本書と[ADR-0031](adr/0031-aadw-v3-jev-bounded-execution.md)は、利用者の追加指定をIssue [#336](https://github.com/hide212131/hane/issues/336)で反映した。実装・評価・有効化は[#333](https://github.com/hide212131/hane/issues/333)で追跡する。
 
-**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストはv2の既存経路を使う。Jevは限定した意味判断を担当する。**
+**ChatGPTアプリ（旧Codexアプリ）を操作と指揮の中心にする。実装はGitHub Actions経由のClaude Codeを優先し、条件付きでCodexへ切り替える。通常レビューはCodeRabbit、必要なGUIテストはv2の既存経路を使う。Jevは依頼解釈から次のactionまで通常の意味判断を担当する。このJev運用は有効であり、残るv3統合は個別に進める。**
 
-文書のmergeは稼働開始ではない。現行は[v2](agentic-development-workflow-v2.md)と[Commander Policy](aadw-command-policy.md)のままであり、Codexレビュー、既存fallback、GUIの権限・判断規則を変更しない。有効化PRで委譲範囲をCommander Policyへ統合し、AGENTSも同時に更新する。以下の将来仕様を使って現行のone-action規則を迂回しない。
+Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.md](../AGENTS.md)を正とする。工程はv2のone-action規則を維持し、Codexレビュー、既存fallback、GUIの権限・判断規則はそれぞれの移行PRが完了するまで現状を維持する。
 
 ## 2. 記事との関係と役割
 
@@ -14,28 +14,28 @@
 
 | 担当 | v3での役割 |
 |---|---|
-| ChatGPTアプリ内Commander | 要求・設計・受入条件・範囲・予算・検証計画を確定し、指示文を作り、GitHubを観測する。難しい例外、設計変更、最終受入、mergeを判断する |
+| ChatGPTアプリ内Commander | current factsを取得し、Jevに渡す。Jevの意味判断に従い、客観的な権限・head/base・必須証拠を確認して次の一actionを実行する。GitHubを観測し、最終受入の事実を確認する |
 | アプリから使う連携手順・小さな補助ツール | Jev呼出し、回答検査、許可済みactionの実行、GitHubの結果取得をつなぐ。別の司令塔や判断規則の正本にはしない |
 | GitHub Actions | 承認済みの依頼を受け、権限・対象を検査し、workerやGUIを起動する。実装指示を独自に考えない |
 | Claude Code | 通常の実装担当。限定したコード変更とテストファイルの追加・修正を行う |
 | Codex | 条件付きの代替実装担当。アプリ内Commanderとは別の役割・実行環境とする |
 | CodeRabbit | 通常のコードレビューを担当し、指摘と対象範囲を返す。修正や次工程の指示、mergeを担当しない |
-| Jev | 受入条件の裏付け、範囲、追加検証、継続・切替候補などを狭く判断する。コード・設計・実装指示文は生成しない |
+| Jev | 依頼解釈、受入条件、範囲、原因分類、作業分解、検証計画、次のaction、継続・切替・完了候補を判断する。Choice / Noul / Scoreと、利用可能な場合は既存handlerを選ぶfunction callingを使う |
 | CI / GUI Validator | 実際の検査・画面操作を行い、対象contextと観測事実を残す。結果の免除やmergeを決めない |
 
-通常は「アプリで依頼 → Actionsで実装 → CI → CodeRabbit → 必要なGUI → 最終受入」と進めるが、失敗や証拠不足があれば、その時点の事実から次の一つのactionを選ぶ。全工程を条件なしで連鎖させない。Jevの結果を採用できる通常判断について、上位モデルに同じ判定を毎回やり直させる構成にはしない。
+通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
 
 ## 3. アプリ中心の実行と継続範囲
 
-利用者はアプリで「Issue #123を進めて」と依頼する。Commanderが承認済みGitHub接続でcurrent factsを取得し、利用可能なツールから実装・レビュー・GUIを依頼する。アプリを使うことは、アプリ内Codexを製品コードのwriterにすることではない。[S7]
+利用者はアプリで「Issue #123を進めて」と依頼する。Commanderが承認済みGitHub接続でcurrent factsを取得し、Jevが作業分解、許可候補、既存handlerと閉じた引数を選ぶ。Commanderは客観的権限と対象を確認してhandlerを実行し、既存ツールから実装・レビュー・GUIを依頼する。アプリを使うことは、アプリ内Codexを製品コードのwriterにすることではない。[S7]
 
-最初は既存のGitHub接続とアプリから呼べるJevの小さな連携を使う。Skillや設定文は使い方の指示であり、API接続・認証・実際のツール呼出しの成功を代替しない。独立した常駐オーケストレーター、Hane製品へのApp Server内包、新しい操作画面を初期要件にしない。
+Jevは既存のTypeSafe接続とアプリ側のJev実行手段から呼び出す。Skillや設定文は使い方を示し、応答そのものの代わりにはしない。独立した常駐オーケストレーター、Hane製品へのApp Server内包、新しい操作画面は初期要件にしない。
 
-有効化後は、アプリ側の実行セッションが続き、承認範囲と証拠が有効な間に限定して通常判断を委譲する。アプリ終了・セッション中断後もJevやCommanderが動き続けるとは仮定しない。既に送信したActionsや外部レビューは別に実行され得るため、再開時にはGitHubのrun・review・head/baseを読み、同じ依頼を重複発行しない。中断中の無人の工程連鎖や通知は別途明示・検証する対象であり、本設計の完成条件ではない。
+Jev判断はアプリ側の実行セッションで行う。アプリ終了・セッション中断後もJevやCommanderが動き続けるとは仮定しない。再開時はGitHubのrun・review・head/baseを読み直し、Jevに新しいcurrent factsを渡して次の判断を得る。同じ依頼を重複発行しない。中断中の無人の工程連鎖や通知は別途の作業とする。
 
 ## 4. 依頼の入力とGitHub Actions
 
-一件分の依頼にはrepository、Issue/PR、expected head、target branchと必要なbase、受入条件のID、不変条件、許可する責務・パス、禁止パス、検証コマンド・GUI scenario、実行設定の版と予算を含める。これはHane内部の契約であり、Jev APIのフィールドではない。
+一件分の依頼にはrepository、Issue/PR、expected head、target branchと必要なbase、受入条件のID、不変条件、許可する責務・パス、禁止パス、検証コマンド・GUI scenario、実行設定の版と明示された停止条件を含める。費用上限は利用者から求められない限り加えない。これはHane内部の契約であり、Jev APIのフィールドではない。
 
 現行の[Claude workflow](../.github/workflows/claude-fix.yml)はPR Conversationの`@claude`、単独行の`AADW_COMMANDER_HANDOFF_V2`、一つの`AADW_TARGET_HEAD: <40桁SHA>`を受ける。依頼者のwrite/maintain/admin権限、openのsame-repository PR、exact headを検査する。Issue本文へ書くだけでは起動しない。v3を作る間はこの既存入口を使い、v3用の新しいマーカーを存在するものとして扱わない。
 
@@ -48,7 +48,7 @@
 | 状況 | 現行とv3での扱い |
 |---|---|
 | Claudeの利用上限・呼出制限 | 現行は`usage_or_rate_limit`に限り、[既存fallback](../.github/workflows/codex-usage-limit-fallback.yml)がsource run/attempt・checkpoint・依頼者・exact headを検査してCodexへ渡す |
-| 同じ原因の実装が進展しない | v3の追加対象。まずCommanderが差分・テスト・reviewと試行内容を判断する。Jevによる自動切替は回数・予算・評価済み条件を別途承認してから許可する |
+| 同じ原因の実装が進展しない | Jevが差分・検証・review・試行内容から継続、修正、切替、停止を判断する。許可された候補にない切替や既存trust boundaryの変更は選べない |
 | 認証・権限の失敗、head変更、実行環境の故障、原因不明 | Codexへ変えれば解決するとは扱わず、停止・再観測・原因確認を行う |
 
 レビュー指摘が出たことだけではClaude失敗としない。同じroot causeの修正をまとめ、通常は同じ担当が続ける。切替後は一件の作業が終わるまでCodexを担当とし、往復切替や二重writerを避ける。新しい担当を起動する前に旧担当の終了を確認し、未反映patchは元の対象headと対応するものだけを検査して引き継ぐ。
@@ -104,7 +104,7 @@ GUI Validatorは観測のみを担当し、コード変更・次工程・merge�
 
 公式JavaScript SDKは`@typesafe-ai/sdk` / `TypeSafeClient.systemOne()`。HTTPは`POST /v1/systemone`で`state`、`questions`、`model`を受け、`model`、`answers`、`usage`を返す。[S3][S4] APIキーは`TYPESAFE_API_KEY`等の承認された秘密情報管理から連携部だけが取得する。
 
-Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは初期実装では使わない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。厳密なconfidence計算式は今回の確認範囲にない。[S2][S3]
+Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは具体的な順序尺度で程度を評価し、`filter`は複数候補の絞り込みに使う。既存handlerがある場合は、TypeSafeのfunction callingパターンで閉じたhandlerと引数を選び、Commanderまたはhandlerが実行する。繰り返す質問は承認済みspecとして再利用し、複数の独立質問は同じ要求へまとめる。質問内容に応じてこれらを利用し、費用・性能のベンチマークや閾値校正を追加の採用条件にしない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。[S2][S3]
 
 質問キーだけに意味を書かず、`instructions`と`criteria`で判断を説明する。同じstateの独立した質問はまとめられるが、互いの回答は参照できない。前の回答で追加証拠や選択肢が変わる場合だけ次のリクエストを使う。以下は未評価の質問例であり、採用済み閾値ではない。[S2]
 
@@ -119,9 +119,9 @@ Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、�
 }
 ```
 
-回答は、権限・鮮度・予算・形式の不一致なら採用しない。既知の証拠不足なら検証を追加し、設計・範囲変更や原因不明ならCommanderへ戻す。範囲内の不具合なら現在の実装担当に修正を依頼し、切替は第5節の条件に限定する。複数の許可済みactionが残るときにChoiceを使う。重大な問題を平均点で相殺せず、低いNoulだけを能力不足や高価なモデルへの切替根拠にしない。
+回答は、権限・鮮度・許可された選択肢・形式が合わない場合は実行しない。既知の証拠不足なら追加検証を選び、設計・範囲変更や原因不明はJevに再提示する。範囲内の不具合なら現在の実装担当に修正を依頼し、切替は第5節の条件に限定する。複数の許可済みactionが残るときにChoiceを使う。重大な問題を平均点で相殺しない。費用・性能の基準でJevの通常判断を却下しない。
 
-将来の自動判断は評価済み条件の範囲だけに適用し、質問別の閾値・予算を有効化時にCommander Policyで承認する。GUI/review未実施、回答欠落・候補外・不正JSON・非有限値をCOMPLETEへ変換しない。
+Jevの回答は通常判断の既定として適用する。GUI/review未実施、回答欠落・候補外・不正JSON・非有限値をCOMPLETEへ変換しない。回答形式の不備は再取得または停止の対象とし、意味判断をChatGPTが別モデルとして重複実施しない。
 
 ## 9. 鮮度・隔離・失敗・費用
 
@@ -133,7 +133,7 @@ JevキーとGitHub書込認証、他のホスト秘密情報を実装workerや�
 
 認証と課金は実行場所・providerごとに確認する。OpenAIの公開/OSS CI/CDにおけるユーザー認証の注意事項[S6]を、Claudeの認証条件へそのまま転用しない。現行Codex fallbackの認証・隔離をv3で再利用できるかも実装時に検証し、文書mergeを適合証明にしない。認証や課金方式を無断で変更しない。
 
-Jevの通信timeout/429/一時障害は上限内の通信再試行、401/403や利用不可は設定確認として扱う。いずれも製品修正の再試行と区別する。Jev障害をCodexの起動や成功への変換理由にせず、取得不能なら停止してCommanderへ戻す。CodeRabbitの無応答、GUIの実行不能も必須証拠不足として扱う。同じ原因で進展しない場合と総回数・時間・予算上限では新しいactionを発行しない。
+Jevの通信timeout/429/一時障害は提供側が許す範囲で再試行し、401/403や利用不可は設定確認として扱う。いずれも製品修正の再試行と区別する。Jev障害をCodexの起動や成功への変換理由にせず、取得不能なら停止してCommanderへ戻す。CodeRabbitの無応答、GUIの実行不能も必須証拠不足として扱う。同じ原因の反復や明示された作業停止条件では新しいactionを発行しない。利用者が指定していない費用上限は設けない。
 
 `COMPLETE`は実装完了候補でありmerge権限ではない。最終受入ではCommanderがcurrent head/base、CI、review、必要なGUI、mergeabilityを確認し、expected headを指定してmergeする。
 
@@ -141,11 +141,11 @@ Jevの通信timeout/429/一時障害は上限内の通信再試行、401/403や�
 
 GitHubを進行状態の正本とする。監査・費用履歴は残せるが、古い選択やCOMPLETEを再開時のcurrent factsとして使わない。専用DBやダッシュボードは初期要件ではない。
 
-## 10. 実装・評価と未確認事項
+## 10. 運用範囲と残る移行作業
 
-[実装・評価計画](aadw-v3-execution-plan.md)に従い、アプリから既存Actionsへ依頼する経路、Jev連携、CodeRabbitと必要なGUIの結果取得、観測評価、限定有効化を進める。v3自体の通常コード・テストをv2のClaudeに作らせることと、稼働後の実装担当は別の問題である。保護されたworkflow等まで通常workerへ一括依頼しない。
+[実装・評価計画](aadw-v3-execution-plan.md)に従い、既存Actions、レビュー、GUIの移行を進める。Jevの意味判断は有効で、費用・性能の追加評価をその条件としない。通常コード・テストの実装担当と、運用基盤の変更担当は分ける。保護されたworkflow等まで通常workerへ一括依頼しない。
 
-未確認事項は、アプリからのJev実呼出しと認証、CodeRabbit導入・契約・actor受理・レビュー範囲の対応付け、Codexの利用可能設定・認証、質問別閾値・予算、必要なGUI scenarioとOSの実行環境である。実サービス試験をfixtureだけで代替したとは報告しない。未確認の経路への委譲は有効にしない。
+残る作業には、CodeRabbit導入・契約・actor受理・レビュー範囲の対応付け、Codexの利用可能設定・認証、必要なGUI scenarioとOSの実行環境、停止・再開時の運用がある。未確認の実行経路や必須証拠を成功扱いしない。
 
 <a id="sources"></a>
 ## 出典と確認範囲
