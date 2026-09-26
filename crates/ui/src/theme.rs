@@ -130,7 +130,7 @@ pub(crate) fn sync_component_theme(
     } else {
         ThemeMode::Light
     };
-    ComponentTheme::change(mode, window, cx);
+    ComponentTheme::change(mode, Some(window), cx);
 }
 
 #[cfg(test)]

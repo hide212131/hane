@@ -31,6 +31,7 @@ hane-ui = { path = "crates/ui" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["runtime_shaders", "font-kit", "wayland", "x11"] }
 gpui-component = { version = "=0.6.6", default-features = false }
+gpui-kit-assets = { version = "=0.6.6" }
 libc = "=0.2.189"
 ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
 unicode-segmentation = "=1.12.0"

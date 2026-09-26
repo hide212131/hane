@@ -92,9 +92,10 @@ impl AssetSource for WorkFolderIcons {
 /// The `AssetSource` registered with the app via `Application::with_assets`.
 /// gpui only allows one asset source per app, but Hane's own sidebar icons
 /// (`WorkFolderIcons`) and `gpui-component`'s standard icon set (e.g. the
-/// `IconName::Copy` glyph used by the file tab `HoverCard`) are bundled
-/// separately, so this tries Hane's own icons first and falls back to
-/// `gpui-component`'s bundled assets for anything Hane does not own.
+/// `IconName::Copy` glyph used by the file tab `HoverCard`, bundled by the
+/// `gpui-kit-assets` crate) are bundled separately, so this tries Hane's own
+/// icons first and falls back to `gpui-kit-assets`'s bundled assets for
+/// anything Hane does not own.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AppAssets;
 
@@ -103,12 +104,12 @@ impl AssetSource for AppAssets {
         if let Some(bytes) = WorkFolderIcons.load(path)? {
             return Ok(Some(bytes));
         }
-        gpui_component::Assets.load(path)
+        gpui_kit_assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut entries = WorkFolderIcons.list(path)?;
-        entries.extend(gpui_component::Assets.list(path)?);
+        entries.extend(gpui_kit_assets::Assets.list(path)?);
         Ok(entries)
     }
 }
@@ -138,7 +139,7 @@ mod tests {
         }
     }
 
-    // gpui-component's own icon set, resolved through `gpui_component::Assets`
+    // gpui-component's own icon set, resolved through `gpui_kit_assets::Assets`
     // rather than one of Hane's `ICON_*` constants. This is what
     // `IconName::Copy` (the file tab HoverCard's copy button) needs to
     // resolve to an actual SVG instead of gpui's default no-op AssetSource.
@@ -151,10 +152,10 @@ mod tests {
         );
         let resolved = AppAssets
             .load(path)
-            .expect("gpui-component's Assets must not error for its own bundled copy icon");
+            .expect("gpui-kit-assets's Assets must not error for its own bundled copy icon");
         assert!(
             resolved.is_some(),
-            "expected gpui-component's bundled Assets to resolve {path} so IconName::Copy renders"
+            "expected gpui-kit-assets's bundled Assets to resolve {path} so IconName::Copy renders"
         );
     }
 }
