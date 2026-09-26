@@ -3,26 +3,25 @@
 ## Current main headline (2026-09-27)
 
 Current `main` at report preparation: `b4061b9d43cd0c14dc4894cc4e27fa9227bd8199`. The
-measurements ran against product source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; the
-intervening changes on `main` are documentation and agent instructions only, with no product
-code changes. Measurements were captured on the reference MacBook Pro M3 Pro. Startup figures
-combine two independent 30-sample runs. RSS values are per-process Resident Set Size after the
-idle periods described in the detailed report.
+measurements used product source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; intervening
+main changes are documentation and agent instructions only. The instrumented measurement
+build is from harness revision `5576d8e9692fb629fc242170ccaab73eb1314b5c`. Startup results use
+30 launches per case; RSS uses two process trials per document/folder case.
 
 | Headline metric | Current measurement | Initial budget | Result |
 |---|---:|---:|---|
-| Empty warm startup | 187.2 ms median / 227.8 ms p95 (n=60) | ≤150 ms | Over; reproduced in both runs |
-| Empty editor RSS, 30 s idle | 97.5–98.5 MB (93.0–93.9 MiB, n=2) | <65 MiB | Over |
-| 10 MiB document RSS, 30 s idle | 317.4–371.1 MB (302.7–353.9 MiB, n=2) | <120 MB | Over |
-| 100 MiB document RSS, 30 s idle | 1,298.2–1,366.3 MB (1,238.0–1,303.0 MiB, n=2) | <350 MB | Over |
-| 1k-note work-folder RSS, 30 s after scan | 124.1–126.6 MB (n=2; first note opened) | No absolute gate | Recorded |
-| 10k-note work-folder RSS, 30 s after scan | 405.6–406.6 MB (n=2; first note opened) | No absolute gate | Recorded |
-| RSS after visiting 100 notes | 143.2 MB (one run, 30 s idle) | No absolute gate | Recorded |
+| Empty warm startup | 188.6 ms median / 244.3 ms p95 (n=30) | ≤150 ms | Over |
+| Empty editor RSS, 30 s idle | 97.0–97.8 MB (92.5–93.3 MiB, n=2) | <65 MiB | Over |
+| 10 MiB document RSS, 30 s idle | 296.9–370.1 MB (283.1–353.0 MiB, n=2) | <120 MB | Over |
+| 100 MiB document RSS, 30 s idle | 1,450.0–2,155.5 MB (1,382.8–2,055.6 MiB, n=2) | <350 MB | Over |
+| 1k-note work-folder RSS, 30 s after scan | 123.1–123.6 MB (n=2; first note opened) | No absolute gate | Recorded |
+| 10k-note work-folder RSS, 30 s after scan | 418.7–477.8 MB (n=2; first note opened) | No absolute gate | Recorded |
+| RSS after visiting 100 notes | 144.0 MB (one run, 30 s idle) | No absolute gate | Recorded |
 
-The unpurged cold-start series measured 185.2 ms median / 199.4 ms p95 (n=60). A true cold
-run was not available: macOS denied the cache-purge command, so this does not establish the
-≤400 ms cold-start gate. The pre-refactor R0 figures remain historical references; the OS,
-Rust and GPUI versions differ, so they are not a same-condition regression comparison.
+The unpurged startup series measured 189.0 ms median / 211.3 ms p95 (n=30). A true cold run
+was unavailable because macOS denied the cache-purge command; this does not establish the
+≤400 ms cold-start gate. Previous R0 figures remain historical references because OS, Rust
+and GPUI versions differ, so they are not a same-condition regression comparison.
 
 See the [full conditions and procedure](issue23-current-main-2026-09-27.md),
 [per-record measurements](issue23-current-main-2026-09-27/raw/measurements.csv),
