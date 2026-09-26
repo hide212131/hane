@@ -20,14 +20,14 @@ Jev判断の運用方法は[Commander Policy](aadw-command-policy.md)と[AGENTS.
 | Claude Code | 通常の実装担当。限定したコード変更とテストファイルの追加・修正を行う |
 | Codex | 条件付きの代替実装担当。アプリ内Commanderとは別の役割・実行環境とする |
 | CodeRabbit | 通常のコードレビューを担当し、指摘と対象範囲を返す。修正や次工程の指示、mergeを担当しない |
-| Jev | 依頼解釈、受入条件、範囲、原因分類、作業分解、実装指示案、検証計画、次のaction、継続・切替・完了候補を判断する。Choice / Noul / Scoreを判断内容に応じて使う |
+| Jev | 依頼解釈、受入条件、範囲、原因分類、作業分解、検証計画、次のaction、継続・切替・完了候補を判断する。Choice / Noul / Scoreと、利用可能な場合は既存handlerを選ぶfunction callingを使う |
 | CI / GUI Validator | 実際の検査・画面操作を行い、対象contextと観測事実を残す。結果の免除やmergeを決めない |
 
-通常は「アプリで依頼 → Jevが判断と作業指示案を作成 → Actionsで実装 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
+通常は「アプリで依頼 → Jevが判断・既存handler・閉じた引数を選択 → Commanderがガードを確認して実行 → CI → CodeRabbit → 必要なGUI → 最終受入」と進める。失敗や証拠不足があれば最新事実をJevに渡し、次の一actionを選ばせる。全工程は条件なしで連鎖させない。Jevの結果を採用できる通常判断をChatGPTに毎回やり直させない。
 
 ## 3. アプリ中心の実行と継続範囲
 
-利用者はアプリで「Issue #123を進めて」と依頼する。Commanderが承認済みGitHub接続でcurrent factsを取得し、Jevが作業分解・許可候補の選択・worker向け指示案を作る。Commanderは客観的権限と対象を確認して既存ツールから実装・レビュー・GUIを依頼する。アプリを使うことは、アプリ内Codexを製品コードのwriterにすることではない。[S7]
+利用者はアプリで「Issue #123を進めて」と依頼する。Commanderが承認済みGitHub接続でcurrent factsを取得し、Jevが作業分解、許可候補、既存handlerと閉じた引数を選ぶ。Commanderは客観的権限と対象を確認してhandlerを実行し、既存ツールから実装・レビュー・GUIを依頼する。アプリを使うことは、アプリ内Codexを製品コードのwriterにすることではない。[S7]
 
 Jevは既存のTypeSafe接続とアプリ側のJev実行手段から呼び出す。Skillや設定文は使い方を示し、応答そのものの代わりにはしない。独立した常駐オーケストレーター、Hane製品へのApp Server内包、新しい操作画面は初期要件にしない。
 
@@ -104,7 +104,7 @@ GUI Validatorは観測のみを担当し、コード変更・次工程・merge�
 
 公式JavaScript SDKは`@typesafe-ai/sdk` / `TypeSafeClient.systemOne()`。HTTPは`POST /v1/systemone`で`state`、`questions`、`model`を受け、`model`、`answers`、`usage`を返す。[S3][S4] APIキーは`TYPESAFE_API_KEY`等の承認された秘密情報管理から連携部だけが取得する。
 
-Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは比較可能な候補の評価・順位付けに使う。質問内容に応じてこれらをすべて利用し、費用・性能のベンチマークや閾値校正を追加の採用条件にしない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。[S2][S3]
+Choiceは許可済みactionを一つ選び、Noulは受入条件の裏付け、意味上の範囲、設計見直し等の独立した判断に使う。Scoreは具体的な順序尺度で程度を評価する。既存handlerがある場合は、TypeSafeのfunction callingパターンで閉じたhandlerと引数を選び、Commanderまたはhandlerが実行する。質問内容に応じてこれらを利用し、費用・性能のベンチマークや閾値校正を追加の採用条件にしない。Choice/Scoreのconfidenceは分布の集中度の要約であり、正答率や操作権限ではない。Noulは「はい」の確率で別のconfidenceを持たない。[S2][S3]
 
 質問キーだけに意味を書かず、`instructions`と`criteria`で判断を説明する。同じstateの独立した質問はまとめられるが、互いの回答は参照できない。前の回答で追加証拠や選択肢が変わる場合だけ次のリクエストを使う。以下は未評価の質問例であり、採用済み閾値ではない。[S2]
 

@@ -89,10 +89,11 @@ target branch の進展を PR branch に取り込む操作は、Issue の製品�
 
 ### 2.8 Jev を意味判断の標準担当にする
 
-- 通常の Issue / PR 作業では、依頼の解釈、受入条件、作業範囲、原因分類、実装・検証計画、次の action、継続・停止・完了候補の判断に Jev を使う。Jev は作業指示文の案も作成できる。
-- 現在の事実とこの Policy を必要な範囲で Jev に渡す。Choice は許可済み候補から次の action を一つ選ぶため、Noul は重要な条件を独立に判定するため、Score は比較可能な案の評価・順位付けに使う。関係する質問は一回の System One 要求にまとめ、独立質問は互いの回答を参照させない。
+- 通常の Issue / PR 作業では、依頼の解釈、受入条件、作業範囲、原因分類、実装・検証計画、次の action、継続・停止・完了候補の判断に Jev を使う。
+- この環境の既定接続は既存の local shell `~/.local/bin/jev`、provider `typesafe`、model `jev-latest` とする。設定済み認証をそのまま使い、API keyを表示・workerへ渡さない。複数primitiveを一度に使う場合は `raw` でSystem One要求を送り、取得したJev応答だけを記録する。
+- 現在の事実とこの Policy を必要な範囲で Jev に渡す。Choice は許可済み候補から次の action を一つ選ぶため、Noul は重要な条件を独立に判定するため、Score は具体的な順序尺度で程度を評価するために使う。既存 action 用のhandlerが利用できる場合はfunction calling形式でhandlerと閉じた引数を選ばせ、Commanderが通常の権限確認後に実行する。関係する独立質問は一回の System One 要求にまとめ、互いの回答を参照させない。
 - Jev の意味判断を標準結果として使う。ChatGPT が同じ意味判断を別途再採点・再評価する工程、性能・精度・費用の追加ベンチマーク、質問別の事前閾値は要求しない。利用者は費用・性能を採用判断の条件にしないと指定している。
-- Jev に渡す候補は、その時点で利用可能かつ許可された action から作る。Jev は選択や提案を行うが、GitHub の書込認証、push、merge、workflow起動、秘密情報を受け取らない。実行前の権限・current head/base・required CI/review/GUIの確認は Commander が行い、条件を満たさない action は実行しない。
+- Jev に渡す候補は、その時点で利用可能かつ許可された action から作る。Jev は認証情報や秘密情報を受け取らず、任意のshell・GitHub操作を直接実行しない。既存の明示的なhandlerがある場合は、閉じた選択肢と引数を選べる。handler/Commander は実行前に権限・current head/base・required CI/review/GUIを確認し、条件を満たさない action は実行しない。
 - Jev の返答が得られない場合は、作り上げた返答を使わず、既存 Policy と current facts から Commander が一つの action を決める。認証・権限・環境障害を誤って Codex fallback と分類しない。
 - 返答、選択肢、根拠、要求・実行モデル、取得可能な usage/latency は既存の実行記録に残せる範囲で記録する。費用や利用量は判断を止める閾値として使わない。
 

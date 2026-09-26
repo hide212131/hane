@@ -23,7 +23,7 @@
 | 操作と指揮 | ChatGPTアプリ（旧Codexアプリ）内のCommander。Jevへcurrent factsを渡し、Jevの意味判断に沿って客観的な権限・head/base・必須証拠を確認し、一つのactionを実行する |
 | 実装 | GitHub ActionsからClaude Codeへ依頼する。利用上限等の確認済み条件でCodexへ切り替える |
 | レビュー | CodeRabbitを通常担当とし、依頼と完了・対象head・範囲を確認する。自動修正やmergeは担当させない |
-| 意味判断 | JevのChoice/Noul/Scoreを使い、依頼解釈、範囲、作業分解、次のaction、継続・修正・検証・切替候補を扱う。具体的な運用範囲はCommander Policyが正本 |
+| 意味判断 | JevのChoice/Noul/Score、利用可能な場合はTypeSafe function callingを使い、依頼解釈、範囲、作業分解、次のaction、継続・修正・検証・切替候補を扱う。具体的な運用範囲はCommander Policyが正本 |
 | 事実確認 | CIと、必要に応じたGUI Validator。実行・観測に限定し、必須検証の免除や次工程は決めない |
 | 連携 | 既存GitHub接続と最小限のアプリ用手順・補助ツール。別の常駐司令塔や状態DBを前提にしない |
 
