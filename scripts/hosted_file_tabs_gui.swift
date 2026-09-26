@@ -341,7 +341,14 @@ func copyIconProbe(_ path: String, _ envX0: Int, _ envY0: Int, _ envX1: Int, _ e
     let searchMargin = 220
     let verticalPad = 8
     let contrastThreshold = 40
-    let searchX0 = max(0, min(image.width, envX1))
+    // Vision's OCR box for a truncated path can extend through the visual
+    // ellipsis and overlap the copy icon. Include a small band to the left of
+    // the OCR envelope's right edge so the icon is still observable even when
+    // the text bounding box is generous. The later size and aggregate
+    // contrast guards prevent the path's tail glyphs from becoming a valid
+    // copy-icon candidate.
+    let leftOverlap = 32
+    let searchX0 = max(0, min(image.width, envX1 - leftOverlap))
     let searchX1 = max(searchX0, min(image.width, envX1 + searchMargin))
     let searchY0 = max(0, envY0 - verticalPad)
     let searchY1 = min(image.height, envY1 + verticalPad)
