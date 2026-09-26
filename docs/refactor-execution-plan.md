@@ -8,7 +8,9 @@
 
 詳細計画は目標・範囲・契約を定め、この文書は実行Issue、依存関係、要件の割当、提出物を定める。各Issue本文は担当範囲の具体的手順・非目標・検証・受入条件を持つ。計画の調査基準は `ef9356c52bae06dee6cf49fa7b1a59ce004b52a0` であり、着手時にはcurrent codeと関連Issue/PR/ADRを読み直す。
 
-**登録時点: 親Issue 1件、実行Issue 18件を作成。RF5-BのIssue作成だけはAPIに拒否され、未作成である。本文を第7節に保持する。実装・製品テスト・GUI検証・性能測定は未着手であり、RF0を含めて完了したフェーズはない。**
+**登録時点: 親Issue 1件、実行Issue 18件を作成。RF5-BのIssue作成だけはAPIに拒否され、未作成であった。本文を第7節に保持した。実装・製品テスト・GUI検証・性能測定は未着手であり、RF0を含めて完了したフェーズはない。**
+
+2026年9月26日に RF5-B を [#368](https://github.com/hide212131/hane/issues/368) として登録した。以後は #368 を正本の実行Issueとして追跡し、登録済みであることを実施済み・検証済みとは扱わない。
 
 文書保存ブランチは `docs/refactor-cycle-2-20260923`。文書PRのmerge前はそのブランチの第2サイクル文書を参照する。mainへの反映前に旧R0〜R5の文書を第2サイクルと取り違えない。Issueの現在の状態と実装PRの証拠はGitHubを正とし、この登録時点の説明を実行状態として使わない。
 
@@ -33,7 +35,7 @@
 | RF3-B | [#305](https://github.com/hide212131/hane/issues/305) | 短い入力欄の文字列・selection操作 | #301/#304の受入済み境界 |
 | RF4 | [#306](https://github.com/hide212131/hane/issues/306) | snapshot、解析/projection経路、引数、fallback | #301/#302/#303の該当分割、第3節の競合確認 |
 | RF5-A | [#307](https://github.com/hide212131/hane/issues/307) | BlockLayoutを正とするgeometry接続 | #306、関連するRF3/RF6の接続、第3節 |
-| RF5-B | **未作成（第7節に本文）** | cache/高さ索引/background jobの所有者と寿命 | #301/#302/#306、#309の文書切替境界、#23の基準。#307と競合させない。 |
+| RF5-B | [#368](https://github.com/hide212131/hane/issues/368) | cache/高さ索引/background jobの所有者と寿命 | #301/#302/#306、#309の文書切替境界、#23の基準。#307と競合させない。 |
 | RF6-A | [#308](https://github.com/hide212131/hane/issues/308) | H1命名/renameの状態と調停 | #301の保存/rename分割、#298の保護契約 |
 | RF6-B | [#309](https://github.com/hide212131/hane/issues/309) | open/save/draft、要求と結果受理 | #301/#298、#308と共有する状態の受入済み境界 |
 | RF7-A | [#310](https://github.com/hide212131/hane/issues/310) | 現行GUI検証の重複整理 | #298の入口。#299と共有する部分はその整理後。 |
@@ -41,7 +43,7 @@
 | RF7-C | [#312](https://github.com/hide212131/hane/issues/312) | 既存release/version整合と手順 | #298。#311と共有checkを変更する場合は調整。 |
 | RF7-D | [#313](https://github.com/hide212131/hane/issues/313) | 依存/feature/vendor patchと解除条件 | #298/#300の利用根拠 |
 | RF8-A | [#314](https://github.com/hide212131/hane/issues/314) | 実測で立証した局所最適化 | #23の基準、対象に関係するRF1〜RF7の受入 |
-| RF8-B | [#315](https://github.com/hide212131/hane/issues/315) | 移行残骸撤去、全要件の最終証拠、文書整合 | 全対象Issueと#23、未作成RF5-Bを含む全範囲の受入 |
+| RF8-B | [#315](https://github.com/hide212131/hane/issues/315) | 移行残骸撤去、全要件の最終証拠、文書整合 | 全対象Issueと#23、RF5-B #368を含む全範囲の受入 |
 
 原則の順序は `RF0 → RF1 → RF2 → RF3/RF4/RF6 → RF5 → RF8`。RF7はRF0の現行入口確認後、製品と競合しない範囲で進める。RF0全体が未完でも、独立領域について台帳・契約・必要な検証条件を受け入れた部分引き渡しはできる。その範囲と残件をIssueに明記し、RF0全体を完了にしない。性能を変え得る実装は、該当する変更前測定を省略しない。
 
@@ -96,7 +98,7 @@
 | 入力先の正本、短い入力欄、本文IME/transaction | #304、#305 | 操作表、Unicode/範囲テスト、native入力証拠 |
 | strict-matchとrebaseの区別、用途別projection、fallback | #306 | 経路図、snapshot契約表、viewport/stale/巨大blockテスト |
 | geometry正本、正規化往復、描画/入力の整合 | #307 | deterministic座標テスト、実GUI/IME、入力/scroll比較 |
-| cache無効化、局所更新、上限、jobと文書の寿命 | RF5-B（未作成）、#309 | 所有者表、競合テスト、処理量とRSS/遅延 |
+| cache無効化、局所更新、上限、jobと文書の寿命 | #368（RF5-B）、#309 | 所有者表、競合テスト、処理量とRSS/遅延 |
 | 命名・保存・draft・操作identity・互換性 | #308、#309 | 状態所有表、遅延/失敗注入、実OS保存/復旧 |
 | 現行GUI/CIの簡素化、権限/品質条件維持 | #310、#311 | 重複比較、入口/構成対応、代表run/artifact |
 | 既存release/versionと依存/vendor | #312、#313 | 発行しないversionテスト、構成build、patch根拠/解除条件 |
@@ -142,9 +144,9 @@ vendor/GPUI変更では、詳細計画第6節に記載したworkspace外の実�
 
 本書保存時点でこれらは未実行である。性能基準は #23 を使用し、古い計測値やこの計画の予算値をcurrent実測として報告しない。実行やmergeの採否はcurrent Commander Policyに従う。
 
-## 7. RF5-B — 未作成Issueの保持本文
+## 7. RF5-B — 実行Issue #368
 
-Issue作成APIが拒否したため、この作業は未登録である。別の番号を推測してリンクせず、対象外にも変更しない。親 #297 と最終受入 #315 で未登録・未完として追跡する。
+当初はIssue作成APIに拒否され、本文だけをこの節に保持していた。2026年9月26日に [#368](https://github.com/hide212131/hane/issues/368) として登録した。以後は親 #297、RF8-A #314、最終受入 #315 と #368 の状態・証拠を対応付けて追跡する。
 
 ### タイトル
 
@@ -179,7 +181,7 @@ refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任
 
 リファクタリングの最初の実装依頼は #298 とする。現行範囲・契約・検証条件を整え、#23 の変更前基準を確認する。その後は #299/#300 の根拠ある削除、#301〜#303 の機械的分割へ進む。文書/Issueの保存だけでは製品改修を開始していない。
 
-全体の完了判断は #315 に集約する。RF5-Bの登録/実施/証拠が未完のまま、親 #297 を完了にしてはならない。
+全体の完了判断は #315 に集約する。RF5-B #368 の実施/証拠が未完のまま、親 #297 を完了にしてはならない。
 
 ## 9. RF0 初回調査記録（#298 の最初のPR）
 
