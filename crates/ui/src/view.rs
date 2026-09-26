@@ -36,7 +36,7 @@ use crate::line::{
     expected_block_disclosures, presented_block_with_table_projection, row_element,
 };
 use crate::shape::WindowShaper;
-use crate::theme::{DEFAULT_THEME, Theme, resolve_theme};
+use crate::theme::{DEFAULT_THEME, Theme, resolve_theme, sync_component_theme};
 use gpui::{
     Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -4061,9 +4061,10 @@ impl EditorView {
         install_action_listeners(root.child(sidebar).child(content), cx)
     }
 
-    pub(crate) fn cycle_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.theme = self.settings.theme.next();
         self.theme = resolve_theme(self.settings.theme, window.appearance());
+        sync_component_theme(self.settings.theme, window.appearance(), window, cx);
         self.block_cache.clear();
         self.layout_cache.clear();
         self.heights = HeightIndex::new(self.item_heights());
@@ -6939,6 +6940,7 @@ impl Render for EditorView {
         let resolved_theme = resolve_theme(self.settings.theme, window.appearance());
         if resolved_theme != self.theme {
             self.theme = resolved_theme;
+            sync_component_theme(self.settings.theme, window.appearance(), window, cx);
             self.block_cache.clear();
             self.layout_cache.clear();
             let (granularity, _) = self.desired_layout();

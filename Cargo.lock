@@ -2958,6 +2958,7 @@ name = "hane-ui"
 version = "0.19.2"
 dependencies = [
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "hane-document",
  "hane-editor",
