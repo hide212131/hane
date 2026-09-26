@@ -18,6 +18,7 @@ hane-presentation.workspace = true
 hane-session.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
+gpui-kit-assets.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]
