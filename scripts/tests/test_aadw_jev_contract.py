@@ -530,4 +530,15 @@ class CliTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # The CI entrypoint invokes this file directly (`python3
+    # scripts/tests/test_aadw_jev_contract.py`) rather than via test
+    # discovery, so the adoption gate suite must be folded into this run
+    # explicitly or it would never execute in CI.
+    import test_aadw_jev_adoption_gate as adoption_gate_tests
+
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromModule(sys.modules[__name__]))
+    suite.addTests(loader.loadTestsFromModule(adoption_gate_tests))
+    result = unittest.TextTestRunner().run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)

@@ -119,3 +119,16 @@ Issue #341 の固定データ契約検査と、Issue #333 の実サービス接�
   追加した。このテストと gate 自体は本 worker の実行環境ではまだ実行して
   いない。CI・レビュー・GUI 検証・実サービス接続の成功は別途 Commander が
   観測する。
+- CI の `Test AADW Jev contract` ステップは `.github/` 変更が禁止範囲のため
+  引き続き `python3 scripts/tests/test_aadw_jev_contract.py` のみを実行する。
+  このコマンドが `unittest.main()` に渡すのは自モジュール（`__main__`）の
+  namespace だけで、別ファイルの `test_aadw_jev_adoption_gate.py` は自動では
+  発見されないため、そのままでは adoption gate のテストが一件も実行されない
+  まま CI が成功し得た。`scripts/tests/test_aadw_jev_contract.py` の
+  `if __name__ == "__main__":` 側で `test_aadw_jev_adoption_gate` を import し、
+  両モジュールのテストを一つの `unittest.TestSuite` にまとめて同一プロセスで
+  実行してから終了コードを返すよう最小修正した。既存 contract テストは
+  減らさず、`python3 scripts/tests/test_aadw_jev_adoption_gate.py` 単体実行も
+  従来どおり成立する（そちらの `__main__` は変更していない）。この結合も
+  本 worker の実行環境では実行していない。CI・レビュー・GUI 検証・実サービス
+  接続の成功は別途 Commander が観測する。
