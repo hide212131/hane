@@ -99,61 +99,85 @@ enum WriterCommand {
     Close,
 }
 
+/// Whether the core still accepts new requests/notifications. Kept behind
+/// the same lock as the pending map so the transition to `Closed` and the
+/// draining of every pending request happen as one atomic step: no caller
+/// can observe `Open` and register a pending request, or enqueue a write,
+/// after that step has started but before it has finished, and none of the
+/// requests being drained can be missed.
+enum PendingState {
+    Open(HashMap<RequestId, Sender<Result<Value, RpcError>>>),
+    Closed,
+}
+
 /// The thread-safe, cloneable half of a transport used to send requests and
 /// notifications. Kept separate from [`RpcTransport`] so callers can hold a
 /// handle without owning the reader/writer/stderr threads.
 pub struct RpcCore {
     writer_tx: SyncSender<WriterCommand>,
-    pending: Mutex<HashMap<RequestId, Sender<Result<Value, RpcError>>>>,
+    pending: Mutex<PendingState>,
     next_id: Mutex<i64>,
 }
 
 impl RpcCore {
     pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RpcError> {
         let (id, reply_rx) = {
-            // Bound the in-flight request count and reserve the pending slot
-            // under a single lock so concurrent callers can never race past
-            // the cap.
-            let mut pending = self.pending.lock().unwrap();
+            // Reserve the pending slot, encode the request and hand it to
+            // the writer queue all under one lock. Holding the lock across
+            // the `try_send` too (not just the map mutation) is what makes
+            // this atomic with `mark_closed`: either this whole block runs
+            // to completion while still `Open`, or `mark_closed` has already
+            // switched to `Closed` and this returns `Disconnected` before
+            // anything is sent or registered.
+            let mut guard = self.pending.lock().unwrap();
+            let pending = match &mut *guard {
+                PendingState::Closed => return Err(RpcError::Disconnected),
+                PendingState::Open(map) => map,
+            };
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(RpcError::Backpressure);
             }
             let id = {
-                let mut guard = self.next_id.lock().unwrap();
-                let current = *guard;
-                *guard += 1;
+                let mut next_id = self.next_id.lock().unwrap();
+                let current = *next_id;
+                *next_id += 1;
                 RequestId::Number(current)
             };
+            let line = protocol::encode_request(&id, method, params);
+            match self.writer_tx.try_send(WriterCommand::Line(line)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err(RpcError::Backpressure),
+                Err(TrySendError::Disconnected(_)) => return Err(RpcError::Disconnected),
+            }
             let (reply_tx, reply_rx) = mpsc::channel();
             pending.insert(id.clone(), reply_tx);
             (id, reply_rx)
         };
 
-        let line = protocol::encode_request(&id, method, params);
-        match self.writer_tx.try_send(WriterCommand::Line(line)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(RpcError::Backpressure);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(RpcError::Disconnected);
-            }
-        }
-
         match reply_rx.recv_timeout(timeout) {
             Ok(outcome) => outcome,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.remove_pending(&id);
                 Err(RpcError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(RpcError::Disconnected),
         }
     }
 
+    fn remove_pending(&self, id: &RequestId) {
+        if let PendingState::Open(map) = &mut *self.pending.lock().unwrap() {
+            map.remove(id);
+        }
+    }
+
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<(), RpcError> {
         let line = protocol::encode_notification(method, params);
+        // Hold the same lock `mark_closed` uses so a notification can never
+        // be enqueued after the core has been marked terminal.
+        let guard = self.pending.lock().unwrap();
+        if matches!(*guard, PendingState::Closed) {
+            return Err(RpcError::Disconnected);
+        }
         match self.writer_tx.try_send(WriterCommand::Line(line)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(RpcError::Backpressure),
@@ -161,22 +185,46 @@ impl RpcCore {
         }
     }
 
-    /// Closes the write side (e.g. the child's stdin), which is the polite
-    /// way of asking a well-behaved stdio server to exit. This is only ever
-    /// called from lifecycle/drop paths, never from the reader/stderr drain
-    /// threads, so a blocking send here cannot stall draining.
-    pub fn close_writer(&self) {
-        let _ = self.writer_tx.send(WriterCommand::Close);
+    /// Same terminal check as `notify`, used for replying to a
+    /// server-originated request from the reader thread: a reply must never
+    /// be enqueued once the core has been marked terminal.
+    fn try_send_if_open(&self, line: String) -> Result<(), TrySendError<WriterCommand>> {
+        let guard = self.pending.lock().unwrap();
+        if matches!(*guard, PendingState::Closed) {
+            return Err(TrySendError::Disconnected(WriterCommand::Line(line)));
+        }
+        self.writer_tx.try_send(WriterCommand::Line(line))
     }
 
-    /// Immediately fails every currently pending request. Called both when
-    /// the reader thread observes real EOF and proactively when a lifecycle
-    /// shutdown is requested, so pending requests are released as soon as
-    /// stop begins instead of waiting for the child to actually exit.
-    fn fail_all_pending(&self) {
-        let mut pending = self.pending.lock().unwrap();
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(RpcError::Disconnected));
+    /// Enqueues a request to close the write side (e.g. the child's stdin),
+    /// which is the polite way of asking a well-behaved stdio server to
+    /// exit. Uses a non-blocking `try_send`: the outgoing queue can be full
+    /// while the writer thread is stuck inside a blocking write to a peer
+    /// that stopped reading, and this must never block on that regardless,
+    /// so lifecycle callers can move on immediately to confirming the child
+    /// actually exits (and killing it if it doesn't). If the queue is full
+    /// the request is simply dropped; the writer thread still terminates
+    /// once the underlying pipe is actually closed (e.g. after the child is
+    /// killed), which is what `Drop` waits on.
+    pub fn close_writer(&self) {
+        let _ = self.writer_tx.try_send(WriterCommand::Close);
+    }
+
+    /// Atomically marks the core terminal and immediately fails every
+    /// currently pending request. Called both when the reader thread
+    /// observes real EOF and proactively when a lifecycle shutdown is
+    /// requested, so pending requests are released as soon as either
+    /// happens instead of waiting for the child to actually exit. Because
+    /// this and every send path share the same lock, no request registered
+    /// or reply sent after this returns can ever be left unresolved, and a
+    /// concurrent EOF/shutdown race can only run this once effectively (the
+    /// second call finds the map already drained).
+    fn mark_closed(&self) {
+        let mut guard = self.pending.lock().unwrap();
+        if let PendingState::Open(map) = std::mem::replace(&mut *guard, PendingState::Closed) {
+            for (_, tx) in map {
+                let _ = tx.send(Err(RpcError::Disconnected));
+            }
         }
     }
 }
@@ -223,7 +271,10 @@ fn spawn_reader(
             }
             match protocol::parse_incoming(&line) {
                 Ok(IncomingMessage::Response { id, outcome }) => {
-                    let sender = core.pending.lock().unwrap().remove(&id);
+                    let sender = match &mut *core.pending.lock().unwrap() {
+                        PendingState::Open(map) => map.remove(&id),
+                        PendingState::Closed => None,
+                    };
                     match sender {
                         Some(tx) => {
                             let mapped = outcome.map_err(RpcError::Remote);
@@ -250,7 +301,9 @@ fn spawn_reader(
                     };
                     // Non-blocking: a full outgoing queue must not stall the
                     // reader thread that is draining the child's stdout.
-                    if core.writer_tx.try_send(WriterCommand::Line(response_line)).is_err() {
+                    // Also refuses to enqueue once the core has been marked
+                    // terminal, matching `call`/`notify`.
+                    if core.try_send_if_open(response_line).is_err() {
                         let _ = events_tx.try_send(RpcEvent::Diagnostic(format!(
                             "dropped reply to server request id={id:?}: outgoing queue full or closed"
                         )));
@@ -263,7 +316,7 @@ fn spawn_reader(
                 }
             }
         }
-        core.fail_all_pending();
+        core.mark_closed();
         on_closed();
     })
 }
@@ -308,7 +361,7 @@ impl RpcTransport {
         let (writer_tx, writer_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let core = Arc::new(RpcCore {
             writer_tx,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingState::Open(HashMap::new())),
             next_id: Mutex::new(1),
         });
 
@@ -328,18 +381,22 @@ impl RpcTransport {
         self.core.clone()
     }
 
-    /// Begins a graceful shutdown: closes our write side (stdin EOF for the
-    /// child) and immediately releases every pending request instead of
-    /// waiting for the child to actually exit or for each call's own
-    /// timeout to elapse.
+    /// Begins a graceful shutdown: marks the core terminal (immediately
+    /// releasing every pending request instead of waiting for the child to
+    /// actually exit or for each call's own timeout to elapse), then
+    /// enqueues a request to close our write side (stdin EOF for the
+    /// child). Both steps are non-blocking, so this returns promptly even
+    /// if the writer thread is stuck writing to a peer that stopped
+    /// reading and the outgoing queue is full.
     pub fn request_shutdown(&self) {
+        self.core.mark_closed();
         self.core.close_writer();
-        self.core.fail_all_pending();
     }
 }
 
 impl Drop for RpcTransport {
     fn drop(&mut self) {
+        self.core.mark_closed();
         self.core.close_writer();
         if let Some(t) = self.writer_thread.take() {
             let _ = t.join();
@@ -708,5 +765,107 @@ mod tests {
         for handle in in_flight {
             let _ = handle.join();
         }
+    }
+
+    #[test]
+    fn request_shutdown_returns_promptly_and_releases_pending_even_when_the_writer_is_stuck_on_a_full_pipe_and_queue()
+    {
+        let handler = Arc::new(RejectAllServerRequests);
+        let (transport, _server_write, server_read, _events, _closed) = spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        // Never read from `server_read`: the OS pipe buffer is finite, so
+        // once enough unread bytes pile up the writer thread blocks inside
+        // `write_all`, exactly like a child that stopped reading its stdin.
+        let _server_read = server_read;
+
+        // A pending call registered before anything blocks, so we can
+        // confirm it is released instead of waiting out its own timeout.
+        let pending_call = {
+            let core = core.clone();
+            thread::spawn(move || core.call("slow", None, Duration::from_secs(30)))
+        };
+        thread::sleep(Duration::from_millis(50));
+
+        // Keep notifying until the outgoing queue reports full. Once the
+        // unread pipe backs up, the writer thread stalls inside a single
+        // `write_all` and stops draining the queue, so this reliably fills
+        // both the OS pipe buffer and the bounded queue without relying on
+        // a specific pipe capacity.
+        let payload = "y".repeat(4096);
+        let mut queue_confirmed_full = false;
+        for _ in 0..(WRITER_QUEUE_CAPACITY * 8) {
+            if matches!(
+                core.notify("filler", Some(Value::String(payload.clone()))),
+                Err(RpcError::Backpressure)
+            ) {
+                queue_confirmed_full = true;
+                break;
+            }
+        }
+        assert!(
+            queue_confirmed_full,
+            "expected the outgoing queue to fill up once the writer thread stalled on the full pipe"
+        );
+
+        // `request_shutdown` must return quickly even though the writer
+        // thread is stuck and the queue is full. Run it on its own thread
+        // and bound the wait instead of hanging the whole test forever if
+        // this regresses.
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            transport.request_shutdown();
+            let _ = done_tx.send(());
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(()),
+            "request_shutdown must not block on a full outgoing queue / stuck writer thread"
+        );
+
+        let result = pending_call.join().unwrap();
+        assert!(matches!(result, Err(RpcError::Disconnected)));
+
+        // Once shutdown has been requested the core is terminal: further
+        // calls and notifications must fail immediately instead of being
+        // enqueued or waiting for their own timeout.
+        assert!(matches!(
+            core.call("after_shutdown", None, Duration::from_secs(5)),
+            Err(RpcError::Disconnected)
+        ));
+        assert!(matches!(core.notify("after_shutdown", None), Err(RpcError::Disconnected)));
+    }
+
+    #[test]
+    fn reader_eof_racing_with_request_shutdown_still_resolves_pending_calls_and_new_calls_fail_fast() {
+        let handler = Arc::new(RejectAllServerRequests);
+        let (transport, server_write, _server_read, _events, closed_rx) = spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        let pending_call = {
+            let core = core.clone();
+            thread::spawn(move || core.call("slow", None, Duration::from_secs(30)))
+        };
+        thread::sleep(Duration::from_millis(50));
+
+        // Race an explicit shutdown against the reader observing EOF: both
+        // paths call into the same terminal-state transition, so however
+        // they interleave, the pending call must resolve exactly once and
+        // nothing is left stuck waiting for a response that will never
+        // arrive.
+        let shutdown_thread = thread::spawn(move || transport.request_shutdown());
+        drop(server_write);
+
+        shutdown_thread.join().unwrap();
+        assert_eq!(closed_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+
+        let result = pending_call.join().unwrap();
+        assert!(matches!(result, Err(RpcError::Disconnected)));
+
+        assert!(matches!(
+            core.call("after", None, Duration::from_secs(5)),
+            Err(RpcError::Disconnected)
+        ));
+        assert!(matches!(core.notify("after", None), Err(RpcError::Disconnected)));
     }
 }
