@@ -86,18 +86,57 @@ def main() -> None:
         )
 
     small = root / "small.md"
-    assert small.is_file() and small.stat().st_size == NOTE_BYTES
+    if not small.is_file():
+        raise SystemExit(f"missing small fixture: {small}")
+    if small.stat().st_size != NOTE_BYTES:
+        raise SystemExit(f"{small}: expected {NOTE_BYTES} bytes, found {small.stat().st_size}")
+
     for name, count in FOLDER_COUNTS.items():
-        notes = sorted((root / name).glob("*.md"))
-        assert len(notes) == count, f"{name}: expected {count} notes, found {len(notes)}"
-        assert all(path.stat().st_size == NOTE_BYTES for path in notes)
-    assert not list((root / "folder_empty").glob("*.md"))
+        folder = root / name
+        if not folder.is_dir():
+            raise SystemExit(f"missing fixture folder: {folder}")
+        notes = sorted(folder.glob("*.md"))
+        if len(notes) != count:
+            raise SystemExit(f"{name}: expected {count} notes, found {len(notes)}")
+        wrong_size = next((path for path in notes if path.stat().st_size != NOTE_BYTES), None)
+        if wrong_size is not None:
+            raise SystemExit(
+                f"{wrong_size}: expected {NOTE_BYTES} bytes, found {wrong_size.stat().st_size}"
+            )
+
+    empty_folder = root / "folder_empty"
+    if not empty_folder.is_dir():
+        raise SystemExit(f"missing fixture folder: {empty_folder}")
+    if list(empty_folder.glob("*.md")):
+        raise SystemExit(f"expected no Markdown notes in {empty_folder}")
+
     large_note = root / "large_then_small/00-large.md"
-    assert large_note.stat().st_size == large_source.stat().st_size
-    assert (root / "large_then_small/01-small.md").stat().st_size == NOTE_BYTES
+    if not large_note.is_file():
+        raise SystemExit(f"missing large note fixture: {large_note}")
+    if large_note.stat().st_size != large_source.stat().st_size:
+        raise SystemExit(
+            f"{large_note}: expected {large_source.stat().st_size} bytes, "
+            f"found {large_note.stat().st_size}"
+        )
+    large_then_small_note = root / "large_then_small/01-small.md"
+    if not large_then_small_note.is_file():
+        raise SystemExit(f"missing small note fixture: {large_then_small_note}")
+    if large_then_small_note.stat().st_size != NOTE_BYTES:
+        raise SystemExit(
+            f"{large_then_small_note}: expected {NOTE_BYTES} bytes, "
+            f"found {large_then_small_note.stat().st_size}"
+        )
+
     for name in ("switch_a", "switch_b"):
-        assert len(list((root / name).glob("*.md"))) == 2
-        assert (root / name / "image.svg").is_file()
+        folder = root / name
+        if not folder.is_dir():
+            raise SystemExit(f"missing fixture folder: {folder}")
+        notes = list(folder.glob("*.md"))
+        if len(notes) != 2:
+            raise SystemExit(f"{name}: expected 2 notes, found {len(notes)}")
+        image = folder / "image.svg"
+        if not image.is_file():
+            raise SystemExit(f"missing image fixture: {image}")
     print(root)
 
 

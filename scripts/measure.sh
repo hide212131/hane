@@ -228,7 +228,7 @@ visit_memory_scenario() {
     mkdir -p "$trial_dir"
     HANE_MEASUREMENT_VISIT_COUNTS="$counts" HANE_MEASUREMENT_IDLE_SECONDS="${HANE_MEASUREMENT_IDLE_SECONDS:-30}" \
         launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$folder"
-    last_count=$(printf '%s\n' "$counts" | awk -F, '{print $NF}')
+    last_count=$(printf '%s\n' "$counts" | tr ',' '\n' | sort -n | tail -n 1)
     wait_attempts=1200
     if [ "$last_count" -ge 1000 ]; then
         wait_attempts=12000
