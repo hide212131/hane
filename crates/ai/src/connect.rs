@@ -65,11 +65,16 @@ pub enum ConnectError {
     /// exclusive write, or — for a shared acquisition — a settings save in
     /// progress) and was rejected immediately rather than waited on.
     SettingsBusy,
-    /// The persisted `AiSettings.settings_generation` no longer matches the
-    /// generation the caller's connection (`RuntimeConfig`/App Server) was
-    /// configured for: a runtime-affecting settings change landed since,
-    /// and this turn/probe must not proceed against a now-stale Base URL,
-    /// API key or model.
+    /// Either the persisted `AiSettings.settings_generation`, or the
+    /// `settings_generation` the target `AiRuntime` itself currently has
+    /// applied (see [`crate::runtime::AiRuntime::configured_settings_generation`]),
+    /// no longer matches the generation the caller's connection
+    /// (`RuntimeConfig`/App Server) was configured for: a runtime-affecting
+    /// settings change landed since, or the runtime has not finished
+    /// applying a matching `reconfigure` yet, and this turn/probe must not
+    /// proceed against a now-stale Base URL, API key or model. `persisted`
+    /// carries whichever of the two authoritative generations actually
+    /// disagreed with `configured`.
     GenerationMismatch { persisted: u64, configured: u64 },
     MissingCustomConnection,
     MissingCredential,
@@ -451,8 +456,21 @@ pub fn build_runtime_config_for_active_connection(
 /// are responsible for both sending the request(s) and waiting for the
 /// correlated terminal notification inside `f`, since only the caller has
 /// access to the runtime's own event stream.
+///
+/// The check does not stop at `configured_settings_generation` (a plain
+/// number the caller supplies and could get wrong, or supply before
+/// `runtime` has actually caught up to it): it also confirms
+/// `runtime.configured_settings_generation()` -- tracked by `runtime`'s own
+/// coordinator thread, updated only by a completed
+/// [`crate::runtime::AiRuntime::reconfigure`] -- matches too. This closes the
+/// gap where persisted settings already moved to a new generation and a
+/// caller's own bookkeeping happens to agree, but `runtime` itself has not
+/// finished applying the matching `reconfigure` yet: without this, `f` could
+/// still run one last time against the stale Base URL/API key/model the
+/// runtime is still actually configured for.
 pub fn with_generation_checked_lock<F, R>(
     settings_store: &AiSettingsStore,
+    runtime: &AiRuntime,
     configured_settings_generation: u64,
     f: F,
 ) -> Result<R, ConnectError>
@@ -465,6 +483,14 @@ where
     let persisted = settings_store.load().map_err(ConnectError::Io)?.settings_generation;
     if persisted != configured_settings_generation {
         return Err(ConnectError::GenerationMismatch { persisted, configured: configured_settings_generation });
+    }
+
+    let runtime_configured = runtime.configured_settings_generation();
+    if runtime_configured != configured_settings_generation {
+        return Err(ConnectError::GenerationMismatch {
+            persisted: runtime_configured,
+            configured: configured_settings_generation,
+        });
     }
 
     Ok(f())
@@ -486,7 +512,7 @@ pub fn call_with_generation_check(
     params: Option<Value>,
     timeout: Duration,
 ) -> Result<Value, ConnectError> {
-    with_generation_checked_lock(settings_store, configured_settings_generation, || {
+    with_generation_checked_lock(settings_store, runtime, configured_settings_generation, || {
         runtime.call(method, params, timeout).map_err(ConnectError::Runtime)
     })?
 }
@@ -906,6 +932,60 @@ mod tests {
         let _ = runtime.shutdown();
     }
 
+    /// Regression coverage for the root cause behind the generation check
+    /// previously trusting only the caller-supplied
+    /// `configured_settings_generation` number: persisted settings can
+    /// already be at a new generation while the target `AiRuntime` itself
+    /// has not actually finished applying a matching `reconfigure` yet. A
+    /// probe/turn claiming that new generation (e.g. because the caller just
+    /// reloaded settings) must still be rejected before it ever reaches the
+    /// runtime, and only starts passing once `reconfigure` has actually
+    /// caught up.
+    #[test]
+    fn call_with_generation_check_rejects_when_the_runtime_has_not_finished_applying_a_matching_reconfigure() {
+        let (store, owner, _journal, dir) = store_and_journal("gated_call_runtime_lagging");
+        let mut first = AiSettings::default();
+        first.chatgpt.model_id = Some("gpt-a".to_string());
+        let saved = store.save(&owner, 0, first, || Ok(true)).unwrap();
+        assert_eq!(saved.settings_generation, 1);
+
+        let (events_tx, _events_rx) = std::sync::mpsc::sync_channel(8);
+        let handler = Arc::new(RejectAllServerRequests);
+        // Spawned for generation 0 (the default) even though persisted
+        // settings are already at generation 1: never started, so an
+        // unreachable binary path is safe here -- the generation check must
+        // reject this before `AiRuntime::call` is ever reached.
+        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+        let runtime = AiRuntime::spawn(config, handler, events_tx);
+        assert_eq!(runtime.configured_settings_generation(), 0);
+
+        // The caller's own bookkeeping (e.g. from a fresh settings reload)
+        // agrees with persisted settings, but `runtime` itself has not
+        // caught up: this must still be rejected before any RPC.
+        let result = call_with_generation_check(&store, 1, &runtime, "turn/start", None, Duration::from_secs(1));
+        assert!(
+            matches!(result, Err(ConnectError::GenerationMismatch { persisted: 0, configured: 1 })),
+            "expected a GenerationMismatch bound to the runtime's own lagging generation, got {result:?}"
+        );
+
+        // Once `reconfigure` actually completes for generation 1, the
+        // generation check itself must pass (the call may still fail
+        // downstream, e.g. on `NotReady` against the unreachable binary, but
+        // never as a `GenerationMismatch` again).
+        let reconfigure_config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+        let _ = runtime.reconfigure(reconfigure_config, 1);
+        assert_eq!(runtime.configured_settings_generation(), 1);
+
+        let result_after_reconfigure =
+            call_with_generation_check(&store, 1, &runtime, "turn/start", None, Duration::from_secs(1));
+        assert!(
+            !matches!(result_after_reconfigure, Err(ConnectError::GenerationMismatch { .. })),
+            "once the runtime's own generation matches, the generation check must pass, got {result_after_reconfigure:?}"
+        );
+
+        let _ = runtime.shutdown();
+    }
+
     #[test]
     fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
         // Regression coverage for the root cause behind
@@ -915,18 +995,24 @@ mod tests {
         // notification). While `f` is still running, a concurrent settings
         // save must be rejected exactly like it would be mid-flight inside a
         // single `AiRuntime::call`, not just before/after `f` runs.
-        let (store, owner, _journal, _dir) = store_and_journal("generation_checked_lock_holds_whole_turn");
+        let (store, owner, _journal, dir) = store_and_journal("generation_checked_lock_holds_whole_turn");
         let saved = store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
         let generation = saved.settings_generation;
         let revision = saved.revision;
 
+        let (events_tx, _events_rx) = std::sync::mpsc::sync_channel(8);
+        let handler = Arc::new(RejectAllServerRequests);
+        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+        let runtime = AiRuntime::spawn_with_configured_settings_generation(config, generation, handler, events_tx);
+
         let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let store_ref = &store;
+        let runtime_ref = &runtime;
 
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
-                with_generation_checked_lock(store_ref, generation, move || {
+                with_generation_checked_lock(store_ref, runtime_ref, generation, move || {
                     let _ = start_tx.send(());
                     // Stands in for the time spent waiting on
                     // `turn/completed` after the initial `turn/start` round
@@ -951,5 +1037,7 @@ mod tests {
         // Once `f` has returned and the shared lock has been released, a
         // save succeeds again.
         store.save(&owner, revision, AiSettings::default(), || Ok(true)).unwrap();
+
+        let _ = runtime.shutdown();
     }
 }

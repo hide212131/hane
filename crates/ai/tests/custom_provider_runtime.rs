@@ -188,7 +188,7 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
     .unwrap();
     second_config.extra_env.extend(second_material.extra_env.clone());
 
-    let reconfigured = runtime.reconfigure(second_config).expect("reconfigure should succeed");
+    let reconfigured = runtime.reconfigure(second_config, 1).expect("reconfigure should succeed");
     assert_eq!(reconfigured.state, RuntimeState::Ready);
     assert!(
         reconfigured.generation > first_status.generation,
@@ -392,7 +392,8 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // above and this runtime becoming its owner.
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
-    let runtime = AiRuntime::spawn(configured.config, handler, events_tx);
+    let runtime =
+        AiRuntime::spawn_with_configured_settings_generation(configured.config, configured.settings_generation, handler, events_tx);
     let status = runtime
         .start_with_owner_lock(owner)
         .expect("start_with_owner_lock should succeed against the generated Custom config");
@@ -463,7 +464,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     .expect("building the runtime config for the rotated settings should succeed");
 
     let reconfigured_status = runtime
-        .reconfigure(reconfigured_runtime_config.config)
+        .reconfigure(reconfigured_runtime_config.config, reconfigured_runtime_config.settings_generation)
         .expect("reconfigure should succeed against the rotated Custom config");
     assert_eq!(reconfigured_status.state, RuntimeState::Ready);
 
@@ -840,10 +841,11 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
 }
 
 /// Asserts that the mock Responses Provider actually received exactly one
-/// request shaped like a genuine Custom Provider probe -- `POST` to a path
-/// under the configured `base_url`, authenticated with exactly the
-/// configured key, and targeting exactly the configured model -- before a
-/// caller goes on to check how the turn's outcome was surfaced. Without this,
+/// request shaped like a genuine Custom Provider probe -- `POST` to exactly
+/// `/v1/responses` under the configured `base_url`, authenticated with
+/// exactly the configured key, and targeting exactly the configured model --
+/// before a caller goes on to check how the turn's outcome was surfaced.
+/// Without this,
 /// a `turn/start` RPC error or a timeout that occurs *before* the App Server
 /// ever reaches the Responses Provider would let a failure test pass without
 /// having exercised the Provider-error path it claims to.
@@ -851,7 +853,10 @@ fn assert_mock_provider_received_the_probe_request(recorded: Option<RecordedRequ
     let recorded = recorded
         .unwrap_or_else(|| panic!("{context}: the mock Responses Provider should have observed exactly one request"));
     assert_eq!(recorded.method, "POST", "{context}: request method");
-    assert!(recorded.path.starts_with("/v1"), "{context}: request path should target the configured base_url: {}", recorded.path);
+    assert_eq!(
+        recorded.path, "/v1/responses",
+        "{context}: request path should target exactly the Responses API endpoint under the configured base_url"
+    );
     let auth = recorded
         .authorization
         .unwrap_or_else(|| panic!("{context}: request should carry an Authorization header"));

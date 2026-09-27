@@ -244,6 +244,16 @@ struct SharedState {
     restart_blocked: bool,
     generation: u64,
     operation_generation: u64,
+    /// The `settings_generation` the `RuntimeConfig` *currently applied* to
+    /// this coordinator was built for. Set at construction (`spawn`/
+    /// `spawn_with_configured_settings_generation`) and updated only when a
+    /// `reconfigure` actually swaps `config` on the coordinator thread —
+    /// never by anything a caller separately claims per RPC call. This is
+    /// what [`AiRuntime::configured_settings_generation`] reads, so a
+    /// generation-gated caller (see `with_generation_checked_lock` in
+    /// `crate::connect`) can bind its check to what this runtime has
+    /// actually applied, not only to its own bookkeeping.
+    config_generation: u64,
     ready_transport: Option<Arc<RpcCore>>,
     /// When `Some`, a `start()` is already in flight and this holds the
     /// reply channels of every additional concurrent caller that attached to
@@ -279,8 +289,11 @@ enum LifecycleCommand {
     /// Switches the coordinator's own `RuntimeConfig` to a new one (e.g. a
     /// fresh Custom Provider Base URL/API key/model after a
     /// `settings_generation`-affecting save) and restarts against it, all on
-    /// this same coordinator thread. See [`AiRuntime::reconfigure`].
-    Reconfigure(RuntimeConfig),
+    /// this same coordinator thread. The `u64` is the `settings_generation`
+    /// the new `RuntimeConfig` was built for; it becomes this coordinator's
+    /// `config_generation` as soon as the swap happens, before the restart
+    /// itself is even attempted. See [`AiRuntime::reconfigure`].
+    Reconfigure(RuntimeConfig, u64),
 }
 
 enum CoordinatorMessage {
@@ -305,6 +318,20 @@ impl AiRuntime {
         handler: Arc<dyn ServerRequestHandler>,
         events_tx: SyncSender<RuntimeEvent>,
     ) -> AiRuntime {
+        AiRuntime::spawn_with_configured_settings_generation(config, 0, handler, events_tx)
+    }
+
+    /// Same as [`Self::spawn`], but additionally records
+    /// `configured_settings_generation` as the `settings_generation` this
+    /// initial `RuntimeConfig` was built for, exactly as a later
+    /// [`Self::reconfigure`] keeps updated on every subsequent config swap.
+    /// See [`Self::configured_settings_generation`].
+    pub fn spawn_with_configured_settings_generation(
+        config: RuntimeConfig,
+        configured_settings_generation: u64,
+        handler: Arc<dyn ServerRequestHandler>,
+        events_tx: SyncSender<RuntimeEvent>,
+    ) -> AiRuntime {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let self_tx = cmd_tx.clone();
         let shared = Arc::new(Mutex::new(SharedState {
@@ -312,6 +339,7 @@ impl AiRuntime {
             restart_blocked: false,
             generation: 0,
             operation_generation: 0,
+            config_generation: configured_settings_generation,
             ready_transport: None,
             start_inflight: None,
             restart_inflight: None,
@@ -423,6 +451,11 @@ impl AiRuntime {
     /// coalesced: each call carries its own `new_config`, and silently
     /// applying only one coalesced leader's config while discarding the
     /// others' would be wrong, so every call is queued and handled in turn.
+    /// `new_configured_settings_generation` is the `settings_generation`
+    /// `new_config` was built for; it becomes what
+    /// [`Self::configured_settings_generation`] reports as soon as the
+    /// coordinator swaps to `new_config`, before the restart itself is even
+    /// attempted.
     ///
     /// This is the supported way to apply a `settings_generation`-affecting
     /// AI settings change (a new Base URL, API key, model or connection
@@ -440,8 +473,27 @@ impl AiRuntime {
     /// old child stops through the new child reaching `Ready`, on this same
     /// coordinator thread, so no other process can ever observe the lock as
     /// free during a reconfigure.
-    pub fn reconfigure(&self, new_config: RuntimeConfig) -> Result<RuntimeStatus, RuntimeError> {
-        self.send_lifecycle(LifecycleCommand::Reconfigure(new_config))
+    pub fn reconfigure(
+        &self,
+        new_config: RuntimeConfig,
+        new_configured_settings_generation: u64,
+    ) -> Result<RuntimeStatus, RuntimeError> {
+        self.send_lifecycle(LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation))
+    }
+
+    /// Returns the `settings_generation` the `RuntimeConfig` *currently
+    /// applied* to this coordinator was built for — set at construction (see
+    /// [`Self::spawn_with_configured_settings_generation`]) and updated only
+    /// by a completed [`Self::reconfigure`], independent of whatever a
+    /// caller separately tracks per call. `crate::connect::with_generation_checked_lock`
+    /// binds its `settings_generation` check to this value (in addition to
+    /// the persisted settings themselves) so a probe/turn is rejected before
+    /// ever reaching this runtime when the coordinator has not actually
+    /// finished applying a matching `reconfigure` yet, rather than trusting
+    /// only a caller-supplied number that happens to match persisted
+    /// settings.
+    pub fn configured_settings_generation(&self) -> u64 {
+        self.shared.lock().unwrap().config_generation
     }
 
     /// Starts the runtime using a runtime owner lock guard the caller
@@ -588,7 +640,7 @@ fn run_coordinator(
                 operation_generation += 1;
                 let op_gen = operation_generation;
                 let result = match cmd {
-                    LifecycleCommand::Reconfigure(new_config) => {
+                    LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation) => {
                         // Stop whatever is active under the *old* config
                         // first (its own stop timeouts still apply), then
                         // swap `config` and start fresh under the new one.
@@ -614,6 +666,20 @@ fn run_coordinator(
                         ) {
                             Ok(_) => {
                                 config = new_config;
+                                // Record the new config's generation as soon
+                                // as the swap itself happens, before the
+                                // restart below is even attempted: a caller
+                                // gating on `configured_settings_generation`
+                                // (see `crate::connect::with_generation_checked_lock`)
+                                // must never observe this coordinator still
+                                // reporting the *old* generation once it has
+                                // structurally moved on to a new `config`,
+                                // regardless of whether the restart below
+                                // goes on to succeed.
+                                {
+                                    let mut state = shared.lock().unwrap();
+                                    state.config_generation = new_configured_settings_generation;
+                                }
                                 do_start(
                                     op_gen,
                                     &mut current,
@@ -772,7 +838,7 @@ fn handle_lifecycle(
                 op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
             )
         }
-        LifecycleCommand::Reconfigure(_) => {
+        LifecycleCommand::Reconfigure(_, _) => {
             unreachable!("Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle")
         }
         LifecycleCommand::StartWithOwnerLock(_) => {
