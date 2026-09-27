@@ -507,11 +507,12 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     let (runtime, events_rx) = spawn_runtime(config);
 
     // First start: the fake server withholds its reply until stdin closes,
-    // so the handshake must time out and the coordinator must clean up and
-    // land on `Failed`. `stop_active`'s cleanup here synchronously waits for
-    // that first (now cancelled) generation's process to actually exit
-    // (including its late response and post-EOF sleep), so by the time this
-    // call returns the stale generation is already fully wound down.
+    // so the handshake must time out. Per the lifecycle-timeout contract,
+    // the coordinator cancels this operation and lands on `Failed`
+    // immediately, without waiting for `Child` cleanup to actually confirm
+    // the (now cancelled) generation's process has exited; that cleanup
+    // still runs synchronously on the coordinator thread afterward, so it is
+    // the *next* explicit start below that ends up waiting for it.
     let first = runtime.start();
     assert!(matches!(first, Err(RuntimeError::Handshake(_))));
     let cancelled_status = runtime.snapshot();
@@ -559,6 +560,89 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     let status = runtime.snapshot();
     assert_eq!(status.state, RuntimeState::Ready);
     assert_eq!(status.generation, second.generation);
+
+    let _ = runtime.stop();
+}
+
+#[test]
+fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_continues_and_blocks_the_next_operation()
+{
+    // `timeout_then_late_response`'s first spawned process withholds its
+    // `initialize` reply until stdin closes, then sleeps a fixed delay
+    // before finally sending that (by then late) reply and exiting. That
+    // fixed post-EOF delay gives a deterministic window during which the
+    // timed-out operation's `Child` cleanup is still running, letting this
+    // test assert that every coalesced `start()` caller already observes
+    // that operation's own failure well before that window elapses, and
+    // that only the *next* lifecycle operation (not this one) actually
+    // waits for cleanup to confirm the old process is gone.
+    let cleanup_delay = Duration::from_millis(300);
+    let mut config = base_config("timeout_immediate_failed");
+    config.start_timeout = Duration::from_millis(100);
+    config.stop_grace_timeout = Duration::from_secs(5);
+    config.stop_force_timeout = Duration::from_secs(5);
+    let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
+    let marker = dir.join("timeout_once.marker");
+    config
+        .extra_env
+        .push(("FAKE_SERVER_MODE".to_string(), "timeout_then_late_response".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_TIMEOUT_ONCE_MARKER".to_string(),
+        marker.display().to_string(),
+    ));
+
+    let (events_tx, _events_rx) = mpsc::channel();
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
+
+    // Several concurrent callers coalesce onto the one leader's attempt (see
+    // `AiRuntime::start`); every one of them must observe the leader's own
+    // Handshake failure, and must observe it fast -- well under the
+    // fixture's post-EOF cleanup delay -- rather than being blocked until
+    // `Child` cleanup actually confirms the old process has exited.
+    let wave_started_at = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let runtime = runtime.clone();
+        handles.push(std::thread::spawn(move || runtime.start()));
+    }
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(handle.join().unwrap());
+    }
+    let wave_elapsed = wave_started_at.elapsed();
+
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome, Err(RuntimeError::Handshake(_))),
+            "expected every coalesced caller to observe the timed-out operation's own failure, got {outcome:?}"
+        );
+    }
+    assert!(
+        wave_elapsed < cleanup_delay / 2,
+        "every coalesced start() caller took {wave_elapsed:?} to fail, which is not comfortably under the \
+         fixture's {cleanup_delay:?} post-EOF cleanup delay; no caller may be blocked waiting for cleanup \
+         to actually confirm the process is gone"
+    );
+
+    // `Failed` must already be visible immediately, independent of the
+    // cleanup that is still running in the background for the process that
+    // timed out.
+    assert_eq!(runtime.snapshot().state, RuntimeState::Failed);
+
+    // The *next* lifecycle operation is a new wave and must still wait for
+    // that cleanup to actually confirm the old process is gone before the
+    // coordinator may spawn a new one.
+    let next_started_at = std::time::Instant::now();
+    let next = runtime.start().expect("next explicit start should succeed once cleanup completes");
+    let next_elapsed = next_started_at.elapsed();
+    assert_eq!(next.state, RuntimeState::Ready);
+    assert!(
+        next_elapsed >= cleanup_delay / 2,
+        "the next lifecycle operation returned after only {next_elapsed:?}, which is not comfortably over \
+         half of the fixture's {cleanup_delay:?} post-EOF cleanup delay; the coordinator must not start a \
+         new operation before the previous one's cleanup is confirmed"
+    );
 
     let _ = runtime.stop();
 }

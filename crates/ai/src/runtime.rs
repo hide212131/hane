@@ -2,19 +2,39 @@
 //! owns start / stop / restart, finite lifecycle timeouts, generation-based
 //! invalidation of late events, and the cross-process runtime owner lock.
 //!
-//! Per `docs/adr/0032-embedded-codex-app-server-ai-foundation.md`, every
-//! start/stop/restart that actually completes (a spawn, or a confirmed
-//! stop/crash cleanup) is assigned its own monotonically increasing
-//! generation. A lifecycle timeout (e.g. the `initialize` handshake not
-//! completing within `start_timeout`) cancels that operation: the
-//! coordinator proceeds straight to `Child` cleanup for the generation it
-//! spawned and reports that operation's own failure to the waiting caller.
-//! Because the coordinator never starts the next start/stop/restart before
-//! that cleanup either confirms the process is gone or reports
-//! `restart_blocked`, and every later generation gets a strictly greater
-//! number, a completion notification or reader/monitor event arriving late
-//! from a timed-out or otherwise stale generation can never be mistaken for
-//! — or revert — the outcome of a subsequent operation.
+//! Per `docs/adr/0032-embedded-codex-app-server-ai-foundation.md`, the
+//! coordinator tracks two distinct, independently monotonic generations:
+//!
+//! - `generation` (the runtime/`Child` generation): bumped once per spawned
+//!   `Child` (in `do_start`) and once per confirmed stop/crash cleanup (in
+//!   `stop_active` / `reap_and_mark_failed`), so every spawn and every
+//!   confirmed terminal transition gets its own fresh identity. This is
+//!   what `ActiveChild::generation` is fixed to at spawn time, and what a
+//!   `ChildEnded`/`RuntimeEvent` is tagged with.
+//! - `operation_generation`: assigned once per *lifecycle operation*
+//!   (`Start` / `Stop` / `Restart`, one value for the whole command even
+//!   when, as in `Restart`, it drives more than one `Child` transition),
+//!   the moment the coordinator dequeues it — distinct from, and unrelated
+//!   in cadence to, `generation`. It identifies the operation itself, not
+//!   whichever `Child` it happens to act on.
+//!
+//! A lifecycle timeout (e.g. the `initialize` handshake not completing
+//! within `start_timeout`) cancels that operation: the coordinator
+//! atomically records it as `Failed` (tagging the status with that
+//! operation's own `operation_generation`) and replies to the waiting
+//! caller — and every coalesced waiter — with that failure immediately,
+//! instead of waiting for `Child` cleanup to actually confirm the process is
+//! gone first. That cleanup (stop, escalate to a forced kill if needed, and
+//! reap) still runs synchronously on the same coordinator thread right
+//! afterward, without regressing the status it just set back through an
+//! intermediate `Stopping` transition, so the next queued start/stop/restart
+//! still cannot begin until it either confirms the process is gone or
+//! reports `restart_blocked`. Because every later generation (of either
+//! kind) gets a strictly greater number, a completion notification or
+//! reader/monitor event arriving late from a timed-out or otherwise stale
+//! generation — checked against both its `generation` and
+//! `operation_generation` — can never be mistaken for, or revert, the
+//! outcome of a subsequent operation.
 //!
 //! Every lifecycle command (`Start` / `Stop` / `Restart`) is handled to
 //! completion by one dedicated coordinator thread before the next queued
@@ -68,6 +88,11 @@ pub struct RuntimeStatus {
     pub state: RuntimeState,
     pub restart_blocked: bool,
     pub generation: u64,
+    /// The lifecycle operation (`Start` / `Stop` / `Restart`) that produced
+    /// this status, distinct from `generation`'s `Child`-spawn/cleanup
+    /// identity. See the module documentation for how the two generations
+    /// differ.
+    pub operation_generation: u64,
 }
 
 /// An event surfaced to the runtime's caller, tagged with the lifecycle
@@ -183,6 +208,7 @@ struct SharedState {
     status: RuntimeState,
     restart_blocked: bool,
     generation: u64,
+    operation_generation: u64,
     ready_transport: Option<Arc<RpcCore>>,
     /// When `Some`, a `start()` is already in flight and this holds the
     /// reply channels of every additional concurrent caller that attached to
@@ -200,6 +226,7 @@ struct SharedState {
 
 struct ActiveChild {
     generation: u64,
+    operation_generation: u64,
     child: Child,
     transport: RpcTransport,
 }
@@ -212,7 +239,7 @@ enum LifecycleCommand {
 
 enum CoordinatorMessage {
     Lifecycle(LifecycleCommand, Sender<Result<RuntimeStatus, RuntimeError>>),
-    ChildEnded { generation: u64 },
+    ChildEnded { generation: u64, operation_generation: u64 },
     Shutdown,
 }
 
@@ -234,6 +261,7 @@ impl AiRuntime {
             status: RuntimeState::Stopped,
             restart_blocked: false,
             generation: 0,
+            operation_generation: 0,
             ready_transport: None,
             start_inflight: None,
             restart_inflight: None,
@@ -381,14 +409,27 @@ fn read_status(shared: &Arc<Mutex<SharedState>>) -> RuntimeStatus {
         state: guard.status,
         restart_blocked: guard.restart_blocked,
         generation: guard.generation,
+        operation_generation: guard.operation_generation,
     }
 }
 
-fn set_status(shared: &Arc<Mutex<SharedState>>, state: RuntimeState, restart_blocked: bool, generation: u64) {
+/// Updates the runtime status atomically: `state`, `restart_blocked`,
+/// `generation`, and `operation_generation` all become visible together
+/// under one lock acquisition, so a lifecycle timeout can record its
+/// operation as cancelled and transition to `Failed` in a single step
+/// instead of exposing an intermediate, inconsistent snapshot.
+fn set_status(
+    shared: &Arc<Mutex<SharedState>>,
+    state: RuntimeState,
+    restart_blocked: bool,
+    generation: u64,
+    operation_generation: u64,
+) {
     let mut guard = shared.lock().unwrap();
     guard.status = state;
     guard.restart_blocked = restart_blocked;
     guard.generation = generation;
+    guard.operation_generation = operation_generation;
 }
 
 fn run_coordinator(
@@ -400,23 +441,32 @@ fn run_coordinator(
     events_tx: Sender<RuntimeEvent>,
 ) {
     let mut current: Option<ActiveChild> = None;
-    // Monotonically increasing operation generation, bumped once per spawned
-    // `Child` (in `do_start`) and once per confirmed stop/crash cleanup (in
-    // `stop_active` / `reap_and_mark_failed`) — so every start/stop/restart
-    // that actually completes gets its own fresh identity, distinct from
-    // whichever `Child` it acted on. `ActiveChild::generation` is fixed at
-    // spawn time and is what gates a specific `ChildEnded`/`RuntimeEvent`
-    // against `current`; this counter is the source of every fresh value
-    // handed out to either, so a timed-out or otherwise cancelled operation's
-    // generation can never be reused by a later one.
+    // Child/runtime generation: bumped once per spawned `Child` (in
+    // `do_start`) and once per confirmed stop/crash cleanup (in
+    // `stop_active` / `reap_and_mark_failed`) — so every spawn and every
+    // confirmed terminal transition gets its own fresh identity.
+    // `ActiveChild::generation` is fixed at spawn time and is what gates a
+    // specific `ChildEnded`/`RuntimeEvent` against `current`; this counter
+    // is the source of every fresh value handed out to either, so a
+    // timed-out or otherwise cancelled generation can never be reused by a
+    // later one.
     let mut generation: u64 = 0;
+    // Operation generation: bumped once per dequeued lifecycle command
+    // (`Start` / `Stop` / `Restart`, and `Shutdown`), independent of
+    // `generation` above — it identifies the *operation*, not whichever
+    // `Child` it acts on. A `Restart` keeps one value across both its
+    // stop and start steps, since it is a single lifecycle operation.
+    let mut operation_generation: u64 = 0;
     let mut owner_guard: Option<OwnerLockGuard> = None;
 
     for msg in rx {
         match msg {
             CoordinatorMessage::Lifecycle(cmd, reply) => {
+                operation_generation += 1;
+                let op_gen = operation_generation;
                 let result = handle_lifecycle(
                     cmd,
+                    op_gen,
                     &mut current,
                     &mut generation,
                     &mut owner_guard,
@@ -425,11 +475,22 @@ fn run_coordinator(
                     &events_tx,
                     &self_tx,
                     &shared,
+                    &reply,
                 );
-                let _ = reply.send(result);
+                if let Some(result) = result {
+                    let _ = reply.send(result);
+                }
             }
-            CoordinatorMessage::ChildEnded { generation: g } => {
-                let matches_current = current.as_ref().map(|c| c.generation) == Some(g);
+            CoordinatorMessage::ChildEnded {
+                generation: g,
+                operation_generation: og,
+            } => {
+                // Gate against both generations: a reader/monitor event only
+                // applies to the exact `Child` (and the exact operation that
+                // spawned it) `current` still holds, never to whatever a
+                // later operation has since moved on to.
+                let matches_current =
+                    current.as_ref().map(|c| (c.generation, c.operation_generation)) == Some((g, og));
                 if matches_current {
                     reap_and_mark_failed(
                         &mut current,
@@ -442,6 +503,8 @@ fn run_coordinator(
                 }
             }
             CoordinatorMessage::Shutdown => {
+                operation_generation += 1;
+                let op_gen = operation_generation;
                 let _ = stop_active(
                     &mut current,
                     &mut generation,
@@ -449,7 +512,9 @@ fn run_coordinator(
                     &config,
                     &shared,
                     &events_tx,
+                    RuntimeState::Stopping,
                     RuntimeState::Stopped,
+                    op_gen,
                 );
                 break;
             }
@@ -460,6 +525,7 @@ fn run_coordinator(
 #[allow(clippy::too_many_arguments)]
 fn handle_lifecycle(
     cmd: LifecycleCommand,
+    op_gen: u64,
     current: &mut Option<ActiveChild>,
     generation: &mut u64,
     owner_guard: &mut Option<OwnerLockGuard>,
@@ -468,32 +534,39 @@ fn handle_lifecycle(
     events_tx: &Sender<RuntimeEvent>,
     self_tx: &Sender<CoordinatorMessage>,
     shared: &Arc<Mutex<SharedState>>,
-) -> Result<RuntimeStatus, RuntimeError> {
+    reply: &Sender<Result<RuntimeStatus, RuntimeError>>,
+) -> Option<Result<RuntimeStatus, RuntimeError>> {
     match cmd {
         LifecycleCommand::Start => do_start(
-            current, generation, owner_guard, config, handler, events_tx, self_tx, shared,
+            op_gen, current, generation, owner_guard, config, handler, events_tx, self_tx, shared, reply,
         ),
-        LifecycleCommand::Stop => stop_active(
+        LifecycleCommand::Stop => Some(stop_active(
             current,
             generation,
             owner_guard,
             config,
             shared,
             events_tx,
+            RuntimeState::Stopping,
             RuntimeState::Stopped,
-        ),
+            op_gen,
+        )),
         LifecycleCommand::Restart => {
-            stop_active(
+            if let Err(e) = stop_active(
                 current,
                 generation,
                 owner_guard,
                 config,
                 shared,
                 events_tx,
+                RuntimeState::Stopping,
                 RuntimeState::Stopped,
-            )?;
+                op_gen,
+            ) {
+                return Some(Err(e));
+            }
             do_start(
-                current, generation, owner_guard, config, handler, events_tx, self_tx, shared,
+                op_gen, current, generation, owner_guard, config, handler, events_tx, self_tx, shared, reply,
             )
         }
     }
@@ -505,6 +578,7 @@ fn try_reap(child: &mut Child) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn do_start(
+    op_gen: u64,
     current: &mut Option<ActiveChild>,
     generation: &mut u64,
     owner_guard: &mut Option<OwnerLockGuard>,
@@ -513,11 +587,12 @@ fn do_start(
     events_tx: &Sender<RuntimeEvent>,
     self_tx: &Sender<CoordinatorMessage>,
     shared: &Arc<Mutex<SharedState>>,
-) -> Result<RuntimeStatus, RuntimeError> {
+    reply: &Sender<Result<RuntimeStatus, RuntimeError>>,
+) -> Option<Result<RuntimeStatus, RuntimeError>> {
     if current.is_some() {
         let status = read_status(shared);
         if status.state == RuntimeState::Ready {
-            return Ok(status);
+            return Some(Ok(status));
         }
         // A previous stop attempt could not confirm the old child had
         // exited. Re-check now; only proceed once it is actually gone.
@@ -529,22 +604,22 @@ fn do_start(
             *current = None;
             *owner_guard = None;
         } else {
-            return Err(RuntimeError::RestartBlocked);
+            return Some(Err(RuntimeError::RestartBlocked));
         }
     }
 
-    set_status(shared, RuntimeState::Starting, false, *generation);
+    set_status(shared, RuntimeState::Starting, false, *generation, op_gen);
 
     let lock = OwnerLock::new(&config.owner_lock_path);
     let guard = match lock.try_acquire() {
         Ok(Some(g)) => g,
         Ok(None) => {
-            set_status(shared, RuntimeState::Stopped, false, *generation);
-            return Err(RuntimeError::OwnerLockUnavailable);
+            set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
+            return Some(Err(RuntimeError::OwnerLockUnavailable));
         }
         Err(e) => {
-            set_status(shared, RuntimeState::Failed, false, *generation);
-            return Err(RuntimeError::OwnerLock(Arc::new(e)));
+            set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
+            return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
         }
     };
 
@@ -554,8 +629,8 @@ fn do_start(
     let mut child = match config.spawn_child() {
         Ok(c) => c,
         Err(e) => {
-            set_status(shared, RuntimeState::Failed, false, g);
-            return Err(RuntimeError::Spawn(Arc::new(e)));
+            set_status(shared, RuntimeState::Failed, false, g, op_gen);
+            return Some(Err(RuntimeError::Spawn(Arc::new(e))));
         }
     };
 
@@ -565,7 +640,10 @@ fn do_start(
 
     let self_tx_clone = self_tx.clone();
     let on_closed: Box<dyn FnOnce() + Send> = Box::new(move || {
-        let _ = self_tx_clone.send(CoordinatorMessage::ChildEnded { generation: g });
+        let _ = self_tx_clone.send(CoordinatorMessage::ChildEnded {
+            generation: g,
+            operation_generation: op_gen,
+        });
     });
 
     let (bridge_tx, bridge_rx) = mpsc::sync_channel::<RpcEvent>(EVENTS_BRIDGE_CAPACITY);
@@ -589,7 +667,7 @@ fn do_start(
         on_closed,
     );
 
-    set_status(shared, RuntimeState::Initializing, false, g);
+    set_status(shared, RuntimeState::Initializing, false, g, op_gen);
 
     let core = transport.handle();
     // Schema per the bundled App Server's `initialize` request: `clientInfo`
@@ -613,6 +691,7 @@ fn do_start(
 
     *current = Some(ActiveChild {
         generation: g,
+        operation_generation: op_gen,
         child,
         transport,
     });
@@ -621,6 +700,14 @@ fn do_start(
     match init_result {
         Ok(_) => {
             if core.notify("initialized", None).is_err() {
+                // The transport is already gone: this operation is
+                // cancelled just like a timeout below. Record `Failed`
+                // (tagged with this operation's own generation) and reply to
+                // the caller — and every coalesced waiter — immediately,
+                // instead of only doing so once `Child` cleanup actually
+                // confirms the process is gone.
+                set_status(shared, RuntimeState::Failed, false, g, op_gen);
+                let _ = reply.send(Err(RuntimeError::Handshake(RpcError::Disconnected)));
                 let _ = stop_active(
                     current,
                     generation,
@@ -629,26 +716,36 @@ fn do_start(
                     shared,
                     events_tx,
                     RuntimeState::Failed,
+                    RuntimeState::Failed,
+                    op_gen,
                 );
-                return Err(RuntimeError::Handshake(RpcError::Disconnected));
+                return None;
             }
             {
                 let mut state = shared.lock().unwrap();
                 state.status = RuntimeState::Ready;
                 state.restart_blocked = false;
                 state.generation = g;
+                state.operation_generation = op_gen;
                 state.ready_transport = Some(core);
             }
-            Ok(read_status(shared))
+            Some(Ok(read_status(shared)))
         }
         Err(err) => {
-            // The handshake timed out (or otherwise failed): this operation
-            // is cancelled. Proceed straight to `Child` cleanup for the
-            // generation it spawned and report that operation's own failure
-            // to the caller; cleanup itself hands out a fresh generation for
-            // the confirmed-stopped transition so a late completion or
-            // reader/monitor event tied to the cancelled generation can never
-            // be mistaken for the outcome of a subsequent operation.
+            // The handshake timed out: this operation is cancelled.
+            // Atomically record it as cancelled and `Failed` (tagged with
+            // this operation's own `operation_generation`, distinct from
+            // whichever `Child` generation it spawned) and reply to the
+            // waiting caller — and every coalesced waiter — right away,
+            // instead of only doing so once `Child` cleanup below actually
+            // confirms the process is gone. That cleanup still proceeds
+            // straight to reaping the generation this operation spawned,
+            // synchronously on this same coordinator thread, so the next
+            // queued start/stop/restart still cannot begin before it
+            // confirms the outcome; it must not regress the status just set
+            // here back through an intermediate `Stopping` transition.
+            set_status(shared, RuntimeState::Failed, false, g, op_gen);
+            let _ = reply.send(Err(RuntimeError::Handshake(err)));
             let _ = stop_active(
                 current,
                 generation,
@@ -657,12 +754,15 @@ fn do_start(
                 shared,
                 events_tx,
                 RuntimeState::Failed,
+                RuntimeState::Failed,
+                op_gen,
             );
-            Err(RuntimeError::Handshake(err))
+            None
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stop_active(
     current: &mut Option<ActiveChild>,
     generation: &mut u64,
@@ -670,7 +770,9 @@ fn stop_active(
     config: &RuntimeConfig,
     shared: &Arc<Mutex<SharedState>>,
     events_tx: &Sender<RuntimeEvent>,
+    in_progress_state: RuntimeState,
     state_on_success: RuntimeState,
+    op_gen: u64,
 ) -> Result<RuntimeStatus, RuntimeError> {
     let mut active = match current.take() {
         Some(a) => a,
@@ -678,7 +780,11 @@ fn stop_active(
     };
 
     let child_generation = active.generation;
-    set_status(shared, RuntimeState::Stopping, false, child_generation);
+    // `in_progress_state` is `Stopping` for a normal `Stop`/`Restart` call,
+    // or `Failed` when this cleanup follows a lifecycle-timeout cancellation
+    // that already recorded `Failed` before calling here — in that case this
+    // re-asserts the same state instead of regressing it to `Stopping`.
+    set_status(shared, in_progress_state, false, child_generation, op_gen);
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
@@ -708,12 +814,12 @@ fn stop_active(
             // this stop/cancel operation has its own identity that a later
             // start/restart's generation can never collide with.
             *generation += 1;
-            set_status(shared, state_on_success, false, *generation);
+            set_status(shared, state_on_success, false, *generation, op_gen);
             Ok(read_status(shared))
         }
         StopOutcome::RestartBlocked => {
             *current = Some(active);
-            set_status(shared, RuntimeState::Failed, true, child_generation);
+            set_status(shared, RuntimeState::Failed, true, child_generation, op_gen);
             let _ = events_tx.send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
@@ -739,6 +845,11 @@ fn reap_and_mark_failed(
     };
 
     let child_generation = active.generation;
+    // No new lifecycle operation was initiated here (this is an
+    // asynchronously detected crash, not a coordinator-dequeued command), so
+    // the resulting `Failed` status is reported under the operation that had
+    // spawned/owned the now-crashed child, rather than minting a new one.
+    let op_gen = active.operation_generation;
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
@@ -762,7 +873,7 @@ fn reap_and_mark_failed(
             // exit: this crash-cleanup operation gets its own identity,
             // distinct from the crashed child's own generation.
             *generation += 1;
-            set_status(shared, RuntimeState::Failed, false, *generation);
+            set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
             let _ = events_tx.send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic("runtime exited unexpectedly".to_string()),
@@ -770,7 +881,7 @@ fn reap_and_mark_failed(
         }
         StopOutcome::RestartBlocked => {
             *current = Some(active);
-            set_status(shared, RuntimeState::Failed, true, child_generation);
+            set_status(shared, RuntimeState::Failed, true, child_generation, op_gen);
             let _ = events_tx.send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
