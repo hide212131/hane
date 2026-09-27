@@ -144,4 +144,26 @@ mod tests {
             "expected gpui-kit-assets's bundled Assets to resolve {path} so IconName::Copy renders"
         );
     }
+
+    // Hane used to bundle its own `arrow-left.svg` and `check.svg` at these
+    // same virtual paths, overriding `IconName::ArrowLeft` and
+    // `IconName::Check` from `gpui-component`'s own icon set. `WorkFolderIcons`
+    // no longer owns either path, so both now resolve through the pinned
+    // `gpui-kit-assets` fallback like `icons/copy.svg` above.
+    #[test]
+    fn app_assets_falls_back_to_component_arrow_left_and_check_icons() {
+        for path in ["icons/arrow-left.svg", "icons/check.svg"] {
+            assert!(
+                WorkFolderIcons.load(path).unwrap().is_none(),
+                "WorkFolderIcons must no longer own {path}"
+            );
+            let resolved = AppAssets
+                .load(path)
+                .unwrap_or_else(|_| panic!("gpui-kit-assets's Assets must not error for {path}"));
+            assert!(
+                resolved.is_some(),
+                "expected gpui-kit-assets's bundled Assets to resolve {path}"
+            );
+        }
+    }
 }
