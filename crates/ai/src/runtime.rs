@@ -305,13 +305,18 @@ enum LifecycleCommand {
     Reconfigure(RuntimeConfig, u64),
 }
 
+/// A boxed callback carrying the owner lock guard this coordinator currently
+/// holds (if any) onto the coordinator thread. See
+/// [`AiRuntime::with_owner_lock`].
+type OwnerLockCallback = Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>;
+
 enum CoordinatorMessage {
     Lifecycle(LifecycleCommand, Sender<Result<RuntimeStatus, RuntimeError>>),
     ChildEnded { generation: u64, operation_generation: u64 },
     /// Runs `f` synchronously on the coordinator thread, passing it the
     /// owner lock guard this coordinator currently holds (if any). See
     /// [`AiRuntime::with_owner_lock`].
-    WithOwnerLock(Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>),
+    WithOwnerLock(OwnerLockCallback),
     Shutdown,
 }
 
@@ -563,7 +568,7 @@ impl AiRuntime {
         R: Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
-        let boxed: Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send> = Box::new(move |owner| {
+        let boxed: OwnerLockCallback = Box::new(move |owner| {
             let _ = tx.send(f(owner));
         });
         self.cmd_tx
