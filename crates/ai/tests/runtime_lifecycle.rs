@@ -822,8 +822,12 @@ fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually
     // right after this cleanup attempt instead of continuing to serve later
     // lifecycle commands. If the coordinator simply dropped its `current`
     // `Child` and `owner_guard` on the way out, the owner lock would be
-    // released immediately even though the killed child has not yet been
-    // confirmed gone, letting a new owner start concurrently with it.
+    // released even though the killed child has not yet been confirmed
+    // gone, letting a new owner start concurrently with it. This test
+    // verifies end-to-end that the lock does eventually get released once
+    // the child is confirmed gone; see the module-level note further down
+    // for why the stronger "not released before confirmation" property is
+    // instead verified by a deterministic unit test rather than here.
     let mut config = base_config("shutdown_unconfirmed");
     config.stop_grace_timeout = Duration::ZERO;
     config.stop_force_timeout = Duration::ZERO;
@@ -839,19 +843,21 @@ fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually
     assert_eq!(status.state, RuntimeState::Failed);
     assert!(status.restart_blocked);
 
-    // The old child was only just killed and is not yet confirmed reaped:
-    // the owner lock must still be held on its behalf, so a fresh acquire
-    // attempt must fail immediately instead of racing a still-exiting
-    // process.
+    // Whether a fresh acquire attempt made right here would still fail is a
+    // real-process timing race: the killed child's exit and the background
+    // cleanup worker's first `try_wait()` (spawned by `shutdown()` to
+    // confirm it and release the owner lock on its behalf, since this
+    // coordinator thread is exiting) both happen asynchronously with this
+    // test thread, so the worker can legitimately have already confirmed the
+    // exit and released the lock before this point. That the lock is never
+    // released *before* such confirmation is instead covered deterministically
+    // (with no real process or thread involved) by
+    // `wait_for_confirmation_then_release_never_drops_the_resource_before_confirmation`
+    // in `crates/ai/src/runtime.rs`. What this integration test still
+    // verifies end-to-end is that the lock *does* eventually get released
+    // once the already-killed child actually exits, so a later runtime can
+    // start again.
     let lock = OwnerLock::new(&lock_path);
-    assert!(
-        lock.try_acquire().unwrap().is_none(),
-        "owner lock must still be held immediately after shutdown() while the old child's exit is unconfirmed"
-    );
-
-    // Once the already-killed child actually exits, the background cleanup
-    // worker handed the child and owner lock off to must confirm it and
-    // release the lock so a later runtime can start again.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if lock.try_acquire().unwrap().is_some() {

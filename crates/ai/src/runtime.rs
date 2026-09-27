@@ -878,22 +878,26 @@ fn stop_active(
 /// lock to a would-be new owner) until `try_wait` actually confirms the
 /// process is gone. If exit can never be confirmed, the lock is simply held
 /// for as long as this process runs, which is the safe default.
+///
+/// The actual "never release before confirmed" guarantee is structural, via
+/// `wait_for_confirmation_then_release` below: `active`/`owner_guard` are
+/// moved into the single `resource` it owns, and it only drops that
+/// `resource` after its own loop returns, which cannot happen before
+/// `try_wait` first reports the child gone.
 fn spawn_shutdown_cleanup_worker(
-    mut active: ActiveChild,
+    active: ActiveChild,
     owner_guard: OwnerLockGuard,
     events_tx: SyncSender<RuntimeEvent>,
 ) {
     let child_generation = active.generation;
     thread::spawn(move || {
         let poll_interval = Duration::from_millis(20);
-        loop {
-            if matches!(active.child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            thread::sleep(poll_interval);
-        }
-        drop(active);
-        drop(owner_guard);
+        wait_for_confirmation_then_release(
+            (active, owner_guard),
+            |(active, _owner_guard)| matches!(active.child.try_wait(), Ok(Some(_))),
+            poll_interval,
+            thread::sleep,
+        );
         let _ = events_tx.try_send(RuntimeEvent {
             generation: child_generation,
             kind: RuntimeEventKind::Diagnostic(
@@ -902,6 +906,33 @@ fn spawn_shutdown_cleanup_worker(
             ),
         });
     });
+}
+
+/// Polls `try_wait` (sleeping `poll_interval` between attempts via the
+/// injected `sleep`) until it reports the held `resource` may be released,
+/// and only then drops it. Kept generic over `resource`/`try_wait`/`sleep`
+/// so the one property that matters — `resource` can never be dropped
+/// before `try_wait` first returns `true` — is exercised by a fully
+/// deterministic unit test below, instead of only by
+/// `spawn_shutdown_cleanup_worker`'s real `ActiveChild`/`OwnerLockGuard`,
+/// whose exit timing depends on real process/OS scheduling and so cannot
+/// deterministically prove the same ordering.
+fn wait_for_confirmation_then_release<R, F1, F2>(
+    mut resource: R,
+    mut try_wait: F1,
+    poll_interval: Duration,
+    mut sleep: F2,
+) where
+    F1: FnMut(&mut R) -> bool,
+    F2: FnMut(Duration),
+{
+    loop {
+        if try_wait(&mut resource) {
+            break;
+        }
+        sleep(poll_interval);
+    }
+    drop(resource);
 }
 
 fn reap_and_mark_failed(
@@ -1109,5 +1140,53 @@ mod tests {
     fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
         let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
         assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
+    }
+
+    /// Deterministic (no real process, no real thread, no real sleep)
+    /// counterpart to `spawn_shutdown_cleanup_worker`'s use of
+    /// `wait_for_confirmation_then_release`: `Probe` stands in for the
+    /// `(ActiveChild, OwnerLockGuard)` tuple the real worker holds — like
+    /// the owner lock, its resource is only "released" (here: marks itself
+    /// dropped) when actually dropped. `try_wait` asserts, on every single
+    /// poll, that the probe has not been released yet, and only reports
+    /// exit confirmed on the third attempt; this exercises every iteration
+    /// of the loop instead of just its final outcome.
+    #[test]
+    fn wait_for_confirmation_then_release_never_drops_the_resource_before_confirmation() {
+        struct Probe {
+            released: Arc<Mutex<bool>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.released.lock().unwrap() = true;
+            }
+        }
+
+        let released = Arc::new(Mutex::new(false));
+        let probe = Probe {
+            released: released.clone(),
+        };
+        let mut attempts = 0u32;
+
+        wait_for_confirmation_then_release(
+            probe,
+            |_resource| {
+                attempts += 1;
+                assert!(
+                    !*released.lock().unwrap(),
+                    "resource (standing in for the owner lock) must not be released before \
+                     try_wait first confirms exit"
+                );
+                attempts >= 3
+            },
+            Duration::from_millis(0),
+            |_| {},
+        );
+
+        assert_eq!(attempts, 3, "try_wait should be polled until it first reports exit confirmed");
+        assert!(
+            *released.lock().unwrap(),
+            "resource must be released once try_wait confirms exit"
+        );
     }
 }
