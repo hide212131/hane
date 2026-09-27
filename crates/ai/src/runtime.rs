@@ -2,6 +2,20 @@
 //! owns start / stop / restart, finite lifecycle timeouts, generation-based
 //! invalidation of late events, and the cross-process runtime owner lock.
 //!
+//! Per `docs/adr/0032-embedded-codex-app-server-ai-foundation.md`, every
+//! start/stop/restart that actually completes (a spawn, or a confirmed
+//! stop/crash cleanup) is assigned its own monotonically increasing
+//! generation. A lifecycle timeout (e.g. the `initialize` handshake not
+//! completing within `start_timeout`) cancels that operation: the
+//! coordinator proceeds straight to `Child` cleanup for the generation it
+//! spawned and reports that operation's own failure to the waiting caller.
+//! Because the coordinator never starts the next start/stop/restart before
+//! that cleanup either confirms the process is gone or reports
+//! `restart_blocked`, and every later generation gets a strictly greater
+//! number, a completion notification or reader/monitor event arriving late
+//! from a timed-out or otherwise stale generation can never be mistaken for
+//! — or revert — the outcome of a subsequent operation.
+//!
 //! Every lifecycle command (`Start` / `Stop` / `Restart`) is handled to
 //! completion by one dedicated coordinator thread before the next queued
 //! command is processed, so there is never more than one `Child` spawn in
@@ -386,6 +400,15 @@ fn run_coordinator(
     events_tx: Sender<RuntimeEvent>,
 ) {
     let mut current: Option<ActiveChild> = None;
+    // Monotonically increasing operation generation, bumped once per spawned
+    // `Child` (in `do_start`) and once per confirmed stop/crash cleanup (in
+    // `stop_active` / `reap_and_mark_failed`) — so every start/stop/restart
+    // that actually completes gets its own fresh identity, distinct from
+    // whichever `Child` it acted on. `ActiveChild::generation` is fixed at
+    // spawn time and is what gates a specific `ChildEnded`/`RuntimeEvent`
+    // against `current`; this counter is the source of every fresh value
+    // handed out to either, so a timed-out or otherwise cancelled operation's
+    // generation can never be reused by a later one.
     let mut generation: u64 = 0;
     let mut owner_guard: Option<OwnerLockGuard> = None;
 
@@ -408,12 +431,20 @@ fn run_coordinator(
             CoordinatorMessage::ChildEnded { generation: g } => {
                 let matches_current = current.as_ref().map(|c| c.generation) == Some(g);
                 if matches_current {
-                    reap_and_mark_failed(&mut current, &mut owner_guard, &config, &shared, &events_tx);
+                    reap_and_mark_failed(
+                        &mut current,
+                        &mut generation,
+                        &mut owner_guard,
+                        &config,
+                        &shared,
+                        &events_tx,
+                    );
                 }
             }
             CoordinatorMessage::Shutdown => {
                 let _ = stop_active(
                     &mut current,
+                    &mut generation,
                     &mut owner_guard,
                     &config,
                     &shared,
@@ -444,6 +475,7 @@ fn handle_lifecycle(
         ),
         LifecycleCommand::Stop => stop_active(
             current,
+            generation,
             owner_guard,
             config,
             shared,
@@ -453,6 +485,7 @@ fn handle_lifecycle(
         LifecycleCommand::Restart => {
             stop_active(
                 current,
+                generation,
                 owner_guard,
                 config,
                 shared,
@@ -590,6 +623,7 @@ fn do_start(
             if core.notify("initialized", None).is_err() {
                 let _ = stop_active(
                     current,
+                    generation,
                     owner_guard,
                     config,
                     shared,
@@ -608,8 +642,16 @@ fn do_start(
             Ok(read_status(shared))
         }
         Err(err) => {
+            // The handshake timed out (or otherwise failed): this operation
+            // is cancelled. Proceed straight to `Child` cleanup for the
+            // generation it spawned and report that operation's own failure
+            // to the caller; cleanup itself hands out a fresh generation for
+            // the confirmed-stopped transition so a late completion or
+            // reader/monitor event tied to the cancelled generation can never
+            // be mistaken for the outcome of a subsequent operation.
             let _ = stop_active(
                 current,
+                generation,
                 owner_guard,
                 config,
                 shared,
@@ -623,6 +665,7 @@ fn do_start(
 
 fn stop_active(
     current: &mut Option<ActiveChild>,
+    generation: &mut u64,
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     shared: &Arc<Mutex<SharedState>>,
@@ -634,8 +677,8 @@ fn stop_active(
         None => return Ok(read_status(shared)),
     };
 
-    let generation = active.generation;
-    set_status(shared, RuntimeState::Stopping, false, generation);
+    let child_generation = active.generation;
+    set_status(shared, RuntimeState::Stopping, false, child_generation);
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
@@ -659,14 +702,20 @@ fn stop_active(
         StopOutcome::Exited => {
             drop(active);
             *owner_guard = None;
-            set_status(shared, state_on_success, false, generation);
+            // The generation being stopped is now confirmed gone. Hand out a
+            // fresh operation generation for this terminal transition itself
+            // instead of reusing the now-defunct child's own generation, so
+            // this stop/cancel operation has its own identity that a later
+            // start/restart's generation can never collide with.
+            *generation += 1;
+            set_status(shared, state_on_success, false, *generation);
             Ok(read_status(shared))
         }
         StopOutcome::RestartBlocked => {
             *current = Some(active);
-            set_status(shared, RuntimeState::Failed, true, generation);
+            set_status(shared, RuntimeState::Failed, true, child_generation);
             let _ = events_tx.send(RuntimeEvent {
-                generation,
+                generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
                     "runtime cleanup could not be confirmed; restart is blocked".to_string(),
                 ),
@@ -678,6 +727,7 @@ fn stop_active(
 
 fn reap_and_mark_failed(
     current: &mut Option<ActiveChild>,
+    generation: &mut u64,
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     shared: &Arc<Mutex<SharedState>>,
@@ -688,7 +738,7 @@ fn reap_and_mark_failed(
         None => return,
     };
 
-    let generation = active.generation;
+    let child_generation = active.generation;
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
@@ -708,17 +758,21 @@ fn reap_and_mark_failed(
         StopOutcome::Exited => {
             drop(active);
             *owner_guard = None;
-            set_status(shared, RuntimeState::Failed, false, generation);
+            // Same fresh-generation treatment as a confirmed `stop_active`
+            // exit: this crash-cleanup operation gets its own identity,
+            // distinct from the crashed child's own generation.
+            *generation += 1;
+            set_status(shared, RuntimeState::Failed, false, *generation);
             let _ = events_tx.send(RuntimeEvent {
-                generation,
+                generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic("runtime exited unexpectedly".to_string()),
             });
         }
         StopOutcome::RestartBlocked => {
             *current = Some(active);
-            set_status(shared, RuntimeState::Failed, true, generation);
+            set_status(shared, RuntimeState::Failed, true, child_generation);
             let _ = events_tx.send(RuntimeEvent {
-                generation,
+                generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
                     "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),
                 ),

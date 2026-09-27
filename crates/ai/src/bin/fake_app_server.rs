@@ -20,6 +20,15 @@
 //!   client asks to stop. Paired with `FAKE_SERVER_ECHO_RECEIVED_FILE=<path>`,
 //!   which is appended with `ECHO_RECEIVED` as soon as the request is read,
 //!   so a test can wait for that instead of assuming a fixed delay.
+//! - `FAKE_SERVER_MODE=timeout_then_late_response`: paired with
+//!   `FAKE_SERVER_TIMEOUT_ONCE_MARKER=<path>`. The first process spawned
+//!   against a given marker path withholds its `initialize` reply (like
+//!   `never_respond`) until stdin closes, then sleeps briefly and only then
+//!   sends the (by then late) `initialize` response before exiting, to
+//!   exercise a stale completion arriving from an already timed-out/cancelled
+//!   generation. Every later process spawned against the same marker path
+//!   (the marker file now exists) instead behaves exactly like `normal`, so a
+//!   subsequent explicit start can succeed on its own generation.
 //! - `FAKE_SERVER_EMIT_SERVER_REQUEST=1`: after replying to `initialize`,
 //!   sends an unsolicited server-to-client request to exercise the "never
 //!   auto-approve" contract.
@@ -60,6 +69,22 @@ fn main() {
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
     let echo_received_file = env::var("FAKE_SERVER_ECHO_RECEIVED_FILE").ok();
+    let timeout_once_marker = env::var("FAKE_SERVER_TIMEOUT_ONCE_MARKER").ok();
+    // Only the first process spawned against a given marker path withholds
+    // its `initialize` reply; every later one (the marker already exists)
+    // behaves normally so a subsequent explicit start can actually succeed.
+    let is_timeout_once_first = mode == "timeout_then_late_response"
+        && match &timeout_once_marker {
+            Some(path) => {
+                let first = !std::path::Path::new(path).exists();
+                if first {
+                    let _ = std::fs::write(path, b"");
+                }
+                first
+            }
+            None => true,
+        };
+    let mut pending_initialize_id: Option<serde_json::Value> = None;
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
@@ -117,6 +142,10 @@ fn main() {
                 if mode == "crash_after_initialize" {
                     std::process::exit(1);
                 }
+                if mode == "timeout_then_late_response" && is_timeout_once_first {
+                    pending_initialize_id = Some(id);
+                    continue;
+                }
                 let response = serde_json::json!({"id": id, "result": {"ok": true}});
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
@@ -165,7 +194,16 @@ fn main() {
         }
     }
 
-    // stdin closed: this is the client's graceful-stop signal.
+    // stdin closed: this is the client's graceful-stop signal. A held-back
+    // `initialize` reply is sent only now, deliberately late relative to
+    // whatever timeout the client already gave up waiting under.
+    if let Some(id) = pending_initialize_id {
+        thread::sleep(Duration::from_millis(300));
+        let response = serde_json::json!({"id": id, "result": {"ok": true}});
+        let _ = writeln!(stdout, "{response}");
+        let _ = stdout.flush();
+    }
+
     if env::var("FAKE_SERVER_IGNORE_STOP").is_ok() {
         loop {
             thread::sleep(Duration::from_secs(3600));

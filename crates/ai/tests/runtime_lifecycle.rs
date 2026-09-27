@@ -5,7 +5,9 @@
 //! coalescing (including a coalesced *failing* start wave), forced-kill
 //! escalation, immediate release of pending calls on stop, stderr drain
 //! under load, the runtime owner lock (including across real OS processes),
-//! and "no automatic resend after a crash".
+//! "no automatic resend after a crash", and invalidation of a late
+//! completion from a timed-out/cancelled generation once a newer,
+//! explicitly-started generation is already `Ready`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hane_ai::{
-    AiRuntime, OwnerLock, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeState,
+    AiRuntime, OwnerLock, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind,
+    RuntimeState,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -477,6 +480,87 @@ fn owner_lock_fails_immediately_from_a_separate_os_process() {
         acquired_stdout.contains("OWNER_LOCK_ACQUIRED"),
         "expected a separate process to acquire the now-free lock, stdout was: {acquired_stdout}"
     );
+}
+
+#[test]
+fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer_ready_generation() {
+    // `timeout_then_late_response` withholds its `initialize` reply from the
+    // *first* spawned process until stdin closes, then sleeps briefly before
+    // finally sending that (by then late) response and exiting. Every later
+    // process spawned against the same marker file behaves normally. This
+    // deterministically reproduces "an operation's completion arrives after
+    // the coordinator already gave up on it and moved on" without depending
+    // on incidental thread-scheduling timing.
+    let mut config = base_config("timeout_then_late");
+    config.start_timeout = Duration::from_millis(150);
+    config.stop_grace_timeout = Duration::from_secs(2);
+    config.stop_force_timeout = Duration::from_secs(2);
+    let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
+    let marker = dir.join("timeout_once.marker");
+    config
+        .extra_env
+        .push(("FAKE_SERVER_MODE".to_string(), "timeout_then_late_response".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_TIMEOUT_ONCE_MARKER".to_string(),
+        marker.display().to_string(),
+    ));
+    let (runtime, events_rx) = spawn_runtime(config);
+
+    // First start: the fake server withholds its reply until stdin closes,
+    // so the handshake must time out and the coordinator must clean up and
+    // land on `Failed`. `stop_active`'s cleanup here synchronously waits for
+    // that first (now cancelled) generation's process to actually exit
+    // (including its late response and post-EOF sleep), so by the time this
+    // call returns the stale generation is already fully wound down.
+    let first = runtime.start();
+    assert!(matches!(first, Err(RuntimeError::Handshake(_))));
+    let cancelled_status = runtime.snapshot();
+    assert_eq!(cancelled_status.state, RuntimeState::Failed);
+
+    // A second, explicit start spawns a fresh process (the marker file now
+    // exists, so this one answers `initialize` immediately) and must reach
+    // `Ready` on a newer generation of its own.
+    let second = runtime.start().expect("second explicit start should succeed");
+    assert_eq!(second.state, RuntimeState::Ready);
+    assert!(second.generation > cancelled_status.generation);
+
+    // The first generation's late `initialize` response is still read by its
+    // own (now-closed) transport and only ever surfaces as a diagnostic
+    // tagged with that stale generation, never as something that could be
+    // mistaken for the second generation's own handshake.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_stale_diagnostic = false;
+    while std::time::Instant::now() < deadline {
+        match events_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(event) => {
+                if let RuntimeEventKind::Diagnostic(msg) = &event.kind {
+                    if msg.contains("late or unknown response") {
+                        assert!(
+                            event.generation < second.generation,
+                            "the stale generation's late response ({}) must predate the newer generation ({})",
+                            event.generation,
+                            second.generation
+                        );
+                        saw_stale_diagnostic = true;
+                        break;
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_stale_diagnostic,
+        "expected a diagnostic about the timed-out generation's late `initialize` response"
+    );
+
+    // Crucially, observing that stale completion must not have clobbered the
+    // newer, explicitly-started generation's `Ready` status.
+    let status = runtime.snapshot();
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert_eq!(status.generation, second.generation);
+
+    let _ = runtime.stop();
 }
 
 #[test]
