@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/ai",
     "crates/app",
     "crates/benchmark",
     "crates/document",
@@ -20,6 +21,7 @@ license = "Apache-2.0"
 rust-version = "1.98.1"
 
 [workspace.dependencies]
+hane-ai = { path = "crates/ai" }
 hane-document = { path = "crates/document" }
 hane-editor = { path = "crates/editor" }
 hane-markdown = { path = "crates/markdown" }
