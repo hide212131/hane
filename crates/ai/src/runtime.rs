@@ -517,7 +517,7 @@ fn run_coordinator(
             CoordinatorMessage::Shutdown => {
                 operation_generation += 1;
                 let op_gen = operation_generation;
-                let _ = stop_active(
+                let outcome = stop_active(
                     &mut current,
                     &mut generation,
                     &mut owner_guard,
@@ -528,6 +528,22 @@ fn run_coordinator(
                     RuntimeState::Stopped,
                     op_gen,
                 );
+                // A `RestartBlocked` outcome means `stop_active` put the
+                // still-alive (or at least unconfirmed-dead) `ActiveChild`
+                // back into `current` and left `owner_guard` untouched. This
+                // coordinator thread is about to exit, so simply letting
+                // `current`/`owner_guard` fall out of scope here would drop
+                // the `Child` (which does not kill it) and release the owner
+                // lock while that process might still be running, letting a
+                // later runtime start a second instance concurrently. Hand
+                // both off to a background worker that keeps confirming the
+                // child's exit and only then releases the lock, instead of
+                // ever dropping it on unconfirmed cleanup.
+                if outcome.is_err()
+                    && let (Some(active), Some(guard)) = (current.take(), owner_guard.take())
+                {
+                    spawn_shutdown_cleanup_worker(active, guard, events_tx.clone());
+                }
                 break;
             }
         }
@@ -850,6 +866,42 @@ fn stop_active(
             Err(RuntimeError::RestartBlocked)
         }
     }
+}
+
+/// Confirms, in the background, that a child whose cleanup could not be
+/// confirmed within `stop_active`'s bounded grace/force timeouts (during
+/// coordinator `Shutdown`) has actually exited before releasing the runtime
+/// owner lock on its behalf. The coordinator thread that owned `active` and
+/// `owner_guard` is exiting right after handing them off here, so nothing
+/// else keeps checking on this child; this worker keeps polling for however
+/// long it takes, and never drops `owner_guard` (which would release the
+/// lock to a would-be new owner) until `try_wait` actually confirms the
+/// process is gone. If exit can never be confirmed, the lock is simply held
+/// for as long as this process runs, which is the safe default.
+fn spawn_shutdown_cleanup_worker(
+    mut active: ActiveChild,
+    owner_guard: OwnerLockGuard,
+    events_tx: SyncSender<RuntimeEvent>,
+) {
+    let child_generation = active.generation;
+    thread::spawn(move || {
+        let poll_interval = Duration::from_millis(20);
+        loop {
+            if matches!(active.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            thread::sleep(poll_interval);
+        }
+        drop(active);
+        drop(owner_guard);
+        let _ = events_tx.try_send(RuntimeEvent {
+            generation: child_generation,
+            kind: RuntimeEventKind::Diagnostic(
+                "runtime shutdown confirmed the previously unconfirmed child had exited; owner lock released"
+                    .to_string(),
+            ),
+        });
+    });
 }
 
 fn reap_and_mark_failed(

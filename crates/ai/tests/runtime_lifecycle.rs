@@ -732,3 +732,54 @@ fn cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart() {
     assert!(runtime.snapshot().restart_blocked);
     assert_eq!(runtime.snapshot().state, RuntimeState::Failed);
 }
+
+#[test]
+fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually_exits() {
+    // Same zero-timeout setup as
+    // `cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart`,
+    // but exercised through `shutdown()`, whose coordinator thread exits
+    // right after this cleanup attempt instead of continuing to serve later
+    // lifecycle commands. If the coordinator simply dropped its `current`
+    // `Child` and `owner_guard` on the way out, the owner lock would be
+    // released immediately even though the killed child has not yet been
+    // confirmed gone, letting a new owner start concurrently with it.
+    let mut config = base_config("shutdown_unconfirmed");
+    config.stop_grace_timeout = Duration::ZERO;
+    config.stop_force_timeout = Duration::ZERO;
+    config
+        .extra_env
+        .push(("FAKE_SERVER_IGNORE_STOP".to_string(), "1".to_string()));
+    let lock_path = config.owner_lock_path.clone();
+    let (runtime, _events) = spawn_runtime(config);
+
+    runtime.start().expect("start should succeed");
+
+    let status = runtime.shutdown();
+    assert_eq!(status.state, RuntimeState::Failed);
+    assert!(status.restart_blocked);
+
+    // The old child was only just killed and is not yet confirmed reaped:
+    // the owner lock must still be held on its behalf, so a fresh acquire
+    // attempt must fail immediately instead of racing a still-exiting
+    // process.
+    let lock = OwnerLock::new(&lock_path);
+    assert!(
+        lock.try_acquire().unwrap().is_none(),
+        "owner lock must still be held immediately after shutdown() while the old child's exit is unconfirmed"
+    );
+
+    // Once the already-killed child actually exits, the background cleanup
+    // worker handed the child and owner lock off to must confirm it and
+    // release the lock so a later runtime can start again.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if lock.try_acquire().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner lock was never released after the unconfirmed child actually exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
