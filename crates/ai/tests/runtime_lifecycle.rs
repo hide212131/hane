@@ -534,17 +534,17 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     while std::time::Instant::now() < deadline {
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(event) => {
-                if let RuntimeEventKind::Diagnostic(msg) = &event.kind {
-                    if msg.contains("late or unknown response") {
-                        assert!(
-                            event.generation < second.generation,
-                            "the stale generation's late response ({}) must predate the newer generation ({})",
-                            event.generation,
-                            second.generation
-                        );
-                        saw_stale_diagnostic = true;
-                        break;
-                    }
+                if let RuntimeEventKind::Diagnostic(msg) = &event.kind
+                    && msg.contains("late or unknown response")
+                {
+                    assert!(
+                        event.generation < second.generation,
+                        "the stale generation's late response ({}) must predate the newer generation ({})",
+                        event.generation,
+                        second.generation
+                    );
+                    saw_stale_diagnostic = true;
+                    break;
                 }
             }
             Err(_) => continue,
