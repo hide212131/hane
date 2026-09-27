@@ -18,15 +18,18 @@
 //! contract for an inference turn or connectivity probe: it acquires the AI
 //! settings lock in **shared** mode, confirms the persisted
 //! `settings_generation` still matches the generation the caller's
-//! connection was configured for, and holds that shared lock until the
-//! caller-supplied `f` itself has completed, failed or been rejected — for
-//! `f`'s entire duration, not just a single RPC round trip, so a multi-step
-//! turn (`thread/start`/`turn/start` through observing its `turn/completed`
-//! notification) stays covered end to end. Never released early and never
-//! waited on by a concurrent settings save (which uses a non-blocking
-//! exclusive try-lock and is rejected immediately instead).
-//! [`call_with_generation_check`] is the single-RPC-call convenience wrapper
-//! for a fixed connectivity probe.
+//! connection was configured for *and* that the target `AiRuntime` is
+//! actually `Ready` for that exact generation (not merely that it has
+//! structurally swapped `config` towards it -- see
+//! [`crate::runtime::AiRuntime::ready_configured_settings_generation`]), and
+//! holds that shared lock until the caller-supplied `f` itself has
+//! completed, failed or been rejected — for `f`'s entire duration, not just a
+//! single RPC round trip, so a multi-step turn (`thread/start`/`turn/start`
+//! through observing its `turn/completed` notification) stays covered end to
+//! end. Never released early and never waited on by a concurrent settings
+//! save (which uses a non-blocking exclusive try-lock and is rejected
+//! immediately instead). [`call_with_generation_check`] is the
+//! single-RPC-call convenience wrapper for a fixed connectivity probe.
 
 use std::io;
 use std::path::PathBuf;
@@ -66,15 +69,18 @@ pub enum ConnectError {
     /// progress) and was rejected immediately rather than waited on.
     SettingsBusy,
     /// Either the persisted `AiSettings.settings_generation`, or the
-    /// `settings_generation` the target `AiRuntime` itself currently has
-    /// applied (see [`crate::runtime::AiRuntime::configured_settings_generation`]),
+    /// generation the target `AiRuntime` is actually `Ready` for (see
+    /// [`crate::runtime::AiRuntime::ready_configured_settings_generation`]),
     /// no longer matches the generation the caller's connection
     /// (`RuntimeConfig`/App Server) was configured for: a runtime-affecting
-    /// settings change landed since, or the runtime has not finished
-    /// applying a matching `reconfigure` yet, and this turn/probe must not
-    /// proceed against a now-stale Base URL, API key or model. `persisted`
-    /// carries whichever of the two authoritative generations actually
-    /// disagreed with `configured`.
+    /// settings change landed since, and this turn/probe must not proceed
+    /// against a now-stale Base URL, API key or model. `persisted` carries
+    /// whichever of the two authoritative generations actually disagreed
+    /// with `configured`. When the runtime is not `Ready` at all (still
+    /// starting, mid-`reconfigure`, or a start/reconfigure failed) this is
+    /// not raised; [`Self::Runtime`]`(`[`crate::runtime::RuntimeError::NotReady`]`)`
+    /// is raised instead, since no generation can be confirmed as actually
+    /// served yet.
     GenerationMismatch { persisted: u64, configured: u64 },
     MissingCustomConnection,
     MissingCredential,
@@ -459,15 +465,18 @@ pub fn build_runtime_config_for_active_connection(
 ///
 /// The check does not stop at `configured_settings_generation` (a plain
 /// number the caller supplies and could get wrong, or supply before
-/// `runtime` has actually caught up to it): it also confirms
-/// `runtime.configured_settings_generation()` -- tracked by `runtime`'s own
-/// coordinator thread, updated only by a completed
-/// [`crate::runtime::AiRuntime::reconfigure`] -- matches too. This closes the
-/// gap where persisted settings already moved to a new generation and a
-/// caller's own bookkeeping happens to agree, but `runtime` itself has not
-/// finished applying the matching `reconfigure` yet: without this, `f` could
-/// still run one last time against the stale Base URL/API key/model the
-/// runtime is still actually configured for.
+/// `runtime` has actually caught up to it): it also confirms, under one
+/// [`crate::runtime::AiRuntime::ready_configured_settings_generation`] lock
+/// acquisition, both that `runtime` is actually `Ready` and that the
+/// generation it is `Ready` for matches. This closes two gaps at once:
+/// persisted settings already moved to a new generation while a caller's own
+/// bookkeeping happens to agree but `runtime` has not finished applying the
+/// matching `reconfigure` yet; and `runtime` having only *structurally*
+/// swapped to a new `config` (which [`crate::runtime::AiRuntime::reconfigure`]
+/// does immediately, before even attempting the restart) while the restart
+/// itself is still in flight or has failed. Without this, `f` could still run
+/// against a runtime that is not actually serving the claimed generation --
+/// or is not serving anything at all yet.
 pub fn with_generation_checked_lock<F, R>(
     settings_store: &AiSettingsStore,
     runtime: &AiRuntime,
@@ -485,10 +494,12 @@ where
         return Err(ConnectError::GenerationMismatch { persisted, configured: configured_settings_generation });
     }
 
-    let runtime_configured = runtime.configured_settings_generation();
-    if runtime_configured != configured_settings_generation {
+    let runtime_ready_generation = runtime
+        .ready_configured_settings_generation()
+        .ok_or(ConnectError::Runtime(RuntimeError::NotReady))?;
+    if runtime_ready_generation != configured_settings_generation {
         return Err(ConnectError::GenerationMismatch {
-            persisted: runtime_configured,
+            persisted: runtime_ready_generation,
             configured: configured_settings_generation,
         });
     }
@@ -521,6 +532,7 @@ pub fn call_with_generation_check(
 mod tests {
     use super::*;
     use crate::rpc::RejectAllServerRequests;
+    use crate::runtime::RuntimeState;
     use crate::secrets::{FakeCredentialStore, UnavailableCredentialStore};
     use crate::settings::{ChatGptConnectionSettings, CustomConnectionSettings};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -934,13 +946,18 @@ mod tests {
 
     /// Regression coverage for the root cause behind the generation check
     /// previously trusting only the caller-supplied
-    /// `configured_settings_generation` number: persisted settings can
-    /// already be at a new generation while the target `AiRuntime` itself
-    /// has not actually finished applying a matching `reconfigure` yet. A
-    /// probe/turn claiming that new generation (e.g. because the caller just
-    /// reloaded settings) must still be rejected before it ever reaches the
-    /// runtime, and only starts passing once `reconfigure` has actually
-    /// caught up.
+    /// `configured_settings_generation` number, and separately
+    /// `AiRuntime::configured_settings_generation` in isolation: that number
+    /// is updated as soon as `reconfigure` *structurally* swaps `config`,
+    /// before the restart against it is even attempted (see the module docs
+    /// on `AiRuntime::reconfigure`), so it can already report a new
+    /// generation while the runtime has not actually reached `Ready` for it
+    /// yet -- whether because a restart is still in flight or because it
+    /// failed outright. A probe/turn claiming that new generation must be
+    /// rejected as `NotReady` (never silently allowed through, and never
+    /// misreported as a `GenerationMismatch` against a stale number) the
+    /// entire time the runtime is not `Ready` for it, and only starts passing
+    /// once the runtime is actually `Ready` for that exact generation.
     #[test]
     fn call_with_generation_check_rejects_when_the_runtime_has_not_finished_applying_a_matching_reconfigure() {
         let (store, owner, _journal, dir) = store_and_journal("gated_call_runtime_lagging");
@@ -958,29 +975,36 @@ mod tests {
         let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
         let runtime = AiRuntime::spawn(config, handler, events_tx);
         assert_eq!(runtime.configured_settings_generation(), 0);
+        assert_eq!(runtime.snapshot().state, RuntimeState::Stopped);
 
-        // The caller's own bookkeeping (e.g. from a fresh settings reload)
-        // agrees with persisted settings, but `runtime` itself has not
-        // caught up: this must still be rejected before any RPC.
+        // Never started (Stopped): rejected as `NotReady`, not misreported as
+        // a generation mismatch against the stale `0` -- there is no
+        // generation this runtime is actually serving yet.
         let result = call_with_generation_check(&store, 1, &runtime, "turn/start", None, Duration::from_secs(1));
         assert!(
-            matches!(result, Err(ConnectError::GenerationMismatch { persisted: 0, configured: 1 })),
-            "expected a GenerationMismatch bound to the runtime's own lagging generation, got {result:?}"
+            matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
+            "expected NotReady while the runtime was never started, got {result:?}"
         );
 
-        // Once `reconfigure` actually completes for generation 1, the
-        // generation check itself must pass (the call may still fail
-        // downstream, e.g. on `NotReady` against the unreachable binary, but
-        // never as a `GenerationMismatch` again).
+        // `reconfigure` fails outright (the binary does not exist), but it
+        // still structurally swapped `config_generation` to `1` immediately,
+        // before ever attempting the restart -- so
+        // `configured_settings_generation` already reports `1` even though
+        // the runtime never reached `Ready` for it.
         let reconfigure_config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
-        let _ = runtime.reconfigure(reconfigure_config, 1);
+        assert!(runtime.reconfigure(reconfigure_config, 1).is_err(), "reconfigure against a nonexistent binary must fail");
         assert_eq!(runtime.configured_settings_generation(), 1);
+        assert_eq!(runtime.snapshot().state, RuntimeState::Failed);
 
-        let result_after_reconfigure =
+        // The generation number alone now matches, but the runtime is
+        // `Failed`, not `Ready` for it: this must still be rejected as
+        // `NotReady`, never treated as a usable generation and never as a
+        // `GenerationMismatch`.
+        let result_after_failed_reconfigure =
             call_with_generation_check(&store, 1, &runtime, "turn/start", None, Duration::from_secs(1));
         assert!(
-            !matches!(result_after_reconfigure, Err(ConnectError::GenerationMismatch { .. })),
-            "once the runtime's own generation matches, the generation check must pass, got {result_after_reconfigure:?}"
+            matches!(result_after_failed_reconfigure, Err(ConnectError::Runtime(RuntimeError::NotReady))),
+            "expected NotReady while the reconfigured runtime failed to reach Ready, got {result_after_failed_reconfigure:?}"
         );
 
         let _ = runtime.shutdown();

@@ -1,8 +1,9 @@
 //! Custom Provider integration tests.
 //!
 //! `custom_provider_key_reaches_only_the_spawned_child_process_environment`,
-//! `rotating_the_custom_provider_key_never_reaches_the_old_child`, and
-//! `internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end`
+//! `rotating_the_custom_provider_key_never_reaches_the_old_child`,
+//! `internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end`,
+//! and `generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation`
 //! always run: they exercise `hane_ai::build_custom_provider_material`'s
 //! `extra_env`, and the full settings-save/reload/config-generation/
 //! reconfigure/generation-gated-probe path (ADR-0032 section 8), end-to-end
@@ -26,10 +27,10 @@ use std::time::Duration;
 
 use hane_ai::{
     build_custom_provider_material, build_runtime_config_for_active_connection, call_with_generation_check,
-    update_custom_credential, write_codex_config, ActiveConnection, AiPaths, AiSettings, AiSettingsStore, AiRuntime,
-    ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore, CustomConnectionSettings,
-    FakeCredentialStore, RejectAllServerRequests, RuntimeConfig, RuntimeState, SaveError, ShellEnvironmentPolicyFormat,
-    CUSTOM_PROVIDER_ENV_KEY,
+    update_custom_credential, with_generation_checked_lock, write_codex_config, ActiveConnection, AiPaths, AiSettings,
+    AiSettingsStore, AiRuntime, ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore,
+    CustomConnectionSettings, FakeCredentialStore, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeState,
+    SaveError, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -493,6 +494,126 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     });
     assert!(matches!(save_attempt, Ok(Err(SaveError::Busy))));
     drop(shared_during_probe);
+
+    let _ = runtime.stop();
+}
+
+/// Regression coverage for the root cause behind a generation-gated
+/// operation (`with_generation_checked_lock`) being able to run its closure
+/// merely because the persisted `settings_generation` and the caller's own
+/// `configured_settings_generation` happen to agree with what
+/// `AiRuntime::reconfigure` has *structurally* swapped `config` to -- even
+/// though the runtime itself has not actually confirmed a matching `Ready`
+/// state yet (still `Stopped`, mid-restart, or the restart failed). Uses a
+/// real `fake_app_server` child (via `FAKE_SERVER_MODE=never_respond`) to
+/// observe the genuinely transient `Starting`/`Initializing` window, not just
+/// the terminal `Stopped`/`Failed` states. Confirms the closure passed to
+/// `with_generation_checked_lock` is never invoked for `Stopped`, `Starting`/
+/// `Initializing`, a failed start, or a generation mismatch while `Ready`,
+/// and is invoked exactly once the runtime is actually `Ready` for the exact
+/// matching generation.
+#[test]
+fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation() {
+    let dir = unique_dir("generation_gate_ready");
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let owner = hane_ai::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
+    let mut first = AiSettings::default();
+    first.chatgpt.model_id = Some("gpt-a".to_string());
+    let saved = settings_store.save(&owner, 0, first, || Ok(true)).unwrap();
+    assert_eq!(saved.settings_generation, 1);
+    drop(owner);
+
+    let closure_calls = AtomicU64::new(0);
+
+    let (mut hang_config, _hang_dir) = fake_server_config("generation_gate_stopped_starting_failed");
+    hang_config.extra_env.push(("FAKE_SERVER_MODE".to_string(), "never_respond".to_string()));
+    hang_config.start_timeout = Duration::from_millis(500);
+    let (events_tx, _events_rx) = mpsc::sync_channel(64);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn_with_configured_settings_generation(hang_config, 1, handler, events_tx);
+
+    let run_gate = |generation: u64| -> Result<(), ConnectError> {
+        with_generation_checked_lock(&settings_store, &runtime, generation, || {
+            closure_calls.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    // --- Stopped: never started yet. ---
+    assert_eq!(runtime.snapshot().state, RuntimeState::Stopped);
+    let calls_before = closure_calls.load(Ordering::SeqCst);
+    let result = run_gate(1);
+    assert!(
+        matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
+        "Stopped: expected NotReady, got {result:?}"
+    );
+    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run while Stopped");
+
+    // --- Starting/Initializing: start() in flight, handshake withheld. ---
+    std::thread::scope(|scope| {
+        let start_handle = scope.spawn(|| runtime.start());
+
+        let mut observed_in_flight_state = None;
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            let state = runtime.snapshot().state;
+            if matches!(state, RuntimeState::Starting | RuntimeState::Initializing) {
+                observed_in_flight_state = Some(state);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let observed_in_flight_state =
+            observed_in_flight_state.expect("should observe Starting/Initializing before start_timeout elapses");
+
+        let calls_before = closure_calls.load(Ordering::SeqCst);
+        let result = run_gate(1);
+        assert!(
+            matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
+            "{observed_in_flight_state:?}: expected NotReady, got {result:?}"
+        );
+        assert_eq!(
+            closure_calls.load(Ordering::SeqCst),
+            calls_before,
+            "closure must not run while {observed_in_flight_state:?}"
+        );
+
+        let start_result = start_handle.join().unwrap();
+        assert!(
+            matches!(start_result, Err(RuntimeError::Handshake(_))),
+            "expected the withheld handshake to time out, got {start_result:?}"
+        );
+    });
+
+    // --- Failed: the start attempt above timed out. ---
+    assert_eq!(runtime.snapshot().state, RuntimeState::Failed);
+    let calls_before = closure_calls.load(Ordering::SeqCst);
+    let result = run_gate(1);
+    assert!(
+        matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
+        "Failed: expected NotReady, got {result:?}"
+    );
+    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run after a failed start");
+
+    // --- Ready for the matching generation: reconfigure onto a working config. ---
+    let (working_config, _working_dir) = fake_server_config("generation_gate_ready_after_reconfigure");
+    let ready_status = runtime
+        .reconfigure(working_config, 1)
+        .expect("reconfigure onto a working config should succeed once the handshake is not withheld");
+    assert_eq!(ready_status.state, RuntimeState::Ready);
+
+    let calls_before = closure_calls.load(Ordering::SeqCst);
+    let result = run_gate(1);
+    assert!(result.is_ok(), "Ready with the matching generation should allow the closure to run, got {result:?}");
+    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before + 1, "closure must run exactly once now");
+
+    // --- Ready but a generation mismatch: still rejected, closure still not run. ---
+    let calls_before = closure_calls.load(Ordering::SeqCst);
+    let result = run_gate(2);
+    assert!(
+        matches!(result, Err(ConnectError::GenerationMismatch { .. })),
+        "a generation mismatch while Ready should still be rejected, got {result:?}"
+    );
+    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run on a generation mismatch");
 
     let _ = runtime.stop();
 }

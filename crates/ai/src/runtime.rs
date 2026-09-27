@@ -484,16 +484,38 @@ impl AiRuntime {
     /// Returns the `settings_generation` the `RuntimeConfig` *currently
     /// applied* to this coordinator was built for — set at construction (see
     /// [`Self::spawn_with_configured_settings_generation`]) and updated only
-    /// by a completed [`Self::reconfigure`], independent of whatever a
-    /// caller separately tracks per call. `crate::connect::with_generation_checked_lock`
-    /// binds its `settings_generation` check to this value (in addition to
-    /// the persisted settings themselves) so a probe/turn is rejected before
-    /// ever reaching this runtime when the coordinator has not actually
-    /// finished applying a matching `reconfigure` yet, rather than trusting
-    /// only a caller-supplied number that happens to match persisted
-    /// settings.
+    /// by [`Self::reconfigure`], independent of whatever a caller separately
+    /// tracks per call. Updated as soon as `reconfigure` structurally swaps
+    /// `config`, *before* the restart against it is even attempted, so this
+    /// can report a generation the runtime is not actually `Ready` for yet
+    /// (or ever, if that restart goes on to fail). A generation-gated caller
+    /// must not treat this number alone as proof the runtime is actually
+    /// serving it; see [`Self::ready_configured_settings_generation`], which
+    /// `crate::connect::with_generation_checked_lock` uses instead for
+    /// exactly that reason.
     pub fn configured_settings_generation(&self) -> u64 {
         self.shared.lock().unwrap().config_generation
+    }
+
+    /// Returns `Some(settings_generation)` for the `RuntimeConfig` currently
+    /// applied to this coordinator, but only while this runtime is actually
+    /// `Ready` for it -- i.e. a spawned/reconfigured `Child` has completed the
+    /// `initialize` handshake, not merely that the coordinator has
+    /// structurally swapped `config` (which [`Self::reconfigure`] does as
+    /// soon as the old child stops, before the new one is even spawned; see
+    /// the module docs). Returns `None` for every other state
+    /// (`Stopped`/`Starting`/`Initializing`/`Stopping`/`Failed`), so a
+    /// generation-gated caller (see `with_generation_checked_lock` in
+    /// `crate::connect`) can require an actually-`Ready` runtime and a
+    /// matching generation together, under one lock acquisition, instead of
+    /// checking [`Self::configured_settings_generation`] in isolation (which
+    /// can already report a new generation the coordinator has only
+    /// structurally moved on to, while a restart against it is still in
+    /// flight or has failed) and separately racing a `snapshot()` call
+    /// against a concurrent state transition.
+    pub fn ready_configured_settings_generation(&self) -> Option<u64> {
+        let guard = self.shared.lock().unwrap();
+        (guard.status == RuntimeState::Ready).then_some(guard.config_generation)
     }
 
     /// Starts the runtime using a runtime owner lock guard the caller
