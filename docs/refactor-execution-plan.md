@@ -311,3 +311,43 @@ GPUIの`TestAppContext`を使わない純粋な`#[test]`のうち、移動した
 **親（`view.rs`）に残した責務**
 
 `EditorView`の定義・field・初期化（`EditorView::from_sessions`）、`_date_badge_refresh_task`の生成（`refresh_sidebar_date_badge_today`の呼出し元）、`impl Render for EditorView`全体、`sidebar_resizer`/`editor_scrollbar`/`sidebar_scrollbar`/`show_sidebar_scrollbar_briefly`などsidebar表示以外の入力処理・レイアウト・保存・background job・cacheは`view.rs`に残した。`lib.rs`、`actions.rs`、`input.rs`、`line.rs`、`shape.rs`は変更していない。
+
+### 9.9 RF2-A: EditorView機械的分割 第2PR — sidebar filter入力分離の旧→新対応（#301）
+
+PR [#388](https://github.com/hide212131/hane/pull/388)は、EditorViewの責務別機械的分割 [#301](https://github.com/hide212131/hane/issues/301) の第2PRとして、sidebarのfilter入力欄（テキスト編集・selection・IME組成・focus/blur）に関わる専用メソッドを `crates/ui/src/view.rs` から新設の `crates/ui/src/view/sidebar_filter.rs` へ移した。意味・処理順・条件式・状態の寿命は変更せず、公開API（`crate::view::EditorView`）と既存の呼出元記述も変更していない。9.8節の第1PRと同じ機械的分割で、9.8節が対象とした`sidebar.rs`（一覧描画・date badge）とは責務が重ならない。
+
+**旧→新シンボル対応**（旧はいずれも `crates/ui/src/view.rs`、新はいずれも `crates/ui/src/view/sidebar_filter.rs`。全メソッドは `impl EditorView` 内）
+
+| シンボル | 新配置での可視性 | 可視性が必要な理由 |
+| --- | --- | --- |
+| `sidebar_filter_is_focused` | `pub(crate)`（変更なし） | `input.rs`/`capture.rs`/`actions.rs`から直接呼ぶため |
+| `sidebar_filter_character_index_for_point` | `pub(crate)`（変更なし） | 同上（`focus_sidebar_filter`からも同一module内で呼ぶ） |
+| `sidebar_filter_has_composition` | `pub(crate)`（変更なし） | `input.rs`/`capture.rs`から直接呼ぶため |
+| `sidebar_filter_text_for_range` | `pub(crate)`（変更なし） | 同上 |
+| `sidebar_filter_selection` | `pub(crate)`（変更なし） | 同上 |
+| `sidebar_filter_marked_range` | `pub(crate)`（変更なし） | 同上 |
+| `replace_sidebar_filter_text` | `pub(crate)`（変更なし） | 同上 |
+| `replace_and_mark_sidebar_filter_text` | `pub(crate)`（変更なし） | 同上 |
+| `commit_sidebar_filter_composition` | `pub(crate)`（変更なし） | 同上 |
+| `cancel_sidebar_filter_composition` | `pub(crate)`（変更なし） | 同上 |
+| `selected_sidebar_filter_text` | `pub(crate)`（変更なし） | 同上 |
+| `move_sidebar_filter_left`/`move_sidebar_filter_right` | `pub(crate)`（変更なし） | `actions.rs`から直接呼ぶため |
+| `move_sidebar_filter_horizontal` | 非公開 | `move_sidebar_filter_left`/`right`内でのみ使用 |
+| `select_sidebar_filter_left`/`select_sidebar_filter_right` | `pub(crate)`（変更なし） | `actions.rs`から直接呼ぶため |
+| `select_sidebar_filter_to` | 非公開 | `select_sidebar_filter_left`/`right`内でのみ使用 |
+| `select_all_sidebar_filter`、`select_sidebar_filter_home`、`select_sidebar_filter_end` | `pub(crate)`（変更なし） | `actions.rs`から直接呼ぶため |
+| `move_sidebar_filter_home`、`move_sidebar_filter_end` | `pub(crate)`（変更なし） | 同上 |
+| `move_sidebar_filter_to` | 非公開 | `move_sidebar_filter_home`/`end`内でのみ使用 |
+| `backspace_sidebar_filter`、`delete_sidebar_filter` | `pub(crate)`（変更なし） | `input.rs`/`capture.rs`から直接呼ぶため |
+| `delete_sidebar_filter_with_direction` | 非公開 | `backspace_sidebar_filter`/`delete_sidebar_filter`内でのみ使用 |
+| `sidebar_filter_changed` | 非公開 | `sidebar_filter.rs`内の各文字列変更メソッドからのみ使用 |
+| `focus_sidebar_filter` | 非公開 → `pub(super)` | `view.rs`の子モジュールである`view/sidebar.rs`（`work_folder_sidebar`内の`on_mouse_down`）から`Self::focus_sidebar_filter`として呼ぶため。`pub(super)`は定義モジュール（`view::sidebar_filter`）の親である`view`とその子孫すべてに公開されるため、兄弟モジュールの`view::sidebar`からも到達できる |
+| `blur_sidebar_filter` | `pub(crate)`（変更なし） | `view.rs`本体・`view/sidebar.rs`・`input.rs`等の複数箇所から直接呼ぶため |
+
+**親（`view.rs`）に残した状態・共有処理**
+
+filter用field一式（`sidebar_filter`、`sidebar_filter_selected_range`、`sidebar_filter_selection_reversed`、`sidebar_filter_marked_range`、`sidebar_filter_composition`、`sidebar_filter_focused`、`sidebar_filter_input_bounds`）とその型`SidebarFilterComposition`、`EditorView::from_sessions`での初期化、work-folder切替時のreset処理（`sidebar_filter`等を初期状態へ戻す代入群）は`view.rs`に残した。`inline_rename_render_state`・`text_input_render_state`・`set_text_input_bounds`のようにinline renameとsidebar filterの両方を扱う共有dispatchも`view.rs`に残し、`sidebar_filter.rs`からは`self.text_input_render_state()`等をそのまま呼ぶだけにした。`byte_offset_from_utf16`/`utf16_offset_from_byte`/`byte_range_from_utf16`/`range_to_utf16`/`next_inline_rename_boundary`/`previous_inline_rename_boundary`/`select_inline_rename_to_fields`/`inline_rename_selected_range`などUTF-16・grapheme境界のヘルパーはinline renameとsidebar filterの双方が使う共有関数のため`view.rs`に残し、`sidebar_filter.rs`は`use super::*;`経由でそのまま参照する。`view.rs`には`mod sidebar_filter;`のみを追加し、`sidebar`用の`use`文と同様に個別の再exportは追加していない。呼出元（`input.rs`/`capture.rs`/`actions.rs`/`view/sidebar.rs`）の記述は、メソッドがモジュールをまたいでも`self.method(...)`/`Self::method`のまま解決するため変更していない。
+
+**テストと未実施検証**
+
+`view.rs`の既存`#[cfg(test)] mod tests`にあるsidebar filter関連のGPUIテスト（`view.sidebar_filter`・`view.sidebar_filter_composition`等のprivate fieldへ直接アクセスするテストを含む）は、`EditorView`本体とそのtest fixtureが引き続き`view.rs`にあるため、そのまま`view.rs`に残した。テスト名・assert・件数は変更・削減していない。`sidebar_filter.rs`側に新規の`#[cfg(test)] mod tests`は追加していない（移設した各メソッドは既に`view.rs`側の既存GPUIテストが経由で検証しており、純粋な単体testに切り出せる独立ロジックが無かったため）。本PRのファイル編集はコードとこの記録のみで、`cargo build`/`cargo test`/lintの実行はworkerの権限外であり未実施。current-head CIとの整合確認はCommanderの次の観測に委ねる。
