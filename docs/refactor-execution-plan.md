@@ -280,3 +280,34 @@ refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任
 このRF1-B範囲の再確認で削除可能と立証できた項目はない。RF0-01/02/03/05/06/07/08/12の各候補は削除ではなく維持・別Issue（[#301](https://github.com/hide212131/hane/issues/301)/[#303](https://github.com/hide212131/hane/issues/303)/[#304](https://github.com/hide212131/hane/issues/304)/[#306](https://github.com/hide212131/hane/issues/306)/[#307](https://github.com/hide212131/hane/issues/307)/[#312](https://github.com/hide212131/hane/issues/312)/[#313](https://github.com/hide212131/hane/issues/313)/[#314](https://github.com/hide212131/hane/issues/314)/[#368](https://github.com/hide212131/hane/issues/368)/[#378](https://github.com/hide212131/hane/issues/378)）・未判断のいずれかに分類し、未確認の範囲と所有Issueをこの節でも隠さない。
 
 検証根拠は、#23のbaseline手順と[raw結果](baseline/issue23-current-main-2026-09-27.md)、および current main `970ac79d17c1772f192bfe72abb19436d839a62c`と同一tree hashで成功したPR #384のCI run [`36322153994`](https://github.com/hide212131/hane/actions/runs/36322153994)（macOS/Windows workspace tests・clippy）である。本PR（[#386](https://github.com/hide212131/hane/pull/386)）の最終変更はdocs-onlyのため、製品GUI確認は不要とする。
+
+### 9.8 RF2-A: EditorView機械的分割 第1PR — sidebar表示分離の旧→新対応（#301）
+
+PR [#387](https://github.com/hide212131/hane/pull/387)は、EditorViewの責務別機械的分割 [#301](https://github.com/hide212131/hane/issues/301) の第1PRとして、sidebarの表示に関わる責務を `crates/ui/src/view.rs` から新設の `crates/ui/src/view/sidebar.rs` へ移した。意味・処理順・条件式・状態の寿命は変更せず、公開API（`crate::view::EditorView`）と既存の呼出元記述も変更していない。
+
+**旧→新シンボル対応**（旧はいずれも `crates/ui/src/view.rs`、新はいずれも `crates/ui/src/view/sidebar.rs`）
+
+| シンボル | 新配置での可視性 | 可視性が必要な理由 |
+| --- | --- | --- |
+| `WorkFolderRow`（構造体） | `pub(super)`、`node`フィールドのみ`pub(super)`（`depth`は非公開のまま） | `view.rs`の`mod tests`が`row.node`を直接参照するため |
+| `flatten_work_folder_tree` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `flatten_filtered_work_folder_tree` | `pub(super)` | 同上 |
+| `EditorView::active_session_has_sidebar_row` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `EditorView::refresh_sidebar_date_badge_today` | `pub(super)` | `view.rs`側`EditorView::from_sessions`内の`_date_badge_refresh_task`生成コードから呼ぶため |
+| `EditorView::apply_sidebar_date_badge_today` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `EditorView::inline_rename_label` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `EditorView::work_folder_sidebar` | `pub(super)` | `view.rs`側`impl Render for EditorView::render`から呼ぶため |
+| `work_folder_root_display_name` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `DateBadgePosition`、`badge_renders_before_remainder` | 非公開 | `sidebar.rs`内でのみ使用（単体testも`sidebar.rs`側に移設） |
+| `file_name_label` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `DATE_BADGE_TODAY_BACKGROUND`ほか色定数一式、`DATE_BADGE_FOREGROUND` | 非公開 | `sidebar.rs`内でのみ使用 |
+| `date_badge_background`、`date_badge_chip` | 非公開 | 同上 |
+| `draft_preview` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+
+`view.rs`には`mod sidebar;`と`use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};`だけを追加し、両関数の既存呼出元（テストを含む）の記述は変更していない。メソッド呼出し（`self.work_folder_sidebar(...)`等）はモジュールをまたいでも`use`不要でそのまま解決するため、呼出元の追加変更はない。`sidebar.rs`側は`use super::*;`で`view.rs`が持つ型・定数・importを再利用し、個別の`use`を追加していない。
+
+GPUIの`TestAppContext`を使わない純粋な`#[test]`のうち、移動した関数だけを検証する`date_badge_palette_has_visible_steps_and_readable_light_text`と`the_date_badge_renders_before_the_remainder_only_on_the_left`は`sidebar.rs`側の`#[cfg(test)] mod tests`へ移設した。`relative_luminance`ヘルパーは`view.rs`側の`active_file_tab_foreground_is_readable_in_both_themes`（タブ色のcontrast検証、date badgeとは無関係）とも共有していたため、削除せずに`sidebar.rs`のtest専用として複製した。`work_folder_sidebar`や`active_session_has_sidebar_row`等をGPUIの実harness越しに検証する`#[gpui::test]`群は、`EditorView`自体とそのtest fixture（`open_inline_rename_test_view`、`draft_test_root`等）が引き続き`view.rs`にあるため、`view.rs`の既存`mod tests`に残し、移動した`pub(super)`シンボルを直接呼び出す形のまま追従させた。テストは削除・削減していない。
+
+**親（`view.rs`）に残した責務**
+
+`EditorView`の定義・field・初期化（`EditorView::from_sessions`）、`_date_badge_refresh_task`の生成（`refresh_sidebar_date_badge_today`の呼出し元）、`impl Render for EditorView`全体、`sidebar_resizer`/`editor_scrollbar`/`sidebar_scrollbar`/`show_sidebar_scrollbar_briefly`などsidebar表示以外の入力処理・レイアウト・保存・background job・cacheは`view.rs`に残した。`lib.rs`、`actions.rs`、`input.rs`、`line.rs`、`shape.rs`は変更していない。
