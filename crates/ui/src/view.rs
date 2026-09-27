@@ -14413,6 +14413,15 @@ mod tests {
              background={background_bounds:?} row_height={row_height}"
         );
 
+        if resize.is_some() {
+            let line_height = view.read_with(cx, |view, _| view.line_height());
+            assert!(
+                row_height > line_height,
+                "narrow fixture must actually wrap the header row onto more than \
+                 one line: row_height={row_height} line_height={line_height}"
+            );
+        }
+
         assert!(
             background_bounds.origin.x > row_bounds.origin.x,
             "header background must not reach the row's own left margin: \
