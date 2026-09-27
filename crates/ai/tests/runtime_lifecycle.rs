@@ -745,26 +745,39 @@ fn crash_cleanup_signals_shutdown_before_waiting_out_the_full_grace_timeout() {
     // voluntarily, so cleanup sits out the entire grace period before
     // escalating to a forced kill. `close_stdout_after_initialize`
     // reproduces "reader EOF without the process actually exiting"
-    // deterministically: the fake server closes its stdout write side right
-    // after answering `initialize` (triggering the crash-detection path)
-    // but keeps blocking on its own stdin read loop, exiting only once that
-    // stdin sees EOF.
+    // deterministically: the fake server keeps its stdout open until this
+    // test writes the `FAKE_SERVER_CLOSE_STDOUT_TRIGGER_FILE` trigger file,
+    // so the close is explicitly ordered *after* `start()` has already
+    // confirmed `Ready`, instead of racing that confirmation against a close
+    // that happens immediately once `initialize` is answered. Once
+    // triggered, the fake server closes its stdout write side (deterministic
+    // on both Unix and Windows) but keeps blocking on its own stdin read
+    // loop, exiting only once that stdin sees EOF.
     let grace_timeout = Duration::from_secs(3);
     let mut config = base_config("crash_cleanup_signals_shutdown");
     config.stop_grace_timeout = grace_timeout;
     config.stop_force_timeout = Duration::from_secs(3);
+    let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
+    let close_stdout_trigger = dir.join("close_stdout.trigger");
     config.extra_env.push((
         "FAKE_SERVER_MODE".to_string(),
         "close_stdout_after_initialize".to_string(),
+    ));
+    config.extra_env.push((
+        "FAKE_SERVER_CLOSE_STDOUT_TRIGGER_FILE".to_string(),
+        close_stdout_trigger.display().to_string(),
     ));
     let (runtime, _events) = spawn_runtime(config);
 
     let status = runtime.start().expect("start should succeed");
     assert_eq!(status.state, RuntimeState::Ready);
 
-    // The crash-cleanup path runs asynchronously once the reader thread
-    // observes the closed transport; wait (bounded) for it to land on
-    // `Failed`, timing from when that wait begins.
+    // Only now, once `Ready` is already confirmed, tell the fake server to
+    // close its stdout and trigger the crash-cleanup path. The crash-cleanup
+    // path runs asynchronously once the reader thread observes the closed
+    // transport; wait (bounded) for it to land on `Failed`, timing from when
+    // that wait begins.
+    std::fs::write(&close_stdout_trigger, b"").expect("failed to write close-stdout trigger file");
     let started = std::time::Instant::now();
     let mut status = runtime.snapshot();
     while status.state != RuntimeState::Failed && started.elapsed() < Duration::from_secs(5) {

@@ -15,13 +15,18 @@
 //! - `FAKE_SERVER_MODE=crash_mid_request`: exits immediately instead of
 //!   answering a `test/echo` request, to exercise mid-request failure.
 //! - `FAKE_SERVER_MODE=close_stdout_after_initialize`: replies to
-//!   `initialize` normally, then closes its stdout (fd 1) so the client's
-//!   reader observes EOF right away, but keeps running and blocking on its
-//!   own stdin read loop instead of exiting, only doing so once stdin
-//!   itself sees EOF. This reproduces "the reader thread observed the
-//!   transport close but the child process is still alive" (e.g. a crashed
-//!   communication channel, or a server-request handler panic) independent
-//!   of the child's own process exiting on its own.
+//!   `initialize` normally, then, once
+//!   `FAKE_SERVER_CLOSE_STDOUT_TRIGGER_FILE=<path>` appears on disk, closes
+//!   its stdout (fd 1 on Unix, the stdout handle on Windows) so the client's
+//!   reader observes EOF, but keeps running and blocking on its own stdin
+//!   read loop instead of exiting, only doing so once stdin itself sees EOF.
+//!   The trigger file lets a test defer this until it has already confirmed
+//!   the client reached `Ready`, instead of racing the client's handshake
+//!   against a close that happens immediately after the reply is written.
+//!   This reproduces "the reader thread observed the transport close but the
+//!   child process is still alive" (e.g. a crashed communication channel, or
+//!   a server-request handler panic) independent of the child's own process
+//!   exiting on its own.
 //! - `FAKE_SERVER_MODE=hold_echo`: replies to `initialize` normally but never
 //!   replies to a `test/echo` request, to exercise a call that is genuinely
 //!   still pending (as opposed to one that already completed) when the
@@ -170,21 +175,21 @@ fn main() {
                         break;
                     }
                 }
-                if mode == "close_stdout_after_initialize" {
-                    #[cfg(unix)]
-                    {
-                        // SAFETY: fd 1 is this process's own stdout, a valid
-                        // open file descriptor at this point. Closing it
-                        // directly (instead of just dropping `stdout`, which
-                        // only drops this handle's buffering, not the
-                        // underlying fd) deterministically delivers EOF to
-                        // the client's reader right away, while this process
-                        // keeps running and blocking on the stdin read loop
-                        // below.
-                        unsafe {
-                            libc::close(1);
+                if mode == "close_stdout_after_initialize"
+                    && let Ok(path) = env::var("FAKE_SERVER_CLOSE_STDOUT_TRIGGER_FILE")
+                {
+                    // Deferred: only closes stdout once the trigger file
+                    // appears, so a test can wait for its own `start()` call
+                    // to actually observe `Ready` first, instead of racing
+                    // that confirmation against a close that happens right
+                    // after this reply is written.
+                    thread::spawn(move || loop {
+                        if std::path::Path::new(&path).exists() {
+                            close_stdout();
+                            break;
                         }
-                    }
+                        thread::sleep(Duration::from_millis(10));
+                    });
                 }
             }
             (Some(id), Some(method)) if method == "test/echo" => {
@@ -237,6 +242,29 @@ fn main() {
         loop {
             thread::sleep(Duration::from_secs(3600));
         }
+    }
+}
+
+/// Closes this process's own OS-level stdout (fd 1 on Unix, the stdout
+/// handle on Windows), not merely this handle's buffering, so the client's
+/// reader observes EOF right away while this process keeps running and
+/// blocking on its own stdin read loop.
+fn close_stdout() {
+    #[cfg(unix)]
+    {
+        // SAFETY: fd 1 is this process's own stdout, a valid open file
+        // descriptor at this point.
+        unsafe {
+            libc::close(1);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        // SAFETY: stdout's raw handle is valid at this point; wrapping it in
+        // an `OwnedHandle` and dropping it closes the underlying OS handle.
+        let handle = io::stdout().as_raw_handle();
+        drop(unsafe { OwnedHandle::from_raw_handle(handle) });
     }
 }
 
