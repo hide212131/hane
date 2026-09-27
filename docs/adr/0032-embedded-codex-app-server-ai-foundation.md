@@ -244,15 +244,26 @@ AiSettings
   probe-workspace/ ← 接続確認専用の空の作業領域
 ```
 
-両接続のCODEX_HOMEを分離し、同時に動くApp Server runtimeはアプリデータ領域ごとに1個とする。これを保証するため、AI設定の共有/排他ロックとは別に**runtime owner lock**を設ける。runtime owner lockは所有プロセス終了時にOSが解放できるプロセス間ロックとし、App Serverの起動・停止・再起動はそのロックを所有するHaneプロセスだけが実行する。PIDファイルだけで所有権を表さない。
+両接続のCODEX_HOMEを分離し、初期版では同じHaneアプリデータ領域に対して**AI runtimeを所有できるHaneプロセスは1つだけ**とする。複数Haneプロセス間でstdioのApp Serverを共有・転送するIPCは作らない。
 
-接続方式の切替だけでなく、Custom ProviderのBase URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する`AiSettings`が変わった場合も`settings_generation`を進める。共有ロック中は設定保存自体を拒否するため、保存成功時点では実行中ターンや接続確認は存在しない。
+これを保証するため、AI設定の共有/排他ロックとは別に**runtime owner lock**を設ける。runtime owner lockはPIDファイルの存在だけで所有権を表す方式ではなく、所有プロセス終了時にOSが自動解放できるプロセス間排他ロックとする。
 
-永続設定の保存成功と、実行中App Serverへの設定反映完了を同一視しない。ランタイムは自分が起動した`settings_generation`を保持する。新しい推論・接続確認の受付時には上記の共有設定ロックを取得し、そのロックの所有下で永続`AiSettings.settings_generation`との一致と`Ready`を再確認する。
+- App Serverの起動・停止・再起動はruntime ownerだけが行う。
+- App Serverを起動したプロセスは、そのApp Serverを停止するまでruntime owner lockを保持する。
+- Base URL、CredentialRef/API key、Provider・モデル、接続方式など`settings_generation`を進める設定変更もruntime ownerだけが実行できる。runtime未起動時に変更する場合も、保存開始前にowner lockをtry-lockし、保存と必要なruntime再生成が終わるまで保持する。
+- runtime owner lockとAI設定の排他ロックを同時に必要とする場合は、必ず**runtime owner lock → AI設定ロック**の順で取得する。逆順では取得しない。
+- owner以外のHaneプロセスはruntime-affecting設定を保存せず、App Serverも起動しない。「AIは別のHaneプロセスで使用中」として即時失敗させる。owner lock取得を無期限に待つbackground retryは行わない。
+- non-runtime設定だけの保存を将来許可する場合でも`revision`競合検出は維持する。初期実装では単純化のため、AI設定画面の保存操作全体をownerに限定してよい。
 
-世代不一致またはruntime不在を検出した場合は要求を開始せず、共有設定ロックを解放してruntime owner lockの取得を試みる。owner lockを取得したプロセスは、取得後に永続設定の`settings_generation`と現在のApp Serverの世代・`Ready`・通信経路を再確認し、未反映または利用不能である場合だけ旧App Serverを停止して新設定で起動する。すでに別プロセスが反映済みなら重複再起動しない。
+接続方式の切替だけでなく、Custom ProviderのBase URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する`AiSettings`が変わった場合も`settings_generation`を進める。共有設定ロック中は設定保存自体を拒否するため、保存成功時点では実行中ターンや接続確認は存在しない。
 
-runtime owner lockを取得できないプロセスはApp Serverを起動・停止・再起動しない。所有プロセスが設定反映を終えた後に、共有設定ロックを取り直して世代と`Ready`を再確認し、受付判定をやり直す。所有プロセスが終了した場合は、次にowner lockを取得したプロセスが永続設定世代と通信経路を再確認し、必要な起動または再接続を行う。
+永続設定の保存成功と、実行中App Serverへの設定反映完了を同一視しない。runtime ownerは自分が起動した`settings_generation`を保持する。新しい推論・接続確認の受付時には共有設定ロックを取得し、その所有下で永続`AiSettings.settings_generation`との一致と`Ready`を再確認する。
+
+runtime owner自身が世代不一致またはruntime不在を検出した場合は要求を開始せず、共有設定ロックを解放し、owner lockを保持したまま永続設定を再読込して必要なApp Server再起動を行う。再起動後に新しい世代で`Ready`になったことを確認してから受付判定をやり直す。
+
+owner以外のプロセスがAI操作を要求した場合はowner lockを非blockingでtry-lockする。取得できなければ即時に「AIは別のHaneプロセスで使用中」と返す。自動ポーリングや固定タイムアウト待ちは行わず、設定画面の再表示、接続確認、推論開始、明示的な「再試行」操作のたびに再取得を試みる。ownerプロセスが終了または明示的にAI runtimeを停止するとOSがowner lockを解放するため、次の操作を行ったプロセスがownerになり、必ず最新`AiSettings`と`settings_generation`を読み直してからApp Serverを起動する。
+
+この契約により、別プロセスからruntime ownerへの設定変更通知は不要になる。ownerが反映すべきruntime-affecting設定を、non-ownerが変更する経路自体を初期版では許可しない。
 
 API keyを子プロセス環境変数へ注入する方式では、同じプロセスのまま新しい会話を作るだけではキーを差し替えられないため、`settings_generation`変更時のruntime再生成は省略しない。
 
