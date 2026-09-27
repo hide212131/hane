@@ -683,10 +683,13 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     config.codex_home = Some(codex_home);
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
-    // Final config-compatibility validation per ADR-0032 section 10: the
-    // bundled binary must accept the generated config under
-    // `--strict-config`, not merely tolerate it silently.
-    config.args.push("--strict-config".to_string());
+    // `HANE_TEST_CODEX_APP_SERVER_BIN` names the `codex` CLI, not the
+    // standalone App Server `RuntimeConfig::new`'s default args assume: it
+    // requires the `app-server` subcommand before its own flags. Final
+    // config-compatibility validation per ADR-0032 section 10: the bundled
+    // binary must accept the generated config under `--strict-config`, not
+    // merely tolerate it silently.
+    config.args = vec!["app-server".to_string(), "--strict-config".to_string(), "--listen".to_string(), "stdio://".to_string()];
 
     let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
@@ -805,7 +808,11 @@ fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, 
     config.codex_home = Some(codex_home);
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
-    config.args.push("--strict-config".to_string());
+    // See the matching comment in
+    // `real_app_server_reaches_the_mock_responses_provider_with_the_configured_key`:
+    // `HANE_TEST_CODEX_APP_SERVER_BIN` names the `codex` CLI, which needs the
+    // `app-server` subcommand before `--strict-config`/`--listen stdio://`.
+    config.args = vec!["app-server".to_string(), "--strict-config".to_string(), "--listen".to_string(), "stdio://".to_string()];
 
     let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
