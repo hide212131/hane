@@ -14369,7 +14369,7 @@ mod tests {
         // background are guaranteed to already exist in the very first
         // committed paint this test reads, instead of depending on that
         // background job's completion timing.
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             let document = view.editor().document().clone();
             let index = BlockIndex::from_buffer(&document);
             view.block_index
@@ -14383,6 +14383,7 @@ mod tests {
                     view.active_height_disclosure(),
                 )),
             );
+            cx.notify();
         });
         cx.run_until_parked();
 
