@@ -268,6 +268,26 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<WriterCommand>) 
     })
 }
 
+/// Runs `core.mark_closed()` and `on_closed` exactly once when the reader
+/// thread's closure exits, whether that is by returning normally after EOF
+/// or by unwinding out of a panicking `handler.handle` call. Without this,
+/// a handler panic would unwind straight out of `spawn_reader`'s closure and
+/// skip the cleanup that normally runs after the read loop, leaving pending
+/// calls stuck and `on_closed` never invoked.
+struct ReaderCleanupGuard {
+    core: Arc<RpcCore>,
+    on_closed: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for ReaderCleanupGuard {
+    fn drop(&mut self) {
+        self.core.mark_closed();
+        if let Some(on_closed) = self.on_closed.take() {
+            on_closed();
+        }
+    }
+}
+
 fn spawn_reader(
     reader: Box<dyn Read + Send>,
     core: Arc<RpcCore>,
@@ -276,6 +296,10 @@ fn spawn_reader(
     on_closed: Box<dyn FnOnce() + Send>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let _cleanup = ReaderCleanupGuard {
+            core: core.clone(),
+            on_closed: Some(on_closed),
+        };
         let buffered = BufReader::new(reader);
         for line_result in buffered.lines() {
             let line = match line_result {
@@ -332,8 +356,9 @@ fn spawn_reader(
                 }
             }
         }
-        core.mark_closed();
-        on_closed();
+        // `_cleanup`'s `Drop` runs `core.mark_closed()` and `on_closed` here
+        // on the normal-exit path, and would run them the same way if this
+        // loop instead unwound out of a panicking `handler.handle` call.
     })
 }
 
@@ -962,6 +987,52 @@ mod tests {
         // test; the background watcher spawned by `join_with_deadline`
         // reclaims it once it does.
         let _ = release_tx.send(());
+    }
+
+    struct PanickingHandler;
+
+    impl ServerRequestHandler for PanickingHandler {
+        fn handle(&self, _method: &str, _params: Option<Value>) -> Result<Value, ErrorObject> {
+            panic!("handler panicked while handling a server-originated request");
+        }
+    }
+
+    #[test]
+    fn reader_thread_panic_in_handler_still_marks_closed_and_calls_on_closed() {
+        let handler = Arc::new(PanickingHandler);
+        let (transport, mut server_write, _server_read, _events, closed_rx) =
+            spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        let pending_call = {
+            let core = core.clone();
+            thread::spawn(move || core.call("slow", None, Duration::from_secs(30)))
+        };
+        thread::sleep(Duration::from_millis(50));
+
+        // A server-originated request drives the reader thread into the
+        // panicking handler.
+        writeln!(
+            server_write,
+            "{}",
+            serde_json::json!({"id": "srv-1", "method": "boom", "params": {}})
+        )
+        .unwrap();
+        server_write.flush().unwrap();
+
+        // Even though the reader thread unwinds out of `handler.handle`
+        // instead of reaching the normal end of its loop, cleanup must still
+        // run exactly once: `on_closed` fires and the pending call resolves
+        // instead of hanging until its own timeout.
+        assert_eq!(closed_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        let result = pending_call.join().unwrap();
+        assert!(matches!(result, Err(RpcError::Disconnected)));
+
+        // The core is terminal, matching the normal-EOF close path.
+        assert!(matches!(
+            core.call("after_panic", None, Duration::from_secs(5)),
+            Err(RpcError::Disconnected)
+        ));
     }
 
     #[test]
