@@ -41,7 +41,7 @@ fn base_config(name: &str) -> RuntimeConfig {
 }
 
 fn spawn_runtime(config: RuntimeConfig) -> (AiRuntime, mpsc::Receiver<RuntimeEvent>) {
-    let (events_tx, events_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     (AiRuntime::spawn(config, handler, events_tx), events_rx)
 }
@@ -176,7 +176,7 @@ fn concurrent_start_calls_spawn_exactly_one_process() {
         marker.display().to_string(),
     ));
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, _events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
 
@@ -219,7 +219,7 @@ fn concurrent_failing_start_calls_share_one_spawn_and_the_same_failure() {
         marker.display().to_string(),
     ));
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, _events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
 
@@ -271,7 +271,7 @@ fn concurrent_restart_calls_do_not_respawn_the_child_repeatedly() {
         marker.display().to_string(),
     ));
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, _events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
     runtime.start().expect("start should succeed");
@@ -367,6 +367,40 @@ fn stderr_spam_does_not_block_stdio_communication() {
         .call("test/echo", Some(serde_json::json!({"x": 1})), Duration::from_secs(5))
         .expect("echo call should succeed while stderr is being spammed");
     assert_eq!(result["x"], 1);
+
+    let _ = runtime.stop();
+}
+
+#[test]
+fn a_full_events_queue_drops_events_instead_of_blocking_the_runtime() {
+    // Regression test for making the final `RuntimeEvent` delivery channel a
+    // bounded `SyncSender`: previously it was an unbounded `Sender`, so a
+    // consumer that never drains it could grow memory without bound. With a
+    // capacity of 1 and a receiver that is never drained here, the
+    // forwarding thread must drop excess events via `try_send` instead of
+    // blocking, and the runtime must still start and serve calls normally
+    // despite the child spamming stderr diagnostics.
+    let mut config = base_config("full_events_queue");
+    config
+        .extra_env
+        .push(("FAKE_SERVER_STDERR_SPAM".to_string(), "1".to_string()));
+    let (events_tx, events_rx) = mpsc::sync_channel(1);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+
+    let status = runtime
+        .start()
+        .expect("start should succeed even though the events queue immediately fills up");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    let result = runtime
+        .call("test/echo", Some(serde_json::json!({"x": 1})), Duration::from_secs(5))
+        .expect("echo call should succeed while the events queue is full and being dropped from");
+    assert_eq!(result["x"], 1);
+
+    // The queue was actually exercised (at least one event made it through)
+    // without needing to drain every dropped one.
+    assert!(events_rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
     let _ = runtime.stop();
 }
@@ -492,7 +526,14 @@ fn late_initialize_response_from_a_timed_out_generation_does_not_clobber_a_newer
     // the coordinator already gave up on it and moved on" without depending
     // on incidental thread-scheduling timing.
     let mut config = base_config("timeout_then_late");
-    config.start_timeout = Duration::from_millis(150);
+    // This same `start_timeout` gates both the first start (which must
+    // actually elapse it, since the fake server withholds its reply until
+    // stdin closes) and the *second*, explicit start below, which must
+    // reach `Ready` well inside it. 150ms cut it too close on a loaded CI
+    // runner and made the second start flaky; a larger value keeps that
+    // margin comfortable while still keeping the first start's timeout
+    // short relative to the rest of the test.
+    config.start_timeout = Duration::from_millis(1000);
     config.stop_grace_timeout = Duration::from_secs(2);
     config.stop_force_timeout = Duration::from_secs(2);
     let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
@@ -602,7 +643,7 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
         cleanup_delay.as_millis().to_string(),
     ));
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, _events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
 

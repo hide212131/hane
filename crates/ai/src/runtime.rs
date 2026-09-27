@@ -56,7 +56,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -72,6 +72,18 @@ use crate::rpc::{RpcCore, RpcError, RpcEvent, RpcTransport, ServerRequestHandler
 /// grow this queue without bound; the reader/stderr threads use a
 /// non-blocking send so a full queue never stalls draining stdout/stderr.
 const EVENTS_BRIDGE_CAPACITY: usize = 1024;
+
+// The caller-supplied destination for `RuntimeEvent`s (`AiRuntime::spawn`'s
+// `events_tx`) is itself a bounded `SyncSender`, matching the internal
+// bridge above: the forwarding thread spawned in `do_start` relays each
+// bridged `RpcEvent` with a non-blocking `try_send` rather than a blocking
+// `send`, so a slow or absent caller-side consumer can never grow memory
+// without bound or stall the forwarding thread. The policy on the two ways
+// `try_send` can fail is explicit: a `Full` queue simply drops that one
+// event (the caller is falling behind; a dropped diagnostic/notification is
+// preferable to unbounded growth or blocking), and a `Disconnected`
+// receiver stops the forwarding thread entirely (nobody will ever read from
+// it again, so there is no point continuing to drain the bridge).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {
@@ -253,7 +265,7 @@ impl AiRuntime {
     pub fn spawn(
         config: RuntimeConfig,
         handler: Arc<dyn ServerRequestHandler>,
-        events_tx: Sender<RuntimeEvent>,
+        events_tx: SyncSender<RuntimeEvent>,
     ) -> AiRuntime {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let self_tx = cmd_tx.clone();
@@ -438,7 +450,7 @@ fn run_coordinator(
     shared: Arc<Mutex<SharedState>>,
     config: RuntimeConfig,
     handler: Arc<dyn ServerRequestHandler>,
-    events_tx: Sender<RuntimeEvent>,
+    events_tx: SyncSender<RuntimeEvent>,
 ) {
     let mut current: Option<ActiveChild> = None;
     // Child/runtime generation: bumped once per spawned `Child` (in
@@ -531,7 +543,7 @@ fn handle_lifecycle(
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     handler: &Arc<dyn ServerRequestHandler>,
-    events_tx: &Sender<RuntimeEvent>,
+    events_tx: &SyncSender<RuntimeEvent>,
     self_tx: &Sender<CoordinatorMessage>,
     shared: &Arc<Mutex<SharedState>>,
     reply: &Sender<Result<RuntimeStatus, RuntimeError>>,
@@ -584,7 +596,7 @@ fn do_start(
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     handler: &Arc<dyn ServerRequestHandler>,
-    events_tx: &Sender<RuntimeEvent>,
+    events_tx: &SyncSender<RuntimeEvent>,
     self_tx: &Sender<CoordinatorMessage>,
     shared: &Arc<Mutex<SharedState>>,
     reply: &Sender<Result<RuntimeStatus, RuntimeError>>,
@@ -654,7 +666,16 @@ fn do_start(
                 RpcEvent::Notification { method, params } => RuntimeEventKind::Notification { method, params },
                 RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
             };
-            let _ = runtime_events_tx.send(RuntimeEvent { generation: g, kind });
+            // Non-blocking: a slow caller-side consumer must never stall
+            // this forwarding thread (which would in turn back up the
+            // bounded bridge above and eventually the reader/stderr
+            // threads' own `try_send`). A full queue drops this one event;
+            // a disconnected receiver means nobody will ever read again, so
+            // stop draining the bridge instead of looping forever.
+            match runtime_events_tx.try_send(RuntimeEvent { generation: g, kind }) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+            }
         }
     });
 
@@ -769,7 +790,7 @@ fn stop_active(
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     shared: &Arc<Mutex<SharedState>>,
-    events_tx: &Sender<RuntimeEvent>,
+    events_tx: &SyncSender<RuntimeEvent>,
     in_progress_state: RuntimeState,
     state_on_success: RuntimeState,
     op_gen: u64,
@@ -820,7 +841,7 @@ fn stop_active(
         StopOutcome::RestartBlocked => {
             *current = Some(active);
             set_status(shared, RuntimeState::Failed, true, child_generation, op_gen);
-            let _ = events_tx.send(RuntimeEvent {
+            let _ = events_tx.try_send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
                     "runtime cleanup could not be confirmed; restart is blocked".to_string(),
@@ -837,7 +858,7 @@ fn reap_and_mark_failed(
     owner_guard: &mut Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     shared: &Arc<Mutex<SharedState>>,
-    events_tx: &Sender<RuntimeEvent>,
+    events_tx: &SyncSender<RuntimeEvent>,
 ) {
     let mut active = match current.take() {
         Some(a) => a,
@@ -874,7 +895,7 @@ fn reap_and_mark_failed(
             // distinct from the crashed child's own generation.
             *generation += 1;
             set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
-            let _ = events_tx.send(RuntimeEvent {
+            let _ = events_tx.try_send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic("runtime exited unexpectedly".to_string()),
             });
@@ -882,7 +903,7 @@ fn reap_and_mark_failed(
         StopOutcome::RestartBlocked => {
             *current = Some(active);
             set_status(shared, RuntimeState::Failed, true, child_generation, op_gen);
-            let _ = events_tx.send(RuntimeEvent {
+            let _ = events_tx.try_send(RuntimeEvent {
                 generation: child_generation,
                 kind: RuntimeEventKind::Diagnostic(
                     "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),

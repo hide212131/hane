@@ -19,6 +19,11 @@
 //!   or server-request replies to a bounded queue: a full queue is reported
 //!   as a diagnostic (or a backpressure error to the caller) and never stalls
 //!   the thread that is draining the child's stdout/stderr.
+//! - `RpcTransport::drop` waits for the reader/writer/stderr threads to
+//!   finish, but only up to a finite timeout per thread; a thread that is
+//!   still stuck past that point is detached (left for a background watcher
+//!   to eventually reclaim) instead of making `drop`, and therefore a
+//!   lifecycle `Shutdown`/`stop`, block indefinitely.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,6 +45,17 @@ const MAX_PENDING_REQUESTS: usize = 256;
 /// non-blocking `try_send` against this queue so a stalled peer can never
 /// block the caller indefinitely.
 const WRITER_QUEUE_CAPACITY: usize = 256;
+
+/// Maximum time `RpcTransport::drop` waits for each of the reader/writer/
+/// stderr threads to finish before giving up on it and detaching it
+/// instead. By the time a transport is dropped in `runtime`, the child's
+/// process has normally already been confirmed exited (or `request_shutdown`
+/// has already closed our write side and marked the core terminal), so these
+/// threads are expected to unwind almost immediately; this bound exists only
+/// so `Drop` itself can never hang indefinitely if one of them is ever stuck
+/// on an unexpected blocking read/write (e.g. a caller that never confirmed
+/// the child was gone, per `RuntimeError::RestartBlocked`).
+const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handles a request the server sent to us. Implementations must respond
 /// promptly (success or a definite decline); they must never silently
@@ -347,6 +363,10 @@ pub struct RpcTransport {
     reader_thread: Option<JoinHandle<()>>,
     writer_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    /// Kept so `Drop` can report a thread that did not finish within
+    /// `THREAD_JOIN_TIMEOUT`, independent of whichever generation's bridge
+    /// this transport was created with.
+    events_tx: SyncSender<RpcEvent>,
 }
 
 impl RpcTransport {
@@ -367,13 +387,14 @@ impl RpcTransport {
 
         let writer_thread = spawn_writer(writer, writer_rx);
         let reader_thread = spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
-        let stderr_thread = stderr.map(|s| spawn_stderr(s, events_tx));
+        let stderr_thread = stderr.map(|s| spawn_stderr(s, events_tx.clone()));
 
         RpcTransport {
             core,
             reader_thread: Some(reader_thread),
             writer_thread: Some(writer_thread),
             stderr_thread,
+            events_tx,
         }
     }
 
@@ -398,15 +419,40 @@ impl Drop for RpcTransport {
     fn drop(&mut self) {
         self.core.mark_closed();
         self.core.close_writer();
-        if let Some(t) = self.writer_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.reader_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.stderr_thread.take() {
-            let _ = t.join();
-        }
+        join_with_timeout(self.writer_thread.take(), "writer", &self.events_tx);
+        join_with_timeout(self.reader_thread.take(), "reader", &self.events_tx);
+        join_with_timeout(self.stderr_thread.take(), "stderr", &self.events_tx);
+    }
+}
+
+/// Waits up to `THREAD_JOIN_TIMEOUT` for `handle` to finish. See
+/// `join_with_deadline` for the detach/diagnostic behavior.
+fn join_with_timeout(handle: Option<JoinHandle<()>>, name: &str, events_tx: &SyncSender<RpcEvent>) {
+    join_with_deadline(handle, name, events_tx, THREAD_JOIN_TIMEOUT);
+}
+
+/// Waits up to `deadline` for `handle` to finish, joining it on a dedicated
+/// watcher thread rather than the current (dropping) thread. If `handle`
+/// finishes first, this returns as soon as it does. If the deadline elapses
+/// first, `handle` is deliberately left to the watcher thread (detached from
+/// the caller's perspective): the watcher keeps waiting for it in the
+/// background and reclaims it whenever it does eventually finish, while this
+/// function itself returns promptly instead of blocking forever on a thread
+/// stuck on an unexpected blocking read/write. A diagnostic is emitted
+/// through `events_tx` (best-effort, same drop-on-full/disconnected policy
+/// as every other diagnostic on this channel) so a stuck thread is visible
+/// instead of silently swallowed.
+fn join_with_deadline(handle: Option<JoinHandle<()>>, name: &str, events_tx: &SyncSender<RpcEvent>, deadline: Duration) {
+    let Some(handle) = handle else { return };
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    if done_rx.recv_timeout(deadline).is_err() {
+        let _ = events_tx.try_send(RpcEvent::Diagnostic(format!(
+            "{name} thread did not finish within {deadline:?}; detaching it instead of blocking shutdown"
+        )));
     }
 }
 
@@ -888,5 +934,46 @@ mod tests {
             Err(RpcError::Disconnected)
         ));
         assert!(matches!(core.notify("after", None), Err(RpcError::Disconnected)));
+    }
+
+    #[test]
+    fn join_with_timeout_detaches_a_thread_that_outlives_the_deadline_instead_of_blocking() {
+        let (events_tx, events_rx) = mpsc::sync_channel(4);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            // Stands in for a thread stuck on an unexpected blocking
+            // read/write past the join deadline.
+            let _ = release_rx.recv();
+        });
+
+        let started = std::time::Instant::now();
+        join_with_deadline(Some(handle), "test", &events_tx, Duration::from_millis(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "join_with_deadline must return once its deadline elapses, not block on the stuck thread"
+        );
+
+        match events_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            RpcEvent::Diagnostic(msg) => assert!(msg.contains("test thread did not finish")),
+            other => panic!("expected a diagnostic about the stuck thread, got {other:?}"),
+        }
+
+        // Release the stuck thread so it does not leak past the end of the
+        // test; the background watcher spawned by `join_with_deadline`
+        // reclaims it once it does.
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn join_with_timeout_returns_promptly_and_emits_no_diagnostic_when_the_thread_finishes_in_time() {
+        let (events_tx, events_rx) = mpsc::sync_channel(4);
+        let handle = thread::spawn(|| {});
+
+        join_with_deadline(Some(handle), "test", &events_tx, Duration::from_secs(5));
+
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no diagnostic should be emitted when the thread finishes well within the deadline"
+        );
     }
 }
