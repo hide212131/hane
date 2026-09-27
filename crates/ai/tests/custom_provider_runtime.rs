@@ -29,8 +29,8 @@ use hane_ai::{
     build_custom_provider_material, build_runtime_config_for_active_connection, call_with_generation_check,
     update_custom_credential, with_generation_checked_lock, write_codex_config, ActiveConnection, AiPaths, AiSettings,
     AiSettingsStore, AiRuntime, ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore,
-    CustomConnectionSettings, FakeCredentialStore, RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeState,
-    SaveError, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
+    CustomConnectionSettings, ExpectedCredentialState, FakeCredentialStore, RejectAllServerRequests, RuntimeConfig,
+    RuntimeError, RuntimeState, SaveError, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -244,9 +244,15 @@ fn with_owner_lock_lets_a_normal_settings_save_happen_while_this_runtime_holds_t
     let saved = runtime
         .with_owner_lock(move |owner| {
             let owner = owner.expect("the active runtime must hold the owner lock while Ready");
-            update_custom_credential(&settings_store, owner, &journal, &credential_store, 0, None, "sk-active", |new_ref| {
-                custom_settings_for(Some(new_ref.clone()))
-            })
+            update_custom_credential(
+                &settings_store,
+                owner,
+                &journal,
+                &credential_store,
+                ExpectedCredentialState { revision: 0, credential_ref: None },
+                "sk-active",
+                |new_ref| custom_settings_for(Some(new_ref.clone())),
+            )
         })
         .expect("with_owner_lock should run its closure on the coordinator thread")
         .expect("the settings save should succeed while this runtime already owns the runtime owner lock");
@@ -276,9 +282,15 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
         AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
-    let saved = update_custom_credential(&settings_store, &owner, &journal, &credential_store, 0, None, "sk-boot", |new_ref| {
-        custom_settings_for(Some(new_ref.clone()))
-    })
+    let saved = update_custom_credential(
+        &settings_store,
+        &owner,
+        &journal,
+        &credential_store,
+        ExpectedCredentialState { revision: 0, credential_ref: None },
+        "sk-boot",
+        |new_ref| custom_settings_for(Some(new_ref.clone())),
+    )
     .expect("the settings save should succeed while holding the freshly acquired owner lock");
     assert_eq!(saved.revision, 1);
 
@@ -358,9 +370,15 @@ fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner
         AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
-    update_custom_credential(&settings_store, &second, &journal, &credential_store, 0, None, "sk-new-owner", |new_ref| {
-        custom_settings_for(Some(new_ref.clone()))
-    })
+    update_custom_credential(
+        &settings_store,
+        &second,
+        &journal,
+        &credential_store,
+        ExpectedCredentialState { revision: 0, credential_ref: None },
+        "sk-new-owner",
+        |new_ref| custom_settings_for(Some(new_ref.clone())),
+    )
     .expect("the new owner should be able to save once it holds the lock");
 }
 
@@ -414,9 +432,15 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
 
     // Step 1: settings/credential save.
     let saved =
-        update_custom_credential(&settings_store, &owner, &journal, &*credential_store, 0, None, "sk-first", |new_ref| {
-            custom_settings_for(Some(new_ref.clone()))
-        })
+        update_custom_credential(
+            &settings_store,
+            &owner,
+            &journal,
+            &*credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| custom_settings_for(Some(new_ref.clone())),
+        )
         .expect("initial credential save should succeed");
 
     // Step 2: settings reload, then Custom config generation from it.
@@ -476,8 +500,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
                 owner,
                 &journal,
                 &*rotation_credential_store,
-                saved_revision,
-                Some(old_ref),
+                ExpectedCredentialState { revision: saved_revision, credential_ref: Some(old_ref) },
                 "sk-second",
                 |new_ref| custom_settings_for(Some(new_ref.clone())),
             )

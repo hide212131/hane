@@ -182,13 +182,22 @@ fn reject_if_journal_pending(journal: &CredentialJournal) -> Result<(), ConnectE
     Ok(())
 }
 
+/// The caller's expected current state of the connection's settings and
+/// credential, checked via optimistic concurrency before
+/// [`update_custom_credential`] mutates anything. `credential_ref` is the
+/// connection's previously active credential, if any (`None` for the very
+/// first key ever saved).
+pub struct ExpectedCredentialState {
+    pub revision: u64,
+    pub credential_ref: Option<CredentialRef>,
+}
+
 /// Creates or rotates the Custom Provider credential and lands the settings
 /// replace that references it, as one journal-guarded transaction (ADR-0032
 /// section 7.3 steps 1-7, `update` shape). `build_new_settings` receives the
 /// freshly generated [`CredentialRef`] and must return the complete new
 /// `AiSettings` to persist (including that ref); it never sees the secret
-/// itself. `old_credential_ref` is the connection's previously active
-/// credential, if any (`None` for the very first key ever saved).
+/// itself.
 ///
 /// `owner` proves the caller already holds the runtime owner lock (see
 /// [`AiSettingsStore::save`] for why this is required at the type level, per
@@ -199,8 +208,7 @@ pub fn update_custom_credential(
     owner: &OwnerLockGuard,
     journal: &CredentialJournal,
     credential_store: &dyn CredentialStore,
-    expected_revision: u64,
-    old_credential_ref: Option<CredentialRef>,
+    expected: ExpectedCredentialState,
     new_secret: &str,
     build_new_settings: impl FnOnce(&CredentialRef) -> AiSettings,
 ) -> Result<AiSettings, ConnectError> {
@@ -208,7 +216,7 @@ pub fn update_custom_credential(
     let guard = acquire_exclusive(settings_store)?;
     reject_if_journal_pending(journal)?;
 
-    // Compare `expected_revision` against the just-reloaded current settings
+    // Compare `expected.revision` against the just-reloaded current settings
     // *before* any journal/credential side effect. Checking this only deep
     // inside `write_while_locked` (after `journal.begin` and
     // `credential_store.set` already ran) would leave a `PendingNew` journal
@@ -217,11 +225,11 @@ pub fn update_custom_credential(
     // `recover` pass and could see it retried/completed instead of
     // discarded.
     let current = settings_store.load().map_err(ConnectError::Io)?;
-    if current.revision != expected_revision {
+    if current.revision != expected.revision {
         return Err(SaveError::RevisionConflict { current: Box::new(current) }.into());
     }
     // Compare the full `Option<CredentialRef>`, not just the `Some` case:
-    // `old_credential_ref == None` must also be rejected when current
+    // `expected.credential_ref == None` must also be rejected when current
     // settings already reference a credential (e.g. a caller mistakenly
     // treating this as the very first key ever saved for a connection that
     // already has one). Checking only `Some(old)` above let a `None` request
@@ -230,7 +238,7 @@ pub fn update_custom_credential(
     // and the actually-still-referenced credential would be orphaned instead
     // of cleaned up.
     let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
-    if current_credential_ref != old_credential_ref {
+    if current_credential_ref != expected.credential_ref {
         return Err(ConnectError::CredentialRefMismatch { current: Box::new(current) });
     }
     let settings_generation_before = current.settings_generation;
@@ -243,7 +251,7 @@ pub fn update_custom_credential(
             kind: JournalOperationKind::Update,
             state: JournalOperationState::PendingNew,
             new_credential_ref: Some(new_ref.clone()),
-            old_credential_ref: old_credential_ref.clone(),
+            old_credential_ref: expected.credential_ref.clone(),
             settings_generation_before,
         })
         .map_err(ConnectError::Io)?;
@@ -256,7 +264,7 @@ pub fn update_custom_credential(
     // Step 4: atomically replace the non-secret settings to reference the
     // new credential.
     let new_settings = build_new_settings(&new_ref);
-    let saved = match settings_store.write_while_locked(owner, &guard, expected_revision, new_settings) {
+    let saved = match settings_store.write_while_locked(owner, &guard, expected.revision, new_settings) {
         Ok(saved) => saved,
         Err(SaveError::PersistedDurabilityUnconfirmed(e)) => {
             // The settings replace's `rename` already landed — persisted
@@ -280,12 +288,12 @@ pub fn update_custom_credential(
     // only then remove the journal entry. A failed delete leaves the entry
     // for the next `recover` to retry (fail-closed, mirroring `recover`
     // itself); the already-successful settings save is still returned.
-    let delete_ok = match &old_credential_ref {
+    let delete_ok = match &expected.credential_ref {
         Some(old) => credential_store.delete(old).is_ok(),
         None => true,
     };
     if delete_ok {
-        journal.complete(Some(&new_ref), old_credential_ref.as_ref()).map_err(ConnectError::Io)?;
+        journal.complete(Some(&new_ref), expected.credential_ref.as_ref()).map_err(ConnectError::Io)?;
     }
 
     Ok(saved)
@@ -590,7 +598,14 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("full_cycle");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -604,8 +619,7 @@ mod tests {
             &owner,
             &journal,
             &credential_store,
-            saved.revision,
-            Some(first_ref.clone()),
+            ExpectedCredentialState { revision: saved.revision, credential_ref: Some(first_ref.clone()) },
             "sk-second",
             |new_ref| custom_settings(Some(new_ref.clone())),
         )
@@ -631,7 +645,14 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("set_failure");
         let credential_store = UnavailableCredentialStore;
 
-        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -645,13 +666,27 @@ mod tests {
     fn a_second_update_is_rejected_while_a_journal_entry_from_a_failed_operation_is_still_pending() {
         let (store, owner, journal, _dir) = store_and_journal("pending_blocks_next");
         let credential_store = UnavailableCredentialStore;
-        let _ = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let _ = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         });
         assert!(!journal.is_empty().unwrap());
 
         let fake_store = FakeCredentialStore::new();
-        let err = update_custom_credential(&store, &owner, &journal, &fake_store, 0, None, "sk-second", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &fake_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-second",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -663,7 +698,14 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("update_stale_revision");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -673,7 +715,14 @@ mod tests {
         // A second writer still thinks the revision is 0 (stale): its
         // rotation attempt must be rejected before any journal entry is
         // begun or any new secret is written.
-        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-stale", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-stale",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -689,7 +738,14 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("delete_stale_revision");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -732,7 +788,14 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("delete_credential_ref_mismatch");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -764,20 +827,34 @@ mod tests {
         let (store, owner, journal, _dir) = store_and_journal("update_none_mismatch");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
         let existing_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
 
-        // `expected_revision` matches, but the caller passes
-        // `old_credential_ref: None` even though current settings already
-        // reference a credential -- as if this were the very first key ever
-        // saved. This must be rejected before any journal/credential side
-        // effect instead of silently treating it as a fresh save (which
+        // `expected.revision` matches, but the caller passes
+        // `expected.credential_ref: None` even though current settings
+        // already reference a credential -- as if this were the very first
+        // key ever saved. This must be rejected before any journal/credential
+        // side effect instead of silently treating it as a fresh save (which
         // would record the wrong `old_credential_ref` in the journal and
         // orphan the still-referenced secret instead of cleaning it up).
-        let err = update_custom_credential(&store, &owner, &journal, &credential_store, saved.revision, None, "sk-second", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: saved.revision, credential_ref: None },
+            "sk-second",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -804,7 +881,14 @@ mod tests {
             crate::owner_lock::OwnerLock::new(dir.join("other-owner.lock")).try_acquire().unwrap().unwrap();
         let credential_store = FakeCredentialStore::new();
 
-        let err = update_custom_credential(&store, &other_owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &other_owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -820,7 +904,14 @@ mod tests {
         let (store, owner, journal, dir) = store_and_journal("delete_owner_mismatch");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -885,7 +976,14 @@ mod tests {
         let credential_store = FakeCredentialStore::new();
 
         crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
-        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();

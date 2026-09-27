@@ -21,6 +21,7 @@ mod settings_lock;
 pub use connect::{
     build_runtime_config_for_active_connection, call_with_generation_check, delete_custom_credential,
     recover_at_startup, update_custom_credential, with_generation_checked_lock, ConfiguredRuntime, ConnectError,
+    ExpectedCredentialState,
 };
 pub use credential_journal::{
     recover as recover_credential_journal, CredentialJournal, CredentialOperation, JournalOperationKind,
