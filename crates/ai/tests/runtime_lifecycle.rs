@@ -798,6 +798,17 @@ fn crash_cleanup_signals_shutdown_before_waiting_out_the_full_grace_timeout() {
         started.elapsed()
     );
 
+    // The trigger file's mere existence is what makes a freshly spawned
+    // fake server close its stdout right after answering `initialize` (see
+    // the fixture's own polling loop). `runtime.start()` below reuses this
+    // same `config` (and therefore the same `FAKE_SERVER_CLOSE_STDOUT_TRIGGER_FILE`
+    // path) to spawn a brand-new fake-server process for the restart, so
+    // without removing the file first, that new process would race its own
+    // handshake reply against closing its stdout and could lose, exactly
+    // like the process that just crashed. Removing it first lets the
+    // restarted process behave like a normal one.
+    std::fs::remove_file(&close_stdout_trigger).expect("failed to remove close-stdout trigger file");
+
     let restarted = runtime.start().expect("a later start should succeed once cleanup is confirmed");
     assert_eq!(restarted.state, RuntimeState::Ready);
     let _ = runtime.stop();
