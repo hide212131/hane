@@ -125,6 +125,9 @@ impl InstrumentationConfig {
 pub(crate) struct Instrumentation {
     pub(crate) metrics_output: Option<Phase0MetricsOutput>,
     pub(crate) process_started: Instant,
+    /// Actual filesystem scan completion, before draft recovery and UI polling.
+    #[cfg(feature = "instrument")]
+    pub(crate) work_folder_scan_completed_at: Option<Instant>,
     pub(crate) file_open_time: Duration,
     pub(crate) load_rss_bytes: Option<u64>,
     pub(crate) ready_reported: bool,
@@ -144,6 +147,8 @@ impl Instrumentation {
         Self {
             metrics_output,
             process_started: Instant::now(),
+            #[cfg(feature = "instrument")]
+            work_folder_scan_completed_at: None,
             file_open_time: Duration::ZERO,
             load_rss_bytes: None,
             ready_reported: false,

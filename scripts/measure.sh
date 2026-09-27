@@ -11,6 +11,10 @@ binary="$workspace_dir/target/release/hane"
 fixtures="$workspace_dir/target/fixtures"
 issue23_fixtures="$fixtures/issue23"
 helper="$script_dir/phase0_input.swift"
+# Match the app harness limits: 6,000 folder polls and 1,200 note polls at 50 ms.
+app_folder_wait_seconds=300
+app_note_wait_seconds=60
+app_edit_cycle_allowance_seconds=10
 warmup=${HANE_MEASUREMENT_WARMUP:-5}
 samples=${HANE_MEASUREMENT_SAMPLES:-30}
 memory_repeats=${HANE_MEASUREMENT_MEMORY_REPEATS:-2}
@@ -62,12 +66,23 @@ wait_ready() {
     done
 }
 
+wait_attempts_for_seconds() {
+    timeout_seconds=$1
+    grace_seconds=${2:-30}
+    printf '%s\n' "$(((timeout_seconds + grace_seconds) * 20))"
+}
+
 wait_marker() {
     log=$1
     marker=$2
-    max_attempts=${3:-1200}
+    max_attempts=${3:-$(wait_attempts_for_seconds "${HANE_MEASUREMENT_IDLE_SECONDS:-30}")}
+    error_log=${4:-}
     attempt=0
     while ! grep -q "$marker" "$log"; do
+        if [ -n "$error_log" ] && grep -q 'hane_measurement_error=' "$error_log"; then
+            cat "$error_log" >&2
+            exit 1
+        fi
         if ! kill -0 "$app_pid" 2>/dev/null; then
             cat "$log" >&2
             exit 1
@@ -136,7 +151,8 @@ startup_series() {
         fi
         if [ "$measure_folder" = true ]; then
             HANE_MEASURE_WORK_FOLDER=1 launch "$scenario" "$directory/$iteration.csv" "$directory/$iteration.log" "$fixture"
-            wait_marker "$directory/$iteration.log" hane_work_folder_ready
+            wait_marker "$directory/$iteration.log" hane_work_folder_ready \
+                "$(wait_attempts_for_seconds "$app_folder_wait_seconds")" "$directory/$iteration.log"
         else
             launch "$scenario" "$directory/$iteration.csv" "$directory/$iteration.log" "$fixture"
         fi
@@ -183,6 +199,7 @@ memory_scenario() {
     scenario=$1
     name=$2
     fixture=$3
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
     directory="$results_dir/$name"
     mkdir -p "$directory"
     rm -rf "$directory"/trial_*
@@ -190,8 +207,10 @@ memory_scenario() {
     while [ "$iteration" -le "$memory_repeats" ]; do
         trial_dir="$directory/trial_$iteration"
         mkdir -p "$trial_dir"
-        launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$fixture" "0" "" "1"
-        wait_marker "$trial_dir/metrics.csv" memory_idle_30s
+        HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
+            launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$fixture" "0" "" "1"
+        wait_marker "$trial_dir/metrics.csv" "memory_idle_${idle_seconds}s" \
+            "$(wait_attempts_for_seconds "$idle_seconds")" "$trial_dir/hane.log"
         stop_app
         iteration=$((iteration + 1))
     done
@@ -201,6 +220,7 @@ folder_memory_scenario() {
     scenario=$1
     name=$2
     folder=$3
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
     directory="$results_dir/$name"
     mkdir -p "$directory"
     rm -rf "$directory"/trial_*
@@ -208,9 +228,10 @@ folder_memory_scenario() {
     while [ "$iteration" -le "$memory_repeats" ]; do
         trial_dir="$directory/trial_$iteration"
         mkdir -p "$trial_dir"
-        HANE_MEASURE_WORK_FOLDER=1 HANE_MEASUREMENT_IDLE_SECONDS="${HANE_MEASUREMENT_IDLE_SECONDS:-30}" \
+        HANE_MEASURE_WORK_FOLDER=1 HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
             launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$folder"
-        wait_marker "$trial_dir/hane.log" memory_work_folder_idle
+        wait_marker "$trial_dir/hane.log" memory_work_folder_idle \
+            "$(wait_attempts_for_seconds "$((app_folder_wait_seconds + idle_seconds))")" "$trial_dir/hane.log"
         stop_app
         iteration=$((iteration + 1))
     done
@@ -221,19 +242,22 @@ visit_memory_scenario() {
     name=$2
     folder=$3
     counts=$4
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
     directory="$results_dir/$name"
     mkdir -p "$directory"
     rm -rf "$directory"/trial_*
     trial_dir="$directory/trial_1"
     mkdir -p "$trial_dir"
-    HANE_MEASUREMENT_VISIT_COUNTS="$counts" HANE_MEASUREMENT_IDLE_SECONDS="${HANE_MEASUREMENT_IDLE_SECONDS:-30}" \
+    HANE_MEASUREMENT_VISIT_COUNTS="$counts" HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
         launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$folder"
     last_count=$(printf '%s\n' "$counts" | tr ',' '\n' | sort -n | tail -n 1)
-    wait_attempts=1200
-    if [ "$last_count" -ge 1000 ]; then
-        wait_attempts=12000
-    fi
-    wait_marker "$trial_dir/hane.log" "label=memory_after_${last_count}_notes" "$wait_attempts"
+    milestone_count=$(printf '%s\n' "$counts" | tr ',' '\n' | sort -n -u | wc -l | tr -d ' ')
+    # Match the app-side folder (6,000 × 50 ms) and note-load (1,200 × 50 ms) waits.
+    wait_timeout_seconds=$((app_folder_wait_seconds
+        + last_count * app_note_wait_seconds
+        + milestone_count * idle_seconds))
+    wait_marker "$trial_dir/hane.log" "label=memory_after_${last_count}_notes" \
+        "$(wait_attempts_for_seconds "$wait_timeout_seconds")" "$trial_dir/hane.log"
     stop_app
 }
 
@@ -243,13 +267,31 @@ longrun_scenario() {
     folder_a=$3
     folder_b=$4
     cycles=$5
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
+    sample_every=$(((cycles + 3) / 4))
+    if [ "$sample_every" -lt 1 ]; then
+        sample_every=1
+    fi
+    sample_count=0
+    cycle=1
+    while [ "$cycle" -le "$cycles" ]; do
+        if [ "$cycle" -eq 1 ] || [ $((cycle % sample_every)) -eq 0 ] || [ "$cycle" -eq "$cycles" ]; then
+            sample_count=$((sample_count + 1))
+        fi
+        cycle=$((cycle + 1))
+    done
     directory="$results_dir/$name"
     mkdir -p "$directory"
     rm -f "$directory/metrics.csv" "$directory/hane.log"
     HANE_MEASUREMENT_CYCLE_FOLDERS="$folder_a;$folder_b" \
-        HANE_MEASUREMENT_CYCLES="$cycles" HANE_MEASUREMENT_IDLE_SECONDS="${HANE_MEASUREMENT_IDLE_SECONDS:-30}" \
+        HANE_MEASUREMENT_CYCLES="$cycles" HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
         launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$folder_a"
-    wait_marker "$directory/hane.log" hane_longrun_complete
+    # Allow time for each folder scan, two note loads, and editing; include every 1-second RSS checkpoint.
+    wait_timeout_seconds=$((cycles
+        * (app_folder_wait_seconds + 2 * app_note_wait_seconds + app_edit_cycle_allowance_seconds)
+        + idle_seconds + sample_count))
+    wait_marker "$directory/hane.log" hane_longrun_complete \
+        "$(wait_attempts_for_seconds "$wait_timeout_seconds")" "$directory/hane.log"
     stop_app
 }
 

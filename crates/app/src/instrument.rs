@@ -16,18 +16,18 @@ async fn wait_for_work_folder(
     view: &WeakEntity<EditorView>,
     cx: &mut AsyncApp,
     expected_root: Option<PathBuf>,
-) -> Option<(PathBuf, usize)> {
+) -> Option<(PathBuf, usize, f64)> {
     for _ in 0..6_000 {
         let state = view
             .update(cx, |view, _| view.measurement_work_folder_state())
             .ok()
             .flatten();
-        if let Some((root, count)) = state
+        if let Some((root, count, elapsed_ms)) = state
             && expected_root
                 .as_ref()
                 .is_none_or(|expected| expected == &root)
         {
-            return Some((root, count));
+            return Some((root, count, elapsed_ms));
         }
         cx.background_executor()
             .timer(Duration::from_millis(50))
@@ -109,7 +109,7 @@ pub(crate) fn apply(
                 .timer(Duration::from_secs(idle_seconds))
                 .await;
             let rss = hane_metrics::process_memory_bytes();
-            let _ = view.update(cx, |view, _| view.record_phase0_idle_memory(rss));
+            let _ = view.update(cx, |view, _| view.record_phase0_idle_memory(rss, idle_seconds));
         })
         .detach();
     }
@@ -160,15 +160,12 @@ pub(crate) fn apply(
         let cycles = config.measurement_cycles;
         let measure_work_folder = config.measure_work_folder;
         cx.spawn(async move |cx| {
-            let Some((initial_root, initial_count)) =
+            let Some((initial_root, initial_count, elapsed_ms)) =
                 wait_for_work_folder(&view, cx, None).await
             else {
                 eprintln!("hane_measurement_error=work_folder_scan_timeout");
                 return;
             };
-            let elapsed_ms = view
-                .update(cx, |view, _| view.measurement_elapsed_ms())
-                .unwrap_or_default();
             eprintln!(
                 "hane_work_folder_ready root={} elapsed_ms={elapsed_ms:.3} indexed_markdown_files={initial_count}",
                 initial_root.display(),

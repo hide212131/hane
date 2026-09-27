@@ -88,6 +88,10 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 const METRICS_CAPACITY: usize = 4_096;
+#[cfg(feature = "instrument")]
+type WorkFolderScanTimestamp = Instant;
+#[cfg(not(feature = "instrument"))]
+type WorkFolderScanTimestamp = ();
 /// Bound whole-block CPU work across all blocks and document switches in this
 /// view. Do not queue missed viewports: a completion wakes the current viewport.
 const MAX_JOINED_PARSE_JOBS: usize = 2;
@@ -2406,6 +2410,10 @@ impl EditorView {
 
     fn begin_work_folder_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.status = Some("Opening work folder…".to_owned());
+        #[cfg(feature = "instrument")]
+        {
+            self.instrumentation.work_folder_scan_completed_at = None;
+        }
         let draft_store = self.draft_store.clone();
         cx.spawn(async move |view, cx| {
             let scan_root = root.clone();
@@ -2413,8 +2421,12 @@ impl EditorView {
                 .background_executor()
                 .spawn(async move {
                     let work_folder = OsWorkFolderScanner.scan(&scan_root);
+                    #[cfg(feature = "instrument")]
+                    let scan_completed_at = Instant::now();
+                    #[cfg(not(feature = "instrument"))]
+                    let scan_completed_at = ();
                     let drafts = draft_store.recover(&scan_root);
-                    (work_folder, drafts)
+                    (work_folder, drafts, scan_completed_at)
                 })
                 .await;
             let _ = view.update(cx, |view, cx| view.finish_work_folder_scan(scanned, cx));
@@ -2428,15 +2440,20 @@ impl EditorView {
         scanned: (
             std::io::Result<WorkFolder>,
             std::io::Result<RecoveredDrafts>,
+            WorkFolderScanTimestamp,
         ),
         cx: &mut Context<Self>,
     ) {
-        let (work_folder, drafts) = scanned;
+        let (work_folder, drafts, _scan_completed_at) = scanned;
         match work_folder {
             Err(error) => {
                 self.status = Some(format!("Could not open work folder: {error}"));
             }
             Ok(work_folder) => {
+                #[cfg(feature = "instrument")]
+                {
+                    self.instrumentation.work_folder_scan_completed_at = Some(_scan_completed_at);
+                }
                 let first = work_folder
                     .entries()
                     .first()
@@ -6270,21 +6287,30 @@ impl EditorView {
     }
 
     #[cfg(feature = "instrument")]
-    pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>) {
+    pub fn record_phase0_idle_memory(&mut self, rss_bytes: Option<u64>, idle_seconds: u64) {
+        let label = format!("memory_idle_{idle_seconds}s");
         if let Some(output) = &mut self.instrumentation.metrics_output
-            && let Err(error) = output.memory("memory_idle_30s", rss_bytes)
+            && let Err(error) = output.memory(&label, rss_bytes)
         {
             eprintln!("could not write idle memory metrics: {error}");
         }
     }
 
-    /// Returns the scanned work-folder root and its indexed Markdown paths for
-    /// the release-only measurement harness.
+    /// Returns the scanned work-folder root, indexed Markdown count, and exact
+    /// scan-completion elapsed time for the release-only measurement harness.
     #[cfg(feature = "instrument")]
-    pub fn measurement_work_folder_state(&self) -> Option<(PathBuf, usize)> {
-        self.work_folder
-            .as_ref()
-            .map(|folder| (folder.root().to_path_buf(), folder.len()))
+    pub fn measurement_work_folder_state(&self) -> Option<(PathBuf, usize, f64)> {
+        let completed_at = self.instrumentation.work_folder_scan_completed_at?;
+        self.work_folder.as_ref().map(|folder| {
+            (
+                folder.root().to_path_buf(),
+                folder.len(),
+                completed_at
+                    .saturating_duration_since(self.instrumentation.process_started)
+                    .as_secs_f64()
+                    * 1_000.0,
+            )
+        })
     }
 
     #[cfg(feature = "instrument")]
@@ -8504,6 +8530,17 @@ mod tests {
     use hane_document::LineId;
     use hane_presentation::testing::FixedAdvanceShaper;
     use hane_session::RecoveredDraft;
+
+    fn work_folder_scan_timestamp_for_test() -> WorkFolderScanTimestamp {
+        #[cfg(feature = "instrument")]
+        {
+            Instant::now()
+        }
+        #[cfg(not(feature = "instrument"))]
+        {
+            ()
+        }
+    }
 
     fn relative_luminance(color: u32) -> f32 {
         fn linear_channel(channel: u32) -> f32 {
@@ -12509,7 +12546,10 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+            view.finish_work_folder_scan(
+                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                cx,
+            );
         });
 
         let warning = view.read_with(cx, |view, _| view.draft_recovery_warning.clone());
@@ -12553,7 +12593,10 @@ mod tests {
         };
 
         view.update(cx, |view, cx| {
-            view.finish_work_folder_scan((Ok(work_folder), Ok(partial)), cx);
+            view.finish_work_folder_scan(
+                (Ok(work_folder), Ok(partial), work_folder_scan_timestamp_for_test()),
+                cx,
+            );
         });
 
         view.read_with(cx, |view, _| {
@@ -12602,7 +12645,10 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+            view.finish_work_folder_scan(
+                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                cx,
+            );
         });
 
         // Let the background read `open_path` kicked off run to completion,
@@ -12672,7 +12718,10 @@ mod tests {
 
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-            view.finish_work_folder_scan((Ok(work_folder), Err(error)), cx);
+            view.finish_work_folder_scan(
+                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                cx,
+            );
             // A save failure arriving well after the recovery warning was
             // raised (a later autosave, a manual save, a conflict) must not
             // be swallowed by the warning that is still sitting in
@@ -12987,7 +13036,10 @@ mod tests {
             failed: 0,
         };
         view.update(cx, |view, cx| {
-            view.finish_work_folder_scan((Ok(work_folder), Ok(recovered)), cx);
+            view.finish_work_folder_scan(
+                (Ok(work_folder), Ok(recovered), work_folder_scan_timestamp_for_test()),
+                cx,
+            );
         });
         cx.run_until_parked();
         let after = view.read_with(cx, |view, _| view.file_tabs_scroll.offset().x);
