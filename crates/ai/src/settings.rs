@@ -196,6 +196,20 @@ impl AiSettingsStore {
         &self.owner_lock_path
     }
 
+    /// Non-mutating check that `owner` was acquired against this store's own
+    /// `owner_lock_path`, i.e. it actually proves ownership of *this* store's
+    /// runtime owner lock rather than some other one. Callers must run this
+    /// before acquiring the settings lock, touching a credential operation
+    /// journal, or performing any credential-store side effect, so a
+    /// mismatched guard is rejected before any of those happen rather than
+    /// only once [`Self::write_while_locked`] is reached.
+    pub fn check_owner(&self, owner: &OwnerLockGuard) -> Result<(), SaveError> {
+        if owner.path() != self.owner_lock_path {
+            return Err(SaveError::OwnerLockMismatch);
+        }
+        Ok(())
+    }
+
     /// Loads the current settings, or `AiSettings::default()` if none have
     /// ever been saved. Does not itself take the settings lock: because
     /// writes are atomic file replaces (see `crate::atomic_file`), a
@@ -234,6 +248,8 @@ impl AiSettingsStore {
         new_settings: AiSettings,
         journal_is_empty: impl FnOnce() -> io::Result<bool>,
     ) -> Result<AiSettings, SaveError> {
+        self.check_owner(owner)?;
+
         let guard = self.lock.try_acquire_exclusive().map_err(SaveError::Io)?.ok_or(SaveError::Busy)?;
 
         if !journal_is_empty().map_err(SaveError::Io)? {
@@ -458,6 +474,37 @@ mod tests {
         let err = store.save(&other_owner, 0, AiSettings::default(), always_empty_journal).unwrap_err();
         assert!(matches!(err, SaveError::OwnerLockMismatch));
         assert_eq!(store.load().unwrap(), AiSettings::default(), "a mismatched guard must never write settings");
+    }
+
+    /// Regression coverage for the root cause behind the mismatch being
+    /// detected only inside `write_while_locked`, after `save` had already
+    /// acquired the settings lock and invoked `journal_is_empty`: a mismatched
+    /// `owner` must be rejected before any of that happens.
+    #[test]
+    fn save_rejects_a_mismatched_owner_before_acquiring_the_lock_or_calling_the_journal_check() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (store, _owner) = store("owner_lock_mismatch_before_side_effects");
+        let other_dir = unique_dir("owner_lock_mismatch_before_side_effects_other");
+        let other_owner = crate::owner_lock::OwnerLock::new(other_dir.join("owner.lock"))
+            .try_acquire()
+            .unwrap()
+            .unwrap();
+
+        let journal_called = AtomicBool::new(false);
+        let err = store
+            .save(&other_owner, 0, AiSettings::default(), || {
+                journal_called.store(true, Ordering::SeqCst);
+                Ok(true)
+            })
+            .unwrap_err();
+        assert!(matches!(err, SaveError::OwnerLockMismatch));
+        assert!(!journal_called.load(Ordering::SeqCst), "the journal check must never run for a mismatched owner");
+
+        // The settings lock itself must still be free: a mismatched owner
+        // must not have taken it.
+        let shared = store.settings_lock().try_acquire_shared().unwrap();
+        assert!(shared.is_some(), "the settings lock must never be acquired for a mismatched owner");
     }
 
     #[test]

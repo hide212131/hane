@@ -204,6 +204,7 @@ pub fn update_custom_credential(
     new_secret: &str,
     build_new_settings: impl FnOnce(&CredentialRef) -> AiSettings,
 ) -> Result<AiSettings, ConnectError> {
+    settings_store.check_owner(owner)?;
     let guard = acquire_exclusive(settings_store)?;
     reject_if_journal_pending(journal)?;
 
@@ -306,6 +307,7 @@ pub fn delete_custom_credential(
     old_credential_ref: CredentialRef,
     new_settings_without_credential: AiSettings,
 ) -> Result<AiSettings, ConnectError> {
+    settings_store.check_owner(owner)?;
     let guard = acquire_exclusive(settings_store)?;
     reject_if_journal_pending(journal)?;
 
@@ -363,6 +365,7 @@ pub fn recover_at_startup(
     journal: &CredentialJournal,
     credential_store: &dyn CredentialStore,
 ) -> Result<RecoveryOutcome, ConnectError> {
+    settings_store.check_owner(owner)?;
     let guard = acquire_exclusive(settings_store)?;
     let current = settings_store.load().map_err(ConnectError::Io)?;
     let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
@@ -781,6 +784,92 @@ mod tests {
             Some("sk-first"),
             "the existing credential must not be orphaned"
         );
+    }
+
+    /// Regression coverage for the root cause behind a mismatched `owner`
+    /// being detected only deep inside `AiSettingsStore::write_while_locked`,
+    /// after `update_custom_credential` had already begun a journal entry and
+    /// written the new secret: it must be rejected before any of that happens.
+    #[test]
+    fn update_with_a_mismatched_owner_touches_neither_the_journal_nor_the_credential_store_nor_settings() {
+        let (store, _owner, journal, dir) = store_and_journal("update_owner_mismatch");
+        let other_owner =
+            crate::owner_lock::OwnerLock::new(dir.join("other-owner.lock")).try_acquire().unwrap().unwrap();
+        let credential_store = FakeCredentialStore::new();
+
+        let err = update_custom_credential(&store, &other_owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::Save(SaveError::OwnerLockMismatch)));
+
+        assert!(journal.is_empty().unwrap(), "a mismatched owner must never leave a journal entry behind");
+        assert!(credential_store.is_empty(), "a mismatched owner must never write a new secret");
+        assert_eq!(store.load().unwrap(), AiSettings::default(), "a mismatched owner must never touch persisted settings");
+    }
+
+    #[test]
+    fn delete_with_a_mismatched_owner_touches_neither_the_journal_nor_the_credential_store_nor_settings() {
+        let (store, owner, journal, dir) = store_and_journal("delete_owner_mismatch");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap();
+        let credential_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+
+        let other_owner =
+            crate::owner_lock::OwnerLock::new(dir.join("other-owner.lock")).try_acquire().unwrap().unwrap();
+        let mut without_credential = saved.clone();
+        without_credential.custom.as_mut().unwrap().credential_ref = None;
+        let err = delete_custom_credential(
+            &store,
+            &other_owner,
+            &journal,
+            &credential_store,
+            saved.revision,
+            credential_ref.clone(),
+            without_credential,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::Save(SaveError::OwnerLockMismatch)));
+
+        assert!(journal.is_empty().unwrap(), "a mismatched owner must never leave a journal entry behind");
+        assert_eq!(credential_store.len(), 1, "a mismatched owner must never delete the still-referenced credential");
+        assert_eq!(store.load().unwrap(), saved, "a mismatched owner must never touch persisted settings");
+    }
+
+    #[test]
+    fn recover_at_startup_with_a_mismatched_owner_touches_neither_the_journal_nor_the_credential_store_nor_settings() {
+        let (store, owner, journal, dir) = store_and_journal("recover_owner_mismatch");
+        let credential_store = FakeCredentialStore::new();
+        let old_ref = CredentialRef::generate();
+        credential_store.set(&old_ref, "old-secret").unwrap();
+
+        let saved = store.save(&owner, 0, custom_settings(Some(old_ref.clone())), || Ok(true)).unwrap();
+        journal
+            .begin(CredentialOperation {
+                kind: JournalOperationKind::Delete,
+                state: JournalOperationState::PendingNew,
+                new_credential_ref: None,
+                old_credential_ref: Some(old_ref.clone()),
+                settings_generation_before: saved.settings_generation,
+            })
+            .unwrap();
+
+        let other_owner =
+            crate::owner_lock::OwnerLock::new(dir.join("other-owner.lock")).try_acquire().unwrap().unwrap();
+        let err = recover_at_startup(&store, &other_owner, &journal, &credential_store).unwrap_err();
+        assert!(matches!(err, ConnectError::Save(SaveError::OwnerLockMismatch)));
+
+        assert!(!journal.is_empty().unwrap(), "a mismatched owner must never resolve the pending journal entry");
+        assert_eq!(
+            credential_store.get(&old_ref).unwrap().as_deref(),
+            Some("old-secret"),
+            "a mismatched owner must never touch the credential store"
+        );
+        assert_eq!(store.load().unwrap(), saved, "a mismatched owner must never touch persisted settings");
     }
 
     #[test]
