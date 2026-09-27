@@ -618,6 +618,71 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
     let _ = runtime.stop();
 }
 
+/// Regression coverage for the root cause behind
+/// `call_with_generation_check` previously only covering a single RPC round
+/// trip: `f` here stands in for a multi-step turn (everything from
+/// `thread/start`/`turn/start` through observing its terminal notification).
+/// While `f` is still running, a concurrent settings save must be rejected
+/// exactly like it would be mid-flight inside a single `AiRuntime::call`, not
+/// just before/after `f` runs. Per the Ready-gate contract
+/// `generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation`
+/// above enforces, the closure can only ever run once `runtime` is actually
+/// `Ready` for the matching generation, so this uses a real `fake_app_server`
+/// child brought all the way to `Ready` (unlike a never-started `AiRuntime`
+/// against a nonexistent binary path, which the gate would reject as
+/// `NotReady` before `f` ever ran).
+#[test]
+fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
+    let dir = unique_dir("generation_checked_lock_holds_whole_turn");
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let owner = hane_ai::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
+    let saved = settings_store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
+    let generation = saved.settings_generation;
+    let revision = saved.revision;
+
+    let (config, _config_dir) = fake_server_config("generation_checked_lock_holds_whole_turn");
+    let (events_tx, _events_rx) = mpsc::sync_channel(64);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn_with_configured_settings_generation(config, generation, handler, events_tx);
+    let status = runtime.start().expect("start should succeed against the fake app server");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    let (start_tx, start_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let settings_store_ref = &settings_store;
+    let runtime_ref = &runtime;
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            with_generation_checked_lock(settings_store_ref, runtime_ref, generation, move || {
+                let _ = start_tx.send(());
+                // Stands in for the time spent waiting on `turn/completed`
+                // after the initial `turn/start` round trip has already
+                // returned.
+                let _ = release_rx.recv();
+                "turn finished"
+            })
+        });
+
+        start_rx.recv_timeout(Duration::from_secs(5)).expect("f should have started");
+        let save_attempt = settings_store.save(&owner, revision, AiSettings::default(), || Ok(true));
+        assert!(
+            matches!(save_attempt, Err(SaveError::Busy)),
+            "a settings save must be rejected while `f` is still in flight, not just during its first RPC call"
+        );
+
+        let _ = release_tx.send(());
+        let result = worker.join().unwrap().unwrap();
+        assert_eq!(result, "turn finished");
+    });
+
+    // Once `f` has returned and the shared lock has been released, a save
+    // succeeds again.
+    settings_store.save(&owner, revision, AiSettings::default(), || Ok(true)).unwrap();
+
+    let _ = runtime.stop();
+}
+
 /// A single recorded HTTP request the mock Responses Provider observed.
 struct RecordedRequest {
     method: String,

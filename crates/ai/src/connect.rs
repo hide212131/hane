@@ -1010,58 +1010,13 @@ mod tests {
         let _ = runtime.shutdown();
     }
 
-    #[test]
-    fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
-        // Regression coverage for the root cause behind
-        // `call_with_generation_check` previously only covering a single RPC
-        // round trip: `f` here stands in for a multi-step turn (everything
-        // from `thread/start`/`turn/start` through observing its terminal
-        // notification). While `f` is still running, a concurrent settings
-        // save must be rejected exactly like it would be mid-flight inside a
-        // single `AiRuntime::call`, not just before/after `f` runs.
-        let (store, owner, _journal, dir) = store_and_journal("generation_checked_lock_holds_whole_turn");
-        let saved = store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
-        let generation = saved.settings_generation;
-        let revision = saved.revision;
-
-        let (events_tx, _events_rx) = std::sync::mpsc::sync_channel(8);
-        let handler = Arc::new(RejectAllServerRequests);
-        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
-        let runtime = AiRuntime::spawn_with_configured_settings_generation(config, generation, handler, events_tx);
-
-        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let store_ref = &store;
-        let runtime_ref = &runtime;
-
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(move || {
-                with_generation_checked_lock(store_ref, runtime_ref, generation, move || {
-                    let _ = start_tx.send(());
-                    // Stands in for the time spent waiting on
-                    // `turn/completed` after the initial `turn/start` round
-                    // trip has already returned.
-                    let _ = release_rx.recv();
-                    "turn finished"
-                })
-            });
-
-            start_rx.recv_timeout(Duration::from_secs(5)).expect("f should have started");
-            let save_attempt = store.save(&owner, revision, AiSettings::default(), || Ok(true));
-            assert!(
-                matches!(save_attempt, Err(SaveError::Busy)),
-                "a settings save must be rejected while `f` is still in flight, not just during its first RPC call"
-            );
-
-            let _ = release_tx.send(());
-            let result = worker.join().unwrap().unwrap();
-            assert_eq!(result, "turn finished");
-        });
-
-        // Once `f` has returned and the shared lock has been released, a
-        // save succeeds again.
-        store.save(&owner, revision, AiSettings::default(), || Ok(true)).unwrap();
-
-        let _ = runtime.shutdown();
-    }
+    // `with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call`
+    // lives in `crates/ai/tests/custom_provider_runtime.rs` instead of here:
+    // per the Ready-gate contract this module's own
+    // `call_with_generation_check_rejects_when_the_runtime_has_not_finished_applying_a_matching_reconfigure`
+    // enforces, the closure can only ever run once `runtime` is actually
+    // `Ready` for the matching generation, which requires a real
+    // `AiRuntime::start()` against a working child process -- available
+    // there via that crate's `fake_app_server` fixture, not from a
+    // never-started `AiRuntime` against a nonexistent binary path.
 }
