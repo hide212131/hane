@@ -21,8 +21,6 @@ pub const ICON_CHEVRON_RIGHT: &str = "icons/work-folder/chevron-right.svg";
 /// Expanded folder disclosure chevron.
 pub const ICON_CHEVRON_DOWN: &str = "icons/work-folder/chevron-down.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
-pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
-pub const ICON_CHECK: &str = "icons/check.svg";
 
 const FILE_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -52,14 +50,6 @@ const SETTINGS_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/settings.svg"
 ));
-const ARROW_LEFT_SVG: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/arrow-left.svg"
-));
-const CHECK_SVG: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/icons/check.svg"
-));
 
 /// Serves the work-folder sidebar icons from memory. Every other asset
 /// path falls through to `None`, the same as gpui's default no-op
@@ -78,8 +68,6 @@ impl AssetSource for WorkFolderIcons {
             ICON_CHEVRON_RIGHT => Some(Cow::Borrowed(CHEVRON_RIGHT_SVG)),
             ICON_CHEVRON_DOWN => Some(Cow::Borrowed(CHEVRON_DOWN_SVG)),
             ICON_SETTINGS => Some(Cow::Borrowed(SETTINGS_SVG)),
-            ICON_ARROW_LEFT => Some(Cow::Borrowed(ARROW_LEFT_SVG)),
-            ICON_CHECK => Some(Cow::Borrowed(CHECK_SVG)),
             _ => None,
         })
     }
@@ -128,8 +116,6 @@ mod tests {
             ICON_CHEVRON_RIGHT,
             ICON_CHEVRON_DOWN,
             ICON_SETTINGS,
-            ICON_ARROW_LEFT,
-            ICON_CHECK,
         ] {
             assert_eq!(
                 AppAssets.load(path).unwrap(),
