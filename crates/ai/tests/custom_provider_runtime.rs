@@ -368,7 +368,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
 
     // Step 1: settings/credential save.
     let saved =
-        update_custom_credential(&settings_store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        update_custom_credential(&settings_store, &owner, &journal, &*credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings_for(Some(new_ref.clone()))
         })
         .expect("initial credential save should succeed");
@@ -378,7 +378,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     assert_eq!(reloaded, saved);
     let configured = build_runtime_config_for_active_connection(
         &reloaded,
-        &credential_store,
+        &*credential_store,
         &paths,
         binary.clone(),
         owner_lock_path.clone(),
@@ -428,7 +428,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
                 &rotation_settings_store,
                 owner,
                 &journal,
-                &rotation_credential_store,
+                &*rotation_credential_store,
                 saved_revision,
                 Some(old_ref),
                 "sk-second",
@@ -454,7 +454,7 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     let reloaded_after_rotation = settings_store.load().unwrap();
     let reconfigured_runtime_config = build_runtime_config_for_active_connection(
         &reloaded_after_rotation,
-        &credential_store,
+        &*credential_store,
         &paths,
         binary,
         owner_lock_path,
