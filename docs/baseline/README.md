@@ -2,7 +2,7 @@
 
 ## Current main headline (2026-09-27)
 
-Current `main` at report preparation: `b4061b9d43cd0c14dc4894cc4e27fa9227bd8199`. The
+Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`. The
 measurements used product source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; intervening
 main changes are documentation and agent instructions only. The instrumented measurement
 build is from harness revision `5576d8e9692fb629fc242170ccaab73eb1314b5c`. Startup results use

@@ -2,7 +2,7 @@
 
 Issue: [#23](https://github.com/hide212131/hane/issues/23)
 
-Current `main` at report preparation: `b4061b9d43cd0c14dc4894cc4e27fa9227bd8199`
+Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`
 
 Measured product source: `174558e522feb7ed17e9cc7567dcd71e0499a7d6`. The intervening `main` changes are documentation and agent instructions only; product code is unchanged.
 
