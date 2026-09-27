@@ -36,6 +36,11 @@ pub struct InstrumentationConfig {
     pub autoscroll: bool,
     pub measure_idle_rss: bool,
     pub background_presentation: bool,
+    pub measure_work_folder: bool,
+    pub work_folder_visit_counts: Vec<usize>,
+    pub measurement_idle_seconds: u64,
+    pub measurement_cycle_folders: Vec<PathBuf>,
+    pub measurement_cycles: usize,
 }
 
 impl InstrumentationConfig {
@@ -52,6 +57,34 @@ impl InstrumentationConfig {
                         .parse::<usize>()
                         .unwrap_or_else(|_| panic!("{name} must be a non-negative integer"))
                 })
+        }
+        fn usize_list(name: &str) -> Vec<usize> {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|item| {
+                            item.parse::<usize>().unwrap_or_else(|_| {
+                                panic!("{name} must contain non-negative integers")
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        fn path_list(name: &str) -> Vec<PathBuf> {
+            std::env::var_os(name)
+                .map(|value| {
+                    value
+                        .to_string_lossy()
+                        .split(';')
+                        .filter(|item| !item.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default()
         }
         Self {
             metrics_csv: std::env::var_os("HANE_METRICS_CSV").map(PathBuf::from),
@@ -71,6 +104,18 @@ impl InstrumentationConfig {
             autoscroll: flag("HANE_AUTOSCROLL"),
             measure_idle_rss: flag("HANE_MEASURE_IDLE_RSS"),
             background_presentation: flag("HANE_BACKGROUND_PRESENTATION"),
+            measure_work_folder: flag("HANE_MEASURE_WORK_FOLDER"),
+            work_folder_visit_counts: usize_list("HANE_MEASUREMENT_VISIT_COUNTS"),
+            measurement_idle_seconds: std::env::var("HANE_MEASUREMENT_IDLE_SECONDS")
+                .ok()
+                .map(|value| {
+                    value.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("HANE_MEASUREMENT_IDLE_SECONDS must be a non-negative integer")
+                    })
+                })
+                .unwrap_or(30),
+            measurement_cycle_folders: path_list("HANE_MEASUREMENT_CYCLE_FOLDERS"),
+            measurement_cycles: usize_var("HANE_MEASUREMENT_CYCLES").unwrap_or_default(),
         }
     }
 }
@@ -80,6 +125,9 @@ impl InstrumentationConfig {
 pub(crate) struct Instrumentation {
     pub(crate) metrics_output: Option<Phase0MetricsOutput>,
     pub(crate) process_started: Instant,
+    /// Actual filesystem scan completion, before draft recovery and UI polling.
+    #[cfg(feature = "instrument")]
+    pub(crate) work_folder_scan_completed_at: Option<Instant>,
     pub(crate) file_open_time: Duration,
     pub(crate) load_rss_bytes: Option<u64>,
     pub(crate) ready_reported: bool,
@@ -99,6 +147,8 @@ impl Instrumentation {
         Self {
             metrics_output,
             process_started: Instant::now(),
+            #[cfg(feature = "instrument")]
+            work_folder_scan_completed_at: None,
             file_open_time: Duration::ZERO,
             load_rss_bytes: None,
             ready_reported: false,

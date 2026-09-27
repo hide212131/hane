@@ -1,31 +1,50 @@
 #!/bin/sh
 set -eu
 
+export PATH="${HOME}/.cargo/bin:${PATH}"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 workspace_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+cd "$workspace_dir"
 scenario=${1:?"usage: scripts/measure.sh <scenario> [results-dir]"}
 results_dir=${2:-"$workspace_dir/target/measure/$scenario"}
 binary="$workspace_dir/target/release/hane"
 fixtures="$workspace_dir/target/fixtures"
+issue23_fixtures="$fixtures/issue23"
 helper="$script_dir/phase0_input.swift"
+# Match the app harness limits: 6,000 folder polls and 1,200 note polls at 50 ms.
+app_folder_wait_seconds=300
+app_note_wait_seconds=60
+app_edit_cycle_allowance_seconds=10
 warmup=${HANE_MEASUREMENT_WARMUP:-5}
 samples=${HANE_MEASUREMENT_SAMPLES:-30}
+memory_repeats=${HANE_MEASUREMENT_MEMORY_REPEATS:-2}
+issue23_visit_counts=${HANE_ISSUE23_VISIT_COUNTS:-10,100,1000}
+issue23_longrun_cycles=${HANE_ISSUE23_LONGRUN_CYCLES:-20}
 measurement_feature=${HANE_MEASUREMENT_FEATURE:-instrument}
 refresh_rate=${HANE_REFRESH_RATE_HZ:-"variable (CGDisplayMode reports 0)"}
 original_input_source=$($helper current-source)
 ascii_source=${HANE_ASCII_INPUT_SOURCE:-com.apple.keylayout.ABC}
 japanese_source=${HANE_JAPANESE_INPUT_SOURCE:-com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese}
 
-mkdir -p "$results_dir"
-cargo run --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
 case "$measurement_feature" in
-    instrument|timing-probe) ;;
+    instrument) ;;
+    timing-probe)
+        if [ "$scenario" != comparison ]; then
+            echo "scenario '$scenario' requires HANE_MEASUREMENT_FEATURE=instrument; timing-probe is supported only for comparison" >&2
+            exit 2
+        fi
+        ;;
     *)
         echo "HANE_MEASUREMENT_FEATURE must be instrument or timing-probe" >&2
         exit 2
         ;;
 esac
-cargo build --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features "$measurement_feature"
+
+mkdir -p "$results_dir"
+cargo +1.98.1 run --locked --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
+python3 "$script_dir/prepare_issue23_fixtures.py" >/dev/null
+python3 "$script_dir/prepare_issue23_fixtures.py" --verify >/dev/null
+cargo +1.98.1 build --locked --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features "$measurement_feature"
 
 app_pid=""
 cleanup() {
@@ -48,6 +67,36 @@ wait_ready() {
         attempt=$((attempt + 1))
         if [ "$attempt" -ge 200 ]; then
             echo "timed out waiting for first InputCapture paint" >&2
+            exit 1
+        fi
+        sleep 0.05
+    done
+}
+
+wait_attempts_for_seconds() {
+    timeout_seconds=$1
+    grace_seconds=${2:-30}
+    printf '%s\n' "$(((timeout_seconds + grace_seconds) * 20))"
+}
+
+wait_marker() {
+    log=$1
+    marker=$2
+    max_attempts=${3:-$(wait_attempts_for_seconds "${HANE_MEASUREMENT_IDLE_SECONDS:-30}")}
+    error_log=${4:-}
+    attempt=0
+    while ! grep -q "$marker" "$log"; do
+        if [ -n "$error_log" ] && grep -q 'hane_measurement_error=' "$error_log"; then
+            cat "$error_log" >&2
+            exit 1
+        fi
+        if ! kill -0 "$app_pid" 2>/dev/null; then
+            cat "$log" >&2
+            exit 1
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "timed out waiting for $marker" >&2
             exit 1
         fi
         sleep 0.05
@@ -98,13 +147,22 @@ startup_series() {
     scenario=$1
     directory=$2
     purge_cache=$3
+    fixture=${4:-}
+    measure_folder=${5:-false}
     mkdir -p "$directory"
+    rm -f "$directory"/*.csv "$directory"/*.log
     iteration=1
     while [ "$iteration" -le "$samples" ]; do
         if [ "$purge_cache" = true ]; then
             /usr/sbin/purge >/dev/null 2>&1 || true
         fi
-        launch "$scenario" "$directory/$iteration.csv" "$directory/$iteration.log"
+        if [ "$measure_folder" = true ]; then
+            HANE_MEASURE_WORK_FOLDER=1 launch "$scenario" "$directory/$iteration.csv" "$directory/$iteration.log" "$fixture"
+            wait_marker "$directory/$iteration.log" hane_work_folder_ready \
+                "$(wait_attempts_for_seconds "$app_folder_wait_seconds")" "$directory/$iteration.log"
+        else
+            launch "$scenario" "$directory/$iteration.csv" "$directory/$iteration.log" "$fixture"
+        fi
         stop_app
         iteration=$((iteration + 1))
     done
@@ -135,10 +193,16 @@ input_scenario() {
     fi
     launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$fixture" "$offset" "$background" "" "$gate" "$input_source" "$autoscroll"
     "$helper" "$mode" "$app_pid" "$warmup"
+    # Let deferred input and paint measurements drain before opening the gate.
+    sleep 1
     : > "$gate"
     "$helper" "$mode" "$app_pid" "$samples"
     sleep 0.5
     stop_app
+    if [ "$mode" != scroll ] && ! grep -q '^"input",' "$directory/metrics.csv"; then
+        echo "no input latency records were captured for '$scenario'" >&2
+        exit 1
+    fi
     if [ "$mode" = ime ]; then
         "$helper" select-source "$ascii_source"
     fi
@@ -148,18 +212,99 @@ memory_scenario() {
     scenario=$1
     name=$2
     fixture=$3
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
     directory="$results_dir/$name"
     mkdir -p "$directory"
-    launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$fixture" "0" "" "1"
-    attempt=0
-    while ! grep -q memory_idle_30s "$directory/metrics.csv"; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -ge 70 ]; then
-            echo "timed out waiting for 30 second idle RSS" >&2
-            exit 1
-        fi
-        sleep 1
+    rm -rf "$directory"/trial_*
+    iteration=1
+    while [ "$iteration" -le "$memory_repeats" ]; do
+        trial_dir="$directory/trial_$iteration"
+        mkdir -p "$trial_dir"
+        HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
+            launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$fixture" "0" "" "1"
+        wait_marker "$trial_dir/metrics.csv" "memory_idle_${idle_seconds}s" \
+            "$(wait_attempts_for_seconds "$idle_seconds")" "$trial_dir/hane.log"
+        stop_app
+        iteration=$((iteration + 1))
     done
+}
+
+folder_memory_scenario() {
+    scenario=$1
+    name=$2
+    folder=$3
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
+    directory="$results_dir/$name"
+    mkdir -p "$directory"
+    rm -rf "$directory"/trial_*
+    iteration=1
+    while [ "$iteration" -le "$memory_repeats" ]; do
+        trial_dir="$directory/trial_$iteration"
+        mkdir -p "$trial_dir"
+        HANE_MEASURE_WORK_FOLDER=1 HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
+            launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$folder"
+        wait_marker "$trial_dir/hane.log" memory_work_folder_idle \
+            "$(wait_attempts_for_seconds "$((app_folder_wait_seconds + idle_seconds))")" "$trial_dir/hane.log"
+        stop_app
+        iteration=$((iteration + 1))
+    done
+}
+
+visit_memory_scenario() {
+    scenario=$1
+    name=$2
+    folder=$3
+    counts=$4
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
+    directory="$results_dir/$name"
+    mkdir -p "$directory"
+    rm -rf "$directory"/trial_*
+    trial_dir="$directory/trial_1"
+    mkdir -p "$trial_dir"
+    HANE_MEASUREMENT_VISIT_COUNTS="$counts" HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
+        launch "$scenario" "$trial_dir/metrics.csv" "$trial_dir/hane.log" "$folder"
+    last_count=$(printf '%s\n' "$counts" | tr ',' '\n' | sort -n | tail -n 1)
+    milestone_count=$(printf '%s\n' "$counts" | tr ',' '\n' | sort -n -u | wc -l | tr -d ' ')
+    # Match the app-side folder (6,000 × 50 ms) and note-load (1,200 × 50 ms) waits.
+    wait_timeout_seconds=$((app_folder_wait_seconds
+        + last_count * app_note_wait_seconds
+        + milestone_count * idle_seconds))
+    wait_marker "$trial_dir/hane.log" "label=memory_after_${last_count}_notes" \
+        "$(wait_attempts_for_seconds "$wait_timeout_seconds")" "$trial_dir/hane.log"
+    stop_app
+}
+
+longrun_scenario() {
+    scenario=$1
+    name=$2
+    folder_a=$3
+    folder_b=$4
+    cycles=$5
+    idle_seconds=${HANE_MEASUREMENT_IDLE_SECONDS:-30}
+    sample_every=$(((cycles + 3) / 4))
+    if [ "$sample_every" -lt 1 ]; then
+        sample_every=1
+    fi
+    sample_count=0
+    cycle=1
+    while [ "$cycle" -le "$cycles" ]; do
+        if [ "$cycle" -eq 1 ] || [ $((cycle % sample_every)) -eq 0 ] || [ "$cycle" -eq "$cycles" ]; then
+            sample_count=$((sample_count + 1))
+        fi
+        cycle=$((cycle + 1))
+    done
+    directory="$results_dir/$name"
+    mkdir -p "$directory"
+    rm -f "$directory/metrics.csv" "$directory/hane.log"
+    HANE_MEASUREMENT_CYCLE_FOLDERS="$folder_a;$folder_b" \
+        HANE_MEASUREMENT_CYCLES="$cycles" HANE_MEASUREMENT_IDLE_SECONDS="$idle_seconds" \
+        launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$folder_a"
+    # Allow time for each folder scan, two note loads, and editing; include every 1-second RSS checkpoint.
+    wait_timeout_seconds=$((cycles
+        * (app_folder_wait_seconds + 2 * app_note_wait_seconds + app_edit_cycle_allowance_seconds)
+        + idle_seconds + sample_count))
+    wait_marker "$directory/hane.log" hane_longrun_complete \
+        "$(wait_attempts_for_seconds "$wait_timeout_seconds")" "$directory/hane.log"
     stop_app
 }
 
@@ -176,12 +321,17 @@ while ! python3 -c 'import sys; stream=open(sys.argv[1],"rb"); stream.seek(int(s
 done
 
 run_startup() {
-    startup_series "empty warm startup" "$results_dir/startup_warm" false
+    startup_series "empty warm startup" "$results_dir/startup_warm" false ""
     if /usr/sbin/purge >/dev/null 2>&1; then
-        startup_series "empty cold startup" "$results_dir/startup_cold" true
+        startup_series "empty cold startup" "$results_dir/startup_cold" true ""
     else
-        startup_series "empty cold startup (OS cache not purged)" "$results_dir/startup_cold_unpurged" false
+        startup_series "empty cold startup (OS cache not purged)" "$results_dir/startup_cold_unpurged" false ""
     fi
+    startup_series "small document warm startup" "$results_dir/startup_small" false "$issue23_fixtures/small.md"
+    startup_series "100 MiB document warm startup" "$results_dir/startup_100mb" false "$fixtures/markdown_100mb.md"
+    startup_series "empty work folder warm startup" "$results_dir/startup_folder_empty" false "$issue23_fixtures/folder_empty" true
+    startup_series "1k work folder warm startup" "$results_dir/startup_folder_1k" false "$issue23_fixtures/folder_1k" true
+    startup_series "10k work folder warm startup" "$results_dir/startup_folder_10k" false "$issue23_fixtures/folder_10k" true
 }
 
 run_input() {
@@ -201,8 +351,31 @@ run_input() {
 }
 
 run_memory() {
-    memory_scenario "memory 10 MB" memory_10mb "$fixtures/markdown_10mb.md"
-    memory_scenario "memory 100 MB" memory_100mb "$fixtures/markdown_100mb.md"
+    memory_scenario "memory empty editor" memory_empty ""
+    memory_scenario "memory 1 MiB" memory_1mb "$fixtures/markdown_1mb.md"
+    memory_scenario "memory 10 MiB" memory_10mb "$fixtures/markdown_10mb.md"
+    memory_scenario "memory 100 MiB" memory_100mb "$fixtures/markdown_100mb.md"
+    folder_memory_scenario "memory empty work folder" memory_folder_empty "$issue23_fixtures/folder_empty"
+    folder_memory_scenario "memory 1k work folder" memory_folder_1k "$issue23_fixtures/folder_1k"
+    folder_memory_scenario "memory 10k work folder" memory_folder_10k "$issue23_fixtures/folder_10k"
+    visit_memory_scenario "memory after visiting notes" memory_visits_1k "$issue23_fixtures/folder_1k" "$issue23_visit_counts"
+    visit_memory_scenario "memory after large then small" memory_large_then_small "$issue23_fixtures/large_then_small" 2
+    longrun_scenario "memory long-running switches, edits, and images" memory_longrun "$issue23_fixtures/switch_a" "$issue23_fixtures/switch_b" "$issue23_longrun_cycles"
+}
+
+run_workfolder() {
+    folder_memory_scenario "memory empty work folder" memory_folder_empty "$issue23_fixtures/folder_empty"
+    folder_memory_scenario "memory 1k work folder" memory_folder_1k "$issue23_fixtures/folder_1k"
+    folder_memory_scenario "memory 10k work folder" memory_folder_10k "$issue23_fixtures/folder_10k"
+    visit_memory_scenario "memory after visiting notes" memory_visits_1k "$issue23_fixtures/folder_1k" "$issue23_visit_counts"
+    visit_memory_scenario "memory after large then small" memory_large_then_small "$issue23_fixtures/large_then_small" 2
+    longrun_scenario "memory long-running switches, edits, and images" memory_longrun "$issue23_fixtures/switch_a" "$issue23_fixtures/switch_b" "$issue23_longrun_cycles"
+}
+
+run_visits_and_longrun() {
+    visit_memory_scenario "memory after visiting notes" memory_visits_1k "$issue23_fixtures/folder_1k" "$issue23_visit_counts"
+    visit_memory_scenario "memory after large then small" memory_large_then_small "$issue23_fixtures/large_then_small" 2
+    longrun_scenario "memory long-running switches, edits, and images" memory_longrun "$issue23_fixtures/switch_a" "$issue23_fixtures/switch_b" "$issue23_longrun_cycles"
 }
 
 run_comparison() {
@@ -217,10 +390,12 @@ case "$scenario" in
     startup) run_startup ;;
     input) run_input ;;
     memory) run_memory ;;
+    workfolder) run_workfolder ;;
+    visits) run_visits_and_longrun ;;
     comparison) run_comparison ;;
     *)
         echo "unknown scenario: $scenario" >&2
-        echo "available scenarios: all, startup, input, memory, comparison" >&2
+        echo "available scenarios: all, startup, input, memory, workfolder, visits, comparison" >&2
         exit 2
         ;;
 esac
