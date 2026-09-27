@@ -54,10 +54,11 @@ fn main() {
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
 
-    if let Ok(marker_path) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE") {
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&marker_path) {
-            let _ = writeln!(file, "{}", std::process::id());
-        }
+    if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
+        .ok()
+        .and_then(|marker_path| std::fs::OpenOptions::new().create(true).append(true).open(marker_path).ok())
+    {
+        let _ = writeln!(file, "{}", std::process::id());
     }
 
     if env::var("FAKE_SERVER_STDERR_SPAM").is_ok() {

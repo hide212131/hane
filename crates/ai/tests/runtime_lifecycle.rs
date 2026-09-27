@@ -1,10 +1,11 @@
 //! Process-boundary integration tests: spawns the `fake_app_server` test
 //! fixture as a real child process (via `AiRuntime`) to exercise the
 //! initialize/initialized barrier and its request schema, finite lifecycle
-//! timeouts, generation bumps across restarts, single-flight restart
-//! coalescing, forced-kill escalation, immediate release of pending calls on
-//! stop, stderr drain under load, the runtime owner lock (including across
-//! real OS processes), and "no automatic resend after a crash".
+//! timeouts, generation bumps across restarts, single-flight start/restart
+//! coalescing (including a coalesced *failing* start wave), forced-kill
+//! escalation, immediate release of pending calls on stop, stderr drain
+//! under load, the runtime owner lock (including across real OS processes),
+//! and "no automatic resend after a crash".
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,6 +194,68 @@ fn concurrent_start_calls_spawn_exactly_one_process() {
     assert_eq!(spawn_count, 1);
 
     let _ = runtime.stop();
+}
+
+#[test]
+fn concurrent_failing_start_calls_share_one_spawn_and_the_same_failure() {
+    // `never_respond` plus a short start timeout makes the one underlying
+    // attempt reliably fail its `initialize` handshake, without depending on
+    // scheduling. Without single-flight coalescing of `Start`, the
+    // coordinator would process every queued `Start` command in turn once
+    // the leader's attempt leaves `current` empty again, spawning (and
+    // timing out) once per concurrent caller instead of once per wave.
+    let mut config = base_config("failing_single_flight");
+    config.start_timeout = Duration::from_millis(300);
+    config
+        .extra_env
+        .push(("FAKE_SERVER_MODE".to_string(), "never_respond".to_string()));
+    let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
+    let marker = dir.join("spawned.log");
+    config.extra_env.push((
+        "FAKE_SERVER_SPAWN_MARKER_FILE".to_string(),
+        marker.display().to_string(),
+    ));
+
+    let (events_tx, _events_rx) = mpsc::channel();
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = Arc::new(AiRuntime::spawn(config, handler, events_tx));
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let runtime = runtime.clone();
+        handles.push(std::thread::spawn(move || runtime.start()));
+    }
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(handle.join().unwrap());
+    }
+
+    let mut debug_reprs = Vec::new();
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome, Err(RuntimeError::Handshake(_))),
+            "expected every coalesced caller in the failing wave to see a Handshake failure, got {outcome:?}"
+        );
+        debug_reprs.push(format!("{outcome:?}"));
+    }
+    assert!(
+        debug_reprs.iter().all(|d| *d == debug_reprs[0]),
+        "every coalesced start call must observe the identical failure, got {debug_reprs:?}"
+    );
+
+    let spawned = std::fs::read_to_string(&marker).unwrap_or_default();
+    let spawn_count = spawned.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        spawn_count, 1,
+        "every concurrent start call in the same failing wave must share one spawn/initialize attempt"
+    );
+
+    // A later call is a new wave and is still free to try again.
+    let retried = runtime.start();
+    assert!(matches!(retried, Err(RuntimeError::Handshake(_))));
+    let spawned_after_retry = std::fs::read_to_string(&marker).unwrap_or_default();
+    let spawn_count_after_retry = spawned_after_retry.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(spawn_count_after_retry, 2, "a later explicit retry must still be free to spawn again");
 }
 
 #[test]

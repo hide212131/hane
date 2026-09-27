@@ -6,11 +6,14 @@
 //! completion by one dedicated coordinator thread before the next queued
 //! command is processed, so there is never more than one `Child` spawn in
 //! flight at a time. `Start` additionally short-circuits to the current
-//! status once already `Ready`, and concurrent `restart()` callers are
-//! coalesced client-side (see `AiRuntime::restart`) so that N concurrent
-//! restart requests still only stop and respawn the child once and all
-//! callers observe that same single outcome, instead of each one redoing a
-//! full stop/start cycle and repeatedly respawning the child. Regular RPC
+//! status once already `Ready`, and concurrent `start()` / `restart()`
+//! callers are each coalesced client-side (see `AiRuntime::start` and
+//! `AiRuntime::restart`) so that N concurrent calls of either kind only
+//! spawn/initialize the child once per wave and all callers observe that
+//! same single outcome — including when that one attempt fails — instead of
+//! each one redoing its own full spawn/initialize (or stop/start) cycle. A
+//! wave ends once its one attempt completes, so a later call always starts a
+//! new wave and is free to try again. Regular RPC
 //! calls (`AiRuntime::call`) do not go through that queue: they borrow a
 //! handle to the current generation's transport and run concurrently with
 //! each other, so a long-running call cannot block a `stop`/`restart`
@@ -167,12 +170,17 @@ struct SharedState {
     restart_blocked: bool,
     generation: u64,
     ready_transport: Option<Arc<RpcCore>>,
-    /// When `Some`, a `restart()` is already in flight and this holds the
+    /// When `Some`, a `start()` is already in flight and this holds the
     /// reply channels of every additional concurrent caller that attached to
-    /// it instead of enqueueing its own redundant `Restart` command. The
+    /// it instead of enqueueing its own redundant `Start` command. The
     /// leader (the caller who found this `None` and set it) fans the single
     /// outcome out to every attached waiter once the one underlying
-    /// stop+start cycle completes.
+    /// spawn/initialize attempt completes, success or failure, so a failing
+    /// attempt is never repeated within the same wave; a later `start()`
+    /// call, arriving once this has been reset to `None`, starts a new wave
+    /// and is free to try again.
+    start_inflight: Option<Vec<Sender<Result<RuntimeStatus, RuntimeError>>>>,
+    /// Same coalescing as `start_inflight`, for `restart()`.
     restart_inflight: Option<Vec<Sender<Result<RuntimeStatus, RuntimeError>>>>,
 }
 
@@ -213,6 +221,7 @@ impl AiRuntime {
             restart_blocked: false,
             generation: 0,
             ready_transport: None,
+            start_inflight: None,
             restart_inflight: None,
         }));
         let shared_for_thread = shared.clone();
@@ -234,8 +243,44 @@ impl AiRuntime {
         reply_rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?
     }
 
+    /// Starts the runtime. Concurrent `start()` callers are coalesced: only
+    /// the first ("leader") caller actually enqueues a `Start` lifecycle
+    /// command; every other caller that arrives while that one is still in
+    /// flight attaches to it and receives the exact same outcome once it
+    /// completes, instead of each one independently spawning and
+    /// initializing its own child. This holds even when the leader's attempt
+    /// fails: every attached caller observes that same failure rather than
+    /// the coordinator repeating the spawn/initialize attempt once per
+    /// queued `Start` command.
     pub fn start(&self) -> Result<RuntimeStatus, RuntimeError> {
-        self.send_lifecycle(LifecycleCommand::Start)
+        let (tx, rx) = mpsc::channel();
+        let is_leader = {
+            let mut guard = self.shared.lock().unwrap();
+            match &mut guard.start_inflight {
+                Some(waiters) => {
+                    waiters.push(tx);
+                    false
+                }
+                None => {
+                    guard.start_inflight = Some(Vec::new());
+                    true
+                }
+            }
+        };
+
+        if !is_leader {
+            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+        }
+
+        let result = self.send_lifecycle(LifecycleCommand::Start);
+        let waiters = {
+            let mut guard = self.shared.lock().unwrap();
+            guard.start_inflight.take().unwrap_or_default()
+        };
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+        result
     }
 
     pub fn stop(&self) -> Result<RuntimeStatus, RuntimeError> {

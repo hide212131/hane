@@ -413,7 +413,6 @@ impl Drop for RpcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     struct RecordingHandler {
         seen: Mutex<Vec<String>>,
@@ -729,9 +728,37 @@ mod tests {
     #[test]
     fn call_reports_backpressure_when_the_pending_request_limit_is_reached() {
         let handler = Arc::new(RejectAllServerRequests);
-        let (transport, _server_write, _server_read, _events, _closed) =
+        let (transport, _server_write, mut server_read, _events, _closed) =
             spawn_transport_over_pipes(handler);
         let core = transport.handle();
+
+        // Drain and discard everything written to the mock server side on a
+        // dedicated thread. Without this, nobody reads `server_read`, the OS
+        // pipe backing it fills up, and the writer thread stalls inside a
+        // blocking write; once that happens, further calls can fail with
+        // `Backpressure` because the outgoing write queue is full rather
+        // than because the pending-request limit was reached (the thing
+        // this test is actually about), and the stalled writer thread would
+        // otherwise never notice `request_shutdown`'s `Close` command and be
+        // left running past the end of the test.
+        let (all_registered_tx, all_registered_rx) = mpsc::channel();
+        let discard_thread = thread::spawn(move || {
+            let mut newline_count = 0usize;
+            let mut signaled = false;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match server_read.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        newline_count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+                        if !signaled && newline_count >= MAX_PENDING_REQUESTS {
+                            signaled = true;
+                            let _ = all_registered_tx.send(());
+                        }
+                    }
+                }
+            }
+        });
 
         // Fill every pending slot with calls that will never receive a
         // response, then confirm a new call fails fast instead of growing
@@ -742,29 +769,23 @@ mod tests {
             in_flight.push(thread::spawn(move || core.call("never_replied", None, Duration::from_secs(30))));
         }
 
-        // Poll instead of sleeping a fixed amount: each probe that lands
-        // before every spawned thread has registered itself simply times
-        // out quickly (and cleans up after itself), so this converges
-        // without being sensitive to how fast threads get scheduled.
-        let mut observed_backpressure = false;
-        for _ in 0..100 {
-            match core.call("one_too_many", None, Duration::from_millis(20)) {
-                Err(RpcError::Backpressure) => {
-                    observed_backpressure = true;
-                    break;
-                }
-                _ => continue,
-            }
-        }
-        assert!(
-            observed_backpressure,
-            "expected backpressure once MAX_PENDING_REQUESTS in-flight calls were pending"
-        );
+        // Wait for confirmation that all MAX_PENDING_REQUESTS requests were
+        // actually written (and therefore already registered in the pending
+        // map, since each call registers itself before its request line can
+        // reach the writer thread) instead of polling on a fixed short
+        // timeout that is sensitive to how fast threads get scheduled.
+        all_registered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("all MAX_PENDING_REQUESTS filler calls should register well within this timeout");
+
+        let result = core.call("one_too_many", None, Duration::from_secs(5));
+        assert!(matches!(result, Err(RpcError::Backpressure)));
 
         transport.request_shutdown();
         for handle in in_flight {
             let _ = handle.join();
         }
+        discard_thread.join().unwrap();
     }
 
     #[test]
