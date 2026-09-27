@@ -8,6 +8,8 @@ Measured product source: `174558e522feb7ed17e9cc7567dcd71e0499a7d6`. The interve
 
 Measurement harness revision: `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`.
 
+Supplemental input-latency harness revision: `feedda47104c1fe8cb0d454ce329dd8d043a24bd`.
+
 Capture date: 2026-09-27 (JST)
 
 This records the post-refactor baseline for the product code on current `main`. It is a measurement, not an
@@ -60,6 +62,30 @@ RSS was 101.2 MB after cycle 1, 108.3 MB after cycle 5, 108.7 MB after cycle 10,
 after cycle 15, 108.9 MB after cycle 20, and 108.1 MB after a final 30-second idle period.
 This single run stayed near 108–109 MB after the first few cycles; it does not establish
 behavior for arbitrarily long sessions.
+
+## Input latency
+
+The full startup/RSS run initially left out its `record_type=input` records. The input suite was
+therefore rerun separately on the same product source and machine, with 30 measured inputs per
+case after the five-event warm-up and a one-second drain before opening the measurement gate.
+The script now fails if an input case produces no input record; the two scroll-only cases are
+expected to have none. The 11 input-active cases produced 540 input rows, including 30 Japanese
+IME commits (240 composition and commit events total). The raw records and app logs identify this
+supplemental run with the `issue23-input-feedda4/` source prefix.
+
+| Input scenario | Input samples | Keystroke-to-model median / p95 | Keystroke-to-frame median / p95 |
+|---|---:|---:|---:|
+| Normal ASCII | 30 | 0.011 / 0.018 ms | 4.778 / 5.389 ms |
+| Japanese IME commit | 30 commits | 0.004 / 0.006 ms | 3.708 / 4.254 ms |
+| 100 MiB document, start/middle/end combined | 90 | 0.008 / 0.027 ms | 2.450 / 4.648 ms |
+| 100 MiB document while scrolling | 30 | 0.009 / 0.022 ms | 2.952 / 3.858 ms |
+| 100k paragraphs, middle | 30 | 0.003 / 0.006 ms | 33.296 / 38.075 ms |
+| 100k paragraphs while scrolling | 30 | 0.003 / 0.006 ms | 33.788 / 38.155 ms |
+| Input during background presentation update | 30 | 0.005 / 0.008 ms | 3.137 / 4.056 ms |
+
+The normal ASCII p95 is within the historical 8 ms gate. The combined 100 MiB p95/p99 are
+4.648/5.621 ms, within the historical 16/33 ms gates. The 100k-paragraph values are recorded
+separately; Issue #23 defines no absolute latency gate for that fixture.
 
 ## Budget and comparison assessment
 

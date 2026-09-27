@@ -23,6 +23,11 @@ was unavailable because macOS denied the cache-purge command; this does not esta
 ≤400 ms cold-start gate. Previous R0 figures remain historical references because OS, Rust
 and GPUI versions differ, so they are not a same-condition regression comparison.
 
+A supplemental input-latency run recorded 100 MiB input-to-frame at 2.450 ms median / 4.648 ms
+p95 / 5.621 ms p99 (90 samples), within the historical 16/33 ms p95/p99 gates. Normal ASCII
+input was 4.778 ms median / 5.389 ms p95 (30 samples). The full input set and 100k-paragraph
+cases are in the [detailed report](issue23-current-main-2026-09-27.md).
+
 See the [full conditions and procedure](issue23-current-main-2026-09-27.md),
 [per-record measurements](issue23-current-main-2026-09-27/raw/measurements.csv),
 [captured app events](issue23-current-main-2026-09-27/raw/measurement_events.log), and
