@@ -10,7 +10,7 @@ import re
 import subprocess
 import tomllib
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 LATENCY_COLUMNS = {
@@ -109,10 +109,20 @@ def main() -> None:
     scan_pattern = re.compile(
         r"hane_work_folder_ready root=(.*?) elapsed_ms=([0-9.]+) indexed_markdown_files=(\d+)"
     )
+    source_file_pattern = re.compile(r"^--- source_file: (.+) ---$")
     for path in sorted(args.input.rglob("*.log")):
         scenario_dir = path.parent.parent if path.parent.name.startswith("trial_") else path.parent
         scenario = scenario_dir.name
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if match := source_file_pattern.match(line):
+                source_path = PurePosixPath(match.group(1))
+                source_dir = (
+                    source_path.parent.parent
+                    if source_path.parent.name.startswith("trial_")
+                    else source_path.parent
+                )
+                scenario = source_dir.name
+                continue
             if match := scan_pattern.search(line):
                 work_folder_scans[scenario].append((float(match.group(2)), int(match.group(3))))
 

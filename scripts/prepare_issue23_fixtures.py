@@ -148,6 +148,11 @@ def main() -> None:
         image = folder / "image.svg"
         if not image.is_file():
             raise SystemExit(f"missing image fixture: {image}")
+        require_contents(
+            folder / "00-image.md",
+            "# Image display workload\n\n![Hane feather](image.svg)\n".encode("utf-8"),
+        )
+        require_contents(image, image_source.read_bytes())
         require_contents(folder / "01-note.md", note_bytes(1))
     print(root)
 
