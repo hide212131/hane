@@ -884,8 +884,29 @@ fn table_row_element(
                 point.height,
             )
         });
-    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
+    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 2);
     let editing = line.table_row.is_none();
+    if table.header
+        && let Some(first) = row.table_cells.first()
+        && let Some(last) = row.table_cells.last()
+    {
+        // Bounded to the grid (first column's left border through the last
+        // column's right border) so the header tint never bleeds into the
+        // row's left/right margins outside the table.
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + first.x))
+                .top(px(0.0))
+                .w(px(last.x + last.width - first.x))
+                .h(px(row.height))
+                .bg(rgb(theme.table_header_background))
+                .debug_selector({
+                    let selector = format!("table-header-background-{}", line.line_id);
+                    move || selector.clone()
+                }),
+        );
+    }
     for cell_layout in &row.table_cells {
         let Some(_cell) = table
             .cells
@@ -1060,9 +1081,6 @@ fn table_row_element(
         theme,
         zoom,
     )
-    .when(table.header, |element| {
-        element.bg(rgb(theme.table_header_background))
-    })
 }
 
 #[derive(Debug, Eq, PartialEq)]

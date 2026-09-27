@@ -14307,6 +14307,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn table_header_background_stays_inside_the_grid(cx: &mut gpui::TestAppContext) {
+        // Issue #294: the header tint used to paint the whole row's
+        // `w_full()` container, bleeding into the row's left/right margins
+        // outside the table instead of stopping at the grid's own borders.
+        let text = "| a | b |\n| --- | --- |\n| c | d |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.run_until_parked();
+
+        let row_bounds = cx.debug_bounds("row-0-0").expect("header row painted");
+        let background_bounds = cx
+            .debug_bounds("table-header-background-0")
+            .expect("header background painted");
+
+        assert!(
+            background_bounds.origin.x > row_bounds.origin.x,
+            "header background must not reach the row's own left margin: \
+             background={background_bounds:?} row={row_bounds:?}"
+        );
+        assert!(
+            background_bounds.origin.x + background_bounds.size.width
+                < row_bounds.origin.x + row_bounds.size.width,
+            "header background must not reach the row's own right margin: \
+             background={background_bounds:?} row={row_bounds:?}"
+        );
+
+        view.read_with(cx, |view, _| {
+            assert!(view.rendered_line(0).is_some_and(|line| line.table_header));
+        });
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        drop(view);
+    }
+
+    #[gpui::test]
     fn drag_selection_respects_utf8_character_boundaries_in_japanese_text_with_sidebar_open(
         cx: &mut gpui::TestAppContext,
     ) {
