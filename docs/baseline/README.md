@@ -1,4 +1,41 @@
-# Refactor baseline
+# Performance baseline
+
+## Current main headline (2026-09-27)
+
+Current `main` at report preparation: `c7a4722138f6416b06b2a65c650e24fb8ae034e8`. The
+measurements used Hane app source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; later main
+changes add documentation, agent instructions, and a standalone `hane-ai` workspace crate.
+`crates/app` does not depend on `hane-ai`, so the measured Hane app source and dependency tree
+are unchanged. The instrumented measurement
+build is from harness revision `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`. Startup results use
+30 launches per case; RSS uses two process trials per document/folder case.
+
+| Headline metric | Current measurement | Initial budget | Result |
+|---|---:|---:|---|
+| Empty warm startup | 164.3 ms median / 175.7 ms p95 (n=30) | ≤150 ms | Over |
+| Empty editor RSS, 30 s idle | 85.6–86.2 MB (81.7–82.2 MiB, n=2) | <65 MiB | Over |
+| 10 MiB document RSS, 30 s idle | 364.0–364.1 MB (347.2–347.3 MiB, n=2) | <120 MB | Over |
+| 100 MiB document RSS, 30 s idle | 1,292.1–1,548.6 MB (1,232.2–1,476.8 MiB, n=2) | <350 MB | Over |
+| 1k-note work-folder RSS, 30 s after scan | 83.9–84.3 MB (n=2; first note opened) | No absolute gate | Recorded |
+| 10k-note work-folder RSS, 30 s after scan | 61.9–88.7 MB (n=2; first note opened) | No absolute gate | Recorded |
+| RSS after visiting 100 notes | 141.9 MB (one run, 30 s idle) | No absolute gate | Recorded |
+
+The unpurged startup series measured 163.5 ms median / 170.0 ms p95 (n=30). A true cold run
+was unavailable because macOS denied the cache-purge command; this does not establish the
+≤400 ms cold-start gate. Previous R0 figures remain historical references because OS, Rust
+and GPUI versions differ, so they are not a same-condition regression comparison.
+
+A supplemental input-latency run recorded 100 MiB input-to-frame at 2.450 ms median / 4.648 ms
+p95 / 5.621 ms p99 (90 samples), within the historical 16/33 ms p95/p99 gates. Normal ASCII
+input was 4.778 ms median / 5.389 ms p95 (30 samples). The full input set and 100k-paragraph
+cases are in the [detailed report](issue23-current-main-2026-09-27.md).
+
+See the [full conditions and procedure](issue23-current-main-2026-09-27.md),
+[per-record measurements](issue23-current-main-2026-09-27/raw/measurements.csv),
+[captured app events](issue23-current-main-2026-09-27/raw/measurement_events.log), and
+[aggregated report](issue23-current-main-2026-09-27/raw/aggregated-results.md).
+
+## Historical R0 baseline
 
 R0で固定したリファクタリング前の回帰基準。製品コードの基準commitは `a811425`、
 UI採取時のHEADは `3efbaac` である。両commit間で製品コードに差分はなく、後者には

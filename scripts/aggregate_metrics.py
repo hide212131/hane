@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 import csv
 import platform
+import re
 import subprocess
 import tomllib
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 LATENCY_COLUMNS = {
@@ -97,12 +98,33 @@ def main() -> None:
                         samples[(scenario, "ime_commit_to_model")].append(float(row["keystroke_to_model_ms"]))
                     if row["keystroke_to_frame_ms"]:
                         samples[(scenario, "ime_commit_to_frame")].append(float(row["keystroke_to_frame_ms"]))
-                if row["record_type"] in {"memory_load", "memory_idle_30s"} and row["rss_bytes"]:
+                if row["record_type"].startswith("memory_") and row["rss_bytes"]:
                     samples[(scenario, row["record_type"])].append(float(row["rss_bytes"]))
                 if scenario.startswith("memory ") and row["record_type"] == "ready" and row["rss_bytes"]:
                     samples[(scenario, "memory_visible_layout")].append(float(row["rss_bytes"]))
                 if scenario.startswith("empty ") and row["record_type"] == "ready" and row["rss_bytes"]:
                     samples[(scenario, "memory_ready")].append(float(row["rss_bytes"]))
+
+    work_folder_scans: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    scan_pattern = re.compile(
+        r"hane_work_folder_ready root=(.*?) elapsed_ms=([0-9.]+) indexed_markdown_files=(\d+)"
+    )
+    source_file_pattern = re.compile(r"^--- source_file: (.+) ---$")
+    for path in sorted(args.input.rglob("*.log")):
+        scenario_dir = path.parent.parent if path.parent.name.startswith("trial_") else path.parent
+        scenario = scenario_dir.name
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if match := source_file_pattern.match(line):
+                source_path = PurePosixPath(match.group(1))
+                source_dir = (
+                    source_path.parent.parent
+                    if source_path.parent.name.startswith("trial_")
+                    else source_path.parent
+                )
+                scenario = source_dir.name
+                continue
+            if match := scan_pattern.search(line):
+                work_folder_scans[scenario].append((float(match.group(2)), int(match.group(3))))
 
     lines = [
         f"# {args.label} measurement results",
@@ -120,7 +142,8 @@ def main() -> None:
         "| Scenario / metric | Samples | Median | p95 | p99 | Max | Unit |",
         "|---|---:|---:|---:|---:|---:|---|",
     ]
-    metric_order = list(LATENCY_COLUMNS) + list(COUNT_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame", "memory_load", "memory_ready", "memory_visible_layout", "memory_idle_30s"]
+    metric_order = list(LATENCY_COLUMNS) + list(COUNT_COLUMNS) + ["ime_commit_to_model", "ime_commit_to_frame"]
+    metric_order.extend(sorted({metric for _, metric in samples if metric.startswith("memory_")}))
     for scenario in sorted({scenario for scenario, _ in samples}):
         for metric in metric_order:
             values = samples.get((scenario, metric), [])
@@ -133,6 +156,25 @@ def main() -> None:
             label = metric
             lines.append(
                 f"| {scenario} — {label} | {count} | {median:.3f} | {p95:.3f} | {p99:.3f} | {maximum:.3f} | {unit} |"
+            )
+
+    if work_folder_scans:
+        lines.extend(
+            [
+                "",
+                "## Work folder scan completion",
+                "",
+                "| Scenario | Indexed Markdown files | Samples | Median | p95 | Max | Unit |",
+                "|---|---:|---:|---:|---:|---:|---|",
+            ]
+        )
+        for scenario, values in sorted(work_folder_scans.items()):
+            times = sorted(value[0] for value in values)
+            counts = sorted(value[1] for value in values)
+            sample_count, median, p95, _, maximum = distribution(times)
+            file_count = percentile([float(value) for value in counts], 0.50)
+            lines.append(
+                f"| {scenario} | {file_count:.0f} | {sample_count} | {median:.3f} | {p95:.3f} | {maximum:.3f} | ms |"
             )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
