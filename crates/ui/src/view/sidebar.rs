@@ -576,6 +576,25 @@ impl EditorView {
                 .children(scrollbar),
         )
     }
+
+    pub(super) fn active_session_has_sidebar_row(&self) -> bool {
+        self.work_folder_drafts
+            .contains_key(&self.sessions.active_id())
+            || self.active_session().path().is_some_and(|path| {
+                self.work_folder.as_ref().is_some_and(|folder| {
+                    let mut rows = Vec::new();
+                    flatten_work_folder_tree(
+                        folder.children(),
+                        1,
+                        &self.expanded_folders,
+                        &mut rows,
+                    );
+                    rows.iter().any(|row| {
+                        matches!(&row.node, WorkFolderNode::File(entry) if entry.path() == path)
+                    })
+                })
+            })
+    }
 }
 
 /// The sidebar label for the work folder root: its own directory name, or
