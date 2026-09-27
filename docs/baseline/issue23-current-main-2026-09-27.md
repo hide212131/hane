@@ -2,9 +2,13 @@
 
 Issue: [#23](https://github.com/hide212131/hane/issues/23)
 
-Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`
+Current `main` at report preparation: `c7a4722138f6416b06b2a65c650e24fb8ae034e8`
 
-Measured product source: `174558e522feb7ed17e9cc7567dcd71e0499a7d6`. The intervening `main` changes are documentation and agent instructions only; product code is unchanged.
+Measured Hane app source: `174558e522feb7ed17e9cc7567dcd71e0499a7d6`. Later `main` changes add
+documentation, agent instructions, and a standalone `hane-ai` workspace crate plus its lockfile
+entry. `crates/app` does not depend on `hane-ai`; the Hane app source and dependency tree used by
+these measurements are unchanged. The measurements cover the Hane app binary, not the standalone
+AI runtime crate.
 
 Measurement harness revision: `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`.
 

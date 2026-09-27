@@ -2,9 +2,11 @@
 
 ## Current main headline (2026-09-27)
 
-Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`. The
-measurements used product source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; intervening
-main changes are documentation and agent instructions only. The instrumented measurement
+Current `main` at report preparation: `c7a4722138f6416b06b2a65c650e24fb8ae034e8`. The
+measurements used Hane app source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; later main
+changes add documentation, agent instructions, and a standalone `hane-ai` workspace crate.
+`crates/app` does not depend on `hane-ai`, so the measured Hane app source and dependency tree
+are unchanged. The instrumented measurement
 build is from harness revision `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`. Startup results use
 30 launches per case; RSS uses two process trials per document/folder case.
 
