@@ -14,14 +14,19 @@
 //! [`AiSettingsStore::save`] (which would try to acquire the same
 //! process-exclusive OS lock a second time and fail).
 //!
-//! [`call_with_generation_check`] implements section 7.3's shared-lock
+//! [`with_generation_checked_lock`] implements section 7.3's shared-lock
 //! contract for an inference turn or connectivity probe: it acquires the AI
 //! settings lock in **shared** mode, confirms the persisted
 //! `settings_generation` still matches the generation the caller's
-//! connection was configured for, and holds that shared lock until the call
-//! itself has completed, failed or been rejected — never released early and
-//! never waited on by a concurrent settings save (which uses a non-blocking
+//! connection was configured for, and holds that shared lock until the
+//! caller-supplied `f` itself has completed, failed or been rejected — for
+//! `f`'s entire duration, not just a single RPC round trip, so a multi-step
+//! turn (`thread/start`/`turn/start` through observing its `turn/completed`
+//! notification) stays covered end to end. Never released early and never
+//! waited on by a concurrent settings save (which uses a non-blocking
 //! exclusive try-lock and is rejected immediately instead).
+//! [`call_with_generation_check`] is the single-RPC-call convenience wrapper
+//! for a fixed connectivity probe.
 
 use std::io;
 use std::path::PathBuf;
@@ -32,9 +37,11 @@ use serde_json::Value;
 use crate::credential_journal::{
     recover, CredentialJournal, CredentialOperation, JournalOperationKind, JournalOperationState, RecoveryOutcome,
 };
+use crate::owner_lock::OwnerLockGuard;
 use crate::paths::AiPaths;
 use crate::provider::{
     build_custom_provider_material, write_codex_config, CustomProviderConfigError, ShellEnvironmentPolicyFormat,
+    WriteCodexConfigError,
 };
 use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeError};
 use crate::secrets::{CredentialRef, CredentialStore, CredentialStoreError};
@@ -76,6 +83,12 @@ pub enum ConnectError {
     /// depend on, so this is rejected before any journal/credential side
     /// effect instead of trusting the caller-supplied ref.
     CredentialRefMismatch { current: AiSettings },
+    /// `write_codex_config`'s atomic replace's `rename` already landed --
+    /// `config.toml` may already reference the new Base URL/model/env key --
+    /// but its parent directory's own crash-durability fsync could not be
+    /// confirmed. Distinct from [`Self::Io`] so a caller never mistakes this
+    /// for "nothing was written".
+    ConfigDurabilityUnconfirmed(io::Error),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -103,6 +116,11 @@ impl std::fmt::Display for ConnectError {
                 f,
                 "the credential being deleted no longer matches the current Custom Provider connection; reload before retrying"
             ),
+            ConnectError::ConfigDurabilityUnconfirmed(e) => write!(
+                f,
+                "Custom Provider config replace may have already taken effect, but its crash-durability \
+                 could not be confirmed: {e}"
+            ),
         }
     }
 }
@@ -124,6 +142,17 @@ impl From<CredentialStoreError> for ConnectError {
 impl From<CustomProviderConfigError> for ConnectError {
     fn from(e: CustomProviderConfigError) -> Self {
         ConnectError::Provider(e)
+    }
+}
+
+impl From<WriteCodexConfigError> for ConnectError {
+    fn from(e: WriteCodexConfigError) -> Self {
+        match e {
+            WriteCodexConfigError::Io(io_err) => ConnectError::Io(io_err),
+            WriteCodexConfigError::PersistedDurabilityUnconfirmed(io_err) => {
+                ConnectError::ConfigDurabilityUnconfirmed(io_err)
+            }
+        }
     }
 }
 
@@ -149,8 +178,14 @@ fn reject_if_journal_pending(journal: &CredentialJournal) -> Result<(), ConnectE
 /// `AiSettings` to persist (including that ref); it never sees the secret
 /// itself. `old_credential_ref` is the connection's previously active
 /// credential, if any (`None` for the very first key ever saved).
+///
+/// `owner` proves the caller already holds the runtime owner lock (see
+/// [`AiSettingsStore::save`] for why this is required at the type level, per
+/// ADR-0032 section 8's fixed "runtime owner lock → AI settings lock"
+/// acquisition order).
 pub fn update_custom_credential(
     settings_store: &AiSettingsStore,
+    owner: &OwnerLockGuard,
     journal: &CredentialJournal,
     credential_store: &dyn CredentialStore,
     expected_revision: u64,
@@ -173,11 +208,18 @@ pub fn update_custom_credential(
     if current.revision != expected_revision {
         return Err(SaveError::RevisionConflict { current }.into());
     }
-    if let Some(old) = &old_credential_ref {
-        let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
-        if current_credential_ref.as_ref() != Some(old) {
-            return Err(ConnectError::CredentialRefMismatch { current });
-        }
+    // Compare the full `Option<CredentialRef>`, not just the `Some` case:
+    // `old_credential_ref == None` must also be rejected when current
+    // settings already reference a credential (e.g. a caller mistakenly
+    // treating this as the very first key ever saved for a connection that
+    // already has one). Checking only `Some(old)` above let a `None` request
+    // through unconditionally, so `journal.complete` below would record the
+    // wrong `old_credential_ref` (never touching the real previous secret)
+    // and the actually-still-referenced credential would be orphaned instead
+    // of cleaned up.
+    let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
+    if current_credential_ref != old_credential_ref {
+        return Err(ConnectError::CredentialRefMismatch { current });
     }
     let settings_generation_before = current.settings_generation;
 
@@ -202,7 +244,7 @@ pub fn update_custom_credential(
     // Step 4: atomically replace the non-secret settings to reference the
     // new credential.
     let new_settings = build_new_settings(&new_ref);
-    let saved = match settings_store.write_while_locked(&guard, expected_revision, new_settings) {
+    let saved = match settings_store.write_while_locked(owner, &guard, expected_revision, new_settings) {
         Ok(saved) => saved,
         Err(SaveError::PersistedDurabilityUnconfirmed(e)) => {
             // The settings replace's `rename` already landed — persisted
@@ -241,8 +283,12 @@ pub fn update_custom_credential(
 /// replace that drops `credential_ref`, as one journal-guarded transaction
 /// (ADR-0032 section 7.3 `delete` shape). `new_settings_without_credential`
 /// must already have `custom.credential_ref` cleared.
+///
+/// `owner` proves the caller already holds the runtime owner lock (see
+/// [`update_custom_credential`]).
 pub fn delete_custom_credential(
     settings_store: &AiSettingsStore,
+    owner: &OwnerLockGuard,
     journal: &CredentialJournal,
     credential_store: &dyn CredentialStore,
     expected_revision: u64,
@@ -281,7 +327,7 @@ pub fn delete_custom_credential(
         })
         .map_err(ConnectError::Io)?;
 
-    let saved = settings_store.write_while_locked(&guard, expected_revision, new_settings_without_credential)?;
+    let saved = settings_store.write_while_locked(owner, &guard, expected_revision, new_settings_without_credential)?;
 
     journal.mark_delete_settings_swapped(&old_credential_ref).map_err(ConnectError::Io)?;
 
@@ -297,8 +343,12 @@ pub fn delete_custom_credential(
 /// exclusive AI settings lock acquisition covering both the recovery itself
 /// and any settings replace it needs to retry on a pending `delete`'s
 /// behalf.
+///
+/// `owner` proves the caller already holds the runtime owner lock (see
+/// [`update_custom_credential`]).
 pub fn recover_at_startup(
     settings_store: &AiSettingsStore,
+    owner: &OwnerLockGuard,
     journal: &CredentialJournal,
     credential_store: &dyn CredentialStore,
 ) -> Result<RecoveryOutcome, ConnectError> {
@@ -314,7 +364,7 @@ pub fn recover_at_startup(
         if let Some(custom) = retried.custom.as_mut() {
             custom.credential_ref = None;
         }
-        match settings_store.write_while_locked(&guard, current.revision, retried) {
+        match settings_store.write_while_locked(owner, &guard, current.revision, retried) {
             Ok(_) => Ok(true),
             Err(SaveError::Io(e)) => Err(e),
             // Conservative/fail-closed for every other outcome: none of
@@ -378,7 +428,7 @@ pub fn build_runtime_config_for_active_connection(
                 shell_env_format,
             )?;
             let codex_home = paths.custom_codex_home();
-            write_codex_config(&codex_home, &material.config_toml).map_err(ConnectError::Io)?;
+            write_codex_config(&codex_home, &material.config_toml)?;
             config.codex_home = Some(codex_home);
             config.extra_env = material.extra_env;
         }
@@ -386,23 +436,29 @@ pub fn build_runtime_config_for_active_connection(
     Ok(ConfiguredRuntime { config, settings_generation: settings.settings_generation })
 }
 
-/// Runs one inference turn or fixed connectivity probe against `runtime`,
+/// Runs `f` -- a fixed connectivity probe's single request/response, or a
+/// full inference turn's every step from `thread/start`/`turn/start` through
+/// observing its terminal `turn/completed`/`turn/failed` notification --
 /// gated on `settings_generation` per ADR-0032 section 7.3: acquires the AI
-/// settings lock in shared mode, confirms the persisted
-/// `settings_generation` still matches `configured_settings_generation` (the
-/// generation `runtime`'s current `RuntimeConfig` was built for), and holds
-/// that shared lock until the call itself has resolved. A concurrent
-/// settings save is therefore either already reflected here (generation
-/// mismatch, rejected before the call is ever sent) or is itself rejected
-/// immediately while this call is in flight — never both silently racing.
-pub fn call_with_generation_check(
+/// settings lock in shared mode, confirms the persisted `settings_generation`
+/// still matches `configured_settings_generation` (the generation the
+/// caller's connection/`RuntimeConfig` was built for), and holds that shared
+/// lock until `f` itself returns -- covering the probe/turn's *entire*
+/// duration, not just its first RPC round trip. A concurrent settings save is
+/// therefore either already reflected here (generation mismatch, rejected
+/// before `f` ever runs) or is itself rejected immediately while `f` is still
+/// in flight, never both silently racing. Callers driving a multi-step turn
+/// are responsible for both sending the request(s) and waiting for the
+/// correlated terminal notification inside `f`, since only the caller has
+/// access to the runtime's own event stream.
+pub fn with_generation_checked_lock<F, R>(
     settings_store: &AiSettingsStore,
     configured_settings_generation: u64,
-    runtime: &AiRuntime,
-    method: &str,
-    params: Option<Value>,
-    timeout: Duration,
-) -> Result<Value, ConnectError> {
+    f: F,
+) -> Result<R, ConnectError>
+where
+    F: FnOnce() -> R,
+{
     let _shared =
         settings_store.settings_lock().try_acquire_shared().map_err(ConnectError::Io)?.ok_or(ConnectError::SettingsBusy)?;
 
@@ -411,7 +467,28 @@ pub fn call_with_generation_check(
         return Err(ConnectError::GenerationMismatch { persisted, configured: configured_settings_generation });
     }
 
-    runtime.call(method, params, timeout).map_err(ConnectError::Runtime)
+    Ok(f())
+}
+
+/// Runs one fixed connectivity probe (a single request/response) against
+/// `runtime`, gated on `settings_generation` via
+/// [`with_generation_checked_lock`]. For a multi-step inference turn whose
+/// completion arrives asynchronously as a notification (`turn/completed`),
+/// call [`with_generation_checked_lock`] directly instead, with an `f` that
+/// also waits for that notification, so the shared lock is held for the
+/// turn's entire duration rather than being released as soon as `turn/start`
+/// itself returns its immediate acknowledgement.
+pub fn call_with_generation_check(
+    settings_store: &AiSettingsStore,
+    configured_settings_generation: u64,
+    runtime: &AiRuntime,
+    method: &str,
+    params: Option<Value>,
+    timeout: Duration,
+) -> Result<Value, ConnectError> {
+    with_generation_checked_lock(settings_store, configured_settings_generation, || {
+        runtime.call(method, params, timeout).map_err(ConnectError::Runtime)
+    })?
 }
 
 #[cfg(test)]
@@ -431,10 +508,12 @@ mod tests {
         dir
     }
 
-    fn store_and_journal(name: &str) -> (AiSettingsStore, CredentialJournal, PathBuf) {
+    fn store_and_journal(name: &str) -> (AiSettingsStore, OwnerLockGuard, CredentialJournal, PathBuf) {
         let dir = unique_dir(name);
+        let owner = crate::owner_lock::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
         (
             AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock")),
+            owner,
             CredentialJournal::new(dir.join("credential-journal.json")),
             dir,
         )
@@ -459,10 +538,10 @@ mod tests {
 
     #[test]
     fn update_then_rotate_then_delete_leaves_no_journal_entries_and_no_stray_secrets() {
-        let (store, journal, _dir) = store_and_journal("full_cycle");
+        let (store, owner, journal, _dir) = store_and_journal("full_cycle");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -473,6 +552,7 @@ mod tests {
 
         let rotated = update_custom_credential(
             &store,
+            &owner,
             &journal,
             &credential_store,
             saved.revision,
@@ -490,7 +570,7 @@ mod tests {
         let mut without_credential = rotated.clone();
         without_credential.custom.as_mut().unwrap().credential_ref = None;
         let deleted =
-            delete_custom_credential(&store, &journal, &credential_store, rotated.revision, second_ref.clone(), without_credential)
+            delete_custom_credential(&store, &owner, &journal, &credential_store, rotated.revision, second_ref.clone(), without_credential)
                 .unwrap();
         assert!(journal.is_empty().unwrap());
         assert!(credential_store.is_empty(), "no secret should remain after deleting the only credential");
@@ -499,10 +579,10 @@ mod tests {
 
     #[test]
     fn update_leaves_a_pending_journal_entry_and_untouched_settings_when_writing_the_secret_fails() {
-        let (store, journal, _dir) = store_and_journal("set_failure");
+        let (store, owner, journal, _dir) = store_and_journal("set_failure");
         let credential_store = UnavailableCredentialStore;
 
-        let err = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -514,15 +594,15 @@ mod tests {
 
     #[test]
     fn a_second_update_is_rejected_while_a_journal_entry_from_a_failed_operation_is_still_pending() {
-        let (store, journal, _dir) = store_and_journal("pending_blocks_next");
+        let (store, owner, journal, _dir) = store_and_journal("pending_blocks_next");
         let credential_store = UnavailableCredentialStore;
-        let _ = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let _ = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         });
         assert!(!journal.is_empty().unwrap());
 
         let fake_store = FakeCredentialStore::new();
-        let err = update_custom_credential(&store, &journal, &fake_store, 0, None, "sk-second", |new_ref| {
+        let err = update_custom_credential(&store, &owner, &journal, &fake_store, 0, None, "sk-second", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -531,10 +611,10 @@ mod tests {
 
     #[test]
     fn update_with_a_stale_expected_revision_touches_neither_the_journal_nor_the_credential_store() {
-        let (store, journal, _dir) = store_and_journal("update_stale_revision");
+        let (store, owner, journal, _dir) = store_and_journal("update_stale_revision");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -544,7 +624,7 @@ mod tests {
         // A second writer still thinks the revision is 0 (stale): its
         // rotation attempt must be rejected before any journal entry is
         // begun or any new secret is written.
-        let err = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-stale", |new_ref| {
+        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-stale", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -557,10 +637,10 @@ mod tests {
 
     #[test]
     fn delete_with_a_stale_expected_revision_touches_neither_the_journal_nor_the_credential_store() {
-        let (store, journal, _dir) = store_and_journal("delete_stale_revision");
+        let (store, owner, journal, _dir) = store_and_journal("delete_stale_revision");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -570,7 +650,7 @@ mod tests {
         // rename), bumping `revision` without touching `credential_ref`.
         let mut renamed = saved.clone();
         renamed.custom.as_mut().unwrap().name = "Renamed".to_string();
-        let renamed_saved = store.save(saved.revision, renamed, || Ok(true)).unwrap();
+        let renamed_saved = store.save(&owner, saved.revision, renamed, || Ok(true)).unwrap();
 
         // The delete caller still holds the stale `expected_revision` (and,
         // notably, `credential_ref` here still matches current settings --
@@ -579,6 +659,7 @@ mod tests {
         without_credential.custom.as_mut().unwrap().credential_ref = None;
         let err = delete_custom_credential(
             &store,
+            &owner,
             &journal,
             &credential_store,
             saved.revision,
@@ -599,10 +680,10 @@ mod tests {
 
     #[test]
     fn delete_whose_credential_ref_no_longer_matches_current_settings_is_rejected_without_side_effects() {
-        let (store, journal, _dir) = store_and_journal("delete_credential_ref_mismatch");
+        let (store, owner, journal, _dir) = store_and_journal("delete_credential_ref_mismatch");
         let credential_store = FakeCredentialStore::new();
 
-        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap();
@@ -614,6 +695,7 @@ mod tests {
         without_credential.custom.as_mut().unwrap().credential_ref = None;
         let err = delete_custom_credential(
             &store,
+            &owner,
             &journal,
             &credential_store,
             saved.revision,
@@ -629,12 +711,46 @@ mod tests {
     }
 
     #[test]
+    fn update_with_old_credential_ref_none_is_rejected_when_current_settings_already_reference_a_credential() {
+        let (store, owner, journal, _dir) = store_and_journal("update_none_mismatch");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap();
+        let existing_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+
+        // `expected_revision` matches, but the caller passes
+        // `old_credential_ref: None` even though current settings already
+        // reference a credential -- as if this were the very first key ever
+        // saved. This must be rejected before any journal/credential side
+        // effect instead of silently treating it as a fresh save (which
+        // would record the wrong `old_credential_ref` in the journal and
+        // orphan the still-referenced secret instead of cleaning it up).
+        let err = update_custom_credential(&store, &owner, &journal, &credential_store, saved.revision, None, "sk-second", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::CredentialRefMismatch { .. }));
+
+        assert!(journal.is_empty().unwrap(), "a mismatched request must never leave a journal entry behind");
+        assert_eq!(credential_store.len(), 1, "a mismatched request must never write a new secret");
+        assert_eq!(store.load().unwrap(), saved, "a mismatched request must never touch persisted settings");
+        assert_eq!(
+            credential_store.get(&existing_ref).unwrap().as_deref(),
+            Some("sk-first"),
+            "the existing credential must not be orphaned"
+        );
+    }
+
+    #[test]
     fn update_whose_settings_replace_lands_but_cannot_confirm_durability_does_not_delete_the_new_secret() {
-        let (store, journal, _dir) = store_and_journal("update_ambiguous_durability");
+        let (store, owner, journal, _dir) = store_and_journal("update_ambiguous_durability");
         let credential_store = FakeCredentialStore::new();
 
         crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
-        let err = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        let err = update_custom_credential(&store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings(Some(new_ref.clone()))
         })
         .unwrap_err();
@@ -657,7 +773,7 @@ mod tests {
         // recovery, which re-derives the outcome from the already-updated
         // persisted settings exactly like a normal success.
         assert!(!journal.is_empty().unwrap());
-        let outcome = recover_at_startup(&store, &journal, &credential_store).unwrap();
+        let outcome = recover_at_startup(&store, &owner, &journal, &credential_store).unwrap();
         assert_eq!(outcome.completed, 1);
         assert!(journal.is_empty().unwrap());
         assert_eq!(credential_store.get(&new_ref).unwrap().as_deref(), Some("sk-first"));
@@ -665,7 +781,7 @@ mod tests {
 
     #[test]
     fn recover_at_startup_retries_a_pending_delete_settings_swap_and_cleans_up() {
-        let (store, journal, _dir) = store_and_journal("recover_delete_pending");
+        let (store, owner, journal, _dir) = store_and_journal("recover_delete_pending");
         let credential_store = FakeCredentialStore::new();
         let old_ref = CredentialRef::generate();
         credential_store.set(&old_ref, "old-secret").unwrap();
@@ -673,7 +789,7 @@ mod tests {
         // Settings still reference the old credential: simulates a crash
         // between the journal's `Delete` `begin` and the settings replace
         // that would have dropped `credential_ref`.
-        let saved = store.save(0, custom_settings(Some(old_ref.clone())), || Ok(true)).unwrap();
+        let saved = store.save(&owner, 0, custom_settings(Some(old_ref.clone())), || Ok(true)).unwrap();
         journal
             .begin(CredentialOperation {
                 kind: JournalOperationKind::Delete,
@@ -684,7 +800,7 @@ mod tests {
             })
             .unwrap();
 
-        let outcome = recover_at_startup(&store, &journal, &credential_store).unwrap();
+        let outcome = recover_at_startup(&store, &owner, &journal, &credential_store).unwrap();
         assert_eq!(outcome.completed, 1);
         assert!(journal.is_empty().unwrap());
         assert!(credential_store.get(&old_ref).unwrap().is_none());
@@ -765,15 +881,15 @@ mod tests {
 
     #[test]
     fn call_with_generation_check_rejects_a_stale_configured_generation_before_ever_touching_the_runtime() {
-        let (store, _journal, dir) = store_and_journal("gated_call_stale");
+        let (store, owner, _journal, dir) = store_and_journal("gated_call_stale");
         let mut first = AiSettings::default();
         first.chatgpt.model_id = Some("gpt-a".to_string());
-        let saved = store.save(0, first, || Ok(true)).unwrap();
+        let saved = store.save(&owner, 0, first, || Ok(true)).unwrap();
         assert_eq!(saved.settings_generation, 1);
 
         let mut changed = saved.clone();
         changed.chatgpt.model_id = Some("gpt-b".to_string());
-        store.save(saved.revision, changed, || Ok(true)).unwrap();
+        store.save(&owner, saved.revision, changed, || Ok(true)).unwrap();
 
         let (events_tx, _events_rx) = std::sync::mpsc::sync_channel(8);
         let handler = Arc::new(RejectAllServerRequests);
@@ -788,5 +904,52 @@ mod tests {
         assert!(matches!(result, Err(ConnectError::GenerationMismatch { persisted: 2, configured: 1 })));
 
         let _ = runtime.shutdown();
+    }
+
+    #[test]
+    fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
+        // Regression coverage for the root cause behind
+        // `call_with_generation_check` previously only covering a single RPC
+        // round trip: `f` here stands in for a multi-step turn (everything
+        // from `thread/start`/`turn/start` through observing its terminal
+        // notification). While `f` is still running, a concurrent settings
+        // save must be rejected exactly like it would be mid-flight inside a
+        // single `AiRuntime::call`, not just before/after `f` runs.
+        let (store, owner, _journal, _dir) = store_and_journal("generation_checked_lock_holds_whole_turn");
+        let saved = store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
+        let generation = saved.settings_generation;
+        let revision = saved.revision;
+
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store_ref = &store;
+
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                with_generation_checked_lock(store_ref, generation, move || {
+                    let _ = start_tx.send(());
+                    // Stands in for the time spent waiting on
+                    // `turn/completed` after the initial `turn/start` round
+                    // trip has already returned.
+                    let _ = release_rx.recv();
+                    "turn finished"
+                })
+            });
+
+            start_rx.recv_timeout(Duration::from_secs(5)).expect("f should have started");
+            let save_attempt = store.save(&owner, revision, AiSettings::default(), || Ok(true));
+            assert!(
+                matches!(save_attempt, Err(SaveError::Busy)),
+                "a settings save must be rejected while `f` is still in flight, not just during its first RPC call"
+            );
+
+            let _ = release_tx.send(());
+            let result = worker.join().unwrap().unwrap();
+            assert_eq!(result, "turn finished");
+        });
+
+        // Once `f` has returned and the shared lock has been released, a
+        // save succeeds again.
+        store.save(&owner, revision, AiSettings::default(), || Ok(true)).unwrap();
     }
 }

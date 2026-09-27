@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use hane_ai::{
     build_custom_provider_material, build_runtime_config_for_active_connection, call_with_generation_check,
-    update_custom_credential, write_codex_config, ActiveConnection, AiPaths, AiSettings, AiSettingsStore,
-    AiRuntime, ChatGptConnectionSettings, ConnectError, CredentialJournal, CustomConnectionSettings,
+    update_custom_credential, write_codex_config, ActiveConnection, AiPaths, AiSettings, AiSettingsStore, AiRuntime,
+    ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore, CustomConnectionSettings,
     FakeCredentialStore, RejectAllServerRequests, RuntimeConfig, RuntimeState, SaveError, ShellEnvironmentPolicyFormat,
     CUSTOM_PROVIDER_ENV_KEY,
 };
@@ -215,6 +215,116 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
     );
 }
 
+/// ADR-0032 section 8's "runtime owner lock → AI settings lock" order, and
+/// the "active runtime already owns the lock" half of it specifically:
+/// while this `AiRuntime` is `Ready` (and therefore already holds the
+/// runtime owner lock itself), a completely separate `OwnerLock` instance
+/// for the same path must not be able to acquire it, and an ordinary
+/// settings save must instead go through `AiRuntime::with_owner_lock` to
+/// borrow proof of that already-held ownership -- never by attempting (and
+/// failing) a second, independent acquisition of the same lock file.
+#[test]
+fn with_owner_lock_lets_a_normal_settings_save_happen_while_this_runtime_holds_the_owner_lock() {
+    let (config, dir) = fake_server_config("with_owner_lock_active");
+    let owner_lock_path = config.owner_lock_path.clone();
+    let runtime = spawn_and_start(config);
+
+    let external = hane_ai::OwnerLock::new(&owner_lock_path);
+    assert!(
+        external.try_acquire().unwrap().is_none(),
+        "a separate OwnerLock instance must not be able to acquire the lock while this runtime is active"
+    );
+
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let journal = CredentialJournal::new(dir.join("credential-journal.json"));
+    let credential_store = FakeCredentialStore::new();
+
+    let saved = runtime
+        .with_owner_lock(move |owner| {
+            let owner = owner.expect("the active runtime must hold the owner lock while Ready");
+            update_custom_credential(&settings_store, owner, &journal, &credential_store, 0, None, "sk-active", |new_ref| {
+                custom_settings_for(Some(new_ref.clone()))
+            })
+        })
+        .expect("with_owner_lock should run its closure on the coordinator thread")
+        .expect("the settings save should succeed while this runtime already owns the runtime owner lock");
+    assert_eq!(saved.revision, 1);
+
+    let _ = runtime.stop();
+
+    // Once stopped, the owner lock is released and a separate acquire now
+    // succeeds.
+    assert!(external.try_acquire().unwrap().is_some());
+}
+
+/// The other half of ADR-0032 section 8's ordering contract: when no
+/// runtime is active yet, a caller try-locks the runtime owner lock itself,
+/// uses it to guard a settings save, and then hands that exact same guard
+/// to `AiRuntime::start_with_owner_lock` -- never dropping it (and
+/// therefore never releasing the lock to a would-be new owner) in between.
+#[test]
+fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap() {
+    let (config, dir) = fake_server_config("start_with_owner_lock");
+    let owner_lock_path = config.owner_lock_path.clone();
+
+    let owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
+    let owner = owner_lock.try_acquire().unwrap().expect("no other process holds the owner lock yet");
+
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let journal = CredentialJournal::new(dir.join("credential-journal.json"));
+    let credential_store = FakeCredentialStore::new();
+    let saved = update_custom_credential(&settings_store, &owner, &journal, &credential_store, 0, None, "sk-boot", |new_ref| {
+        custom_settings_for(Some(new_ref.clone()))
+    })
+    .expect("the settings save should succeed while holding the freshly acquired owner lock");
+    assert_eq!(saved.revision, 1);
+
+    let (events_tx, _events_rx) = mpsc::sync_channel(64);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+    let status = runtime.start_with_owner_lock(owner).expect("start_with_owner_lock should succeed");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    // A separate `OwnerLock` instance still cannot acquire it: the same
+    // guard handed to `start_with_owner_lock` is still held, continuously,
+    // by the now-running coordinator.
+    let external = hane_ai::OwnerLock::new(&owner_lock_path);
+    assert!(external.try_acquire().unwrap().is_none());
+
+    let _ = runtime.stop();
+    assert!(external.try_acquire().unwrap().is_some());
+}
+
+/// Structural rejection of a non-owner: while a first `OwnerLock` instance
+/// holds the lock, a second, independent instance for the same path cannot
+/// acquire it and therefore has no way to obtain the `&OwnerLockGuard`
+/// proof `update_custom_credential`/`AiSettingsStore::save` require. Once
+/// the first is dropped, the lock becomes available and the new owner can
+/// save normally.
+#[test]
+fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner_releases_the_lock() {
+    let dir = unique_dir("non_owner_rejected");
+    let owner_lock_path = dir.join("owner.lock");
+    let first_owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
+    let first = first_owner_lock.try_acquire().unwrap().unwrap();
+
+    let second_owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
+    assert!(
+        second_owner_lock.try_acquire().unwrap().is_none(),
+        "a non-owner must be rejected before it can ever obtain the proof required to call a settings-write API"
+    );
+
+    drop(first);
+    let second = second_owner_lock.try_acquire().unwrap().expect("the lock becomes available once the owner releases it");
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let journal = CredentialJournal::new(dir.join("credential-journal.json"));
+    let credential_store = FakeCredentialStore::new();
+    update_custom_credential(&settings_store, &second, &journal, &credential_store, 0, None, "sk-new-owner", |new_ref| {
+        custom_settings_for(Some(new_ref.clone()))
+    })
+    .expect("the new owner should be able to save once it holds the lock");
+}
+
 fn custom_settings_for(credential_ref: Option<hane_ai::CredentialRef>) -> AiSettings {
     AiSettings {
         schema_version: hane_ai::AI_SETTINGS_SCHEMA_VERSION,
@@ -244,15 +354,21 @@ fn custom_settings_for(credential_ref: Option<hane_ai::CredentialRef>) -> AiSett
 fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end() {
     let dir = unique_dir("internal_path");
     let paths = AiPaths::new(&dir);
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let settings_store = Arc::new(AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock")));
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
-    let credential_store = FakeCredentialStore::new();
+    let credential_store: Arc<dyn CredentialStore> = Arc::new(FakeCredentialStore::new());
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
     let owner_lock_path = dir.join("runtime.lock");
 
+    // Step 0: acquire the runtime owner lock ourselves, per ADR-0032
+    // section 8's "try-lock before an out-of-runtime save, hold it through
+    // any necessary runtime (re)generation" contract -- there is no
+    // `AiRuntime` yet to hold it internally for this very first save.
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
+
     // Step 1: settings/credential save.
     let saved =
-        update_custom_credential(&settings_store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+        update_custom_credential(&settings_store, &owner, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
             custom_settings_for(Some(new_ref.clone()))
         })
         .expect("initial credential save should succeed");
@@ -270,11 +386,16 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     )
     .expect("building the runtime config for the freshly saved settings should succeed");
 
-    // Step 3: runtime spawn/start against the generated config.
+    // Step 3: runtime spawn/start against the generated config, handing the
+    // same already-held owner lock guard over to the coordinator so it is
+    // never released to a would-be new owner between the settings save
+    // above and this runtime becoming its owner.
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(configured.config, handler, events_tx);
-    let status = runtime.start().expect("start should succeed against the generated Custom config");
+    let status = runtime
+        .start_with_owner_lock(owner)
+        .expect("start_with_owner_lock should succeed against the generated Custom config");
     assert_eq!(status.state, RuntimeState::Ready);
 
     // Step 4: generation-gated probe request/response.
@@ -291,18 +412,31 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
 
     // Rotating the credential bumps `settings_generation`: a probe still
     // configured for the old generation must be rejected before ever
-    // reaching the runtime.
+    // reaching the runtime. The runtime is already `Ready` and therefore
+    // already holds the runtime owner lock itself, so this save borrows
+    // proof of that ownership from the running coordinator via
+    // `with_owner_lock` instead of attempting (and failing) a second,
+    // independent acquisition of the same lock file.
     let old_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
-    let rotated = update_custom_credential(
-        &settings_store,
-        &journal,
-        &credential_store,
-        saved.revision,
-        Some(old_ref),
-        "sk-second",
-        |new_ref| custom_settings_for(Some(new_ref.clone())),
-    )
-    .expect("credential rotation should succeed");
+    let saved_revision = saved.revision;
+    let rotation_settings_store = settings_store.clone();
+    let rotation_credential_store = credential_store.clone();
+    let rotated = runtime
+        .with_owner_lock(move |owner| {
+            let owner = owner.expect("the active runtime must hold the owner lock while Ready");
+            update_custom_credential(
+                &rotation_settings_store,
+                owner,
+                &journal,
+                &rotation_credential_store,
+                saved_revision,
+                Some(old_ref),
+                "sk-second",
+                |new_ref| custom_settings_for(Some(new_ref.clone())),
+            )
+        })
+        .expect("with_owner_lock should run its closure on the coordinator thread")
+        .expect("credential rotation should succeed");
     assert!(rotated.settings_generation > configured.settings_generation);
 
     let stale_probe = call_with_generation_check(
@@ -348,10 +482,15 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // concurrent settings save must be rejected immediately instead of
     // silently applying or waiting behind it (the same contract
     // `call_with_generation_check` itself relies on for every probe/turn
-    // above).
+    // above). This save still needs the runtime owner lock proof, borrowed
+    // the same way as the rotation above.
     let shared_during_probe = settings_store.settings_lock().try_acquire_shared().unwrap().unwrap();
-    let save_attempt = settings_store.save(0, AiSettings::default(), || Ok(true));
-    assert!(matches!(save_attempt, Err(SaveError::Busy)));
+    let busy_settings_store = settings_store.clone();
+    let save_attempt = runtime.with_owner_lock(move |owner| {
+        let owner = owner.expect("the active runtime must hold the owner lock while Ready");
+        busy_settings_store.save(owner, 0, AiSettings::default(), || Ok(true))
+    });
+    assert!(matches!(save_attempt, Ok(Err(SaveError::Busy))));
     drop(shared_during_probe);
 
     let _ = runtime.stop();
@@ -367,10 +506,14 @@ struct RecordedRequest {
 
 /// Minimal single-request HTTP/1.1 mock server: accepts one connection,
 /// reads the request line, headers and (if `Content-Length` is present)
-/// body, records it, and replies with a canned "completed" Responses API
-/// body. Not a general-purpose HTTP server: it is a test fixture scoped to
-/// exactly what a single Custom Provider probe turn needs.
-fn spawn_mock_responses_provider() -> (u16, Arc<Mutex<Option<RecordedRequest>>>, std::thread::JoinHandle<()>) {
+/// body, records it, and replies with exactly `response` (a full raw
+/// HTTP/1.1 response, status line through body). Not a general-purpose HTTP
+/// server: it is a test fixture scoped to exactly what a single Custom
+/// Provider probe turn needs, letting callers inject any upstream reply
+/// (success, 401/403/429, malformed, or Responses-API-incompatible) to
+/// confirm the App Server surfaces each distinctly rather than always
+/// reporting success.
+fn spawn_mock_responses_provider(response: String) -> (u16, Arc<Mutex<Option<RecordedRequest>>>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a mock Responses Provider port");
     let port = listener.local_addr().unwrap().port();
     let recorded: Arc<Mutex<Option<RecordedRequest>>> = Arc::new(Mutex::new(None));
@@ -378,14 +521,55 @@ fn spawn_mock_responses_provider() -> (u16, Arc<Mutex<Option<RecordedRequest>>>,
 
     let handle = std::thread::spawn(move || {
         if let Ok((stream, _addr)) = listener.accept() {
-            handle_one_request(stream, &recorded_for_thread);
+            handle_one_request(stream, &recorded_for_thread, &response);
         }
     });
 
     (port, recorded, handle)
 }
 
-fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<RecordedRequest>>>) {
+/// A full raw HTTP/1.1 response with a JSON body and the given status line
+/// (e.g. `"200 OK"`, `"401 Unauthorized"`).
+fn json_response(status_line: &str, body: &serde_json::Value) -> String {
+    let body_text = body.to_string();
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_text.len(),
+        body_text
+    )
+}
+
+/// A full raw HTTP/1.1 response whose body is not necessarily valid JSON,
+/// used to inject a malformed upstream reply.
+fn raw_response(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// The fixed "completed" Responses API body the successful test path
+/// expects to see echoed back in `turn/completed`.
+fn fixed_pong_response() -> String {
+    json_response(
+        "200 OK",
+        &serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "pong"}]
+                }
+            ]
+        }),
+    )
+}
+
+fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<RecordedRequest>>>, response: &str) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
 
@@ -427,26 +611,24 @@ fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<Recorde
 
     *recorded.lock().unwrap() = Some(RecordedRequest { method, path, authorization, body });
 
-    let response_body = serde_json::json!({
-        "id": "resp_test",
-        "object": "response",
-        "status": "completed",
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "pong"}]
-            }
-        ]
-    })
-    .to_string();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response_body.len(),
-        response_body
-    );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// Prints an explicit, distinctly grep-able skip notice for a test that
+/// requires a real, bundled Codex App Server 0.157.1 binary
+/// (`HANE_TEST_CODEX_APP_SERVER_BIN`), instead of silently passing. The
+/// leading `REQUIRED_REAL_APP_SERVER_EVIDENCE_NOT_OBTAINED` marker is fixed
+/// and must not be treated as, or confused with, an actual pass: this test
+/// returning green only means it did not assert anything, not that the
+/// required real-App-Server evidence was obtained.
+fn print_real_app_server_evidence_skipped(test_name: &str, what_was_not_obtained: &str) {
+    eprintln!(
+        "REQUIRED_REAL_APP_SERVER_EVIDENCE_NOT_OBTAINED: {test_name} - HANE_TEST_CODEX_APP_SERVER_BIN is not set, \
+         so {what_was_not_obtained} was not obtained in this run. A green result for this test must not be read as \
+         satisfying ADR-0032's real-response acceptance evidence; that evidence must be obtained separately with \
+         HANE_TEST_CODEX_APP_SERVER_BIN set to a real Codex App Server 0.157.1 binary."
+    );
 }
 
 /// Requires a real, bundled Codex App Server 0.157.1 binary at the path
@@ -457,11 +639,10 @@ fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<Recorde
 #[test]
 fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key() {
     let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
-        eprintln!(
-            "SKIPPED: real_app_server_reaches_the_mock_responses_provider_with_the_configured_key - \
-             HANE_TEST_CODEX_APP_SERVER_BIN is not set, so this evidence (a real Codex App Server 0.157.1 \
-             reaching a mock Responses Provider with the generated Custom Provider config) was not obtained \
-             in this run."
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reaches_the_mock_responses_provider_with_the_configured_key",
+            "evidence that a real Codex App Server 0.157.1 reaches a mock Responses Provider with the generated \
+             Custom Provider config and returns the fixed \"pong\" reply via turn/completed",
         );
         return;
     };
@@ -485,7 +666,7 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
         "HANE_TEST_CODEX_APP_SERVER_BIN must point at Codex App Server 0.157.1, got: {version_text}"
     );
 
-    let (port, recorded, _http_thread) = spawn_mock_responses_provider();
+    let (port, recorded, _http_thread) = spawn_mock_responses_provider(fixed_pong_response());
     let base_url = format!("http://127.0.0.1:{port}/v1");
 
     let dir = unique_dir("real_app_server");
@@ -588,4 +769,222 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     let body_json: serde_json::Value =
         serde_json::from_str(&recorded.body).expect("the Responses API request body should be valid JSON");
     assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "request must target exactly the configured model");
+}
+
+/// Spawns the real App Server (`binary`) against a Custom Provider config
+/// pointed at a mock Responses Provider that always replies with
+/// `mock_response`, runs one `thread/start`/`turn/start`, and reports
+/// whether a `turn/completed` notification carrying the fixed "pong" success
+/// text was observed within a bounded timeout. Any other outcome -- a
+/// `turn/start` RPC error, a `turn/completed`/other notification that does
+/// *not* contain "pong", or timing out without ever observing
+/// `turn/completed` -- is reported as `false` (not success): this crate
+/// cannot assume in advance exactly which of those shapes the bundled App
+/// Server uses to surface a given upstream failure, but "silently reports
+/// success anyway" must never be one of them.
+fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, mock_response: String) -> bool {
+    let (port, _recorded, _http_thread) = spawn_mock_responses_provider(mock_response);
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+
+    let dir = unique_dir(dir_name);
+    let codex_home = dir.join("codex-home");
+    let probe_workspace = dir.join("probe-workspace");
+    std::fs::create_dir_all(&probe_workspace).unwrap();
+
+    let material = build_custom_provider_material(
+        "My Provider",
+        &base_url,
+        "gpt-test-model",
+        "sk-real-secret",
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .unwrap();
+    write_codex_config(&codex_home, &material.config_toml).unwrap();
+
+    let mut config = RuntimeConfig::new(PathBuf::from(binary), dir.join("runtime.lock"));
+    config.codex_home = Some(codex_home);
+    config.extra_env.extend(material.extra_env);
+    config.start_timeout = Duration::from_secs(30);
+    config.args.push("--strict-config".to_string());
+
+    let (events_tx, events_rx) = mpsc::sync_channel(1024);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+    let status = runtime
+        .start()
+        .expect("real App Server should reach Ready with the generated Custom config under --strict-config");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    let thread_start = runtime.call(
+        "thread/start",
+        Some(serde_json::json!({
+            "cwd": probe_workspace.to_string_lossy(),
+            "modelProvider": hane_ai::CUSTOM_PROVIDER_ID,
+            "model": "gpt-test-model",
+        })),
+        Duration::from_secs(30),
+    );
+    let thread_start = match thread_start {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = runtime.stop();
+            return false;
+        }
+    };
+    let Some(thread_id) = thread_start["thread"]["id"].as_str().map(str::to_string) else {
+        let _ = runtime.stop();
+        return false;
+    };
+
+    let turn_start = runtime.call(
+        "turn/start",
+        Some(serde_json::json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": "ping"}],
+        })),
+        Duration::from_secs(30),
+    );
+    if turn_start.is_err() {
+        let _ = runtime.stop();
+        return false;
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let observed_success = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let event = match events_rx.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(_) => break false,
+        };
+        let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
+            continue;
+        };
+        if method == "turn/completed" {
+            let text = params.unwrap_or(serde_json::Value::Null).to_string();
+            break text.contains("pong");
+        }
+        if method.contains("fail") {
+            break false;
+        }
+    };
+
+    let _ = runtime.stop();
+    observed_success
+}
+
+#[test]
+fn real_app_server_reports_failure_for_401_unauthorized_from_the_provider() {
+    let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reports_failure_for_401_unauthorized_from_the_provider",
+            "evidence that a 401 Unauthorized response from the Responses Provider is surfaced as a failure",
+        );
+        return;
+    };
+    let response = json_response(
+        "401 Unauthorized",
+        &serde_json::json!({"error": {"message": "invalid api key", "type": "invalid_request_error"}}),
+    );
+    let observed_success =
+        observed_successful_turn_against_mock_response(&binary, "real_app_server_401", response);
+    assert!(
+        !observed_success,
+        "a 401 Unauthorized response from the Responses Provider must never be reported as a successful turn/completed"
+    );
+}
+
+#[test]
+fn real_app_server_reports_failure_for_403_forbidden_from_the_provider() {
+    let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reports_failure_for_403_forbidden_from_the_provider",
+            "evidence that a 403 Forbidden response from the Responses Provider is surfaced as a failure",
+        );
+        return;
+    };
+    let response = json_response(
+        "403 Forbidden",
+        &serde_json::json!({"error": {"message": "access denied", "type": "permission_error"}}),
+    );
+    let observed_success =
+        observed_successful_turn_against_mock_response(&binary, "real_app_server_403", response);
+    assert!(
+        !observed_success,
+        "a 403 Forbidden response from the Responses Provider must never be reported as a successful turn/completed"
+    );
+}
+
+#[test]
+fn real_app_server_reports_failure_for_429_rate_limited_from_the_provider() {
+    let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reports_failure_for_429_rate_limited_from_the_provider",
+            "evidence that a 429 Too Many Requests response from the Responses Provider is surfaced as a failure",
+        );
+        return;
+    };
+    let response = json_response(
+        "429 Too Many Requests",
+        &serde_json::json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}}),
+    );
+    let observed_success =
+        observed_successful_turn_against_mock_response(&binary, "real_app_server_429", response);
+    assert!(
+        !observed_success,
+        "a 429 Too Many Requests response from the Responses Provider must never be reported as a successful turn/completed"
+    );
+}
+
+#[test]
+fn real_app_server_reports_failure_for_a_malformed_response_body_from_the_provider() {
+    let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reports_failure_for_a_malformed_response_body_from_the_provider",
+            "evidence that a malformed (non-JSON) 200 response body from the Responses Provider is surfaced as a failure",
+        );
+        return;
+    };
+    let response = raw_response("200 OK", "this is not valid json {{{");
+    let observed_success =
+        observed_successful_turn_against_mock_response(&binary, "real_app_server_malformed", response);
+    assert!(
+        !observed_success,
+        "a malformed, non-JSON 200 response body from the Responses Provider must never be reported as a \
+         successful turn/completed"
+    );
+}
+
+#[test]
+fn real_app_server_reports_failure_for_a_responses_api_incompatible_body_from_the_provider() {
+    let Ok(binary) = std::env::var("HANE_TEST_CODEX_APP_SERVER_BIN") else {
+        print_real_app_server_evidence_skipped(
+            "real_app_server_reports_failure_for_a_responses_api_incompatible_body_from_the_provider",
+            "evidence that a well-formed JSON 200 response shaped like the (incompatible) Chat Completions API, \
+             instead of the Responses API, from the Responses Provider is surfaced as a failure",
+        );
+        return;
+    };
+    // Well-formed JSON, but shaped like a Chat Completions response
+    // (`choices[].message`) rather than the Responses API's `output[]` this
+    // Custom Provider config declares `wire_api = "responses"` for.
+    let response = json_response(
+        "200 OK",
+        &serde_json::json!({
+            "id": "chatcmpl_test",
+            "object": "chat.completion",
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}
+            ]
+        }),
+    );
+    let observed_success =
+        observed_successful_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
+    assert!(
+        !observed_success,
+        "a Responses-API-incompatible (Chat Completions shaped) response body must never be reported as a \
+         successful turn/completed"
+    );
 }

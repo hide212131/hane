@@ -18,7 +18,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::atomic_file::atomic_write_bytes;
+use crate::atomic_file::{atomic_write_bytes, AtomicWriteError};
 
 /// The `model_providers` table key and `model_provider` selector Hane's
 /// generated config always uses for the Custom Provider connection.
@@ -214,13 +214,52 @@ pub fn build_custom_provider_material(
     })
 }
 
+/// The outcome of a failed [`write_codex_config`]: mirrors
+/// [`AtomicWriteError`] (see [`crate::settings::SaveError::PersistedDurabilityUnconfirmed`]
+/// for the same distinction applied to the `AiSettings` file) so callers can
+/// tell a write that never took effect apart from one whose `rename` already
+/// landed — `config.toml` may already reference the new Base URL/model/env
+/// key — but whose parent-directory crash-durability fsync could not be
+/// confirmed. Callers must not treat the latter like the former (e.g. by
+/// deleting a credential the already-visible new config may now reference).
+#[derive(Debug)]
+pub enum WriteCodexConfigError {
+    /// The write never took effect: `config.toml` (if it existed) still has
+    /// its previous contents, or `codex_home` itself could not be created.
+    Io(io::Error),
+    /// The atomic replace's `rename` already landed, but the parent
+    /// directory's own crash-durability fsync could not be confirmed.
+    PersistedDurabilityUnconfirmed(io::Error),
+}
+
+impl std::fmt::Display for WriteCodexConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteCodexConfigError::Io(e) => write!(f, "I/O error writing Custom Provider config: {e}"),
+            WriteCodexConfigError::PersistedDurabilityUnconfirmed(e) => write!(
+                f,
+                "Custom Provider config replace may have already taken effect, but its crash-durability \
+                 could not be confirmed: {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteCodexConfigError {}
+
 /// Writes the generated config to `<codex_home>/config.toml` via an atomic
 /// same-filesystem replace, so a reader (including the App Server itself, if
 /// it were ever started concurrently with a regeneration) never observes a
 /// torn file.
-pub fn write_codex_config(codex_home: &Path, config_toml: &str) -> io::Result<()> {
-    std::fs::create_dir_all(codex_home)?;
-    atomic_write_bytes(&codex_home.join("config.toml"), config_toml.as_bytes())
+pub fn write_codex_config(codex_home: &Path, config_toml: &str) -> Result<(), WriteCodexConfigError> {
+    std::fs::create_dir_all(codex_home).map_err(WriteCodexConfigError::Io)?;
+    match atomic_write_bytes(&codex_home.join("config.toml"), config_toml.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(AtomicWriteError::NotPersisted(e)) => Err(WriteCodexConfigError::Io(e)),
+        Err(AtomicWriteError::RenameSucceededSyncFailed(e)) => {
+            Err(WriteCodexConfigError::PersistedDurabilityUnconfirmed(e))
+        }
+    }
 }
 
 #[cfg(test)]

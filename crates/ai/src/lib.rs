@@ -20,7 +20,7 @@ mod settings_lock;
 
 pub use connect::{
     build_runtime_config_for_active_connection, call_with_generation_check, delete_custom_credential,
-    recover_at_startup, update_custom_credential, ConfiguredRuntime, ConnectError,
+    recover_at_startup, update_custom_credential, with_generation_checked_lock, ConfiguredRuntime, ConnectError,
 };
 pub use credential_journal::{
     recover as recover_credential_journal, CredentialJournal, CredentialOperation, JournalOperationKind,
@@ -31,8 +31,8 @@ pub use paths::AiPaths;
 pub use protocol::{ErrorObject, IncomingMessage, ParseError, RequestId};
 pub use provider::{
     build_custom_provider_material, generate_custom_provider_toml, validate_base_url, write_codex_config,
-    CustomProviderConfigError, CustomProviderMaterial, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
-    CUSTOM_PROVIDER_ID,
+    CustomProviderConfigError, CustomProviderMaterial, ShellEnvironmentPolicyFormat, WriteCodexConfigError,
+    CUSTOM_PROVIDER_ENV_KEY, CUSTOM_PROVIDER_ID,
 };
 pub use rpc::{RejectAllServerRequests, RpcError, RpcEvent, ServerRequestHandler};
 pub use runtime::{

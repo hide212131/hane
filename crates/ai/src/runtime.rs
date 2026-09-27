@@ -268,6 +268,12 @@ struct ActiveChild {
 
 enum LifecycleCommand {
     Start,
+    /// Starts the runtime using an owner lock guard the caller already
+    /// acquired itself (e.g. to guard an out-of-runtime `AiSettings` save
+    /// per ADR-0032 section 8), carrying that exact same guard over to this
+    /// coordinator instead of releasing it and letting `do_start` acquire a
+    /// fresh one. See [`AiRuntime::start_with_owner_lock`].
+    StartWithOwnerLock(OwnerLockGuard),
     Stop,
     Restart,
     /// Switches the coordinator's own `RuntimeConfig` to a new one (e.g. a
@@ -280,6 +286,10 @@ enum LifecycleCommand {
 enum CoordinatorMessage {
     Lifecycle(LifecycleCommand, Sender<Result<RuntimeStatus, RuntimeError>>),
     ChildEnded { generation: u64, operation_generation: u64 },
+    /// Runs `f` synchronously on the coordinator thread, passing it the
+    /// owner lock guard this coordinator currently holds (if any). See
+    /// [`AiRuntime::with_owner_lock`].
+    WithOwnerLock(Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>),
     Shutdown,
 }
 
@@ -434,6 +444,51 @@ impl AiRuntime {
         self.send_lifecycle(LifecycleCommand::Reconfigure(new_config))
     }
 
+    /// Starts the runtime using a runtime owner lock guard the caller
+    /// already acquired itself, e.g. immediately after using it to guard an
+    /// out-of-runtime `AiSettings` save per ADR-0032 section 8 ("runtime
+    /// owner lock → AI settings lock" order, with the save-then-start
+    /// sequence holding the same guard throughout). Unlike [`Self::start`],
+    /// this never attempts its own fresh acquisition: the exact same guard
+    /// is carried over to the coordinator thread and held continuously, so
+    /// no other process can ever observe the lock as free between the
+    /// settings save and this runtime becoming its owner. If this runtime is
+    /// already `Ready`, `owner` is simply dropped (releasing whatever
+    /// separate OS lock file handle it held) and the current status is
+    /// returned, exactly like [`Self::start`].
+    pub fn start_with_owner_lock(&self, owner: OwnerLockGuard) -> Result<RuntimeStatus, RuntimeError> {
+        self.send_lifecycle(LifecycleCommand::StartWithOwnerLock(owner))
+    }
+
+    /// Runs `f` synchronously on this runtime's own lifecycle coordinator
+    /// thread, passing it `Some(&OwnerLockGuard)` if this `AiRuntime` is
+    /// currently the runtime owner (actively running or between an
+    /// unconfirmed stop and a later start where the guard is still carried
+    /// over), or `None` otherwise. Per ADR-0032 section 8's "runtime owner
+    /// lock → AI settings lock" order, this is how a caller performs an
+    /// `AiSettings` save while this process's own active runtime already
+    /// owns the runtime owner lock, without needing (and being unable to,
+    /// per OS `flock` semantics, which treat a second independently opened
+    /// file handle to the same lock file as a distinct holder even within
+    /// the same process) a second, independent acquisition of the same lock
+    /// file. Serialized with every other lifecycle command on the same
+    /// coordinator thread, so `f` can never observe the guard disappearing
+    /// partway through.
+    pub fn with_owner_lock<F, R>(&self, f: F) -> Result<R, RuntimeError>
+    where
+        F: FnOnce(Option<&OwnerLockGuard>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        let boxed: Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send> = Box::new(move |owner| {
+            let _ = tx.send(f(owner));
+        });
+        self.cmd_tx
+            .send(CoordinatorMessage::WithOwnerLock(boxed))
+            .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+        rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)
+    }
+
     /// Sends a request while the runtime is `Ready`. Runs on the calling
     /// thread against the current generation's transport, independent of
     /// the lifecycle coordinator, so it never blocks a concurrent stop or
@@ -564,6 +619,7 @@ fn run_coordinator(
                                     &mut current,
                                     &mut generation,
                                     &mut owner_guard,
+                                    None,
                                     &config,
                                     &handler,
                                     &events_tx,
@@ -575,6 +631,19 @@ fn run_coordinator(
                             Err(e) => Some(Err(e)),
                         }
                     }
+                    LifecycleCommand::StartWithOwnerLock(owner) => do_start(
+                        op_gen,
+                        &mut current,
+                        &mut generation,
+                        &mut owner_guard,
+                        Some(owner),
+                        &config,
+                        &handler,
+                        &events_tx,
+                        &self_tx,
+                        &shared,
+                        &reply,
+                    ),
                     other => handle_lifecycle(
                         other,
                         op_gen,
@@ -592,6 +661,9 @@ fn run_coordinator(
                 if let Some(result) = result {
                     let _ = reply.send(result);
                 }
+            }
+            CoordinatorMessage::WithOwnerLock(f) => {
+                f(owner_guard.as_ref());
             }
             CoordinatorMessage::ChildEnded {
                 generation: g,
@@ -667,7 +739,7 @@ fn handle_lifecycle(
 ) -> Option<Result<RuntimeStatus, RuntimeError>> {
     match cmd {
         LifecycleCommand::Start => do_start(
-            op_gen, current, generation, owner_guard, config, handler, events_tx, self_tx, shared, reply,
+            op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
         ),
         LifecycleCommand::Stop => Some(stop_active(
             current,
@@ -697,11 +769,14 @@ fn handle_lifecycle(
                 return Some(Err(e));
             }
             do_start(
-                op_gen, current, generation, owner_guard, config, handler, events_tx, self_tx, shared, reply,
+                op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
             )
         }
         LifecycleCommand::Reconfigure(_) => {
             unreachable!("Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle")
+        }
+        LifecycleCommand::StartWithOwnerLock(_) => {
+            unreachable!("StartWithOwnerLock is handled directly in run_coordinator, before reaching handle_lifecycle")
         }
     }
 }
@@ -716,6 +791,7 @@ fn do_start(
     current: &mut Option<ActiveChild>,
     generation: &mut u64,
     owner_guard: &mut Option<OwnerLockGuard>,
+    external_owner: Option<OwnerLockGuard>,
     config: &RuntimeConfig,
     handler: &Arc<dyn ServerRequestHandler>,
     events_tx: &SyncSender<RuntimeEvent>,
@@ -726,6 +802,13 @@ fn do_start(
     if current.is_some() {
         let status = read_status(shared);
         if status.state == RuntimeState::Ready {
+            // Already running under this coordinator's own owner lock: an
+            // `external_owner` supplied here (only possible via
+            // `StartWithOwnerLock`) is redundant and is simply dropped here,
+            // releasing whatever separate OS lock file handle it held. It
+            // must never be assigned to `owner_guard`, which would replace
+            // (and thereby release) the guard actually backing the
+            // already-active child.
             return Some(Ok(status));
         }
         // A previous stop attempt could not confirm the old child had
@@ -751,24 +834,29 @@ fn do_start(
     // no window for a different Hane process to become the owner in
     // between. Every other caller reaches this with `owner_guard` already
     // `None` (the invariant the `current.is_some()` branch above restores it
-    // to before falling through), so this is a genuinely fresh acquisition
-    // for `Start`/`Stop`/`Restart`.
+    // to before falling through). `external_owner` is `Some` only for
+    // `StartWithOwnerLock`, carrying over a guard the caller acquired itself
+    // before this coordinator ever existed; every other caller passes
+    // `None` here, falling through to a genuinely fresh acquisition.
     let guard = match owner_guard.take() {
         Some(carried) => carried,
-        None => {
-            let lock = OwnerLock::new(&config.owner_lock_path);
-            match lock.try_acquire() {
-                Ok(Some(g)) => g,
-                Ok(None) => {
-                    set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
-                    return Some(Err(RuntimeError::OwnerLockUnavailable));
-                }
-                Err(e) => {
-                    set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
-                    return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
+        None => match external_owner {
+            Some(external) => external,
+            None => {
+                let lock = OwnerLock::new(&config.owner_lock_path);
+                match lock.try_acquire() {
+                    Ok(Some(g)) => g,
+                    Ok(None) => {
+                        set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
+                        return Some(Err(RuntimeError::OwnerLockUnavailable));
+                    }
+                    Err(e) => {
+                        set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
+                        return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
+                    }
                 }
             }
-        }
+        },
     };
 
     *generation += 1;
@@ -1272,6 +1360,30 @@ mod tests {
     fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
         let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
         assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
+    }
+
+    #[test]
+    fn with_owner_lock_reports_none_before_the_runtime_ever_starts() {
+        use crate::rpc::RejectAllServerRequests;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-with-owner-lock-test-{}-{}",
+            std::process::id(),
+            "with_owner_lock_reports_none_before_the_runtime_ever_starts"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+        let (events_tx, _events_rx) = mpsc::sync_channel(8);
+        let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+        let runtime = AiRuntime::spawn(config, handler, events_tx);
+
+        // Never started: no `Start`/`StartWithOwnerLock` was ever issued, so
+        // this coordinator does not (and must not) hold the owner lock yet.
+        let has_owner = runtime.with_owner_lock(|owner| owner.is_some()).unwrap();
+        assert!(!has_owner, "no owner lock should be held before Start is ever issued");
+
+        let _ = runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

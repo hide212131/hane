@@ -22,6 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists, AtomicWriteError};
+use crate::owner_lock::OwnerLockGuard;
 use crate::secrets::CredentialRef;
 use crate::settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock};
 
@@ -196,8 +197,18 @@ impl AiSettingsStore {
     /// 7.3. `journal_is_empty` is invoked under the freshly acquired
     /// exclusive lock, so a concurrent credential operation cannot begin
     /// between that check and this write landing.
+    ///
+    /// `owner` proves the caller already holds the runtime owner lock,
+    /// enforcing ADR-0032 section 8's fixed "runtime owner lock → AI
+    /// settings lock" acquisition order at the type level: there is no way
+    /// to reach this method (or [`Self::write_while_locked`]) without first
+    /// obtaining an [`OwnerLockGuard`] via [`crate::owner_lock::OwnerLock::try_acquire`]
+    /// or [`crate::runtime::AiRuntime::with_owner_lock`]/`start_with_owner_lock`,
+    /// each of which itself rejects a non-owner. Not otherwise inspected
+    /// here; it exists purely as a compile-time proof of possession.
     pub fn save(
         &self,
+        owner: &OwnerLockGuard,
         expected_revision: u64,
         new_settings: AiSettings,
         journal_is_empty: impl FnOnce() -> io::Result<bool>,
@@ -208,7 +219,7 @@ impl AiSettingsStore {
             return Err(SaveError::PendingCredentialJournal);
         }
 
-        self.write_while_locked(&guard, expected_revision, new_settings)
+        self.write_while_locked(owner, &guard, expected_revision, new_settings)
     }
 
     /// Performs the read-current/check-`revision`/atomic-replace write
@@ -229,13 +240,17 @@ impl AiSettingsStore {
     /// the credential journal recovery path intentionally calls this while
     /// its own journal entry is still pending, since recovering that entry
     /// is exactly what is retrying this write.
+    ///
+    /// `owner` is the same runtime-owner-lock proof [`Self::save`] requires;
+    /// see its documentation.
     pub fn write_while_locked(
         &self,
+        owner: &OwnerLockGuard,
         guard: &AiSettingsExclusiveGuard,
         expected_revision: u64,
         mut new_settings: AiSettings,
     ) -> Result<AiSettings, SaveError> {
-        let _ = guard;
+        let _ = (owner, guard);
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
             return Err(SaveError::RevisionConflict { current });
@@ -274,9 +289,18 @@ mod tests {
         dir
     }
 
-    fn store(name: &str) -> AiSettingsStore {
+    /// Returns a fresh store together with an already-acquired runtime owner
+    /// lock guard for the same unique directory, standing in for a caller
+    /// that (per ADR-0032 section 8) has already established itself as the
+    /// runtime owner before ever calling [`AiSettingsStore::save`].
+    fn store(name: &str) -> (AiSettingsStore, OwnerLockGuard) {
         let dir = unique_dir(name);
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"))
+        let store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+        let owner = crate::owner_lock::OwnerLock::new(dir.join("owner.lock"))
+            .try_acquire()
+            .unwrap()
+            .unwrap();
+        (store, owner)
     }
 
     fn always_empty_journal() -> io::Result<bool> {
@@ -285,18 +309,18 @@ mod tests {
 
     #[test]
     fn load_without_a_saved_file_returns_defaults() {
-        let store = store("defaults");
+        let (store, _owner) = store("defaults");
         let loaded = store.load().unwrap();
         assert_eq!(loaded, AiSettings::default());
     }
 
     #[test]
     fn save_persists_and_advances_revision() {
-        let store = store("persist");
+        let (store, owner) = store("persist");
         let mut settings = AiSettings::default();
         settings.chatgpt.model_id = Some("gpt-test".to_string());
 
-        let saved = store.save(0, settings, always_empty_journal).unwrap();
+        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
         assert_eq!(saved.revision, 1);
         assert_eq!(saved.settings_generation, 1);
 
@@ -306,7 +330,7 @@ mod tests {
 
     #[test]
     fn display_name_only_change_advances_revision_but_not_settings_generation() {
-        let store = store("display_name_only");
+        let (store, owner) = store("display_name_only");
         let custom = CustomConnectionSettings {
             id: "conn-1".to_string(),
             name: "My Provider".to_string(),
@@ -317,12 +341,12 @@ mod tests {
         let mut settings = AiSettings::default();
         settings.active_connection = ActiveConnection::Custom;
         settings.custom = Some(custom.clone());
-        let saved = store.save(0, settings, always_empty_journal).unwrap();
+        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
         assert_eq!(saved.settings_generation, 1);
 
         let mut renamed = saved.clone();
         renamed.custom.as_mut().unwrap().name = "Renamed Provider".to_string();
-        let saved_again = store.save(saved.revision, renamed, always_empty_journal).unwrap();
+        let saved_again = store.save(&owner, saved.revision, renamed, always_empty_journal).unwrap();
 
         assert_eq!(saved_again.revision, 2);
         assert_eq!(saved_again.settings_generation, 1, "a display-name-only change must not bump settings_generation");
@@ -330,7 +354,7 @@ mod tests {
 
     #[test]
     fn base_url_change_advances_settings_generation() {
-        let store = store("base_url_change");
+        let (store, owner) = store("base_url_change");
         let custom = CustomConnectionSettings {
             id: "conn-1".to_string(),
             name: "My Provider".to_string(),
@@ -341,27 +365,27 @@ mod tests {
         let mut settings = AiSettings::default();
         settings.active_connection = ActiveConnection::Custom;
         settings.custom = Some(custom.clone());
-        let saved = store.save(0, settings, always_empty_journal).unwrap();
+        let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
 
         let mut changed = saved.clone();
         changed.custom.as_mut().unwrap().base_url = "https://other.example/v1".to_string();
-        let saved_again = store.save(saved.revision, changed, always_empty_journal).unwrap();
+        let saved_again = store.save(&owner, saved.revision, changed, always_empty_journal).unwrap();
 
         assert_eq!(saved_again.settings_generation, saved.settings_generation + 1);
     }
 
     #[test]
     fn stale_expected_revision_is_rejected_and_does_not_overwrite() {
-        let store = store("stale_revision");
+        let (store, owner) = store("stale_revision");
         let mut first = AiSettings::default();
         first.chatgpt.model_id = Some("gpt-a".to_string());
-        let saved_first = store.save(0, first, always_empty_journal).unwrap();
+        let saved_first = store.save(&owner, 0, first, always_empty_journal).unwrap();
 
         // A second writer reads the same starting point (revision 0) and
         // tries to save with a snapshot that is now stale.
         let mut stale = AiSettings::default();
         stale.chatgpt.model_id = Some("gpt-b".to_string());
-        let err = store.save(0, stale, always_empty_journal).unwrap_err();
+        let err = store.save(&owner, 0, stale, always_empty_journal).unwrap_err();
         match err {
             SaveError::RevisionConflict { current } => assert_eq!(current, saved_first),
             other => panic!("expected RevisionConflict, got {other:?}"),
@@ -373,20 +397,20 @@ mod tests {
 
     #[test]
     fn save_is_rejected_immediately_while_a_shared_holder_exists() {
-        let store = store("busy_shared_holder");
+        let (store, owner) = store("busy_shared_holder");
         let shared = store.settings_lock().try_acquire_shared().unwrap().unwrap();
 
-        let err = store.save(0, AiSettings::default(), always_empty_journal).unwrap_err();
+        let err = store.save(&owner, 0, AiSettings::default(), always_empty_journal).unwrap_err();
         assert!(matches!(err, SaveError::Busy));
 
         drop(shared);
-        store.save(0, AiSettings::default(), always_empty_journal).unwrap();
+        store.save(&owner, 0, AiSettings::default(), always_empty_journal).unwrap();
     }
 
     #[test]
     fn save_is_rejected_while_a_credential_journal_entry_is_pending() {
-        let store = store("pending_journal");
-        let err = store.save(0, AiSettings::default(), || Ok(false)).unwrap_err();
+        let (store, owner) = store("pending_journal");
+        let err = store.save(&owner, 0, AiSettings::default(), || Ok(false)).unwrap_err();
         assert!(matches!(err, SaveError::PendingCredentialJournal));
         // Nothing was written.
         assert_eq!(store.load().unwrap(), AiSettings::default());
@@ -402,12 +426,12 @@ mod tests {
         // `crate::connect::update_custom_credential` does not mistake this
         // for "nothing happened" and delete a resource the new settings
         // already reference.
-        let store = store("ambiguous_durability");
+        let (store, owner) = store("ambiguous_durability");
         crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
 
         let mut settings = AiSettings::default();
         settings.chatgpt.model_id = Some("gpt-test".to_string());
-        let err = store.save(0, settings.clone(), always_empty_journal).unwrap_err();
+        let err = store.save(&owner, 0, settings.clone(), always_empty_journal).unwrap_err();
         match err {
             SaveError::PersistedDurabilityUnconfirmed(_) => {}
             other => panic!("expected PersistedDurabilityUnconfirmed, got {other:?}"),
