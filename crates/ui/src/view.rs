@@ -88,6 +88,7 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 mod sidebar;
+#[cfg(test)]
 use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};
 
 const METRICS_CAPACITY: usize = 4_096;
