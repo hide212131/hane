@@ -734,6 +734,63 @@ fn cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart() {
 }
 
 #[test]
+fn crash_cleanup_signals_shutdown_before_waiting_out_the_full_grace_timeout() {
+    // When the reader thread observes the transport close (e.g. a crashed
+    // communication channel or a server-request handler panic) while the
+    // child process itself is still alive and blocked reading its own
+    // stdin, `reap_and_mark_failed` must proactively close this client's
+    // write side (`request_shutdown`) *before* running the stop sequence,
+    // exactly like `stop_active` already does for an explicit stop. Without
+    // that, the child never observes stdin EOF and has no way to exit
+    // voluntarily, so cleanup sits out the entire grace period before
+    // escalating to a forced kill. `close_stdout_after_initialize`
+    // reproduces "reader EOF without the process actually exiting"
+    // deterministically: the fake server closes its stdout write side right
+    // after answering `initialize` (triggering the crash-detection path)
+    // but keeps blocking on its own stdin read loop, exiting only once that
+    // stdin sees EOF.
+    let grace_timeout = Duration::from_secs(3);
+    let mut config = base_config("crash_cleanup_signals_shutdown");
+    config.stop_grace_timeout = grace_timeout;
+    config.stop_force_timeout = Duration::from_secs(3);
+    config.extra_env.push((
+        "FAKE_SERVER_MODE".to_string(),
+        "close_stdout_after_initialize".to_string(),
+    ));
+    let (runtime, _events) = spawn_runtime(config);
+
+    let status = runtime.start().expect("start should succeed");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    // The crash-cleanup path runs asynchronously once the reader thread
+    // observes the closed transport; wait (bounded) for it to land on
+    // `Failed`, timing from when that wait begins.
+    let started = std::time::Instant::now();
+    let mut status = runtime.snapshot();
+    while status.state != RuntimeState::Failed && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+        status = runtime.snapshot();
+    }
+    assert_eq!(status.state, RuntimeState::Failed);
+
+    // `restart_blocked` staying false means cleanup actually confirmed the
+    // child exited (`StopOutcome::Exited`), not merely that a forced kill
+    // was attempted and left unconfirmed.
+    assert!(!status.restart_blocked);
+    assert!(
+        started.elapsed() < grace_timeout / 2,
+        "reaching a confirmed Failed took {:?}, which is not comfortably under half the \
+         {grace_timeout:?} grace timeout; the child should have exited promptly once cleanup \
+         closed its stdin instead of only being force-killed after the full grace period elapsed",
+        started.elapsed()
+    );
+
+    let restarted = runtime.start().expect("a later start should succeed once cleanup is confirmed");
+    assert_eq!(restarted.state, RuntimeState::Ready);
+    let _ = runtime.stop();
+}
+
+#[test]
 fn shutdown_does_not_release_the_owner_lock_until_the_unconfirmed_child_actually_exits() {
     // Same zero-timeout setup as
     // `cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart`,

@@ -923,10 +923,21 @@ fn reap_and_mark_failed(
     // the resulting `Failed` status is reported under the operation that had
     // spawned/owned the now-crashed child, rather than minting a new one.
     let op_gen = active.operation_generation;
+    // Publish `Failed` before running the stop sequence below: leaving the
+    // published state at `Ready` while cleanup is still in flight would let
+    // callers observe a stale, already-wrong status.
+    set_status(shared, RuntimeState::Failed, false, child_generation, op_gen);
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
     }
+
+    // Close our write side first: a well-behaved server treats stdin EOF as
+    // its cue to exit on its own. Without this, a reader-thread-detected EOF
+    // or a server-request handler panic can leave the child process itself
+    // still running with no shutdown signal, so `perform_stop_sequence` below
+    // would have to wait out the full grace timeout before it kills it.
+    active.transport.request_shutdown();
 
     let poll_interval = Duration::from_millis(20);
     let outcome = perform_stop_sequence(

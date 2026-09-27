@@ -14,6 +14,14 @@
 //!   receiving `initialize`, before replying.
 //! - `FAKE_SERVER_MODE=crash_mid_request`: exits immediately instead of
 //!   answering a `test/echo` request, to exercise mid-request failure.
+//! - `FAKE_SERVER_MODE=close_stdout_after_initialize`: replies to
+//!   `initialize` normally, then closes its stdout (fd 1) so the client's
+//!   reader observes EOF right away, but keeps running and blocking on its
+//!   own stdin read loop instead of exiting, only doing so once stdin
+//!   itself sees EOF. This reproduces "the reader thread observed the
+//!   transport close but the child process is still alive" (e.g. a crashed
+//!   communication channel, or a server-request handler panic) independent
+//!   of the child's own process exiting on its own.
 //! - `FAKE_SERVER_MODE=hold_echo`: replies to `initialize` normally but never
 //!   replies to a `test/echo` request, to exercise a call that is genuinely
 //!   still pending (as opposed to one that already completed) when the
@@ -160,6 +168,22 @@ fn main() {
                         serde_json::json!({"id": "srv-1", "method": "test/serverRequest", "params": {}});
                     if writeln!(stdout, "{request}").is_err() || stdout.flush().is_err() {
                         break;
+                    }
+                }
+                if mode == "close_stdout_after_initialize" {
+                    #[cfg(unix)]
+                    {
+                        // SAFETY: fd 1 is this process's own stdout, a valid
+                        // open file descriptor at this point. Closing it
+                        // directly (instead of just dropping `stdout`, which
+                        // only drops this handle's buffering, not the
+                        // underlying fd) deterministically delivers EOF to
+                        // the client's reader right away, while this process
+                        // keeps running and blocking on the stdin read loop
+                        // below.
+                        unsafe {
+                            libc::close(1);
+                        }
                     }
                 }
             }
