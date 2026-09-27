@@ -167,7 +167,13 @@ impl std::error::Error for RuntimeError {}
 /// outright rather than letting `std::process::Command` fall back to a
 /// `PATH` lookup). The standalone App Server binary is invoked directly with
 /// `--listen stdio://`: it has no `app-server` subcommand of its own.
-#[derive(Debug, Clone)]
+///
+/// `extra_env` can carry a Custom Provider API key (see `crate::provider`)
+/// for injection into this child only. `Debug` is implemented manually
+/// rather than derived so that a stray `{:?}` on this config (logs,
+/// diagnostics, panics) can never print a secret value placed there;
+/// `extra_env` keys are shown, values are not.
+#[derive(Clone)]
 pub struct RuntimeConfig {
     pub binary_path: PathBuf,
     pub args: Vec<String>,
@@ -177,6 +183,23 @@ pub struct RuntimeConfig {
     pub start_timeout: Duration,
     pub stop_grace_timeout: Duration,
     pub stop_force_timeout: Duration,
+}
+
+impl std::fmt::Debug for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_env: Vec<(&str, &str)> =
+            self.extra_env.iter().map(|(k, _)| (k.as_str(), "<redacted>")).collect();
+        f.debug_struct("RuntimeConfig")
+            .field("binary_path", &self.binary_path)
+            .field("args", &self.args)
+            .field("codex_home", &self.codex_home)
+            .field("extra_env", &redacted_env)
+            .field("owner_lock_path", &self.owner_lock_path)
+            .field("start_timeout", &self.start_timeout)
+            .field("stop_grace_timeout", &self.stop_grace_timeout)
+            .field("stop_force_timeout", &self.stop_force_timeout)
+            .finish()
+    }
 }
 
 impl RuntimeConfig {
@@ -1140,6 +1163,20 @@ mod tests {
     fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
         let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
         assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
+    }
+
+    #[test]
+    fn debug_formatting_never_prints_an_extra_env_secret_value() {
+        let mut config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        config
+            .extra_env
+            .push(("HANE_AI_PROVIDER_KEY".to_string(), "sk-super-secret-value".to_string()));
+        let formatted = format!("{config:?}");
+        assert!(formatted.contains("HANE_AI_PROVIDER_KEY"), "env var name should still be visible");
+        assert!(
+            !formatted.contains("sk-super-secret-value"),
+            "extra_env values must never appear in Debug output, got: {formatted}"
+        );
     }
 
     /// Deterministic (no real process, no real thread, no real sleep)
