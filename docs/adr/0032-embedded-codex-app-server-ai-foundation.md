@@ -192,6 +192,8 @@ Custom Provider用キーを一律に`account/login/start(type: apiKey)`へ渡す
 ```text
 AiSettings
   schema_version
+  revision
+  settings_generation
   active_connection: ChatGpt | Custom
   chatgpt.model_id
   custom.id / name / base_url / model_id / credential_ref
@@ -211,9 +213,24 @@ AiSettings
 
 キー削除も同じoperation journalを使い、旧CredentialRefを削除予定として永続化してから`credential_ref`を外した非秘密設定をatomic replaceし、その成功後に資格情報を削除する。これにより新規資格情報の作成直後、設定切替直後、削除失敗のいずれで異常終了しても、Haneが作成した資格情報を次回起動時に追跡できる。
 
-資格情報の更新・削除操作は直列化する。未完了のcredential operation journalが1件でもある間は、新しいキー変更・キー削除・接続設定変更のうちCredentialRefを変更する操作を開始しない。まず起動時と設定画面表示時に既存journalの復旧を実行し、設定変更と不要資格情報の削除が完了してjournalが消えた後だけ次の操作を受け付ける。復旧が継続して失敗する場合は「資格情報の復旧が必要」と表示し、新しい資格情報操作を拒否する。これにより`A→B`が未完了のまま`B→C`を開始して、先行journalの参照関係を失う状態を作らない。
+資格情報の更新・削除だけでなく、`AiSettings`への全書込みを同じ排他制御に通す。プロセス内では保存処理を単一writerで直列化し、さらに複数Haneプロセスが同じアプリデータ領域を共有しても競合しないよう、AI設定用のOSプロセス間排他ロックを設ける。
 
-設定エラーを黙ってデフォルト接続へ戻さない。
+プロセス間ロックは、PIDファイルの存在だけで所有権を表す方式ではなく、所有プロセス終了時にOSが解放でき、共有/排他モードを持つファイルロック等を用いる。
+
+- AI設定の変更、credential operation journalの復旧、現在設定の読込み、`revision`比較、資格情報操作、設定のatomic replace、journal更新というread-modify-write系列は**排他ロック**の所有下で行う。
+- 推論ターンと固定の接続確認は**共有ロック**を取得し、その所有下で永続`settings_generation`を読み、実行中App Serverの世代と一致して`Ready`であることを確認してから`turn/start`等を受理する。共有ロックはそのターンまたは接続確認が成功・失敗・キャンセルのいずれかで完了するまで保持する。
+- 設定保存は共有ロックが存在する間に待ち続けず、「AI処理中」として拒否する。したがって、接続確認中の設定保存も拒否し、設定変更のために接続確認を暗黙に中断しない。
+- 排他ロック取得後に共有ロックを新規取得できないため、設定変更の開始後に旧世代の新しい推論が受理されることもない。
+
+これにより、世代確認と`turn/start`受付の間に別Haneプロセスが設定を更新するTOCTOUを防ぎ、設定変更の完了後に旧Base URL、API key、モデルで新しい処理を開始しない。ロックを取得できない場合はAI設定を書き換えず、また推論受付側も設定世代を確認できないまま開始しない。
+
+書込み競合検出用の`revision`と、App Server起動設定用の`settings_generation`を分離する。`revision`は`custom.name`等の表示専用設定を含む、すべての`AiSettings`書込みが成功するたびに進める。保存要求は読み込んだ`revision`を`expected_revision`として渡し、プロセス間ロック取得後に永続化直前の現在値と一致することを再確認する。一致しなければ、古い画面スナップショットで`model_id`、`base_url`、`credential_ref`等を上書きせず、競合として保存を拒否して最新設定を再読込する。
+
+`settings_generation`は、接続方式、Base URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する変更が成功した場合だけ進める。表示名等の非ランタイム設定だけを変更した場合も`revision`は進むが、`settings_generation`は進めない。
+
+未完了のcredential operation journalが1件でもある間は、CredentialRefを変える操作だけでなく通常のAI設定保存も開始しない。まず起動時と設定画面表示時に既存journalの復旧を実行し、設定変更と不要資格情報の削除が完了してjournalが消えた後だけ次の`AiSettings`書込みを受け付ける。復旧が継続して失敗する場合は「資格情報の復旧が必要」と表示し、AI設定保存を拒否する。これにより`A→B`が未完了のまま`B→C`を開始する連鎖更新と、通常保存による古い設定スナップショットの上書きを防ぐ。
+
+設定エラーや世代競合を黙ってデフォルト接続へ戻さない。
 
 ## 8. 接続方式と保存領域の分離
 
@@ -227,11 +244,21 @@ AiSettings
   probe-workspace/ ← 接続確認専用の空の作業領域
 ```
 
-両接続のCODEX_HOMEを分離し、同時に動くランタイムはまず1個とする。切替時は実行中ターンの完了またはユーザー操作による中断を待ち、旧プロセスを終了して新設定で起動する。
+両接続のCODEX_HOMEを分離し、同時に動くApp Server runtimeはアプリデータ領域ごとに1個とする。これを保証するため、AI設定の共有/排他ロックとは別に**runtime owner lock**を設ける。runtime owner lockは所有プロセス終了時にOSが解放できるプロセス間ロックとし、App Serverの起動・停止・再起動はそのロックを所有するHaneプロセスだけが実行する。PIDファイルだけで所有権を表さない。
+
+接続方式の切替だけでなく、Custom ProviderのBase URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する`AiSettings`が変わった場合も`settings_generation`を進める。共有ロック中は設定保存自体を拒否するため、保存成功時点では実行中ターンや接続確認は存在しない。
+
+永続設定の保存成功と、実行中App Serverへの設定反映完了を同一視しない。ランタイムは自分が起動した`settings_generation`を保持する。新しい推論・接続確認の受付時には上記の共有設定ロックを取得し、そのロックの所有下で永続`AiSettings.settings_generation`との一致と`Ready`を再確認する。
+
+世代不一致またはruntime不在を検出した場合は要求を開始せず、共有設定ロックを解放してruntime owner lockの取得を試みる。owner lockを取得したプロセスは、取得後に永続設定の`settings_generation`と現在のApp Serverの世代・`Ready`・通信経路を再確認し、未反映または利用不能である場合だけ旧App Serverを停止して新設定で起動する。すでに別プロセスが反映済みなら重複再起動しない。
+
+runtime owner lockを取得できないプロセスはApp Serverを起動・停止・再起動しない。所有プロセスが設定反映を終えた後に、共有設定ロックを取り直して世代と`Ready`を再確認し、受付判定をやり直す。所有プロセスが終了した場合は、次にowner lockを取得したプロセスが永続設定世代と通信経路を再確認し、必要な起動または再接続を行う。
+
+API keyを子プロセス環境変数へ注入する方式では、同じプロセスのまま新しい会話を作るだけではキーを差し替えられないため、`settings_generation`変更時のruntime再生成は省略しない。
 
 HOME/USERPROFILEをこれらの領域へ置き換えない。外部Codexの設定やauth.jsonを取り込まない。ChatGPT資格情報をCustom接続先へ送らない。Custom障害や利用上限時に、別課金経路へ自動フォールバックしない。
 
-将来の各会話はconnection_idと設定世代に紐付ける。接続先やキーの変更後、以前の会話を新しい接続先へ暗黙に継続しない。新しい会話にするか、明示した切替操作を必要とする。
+将来の各会話はconnection_idと`settings_generation`に紐付ける。接続先、キー、またはランタイムへ影響する設定の変更後、以前の会話を新しい設定世代へ暗黙に継続しない。設定変更を反映したApp Serverの再起動完了後に新しい会話を開始するか、明示した再接続操作を必要とする。
 
 CODEX_HOMEはOS sandboxではなく、状態保存先の分離である。Codexには設定の優先順位やproject configがある。初期はユーザーの文書フォルダをcwdにせず、Hane管理領域で起動する。Provider/送信先/認証方式はHaneから明示してeffective configを検査する。組織の強制ポリシーは回避せず、競合はエラー表示する。[S5]
 
