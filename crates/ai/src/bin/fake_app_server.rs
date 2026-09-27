@@ -14,6 +14,12 @@
 //!   receiving `initialize`, before replying.
 //! - `FAKE_SERVER_MODE=crash_mid_request`: exits immediately instead of
 //!   answering a `test/echo` request, to exercise mid-request failure.
+//! - `FAKE_SERVER_MODE=hold_echo`: replies to `initialize` normally but never
+//!   replies to a `test/echo` request, to exercise a call that is genuinely
+//!   still pending (as opposed to one that already completed) when the
+//!   client asks to stop. Paired with `FAKE_SERVER_ECHO_RECEIVED_FILE=<path>`,
+//!   which is appended with `ECHO_RECEIVED` as soon as the request is read,
+//!   so a test can wait for that instead of assuming a fixed delay.
 //! - `FAKE_SERVER_EMIT_SERVER_REQUEST=1`: after replying to `initialize`,
 //!   sends an unsolicited server-to-client request to exercise the "never
 //!   auto-approve" contract.
@@ -53,6 +59,7 @@ fn main() {
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
+    let echo_received_file = env::var("FAKE_SERVER_ECHO_RECEIVED_FILE").ok();
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
@@ -125,6 +132,12 @@ fn main() {
             (Some(id), Some(method)) if method == "test/echo" => {
                 if mode == "crash_mid_request" {
                     std::process::exit(1);
+                }
+                if mode == "hold_echo" {
+                    if let Some(path) = &echo_received_file {
+                        append_record(path, "ECHO_RECEIVED");
+                    }
+                    continue;
                 }
                 let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
                 let response = serde_json::json!({"id": id, "result": params});

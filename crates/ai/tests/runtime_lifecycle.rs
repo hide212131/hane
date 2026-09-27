@@ -311,7 +311,23 @@ fn initialize_sends_schema_compliant_params_and_the_initialized_notification() {
     let status = runtime.start().expect("start should succeed");
     assert_eq!(status.state, RuntimeState::Ready);
 
-    let recorded = std::fs::read_to_string(&record_file).unwrap();
+    // `runtime.start()` returns once the `initialized` notification has been
+    // handed to the bounded writer queue, not once the writer thread has
+    // actually flushed it to the child's stdin and the fake server has read
+    // and recorded it. Wait for that record to actually appear (bounded)
+    // instead of assuming it is already there by the time `start()` returns.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let recorded = loop {
+        let contents = std::fs::read_to_string(&record_file).unwrap_or_default();
+        if contents.lines().count() >= 2 {
+            break contents;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake server never recorded the INITIALIZED notification; recorded so far: {contents:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let mut lines = recorded.lines();
 
     let params_line = lines.next().expect("init params should have been recorded");
@@ -360,10 +376,27 @@ fn stop_releases_pending_calls_immediately_instead_of_waiting_for_the_child_to_e
     // close to the whole grace period. Asserting the call fails in well
     // under that window is what actually distinguishes "released as soon
     // as stop begins" from "released once the child eventually exits".
+    //
+    // The normal fake server replies to `test/echo` immediately, which does
+    // not reliably keep the call pending long enough to observe that
+    // distinction (a fixed sleep before `stop()` is a guess about how fast
+    // the reply round-trips). `hold_echo` mode instead lets `initialize`
+    // succeed normally but never replies to `test/echo`, and records receipt
+    // of the request to a marker file so the test can wait for confirmation
+    // that the call is actually pending in the fake server before stopping.
     let grace_timeout = Duration::from_secs(3);
     let mut config = base_config("stop_releases_pending");
     config.stop_grace_timeout = grace_timeout;
     config.stop_force_timeout = Duration::from_secs(3);
+    let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
+    let echo_received_file = dir.join("echo_received.log");
+    config
+        .extra_env
+        .push(("FAKE_SERVER_MODE".to_string(), "hold_echo".to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_ECHO_RECEIVED_FILE".to_string(),
+        echo_received_file.display().to_string(),
+    ));
     config
         .extra_env
         .push(("FAKE_SERVER_IGNORE_STOP".to_string(), "1".to_string()));
@@ -380,9 +413,23 @@ fn stop_releases_pending_calls_immediately_instead_of_waiting_for_the_child_to_e
         (started.elapsed(), result)
     });
 
-    // Give the call a moment to actually register as pending before we ask
-    // the runtime to stop.
-    std::thread::sleep(Duration::from_millis(100));
+    // Wait (bounded) for the fake server to confirm it actually received the
+    // `test/echo` request and is holding it, instead of assuming a fixed
+    // sleep is long enough for the request to have registered as pending.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let received = std::fs::read_to_string(&echo_received_file)
+            .map(|s| s.contains("ECHO_RECEIVED"))
+            .unwrap_or(false);
+        if received {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake server never confirmed receiving the test/echo request"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let stopped = runtime.stop().expect("stop should still succeed via a forced kill");
     assert_eq!(stopped.state, RuntimeState::Stopped);
