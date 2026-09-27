@@ -14306,19 +14306,112 @@ mod tests {
         drop(view);
     }
 
-    #[gpui::test]
-    fn table_header_background_stays_inside_the_grid(cx: &mut gpui::TestAppContext) {
-        // Issue #294: the header tint used to paint the whole row's
-        // `w_full()` container, bleeding into the row's left/right margins
-        // outside the table instead of stopping at the grid's own borders.
-        let text = "| a | b |\n| --- | --- |\n| c | d |";
+    /// The header row's own line-horizontal padding and its first/last
+    /// column geometry, read from the same `BlockLayout` the renderer paints
+    /// from (see `table_row_element`'s `first.x`/`last.x + last.width`),
+    /// plus the row's own painted height.
+    fn header_row_grid_span(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (f32, f32, f32, f32) {
+        cx.update(|_, app| {
+            view.read_with(app, |editor_view, _| {
+                let (block_id, visual_line) = *editor_view
+                    .line_owners
+                    .get(&0)
+                    .expect("header line owner recorded");
+                let layout = &editor_view
+                    .layout_cache
+                    .get(&block_id)
+                    .expect("layout cached")
+                    .layout;
+                let row = layout
+                    .lines
+                    .iter()
+                    .find(|row| row.line == visual_line)
+                    .expect("header row layout exists");
+                let first = row.table_cells.first().expect("header row has cells");
+                let last = row.table_cells.last().expect("header row has cells");
+                (
+                    editor_view.theme.line_horizontal_padding,
+                    first.x,
+                    last.x + last.width,
+                    row.height,
+                )
+            })
+        })
+    }
+
+    /// Opens `text` (its first line must be a table header), forces the
+    /// document's Formal (table-aware) index and initial heights in place
+    /// synchronously instead of leaving them to the background reparse job,
+    /// and asserts the painted header background spans exactly from the
+    /// first column's left border to the last column's right border without
+    /// reaching the row's own left/right margins.
+    ///
+    /// Issue #294: the header tint used to paint the whole row's
+    /// `w_full()` container, bleeding into the row's left/right margins
+    /// outside the table instead of stopping at the grid's own borders.
+    fn assert_table_header_background_matches_grid(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+        resize: Option<gpui::Size<Pixels>>,
+    ) {
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        if let Some(size) = resize {
+            cx.simulate_resize(size);
+        }
+        cx.run_until_parked();
+
+        // A fresh view starts from a quick, non-table-aware index while the
+        // structure-aware reparse runs in the background; publish the Formal
+        // index and its heights synchronously so the header row and its
+        // background are guaranteed to already exist in the very first
+        // committed paint this test reads, instead of depending on that
+        // background job's completion timing.
+        view.update(cx, |view, _| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+        });
         cx.run_until_parked();
 
         let row_bounds = cx.debug_bounds("row-0-0").expect("header row painted");
         let background_bounds = cx
             .debug_bounds("table-header-background-0")
             .expect("header background painted");
+        let (padding, first_x, last_right, row_height) = header_row_grid_span(&view, cx);
+
+        let expected_left = f32::from(row_bounds.origin.x) + padding + first_x;
+        let expected_right = f32::from(row_bounds.origin.x) + padding + last_right;
+        let actual_left = f32::from(background_bounds.origin.x);
+        let actual_right = actual_left + f32::from(background_bounds.size.width);
+
+        assert!(
+            (actual_left - expected_left).abs() < 0.5,
+            "header background must start at the first column's left border: \
+             background={background_bounds:?} expected_left={expected_left}"
+        );
+        assert!(
+            (actual_right - expected_right).abs() < 0.5,
+            "header background must end at the last column's right border: \
+             background={background_bounds:?} expected_right={expected_right}"
+        );
+        assert!(
+            (f32::from(background_bounds.size.height) - row_height).abs() < 0.5,
+            "header background must span the row's full (possibly wrapped) height: \
+             background={background_bounds:?} row_height={row_height}"
+        );
 
         assert!(
             background_bounds.origin.x > row_bounds.origin.x,
@@ -14340,6 +14433,35 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
         drop(view);
+    }
+
+    #[gpui::test]
+    fn table_header_background_stays_inside_the_grid(cx: &mut gpui::TestAppContext) {
+        // Two columns, single-line cells: the minimal grid.
+        assert_table_header_background_matches_grid(
+            cx,
+            "| a | b |\n| --- | --- |\n| c | d |",
+            None,
+        );
+
+        // More than two columns, so the invariant is checked across an
+        // interior border too, not just the outer two.
+        assert_table_header_background_matches_grid(
+            cx,
+            "| Name | Count | Status |\n|:-----|------:|:------:|\n\
+             | Hane | 3 | Ready |\n| Long value | 120 | Working |",
+            None,
+        );
+
+        // A header cell long enough to wrap under a narrow width, so the
+        // physical header row's own height grows past a single line and the
+        // background must still track that taller, variable row height.
+        assert_table_header_background_matches_grid(
+            cx,
+            "| これは非常に長い日本語の見出しセルでありセル内で折り返される必要があります | short |\n\
+             | --- | --- |\n| c | d |",
+            Some(gpui::size(px(420.0), px(760.0))),
+        );
     }
 
     #[gpui::test]
