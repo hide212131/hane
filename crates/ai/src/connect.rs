@@ -93,7 +93,7 @@ pub enum ConnectError {
     /// proceeding would risk deleting a secret the current settings still
     /// depend on, so this is rejected before any journal/credential side
     /// effect instead of trusting the caller-supplied ref.
-    CredentialRefMismatch { current: AiSettings },
+    CredentialRefMismatch { current: Box<AiSettings> },
     /// `write_codex_config`'s atomic replace's `rename` already landed --
     /// `config.toml` may already reference the new Base URL/model/env key --
     /// but its parent directory's own crash-durability fsync could not be
@@ -218,7 +218,7 @@ pub fn update_custom_credential(
     // discarded.
     let current = settings_store.load().map_err(ConnectError::Io)?;
     if current.revision != expected_revision {
-        return Err(SaveError::RevisionConflict { current }.into());
+        return Err(SaveError::RevisionConflict { current: Box::new(current) }.into());
     }
     // Compare the full `Option<CredentialRef>`, not just the `Some` case:
     // `old_credential_ref == None` must also be rejected when current
@@ -231,7 +231,7 @@ pub fn update_custom_credential(
     // of cleaned up.
     let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
     if current_credential_ref != old_credential_ref {
-        return Err(ConnectError::CredentialRefMismatch { current });
+        return Err(ConnectError::CredentialRefMismatch { current: Box::new(current) });
     }
     let settings_generation_before = current.settings_generation;
 
@@ -322,11 +322,11 @@ pub fn delete_custom_credential(
     // would finish deleting a credential settings still depend on.
     let current = settings_store.load().map_err(ConnectError::Io)?;
     if current.revision != expected_revision {
-        return Err(SaveError::RevisionConflict { current }.into());
+        return Err(SaveError::RevisionConflict { current: Box::new(current) }.into());
     }
     let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
     if current_credential_ref.as_ref() != Some(&old_credential_ref) {
-        return Err(ConnectError::CredentialRefMismatch { current });
+        return Err(ConnectError::CredentialRefMismatch { current: Box::new(current) });
     }
     let settings_generation_before = current.settings_generation;
 

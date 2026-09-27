@@ -116,7 +116,7 @@ pub enum SaveError {
     /// The `expected_revision` the caller read no longer matches the
     /// persisted `revision`: another save landed in between. The caller must
     /// reload and must not blindly overwrite fields with a stale snapshot.
-    RevisionConflict { current: AiSettings },
+    RevisionConflict { current: Box<AiSettings> },
     /// A credential operation journal entry is still unresolved. Per section
     /// 7.3, no ordinary `AiSettings` save may proceed until journal recovery
     /// has completed and removed it.
@@ -295,7 +295,7 @@ impl AiSettingsStore {
         }
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
-            return Err(SaveError::RevisionConflict { current });
+            return Err(SaveError::RevisionConflict { current: Box::new(current) });
         }
 
         new_settings.schema_version = AI_SETTINGS_SCHEMA_VERSION;
@@ -428,7 +428,7 @@ mod tests {
         stale.chatgpt.model_id = Some("gpt-b".to_string());
         let err = store.save(&owner, 0, stale, always_empty_journal).unwrap_err();
         match err {
-            SaveError::RevisionConflict { current } => assert_eq!(current, saved_first),
+            SaveError::RevisionConflict { current } => assert_eq!(*current, saved_first),
             other => panic!("expected RevisionConflict, got {other:?}"),
         }
 
