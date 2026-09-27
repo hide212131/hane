@@ -549,23 +549,98 @@ fn raw_response(status_line: &str, body: &str) -> String {
     )
 }
 
-/// The fixed "completed" Responses API body the successful test path
-/// expects to see echoed back in `turn/completed`.
+/// A full raw HTTP/1.1 `text/event-stream` response whose body is the
+/// concatenation of one Server-Sent Event per `data:` line for each of
+/// `events`, in order. The Responses API (`wire_api = "responses"`) streams
+/// its reply this way rather than returning one plain JSON body: a bundled
+/// Codex App Server's Responses client expects this framing, and a plain
+/// `200 application/json` body with a fully "completed" response (as a
+/// non-streaming Responses/Chat-Completions-style reply would use) is never
+/// recognized as any event, so no `turn/completed` (nor any failure
+/// notification) is ever observed for it.
+fn sse_response(status_line: &str, events: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&event.to_string());
+        body.push_str("\n\n");
+    }
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// The fixed "completed" Responses API stream the successful test path
+/// expects to see echoed back, as `text`, in `turn/completed`: the standard
+/// OpenAI Responses API streaming event sequence for one simple assistant
+/// text message ("pong"), ending in the terminal `response.completed` event
+/// carrying the full response object.
 fn fixed_pong_response() -> String {
-    json_response(
+    let item = serde_json::json!({
+        "id": "msg_test",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "pong"}]
+    });
+    let completed_response = serde_json::json!({
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "output": [item]
+    });
+    sse_response(
         "200 OK",
-        &serde_json::json!({
-            "id": "resp_test",
-            "object": "response",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "pong"}]
-                }
-            ]
-        }),
+        &[
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_test", "object": "response", "status": "in_progress", "output": []}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "msg_test", "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+            }),
+            serde_json::json!({
+                "type": "response.content_part.added",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "pong"
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "pong"
+            }),
+            serde_json::json!({
+                "type": "response.content_part.done",
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "pong"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": item
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": completed_response
+            }),
+        ],
     )
 }
 
@@ -761,32 +836,52 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     let _ = runtime.stop();
 
     let recorded = recorded.lock().unwrap().take();
-    let recorded = recorded.expect("the mock Responses Provider should have observed exactly one request");
-    assert_eq!(recorded.method, "POST");
-    assert!(recorded.path.starts_with("/v1"), "request path should target the configured base_url: {}", recorded.path);
-    let auth = recorded.authorization.expect("request should carry an Authorization header");
-    assert_eq!(
-        auth, "Bearer sk-real-secret",
-        "request must be authenticated with exactly the configured Custom Provider key"
-    );
-    let body_json: serde_json::Value =
-        serde_json::from_str(&recorded.body).expect("the Responses API request body should be valid JSON");
-    assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "request must target exactly the configured model");
+    assert_mock_provider_received_the_probe_request(recorded, "fixed pong success case");
+}
+
+/// Asserts that the mock Responses Provider actually received exactly one
+/// request shaped like a genuine Custom Provider probe -- `POST` to a path
+/// under the configured `base_url`, authenticated with exactly the
+/// configured key, and targeting exactly the configured model -- before a
+/// caller goes on to check how the turn's outcome was surfaced. Without this,
+/// a `turn/start` RPC error or a timeout that occurs *before* the App Server
+/// ever reaches the Responses Provider would let a failure test pass without
+/// having exercised the Provider-error path it claims to.
+fn assert_mock_provider_received_the_probe_request(recorded: Option<RecordedRequest>, context: &str) {
+    let recorded = recorded
+        .unwrap_or_else(|| panic!("{context}: the mock Responses Provider should have observed exactly one request"));
+    assert_eq!(recorded.method, "POST", "{context}: request method");
+    assert!(recorded.path.starts_with("/v1"), "{context}: request path should target the configured base_url: {}", recorded.path);
+    let auth = recorded
+        .authorization
+        .unwrap_or_else(|| panic!("{context}: request should carry an Authorization header"));
+    assert_eq!(auth, "Bearer sk-real-secret", "{context}: request must be authenticated with exactly the configured key");
+    let body_json: serde_json::Value = serde_json::from_str(&recorded.body)
+        .unwrap_or_else(|e| panic!("{context}: the Responses API request body should be valid JSON: {e}"));
+    assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "{context}: request must target exactly the configured model");
 }
 
 /// Spawns the real App Server (`binary`) against a Custom Provider config
 /// pointed at a mock Responses Provider that always replies with
 /// `mock_response`, runs one `thread/start`/`turn/start`, and reports
 /// whether a `turn/completed` notification carrying the fixed "pong" success
-/// text was observed within a bounded timeout. Any other outcome -- a
-/// `turn/start` RPC error, a `turn/completed`/other notification that does
+/// text was observed within a bounded timeout, together with the request (if
+/// any) the mock Responses Provider actually received. Any other outcome --
+/// a `turn/start` RPC error, a `turn/completed`/other notification that does
 /// *not* contain "pong", or timing out without ever observing
 /// `turn/completed` -- is reported as `false` (not success): this crate
 /// cannot assume in advance exactly which of those shapes the bundled App
 /// Server uses to surface a given upstream failure, but "silently reports
-/// success anyway" must never be one of them.
-fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, mock_response: String) -> bool {
-    let (port, _recorded, _http_thread) = spawn_mock_responses_provider(mock_response);
+/// success anyway" must never be one of them. Callers must separately check
+/// the returned recorded request: a `false` result must mean the Provider
+/// error was actually surfaced as a failure, not merely that the App Server
+/// never reached the Provider at all.
+fn observed_successful_turn_against_mock_response(
+    binary: &str,
+    dir_name: &str,
+    mock_response: String,
+) -> (bool, Option<RecordedRequest>) {
+    let (port, recorded, _http_thread) = spawn_mock_responses_provider(mock_response);
     let base_url = format!("http://127.0.0.1:{port}/v1");
 
     let dir = unique_dir(dir_name);
@@ -835,12 +930,12 @@ fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, 
         Ok(v) => v,
         Err(_) => {
             let _ = runtime.stop();
-            return false;
+            return (false, recorded.lock().unwrap().take());
         }
     };
     let Some(thread_id) = thread_start["thread"]["id"].as_str().map(str::to_string) else {
         let _ = runtime.stop();
-        return false;
+        return (false, recorded.lock().unwrap().take());
     };
 
     let turn_start = runtime.call(
@@ -853,7 +948,7 @@ fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, 
     );
     if turn_start.is_err() {
         let _ = runtime.stop();
-        return false;
+        return (false, recorded.lock().unwrap().take());
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -879,7 +974,7 @@ fn observed_successful_turn_against_mock_response(binary: &str, dir_name: &str, 
     };
 
     let _ = runtime.stop();
-    observed_success
+    (observed_success, recorded.lock().unwrap().take())
 }
 
 #[test]
@@ -895,8 +990,9 @@ fn real_app_server_reports_failure_for_401_unauthorized_from_the_provider() {
         "401 Unauthorized",
         &serde_json::json!({"error": {"message": "invalid api key", "type": "invalid_request_error"}}),
     );
-    let observed_success =
+    let (observed_success, recorded) =
         observed_successful_turn_against_mock_response(&binary, "real_app_server_401", response);
+    assert_mock_provider_received_the_probe_request(recorded, "401 Unauthorized case");
     assert!(
         !observed_success,
         "a 401 Unauthorized response from the Responses Provider must never be reported as a successful turn/completed"
@@ -916,8 +1012,9 @@ fn real_app_server_reports_failure_for_403_forbidden_from_the_provider() {
         "403 Forbidden",
         &serde_json::json!({"error": {"message": "access denied", "type": "permission_error"}}),
     );
-    let observed_success =
+    let (observed_success, recorded) =
         observed_successful_turn_against_mock_response(&binary, "real_app_server_403", response);
+    assert_mock_provider_received_the_probe_request(recorded, "403 Forbidden case");
     assert!(
         !observed_success,
         "a 403 Forbidden response from the Responses Provider must never be reported as a successful turn/completed"
@@ -937,8 +1034,9 @@ fn real_app_server_reports_failure_for_429_rate_limited_from_the_provider() {
         "429 Too Many Requests",
         &serde_json::json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}}),
     );
-    let observed_success =
+    let (observed_success, recorded) =
         observed_successful_turn_against_mock_response(&binary, "real_app_server_429", response);
+    assert_mock_provider_received_the_probe_request(recorded, "429 Too Many Requests case");
     assert!(
         !observed_success,
         "a 429 Too Many Requests response from the Responses Provider must never be reported as a successful turn/completed"
@@ -955,8 +1053,9 @@ fn real_app_server_reports_failure_for_a_malformed_response_body_from_the_provid
         return;
     };
     let response = raw_response("200 OK", "this is not valid json {{{");
-    let observed_success =
+    let (observed_success, recorded) =
         observed_successful_turn_against_mock_response(&binary, "real_app_server_malformed", response);
+    assert_mock_provider_received_the_probe_request(recorded, "malformed response body case");
     assert!(
         !observed_success,
         "a malformed, non-JSON 200 response body from the Responses Provider must never be reported as a \
@@ -987,8 +1086,9 @@ fn real_app_server_reports_failure_for_a_responses_api_incompatible_body_from_th
             ]
         }),
     );
-    let observed_success =
+    let (observed_success, recorded) =
         observed_successful_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
+    assert_mock_provider_received_the_probe_request(recorded, "Responses-API-incompatible body case");
     assert!(
         !observed_success,
         "a Responses-API-incompatible (Chat Completions shaped) response body must never be reported as a \
