@@ -13,4 +13,6 @@ mod runtime;
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use protocol::{ErrorObject, IncomingMessage, ParseError, RequestId};
 pub use rpc::{RejectAllServerRequests, RpcError, RpcEvent, ServerRequestHandler};
-pub use runtime::{AiRuntime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeState, RuntimeStatus};
+pub use runtime::{
+    AiRuntime, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimeEventKind, RuntimeState, RuntimeStatus,
+};

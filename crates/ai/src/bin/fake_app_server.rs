@@ -22,6 +22,16 @@
 //! - `FAKE_SERVER_IGNORE_STOP=1`: after stdin closes (the client's graceful
 //!   stop signal), sleeps instead of exiting, so the client must escalate
 //!   to a forced kill.
+//! - `FAKE_SERVER_RECORD_INIT_FILE=<path>`: appends the raw `initialize`
+//!   request params as `INIT_PARAMS:{json}` and, once the `initialized`
+//!   notification is received, appends `INITIALIZED`, so a test can assert
+//!   on the exact schema the client sent.
+//! - `FAKE_SERVER_OWNER_LOCK_TRY_PATH=<path>`: instead of running the normal
+//!   stdio protocol loop, tries to acquire `hane_ai::OwnerLock` at the given
+//!   path in this (separate) OS process, prints `OWNER_LOCK_ACQUIRED` or
+//!   `OWNER_LOCK_BUSY` to stdout, and exits immediately. Used to verify the
+//!   runtime owner lock is exclusive across real processes, not just across
+//!   handles within one process.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -29,8 +39,20 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
+    if let Ok(path) = env::var("FAKE_SERVER_OWNER_LOCK_TRY_PATH") {
+        let lock = hane_ai::OwnerLock::new(std::path::PathBuf::from(path));
+        match lock.try_acquire() {
+            Ok(Some(_guard)) => println!("OWNER_LOCK_ACQUIRED"),
+            Ok(None) => println!("OWNER_LOCK_BUSY"),
+            Err(e) => println!("OWNER_LOCK_ERROR:{e}"),
+        }
+        let _ = io::stdout().flush();
+        return;
+    }
+
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
+    let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
 
     if let Ok(marker_path) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE") {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&marker_path) {
@@ -77,6 +99,10 @@ fn main() {
 
         match (id, method) {
             (Some(id), Some(method)) if method == "initialize" => {
+                if let Some(path) = &record_init_file {
+                    let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    append_record(path, &format!("INIT_PARAMS:{params}"));
+                }
                 if mode == "never_respond" {
                     continue;
                 }
@@ -114,9 +140,13 @@ fn main() {
                     break;
                 }
             }
+            (None, Some(method)) if method == "initialized" => {
+                if let Some(path) = &record_init_file {
+                    append_record(path, "INITIALIZED");
+                }
+            }
             _ => {
-                // Notifications (e.g. "initialized") and malformed lines
-                // need no reply.
+                // Other notifications and malformed lines need no reply.
             }
         }
     }
@@ -126,5 +156,11 @@ fn main() {
         loop {
             thread::sleep(Duration::from_secs(3600));
         }
+    }
+}
+
+fn append_record(path: &str, line: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
     }
 }

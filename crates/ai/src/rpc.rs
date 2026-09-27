@@ -13,10 +13,16 @@
 //!   automatic approval is ever sent.
 //! - stderr is drained continuously on its own thread so a slow or absent
 //!   consumer can never cause the child to block on a full pipe.
+//! - The outgoing write queue and the number of in-flight requests are
+//!   bounded. Callers get an explicit [`RpcError::Backpressure`] instead of
+//!   blocking, and the reader/stderr threads only ever *try* to hand events
+//!   or server-request replies to a bounded queue: a full queue is reported
+//!   as a diagnostic (or a backpressure error to the caller) and never stalls
+//!   the thread that is draining the child's stdout/stderr.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,6 +30,16 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::protocol::{self, ErrorObject, IncomingMessage, RequestId};
+
+/// Hard cap on concurrently in-flight requests. Once reached, `call` fails
+/// fast with [`RpcError::Backpressure`] instead of growing the pending map
+/// without bound.
+const MAX_PENDING_REQUESTS: usize = 256;
+
+/// Capacity of the bounded outgoing write queue. `call`/`notify` use a
+/// non-blocking `try_send` against this queue so a stalled peer can never
+/// block the caller indefinitely.
+const WRITER_QUEUE_CAPACITY: usize = 256;
 
 /// Handles a request the server sent to us. Implementations must respond
 /// promptly (success or a definite decline); they must never silently
@@ -47,6 +63,10 @@ impl ServerRequestHandler for RejectAllServerRequests {
 pub enum RpcError {
     Timeout,
     Disconnected,
+    /// The outgoing queue is full or the in-flight request limit was
+    /// reached. The caller must back off and retry later; this is never
+    /// silently turned into blocking.
+    Backpressure,
     Remote(ErrorObject),
 }
 
@@ -55,6 +75,9 @@ impl std::fmt::Display for RpcError {
         match self {
             RpcError::Timeout => write!(f, "rpc call timed out"),
             RpcError::Disconnected => write!(f, "transport disconnected"),
+            RpcError::Backpressure => {
+                write!(f, "rpc request rejected: too many pending requests or a full outgoing queue")
+            }
             RpcError::Remote(err) => write!(f, "remote error {}: {}", err.code, err.message),
         }
     }
@@ -80,26 +103,43 @@ enum WriterCommand {
 /// notifications. Kept separate from [`RpcTransport`] so callers can hold a
 /// handle without owning the reader/writer/stderr threads.
 pub struct RpcCore {
-    writer_tx: Sender<WriterCommand>,
+    writer_tx: SyncSender<WriterCommand>,
     pending: Mutex<HashMap<RequestId, Sender<Result<Value, RpcError>>>>,
     next_id: Mutex<i64>,
 }
 
 impl RpcCore {
     pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RpcError> {
-        let id = {
-            let mut guard = self.next_id.lock().unwrap();
-            let current = *guard;
-            *guard += 1;
-            RequestId::Number(current)
+        let (id, reply_rx) = {
+            // Bound the in-flight request count and reserve the pending slot
+            // under a single lock so concurrent callers can never race past
+            // the cap.
+            let mut pending = self.pending.lock().unwrap();
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err(RpcError::Backpressure);
+            }
+            let id = {
+                let mut guard = self.next_id.lock().unwrap();
+                let current = *guard;
+                *guard += 1;
+                RequestId::Number(current)
+            };
+            let (reply_tx, reply_rx) = mpsc::channel();
+            pending.insert(id.clone(), reply_tx);
+            (id, reply_rx)
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id.clone(), reply_tx);
 
         let line = protocol::encode_request(&id, method, params);
-        if self.writer_tx.send(WriterCommand::Line(line)).is_err() {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(RpcError::Disconnected);
+        match self.writer_tx.try_send(WriterCommand::Line(line)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(RpcError::Backpressure);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.pending.lock().unwrap().remove(&id);
+                return Err(RpcError::Disconnected);
+            }
         }
 
         match reply_rx.recv_timeout(timeout) {
@@ -114,17 +154,25 @@ impl RpcCore {
 
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<(), RpcError> {
         let line = protocol::encode_notification(method, params);
-        self.writer_tx
-            .send(WriterCommand::Line(line))
-            .map_err(|_| RpcError::Disconnected)
+        match self.writer_tx.try_send(WriterCommand::Line(line)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(RpcError::Backpressure),
+            Err(TrySendError::Disconnected(_)) => Err(RpcError::Disconnected),
+        }
     }
 
     /// Closes the write side (e.g. the child's stdin), which is the polite
-    /// way of asking a well-behaved stdio server to exit.
+    /// way of asking a well-behaved stdio server to exit. This is only ever
+    /// called from lifecycle/drop paths, never from the reader/stderr drain
+    /// threads, so a blocking send here cannot stall draining.
     pub fn close_writer(&self) {
         let _ = self.writer_tx.send(WriterCommand::Close);
     }
 
+    /// Immediately fails every currently pending request. Called both when
+    /// the reader thread observes real EOF and proactively when a lifecycle
+    /// shutdown is requested, so pending requests are released as soon as
+    /// stop begins instead of waiting for the child to actually exit.
     fn fail_all_pending(&self) {
         let mut pending = self.pending.lock().unwrap();
         for (_, tx) in pending.drain() {
@@ -160,7 +208,7 @@ fn spawn_reader(
     reader: Box<dyn Read + Send>,
     core: Arc<RpcCore>,
     handler: Arc<dyn ServerRequestHandler>,
-    events_tx: Sender<RpcEvent>,
+    events_tx: SyncSender<RpcEvent>,
     on_closed: Box<dyn FnOnce() + Send>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -182,14 +230,17 @@ fn spawn_reader(
                             let _ = tx.send(mapped);
                         }
                         None => {
-                            let _ = events_tx.send(RpcEvent::Diagnostic(format!(
+                            // Best-effort: never block the reader (which
+                            // drains the child's stdout) on a full events
+                            // queue.
+                            let _ = events_tx.try_send(RpcEvent::Diagnostic(format!(
                                 "late or unknown response id={id:?}"
                             )));
                         }
                     }
                 }
                 Ok(IncomingMessage::Notification { method, params }) => {
-                    let _ = events_tx.send(RpcEvent::Notification { method, params });
+                    let _ = events_tx.try_send(RpcEvent::Notification { method, params });
                 }
                 Ok(IncomingMessage::ServerRequest { id, method, params }) => {
                     let outcome = handler.handle(&method, params);
@@ -197,10 +248,16 @@ fn spawn_reader(
                         Ok(result) => protocol::encode_response_ok(&id, result),
                         Err(err) => protocol::encode_response_err(&id, err),
                     };
-                    let _ = core.writer_tx.send(WriterCommand::Line(response_line));
+                    // Non-blocking: a full outgoing queue must not stall the
+                    // reader thread that is draining the child's stdout.
+                    if core.writer_tx.try_send(WriterCommand::Line(response_line)).is_err() {
+                        let _ = events_tx.try_send(RpcEvent::Diagnostic(format!(
+                            "dropped reply to server request id={id:?}: outgoing queue full or closed"
+                        )));
+                    }
                 }
                 Err(err) => {
-                    let _ = events_tx.send(RpcEvent::Diagnostic(format!(
+                    let _ = events_tx.try_send(RpcEvent::Diagnostic(format!(
                         "malformed message ignored: {err}"
                     )));
                 }
@@ -211,13 +268,16 @@ fn spawn_reader(
     })
 }
 
-fn spawn_stderr(reader: Box<dyn Read + Send>, events_tx: Sender<RpcEvent>) -> JoinHandle<()> {
+fn spawn_stderr(reader: Box<dyn Read + Send>, events_tx: SyncSender<RpcEvent>) -> JoinHandle<()> {
     thread::spawn(move || {
         let buffered = BufReader::new(reader);
         for line_result in buffered.lines() {
             match line_result {
                 Ok(line) => {
-                    let _ = events_tx.send(RpcEvent::Diagnostic(format!("stderr: {line}")));
+                    // Non-blocking: a slow/absent events consumer must never
+                    // stop this thread from draining stderr, or a chatty
+                    // child could block on a full stderr pipe.
+                    let _ = events_tx.try_send(RpcEvent::Diagnostic(format!("stderr: {line}")));
                 }
                 Err(_) => break,
             }
@@ -242,10 +302,10 @@ impl RpcTransport {
         writer: Box<dyn Write + Send>,
         stderr: Option<Box<dyn Read + Send>>,
         handler: Arc<dyn ServerRequestHandler>,
-        events_tx: Sender<RpcEvent>,
+        events_tx: SyncSender<RpcEvent>,
         on_closed: Box<dyn FnOnce() + Send>,
     ) -> RpcTransport {
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let core = Arc::new(RpcCore {
             writer_tx,
             pending: Mutex::new(HashMap::new()),
@@ -268,8 +328,13 @@ impl RpcTransport {
         self.core.clone()
     }
 
+    /// Begins a graceful shutdown: closes our write side (stdin EOF for the
+    /// child) and immediately releases every pending request instead of
+    /// waiting for the child to actually exit or for each call's own
+    /// timeout to elapse.
     pub fn request_shutdown(&self) {
         self.core.close_writer();
+        self.core.fail_all_pending();
     }
 }
 
@@ -315,7 +380,7 @@ mod tests {
     ) {
         let (to_client_r, to_client_w) = std::io::pipe().unwrap();
         let (from_client_r, from_client_w) = std::io::pipe().unwrap();
-        let (events_tx, events_rx) = mpsc::channel();
+        let (events_tx, events_rx) = mpsc::sync_channel(1024);
         let (closed_tx, closed_rx) = mpsc::channel();
         let on_closed = Box::new(move || {
             let _ = closed_tx.send(());
@@ -536,6 +601,112 @@ mod tests {
         match events_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             RpcEvent::Diagnostic(msg) => assert!(msg.contains("late or unknown response")),
             other => panic!("expected diagnostic about late response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_delivered_out_of_order_are_correlated_to_the_right_caller() {
+        let handler = Arc::new(RejectAllServerRequests);
+        let (transport, mut server_write, mut server_read, _events, _closed) =
+            spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        let responder = thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut ids = Vec::new();
+            while ids.len() < 2 {
+                let n = server_read.read(&mut buf).unwrap();
+                for line in std::str::from_utf8(&buf[..n]).unwrap().lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let request: Value = serde_json::from_str(line).unwrap();
+                    ids.push(request["id"].clone());
+                }
+            }
+            // Reply in the reverse order the requests were received in.
+            for id in ids.into_iter().rev() {
+                let resp = serde_json::json!({"id": id, "result": {"echo_id": id}});
+                writeln!(server_write, "{}", resp).unwrap();
+            }
+        });
+
+        let core_a = core.clone();
+        let call_a = thread::spawn(move || core_a.call("first", None, Duration::from_secs(5)));
+        thread::sleep(Duration::from_millis(20));
+        let core_b = core.clone();
+        let call_b = thread::spawn(move || core_b.call("second", None, Duration::from_secs(5)));
+
+        let result_a = call_a.join().unwrap().unwrap();
+        let result_b = call_b.join().unwrap().unwrap();
+        responder.join().unwrap();
+
+        // Each caller must see the reply addressed to its own request id,
+        // regardless of the order the two responses arrived on the wire.
+        assert_ne!(result_a["echo_id"], result_b["echo_id"]);
+    }
+
+    #[test]
+    fn request_shutdown_fails_pending_calls_immediately_without_waiting_for_eof() {
+        let handler = Arc::new(RejectAllServerRequests);
+        let (transport, _server_write, mut server_read, _events, _closed) =
+            spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        let call_thread = thread::spawn(move || core.call("slow", None, Duration::from_secs(30)));
+
+        // Wait for the request to actually be written before shutting down.
+        let mut buf = [0u8; 4096];
+        let _ = server_read.read(&mut buf).unwrap();
+
+        // `_server_write` is still open (no EOF has been sent to our
+        // reader), so if this still unblocks the call quickly it can only
+        // be because `request_shutdown` proactively released pending
+        // requests instead of waiting for the reader thread to observe EOF.
+        transport.request_shutdown();
+
+        let result = call_thread.join().unwrap();
+        assert!(matches!(result, Err(RpcError::Disconnected)));
+    }
+
+    #[test]
+    fn call_reports_backpressure_when_the_pending_request_limit_is_reached() {
+        let handler = Arc::new(RejectAllServerRequests);
+        let (transport, _server_write, _server_read, _events, _closed) =
+            spawn_transport_over_pipes(handler);
+        let core = transport.handle();
+
+        // Fill every pending slot with calls that will never receive a
+        // response, then confirm a new call fails fast instead of growing
+        // the pending map without bound.
+        let mut in_flight = Vec::new();
+        for _ in 0..MAX_PENDING_REQUESTS {
+            let core = core.clone();
+            in_flight.push(thread::spawn(move || core.call("never_replied", None, Duration::from_secs(30))));
+        }
+
+        // Poll instead of sleeping a fixed amount: each probe that lands
+        // before every spawned thread has registered itself simply times
+        // out quickly (and cleans up after itself), so this converges
+        // without being sensitive to how fast threads get scheduled.
+        let mut observed_backpressure = false;
+        for _ in 0..100 {
+            match core.call("one_too_many", None, Duration::from_millis(20)) {
+                Err(RpcError::Backpressure) => {
+                    observed_backpressure = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            observed_backpressure,
+            "expected backpressure once MAX_PENDING_REQUESTS in-flight calls were pending"
+        );
+
+        transport.request_shutdown();
+        for handle in in_flight {
+            let _ = handle.join();
         }
     }
 }

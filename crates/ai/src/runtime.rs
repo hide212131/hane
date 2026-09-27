@@ -4,12 +4,17 @@
 //!
 //! Every lifecycle command (`Start` / `Stop` / `Restart`) is handled to
 //! completion by one dedicated coordinator thread before the next queued
-//! command is processed, so concurrent callers are naturally serialized and
-//! observe the same outcome instead of racing to spawn duplicate children.
-//! Regular RPC calls (`AiRuntime::call`) do not go through that queue: they
-//! borrow a handle to the current generation's transport and run
-//! concurrently with each other, so a long-running call cannot block a
-//! `stop`/`restart` request.
+//! command is processed, so there is never more than one `Child` spawn in
+//! flight at a time. `Start` additionally short-circuits to the current
+//! status once already `Ready`, and concurrent `restart()` callers are
+//! coalesced client-side (see `AiRuntime::restart`) so that N concurrent
+//! restart requests still only stop and respawn the child once and all
+//! callers observe that same single outcome, instead of each one redoing a
+//! full stop/start cycle and repeatedly respawning the child. Regular RPC
+//! calls (`AiRuntime::call`) do not go through that queue: they borrow a
+//! handle to the current generation's transport and run concurrently with
+//! each other, so a long-running call cannot block a `stop`/`restart`
+//! request.
 
 use std::io;
 use std::path::PathBuf;
@@ -23,6 +28,13 @@ use serde_json::Value;
 
 use crate::owner_lock::{OwnerLock, OwnerLockGuard};
 use crate::rpc::{RpcCore, RpcError, RpcEvent, RpcTransport, ServerRequestHandler};
+
+/// Capacity of the internal bridge queue carrying [`RpcEvent`]s from a
+/// child's reader/stderr threads to the forwarding thread that relays them
+/// to the caller-supplied `events_tx`. Bounded so a slow consumer cannot
+/// grow this queue without bound; the reader/stderr threads use a
+/// non-blocking send so a full queue never stalls draining stdout/stderr.
+const EVENTS_BRIDGE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {
@@ -41,19 +53,31 @@ pub struct RuntimeStatus {
     pub generation: u64,
 }
 
+/// An event surfaced to the runtime's caller, tagged with the lifecycle
+/// generation it came from. Events from a generation older than the current
+/// one (e.g. a straggling notification flushed while a newer generation is
+/// already `Ready`) are recognizable as stale by comparing `generation`
+/// against [`RuntimeStatus::generation`], instead of being indistinguishable
+/// from current-generation events.
 #[derive(Debug, Clone)]
-pub enum RuntimeEvent {
+pub struct RuntimeEvent {
+    pub generation: u64,
+    pub kind: RuntimeEventKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEventKind {
     Notification { method: String, params: Option<Value> },
     Diagnostic(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RuntimeError {
     NotReady,
     RestartBlocked,
     OwnerLockUnavailable,
-    OwnerLock(io::Error),
-    Spawn(io::Error),
+    OwnerLock(Arc<io::Error>),
+    Spawn(Arc<io::Error>),
     Handshake(RpcError),
     Rpc(RpcError),
     CoordinatorUnavailable,
@@ -84,8 +108,11 @@ impl std::fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 /// Configuration for one embedded App Server runtime. `binary_path` must be
-/// an explicit path to the bundled executable; it is never resolved via
-/// `PATH`.
+/// an absolute, explicit path to the bundled standalone executable; it is
+/// never resolved via `PATH` (`spawn_child` rejects a non-absolute path
+/// outright rather than letting `std::process::Command` fall back to a
+/// `PATH` lookup). The standalone App Server binary is invoked directly with
+/// `--listen stdio://`: it has no `app-server` subcommand of its own.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub binary_path: PathBuf,
@@ -102,11 +129,7 @@ impl RuntimeConfig {
     pub fn new(binary_path: impl Into<PathBuf>, owner_lock_path: impl Into<PathBuf>) -> Self {
         RuntimeConfig {
             binary_path: binary_path.into(),
-            args: vec![
-                "app-server".to_string(),
-                "--listen".to_string(),
-                "stdio://".to_string(),
-            ],
+            args: vec!["--listen".to_string(), "stdio://".to_string()],
             codex_home: None,
             extra_env: Vec::new(),
             owner_lock_path: owner_lock_path.into(),
@@ -117,6 +140,15 @@ impl RuntimeConfig {
     }
 
     fn spawn_child(&self) -> io::Result<Child> {
+        if !self.binary_path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AI runtime binary_path must be an absolute path, got {:?}; refusing to fall back to a PATH lookup",
+                    self.binary_path
+                ),
+            ));
+        }
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
         if let Some(home) = &self.codex_home {
@@ -135,6 +167,13 @@ struct SharedState {
     restart_blocked: bool,
     generation: u64,
     ready_transport: Option<Arc<RpcCore>>,
+    /// When `Some`, a `restart()` is already in flight and this holds the
+    /// reply channels of every additional concurrent caller that attached to
+    /// it instead of enqueueing its own redundant `Restart` command. The
+    /// leader (the caller who found this `None` and set it) fans the single
+    /// outcome out to every attached waiter once the one underlying
+    /// stop+start cycle completes.
+    restart_inflight: Option<Vec<Sender<Result<RuntimeStatus, RuntimeError>>>>,
 }
 
 struct ActiveChild {
@@ -174,6 +213,7 @@ impl AiRuntime {
             restart_blocked: false,
             generation: 0,
             ready_transport: None,
+            restart_inflight: None,
         }));
         let shared_for_thread = shared.clone();
         let coordinator = thread::spawn(move || {
@@ -202,8 +242,41 @@ impl AiRuntime {
         self.send_lifecycle(LifecycleCommand::Stop)
     }
 
+    /// Restarts the runtime. Concurrent `restart()` callers are coalesced:
+    /// only the first ("leader") caller actually enqueues a `Restart`
+    /// lifecycle command; every other caller that arrives while that one is
+    /// still in flight attaches to it and receives the exact same outcome
+    /// once it completes, instead of each one independently stopping and
+    /// respawning the child.
     pub fn restart(&self) -> Result<RuntimeStatus, RuntimeError> {
-        self.send_lifecycle(LifecycleCommand::Restart)
+        let (tx, rx) = mpsc::channel();
+        let is_leader = {
+            let mut guard = self.shared.lock().unwrap();
+            match &mut guard.restart_inflight {
+                Some(waiters) => {
+                    waiters.push(tx);
+                    false
+                }
+                None => {
+                    guard.restart_inflight = Some(Vec::new());
+                    true
+                }
+            }
+        };
+
+        if !is_leader {
+            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+        }
+
+        let result = self.send_lifecycle(LifecycleCommand::Restart);
+        let waiters = {
+            let mut guard = self.shared.lock().unwrap();
+            guard.restart_inflight.take().unwrap_or_default()
+        };
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+        result
     }
 
     /// Sends a request while the runtime is `Ready`. Runs on the calling
@@ -393,7 +466,7 @@ fn do_start(
         }
         Err(e) => {
             set_status(shared, RuntimeState::Failed, false, *generation);
-            return Err(RuntimeError::OwnerLock(e));
+            return Err(RuntimeError::OwnerLock(Arc::new(e)));
         }
     };
 
@@ -404,7 +477,7 @@ fn do_start(
         Ok(c) => c,
         Err(e) => {
             set_status(shared, RuntimeState::Failed, false, g);
-            return Err(RuntimeError::Spawn(e));
+            return Err(RuntimeError::Spawn(Arc::new(e)));
         }
     };
 
@@ -417,15 +490,15 @@ fn do_start(
         let _ = self_tx_clone.send(CoordinatorMessage::ChildEnded { generation: g });
     });
 
-    let (bridge_tx, bridge_rx) = mpsc::channel::<RpcEvent>();
+    let (bridge_tx, bridge_rx) = mpsc::sync_channel::<RpcEvent>(EVENTS_BRIDGE_CAPACITY);
     let runtime_events_tx = events_tx.clone();
     thread::spawn(move || {
         for event in bridge_rx {
-            let mapped = match event {
-                RpcEvent::Notification { method, params } => RuntimeEvent::Notification { method, params },
-                RpcEvent::Diagnostic(msg) => RuntimeEvent::Diagnostic(msg),
+            let kind = match event {
+                RpcEvent::Notification { method, params } => RuntimeEventKind::Notification { method, params },
+                RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
             };
-            let _ = runtime_events_tx.send(mapped);
+            let _ = runtime_events_tx.send(RuntimeEvent { generation: g, kind });
         }
     });
 
@@ -441,10 +514,21 @@ fn do_start(
     set_status(shared, RuntimeState::Initializing, false, g);
 
     let core = transport.handle();
+    // Schema per the bundled App Server's `initialize` request: `clientInfo`
+    // carries name/title/version, and `capabilities` explicitly disables the
+    // experimental API and attestation requests this client does not use.
     let init_result = core.call(
         "initialize",
         Some(serde_json::json!({
-            "clientInfo": {"name": "hane", "version": env!("CARGO_PKG_VERSION")}
+            "clientInfo": {
+                "name": "hane",
+                "title": "Hane",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": false,
+                "requestAttestation": false,
+            },
         })),
         config.start_timeout,
     );
@@ -536,9 +620,12 @@ fn stop_active(
         StopOutcome::RestartBlocked => {
             *current = Some(active);
             set_status(shared, RuntimeState::Failed, true, generation);
-            let _ = events_tx.send(RuntimeEvent::Diagnostic(
-                "runtime cleanup could not be confirmed; restart is blocked".to_string(),
-            ));
+            let _ = events_tx.send(RuntimeEvent {
+                generation,
+                kind: RuntimeEventKind::Diagnostic(
+                    "runtime cleanup could not be confirmed; restart is blocked".to_string(),
+                ),
+            });
             Err(RuntimeError::RestartBlocked)
         }
     }
@@ -577,16 +664,20 @@ fn reap_and_mark_failed(
             drop(active);
             *owner_guard = None;
             set_status(shared, RuntimeState::Failed, false, generation);
-            let _ = events_tx.send(RuntimeEvent::Diagnostic(
-                "runtime exited unexpectedly".to_string(),
-            ));
+            let _ = events_tx.send(RuntimeEvent {
+                generation,
+                kind: RuntimeEventKind::Diagnostic("runtime exited unexpectedly".to_string()),
+            });
         }
         StopOutcome::RestartBlocked => {
             *current = Some(active);
             set_status(shared, RuntimeState::Failed, true, generation);
-            let _ = events_tx.send(RuntimeEvent::Diagnostic(
-                "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),
-            ));
+            let _ = events_tx.send(RuntimeEvent {
+                generation,
+                kind: RuntimeEventKind::Diagnostic(
+                    "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),
+                ),
+            });
         }
     }
 }
@@ -711,5 +802,18 @@ mod tests {
         );
         assert_eq!(outcome, StopOutcome::RestartBlocked);
         assert_eq!(process.kill_calls, 1);
+    }
+
+    #[test]
+    fn spawn_child_rejects_a_non_absolute_binary_path_instead_of_falling_back_to_path_lookup() {
+        let config = RuntimeConfig::new("codex-app-server", "/tmp/hane-ai-test-owner.lock");
+        let err = config.spawn_child().expect_err("a bare filename must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
+        let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
     }
 }

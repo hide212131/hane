@@ -76,33 +76,63 @@ mod platform {
     use std::io;
     use std::os::windows::io::AsRawHandle;
 
+    /// Mirrors the layout of the Win32 `OVERLAPPED` struct closely enough
+    /// for `LockFileEx`'s purposes: the `Offset`/`OffsetHigh` fields we set
+    /// occupy the same first 8 bytes as the union's `Pointer` field on every
+    /// supported target, and we never touch `hEvent` (synchronous handle).
+    #[repr(C)]
+    #[allow(non_snake_case, dead_code)]
+    struct Overlapped {
+        Internal: usize,
+        InternalHigh: usize,
+        Offset: u32,
+        OffsetHigh: u32,
+        hEvent: *mut core::ffi::c_void,
+    }
+
     #[allow(non_snake_case)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn LockFile(
+        fn LockFileEx(
             h_file: *mut core::ffi::c_void,
-            dw_file_offset_low: u32,
-            dw_file_offset_high: u32,
+            dw_flags: u32,
+            dw_reserved: u32,
             n_number_of_bytes_to_lock_low: u32,
             n_number_of_bytes_to_lock_high: u32,
+            lp_overlapped: *mut Overlapped,
         ) -> i32;
     }
 
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
     const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_IO_PENDING: i32 = 997;
 
+    /// Non-blocking exclusive try-lock. `LOCKFILE_FAIL_IMMEDIATELY` is what
+    /// makes this a true try-lock: without it `LockFileEx` would wait for
+    /// the region to become available instead of failing right away.
     pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
         let handle = file.as_raw_handle();
+        let mut overlapped: Overlapped = unsafe { std::mem::zeroed() };
         // Lock a single fixed byte range; only exclusivity matters here, not
         // the file's actual contents or size.
-        let ok = unsafe { LockFile(handle, 0, 0, 1, 0) };
+        let ok = unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
         if ok != 0 {
             Ok(true)
         } else {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
-                Ok(false)
-            } else {
-                Err(err)
+            match err.raw_os_error() {
+                Some(ERROR_LOCK_VIOLATION) | Some(ERROR_IO_PENDING) => Ok(false),
+                _ => Err(err),
             }
         }
     }
