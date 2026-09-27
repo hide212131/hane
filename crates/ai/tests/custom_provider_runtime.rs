@@ -140,6 +140,76 @@ fn rotating_the_custom_provider_key_never_reaches_the_old_child() {
     ], "each child must see only the key generated for its own generation, never the other's");
 }
 
+#[test]
+fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropping_it() {
+    // Unlike `rotating_the_custom_provider_key_never_reaches_the_old_child`,
+    // which simulates a restart by dropping the first `AiRuntime` and
+    // constructing a second one, this exercises `AiRuntime::reconfigure`
+    // directly on one `AiRuntime` handle -- the supported way to apply a
+    // `settings_generation`-affecting change without ever tearing down the
+    // coordinator thread (and therefore never releasing the runtime owner
+    // lock to a would-be new owner) in between.
+    let (mut first_config, dir) = fake_server_config("reconfigure_rotation");
+    let record_file = dir.join("env-record.txt");
+    first_config
+        .extra_env
+        .push(("FAKE_SERVER_RECORD_ENV_FILE".to_string(), record_file.to_string_lossy().to_string()));
+    first_config
+        .extra_env
+        .push(("FAKE_SERVER_RECORD_ENV_VARS".to_string(), CUSTOM_PROVIDER_ENV_KEY.to_string()));
+    let first_material = build_custom_provider_material(
+        "My Provider",
+        "https://provider.example/v1",
+        "gpt-test-model",
+        "sk-first-secret",
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .unwrap();
+    first_config.extra_env.extend(first_material.extra_env.clone());
+    let first_owner_lock_path = first_config.owner_lock_path.clone();
+
+    let runtime = spawn_and_start(first_config.clone());
+    let first_status = runtime.snapshot();
+
+    let mut second_config = first_config;
+    second_config.extra_env.retain(|(k, _)| k != CUSTOM_PROVIDER_ENV_KEY);
+    let second_material = build_custom_provider_material(
+        "My Provider",
+        "https://provider.example/v1",
+        "gpt-test-model",
+        "sk-second-secret",
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .unwrap();
+    second_config.extra_env.extend(second_material.extra_env.clone());
+
+    let reconfigured = runtime.reconfigure(second_config).expect("reconfigure should succeed");
+    assert_eq!(reconfigured.state, RuntimeState::Ready);
+    assert!(
+        reconfigured.generation > first_status.generation,
+        "reconfigure must spawn a fresh child generation, not silently reuse the old one"
+    );
+
+    let _ = runtime.stop();
+
+    // The owner lock is never released to a would-be new owner across the
+    // reconfigure: it was held by this same `AiRuntime` throughout, so a
+    // separate acquire attempt only succeeds now, after this explicit stop.
+    let external_lock = hane_ai::OwnerLock::new(&first_owner_lock_path);
+    assert!(external_lock.try_acquire().unwrap().is_some());
+
+    let recorded = std::fs::read_to_string(&record_file).unwrap();
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-first-secret"),
+            format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-second-secret"),
+        ],
+        "the reconfigured child must see only the newly rotated key, never the old one"
+    );
+}
+
 /// A single recorded HTTP request the mock Responses Provider observed.
 struct RecordedRequest {
     method: String,

@@ -39,9 +39,10 @@ pub enum CustomProviderConfigError {
     /// The Base URL carries embedded credentials
     /// (`https://user:pass@host/...` or `https://user@host/...`).
     CredentialInUrl,
-    /// `name` or `model_id` is empty or contains a control character (which
-    /// would otherwise let a crafted value break out of the generated TOML
-    /// string literal it is embedded in).
+    /// `name`, `model_id` or the Base URL is empty (`name`/`model_id` only)
+    /// or contains a control character (including a newline), which would
+    /// otherwise let a crafted value break out of the generated TOML string
+    /// literal it is embedded in.
     InvalidField(&'static str),
 }
 
@@ -97,6 +98,13 @@ fn extract_host(authority: &str) -> &str {
 /// enough of the authority component to check for embedded credentials and
 /// to allow the explicit local-development HTTP exception.
 pub fn validate_base_url(raw: &str) -> Result<(), CustomProviderConfigError> {
+    if raw.chars().any(|c| c.is_control()) {
+        // Rejected before any scheme/authority parsing: a control character
+        // (including `\n`/`\r`) here could otherwise inject a line into the
+        // generated TOML once embedded in a string literal, regardless of
+        // which branch below would otherwise accept the URL.
+        return Err(CustomProviderConfigError::InvalidField("base_url"));
+    }
     let (is_https, after_scheme) = if let Some(rest) = raw.strip_prefix("https://") {
         (true, rest)
     } else if let Some(rest) = raw.strip_prefix("http://") {
@@ -234,6 +242,22 @@ mod tests {
         assert!(validate_base_url("http://localhost:8080/v1").is_ok());
         assert!(validate_base_url("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_base_url("http://[::1]:8080/v1").is_ok());
+    }
+
+    #[test]
+    fn a_newline_or_other_control_character_in_the_base_url_is_rejected() {
+        assert_eq!(
+            validate_base_url("https://provider.example/v1\nInjected = true"),
+            Err(CustomProviderConfigError::InvalidField("base_url"))
+        );
+        assert_eq!(
+            validate_base_url("https://provider.example/v1\r\n[malicious]"),
+            Err(CustomProviderConfigError::InvalidField("base_url"))
+        );
+        assert_eq!(
+            validate_base_url("https://provider.example/\u{0007}v1"),
+            Err(CustomProviderConfigError::InvalidField("base_url"))
+        );
     }
 
     #[test]

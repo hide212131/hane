@@ -6,6 +6,7 @@
 //! for the design this implements.
 
 mod atomic_file;
+mod connect;
 mod credential_journal;
 mod owner_lock;
 mod paths;
@@ -17,6 +18,10 @@ mod secrets;
 mod settings;
 mod settings_lock;
 
+pub use connect::{
+    build_runtime_config_for_active_connection, call_with_generation_check, delete_custom_credential,
+    recover_at_startup, update_custom_credential, ConfiguredRuntime, ConnectError,
+};
 pub use credential_journal::{
     recover as recover_credential_journal, CredentialJournal, CredentialOperation, JournalOperationKind,
     JournalOperationState, RecoveryOutcome,

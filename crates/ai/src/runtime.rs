@@ -270,6 +270,11 @@ enum LifecycleCommand {
     Start,
     Stop,
     Restart,
+    /// Switches the coordinator's own `RuntimeConfig` to a new one (e.g. a
+    /// fresh Custom Provider Base URL/API key/model after a
+    /// `settings_generation`-affecting save) and restarts against it, all on
+    /// this same coordinator thread. See [`AiRuntime::reconfigure`].
+    Reconfigure(RuntimeConfig),
 }
 
 enum CoordinatorMessage {
@@ -401,6 +406,32 @@ impl AiRuntime {
         result
     }
 
+    /// Switches to `new_config`: stops whatever child is currently active
+    /// under the old config (if any) and starts a fresh one under
+    /// `new_config`, entirely on the coordinator thread this `AiRuntime`
+    /// already owns. Unlike `start`/`restart`, concurrent calls are *not*
+    /// coalesced: each call carries its own `new_config`, and silently
+    /// applying only one coalesced leader's config while discarding the
+    /// others' would be wrong, so every call is queued and handled in turn.
+    ///
+    /// This is the supported way to apply a `settings_generation`-affecting
+    /// AI settings change (a new Base URL, API key, model or connection
+    /// method) to a running embedded App Server. Do not drop this
+    /// `AiRuntime` and construct a new one with a different `RuntimeConfig`
+    /// instead: that would tear down the coordinator thread and briefly
+    /// release the runtime owner lock entirely (see the module docs and
+    /// `docs/adr/0032-embedded-codex-app-server-ai-foundation.md` section 8's
+    /// "runtime owner lock → AI settings lock" ordering), opening a window
+    /// for a different Hane process to become the new owner before this one
+    /// restarts. `reconfigure` never releases the owner lock to a
+    /// would-be new owner in between: `stop_active` only clears it once the
+    /// old child is confirmed exited, and the following `do_start`
+    /// immediately re-acquires the very same lock file for the new child, on
+    /// this same coordinator thread.
+    pub fn reconfigure(&self, new_config: RuntimeConfig) -> Result<RuntimeStatus, RuntimeError> {
+        self.send_lifecycle(LifecycleCommand::Reconfigure(new_config))
+    }
+
     /// Sends a request while the runtime is `Ready`. Runs on the calling
     /// thread against the current generation's transport, independent of
     /// the lifecycle coordinator, so it never blocks a concurrent stop or
@@ -471,7 +502,7 @@ fn run_coordinator(
     rx: mpsc::Receiver<CoordinatorMessage>,
     self_tx: Sender<CoordinatorMessage>,
     shared: Arc<Mutex<SharedState>>,
-    config: RuntimeConfig,
+    mut config: RuntimeConfig,
     handler: Arc<dyn ServerRequestHandler>,
     events_tx: SyncSender<RuntimeEvent>,
 ) {
@@ -499,19 +530,58 @@ fn run_coordinator(
             CoordinatorMessage::Lifecycle(cmd, reply) => {
                 operation_generation += 1;
                 let op_gen = operation_generation;
-                let result = handle_lifecycle(
-                    cmd,
-                    op_gen,
-                    &mut current,
-                    &mut generation,
-                    &mut owner_guard,
-                    &config,
-                    &handler,
-                    &events_tx,
-                    &self_tx,
-                    &shared,
-                    &reply,
-                );
+                let result = match cmd {
+                    LifecycleCommand::Reconfigure(new_config) => {
+                        // Stop whatever is active under the *old* config
+                        // first (its own stop timeouts still apply), then
+                        // swap `config` and start fresh under the new one.
+                        // `owner_guard` is only ever cleared once
+                        // `stop_active` confirms the old child is gone, and
+                        // `do_start` immediately re-acquires the same lock
+                        // file afterward, on this same coordinator thread.
+                        match stop_active(
+                            &mut current,
+                            &mut generation,
+                            &mut owner_guard,
+                            &config,
+                            &shared,
+                            &events_tx,
+                            RuntimeState::Stopping,
+                            RuntimeState::Stopped,
+                            op_gen,
+                        ) {
+                            Ok(_) => {
+                                config = new_config;
+                                do_start(
+                                    op_gen,
+                                    &mut current,
+                                    &mut generation,
+                                    &mut owner_guard,
+                                    &config,
+                                    &handler,
+                                    &events_tx,
+                                    &self_tx,
+                                    &shared,
+                                    &reply,
+                                )
+                            }
+                            Err(e) => Some(Err(e)),
+                        }
+                    }
+                    other => handle_lifecycle(
+                        other,
+                        op_gen,
+                        &mut current,
+                        &mut generation,
+                        &mut owner_guard,
+                        &config,
+                        &handler,
+                        &events_tx,
+                        &self_tx,
+                        &shared,
+                        &reply,
+                    ),
+                };
                 if let Some(result) = result {
                     let _ = reply.send(result);
                 }
@@ -619,6 +689,9 @@ fn handle_lifecycle(
             do_start(
                 op_gen, current, generation, owner_guard, config, handler, events_tx, self_tx, shared, reply,
             )
+        }
+        LifecycleCommand::Reconfigure(_) => {
+            unreachable!("Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle")
         }
     }
 }

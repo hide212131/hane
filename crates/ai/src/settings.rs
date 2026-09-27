@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists};
 use crate::secrets::CredentialRef;
-use crate::settings_lock::AiSettingsLock;
+use crate::settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock};
 
 pub const AI_SETTINGS_SCHEMA_VERSION: u32 = 1;
 
@@ -185,15 +185,43 @@ impl AiSettingsStore {
     pub fn save(
         &self,
         expected_revision: u64,
-        mut new_settings: AiSettings,
+        new_settings: AiSettings,
         journal_is_empty: impl FnOnce() -> io::Result<bool>,
     ) -> Result<AiSettings, SaveError> {
-        let _guard = self.lock.try_acquire_exclusive().map_err(SaveError::Io)?.ok_or(SaveError::Busy)?;
+        let guard = self.lock.try_acquire_exclusive().map_err(SaveError::Io)?.ok_or(SaveError::Busy)?;
 
         if !journal_is_empty().map_err(SaveError::Io)? {
             return Err(SaveError::PendingCredentialJournal);
         }
 
+        self.write_while_locked(&guard, expected_revision, new_settings)
+    }
+
+    /// Performs the read-current/check-`revision`/atomic-replace write
+    /// itself, assuming the caller already holds `guard` (the exclusive AI
+    /// settings lock). This exists for callers that must keep that lock held
+    /// across more than just this one write — per
+    /// `docs/adr/0032-embedded-codex-app-server-ai-foundation.md` section
+    /// 7.3, a credential update/delete's journal-begin, secret write,
+    /// settings replace, journal-mark-swapped, old-secret cleanup and
+    /// journal-complete steps must all happen under one continuous exclusive
+    /// acquisition, not one lock acquisition per step. [`Self::save`] itself
+    /// uses this after acquiring its own guard and checking the journal is
+    /// empty, so plain (non-transactional) saves go through the same
+    /// revision/`settings_generation` logic.
+    ///
+    /// Deliberately does not check `journal_is_empty`: callers that need
+    /// that invariant (every ordinary [`Self::save`]) enforce it themselves;
+    /// the credential journal recovery path intentionally calls this while
+    /// its own journal entry is still pending, since recovering that entry
+    /// is exactly what is retrying this write.
+    pub fn write_while_locked(
+        &self,
+        guard: &AiSettingsExclusiveGuard,
+        expected_revision: u64,
+        mut new_settings: AiSettings,
+    ) -> Result<AiSettings, SaveError> {
+        let _ = guard;
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
             return Err(SaveError::RevisionConflict { current });

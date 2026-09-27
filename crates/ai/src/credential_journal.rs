@@ -168,6 +168,13 @@ pub struct RecoveryOutcome {
     /// safely confirmed against `current_credential_ref` (an inconsistency
     /// requiring diagnosis rather than an automatic choice).
     pub left_for_diagnosis: usize,
+    /// Operations whose settings side was confirmed, but cleaning up the
+    /// now-unreferenced credential via [`CredentialStore::delete`] failed
+    /// (e.g. the OS credential store was transiently unavailable). The
+    /// journal entry is deliberately left in place (fail-closed: never
+    /// marked complete) instead of being dropped as if cleanup had
+    /// succeeded, so a later `recover` retries the same idempotent delete.
+    pub deletion_failed: usize,
 }
 
 /// Recovers every pending journal entry against the already-durable
@@ -192,6 +199,27 @@ pub fn recover(
 ) -> io::Result<RecoveryOutcome> {
     let mut completed = 0usize;
     let mut left_for_diagnosis = 0usize;
+    let mut deletion_failed = 0usize;
+
+    // Deletes the now-unreferenced credential (if any) and completes the
+    // journal entry only when that delete actually succeeded (idempotently
+    // succeeding when the entry is already gone counts as success). A
+    // failed delete must never be treated as if cleanup had happened: the
+    // entry is left in the journal (fail-closed) so a later `recover` retries
+    // it, rather than the journal silently forgetting a credential store
+    // entry that may still exist.
+    let delete_and_complete = |to_delete: Option<&CredentialRef>,
+                                    new_ref: Option<&CredentialRef>,
+                                    old_ref: Option<&CredentialRef>|
+     -> io::Result<bool> {
+        if let Some(target) = to_delete {
+            if let Err(_err) = store.delete(target) {
+                return Ok(false);
+            }
+        }
+        journal.complete(new_ref, old_ref)?;
+        Ok(true)
+    };
 
     for op in journal.pending_operations()? {
         match op.kind {
@@ -199,20 +227,20 @@ pub fn recover(
                 if current_credential_ref == op.new_credential_ref.as_ref() {
                     // The new side won: retry deleting the now-unreferenced
                     // old credential (idempotent if already gone).
-                    if let Some(old) = &op.old_credential_ref {
-                        let _ = store.delete(old);
+                    if delete_and_complete(op.old_credential_ref.as_ref(), op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())? {
+                        completed += 1;
+                    } else {
+                        deletion_failed += 1;
                     }
-                    journal.complete(op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())?;
-                    completed += 1;
                 } else if current_credential_ref == op.old_credential_ref.as_ref() {
                     // The old side is still active: the settings swap never
                     // landed. Clean up the unreferenced new credential
                     // instead of leaking it.
-                    if let Some(new) = &op.new_credential_ref {
-                        let _ = store.delete(new);
+                    if delete_and_complete(op.new_credential_ref.as_ref(), op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())? {
+                        completed += 1;
+                    } else {
+                        deletion_failed += 1;
                     }
-                    journal.complete(op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())?;
-                    completed += 1;
                 } else {
                     // Neither side matches the durable settings: leave for
                     // diagnosis rather than deleting a credential that might
@@ -226,20 +254,20 @@ pub fn recover(
                     // durably landed. Ask the caller to retry that specific
                     // write; only proceed to cleanup once it confirms.
                     if on_pending_settings_swap(&op)? {
-                        if let Some(old) = &op.old_credential_ref {
-                            let _ = store.delete(old);
+                        if delete_and_complete(op.old_credential_ref.as_ref(), None, op.old_credential_ref.as_ref())? {
+                            completed += 1;
+                        } else {
+                            deletion_failed += 1;
                         }
-                        journal.complete(None, op.old_credential_ref.as_ref())?;
-                        completed += 1;
                     }
                 } else if current_credential_ref.is_none() {
                     // credential_ref already cleared: retry deleting the
                     // now-unreferenced secret.
-                    if let Some(old) = &op.old_credential_ref {
-                        let _ = store.delete(old);
+                    if delete_and_complete(op.old_credential_ref.as_ref(), None, op.old_credential_ref.as_ref())? {
+                        completed += 1;
+                    } else {
+                        deletion_failed += 1;
                     }
-                    journal.complete(None, op.old_credential_ref.as_ref())?;
-                    completed += 1;
                 } else {
                     // Settings now reference something else entirely: leave
                     // for diagnosis instead of deleting a credential that
@@ -250,7 +278,7 @@ pub fn recover(
         }
     }
 
-    Ok(RecoveryOutcome { completed, left_for_diagnosis })
+    Ok(RecoveryOutcome { completed, left_for_diagnosis, deletion_failed })
 }
 
 #[cfg(test)]
@@ -469,5 +497,50 @@ mod tests {
         assert_eq!(outcome.completed, 0);
         assert!(!journal.is_empty().unwrap());
         assert!(store.get(&old_ref).unwrap().is_some(), "credential must not be deleted before the replace is confirmed");
+    }
+
+    /// A [`CredentialStore`] that always fails `delete` (backed by a real
+    /// [`FakeCredentialStore`] for `set`/`get`), used to exercise recovery's
+    /// fail-closed behavior when cleanup itself cannot be confirmed.
+    struct DeleteAlwaysFailsStore(FakeCredentialStore);
+
+    impl CredentialStore for DeleteAlwaysFailsStore {
+        fn set(&self, credential_ref: &CredentialRef, secret: &str) -> Result<(), crate::secrets::CredentialStoreError> {
+            self.0.set(credential_ref, secret)
+        }
+        fn get(&self, credential_ref: &CredentialRef) -> Result<Option<String>, crate::secrets::CredentialStoreError> {
+            self.0.get(credential_ref)
+        }
+        fn delete(&self, _credential_ref: &CredentialRef) -> Result<(), crate::secrets::CredentialStoreError> {
+            Err(crate::secrets::CredentialStoreError::Backend("simulated delete failure".to_string()))
+        }
+    }
+
+    #[test]
+    fn recover_update_where_deleting_the_now_unreferenced_credential_fails_leaves_the_entry_pending() {
+        let journal = unique_journal("recover_delete_fails_fail_closed");
+        let store = DeleteAlwaysFailsStore(FakeCredentialStore::new());
+        let new_ref = CredentialRef::generate();
+        let old_ref = CredentialRef::generate();
+        journal
+            .begin(CredentialOperation {
+                kind: JournalOperationKind::Update,
+                state: JournalOperationState::SettingsSwapped,
+                new_credential_ref: Some(new_ref.clone()),
+                old_credential_ref: Some(old_ref.clone()),
+                settings_generation_before: 1,
+            })
+            .unwrap();
+
+        // The new side won, but cleaning up the old credential fails: the
+        // entry must not be silently completed as if cleanup had succeeded.
+        let outcome = recover(&journal, Some(&new_ref), &store, |_| Ok(false)).unwrap();
+
+        assert_eq!(outcome.completed, 0);
+        assert_eq!(outcome.deletion_failed, 1);
+        assert!(
+            !journal.is_empty().unwrap(),
+            "an entry whose cleanup delete failed must remain in the journal for a later retry"
+        );
     }
 }
