@@ -708,20 +708,17 @@ pub(crate) fn row_element(
     // presentation rather than becoming an inactive table row. Layout still
     // gives it the formal cell geometry, so caret, selection and IME painting
     // must use the same cell renderer to stay on those shared boundaries.
+    //
+    // `line.table_header` (not a fresh lookup into `block.table_projection`)
+    // is the header signal here: it is set from the same header detection the
+    // rest of presentation already relies on (see `shape.rs`'s `runs`), which
+    // falls back to a locally scanned delimiter line when the block has no
+    // formal table projection yet. A projection-only lookup would leave a
+    // disclosed header row's tint painted as blank as soon as it renders from
+    // a quick, not-yet-formal index.
     if line.table_row.is_none() && !row.table_cells.is_empty() {
-        let header = block
-            .table_projection
-            .as_ref()
-            .and_then(|projection| {
-                projection.rows.iter().find(|projected| {
-                    projected.source_range == line.source_range
-                        || (projected.source_range.start < line.source_range.end
-                            && line.source_range.start < projected.source_range.end)
-                })
-            })
-            .is_some_and(|projected| projected.header);
         let table = TableRowDisplay {
-            header,
+            header: line.table_header,
             column_count: row
                 .table_cells
                 .iter()
@@ -884,8 +881,29 @@ fn table_row_element(
                 point.height,
             )
         });
-    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 1);
+    let mut elements = Vec::with_capacity(row.table_cells.len() * 2 + 2);
     let editing = line.table_row.is_none();
+    if table.header
+        && let Some(first) = row.table_cells.first()
+        && let Some(last) = row.table_cells.last()
+    {
+        // Bounded to the grid (first column's left border through the last
+        // column's right border) so the header tint never bleeds into the
+        // row's left/right margins outside the table.
+        elements.push(
+            div()
+                .absolute()
+                .left(px(theme.line_horizontal_padding + first.x))
+                .top(px(0.0))
+                .w(px(last.x + last.width - first.x))
+                .h(px(row.height))
+                .bg(rgb(theme.table_header_background))
+                .debug_selector({
+                    let selector = format!("table-header-background-{}", line.line_id);
+                    move || selector.clone()
+                }),
+        );
+    }
     for cell_layout in &row.table_cells {
         let Some(_cell) = table
             .cells
@@ -1060,9 +1078,6 @@ fn table_row_element(
         theme,
         zoom,
     )
-    .when(table.header, |element| {
-        element.bg(rgb(theme.table_header_background))
-    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
