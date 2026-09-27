@@ -193,10 +193,16 @@ input_scenario() {
     fi
     launch "$scenario" "$directory/metrics.csv" "$directory/hane.log" "$fixture" "$offset" "$background" "" "$gate" "$input_source" "$autoscroll"
     "$helper" "$mode" "$app_pid" "$warmup"
+    # Let deferred input and paint measurements drain before opening the gate.
+    sleep 1
     : > "$gate"
     "$helper" "$mode" "$app_pid" "$samples"
     sleep 0.5
     stop_app
+    if [ "$mode" != scroll ] && ! grep -q '^"input",' "$directory/metrics.csv"; then
+        echo "no input latency records were captured for '$scenario'" >&2
+        exit 1
+    fi
     if [ "$mode" = ime ]; then
         "$helper" select-source "$ascii_source"
     fi
