@@ -16,8 +16,23 @@ pub struct OwnerLock {
 
 /// Holding this guard means the current process owns the runtime lock.
 /// Dropping it (or the process exiting) releases the OS-level lock.
+///
+/// Carries the exact path it was acquired against so a caller that receives
+/// this guard from elsewhere (e.g. [`crate::runtime::AiRuntime::start_with_owner_lock`]
+/// or [`crate::settings::AiSettingsStore::save`]/`write_while_locked`) can
+/// confirm it actually proves ownership of *its own* runtime owner lock,
+/// rather than trusting that any `OwnerLockGuard` value proves ownership of
+/// whichever lock file that caller cares about.
 pub struct OwnerLockGuard {
+    path: PathBuf,
     _file: File,
+}
+
+impl OwnerLockGuard {
+    /// The path of the runtime owner lock this guard proves ownership of.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl OwnerLock {
@@ -41,7 +56,7 @@ impl OwnerLock {
             .truncate(false)
             .open(&self.path)?;
         if platform::try_lock_exclusive(&file)? {
-            Ok(Some(OwnerLockGuard { _file: file }))
+            Ok(Some(OwnerLockGuard { path: self.path.clone(), _file: file }))
         } else {
             Ok(None)
         }

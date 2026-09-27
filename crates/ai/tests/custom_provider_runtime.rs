@@ -236,7 +236,8 @@ fn with_owner_lock_lets_a_normal_settings_save_happen_while_this_runtime_holds_t
         "a separate OwnerLock instance must not be able to acquire the lock while this runtime is active"
     );
 
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let settings_store =
+        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
 
@@ -271,7 +272,8 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
     let owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
     let owner = owner_lock.try_acquire().unwrap().expect("no other process holds the owner lock yet");
 
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let settings_store =
+        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
     let saved = update_custom_credential(&settings_store, &owner, &journal, &credential_store, 0, None, "sk-boot", |new_ref| {
@@ -296,6 +298,41 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
     assert!(external.try_acquire().unwrap().is_some());
 }
 
+/// Regression coverage for the root cause behind `start_with_owner_lock`
+/// accepting *any* `OwnerLockGuard` as proof of ownership: a guard acquired
+/// against a different path proves ownership of a different runtime owner
+/// lock, not this runtime's own (`RuntimeConfig::owner_lock_path`), and must
+/// be rejected before any child is spawned -- leaving this runtime's own
+/// owner lock free for its rightful owner to acquire.
+#[test]
+fn start_with_owner_lock_rejects_a_guard_acquired_against_a_different_path() {
+    let (config, dir) = fake_server_config("start_with_owner_lock_mismatch");
+    let own_owner_lock_path = config.owner_lock_path.clone();
+
+    let other_owner_lock_path = dir.join("other-owner.lock");
+    let other_owner = hane_ai::OwnerLock::new(&other_owner_lock_path)
+        .try_acquire()
+        .unwrap()
+        .expect("no other process holds the unrelated owner lock yet");
+
+    let (events_tx, _events_rx) = mpsc::sync_channel(64);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+    let result = runtime.start_with_owner_lock(other_owner);
+    assert!(
+        matches!(result, Err(RuntimeError::OwnerLockPathMismatch)),
+        "expected OwnerLockPathMismatch, got {result:?}"
+    );
+    assert_eq!(runtime.snapshot().state, RuntimeState::Stopped, "no child must be spawned on a mismatched guard");
+
+    // This runtime's own owner lock was never touched by the rejected guard,
+    // so it is still free for its rightful owner to acquire.
+    let own_owner_lock = hane_ai::OwnerLock::new(&own_owner_lock_path);
+    assert!(own_owner_lock.try_acquire().unwrap().is_some());
+
+    let _ = runtime.shutdown();
+}
+
 /// Structural rejection of a non-owner: while a first `OwnerLock` instance
 /// holds the lock, a second, independent instance for the same path cannot
 /// acquire it and therefore has no way to obtain the `&OwnerLockGuard`
@@ -317,7 +354,8 @@ fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner
 
     drop(first);
     let second = second_owner_lock.try_acquire().unwrap().expect("the lock becomes available once the owner releases it");
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let settings_store =
+        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
     update_custom_credential(&settings_store, &second, &journal, &credential_store, 0, None, "sk-new-owner", |new_ref| {
@@ -355,11 +393,18 @@ fn custom_settings_for(credential_ref: Option<hane_ai::CredentialRef>) -> AiSett
 fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end() {
     let dir = unique_dir("internal_path");
     let paths = AiPaths::new(&dir);
-    let settings_store = Arc::new(AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock")));
+    // The settings store and the runtime it later configures must share the
+    // exact same runtime owner lock path (`AiPaths::runtime_owner_lock_path`)
+    // for a guard acquired against it to prove ownership to both.
+    let owner_lock_path = paths.runtime_owner_lock_path();
+    let settings_store = Arc::new(AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    ));
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store: Arc<dyn CredentialStore> = Arc::new(FakeCredentialStore::new());
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
-    let owner_lock_path = dir.join("runtime.lock");
 
     // Step 0: acquire the runtime owner lock ourselves, per ADR-0032
     // section 8's "try-lock before an out-of-runtime save, hold it through
@@ -515,8 +560,10 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
 #[test]
 fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation() {
     let dir = unique_dir("generation_gate_ready");
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
-    let owner = hane_ai::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
+    let owner_lock_path = dir.join("owner.lock");
+    let settings_store =
+        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
     let mut first = AiSettings::default();
     first.chatgpt.model_id = Some("gpt-a".to_string());
     let saved = settings_store.save(&owner, 0, first, || Ok(true)).unwrap();
@@ -634,8 +681,10 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
 #[test]
 fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
     let dir = unique_dir("generation_checked_lock_holds_whole_turn");
-    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
-    let owner = hane_ai::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
+    let owner_lock_path = dir.join("owner.lock");
+    let settings_store =
+        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
     let saved = settings_store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
     let generation = saved.settings_generation;
     let revision = saved.revision;

@@ -121,6 +121,13 @@ pub enum SaveError {
     /// 7.3, no ordinary `AiSettings` save may proceed until journal recovery
     /// has completed and removed it.
     PendingCredentialJournal,
+    /// `owner` was acquired against a different path than this store's own
+    /// [`AiSettingsStore::new`] `owner_lock_path`: it proves ownership of
+    /// *some* runtime owner lock, but not the one this store is scoped to,
+    /// so it cannot serve as proof of ADR-0032 section 8's "runtime owner
+    /// lock → AI settings lock" acquisition order for this store. Rejected
+    /// before the settings file is read or written.
+    OwnerLockMismatch,
     /// The atomic replace's `rename` durably landed — any reader opening the
     /// settings file now observes `new_settings` — but this process could
     /// not confirm the parent directory entry's own crash-durability fsync.
@@ -144,6 +151,9 @@ impl std::fmt::Display for SaveError {
             SaveError::PendingCredentialJournal => {
                 write!(f, "a credential operation journal entry must be recovered before saving AI settings")
             }
+            SaveError::OwnerLockMismatch => {
+                write!(f, "the supplied runtime owner lock guard does not belong to this AI settings store")
+            }
             SaveError::PersistedDurabilityUnconfirmed(e) => write!(
                 f,
                 "AI settings replace may have already taken effect, but its crash-durability could not be confirmed: {e}"
@@ -159,13 +169,18 @@ impl std::error::Error for SaveError {}
 pub struct AiSettingsStore {
     path: PathBuf,
     lock: AiSettingsLock,
+    /// The runtime owner lock path every `owner: &OwnerLockGuard` passed to
+    /// [`Self::save`]/[`Self::write_while_locked`] must have been acquired
+    /// against; see [`SaveError::OwnerLockMismatch`].
+    owner_lock_path: PathBuf,
 }
 
 impl AiSettingsStore {
-    pub fn new(path: impl Into<PathBuf>, lock_path: impl Into<PathBuf>) -> Self {
+    pub fn new(path: impl Into<PathBuf>, lock_path: impl Into<PathBuf>, owner_lock_path: impl Into<PathBuf>) -> Self {
         AiSettingsStore {
             path: path.into(),
             lock: AiSettingsLock::new(lock_path),
+            owner_lock_path: owner_lock_path.into(),
         }
     }
 
@@ -175,6 +190,10 @@ impl AiSettingsStore {
 
     pub fn settings_lock(&self) -> &AiSettingsLock {
         &self.lock
+    }
+
+    pub fn owner_lock_path(&self) -> &Path {
+        &self.owner_lock_path
     }
 
     /// Loads the current settings, or `AiSettings::default()` if none have
@@ -204,8 +223,10 @@ impl AiSettingsStore {
     /// to reach this method (or [`Self::write_while_locked`]) without first
     /// obtaining an [`OwnerLockGuard`] via [`crate::owner_lock::OwnerLock::try_acquire`]
     /// or [`crate::runtime::AiRuntime::with_owner_lock`]/`start_with_owner_lock`,
-    /// each of which itself rejects a non-owner. Not otherwise inspected
-    /// here; it exists purely as a compile-time proof of possession.
+    /// each of which itself rejects a non-owner. [`Self::write_while_locked`]
+    /// additionally confirms `owner` was acquired against this store's own
+    /// `owner_lock_path`, rejecting with [`SaveError::OwnerLockMismatch`] a
+    /// guard that proves ownership of a *different* runtime owner lock.
     pub fn save(
         &self,
         owner: &OwnerLockGuard,
@@ -242,7 +263,9 @@ impl AiSettingsStore {
     /// is exactly what is retrying this write.
     ///
     /// `owner` is the same runtime-owner-lock proof [`Self::save`] requires;
-    /// see its documentation.
+    /// see its documentation. Rejected with [`SaveError::OwnerLockMismatch`]
+    /// before the settings file is even read if `owner` was acquired against
+    /// a different path than this store's own `owner_lock_path`.
     pub fn write_while_locked(
         &self,
         owner: &OwnerLockGuard,
@@ -250,7 +273,10 @@ impl AiSettingsStore {
         expected_revision: u64,
         mut new_settings: AiSettings,
     ) -> Result<AiSettings, SaveError> {
-        let _ = (owner, guard);
+        let _ = guard;
+        if owner.path() != self.owner_lock_path {
+            return Err(SaveError::OwnerLockMismatch);
+        }
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
             return Err(SaveError::RevisionConflict { current });
@@ -295,11 +321,10 @@ mod tests {
     /// runtime owner before ever calling [`AiSettingsStore::save`].
     fn store(name: &str) -> (AiSettingsStore, OwnerLockGuard) {
         let dir = unique_dir(name);
-        let store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
-        let owner = crate::owner_lock::OwnerLock::new(dir.join("owner.lock"))
-            .try_acquire()
-            .unwrap()
-            .unwrap();
+        let owner_lock_path = dir.join("owner.lock");
+        let store =
+            AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+        let owner = crate::owner_lock::OwnerLock::new(owner_lock_path).try_acquire().unwrap().unwrap();
         (store, owner)
     }
 
@@ -414,6 +439,25 @@ mod tests {
         assert!(matches!(err, SaveError::PendingCredentialJournal));
         // Nothing was written.
         assert_eq!(store.load().unwrap(), AiSettings::default());
+    }
+
+    /// Regression coverage for the root cause behind `save`/
+    /// `write_while_locked` accepting *any* `OwnerLockGuard` as proof of
+    /// ownership: a guard acquired against a different path proves ownership
+    /// of a different runtime owner lock, not this store's own, and must be
+    /// rejected before the settings file is ever touched.
+    #[test]
+    fn save_rejects_a_guard_acquired_against_a_different_owner_lock_path() {
+        let (store, _owner) = store("owner_lock_mismatch");
+        let other_dir = unique_dir("owner_lock_mismatch_other");
+        let other_owner = crate::owner_lock::OwnerLock::new(other_dir.join("owner.lock"))
+            .try_acquire()
+            .unwrap()
+            .unwrap();
+
+        let err = store.save(&other_owner, 0, AiSettings::default(), always_empty_journal).unwrap_err();
+        assert!(matches!(err, SaveError::OwnerLockMismatch));
+        assert_eq!(store.load().unwrap(), AiSettings::default(), "a mismatched guard must never write settings");
     }
 
     #[test]

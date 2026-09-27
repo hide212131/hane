@@ -548,9 +548,10 @@ mod tests {
 
     fn store_and_journal(name: &str) -> (AiSettingsStore, OwnerLockGuard, CredentialJournal, PathBuf) {
         let dir = unique_dir(name);
-        let owner = crate::owner_lock::OwnerLock::new(dir.join("owner.lock")).try_acquire().unwrap().unwrap();
+        let owner_lock_path = dir.join("owner.lock");
+        let owner = crate::owner_lock::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
         (
-            AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock")),
+            AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path),
             owner,
             CredentialJournal::new(dir.join("credential-journal.json")),
             dir,

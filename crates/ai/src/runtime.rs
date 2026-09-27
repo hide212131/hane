@@ -130,6 +130,12 @@ pub enum RuntimeError {
     NotReady,
     RestartBlocked,
     OwnerLockUnavailable,
+    /// An externally acquired [`OwnerLockGuard`] (via
+    /// [`AiRuntime::start_with_owner_lock`]) was acquired against a
+    /// different path than this runtime's own `RuntimeConfig::owner_lock_path`:
+    /// it proves ownership of a *different* runtime owner lock, not the one
+    /// this runtime is scoped to. Rejected before any child is spawned.
+    OwnerLockPathMismatch,
     OwnerLock(Arc<io::Error>),
     Spawn(Arc<io::Error>),
     Handshake(RpcError),
@@ -147,6 +153,9 @@ impl std::fmt::Display for RuntimeError {
             ),
             RuntimeError::OwnerLockUnavailable => {
                 write!(f, "AI runtime is owned by another Hane process")
+            }
+            RuntimeError::OwnerLockPathMismatch => {
+                write!(f, "the supplied runtime owner lock guard does not belong to this runtime")
             }
             RuntimeError::OwnerLock(e) => write!(f, "failed to acquire runtime owner lock: {e}"),
             RuntimeError::Spawn(e) => write!(f, "failed to start the App Server process: {e}"),
@@ -887,6 +896,18 @@ fn do_start(
     shared: &Arc<Mutex<SharedState>>,
     reply: &Sender<Result<RuntimeStatus, RuntimeError>>,
 ) -> Option<Result<RuntimeStatus, RuntimeError>> {
+    // `external_owner` is only ever `Some` for `StartWithOwnerLock`, carrying
+    // a guard the caller acquired itself. Confirm it actually proves
+    // ownership of *this* runtime's own owner lock before doing anything
+    // else: a guard acquired against a different path must be rejected
+    // outright, never silently accepted (and possibly carried into
+    // `owner_guard`) as if it were equivalent proof.
+    if let Some(external) = &external_owner {
+        if external.path() != config.owner_lock_path {
+            return Some(Err(RuntimeError::OwnerLockPathMismatch));
+        }
+    }
+
     if current.is_some() {
         let status = read_status(shared);
         if status.state == RuntimeState::Ready {
