@@ -12,6 +12,7 @@
 
 - Issue #241
 - ADR-0027: AADW v2 は ChatGPT Commander と GitHub facts を核にする
+- ADR-0031: AADW v3。Claude優先・条件付きCodexを引き継ぐ
 
 ## 背景
 
@@ -76,4 +77,4 @@ enabled = false
 
 ## 正本
 
-全体設計は [`docs/agentic-development-workflow-v2.md`](../agentic-development-workflow-v2.md)、判断ルールは [`docs/aadw-command-policy.md`](../aadw-command-policy.md) を正とする。
+この fallback 自体の trust boundary は本ADRを正とする。現行AADW全体は [`docs/agentic-development-workflow-v3.md`](../agentic-development-workflow-v3.md) と [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)、判断ルールは [`docs/aadw-command-policy.md`](../aadw-command-policy.md) を正とする。

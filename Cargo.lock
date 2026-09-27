@@ -2892,6 +2892,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hane-ai"
+version = "0.19.2"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hane-benchmark"
 version = "0.19.2"
 dependencies = [

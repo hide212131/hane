@@ -4,9 +4,9 @@
 
 Issue / Pull Request のタイトル・本文、およびコメント・返信・進捗報告は、上記の共通指示に従って日本語で書く。
 
-## AADW v2 で実装・修正するときの責務
+## AADW v3 で実装・修正するときの責務
 
-Hane の現行 AADW は [AADW v2 設計書](docs/agentic-development-workflow-v2.md) と [AADW Commander Policy](docs/aadw-command-policy.md) を正とする。ChatGPT が Commander であり、Claude Code は repository mutation を担う実装 worker である。
+Hane の現行 AADW は [AADW v3 設計書](docs/agentic-development-workflow-v3.md)、[ADR-0031](docs/adr/0031-aadw-v3-jev-bounded-execution.md)、[AADW Commander Policy](docs/aadw-command-policy.md) を正とする。ChatGPT が Commander であり、Claude Code は repository mutation を担う通常の実装 worker である。通常レビューは CodeRabbit が担当し、Codex は承認済み条件での代替実装に限定する。
 
 - Issue 本文、acceptance criteria、関連する ADR、既存コードを読み、要求と決定済みの制約を守る範囲で具体的な実装方法を判断する。
 - Issue に書かれた具体的な変更ファイルや手順は、必須として明記されていない限り設計時点の参考情報として扱い、コードを読んで最終判断する。

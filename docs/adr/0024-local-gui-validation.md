@@ -2,7 +2,7 @@
 
 ## ステータス
 
-採用。AADW orchestration に関する部分は [ADR-0027](0027-aadw-v2-chatgpt-commander.md) により改訂。
+採用。AADW orchestration に関する部分は [ADR-0031](0031-aadw-v3-jev-bounded-execution.md) により現行運用へ改訂。GUI validation の trust boundary と実行入口は v3 でも引き継ぐ。
 
 ## 日付
 
@@ -26,7 +26,7 @@ Hosted GUI Validation の初期入口は manual `workflow_dispatch` で、PR番�
 
 ### 現在存在する実行入口を使う
 
-現行 v2 では GitHub-hosted macOS の `AADW Hosted GUI Validation` と、ローカル Mac の `scripts/gui_validate.py` を用途に応じて使う。
+現行 v3 では GitHub-hosted macOS の `AADW Hosted GUI Validation` と、ローカル Mac の `scripts/gui_validate.py` を用途に応じて使う。
 
 通常の Hosted GUI Validation は Pull Request Conversation に単独の `/gui-validate head` または `/gui-validate merge` を投稿して起動する。comment router は authorization と request construction に限定し、コメントイベントの PR 番号、GitHub API から取得した current head、current target branch、trusted default branch の procedure を使って Hosted GUI Validation を dispatch する。文章中の部分一致や未知の引数では起動しない。
 
@@ -65,13 +65,14 @@ comment router にだけ dispatch と PR Conversation への通知に必要な�
 - head と、必要な場合は current base / merge context に対応する focused evidence を使いながら、GUI worker の観測と Commander の意味判断を分離できる。
 - workflow run / artifact / current GitHub facts を正本とし、AADW 専用の persistent state を追加しない。
 
-## AADW v2 により置き換えた部分
+## AADW v2 以降で置き換えた部分
 
-v1 の GUI requirement workflow、Copilot final judge、merge gate、receipt / state transition の契約は現行では使わない。これらを含む旧全文は [`docs/history/aadw-v1/adr/0024-local-gui-validation.md`](../history/aadw-v1/adr/0024-local-gui-validation.md) に保存する。
+v1 の GUI requirement workflow、Copilot final judge、merge gate、receipt / state transition の契約は現行では使わない。v3でもこの判断を引き継ぐ。これらを含む旧全文は [`docs/history/aadw-v1/adr/0024-local-gui-validation.md`](../history/aadw-v1/adr/0024-local-gui-validation.md) に保存する。
 
 ## 現行の参照先
 
-- [AADW v2 設計書](../agentic-development-workflow-v2.md)
+- [AADW v3 設計書](../agentic-development-workflow-v3.md)
+- [ADR-0031](0031-aadw-v3-jev-bounded-execution.md)
 - [AADW Commander Policy](../aadw-command-policy.md)
 - [Local GUI validation](../local-gui-validation.md)
 - [CLI 操作説明](../local-gui-validate-cli.md)
