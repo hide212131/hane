@@ -108,9 +108,15 @@ UIは生JSONやトークンを保持せず、`AiService`の操作と秘密を含
 
 ## 5. ランタイムとプロトコル
 
-状態の基本形は`Stopped → Starting → Initializing → Ready`、異常時は`Failed`、終了時は`Stopping → Stopped`。
+状態の基本形は`Stopped → Starting → Initializing → Ready`、異常時は`Failed`、終了時は`Stopping → Stopped`。再起動は内部的に`Stopping → Starting → Initializing → Ready`を一つのlifecycle操作として扱う。
 
-Readyになる前に通常要求を送らない。複数の操作が同時に起動を求めても起動・initializeは一度だけにする。GUIからの操作はコマンドキュー経由で処理する。
+ownerプロセス内ではApp Serverのstart / initialize / stop / restartを**単一のruntime lifecycle coordinator**に集約し、同時に一つだけ実行する。GUIやAI操作から直接`Child`を起動・killせず、すべてcoordinatorのコマンドキューを通す。
+
+Readyになる前に通常要求を送らない。複数の操作が同時に同じ起動を求めても子プロセスとinitializeは一度だけとし、後続操作は同じlifecycle結果を待つ。起動・停止には有限のlifecycle timeoutを設け、完了しない場合は`Failed`として待機中操作をエラー終了する。無期限待機しない。
+
+runtime-affecting設定の保存は推論・固定接続確認が保持する共有設定ロック中には拒否されるため、設定変更を反映するrestartはactiveなAI要求がない状態から開始する。子プロセスが実行中要求の途中で異常終了した場合は、そのgenerationに属するpending requestをすべて失敗完了させ、共有設定ロックを解放して`Failed`へ遷移する。途中要求を新プロセスへ自動再送せず、次の明示的なAI操作がlifecycle coordinator経由で再起動を要求する。
+
+restart開始後は新しい推論・接続確認を受理せず、同じlifecycle結果の完了後に`Ready`と`settings_generation`を再確認してから開始する。これにより、複数要求が同時にrestart・stop・startを競合実行したり、旧App Serverへの要求と再起動を並行させたりしない。
 
 通信処理では以下を必須とする。
 
