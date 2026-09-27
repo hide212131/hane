@@ -6,7 +6,7 @@ Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`
 
 Measured product source: `174558e522feb7ed17e9cc7567dcd71e0499a7d6`. The intervening `main` changes are documentation and agent instructions only; product code is unchanged.
 
-Measurement harness revision: `5576d8e9692fb629fc242170ccaab73eb1314b5c`.
+Measurement harness revision: `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`.
 
 Capture date: 2026-09-27 (JST)
 
@@ -24,31 +24,31 @@ once each. RSS is per-process resident set size (RSS), in bytes, after the liste
 
 | Scenario | Samples | Median | p95 | Notes |
 |---|---:|---:|---:|---|
-| Empty warm startup | 30 | 188.597 ms | 244.299 ms | New process per launch |
-| Empty unpurged startup | 30 | 189.042 ms | 211.348 ms | OS cache was not purged; not a true cold result |
-| 1 KiB Markdown startup | 30 | 200.667 ms | 222.585 ms | File-open median 71.150 ms |
-| 100 MiB Markdown startup | 30 | 385.340 ms | 418.998 ms | File-open median 239.404 ms |
-| Empty work-folder startup | 30 | 192.423 ms | 224.635 ms | Scan completion median 313.440 ms, p95 361.887 ms |
-| 1k-note work-folder startup | 30 | 192.408 ms | 225.242 ms | Scan completion median 322.066 ms, p95 362.686 ms |
-| 10k-note work-folder startup | 30 | 186.819 ms | 203.377 ms | Scan completion median 659.870 ms, p95 692.250 ms |
+| Empty warm startup | 30 | 164.306 ms | 175.748 ms | New process per launch |
+| Empty unpurged startup | 30 | 163.532 ms | 169.968 ms | OS cache was not purged; not a true cold result |
+| 1 KiB Markdown startup | 30 | 171.249 ms | 183.681 ms | File-open median 60.512 ms |
+| 100 MiB Markdown startup | 30 | 343.596 ms | 367.273 ms | File-open median 218.981 ms |
+| Empty work-folder startup | 30 | 164.454 ms | 175.837 ms | Scan completion median 182.441 ms, p95 196.329 ms |
+| 1k-note work-folder startup | 30 | 166.114 ms | 170.606 ms | Scan completion median 184.683 ms, p95 189.622 ms |
+| 10k-note work-folder startup | 30 | 163.414 ms | 173.232 ms | Scan completion median 186.574 ms, p95 198.799 ms |
 
-For 10k notes, the first editor paint was ready at a median of 186.819 ms while the scan
-completed at a median of 659.870 ms (p95 692.250 ms). Folder discovery completed after the
+For 10k notes, the first editor paint was ready at a median of 163.414 ms while the scan
+completed at a median of 186.574 ms (p95 198.799 ms). Folder discovery completed after the
 editor became ready in these runs.
 
 | RSS scenario | Samples | Measured bytes | MB (decimal) | MiB (binary) | Initial budget |
 |---|---:|---:|---:|---:|---:|
-| Empty editor, 30 s idle | 2 | 96,993,280–97,796,096 | 97.0–97.8 | 92.5–93.3 | <65 MiB |
-| 1 MiB document, 30 s idle | 2 | 121,503,744–122,175,488 | 121.5–122.2 | 115.9–116.5 | — |
-| 10 MiB document, 30 s idle | 2 | 296,878,080–370,130,944 | 296.9–370.1 | 283.1–353.0 | <120 MB |
-| 100 MiB document, 30 s idle | 2 | 1,449,951,232–2,155,495,424 | 1,450.0–2,155.5 | 1,382.8–2,055.6 | <350 MB |
-| Empty work folder, 30 s after scan | 2 | 87,212,032–87,425,024 | 87.2–87.4 | 83.2–83.4 | — |
-| 1k-note folder, 30 s after scan | 2 | 123,076,608–123,568,128 | 123.1–123.6 | 117.4–117.8 | — |
-| 10k-note folder, 30 s after scan | 2 | 418,693,120–477,822,976 | 418.7–477.8 | 399.3–455.7 | — |
-| 10 visited notes, then 30 s idle | 1 | 132,546,560 | 132.5 | 126.4 | — |
-| 100 visited notes, then 30 s idle | 1 | 144,015,360 | 144.0 | 137.3 | — |
-| 1,000 visited notes, then 30 s idle | 1 | 188,628,992 | 188.6 | 179.9 | — |
-| Open 100 MiB note, return to small note, then 30 s idle | 1 | 354,680,832 | 354.7 | 338.2 | — |
+| Empty editor, 30 s idle | 2 | 85,622,784–86,245,376 | 85.6–86.2 | 81.7–82.2 | <65 MiB |
+| 1 MiB document, 30 s idle | 2 | 115,048,448–115,146,752 | 115.0–115.1 | 109.7–109.8 | — |
+| 10 MiB document, 30 s idle | 2 | 364,019,712–364,134,400 | 364.0–364.1 | 347.2–347.3 | <120 MB |
+| 100 MiB document, 30 s idle | 2 | 1,292,075,008–1,548,550,144 | 1,292.1–1,548.6 | 1,232.2–1,476.8 | <350 MB |
+| Empty work folder, 30 s after scan | 2 | 77,185,024–77,217,792 | 77.2 | 73.6–73.7 | — |
+| 1k-note folder, 30 s after scan | 2 | 83,935,232–84,279,296 | 83.9–84.3 | 80.0–80.4 | — |
+| 10k-note folder, 30 s after scan | 2 | 61,931,520–88,670,208 | 61.9–88.7 | 59.1–84.6 | — |
+| 10 visited notes, then 30 s idle | 1 | 131,219,456 | 131.2 | 125.2 | — |
+| 100 visited notes, then 30 s idle | 1 | 141,885,440 | 141.9 | 135.3 | — |
+| 1,000 visited notes, then 30 s idle | 1 | 255,098,880 | 255.1 | 243.2 | — |
+| Open 100 MiB note, return to small note, then 30 s idle | 1 | 354,254,848 | 354.3 | 337.8 | — |
 
 Work-folder RSS includes the first note that work-folder mode opens automatically; the 1k/10k
 runs did not open the remaining indexed notes. Visit scenarios waited for each note's file load
@@ -56,18 +56,18 @@ to finish before recording the 10, 100 and 1,000 session checkpoints.
 
 The 20-cycle long-running scenario switched between two work folders, opened two notes per
 folder (including an image note), and performed 10 edit/undo/redo cycles per folder switch.
-RSS was 97.6 MB after cycle 1, 108.1 MB after cycle 5, 108.3 MB after cycle 10, 108.4 MB
-after cycle 15, 108.8 MB after cycle 20, and 108.2 MB after a final 30-second idle period.
+RSS was 101.2 MB after cycle 1, 108.3 MB after cycle 5, 108.7 MB after cycle 10, 108.7 MB
+after cycle 15, 108.9 MB after cycle 20, and 108.1 MB after a final 30-second idle period.
 This single run stayed near 108–109 MB after the first few cycles; it does not establish
 behavior for arbitrarily long sessions.
 
 ## Budget and comparison assessment
 
-- The ≤150 ms warm-start target was exceeded: median 188.597 ms and p95 244.299 ms in 30
+- The ≤150 ms warm-start target was exceeded: median 164.306 ms and p95 175.748 ms in 30
   launches. The previous R0 reference is 165.934 ms, but its OS, Rust and GPUI versions differ,
   so the 10% relative-regression rule is not a valid conclusion across these conditions.
 - The empty-editor, 10 MiB and 100 MiB RSS gates were exceeded. The 100 MiB document samples
-  varied substantially (about 1.45–2.16 GB decimal), but both exceed the 350 MB gate.
+  varied (about 1.29–1.55 GB decimal), and both exceed the 350 MB gate.
 - A true cold-start result is unknown. `/usr/sbin/purge` returned nonzero, so those samples
   were labelled “OS cache not purged.” The 400 ms cold gate cannot be marked pass.
 - The previous R0 reference also recorded 103.6 MB for a 10 MB document and 263.1 MB for a
@@ -141,8 +141,9 @@ The script attempts `/usr/sbin/purge` before each cold-labelled sample. A nonzer
 recorded as “OS cache not purged”; these are separate-process launches with warm OS/file
 caches, not cold-cache measurements. Warm runs also use a new app process for every sample
 without purging OS caches. Startup is measured from process start to the first `InputCapture`
-paint. Work-folder completion is logged separately after asynchronous scan and index
-publication; the automatically opened first note may still be loading then.
+paint. Work-folder scan completion time is captured when the background scanner returns, then
+reported when the view publishes the results; the reported elapsed time excludes the later
+polling delay and draft recovery. The automatically opened first note may still be loading then.
 
 RSS is the operating system's resident-set byte count, not virtual memory. In this report,
 `MB = 1,000,000 bytes` and `MiB = 1,048,576 bytes`; raw CSV always retains exact bytes.

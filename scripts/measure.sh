@@ -26,17 +26,24 @@ original_input_source=$($helper current-source)
 ascii_source=${HANE_ASCII_INPUT_SOURCE:-com.apple.keylayout.ABC}
 japanese_source=${HANE_JAPANESE_INPUT_SOURCE:-com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese}
 
-mkdir -p "$results_dir"
-cargo +1.98.1 run --locked --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
-python3 "$script_dir/prepare_issue23_fixtures.py" >/dev/null
-python3 "$script_dir/prepare_issue23_fixtures.py" --verify >/dev/null
 case "$measurement_feature" in
-    instrument|timing-probe) ;;
+    instrument) ;;
+    timing-probe)
+        if [ "$scenario" != comparison ]; then
+            echo "scenario '$scenario' requires HANE_MEASUREMENT_FEATURE=instrument; timing-probe is supported only for comparison" >&2
+            exit 2
+        fi
+        ;;
     *)
         echo "HANE_MEASUREMENT_FEATURE must be instrument or timing-probe" >&2
         exit 2
         ;;
 esac
+
+mkdir -p "$results_dir"
+cargo +1.98.1 run --locked --manifest-path "$workspace_dir/Cargo.toml" --release -p hane-benchmark --bin hane-bench -- fixtures >/dev/null
+python3 "$script_dir/prepare_issue23_fixtures.py" >/dev/null
+python3 "$script_dir/prepare_issue23_fixtures.py" --verify >/dev/null
 cargo +1.98.1 build --locked --manifest-path "$workspace_dir/Cargo.toml" --release -p hane --features "$measurement_feature"
 
 app_pid=""

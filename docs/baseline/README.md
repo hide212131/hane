@@ -5,20 +5,20 @@
 Current `main` at report preparation: `784707877d67323d38885d706ec55382bdf8dcdb`. The
 measurements used product source `174558e522feb7ed17e9cc7567dcd71e0499a7d6`; intervening
 main changes are documentation and agent instructions only. The instrumented measurement
-build is from harness revision `5576d8e9692fb629fc242170ccaab73eb1314b5c`. Startup results use
+build is from harness revision `58ab905db035e3d56ac4c59a8fbd6c2be0065f53`. Startup results use
 30 launches per case; RSS uses two process trials per document/folder case.
 
 | Headline metric | Current measurement | Initial budget | Result |
 |---|---:|---:|---|
-| Empty warm startup | 188.6 ms median / 244.3 ms p95 (n=30) | ≤150 ms | Over |
-| Empty editor RSS, 30 s idle | 97.0–97.8 MB (92.5–93.3 MiB, n=2) | <65 MiB | Over |
-| 10 MiB document RSS, 30 s idle | 296.9–370.1 MB (283.1–353.0 MiB, n=2) | <120 MB | Over |
-| 100 MiB document RSS, 30 s idle | 1,450.0–2,155.5 MB (1,382.8–2,055.6 MiB, n=2) | <350 MB | Over |
-| 1k-note work-folder RSS, 30 s after scan | 123.1–123.6 MB (n=2; first note opened) | No absolute gate | Recorded |
-| 10k-note work-folder RSS, 30 s after scan | 418.7–477.8 MB (n=2; first note opened) | No absolute gate | Recorded |
-| RSS after visiting 100 notes | 144.0 MB (one run, 30 s idle) | No absolute gate | Recorded |
+| Empty warm startup | 164.3 ms median / 175.7 ms p95 (n=30) | ≤150 ms | Over |
+| Empty editor RSS, 30 s idle | 85.6–86.2 MB (81.7–82.2 MiB, n=2) | <65 MiB | Over |
+| 10 MiB document RSS, 30 s idle | 364.0–364.1 MB (347.2–347.3 MiB, n=2) | <120 MB | Over |
+| 100 MiB document RSS, 30 s idle | 1,292.1–1,548.6 MB (1,232.2–1,476.8 MiB, n=2) | <350 MB | Over |
+| 1k-note work-folder RSS, 30 s after scan | 83.9–84.3 MB (n=2; first note opened) | No absolute gate | Recorded |
+| 10k-note work-folder RSS, 30 s after scan | 61.9–88.7 MB (n=2; first note opened) | No absolute gate | Recorded |
+| RSS after visiting 100 notes | 141.9 MB (one run, 30 s idle) | No absolute gate | Recorded |
 
-The unpurged startup series measured 189.0 ms median / 211.3 ms p95 (n=30). A true cold run
+The unpurged startup series measured 163.5 ms median / 170.0 ms p95 (n=30). A true cold run
 was unavailable because macOS denied the cache-purge command; this does not establish the
 ≤400 ms cold-start gate. Previous R0 figures remain historical references because OS, Rust
 and GPUI versions differ, so they are not a same-condition regression comparison.
