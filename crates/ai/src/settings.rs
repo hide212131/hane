@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists};
+use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists, AtomicWriteError};
 use crate::secrets::CredentialRef;
 use crate::settings_lock::{AiSettingsExclusiveGuard, AiSettingsLock};
 
@@ -120,6 +120,16 @@ pub enum SaveError {
     /// 7.3, no ordinary `AiSettings` save may proceed until journal recovery
     /// has completed and removed it.
     PendingCredentialJournal,
+    /// The atomic replace's `rename` durably landed — any reader opening the
+    /// settings file now observes `new_settings` — but this process could
+    /// not confirm the parent directory entry's own crash-durability fsync.
+    /// Callers must treat the write as having happened (e.g.
+    /// `update_custom_credential` must not delete the credential the new,
+    /// already-visible settings may now reference): the credential
+    /// operation journal entry guarding this write is left in place so
+    /// startup recovery re-derives the outcome from the already-updated
+    /// persisted settings, exactly as it would for a normal success.
+    PersistedDurabilityUnconfirmed(io::Error),
 }
 
 impl std::fmt::Display for SaveError {
@@ -133,6 +143,10 @@ impl std::fmt::Display for SaveError {
             SaveError::PendingCredentialJournal => {
                 write!(f, "a credential operation journal entry must be recovered before saving AI settings")
             }
+            SaveError::PersistedDurabilityUnconfirmed(e) => write!(
+                f,
+                "AI settings replace may have already taken effect, but its crash-durability could not be confirmed: {e}"
+            ),
         }
     }
 }
@@ -237,8 +251,13 @@ impl AiSettingsStore {
 
         let bytes = serde_json::to_vec_pretty(&new_settings)
             .map_err(|e| SaveError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        atomic_write_bytes(&self.path, &bytes).map_err(SaveError::Io)?;
-        Ok(new_settings)
+        match atomic_write_bytes(&self.path, &bytes) {
+            Ok(()) => Ok(new_settings),
+            Err(AtomicWriteError::NotPersisted(e)) => Err(SaveError::Io(e)),
+            Err(AtomicWriteError::RenameSucceededSyncFailed(e)) => {
+                Err(SaveError::PersistedDurabilityUnconfirmed(e))
+            }
+        }
     }
 }
 
@@ -371,5 +390,32 @@ mod tests {
         assert!(matches!(err, SaveError::PendingCredentialJournal));
         // Nothing was written.
         assert_eq!(store.load().unwrap(), AiSettings::default());
+    }
+
+    #[test]
+    fn a_rename_that_landed_but_could_not_confirm_parent_dir_sync_durability_still_persists_and_is_reported_distinctly()
+    {
+        // Regression coverage for the "rename succeeded, parent directory
+        // fsync failed" case: the write must still take effect (the settings
+        // file already has the new content) and the error returned must be
+        // distinguishable from an outright failed write, so a caller like
+        // `crate::connect::update_custom_credential` does not mistake this
+        // for "nothing happened" and delete a resource the new settings
+        // already reference.
+        let store = store("ambiguous_durability");
+        crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
+
+        let mut settings = AiSettings::default();
+        settings.chatgpt.model_id = Some("gpt-test".to_string());
+        let err = store.save(0, settings.clone(), always_empty_journal).unwrap_err();
+        match err {
+            SaveError::PersistedDurabilityUnconfirmed(_) => {}
+            other => panic!("expected PersistedDurabilityUnconfirmed, got {other:?}"),
+        }
+
+        // The write actually landed despite the reported error.
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.chatgpt.model_id, settings.chatgpt.model_id);
+        assert_eq!(reloaded.revision, 1);
     }
 }

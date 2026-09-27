@@ -1,11 +1,13 @@
 //! Custom Provider integration tests.
 //!
-//! `custom_provider_key_reaches_only_the_spawned_child_process_environment`
-//! and `rotating_the_custom_provider_key_never_reaches_the_old_child`
+//! `custom_provider_key_reaches_only_the_spawned_child_process_environment`,
+//! `rotating_the_custom_provider_key_never_reaches_the_old_child`, and
+//! `internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end`
 //! always run: they exercise `hane_ai::build_custom_provider_material`'s
-//! `extra_env` end-to-end through `AiRuntime` against this crate's own
-//! `fake_app_server` fixture, with no dependency on a real Codex binary or
-//! network access.
+//! `extra_env`, and the full settings-save/reload/config-generation/
+//! reconfigure/generation-gated-probe path (ADR-0032 section 8), end-to-end
+//! through `AiRuntime` against this crate's own `fake_app_server` fixture,
+//! with no dependency on a real Codex binary or network access.
 //!
 //! `real_app_server_reaches_the_mock_responses_provider_with_the_configured_key`
 //! additionally requires a real, bundled Codex App Server 0.157.1 binary
@@ -23,8 +25,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hane_ai::{
-    build_custom_provider_material, write_codex_config, AiRuntime, RejectAllServerRequests, RuntimeConfig,
-    RuntimeState, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
+    build_custom_provider_material, build_runtime_config_for_active_connection, call_with_generation_check,
+    update_custom_credential, write_codex_config, ActiveConnection, AiPaths, AiSettings, AiSettingsStore,
+    AiRuntime, ChatGptConnectionSettings, ConnectError, CredentialJournal, CustomConnectionSettings,
+    FakeCredentialStore, RejectAllServerRequests, RuntimeConfig, RuntimeState, SaveError, ShellEnvironmentPolicyFormat,
+    CUSTOM_PROVIDER_ENV_KEY,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -210,6 +215,148 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
     );
 }
 
+fn custom_settings_for(credential_ref: Option<hane_ai::CredentialRef>) -> AiSettings {
+    AiSettings {
+        schema_version: hane_ai::AI_SETTINGS_SCHEMA_VERSION,
+        revision: 0,
+        settings_generation: 0,
+        active_connection: ActiveConnection::Custom,
+        chatgpt: ChatGptConnectionSettings::default(),
+        custom: Some(CustomConnectionSettings {
+            id: "conn-1".to_string(),
+            name: "My Provider".to_string(),
+            base_url: "https://provider.example/v1".to_string(),
+            model_id: "gpt-test".to_string(),
+            credential_ref,
+        }),
+    }
+}
+
+/// Composes the individual `hane_ai` public functions this crate already
+/// exposes -- credential/settings save, settings reload, Custom config
+/// generation, `AiRuntime::reconfigure`, `settings_generation`-gated probe --
+/// into the one internal, GUI-less path described by ADR-0032 section 8, and
+/// exercises it end-to-end against the `fake_app_server` fixture (no real
+/// Codex binary required). Also confirms the shared/exclusive AI settings
+/// lock contract these steps depend on: a settings save is rejected
+/// immediately while a probe holds the lock in shared mode.
+#[test]
+fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end() {
+    let dir = unique_dir("internal_path");
+    let paths = AiPaths::new(&dir);
+    let settings_store = AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"));
+    let journal = CredentialJournal::new(dir.join("credential-journal.json"));
+    let credential_store = FakeCredentialStore::new();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
+    let owner_lock_path = dir.join("runtime.lock");
+
+    // Step 1: settings/credential save.
+    let saved =
+        update_custom_credential(&settings_store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings_for(Some(new_ref.clone()))
+        })
+        .expect("initial credential save should succeed");
+
+    // Step 2: settings reload, then Custom config generation from it.
+    let reloaded = settings_store.load().unwrap();
+    assert_eq!(reloaded, saved);
+    let configured = build_runtime_config_for_active_connection(
+        &reloaded,
+        &credential_store,
+        &paths,
+        binary.clone(),
+        owner_lock_path.clone(),
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .expect("building the runtime config for the freshly saved settings should succeed");
+
+    // Step 3: runtime spawn/start against the generated config.
+    let (events_tx, _events_rx) = mpsc::sync_channel(64);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(configured.config, handler, events_tx);
+    let status = runtime.start().expect("start should succeed against the generated Custom config");
+    assert_eq!(status.state, RuntimeState::Ready);
+
+    // Step 4: generation-gated probe request/response.
+    let probe = call_with_generation_check(
+        &settings_store,
+        configured.settings_generation,
+        &runtime,
+        "test/echo",
+        Some(serde_json::json!({"ping": true})),
+        Duration::from_secs(5),
+    )
+    .expect("the probe must succeed while settings_generation still matches");
+    assert_eq!(probe["ping"], serde_json::json!(true));
+
+    // Rotating the credential bumps `settings_generation`: a probe still
+    // configured for the old generation must be rejected before ever
+    // reaching the runtime.
+    let old_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+    let rotated = update_custom_credential(
+        &settings_store,
+        &journal,
+        &credential_store,
+        saved.revision,
+        Some(old_ref),
+        "sk-second",
+        |new_ref| custom_settings_for(Some(new_ref.clone())),
+    )
+    .expect("credential rotation should succeed");
+    assert!(rotated.settings_generation > configured.settings_generation);
+
+    let stale_probe = call_with_generation_check(
+        &settings_store,
+        configured.settings_generation,
+        &runtime,
+        "test/echo",
+        Some(serde_json::json!({"ping": true})),
+        Duration::from_secs(5),
+    );
+    assert!(matches!(stale_probe, Err(ConnectError::GenerationMismatch { .. })));
+
+    // Runtime re-generation for the rotated settings, then reconfigure and a
+    // fresh generation-gated probe.
+    let reloaded_after_rotation = settings_store.load().unwrap();
+    let reconfigured_runtime_config = build_runtime_config_for_active_connection(
+        &reloaded_after_rotation,
+        &credential_store,
+        &paths,
+        binary,
+        owner_lock_path,
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .expect("building the runtime config for the rotated settings should succeed");
+
+    let reconfigured_status = runtime
+        .reconfigure(reconfigured_runtime_config.config)
+        .expect("reconfigure should succeed against the rotated Custom config");
+    assert_eq!(reconfigured_status.state, RuntimeState::Ready);
+
+    let fresh_probe = call_with_generation_check(
+        &settings_store,
+        reconfigured_runtime_config.settings_generation,
+        &runtime,
+        "test/echo",
+        Some(serde_json::json!({"ping": true})),
+        Duration::from_secs(5),
+    )
+    .expect("the probe must succeed again once the runtime was reconfigured for the new generation");
+    assert_eq!(fresh_probe["ping"], serde_json::json!(true));
+
+    // While a probe/turn holds the AI settings lock in shared mode, a
+    // concurrent settings save must be rejected immediately instead of
+    // silently applying or waiting behind it (the same contract
+    // `call_with_generation_check` itself relies on for every probe/turn
+    // above).
+    let shared_during_probe = settings_store.settings_lock().try_acquire_shared().unwrap().unwrap();
+    let save_attempt = settings_store.save(0, AiSettings::default(), || Ok(true));
+    assert!(matches!(save_attempt, Err(SaveError::Busy)));
+    drop(shared_during_probe);
+
+    let _ = runtime.stop();
+}
+
 /// A single recorded HTTP request the mock Responses Provider observed.
 struct RecordedRequest {
     method: String,
@@ -319,6 +466,25 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
         return;
     };
 
+    // The binary named by `HANE_TEST_CODEX_APP_SERVER_BIN` must actually be
+    // the 0.157.1 build this crate's Custom Provider config generation was
+    // confirmed against (per ADR-0032 section 10) -- a different version
+    // silently substituted here would invalidate every assertion below
+    // without failing loudly.
+    let version_output = std::process::Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("querying the configured Codex App Server binary's --version should succeed");
+    let version_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&version_output.stdout),
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+    assert!(
+        version_text.contains("0.157.1"),
+        "HANE_TEST_CODEX_APP_SERVER_BIN must point at Codex App Server 0.157.1, got: {version_text}"
+    );
+
     let (port, recorded, _http_thread) = spawn_mock_responses_provider();
     let base_url = format!("http://127.0.0.1:{port}/v1");
 
@@ -336,11 +502,17 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     config.codex_home = Some(codex_home);
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
+    // Final config-compatibility validation per ADR-0032 section 10: the
+    // bundled binary must accept the generated config under
+    // `--strict-config`, not merely tolerate it silently.
+    config.args.push("--strict-config".to_string());
 
-    let (events_tx, _events_rx) = mpsc::sync_channel(1024);
+    let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(config, handler, events_tx);
-    let status = runtime.start().expect("real App Server should reach Ready with the generated Custom config");
+    let status = runtime
+        .start()
+        .expect("real App Server should reach Ready with the generated Custom config under --strict-config");
     assert_eq!(status.state, RuntimeState::Ready);
 
     let thread_start = runtime
@@ -359,13 +531,47 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
         .expect("thread/start response should include thread.id")
         .to_string();
 
-    let _ = runtime.call(
-        "turn/start",
-        Some(serde_json::json!({
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": "ping"}],
-        })),
-        Duration::from_secs(30),
+    // Unlike a discarded `let _ = ...`, a `turn/start` failure (a JSON-RPC
+    // error response surfaces as `Err(RuntimeError::Rpc(RpcError::Remote))`)
+    // must fail this test instead of silently being treated as evidence of
+    // success.
+    let _turn_start = runtime
+        .call(
+            "turn/start",
+            Some(serde_json::json!({
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "ping"}],
+            })),
+            Duration::from_secs(30),
+        )
+        .expect("turn/start should succeed against the generated Custom config");
+
+    // Wait for the turn to actually complete instead of racing `stop()`
+    // against it: `turn/completed` (mirroring the already-established
+    // `thread/start`/`turn/start` naming) is delivered asynchronously as a
+    // notification, not in `turn/start`'s own response.
+    let turn_completed_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let turn_completed_params = loop {
+        let remaining = turn_completed_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for a turn/completed notification from the real App Server");
+        let event = events_rx
+            .recv_timeout(remaining)
+            .expect("timed out waiting for a turn/completed notification from the real App Server");
+        let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
+            continue;
+        };
+        assert!(
+            !method.contains("fail"),
+            "received a failure notification instead of turn/completed: {method} {params:?}"
+        );
+        if method == "turn/completed" {
+            break params.unwrap_or(serde_json::Value::Null);
+        }
+    };
+    let turn_completed_text = turn_completed_params.to_string();
+    assert!(
+        turn_completed_text.contains("pong"),
+        "turn/completed payload should include the mock Responses Provider's fixed \"pong\" reply, got: {turn_completed_text}"
     );
 
     let _ = runtime.stop();
@@ -375,6 +581,11 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     assert_eq!(recorded.method, "POST");
     assert!(recorded.path.starts_with("/v1"), "request path should target the configured base_url: {}", recorded.path);
     let auth = recorded.authorization.expect("request should carry an Authorization header");
-    assert!(auth.contains("sk-real-secret"), "request must be authenticated with the configured Custom Provider key");
-    assert!(!recorded.body.is_empty());
+    assert_eq!(
+        auth, "Bearer sk-real-secret",
+        "request must be authenticated with exactly the configured Custom Provider key"
+    );
+    let body_json: serde_json::Value =
+        serde_json::from_str(&recorded.body).expect("the Responses API request body should be valid JSON");
+    assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "request must target exactly the configured model");
 }

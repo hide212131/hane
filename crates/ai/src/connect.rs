@@ -67,6 +67,15 @@ pub enum ConnectError {
     MissingCustomConnection,
     MissingCredential,
     CredentialNotFound,
+    /// `delete_custom_credential`'s `old_credential_ref` argument does not
+    /// match the `credential_ref` the just-reloaded current `AiSettings`
+    /// actually references, even though `expected_revision` matched. This
+    /// can only happen if the caller derived `old_credential_ref` from
+    /// something other than the settings snapshot at `expected_revision`;
+    /// proceeding would risk deleting a secret the current settings still
+    /// depend on, so this is rejected before any journal/credential side
+    /// effect instead of trusting the caller-supplied ref.
+    CredentialRefMismatch { current: AiSettings },
 }
 
 impl std::fmt::Display for ConnectError {
@@ -90,6 +99,10 @@ impl std::fmt::Display for ConnectError {
             ConnectError::CredentialNotFound => {
                 write!(f, "the Custom Provider credential was not found in the OS credential store")
             }
+            ConnectError::CredentialRefMismatch { .. } => write!(
+                f,
+                "the credential being deleted no longer matches the current Custom Provider connection; reload before retrying"
+            ),
         }
     }
 }
@@ -148,7 +161,25 @@ pub fn update_custom_credential(
     let guard = acquire_exclusive(settings_store)?;
     reject_if_journal_pending(journal)?;
 
-    let settings_generation_before = settings_store.load().map_err(ConnectError::Io)?.settings_generation;
+    // Compare `expected_revision` against the just-reloaded current settings
+    // *before* any journal/credential side effect. Checking this only deep
+    // inside `write_while_locked` (after `journal.begin` and
+    // `credential_store.set` already ran) would leave a `PendingNew` journal
+    // entry and a freshly written secret behind on a stale request, which is
+    // indistinguishable from a genuine crash-mid-operation to a later
+    // `recover` pass and could see it retried/completed instead of
+    // discarded.
+    let current = settings_store.load().map_err(ConnectError::Io)?;
+    if current.revision != expected_revision {
+        return Err(SaveError::RevisionConflict { current }.into());
+    }
+    if let Some(old) = &old_credential_ref {
+        let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
+        if current_credential_ref.as_ref() != Some(old) {
+            return Err(ConnectError::CredentialRefMismatch { current });
+        }
+    }
+    let settings_generation_before = current.settings_generation;
 
     // Step 1-2: assign the new identifier and durably record the pending
     // operation before the secret is written anywhere.
@@ -173,6 +204,15 @@ pub fn update_custom_credential(
     let new_settings = build_new_settings(&new_ref);
     let saved = match settings_store.write_while_locked(&guard, expected_revision, new_settings) {
         Ok(saved) => saved,
+        Err(SaveError::PersistedDurabilityUnconfirmed(e)) => {
+            // The settings replace's `rename` already landed — persisted
+            // settings may already reference `new_ref` — so deleting it here
+            // would risk deleting a secret the durable settings now depend
+            // on. Leave the journal's `PendingNew` entry in place: startup
+            // recovery re-reads the (already-updated) persisted settings and
+            // resolves this exactly like a normal "new side won" success.
+            return Err(SaveError::PersistedDurabilityUnconfirmed(e).into());
+        }
         Err(e) => {
             let _ = credential_store.delete(&new_ref);
             return Err(e.into());
@@ -212,7 +252,24 @@ pub fn delete_custom_credential(
     let guard = acquire_exclusive(settings_store)?;
     reject_if_journal_pending(journal)?;
 
-    let settings_generation_before = settings_store.load().map_err(ConnectError::Io)?.settings_generation;
+    // Same pre-check as `update_custom_credential`: compare
+    // `expected_revision`, and confirm `old_credential_ref` actually matches
+    // what current settings reference, *before* the journal is touched. A
+    // stale-revision delete that skipped this would still leave a `Delete`
+    // `PendingNew` journal entry referencing `old_credential_ref` — and if
+    // current settings happen to still reference exactly that credential
+    // (e.g. the concurrent write that won was unrelated to it), a later
+    // `recover` cannot tell that apart from a genuine crash mid-delete, and
+    // would finish deleting a credential settings still depend on.
+    let current = settings_store.load().map_err(ConnectError::Io)?;
+    if current.revision != expected_revision {
+        return Err(SaveError::RevisionConflict { current }.into());
+    }
+    let current_credential_ref = current.custom.as_ref().and_then(|c| c.credential_ref.clone());
+    if current_credential_ref.as_ref() != Some(&old_credential_ref) {
+        return Err(ConnectError::CredentialRefMismatch { current });
+    }
+    let settings_generation_before = current.settings_generation;
 
     journal
         .begin(CredentialOperation {
@@ -260,9 +317,19 @@ pub fn recover_at_startup(
         match settings_store.write_while_locked(&guard, current.revision, retried) {
             Ok(_) => Ok(true),
             Err(SaveError::Io(e)) => Err(e),
-            Err(SaveError::RevisionConflict { .. } | SaveError::Busy | SaveError::PendingCredentialJournal) => {
-                Ok(false)
-            }
+            // Conservative/fail-closed for every other outcome: none of
+            // these confirm the replace landed, so this pass leaves the
+            // journal entry in place for a later `recover` to re-derive from
+            // a fresh read instead of guessing. In particular,
+            // `PersistedDurabilityUnconfirmed` is *not* treated as success
+            // here even though its `rename` may well have landed: the next
+            // `recover_at_startup` call re-reads `current` from disk, so if
+            // it did land, `current_credential_ref` will already show that
+            // and this closure will not even be invoked on that next pass.
+            Err(SaveError::RevisionConflict { .. }
+            | SaveError::Busy
+            | SaveError::PendingCredentialJournal
+            | SaveError::PersistedDurabilityUnconfirmed(_)) => Ok(false),
         }
     })
     .map_err(ConnectError::Io)
@@ -272,7 +339,10 @@ pub fn recover_at_startup(
 /// currently active connection: the `RuntimeConfig` itself, and the
 /// `settings_generation` it was built for (per ADR-0032 section 8, needed to
 /// later confirm via [`call_with_generation_check`] that persisted settings
-/// have not moved on since).
+/// have not moved on since). `Debug` is safe to derive: `RuntimeConfig`'s own
+/// manual `Debug` impl already redacts `extra_env` values, so this never
+/// prints a secret either.
+#[derive(Debug)]
 pub struct ConfiguredRuntime {
     pub config: RuntimeConfig,
     pub settings_generation: u64,
@@ -457,6 +527,140 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, ConnectError::Save(SaveError::PendingCredentialJournal)));
+    }
+
+    #[test]
+    fn update_with_a_stale_expected_revision_touches_neither_the_journal_nor_the_credential_store() {
+        let (store, journal, _dir) = store_and_journal("update_stale_revision");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap();
+        assert!(journal.is_empty().unwrap());
+        assert_eq!(credential_store.len(), 1);
+
+        // A second writer still thinks the revision is 0 (stale): its
+        // rotation attempt must be rejected before any journal entry is
+        // begun or any new secret is written.
+        let err = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-stale", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::Save(SaveError::RevisionConflict { .. })));
+
+        assert!(journal.is_empty().unwrap(), "a stale request must never leave a journal entry behind");
+        assert_eq!(credential_store.len(), 1, "a stale request must never write a new secret");
+        assert_eq!(store.load().unwrap(), saved, "a stale request must never touch persisted settings");
+    }
+
+    #[test]
+    fn delete_with_a_stale_expected_revision_touches_neither_the_journal_nor_the_credential_store() {
+        let (store, journal, _dir) = store_and_journal("delete_stale_revision");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap();
+        let credential_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+
+        // A concurrent, unrelated change lands first (e.g. a display-name
+        // rename), bumping `revision` without touching `credential_ref`.
+        let mut renamed = saved.clone();
+        renamed.custom.as_mut().unwrap().name = "Renamed".to_string();
+        let renamed_saved = store.save(saved.revision, renamed, || Ok(true)).unwrap();
+
+        // The delete caller still holds the stale `expected_revision` (and,
+        // notably, `credential_ref` here still matches current settings --
+        // this is exactly the case a revision-only check could miss).
+        let mut without_credential = saved.clone();
+        without_credential.custom.as_mut().unwrap().credential_ref = None;
+        let err = delete_custom_credential(
+            &store,
+            &journal,
+            &credential_store,
+            saved.revision,
+            credential_ref.clone(),
+            without_credential,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::Save(SaveError::RevisionConflict { .. })));
+
+        assert!(journal.is_empty().unwrap(), "a stale request must never leave a journal entry behind");
+        assert_eq!(credential_store.len(), 1, "a stale request must never delete the still-referenced credential");
+        assert_eq!(
+            store.load().unwrap(),
+            renamed_saved,
+            "a stale request must never touch persisted settings"
+        );
+    }
+
+    #[test]
+    fn delete_whose_credential_ref_no_longer_matches_current_settings_is_rejected_without_side_effects() {
+        let (store, journal, _dir) = store_and_journal("delete_credential_ref_mismatch");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap();
+
+        // `expected_revision` matches, but the caller's `old_credential_ref`
+        // does not match what current settings actually reference.
+        let wrong_ref = CredentialRef::generate();
+        let mut without_credential = saved.clone();
+        without_credential.custom.as_mut().unwrap().credential_ref = None;
+        let err = delete_custom_credential(
+            &store,
+            &journal,
+            &credential_store,
+            saved.revision,
+            wrong_ref,
+            without_credential,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::CredentialRefMismatch { .. }));
+
+        assert!(journal.is_empty().unwrap());
+        assert_eq!(credential_store.len(), 1, "the actually-referenced credential must not be deleted");
+        assert_eq!(store.load().unwrap(), saved);
+    }
+
+    #[test]
+    fn update_whose_settings_replace_lands_but_cannot_confirm_durability_does_not_delete_the_new_secret() {
+        let (store, journal, _dir) = store_and_journal("update_ambiguous_durability");
+        let credential_store = FakeCredentialStore::new();
+
+        crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
+        let err = update_custom_credential(&store, &journal, &credential_store, 0, None, "sk-first", |new_ref| {
+            custom_settings(Some(new_ref.clone()))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Save(SaveError::PersistedDurabilityUnconfirmed(_))),
+            "expected PersistedDurabilityUnconfirmed, got {err:?}"
+        );
+
+        // The settings replace's `rename` actually landed: persisted
+        // settings already reference the new credential.
+        let reloaded = store.load().unwrap();
+        let new_ref = reloaded.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+        assert_eq!(
+            credential_store.get(&new_ref).unwrap().as_deref(),
+            Some("sk-first"),
+            "the new secret must not have been deleted: persisted settings already reference it"
+        );
+
+        // The journal's `PendingNew` entry is left in place for startup
+        // recovery, which re-derives the outcome from the already-updated
+        // persisted settings exactly like a normal success.
+        assert!(!journal.is_empty().unwrap());
+        let outcome = recover_at_startup(&store, &journal, &credential_store).unwrap();
+        assert_eq!(outcome.completed, 1);
+        assert!(journal.is_empty().unwrap());
+        assert_eq!(credential_store.get(&new_ref).unwrap().as_deref(), Some("sk-first"));
     }
 
     #[test]

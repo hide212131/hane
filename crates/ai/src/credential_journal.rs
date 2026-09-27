@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
 
-use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists};
+use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists, AtomicWriteError};
 use crate::secrets::{CredentialRef, CredentialStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +100,15 @@ impl CredentialJournal {
     fn write(&self, file: &JournalFile) -> io::Result<()> {
         let bytes =
             serde_json::to_vec_pretty(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        atomic_write_bytes(&self.path, &bytes)
+        // Unlike `AiSettingsStore::write_while_locked`, no caller here reacts
+        // to a write failure by deleting a resource the new content might
+        // already reference (`recover`'s decisions are always re-derived
+        // from a fresh read of the *settings* file, not from whether this
+        // journal write's own durability was confirmed), so both
+        // `AtomicWriteError` variants collapse to a plain I/O error here.
+        atomic_write_bytes(&self.path, &bytes).map_err(|e| match e {
+            AtomicWriteError::NotPersisted(e) | AtomicWriteError::RenameSucceededSyncFailed(e) => e,
+        })
     }
 
     pub fn is_empty(&self) -> io::Result<bool> {

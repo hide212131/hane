@@ -423,11 +423,13 @@ impl AiRuntime {
     /// `docs/adr/0032-embedded-codex-app-server-ai-foundation.md` section 8's
     /// "runtime owner lock → AI settings lock" ordering), opening a window
     /// for a different Hane process to become the new owner before this one
-    /// restarts. `reconfigure` never releases the owner lock to a
-    /// would-be new owner in between: `stop_active` only clears it once the
-    /// old child is confirmed exited, and the following `do_start`
-    /// immediately re-acquires the very same lock file for the new child, on
-    /// this same coordinator thread.
+    /// restarts. `reconfigure` never releases the owner lock to a would-be
+    /// new owner in between: unlike a plain `stop`/`restart`, the internal
+    /// stop step keeps the very same `OwnerLockGuard` alive (it is never
+    /// dropped, and no new one is ever acquired) all the way from before the
+    /// old child stops through the new child reaching `Ready`, on this same
+    /// coordinator thread, so no other process can ever observe the lock as
+    /// free during a reconfigure.
     pub fn reconfigure(&self, new_config: RuntimeConfig) -> Result<RuntimeStatus, RuntimeError> {
         self.send_lifecycle(LifecycleCommand::Reconfigure(new_config))
     }
@@ -535,10 +537,14 @@ fn run_coordinator(
                         // Stop whatever is active under the *old* config
                         // first (its own stop timeouts still apply), then
                         // swap `config` and start fresh under the new one.
-                        // `owner_guard` is only ever cleared once
-                        // `stop_active` confirms the old child is gone, and
-                        // `do_start` immediately re-acquires the same lock
-                        // file afterward, on this same coordinator thread.
+                        // `release_owner_lock: false` keeps `owner_guard`
+                        // held by this coordinator across the whole
+                        // stop-then-start sequence (see `do_start`'s own
+                        // handling of an already-held `owner_guard`), instead
+                        // of dropping and immediately re-acquiring the OS
+                        // lock file, which would open a window for a
+                        // different Hane process to become the owner in
+                        // between.
                         match stop_active(
                             &mut current,
                             &mut generation,
@@ -549,6 +555,7 @@ fn run_coordinator(
                             RuntimeState::Stopping,
                             RuntimeState::Stopped,
                             op_gen,
+                            false,
                         ) {
                             Ok(_) => {
                                 config = new_config;
@@ -620,6 +627,7 @@ fn run_coordinator(
                     RuntimeState::Stopping,
                     RuntimeState::Stopped,
                     op_gen,
+                    true,
                 );
                 // A `RestartBlocked` outcome means `stop_active` put the
                 // still-alive (or at least unconfirmed-dead) `ActiveChild`
@@ -671,6 +679,7 @@ fn handle_lifecycle(
             RuntimeState::Stopping,
             RuntimeState::Stopped,
             op_gen,
+            true,
         )),
         LifecycleCommand::Restart => {
             if let Err(e) = stop_active(
@@ -683,6 +692,7 @@ fn handle_lifecycle(
                 RuntimeState::Stopping,
                 RuntimeState::Stopped,
                 op_gen,
+                true,
             ) {
                 return Some(Err(e));
             }
@@ -734,16 +744,30 @@ fn do_start(
 
     set_status(shared, RuntimeState::Starting, false, *generation, op_gen);
 
-    let lock = OwnerLock::new(&config.owner_lock_path);
-    let guard = match lock.try_acquire() {
-        Ok(Some(g)) => g,
-        Ok(None) => {
-            set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
-            return Some(Err(RuntimeError::OwnerLockUnavailable));
-        }
-        Err(e) => {
-            set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
-            return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
+    // `owner_guard` is already `Some` exactly when `Reconfigure` stopped the
+    // old child with `release_owner_lock: false`: reuse that same guard
+    // instead of acquiring a fresh one, so the OS lock is held continuously
+    // from before the old child stopped through this new child's spawn, with
+    // no window for a different Hane process to become the owner in
+    // between. Every other caller reaches this with `owner_guard` already
+    // `None` (the invariant the `current.is_some()` branch above restores it
+    // to before falling through), so this is a genuinely fresh acquisition
+    // for `Start`/`Stop`/`Restart`.
+    let guard = match owner_guard.take() {
+        Some(carried) => carried,
+        None => {
+            let lock = OwnerLock::new(&config.owner_lock_path);
+            match lock.try_acquire() {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
+                    return Some(Err(RuntimeError::OwnerLockUnavailable));
+                }
+                Err(e) => {
+                    set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
+                    return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
+                }
+            }
         }
     };
 
@@ -851,6 +875,7 @@ fn do_start(
                     RuntimeState::Failed,
                     RuntimeState::Failed,
                     op_gen,
+                    true,
                 );
                 return None;
             }
@@ -889,6 +914,7 @@ fn do_start(
                 RuntimeState::Failed,
                 RuntimeState::Failed,
                 op_gen,
+                true,
             );
             None
         }
@@ -906,6 +932,7 @@ fn stop_active(
     in_progress_state: RuntimeState,
     state_on_success: RuntimeState,
     op_gen: u64,
+    release_owner_lock: bool,
 ) -> Result<RuntimeStatus, RuntimeError> {
     let mut active = match current.take() {
         Some(a) => a,
@@ -940,7 +967,16 @@ fn stop_active(
     match outcome {
         StopOutcome::Exited => {
             drop(active);
-            *owner_guard = None;
+            // `release_owner_lock` is `false` only for the `Reconfigure`
+            // path: it needs the owner lock to stay held by this same
+            // coordinator, uninterrupted, from before this stop through the
+            // subsequent `do_start` for the new config, so no other Hane
+            // process can ever become the owner in between. Every other
+            // caller (`Stop`/`Restart`/`Shutdown`) releases it here as
+            // before.
+            if release_owner_lock {
+                *owner_guard = None;
+            }
             // The generation being stopped is now confirmed gone. Hand out a
             // fresh operation generation for this terminal transition itself
             // instead of reusing the now-defunct child's own generation, so
