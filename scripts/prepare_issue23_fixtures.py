@@ -20,6 +20,11 @@ def note_bytes(number: int) -> bytes:
     return header + body
 
 
+def require_contents(path: Path, expected: bytes) -> None:
+    if path.read_bytes() != expected:
+        raise SystemExit(f"{path}: content does not match the deterministic fixture")
+
+
 def write_notes(directory: Path, count: int) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     payloads = [note_bytes(number) for number in range(1, min(count, 2) + 1)]
@@ -90,6 +95,7 @@ def main() -> None:
         raise SystemExit(f"missing small fixture: {small}")
     if small.stat().st_size != NOTE_BYTES:
         raise SystemExit(f"{small}: expected {NOTE_BYTES} bytes, found {small.stat().st_size}")
+    require_contents(small, note_bytes(0))
 
     for name, count in FOLDER_COUNTS.items():
         folder = root / name
@@ -103,6 +109,10 @@ def main() -> None:
             raise SystemExit(
                 f"{wrong_size}: expected {NOTE_BYTES} bytes, found {wrong_size.stat().st_size}"
             )
+        for note in notes:
+            number = int(note.stem.removeprefix("note-"))
+            payload_number = number if number <= 2 else 1 + ((number - 1) % 2)
+            require_contents(note, note_bytes(payload_number))
 
     empty_folder = root / "folder_empty"
     if not empty_folder.is_dir():
@@ -126,6 +136,7 @@ def main() -> None:
             f"{large_then_small_note}: expected {NOTE_BYTES} bytes, "
             f"found {large_then_small_note.stat().st_size}"
         )
+    require_contents(large_then_small_note, note_bytes(0))
 
     for name in ("switch_a", "switch_b"):
         folder = root / name
@@ -137,6 +148,7 @@ def main() -> None:
         image = folder / "image.svg"
         if not image.is_file():
             raise SystemExit(f"missing image fixture: {image}")
+        require_contents(folder / "01-note.md", note_bytes(1))
     print(root)
 
 
