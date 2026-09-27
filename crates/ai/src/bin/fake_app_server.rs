@@ -23,9 +23,10 @@
 //! - `FAKE_SERVER_MODE=timeout_then_late_response`: paired with
 //!   `FAKE_SERVER_TIMEOUT_ONCE_MARKER=<path>`. The first process spawned
 //!   against a given marker path withholds its `initialize` reply (like
-//!   `never_respond`) until stdin closes, then sleeps briefly and only then
-//!   sends the (by then late) `initialize` response before exiting, to
-//!   exercise a stale completion arriving from an already timed-out/cancelled
+//!   `never_respond`) until stdin closes, then sleeps
+//!   `FAKE_SERVER_TIMEOUT_ONCE_DELAY_MS` (default 300ms) and only then sends
+//!   the (by then late) `initialize` response before exiting, to exercise a
+//!   stale completion arriving from an already timed-out/cancelled
 //!   generation. Every later process spawned against the same marker path
 //!   (the marker file now exists) instead behaves exactly like `normal`, so a
 //!   subsequent explicit start can succeed on its own generation.
@@ -70,6 +71,10 @@ fn main() {
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
     let echo_received_file = env::var("FAKE_SERVER_ECHO_RECEIVED_FILE").ok();
     let timeout_once_marker = env::var("FAKE_SERVER_TIMEOUT_ONCE_MARKER").ok();
+    let timeout_once_delay_ms: u64 = env::var("FAKE_SERVER_TIMEOUT_ONCE_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     // Only the first process spawned against a given marker path withholds
     // its `initialize` reply; every later one (the marker already exists)
     // behaves normally so a subsequent explicit start can actually succeed.
@@ -198,7 +203,7 @@ fn main() {
     // `initialize` reply is sent only now, deliberately late relative to
     // whatever timeout the client already gave up waiting under.
     if let Some(id) = pending_initialize_id {
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(timeout_once_delay_ms));
         let response = serde_json::json!({"id": id, "result": {"ok": true}});
         let _ = writeln!(stdout, "{response}");
         let _ = stdout.flush();

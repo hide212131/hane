@@ -569,16 +569,23 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
 {
     // `timeout_then_late_response`'s first spawned process withholds its
     // `initialize` reply until stdin closes, then sleeps a fixed delay
-    // before finally sending that (by then late) reply and exiting. That
-    // fixed post-EOF delay gives a deterministic window during which the
-    // timed-out operation's `Child` cleanup is still running, letting this
-    // test assert that every coalesced `start()` caller already observes
-    // that operation's own failure well before that window elapses, and
-    // that only the *next* lifecycle operation (not this one) actually
-    // waits for cleanup to confirm the old process is gone.
-    let cleanup_delay = Duration::from_millis(300);
+    // (`FAKE_SERVER_TIMEOUT_ONCE_DELAY_MS`) before finally sending that (by
+    // then late) reply and exiting. That fixed post-EOF delay gives a
+    // deterministic window during which the timed-out operation's `Child`
+    // cleanup is still running, letting this test assert that every
+    // coalesced `start()` caller already observes that operation's own
+    // failure well before that window elapses, and that only the *next*
+    // lifecycle operation (not this one) actually waits for cleanup to
+    // confirm the old process is gone.
+    //
+    // The cleanup delay and start timeout are both scaled well above their
+    // respective floors (a fixed spawn/IPC cost and OS scheduling jitter) so
+    // that a loaded, slower CI runner (observed on macOS: 5 coalesced
+    // callers took 177ms against a 150ms threshold) still leaves a
+    // comfortable margin instead of flaking on timing alone.
+    let cleanup_delay = Duration::from_millis(2000);
     let mut config = base_config("timeout_immediate_failed");
-    config.start_timeout = Duration::from_millis(100);
+    config.start_timeout = Duration::from_millis(600);
     config.stop_grace_timeout = Duration::from_secs(5);
     config.stop_force_timeout = Duration::from_secs(5);
     let dir = config.owner_lock_path.parent().unwrap().to_path_buf();
@@ -590,6 +597,10 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
         "FAKE_SERVER_TIMEOUT_ONCE_MARKER".to_string(),
         marker.display().to_string(),
     ));
+    config.extra_env.push((
+        "FAKE_SERVER_TIMEOUT_ONCE_DELAY_MS".to_string(),
+        cleanup_delay.as_millis().to_string(),
+    ));
 
     let (events_tx, _events_rx) = mpsc::channel();
     let handler = Arc::new(RejectAllServerRequests);
@@ -599,12 +610,21 @@ fn initialize_timeout_fails_every_coalesced_waiter_immediately_while_cleanup_con
     // `AiRuntime::start`); every one of them must observe the leader's own
     // Handshake failure, and must observe it fast -- well under the
     // fixture's post-EOF cleanup delay -- rather than being blocked until
-    // `Child` cleanup actually confirms the old process has exited.
+    // `Child` cleanup actually confirms the old process has exited. A
+    // barrier synchronizes the callers' `start()` invocations so the
+    // measured wave only reflects the handshake timeout itself, not thread
+    // spawn scheduling variance.
+    let caller_count = 5;
+    let barrier = Arc::new(std::sync::Barrier::new(caller_count));
     let wave_started_at = std::time::Instant::now();
     let mut handles = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..caller_count {
         let runtime = runtime.clone();
-        handles.push(std::thread::spawn(move || runtime.start()));
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            runtime.start()
+        }));
     }
     let mut outcomes = Vec::new();
     for handle in handles {
