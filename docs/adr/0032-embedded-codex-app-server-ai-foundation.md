@@ -108,9 +108,19 @@ UIは生JSONやトークンを保持せず、`AiService`の操作と秘密を含
 
 ## 5. ランタイムとプロトコル
 
-状態の基本形は`Stopped → Starting → Initializing → Ready`、異常時は`Failed`、終了時は`Stopping → Stopped`。
+状態の基本形は`Stopped → Starting → Initializing → Ready`、異常時は`Failed`、終了時は`Stopping → Stopped`。再起動は内部的に`Stopping → Starting → Initializing → Ready`を一つのlifecycle操作として扱う。
 
-Readyになる前に通常要求を送らない。複数の操作が同時に起動を求めても起動・initializeは一度だけにする。GUIからの操作はコマンドキュー経由で処理する。
+ownerプロセス内ではApp Serverのstart / initialize / stop / restartを**単一のruntime lifecycle coordinator**に集約し、同時に一つだけ実行する。GUIやAI操作から直接`Child`を起動・killせず、すべてcoordinatorのコマンドキューを通す。
+
+Readyになる前に通常要求を送らない。複数の操作が同時に同じ起動を求めても子プロセスとinitializeは一度だけとし、後続操作は同じlifecycle結果を待つ。起動・停止には有限のlifecycle timeoutを設け、完了しない場合は当該lifecycle操作をキャンセル扱いにして`Failed`へ遷移し、待機中操作をエラー終了する。
+
+timeoutしたlifecycle操作に対応する`Child`が生成済みであれば、coordinatorが停止要求を送り、必要なら強制終了して必ずreapを試みる。reapが完了するまでcoordinatorは次のstart / stop / restartを開始しない。各lifecycle操作には単調増加のoperation generationを割り当て、timeout・キャンセル済み世代から遅れて到着した完了通知やreader/monitorイベントはruntime状態を`Ready`等へ戻さず無効化する。
+
+Childの停止・reapにも有限のcleanup timeoutを設ける。cleanup timeoutまでに終了確認できない場合は、プロセス存在が解消したことを確認できるまでruntimeを`Failed`かつ**restart blocked**として扱い、新しいChildを起動しない。ユーザー操作による再試行でも、残存Childの不存在または回収完了を確認してからだけ新しいlifecycle operation generationを開始する。無期限待機や、回収結果不明のまま二重起動することはしない。
+
+runtime-affecting設定の保存は推論・固定接続確認が保持する共有設定ロック中には拒否されるため、設定変更を反映するrestartはactiveなAI要求がない状態から開始する。子プロセスが実行中要求の途中で異常終了した場合は、そのgenerationに属するpending requestをすべて失敗完了させ、共有設定ロックを解放して`Failed`へ遷移する。途中要求を新プロセスへ自動再送せず、次の明示的なAI操作がlifecycle coordinator経由で再起動を要求する。
+
+restart開始後は新しい推論・接続確認を受理せず、同じlifecycle結果の完了後に`Ready`と`settings_generation`を再確認してから開始する。これにより、複数要求が同時にrestart・stop・startを競合実行したり、旧App Serverへの要求と再起動を並行させたりしない。
 
 通信処理では以下を必須とする。
 
@@ -192,6 +202,8 @@ Custom Provider用キーを一律に`account/login/start(type: apiKey)`へ渡す
 ```text
 AiSettings
   schema_version
+  revision
+  settings_generation
   active_connection: ChatGpt | Custom
   chatgpt.model_id
   custom.id / name / base_url / model_id / credential_ref
@@ -211,9 +223,24 @@ AiSettings
 
 キー削除も同じoperation journalを使い、旧CredentialRefを削除予定として永続化してから`credential_ref`を外した非秘密設定をatomic replaceし、その成功後に資格情報を削除する。これにより新規資格情報の作成直後、設定切替直後、削除失敗のいずれで異常終了しても、Haneが作成した資格情報を次回起動時に追跡できる。
 
-資格情報の更新・削除操作は直列化する。未完了のcredential operation journalが1件でもある間は、新しいキー変更・キー削除・接続設定変更のうちCredentialRefを変更する操作を開始しない。まず起動時と設定画面表示時に既存journalの復旧を実行し、設定変更と不要資格情報の削除が完了してjournalが消えた後だけ次の操作を受け付ける。復旧が継続して失敗する場合は「資格情報の復旧が必要」と表示し、新しい資格情報操作を拒否する。これにより`A→B`が未完了のまま`B→C`を開始して、先行journalの参照関係を失う状態を作らない。
+資格情報の更新・削除だけでなく、`AiSettings`への全書込みを同じ排他制御に通す。プロセス内では保存処理を単一writerで直列化し、さらに複数Haneプロセスが同じアプリデータ領域を共有しても競合しないよう、AI設定用のOSプロセス間排他ロックを設ける。
 
-設定エラーを黙ってデフォルト接続へ戻さない。
+プロセス間ロックは、PIDファイルの存在だけで所有権を表す方式ではなく、所有プロセス終了時にOSが解放でき、共有/排他モードを持つファイルロック等を用いる。
+
+- AI設定の変更、credential operation journalの復旧、現在設定の読込み、`revision`比較、資格情報操作、設定のatomic replace、journal更新というread-modify-write系列は**排他ロック**の所有下で行う。
+- 推論ターンと固定の接続確認は**共有ロック**を取得し、その所有下で永続`settings_generation`を読み、実行中App Serverの世代と一致して`Ready`であることを確認してから`turn/start`等を受理する。共有ロックはそのターンまたは接続確認が成功・失敗・キャンセルのいずれかで完了するまで保持する。
+- 設定保存は共有ロックが存在する間に待ち続けず、「AI処理中」として拒否する。したがって、接続確認中の設定保存も拒否し、設定変更のために接続確認を暗黙に中断しない。
+- 排他ロック取得後に共有ロックを新規取得できないため、設定変更の開始後に旧世代の新しい推論が受理されることもない。
+
+これにより、世代確認と`turn/start`受付の間に別Haneプロセスが設定を更新するTOCTOUを防ぎ、設定変更の完了後に旧Base URL、API key、モデルで新しい処理を開始しない。ロックを取得できない場合はAI設定を書き換えず、また推論受付側も設定世代を確認できないまま開始しない。
+
+書込み競合検出用の`revision`と、App Server起動設定用の`settings_generation`を分離する。`revision`は`custom.name`等の表示専用設定を含む、すべての`AiSettings`書込みが成功するたびに進める。保存要求は読み込んだ`revision`を`expected_revision`として渡し、プロセス間ロック取得後に永続化直前の現在値と一致することを再確認する。一致しなければ、古い画面スナップショットで`model_id`、`base_url`、`credential_ref`等を上書きせず、競合として保存を拒否して最新設定を再読込する。
+
+`settings_generation`は、接続方式、Base URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する変更が成功した場合だけ進める。表示名等の非ランタイム設定だけを変更した場合も`revision`は進むが、`settings_generation`は進めない。
+
+未完了のcredential operation journalが1件でもある間は、CredentialRefを変える操作だけでなく通常のAI設定保存も開始しない。まず起動時と設定画面表示時に既存journalの復旧を実行し、設定変更と不要資格情報の削除が完了してjournalが消えた後だけ次の`AiSettings`書込みを受け付ける。復旧が継続して失敗する場合は「資格情報の復旧が必要」と表示し、AI設定保存を拒否する。これにより`A→B`が未完了のまま`B→C`を開始する連鎖更新と、通常保存による古い設定スナップショットの上書きを防ぐ。
+
+設定エラーや世代競合を黙ってデフォルト接続へ戻さない。
 
 ## 8. 接続方式と保存領域の分離
 
@@ -227,11 +254,32 @@ AiSettings
   probe-workspace/ ← 接続確認専用の空の作業領域
 ```
 
-両接続のCODEX_HOMEを分離し、同時に動くランタイムはまず1個とする。切替時は実行中ターンの完了またはユーザー操作による中断を待ち、旧プロセスを終了して新設定で起動する。
+両接続のCODEX_HOMEを分離し、初期版では同じHaneアプリデータ領域に対して**AI runtimeを所有できるHaneプロセスは1つだけ**とする。複数Haneプロセス間でstdioのApp Serverを共有・転送するIPCは作らない。
+
+これを保証するため、AI設定の共有/排他ロックとは別に**runtime owner lock**を設ける。runtime owner lockはPIDファイルの存在だけで所有権を表す方式ではなく、所有プロセス終了時にOSが自動解放できるプロセス間排他ロックとする。
+
+- App Serverの起動・停止・再起動はruntime ownerだけが行う。
+- App Serverを起動したプロセスは、そのApp Serverを停止するまでruntime owner lockを保持する。
+- Base URL、CredentialRef/API key、Provider・モデル、接続方式など`settings_generation`を進める設定変更もruntime ownerだけが実行できる。runtime未起動時に変更する場合も、保存開始前にowner lockをtry-lockし、保存と必要なruntime再生成が終わるまで保持する。
+- runtime owner lockとAI設定の排他ロックを同時に必要とする場合は、必ず**runtime owner lock → AI設定ロック**の順で取得する。逆順では取得しない。
+- owner以外のHaneプロセスはruntime-affecting設定を保存せず、App Serverも起動しない。「AIは別のHaneプロセスで使用中」として即時失敗させる。owner lock取得を無期限に待つbackground retryは行わない。
+- non-runtime設定だけの保存を将来許可する場合でも`revision`競合検出は維持する。初期実装では単純化のため、AI設定画面の保存操作全体をownerに限定してよい。
+
+接続方式の切替だけでなく、Custom ProviderのBase URL、CredentialRef/API key、Provider・モデル指定など、App Serverの起動時環境または生成設定へ影響する`AiSettings`が変わった場合も`settings_generation`を進める。共有設定ロック中は設定保存自体を拒否するため、保存成功時点では実行中ターンや接続確認は存在しない。
+
+永続設定の保存成功と、実行中App Serverへの設定反映完了を同一視しない。runtime ownerは自分が起動した`settings_generation`を保持する。新しい推論・接続確認の受付時には共有設定ロックを取得し、その所有下で永続`AiSettings.settings_generation`との一致と`Ready`を再確認する。
+
+runtime owner自身が世代不一致またはruntime不在を検出した場合は要求を開始せず、共有設定ロックを解放し、owner lockを保持したまま永続設定を再読込して必要なApp Server再起動を行う。再起動後に新しい世代で`Ready`になったことを確認してから受付判定をやり直す。
+
+owner以外のプロセスがAI操作を要求した場合はowner lockを非blockingでtry-lockする。取得できなければ即時に「AIは別のHaneプロセスで使用中」と返す。自動ポーリングや固定タイムアウト待ちは行わず、設定画面の再表示、接続確認、推論開始、明示的な「再試行」操作のたびに再取得を試みる。ownerプロセスが終了または明示的にAI runtimeを停止するとOSがowner lockを解放するため、次の操作を行ったプロセスがownerになり、必ず最新`AiSettings`と`settings_generation`を読み直してからApp Serverを起動する。
+
+この契約により、別プロセスからruntime ownerへの設定変更通知は不要になる。ownerが反映すべきruntime-affecting設定を、non-ownerが変更する経路自体を初期版では許可しない。
+
+API keyを子プロセス環境変数へ注入する方式では、同じプロセスのまま新しい会話を作るだけではキーを差し替えられないため、`settings_generation`変更時のruntime再生成は省略しない。
 
 HOME/USERPROFILEをこれらの領域へ置き換えない。外部Codexの設定やauth.jsonを取り込まない。ChatGPT資格情報をCustom接続先へ送らない。Custom障害や利用上限時に、別課金経路へ自動フォールバックしない。
 
-将来の各会話はconnection_idと設定世代に紐付ける。接続先やキーの変更後、以前の会話を新しい接続先へ暗黙に継続しない。新しい会話にするか、明示した切替操作を必要とする。
+将来の各会話はconnection_idと`settings_generation`に紐付ける。接続先、キー、またはランタイムへ影響する設定の変更後、以前の会話を新しい設定世代へ暗黙に継続しない。設定変更を反映したApp Serverの再起動完了後に新しい会話を開始するか、明示した再接続操作を必要とする。
 
 CODEX_HOMEはOS sandboxではなく、状態保存先の分離である。Codexには設定の優先順位やproject configがある。初期はユーザーの文書フォルダをcwdにせず、Hane管理領域で起動する。Provider/送信先/認証方式はHaneから明示してeffective configを検査する。組織の強制ポリシーは回避せず、競合はエラー表示する。[S5]
 
