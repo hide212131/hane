@@ -272,32 +272,46 @@ impl EditorView {
     /// Runs once per requested animation frame, before `render`'s own
     /// `scroll_y` clamp (which also bounds whatever this step adds, so
     /// inertia can never carry the position past a document edge or survive
-    /// a viewport-height remeasurement that clamped it away). Stops silently
-    /// the moment something else has moved `scroll_y` since the last step
-    /// (see `ScrollInertia::last_applied`), so stale wheel momentum never
-    /// overwrites cursor-follow, selection autoscroll, a scrollbar drag, a
-    /// document switch, zoom, or a pinch.
+    /// a viewport-height remeasurement that clamped it away). Delegates the
+    /// actual state advance to `advance_scroll_inertia`, which touches
+    /// nothing window-related, so `window.request_animation_frame()` (only
+    /// callable during `request_layout`, `prepaint`, or `paint`) stays
+    /// confined to this wrapper instead of being invoked from tests that
+    /// call the step outside a real frame.
     pub(super) fn step_scroll_inertia(&mut self, window: &Window) {
+        if self.advance_scroll_inertia() {
+            window.request_animation_frame();
+        }
+    }
+
+    /// Advances scroll inertia by one animation frame's worth of decay,
+    /// mutating only `self`. Stops silently the moment something else has
+    /// moved `scroll_y` since the last step (see `ScrollInertia::last_applied`),
+    /// so stale wheel momentum never overwrites cursor-follow, selection
+    /// autoscroll, a scrollbar drag, a document switch, zoom, or a pinch.
+    /// Returns whether the coast is still running, i.e. whether a real
+    /// caller must follow up with `window.request_animation_frame()`.
+    pub(super) fn advance_scroll_inertia(&mut self) -> bool {
         let Some(mut inertia) = self.scroll_inertia else {
-            return;
+            return false;
         };
         if self.scroll_y != inertia.last_applied {
             self.scroll_inertia = None;
-            return;
+            return false;
         }
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(inertia.last_frame);
         let Some((distance, next_velocity)) = eased_scroll_inertia_step(inertia.velocity, elapsed)
         else {
             self.scroll_inertia = None;
-            return;
+            return false;
         };
         self.scroll_y += distance;
         inertia.velocity = next_velocity;
         inertia.last_frame = now;
         inertia.last_applied = self.scroll_y;
         self.scroll_inertia = Some(inertia);
-        window.request_animation_frame();
+        true
     }
 
     /// macOS trackpad pinch. `event.delta` is the incremental scale

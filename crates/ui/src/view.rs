@@ -354,15 +354,29 @@ fn scroll_inertia_velocity_for_lines_delta(scroll_delta: f32) -> f32 {
 /// distance to add to `scroll_y` this frame and the velocity remaining
 /// afterward, or `None` once the remaining coast distance is imperceptible
 /// and the animation should stop.
+///
+/// The total coast distance still owed at the start of this call is
+/// `velocity * tau` (see `scroll_inertia_velocity_for_lines_delta`'s doc
+/// comment on this telescoping identity). Once decaying `velocity` for one
+/// more frame would leave less than `SCROLL_INERTIA_SETTLE_EPSILON` of that
+/// distance remaining, this step folds the *entire* remaining distance into
+/// its own `distance` instead of only this frame's fractional share,
+/// because the next call would otherwise return `None` and silently drop
+/// whatever fraction was left unapplied (issue #389: this previously left
+/// the coast short of the delta it was supposed to land on).
 fn eased_scroll_inertia_step(velocity: f32, elapsed: Duration) -> Option<(f32, f32)> {
     let elapsed = elapsed.max(SCROLL_INERTIA_MIN_FRAME_TIME).as_secs_f32();
     let tau = SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32();
-    let decay = (-elapsed / tau).exp();
-    let next_velocity = velocity * decay;
-    if (next_velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+    if (velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
         return None;
     }
-    let distance = velocity * tau * (1.0 - decay);
+    let decay = (-elapsed / tau).exp();
+    let next_velocity = velocity * decay;
+    let distance = if (next_velocity * tau).abs() <= SCROLL_INERTIA_SETTLE_EPSILON {
+        velocity * tau
+    } else {
+        velocity * tau * (1.0 - decay)
+    };
     Some((distance, next_velocity))
 }
 
@@ -8740,9 +8754,15 @@ mod tests {
              {coast_distance}"
         );
 
-        // A long-settled duration fully decays the velocity below the
-        // imperceptible-motion threshold.
-        assert!(eased_scroll_inertia_step(velocity, Duration::from_secs(1)).is_none());
+        // A long-settled duration decays the velocity below the
+        // imperceptible-motion threshold, but the step must still deliver
+        // the full remaining coast distance instead of silently dropping it
+        // (issue #389); a further call then settles with no motion left.
+        let (long_distance, long_next_velocity) =
+            eased_scroll_inertia_step(velocity, Duration::from_secs(1))
+                .expect("a long-elapsed step must still return the remaining coast distance");
+        assert!((long_distance - coast_distance).abs() < 1e-3, "{long_distance}");
+        assert!(eased_scroll_inertia_step(long_next_velocity, Duration::from_millis(16)).is_none());
     }
 
     #[test]
@@ -12832,13 +12852,17 @@ mod tests {
         // after a delay for the inertia to ramp up.
         assert!(immediate > 0.0, "{immediate}");
 
-        let coasted = view.update_in(cx, |view, window, _cx| {
+        let coasted = view.update(cx, |view, _cx| {
             let inertia = view
                 .scroll_inertia
                 .as_mut()
                 .expect("a plain Lines wheel scroll must arm short inertia");
             inertia.last_frame -= Duration::from_millis(20);
-            view.step_scroll_inertia(window);
+            // `advance_scroll_inertia` steps the coast state without touching
+            // `window`, so it can be called outside a real render frame (see
+            // issue #389's macOS CI failure: `window.request_animation_frame()`
+            // may only be called during request_layout, prepaint, or paint).
+            view.advance_scroll_inertia();
             view.scroll_y
         });
         assert!(
@@ -12877,14 +12901,16 @@ mod tests {
         assert!(immediate > before, "before={before}, immediate={immediate}");
 
         // Run the coast to completion, as `step_scroll_inertia` would across
-        // real animation frames, until it settles on its own.
-        let settled = view.update_in(cx, |view, window, _cx| {
+        // real animation frames, until it settles on its own. Steps via
+        // `advance_scroll_inertia` (see `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+        // to avoid calling `window.request_animation_frame()` outside a real frame.
+        let settled = view.update(cx, |view, _cx| {
             for _ in 0..64 {
                 let Some(inertia) = view.scroll_inertia.as_mut() else {
                     break;
                 };
                 inertia.last_frame -= Duration::from_millis(16);
-                view.step_scroll_inertia(window);
+                view.advance_scroll_inertia();
             }
             view.scroll_y
         });
@@ -12968,7 +12994,11 @@ mod tests {
                     break;
                 };
                 inertia.last_frame -= Duration::from_millis(16);
-                view.step_scroll_inertia(window);
+                // Steps via `advance_scroll_inertia` (see
+                // `plain_wheel_lines_scroll_keeps_coasting_after_the_input_stops`)
+                // to avoid calling `window.request_animation_frame()` outside a
+                // real frame.
+                view.advance_scroll_inertia();
             }
         });
         let (before, max_scroll_y) = view.read_with(cx, |view, _| {
@@ -12992,13 +13022,13 @@ mod tests {
             expected_delta * 2.0
         });
 
-        let settled = view.update_in(cx, |view, window, _cx| {
+        let settled = view.update(cx, |view, _cx| {
             for _ in 0..64 {
                 let Some(inertia) = view.scroll_inertia.as_mut() else {
                     break;
                 };
                 inertia.last_frame -= Duration::from_millis(16);
-                view.step_scroll_inertia(window);
+                view.advance_scroll_inertia();
             }
             view.scroll_y
         });
