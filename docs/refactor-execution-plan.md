@@ -386,3 +386,81 @@ Issue [#389](https://github.com/hide212131/hane/issues/389) のホイールス�
 通常ホイールは従来どおり受け取ったdeltaを即時に `scroll_y` へ反映する。Ctrl/Cmd+wheelのtarget accumulation、display-linked interpolation、pinch takeover、100% snap、zoom anchor、animation中にdocument-wide height indexを毎frame再構築しない条件をそのまま保つ。既存testの名前・assert・件数は変更しない。
 
 検証は `cargo test --workspace`、`cargo test --workspace --all-features`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` と current head のmacOS/Windows CIを確認する。特にwheel zoom queue/reverse、plain wheelとの役割分担、pinch takeover、zoom anchor、scroll clampの既存回帰を維持する。CI結果とexact headはPR側で追記する。
+
+### 9.11 RF2-A: EditorView機械的分割 第4PR — inline rename分離（#301）
+
+PR #394で受入済みの設計に基づき、inline rename専用メソッドを `crates/ui/src/view/inline_rename.rs` へ移す実装PRを開始する。設計PR #394のmerge commitおよび実装branchの起点は `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97`。PR本文は `Refs #301` とし、#301全体は閉じない。
+
+**実際の旧→新対応と可視性**
+
+実装はPR [#396](https://github.com/hide212131/hane/pull/396)、starting head `bbfc1d3e35f74826ea4f55d6fd36782802b021ea`（base commit `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` から分岐）に対して行った。製品コード移動を含む実装commit/headは `a266285c6da4f139899fcf751ee7d80847b902fd`。許可された3ファイル `crates/ui/src/view.rs`、新規 `crates/ui/src/view/inline_rename.rs`、本書のみを変更した。
+
+[実装仕様](refactor-rf2a-inline-rename-implementation-spec.md) 第3節の36メソッドは、同じ相対順のまま `crates/ui/src/view.rs` の元の一つの `impl EditorView` ブロック（`text_input_render_state` / `set_text_input_bounds` と共有していたブロック）から、新規 `crates/ui/src/view/inline_rename.rs` の新しい `impl EditorView` ブロックへ機械的に移した。署名・引数・戻り値・属性・コメント・bodyは変更していない。可視性は仕様どおり2件だけ変更した。`begin_inline_rename`（private→`pub(super)`、兄弟 `view/sidebar.rs` の2箇所のダブルクリックhandlerから呼ぶため）と `inline_rename_has_background_conflict`（private→`pub(super)`、親 `view.rs` の既存 `mod tests` 内のassertから呼ぶため）。他28件の `pub(crate)` と残り6件のprivateは維持した。
+
+移動した36件の個別対応は次のとおり。各行で旧定義 `crates/ui/src/view.rs::<method>` を同名の新定義 `crates/ui/src/view/inline_rename.rs::<method>` へ移した。順序は設計仕様第3節と一致する。
+
+1. `inline_rename_active`
+2. `inline_rename_render_state`
+3. `set_inline_rename_input_bounds`
+4. `inline_rename_character_index_for_point`
+5. `move_inline_rename_to_point`
+6. `inline_rename_has_composition`
+7. `inline_rename_text_for_range`
+8. `inline_rename_selection`
+9. `inline_rename_marked_range`
+10. `replace_inline_rename_text`
+11. `replace_and_mark_inline_rename_text`
+12. `commit_inline_rename_composition`
+13. `cancel_inline_rename_composition`
+14. `selected_inline_rename_text`
+15. `move_inline_rename_left`
+16. `move_inline_rename_right`
+17. `move_inline_rename_horizontal`
+18. `select_inline_rename_left`
+19. `select_inline_rename_right`
+20. `select_all_inline_rename`
+21. `select_inline_rename_home`
+22. `select_inline_rename_end`
+23. `move_inline_rename_home`
+24. `move_inline_rename_end`
+25. `move_inline_rename_to`
+26. `backspace_inline_rename`
+27. `delete_inline_rename`
+28. `delete_inline_rename_with_direction`
+29. `begin_inline_rename_from_selection`
+30. `begin_inline_rename`
+31. `inline_rename_has_background_conflict`
+32. `reserve_inline_rename_tickets`
+33. `confirm_inline_rename`
+34. `finish_inline_rename`
+35. `follow_inline_rename_paths`
+36. `cancel_inline_rename`
+
+`view.rs` には `mod inline_rename;` を既存の `mod sidebar; mod sidebar_filter; mod viewport;` の直前に追加した。`EditorView` の型・field・初期化（`new` / `from_sessions`）、`InlineRename` / `InlineRenameKind` / `InlineRenameComposition` / `InlineRenameRenderState` / `SidebarFilterComposition`、UTF-16/grapheme/selection共有helper（`inline_rename_parts`、`valid_inline_rename_name`、`rebase_ui_path`、`byte_offset_from_utf16`、`utf16_offset_from_byte`、`byte_range_from_utf16`、`inline_rename_selected_range`、`range_to_utf16`、`previous_inline_rename_boundary`、`next_inline_rename_boundary`、`inline_rename_cursor`、`select_inline_rename_to`、`select_inline_rename_to_fields`）、`text_input_render_state`、`set_text_input_bounds`、既存 `mod tests` は `view.rs` に残した。新moduleの冒頭は既存の兄弟module（`view/sidebar.rs` 等）と同じ `use super::*;` を使い、`shape_inline_rename_line` / `InlineRenameInput`（`input.rs` 由来で `view.rs` が再exportしているもの）や上記共有型・helperを、兄弟 `view/sidebar_filter.rs` が既に使っているのと同じ経路で参照する。`actions.rs`、`input.rs`、`capture.rs`、`view/sidebar.rs`、`view/sidebar_filter.rs`、`view/viewport.rs`、session crate、Cargo設定・lock、workflowは変更していない。
+
+`crates/ui/src/view.rs` の該当 `impl EditorView` ブロックは、移動後に `text_input_render_state` の直後へ `set_text_input_bounds`、その直後へ `pub fn new` が続く形になった。両ファイルとも移動対象36シンボルが一度だけ定義され、`view.rs` 側に旧定義や委譲wrapperが残っていないことをシンボル名の再検索で確認した。body比較は、移動元の原文をそのまま新moduleへ転記し、rustfmtや条件式の書き換えを加えない方法で行った。入力先の優先順、IME、pending guard、path検査、ticket予約、二段spawn、`.detach()`、通知、保存再開とH1同期を含む既存の処理順はコード上変更していない。
+
+**検証結果**
+
+2026-09-28、PR head `ac3d8750eba6ed18b0b464a88aebae04df623a86`（実装コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` と、その後の実行計画のみの更新）を対象にmacOS arm64上で実行した。実行toolchainは `rustc 1.98.1 (48a229cea 2026-09-01)` / `cargo 1.98.1 (797e8a9bc 2026-08-05)`。PATH上のHomebrew cargoは1.93.1だったため、インストール済みtoolchainを `~/.cargo/bin/rustup run 1.98.1` で明示した。各コマンドの終了コードは次のとおり。
+
+- `cargo test -p hane-ui --all-features --locked -- --list` — 終了コード0、213件を列挙（このコマンドは実行ではなく一覧表示）。
+- `cargo test -p hane-ui --all-features --locked rename` — 終了コード0、22 passed / 0 failed。
+- `cargo test -p hane-ui --all-features --locked sidebar_file_filter` — 終了コード0、2 passed / 0 failed。
+- `cargo test --workspace --locked` — 終了コード0、38 test-result groupsで合計776 passed / 0 failed / 0 ignored。
+- `cargo test --workspace --all-features --locked` — 終了コード0、38 test-result groupsで合計776 passed / 0 failed / 0 ignored。
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — 終了コード0。`block v0.1.6` の将来のRustで拒否される可能性に関するCargo future-incompat warningは出たが、clippy diagnosticsや失敗はない。
+- `git diff --check origin/main...HEAD` および作業treeに対する `git diff --check` — どちらも終了コード0。
+
+current-head CI run [36425314180](https://github.com/hide212131/hane/actions/runs/36425314180) はPR head `ba49bf4ce4cbe10c96ef11b6e37be34eefad614f` でmacOS / Windowsとも成功した。両OSのworkspace testsとclippy、macOS fallback glyph rasterization、macOS input source reactivationのcheckが成功。より前のrun [36421117864](https://github.com/hide212131/hane/actions/runs/36421117864) も、製品コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` と同一のコードを含むheadで成功している。mainはbase `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` のまま。
+
+GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。
+
+CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e8357196fb7415ccaac6fd105fe3b53e7ca94cc` でコード移動の不一致なしとしたが、実行計画の36件対応表不足を指摘したため、本節へ個別一覧を追加した。対応表を含むhead `ba49bf4ce4cbe10c96ef11b6e37be34eefad614f` に対するfull review run `31ffbd25-3836-4bc2-8070-c2ed4a31a740` はactionable commentsなし、Merge Risk Minimalとした。Docstring Coverageは36件のうち5.56%というwarning（inconclusive）を残した。本PRの受入条件は属性・既存コメント・本体を保つ機械的移動であり、関数コメントを新規追加することはこの範囲に含めない。独立したWindows renameの懸念も引き続き別作業として扱う。
+
+この節に対応表・検証結果・レビュー結果を追記した後のPR変更は文書のみで、製品コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` からコード差分はない。最終の文書更新後もcurrent-head CIとCodeRabbit full reviewを再確認し、PR上の結果をIssue #301へ報告する。
+本PRの最終checks確認者は、このタスクを進めるHane Commander（ChatGPT Commander）である。merge直前にcurrent main/head、必要なCI checks、CodeRabbitの最終head review、作業treeをGitHubとcheckoutから再取得し、exact SHAと結果を照合して受入可否を確認する。Claude workerは実装担当、trusted finalizerはpush担当であり、この最終確認はworkerの報告に代替させない。
+
+**残件**
+
+session I/O、background parse、height/cache、viewportの残りのpointer/panel処理、settings、計測、renderなど未分離領域は #301 の後続として引き続き実行計画で追跡する。#304 には filter/renameの入力先判定の集約、#305 には親に残したUTF-16/grapheme/selection helperの所有権整理、#308/#309 にはticket・H1同期・保存queueの所有権整理を引き渡す。受入後もこのPRだけで#301全体を完了扱いにしない。rollbackはこの機械的移動PRを一単位で戻し、新配置に依存する後続がある場合は逆順に戻す。
