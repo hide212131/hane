@@ -53,9 +53,11 @@
 //! each other, so a long-running call cannot block a `stop`/`restart`
 //! request.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -121,7 +123,10 @@ pub struct RuntimeEvent {
 
 #[derive(Debug, Clone)]
 pub enum RuntimeEventKind {
-    Notification { method: String, params: Option<Value> },
+    Notification {
+        method: String,
+        params: Option<Value>,
+    },
     Diagnostic(String),
 }
 
@@ -156,7 +161,10 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "AI runtime is owned by another Hane process")
             }
             RuntimeError::OwnerLockPathMismatch => {
-                write!(f, "the supplied runtime owner lock guard does not belong to this runtime")
+                write!(
+                    f,
+                    "the supplied runtime owner lock guard does not belong to this runtime"
+                )
             }
             RuntimeError::OwnerLock(e) => write!(f, "failed to acquire runtime owner lock: {e}"),
             RuntimeError::Spawn(e) => write!(f, "failed to start the App Server process: {e}"),
@@ -188,6 +196,9 @@ pub struct RuntimeConfig {
     pub binary_path: PathBuf,
     pub args: Vec<String>,
     pub codex_home: Option<PathBuf>,
+    /// The child process starts in a Hane-owned, empty AI workspace. This is
+    /// intentionally independent of the Editor's current document/worktree.
+    pub working_directory: Option<PathBuf>,
     pub extra_env: Vec<(String, String)>,
     pub owner_lock_path: PathBuf,
     pub start_timeout: Duration,
@@ -197,12 +208,16 @@ pub struct RuntimeConfig {
 
 impl std::fmt::Debug for RuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_env: Vec<(&str, &str)> =
-            self.extra_env.iter().map(|(k, _)| (k.as_str(), "<redacted>")).collect();
+        let redacted_env: Vec<(&str, &str)> = self
+            .extra_env
+            .iter()
+            .map(|(k, _)| (k.as_str(), "<redacted>"))
+            .collect();
         f.debug_struct("RuntimeConfig")
             .field("binary_path", &self.binary_path)
             .field("args", &self.args)
             .field("codex_home", &self.codex_home)
+            .field("working_directory", &self.working_directory)
             .field("extra_env", &redacted_env)
             .field("owner_lock_path", &self.owner_lock_path)
             .field("start_timeout", &self.start_timeout)
@@ -218,6 +233,7 @@ impl RuntimeConfig {
             binary_path: binary_path.into(),
             args: vec!["--listen".to_string(), "stdio://".to_string()],
             codex_home: None,
+            working_directory: None,
             extra_env: Vec::new(),
             owner_lock_path: owner_lock_path.into(),
             start_timeout: Duration::from_secs(20),
@@ -236,17 +252,76 @@ impl RuntimeConfig {
                 ),
             ));
         }
+        let codex_home = self.codex_home.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AI runtime requires an explicit Hane-owned CODEX_HOME; refusing to use the user's Codex home",
+            )
+        })?;
+        let working_directory = self.working_directory.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AI runtime requires an explicit Hane-owned working directory; refusing to use the Editor cwd",
+            )
+        })?;
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
-        if let Some(home) = &self.codex_home {
-            cmd.env("CODEX_HOME", home);
-        }
+        cmd.env_clear();
+        cmd.envs(filtered_parent_environment(std::env::vars_os()));
+        cmd.env("CODEX_HOME", codex_home);
         cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd.current_dir(working_directory);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.spawn()
     }
+}
+
+/// Only OS/runtime variables with an explicit use in the Hane child remain
+/// inherited. In particular, do not pass Codex session/app tool plumbing,
+/// provider overrides, or other credential-bearing variables through from a
+/// parent application (which may itself have been launched by Codex).
+const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "APPDATA",
+    "CURL_CA_BUNDLE",
+    "COMSPEC",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_RUNTIME_DIR",
+    "__CF_USER_TEXT_ENCODING",
+];
+
+fn filtered_parent_environment(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    vars.into_iter().filter(|(key, _)| {
+        let key = key.to_string_lossy();
+        CHILD_ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+    })
 }
 
 struct SharedState {
@@ -312,8 +387,18 @@ enum LifecycleCommand {
 type OwnerLockCallback = Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>;
 
 enum CoordinatorMessage {
-    Lifecycle(LifecycleCommand, Sender<Result<RuntimeStatus, RuntimeError>>),
-    ChildEnded { generation: u64, operation_generation: u64 },
+    Lifecycle(
+        LifecycleCommand,
+        Sender<Result<RuntimeStatus, RuntimeError>>,
+    ),
+    CriticalEventOverflow {
+        generation: u64,
+        operation_generation: u64,
+    },
+    ChildEnded {
+        generation: u64,
+        operation_generation: u64,
+    },
     /// Runs `f` synchronously on the coordinator thread, passing it the
     /// owner lock guard this coordinator currently holds (if any). See
     /// [`AiRuntime::with_owner_lock`].
@@ -361,7 +446,14 @@ impl AiRuntime {
         }));
         let shared_for_thread = shared.clone();
         let coordinator = thread::spawn(move || {
-            run_coordinator(cmd_rx, self_tx, shared_for_thread, config, handler, events_tx);
+            run_coordinator(
+                cmd_rx,
+                self_tx,
+                shared_for_thread,
+                config,
+                handler,
+                events_tx,
+            );
         });
         AiRuntime {
             cmd_tx,
@@ -375,7 +467,9 @@ impl AiRuntime {
         self.cmd_tx
             .send(CoordinatorMessage::Lifecycle(cmd, reply_tx))
             .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
-        reply_rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?
+        reply_rx
+            .recv()
+            .map_err(|_| RuntimeError::CoordinatorUnavailable)?
     }
 
     /// Starts the runtime. Concurrent `start()` callers are coalesced: only
@@ -404,7 +498,9 @@ impl AiRuntime {
         };
 
         if !is_leader {
-            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+            return rx
+                .recv()
+                .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
         }
 
         let result = self.send_lifecycle(LifecycleCommand::Start);
@@ -445,7 +541,9 @@ impl AiRuntime {
         };
 
         if !is_leader {
-            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+            return rx
+                .recv()
+                .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
         }
 
         let result = self.send_lifecycle(LifecycleCommand::Restart);
@@ -493,7 +591,10 @@ impl AiRuntime {
         new_config: RuntimeConfig,
         new_configured_settings_generation: u64,
     ) -> Result<RuntimeStatus, RuntimeError> {
-        self.send_lifecycle(LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation))
+        self.send_lifecycle(LifecycleCommand::Reconfigure(
+            new_config,
+            new_configured_settings_generation,
+        ))
     }
 
     /// Returns the `settings_generation` the `RuntimeConfig` *currently
@@ -545,7 +646,10 @@ impl AiRuntime {
     /// already `Ready`, `owner` is simply dropped (releasing whatever
     /// separate OS lock file handle it held) and the current status is
     /// returned, exactly like [`Self::start`].
-    pub fn start_with_owner_lock(&self, owner: OwnerLockGuard) -> Result<RuntimeStatus, RuntimeError> {
+    pub fn start_with_owner_lock(
+        &self,
+        owner: OwnerLockGuard,
+    ) -> Result<RuntimeStatus, RuntimeError> {
         self.send_lifecycle(LifecycleCommand::StartWithOwnerLock(owner))
     }
 
@@ -603,7 +707,12 @@ impl AiRuntime {
     /// thread against the current generation's transport, independent of
     /// the lifecycle coordinator, so it never blocks a concurrent stop or
     /// restart and is never retried automatically on failure.
-    pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RuntimeError> {
+    pub fn call(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, RuntimeError> {
         let core = {
             let guard = self.shared.lock().unwrap();
             match (guard.status, &guard.ready_transport) {
@@ -611,7 +720,8 @@ impl AiRuntime {
                 _ => return Err(RuntimeError::NotReady),
             }
         };
-        core.call(method, params, timeout).map_err(RuntimeError::Rpc)
+        core.call(method, params, timeout)
+            .map_err(RuntimeError::Rpc)
     }
 
     pub fn snapshot(&self) -> RuntimeStatus {
@@ -698,7 +808,10 @@ fn run_coordinator(
                 operation_generation += 1;
                 let op_gen = operation_generation;
                 let result = match cmd {
-                    LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation) => {
+                    LifecycleCommand::Reconfigure(
+                        new_config,
+                        new_configured_settings_generation,
+                    ) => {
                         // A currently held `owner_guard` proves ownership of
                         // `config.owner_lock_path`, not of whatever path
                         // `new_config` carries. Carrying it forward into a
@@ -752,7 +865,8 @@ fn run_coordinator(
                                     // restart below goes on to succeed.
                                     {
                                         let mut state = shared.lock().unwrap();
-                                        state.config_generation = new_configured_settings_generation;
+                                        state.config_generation =
+                                            new_configured_settings_generation;
                                     }
                                     do_start(
                                         op_gen,
@@ -832,8 +946,10 @@ fn run_coordinator(
                 // applies to the exact `Child` (and the exact operation that
                 // spawned it) `current` still holds, never to whatever a
                 // later operation has since moved on to.
-                let matches_current =
-                    current.as_ref().map(|c| (c.generation, c.operation_generation)) == Some((g, og));
+                let matches_current = current
+                    .as_ref()
+                    .map(|c| (c.generation, c.operation_generation))
+                    == Some((g, og));
                 if matches_current {
                     reap_and_mark_failed(
                         &mut current,
@@ -842,6 +958,37 @@ fn run_coordinator(
                         &config,
                         &shared,
                         &events_tx,
+                    );
+                }
+            }
+            CoordinatorMessage::CriticalEventOverflow {
+                generation: g,
+                operation_generation: og,
+            } => {
+                let matches_current = current
+                    .as_ref()
+                    .map(|child| (child.generation, child.operation_generation))
+                    == Some((g, og));
+                if matches_current {
+                    operation_generation += 1;
+                    let op_gen = operation_generation;
+                    let _ = events_tx.try_send(RuntimeEvent {
+                        generation: g,
+                        kind: RuntimeEventKind::Diagnostic(
+                            "critical App Server notification was lost; stopping and isolating the runtime".to_string(),
+                        ),
+                    });
+                    let _ = stop_active(
+                        &mut current,
+                        &mut generation,
+                        &mut owner_guard,
+                        &config,
+                        &shared,
+                        &events_tx,
+                        RuntimeState::Failed,
+                        RuntimeState::Failed,
+                        op_gen,
+                        true,
                     );
                 }
             }
@@ -898,7 +1045,17 @@ fn handle_lifecycle(
 ) -> Option<Result<RuntimeStatus, RuntimeError>> {
     match cmd {
         LifecycleCommand::Start => do_start(
-            op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
+            op_gen,
+            current,
+            generation,
+            owner_guard,
+            None,
+            config,
+            handler,
+            events_tx,
+            self_tx,
+            shared,
+            reply,
         ),
         LifecycleCommand::Stop => Some(stop_active(
             current,
@@ -928,14 +1085,28 @@ fn handle_lifecycle(
                 return Some(Err(e));
             }
             do_start(
-                op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
+                op_gen,
+                current,
+                generation,
+                owner_guard,
+                None,
+                config,
+                handler,
+                events_tx,
+                self_tx,
+                shared,
+                reply,
             )
         }
         LifecycleCommand::Reconfigure(_, _) => {
-            unreachable!("Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle")
+            unreachable!(
+                "Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle"
+            )
         }
         LifecycleCommand::StartWithOwnerLock(_) => {
-            unreachable!("StartWithOwnerLock is handled directly in run_coordinator, before reaching handle_lifecycle")
+            unreachable!(
+                "StartWithOwnerLock is handled directly in run_coordinator, before reaching handle_lifecycle"
+            )
         }
     }
 }
@@ -1042,8 +1213,14 @@ fn do_start(
     };
 
     let stdin = child.stdin.take().expect("child spawned with piped stdin");
-    let stdout = child.stdout.take().expect("child spawned with piped stdout");
-    let stderr = child.stderr.take().expect("child spawned with piped stderr");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child spawned with piped stdout");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child spawned with piped stderr");
 
     let self_tx_clone = self_tx.clone();
     let on_closed: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -1055,31 +1232,60 @@ fn do_start(
 
     let (bridge_tx, bridge_rx) = mpsc::sync_channel::<RpcEvent>(EVENTS_BRIDGE_CAPACITY);
     let runtime_events_tx = events_tx.clone();
+    let overflow_sent = Arc::new(AtomicBool::new(false));
+    let overflow_sender = self_tx.clone();
+    let on_critical_overflow: Arc<dyn Fn() + Send + Sync> = {
+        let overflow_sent = overflow_sent.clone();
+        Arc::new(move || {
+            if !overflow_sent.swap(true, Ordering::SeqCst) {
+                let _ = overflow_sender.send(CoordinatorMessage::CriticalEventOverflow {
+                    generation: g,
+                    operation_generation: op_gen,
+                });
+            }
+        })
+    };
+    let bridge_overflow = on_critical_overflow.clone();
     thread::spawn(move || {
         for event in bridge_rx {
+            let is_critical = matches!(
+                &event,
+                RpcEvent::Notification { method, .. }
+                    if matches!(method.as_str(),
+                        "account/login/completed" | "account/updated" | "item/completed" | "turn/completed" | "turn/failed")
+            );
             let kind = match event {
-                RpcEvent::Notification { method, params } => RuntimeEventKind::Notification { method, params },
+                RpcEvent::Notification { method, params } => {
+                    RuntimeEventKind::Notification { method, params }
+                }
                 RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
             };
-            // Non-blocking: a slow caller-side consumer must never stall
-            // this forwarding thread (which would in turn back up the
-            // bounded bridge above and eventually the reader/stderr
-            // threads' own `try_send`). A full queue drops this one event;
-            // a disconnected receiver means nobody will ever read again, so
-            // stop draining the bridge instead of looping forever.
-            match runtime_events_tx.try_send(RuntimeEvent { generation: g, kind }) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+            // Never block the App Server reader. A lost critical event
+            // schedules an independent coordinator wake that stops this
+            // exact child generation; diagnostics remain best-effort.
+            match runtime_events_tx.try_send(RuntimeEvent {
+                generation: g,
+                kind,
+            }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) if is_critical => bridge_overflow(),
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) if is_critical => {
+                    bridge_overflow();
+                    break;
+                }
                 Err(TrySendError::Disconnected(_)) => break,
             }
         }
     });
 
-    let transport = RpcTransport::spawn(
+    let transport = RpcTransport::spawn_with_critical_overflow(
         Box::new(stdout),
         Box::new(stdin),
         Some(Box::new(stderr)),
         handler.clone(),
         bridge_tx,
+        on_critical_overflow,
         on_closed,
     );
 
@@ -1348,7 +1554,13 @@ fn reap_and_mark_failed(
     // Publish `Failed` before running the stop sequence below: leaving the
     // published state at `Ready` while cleanup is still in flight would let
     // callers observe a stale, already-wrong status.
-    set_status(shared, RuntimeState::Failed, false, child_generation, op_gen);
+    set_status(
+        shared,
+        RuntimeState::Failed,
+        false,
+        child_generation,
+        op_gen,
+    );
     {
         let mut state = shared.lock().unwrap();
         state.ready_transport = None;
@@ -1426,7 +1638,12 @@ where
     StopOutcome::RestartBlocked
 }
 
-fn wait_until<C, F>(handle: &mut C, try_wait: &mut F, timeout: Duration, poll_interval: Duration) -> bool
+fn wait_until<C, F>(
+    handle: &mut C,
+    try_wait: &mut F,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> bool
 where
     F: FnMut(&mut C) -> io::Result<bool>,
 {
@@ -1446,6 +1663,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     struct FakeProcess {
         exited: bool,
@@ -1523,14 +1741,122 @@ mod tests {
     #[test]
     fn spawn_child_rejects_a_non_absolute_binary_path_instead_of_falling_back_to_path_lookup() {
         let config = RuntimeConfig::new("codex-app-server", "/tmp/hane-ai-test-owner.lock");
-        let err = config.spawn_child().expect_err("a bare filename must be rejected");
+        let err = config
+            .spawn_child()
+            .expect_err("a bare filename must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
         let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
-        assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
+        assert_eq!(
+            config.args,
+            vec!["--listen".to_string(), "stdio://".to_string()]
+        );
+    }
+
+    #[test]
+    fn child_environment_drops_codex_session_and_provider_overrides_but_keeps_os_network_settings()
+    {
+        let input = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("HOME"), OsString::from("/Users/test")),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:8080"),
+            ),
+            (
+                OsString::from("SSL_CERT_FILE"),
+                OsString::from("/tmp/ca.pem"),
+            ),
+            (
+                OsString::from("CODEX_HOME"),
+                OsString::from("/Users/test/.codex"),
+            ),
+            (
+                OsString::from("CODEX_APP_TOOLS_PIPE_PATH"),
+                OsString::from("/tmp/tools.sock"),
+            ),
+            (
+                OsString::from("CODEX_SESSION_ID"),
+                OsString::from("session-secret"),
+            ),
+            (
+                OsString::from("CODEX_THREAD_ID"),
+                OsString::from("thread-secret"),
+            ),
+            (
+                OsString::from("CODEX_PERMISSION_PROFILE"),
+                OsString::from("danger-full-access"),
+            ),
+            (
+                OsString::from("CODEX_MCP_NODE_PATH"),
+                OsString::from("/tmp/node"),
+            ),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("external-api-key"),
+            ),
+            (
+                OsString::from("OPENAI_BASE_URL"),
+                OsString::from("https://external.test/v1"),
+            ),
+            (
+                OsString::from("HANE_AI_PROVIDER_KEY"),
+                OsString::from("parent-key"),
+            ),
+        ];
+        let filtered: std::collections::HashMap<_, _> =
+            filtered_parent_environment(input).collect();
+
+        assert_eq!(
+            filtered.get(OsStr::new("PATH")),
+            Some(&OsString::from("/usr/bin"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("HOME")),
+            Some(&OsString::from("/Users/test"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.test:8080"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("SSL_CERT_FILE")),
+            Some(&OsString::from("/tmp/ca.pem"))
+        );
+        for blocked in [
+            "CODEX_HOME",
+            "CODEX_APP_TOOLS_PIPE_PATH",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_PERMISSION_PROFILE",
+            "CODEX_MCP_NODE_PATH",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "HANE_AI_PROVIDER_KEY",
+        ] {
+            assert!(
+                !filtered.contains_key(OsStr::new(blocked)),
+                "unexpected inherited variable: {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawning_requires_hane_owned_codex_home_and_working_directory() {
+        let missing_home = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock")
+            .spawn_child()
+            .unwrap_err();
+        assert_eq!(missing_home.kind(), io::ErrorKind::InvalidInput);
+        assert!(missing_home.to_string().contains("CODEX_HOME"));
+
+        let mut missing_cwd = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        missing_cwd.codex_home = Some(PathBuf::from("/tmp/hane-ai-codex-home"));
+        let missing_cwd = missing_cwd.spawn_child().unwrap_err();
+        assert_eq!(missing_cwd.kind(), io::ErrorKind::InvalidInput);
+        assert!(missing_cwd.to_string().contains("working directory"));
     }
 
     #[test]
@@ -1543,7 +1869,8 @@ mod tests {
             "with_owner_lock_reports_none_before_the_runtime_ever_starts"
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+        let config =
+            RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
         let (events_tx, _events_rx) = mpsc::sync_channel(8);
         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
         let runtime = AiRuntime::spawn(config, handler, events_tx);
@@ -1551,7 +1878,10 @@ mod tests {
         // Never started: no `Start`/`StartWithOwnerLock` was ever issued, so
         // this coordinator does not (and must not) hold the owner lock yet.
         let has_owner = runtime.with_owner_lock(|owner| owner.is_some()).unwrap();
-        assert!(!has_owner, "no owner lock should be held before Start is ever issued");
+        assert!(
+            !has_owner,
+            "no owner lock should be held before Start is ever issued"
+        );
 
         let _ = runtime.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1560,11 +1890,15 @@ mod tests {
     #[test]
     fn debug_formatting_never_prints_an_extra_env_secret_value() {
         let mut config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
-        config
-            .extra_env
-            .push(("HANE_AI_PROVIDER_KEY".to_string(), "sk-super-secret-value".to_string()));
+        config.extra_env.push((
+            "HANE_AI_PROVIDER_KEY".to_string(),
+            "sk-super-secret-value".to_string(),
+        ));
         let formatted = format!("{config:?}");
-        assert!(formatted.contains("HANE_AI_PROVIDER_KEY"), "env var name should still be visible");
+        assert!(
+            formatted.contains("HANE_AI_PROVIDER_KEY"),
+            "env var name should still be visible"
+        );
         assert!(
             !formatted.contains("sk-super-secret-value"),
             "extra_env values must never appear in Debug output, got: {formatted}"
@@ -1612,7 +1946,10 @@ mod tests {
             |_| {},
         );
 
-        assert_eq!(attempts, 3, "try_wait should be polled until it first reports exit confirmed");
+        assert_eq!(
+            attempts, 3,
+            "try_wait should be polled until it first reports exit confirmed"
+        );
         assert!(
             *released.lock().unwrap(),
             "resource must be released once try_wait confirms exit"
@@ -1649,6 +1986,9 @@ mod tests {
         let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
         let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
         config.args = vec!["-c".to_string(), script.to_string()];
+        config.codex_home = Some(dir.join("codex-home"));
+        config.working_directory = Some(dir.join("probe-workspace"));
+        std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
         config.start_timeout = Duration::from_secs(5);
         config.stop_grace_timeout = Duration::from_millis(500);
         config.stop_force_timeout = Duration::from_secs(2);
@@ -1656,7 +1996,9 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::sync_channel(8);
         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
         let runtime = AiRuntime::spawn(config, handler, events_tx);
-        let status = runtime.start().expect("start should succeed against the fake App Server");
+        let status = runtime
+            .start()
+            .expect("start should succeed against the fake App Server");
         assert_eq!(status.state, RuntimeState::Ready);
 
         let mismatched_config = RuntimeConfig::new(
@@ -1711,6 +2053,9 @@ mod tests {
         let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
         let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
         config.args = vec!["-c".to_string(), script.to_string()];
+        config.codex_home = Some(dir.join("codex-home"));
+        config.working_directory = Some(dir.join("probe-workspace"));
+        std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
         config.start_timeout = Duration::from_secs(5);
         config.stop_grace_timeout = Duration::from_millis(500);
         config.stop_force_timeout = Duration::from_secs(2);
@@ -1718,7 +2063,9 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::sync_channel(8);
         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
         let runtime = AiRuntime::spawn(config, handler, events_tx);
-        let status = runtime.start().expect("start should succeed against the fake App Server");
+        let status = runtime
+            .start()
+            .expect("start should succeed against the fake App Server");
         assert_eq!(status.state, RuntimeState::Ready);
 
         let panic_result = runtime.with_owner_lock(|_owner| {
@@ -1747,7 +2094,9 @@ mod tests {
 
         // A subsequent ordinary lifecycle command must still be processed
         // normally by the same coordinator thread.
-        let stop_status = runtime.stop().expect("stop should still succeed after the earlier callback panic");
+        let stop_status = runtime
+            .stop()
+            .expect("stop should still succeed after the earlier callback panic");
         assert_eq!(stop_status.state, RuntimeState::Stopped);
 
         let _ = runtime.shutdown();

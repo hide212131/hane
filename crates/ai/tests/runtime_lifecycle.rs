@@ -33,6 +33,10 @@ fn base_config(name: &str) -> RuntimeConfig {
     let dir = unique_dir(name);
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
     let mut config = RuntimeConfig::new(binary, dir.join("runtime.lock"));
+    config.codex_home = Some(dir.join("codex-home"));
+    config.working_directory = Some(dir.join("working-directory"));
+    std::fs::create_dir_all(config.codex_home.as_ref().unwrap()).unwrap();
+    std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
     config.args = Vec::new();
     config.start_timeout = Duration::from_secs(5);
     config.stop_grace_timeout = Duration::from_millis(500);
@@ -403,6 +407,33 @@ fn a_full_events_queue_drops_events_instead_of_blocking_the_runtime() {
     assert!(events_rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
     let _ = runtime.stop();
+}
+
+#[test]
+fn a_full_runtime_event_queue_stops_the_child_after_losing_a_critical_notification() {
+    let mut config = base_config("critical_event_overflow");
+    config.extra_env.push((
+        "FAKE_SERVER_CRITICAL_NOTIFICATION_COUNT".to_string(),
+        "2".to_string(),
+    ));
+    let (events_tx, events_rx) = mpsc::sync_channel(1);
+    let handler = Arc::new(RejectAllServerRequests);
+    let runtime = AiRuntime::spawn(config, handler, events_tx);
+
+    let status = runtime.start().expect("initialize should complete before test notifications");
+    assert_eq!(status.state, RuntimeState::Ready);
+    assert!(events_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = runtime.snapshot();
+        if status.state == RuntimeState::Failed {
+            assert!(!status.restart_blocked);
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "critical notification loss was not handled");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

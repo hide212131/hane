@@ -34,8 +34,10 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex;
 
-use crate::atomic_file::{atomic_write_bytes, read_to_string_if_exists, AtomicWriteError};
+use crate::atomic_file::{AtomicWriteError, atomic_write_bytes, read_to_string_if_exists};
 use crate::secrets::{CredentialRef, CredentialStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,9 @@ pub struct CredentialJournal {
     path: PathBuf,
 }
 
+#[cfg(test)]
+static FAIL_NEXT_UPDATE_MARK_FOR: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 impl CredentialJournal {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         CredentialJournal { path: path.into() }
@@ -90,16 +95,15 @@ impl CredentialJournal {
 
     fn read(&self) -> io::Result<JournalFile> {
         match read_to_string_if_exists(&self.path)? {
-            Some(contents) => {
-                serde_json::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
+            Some(contents) => serde_json::from_str(&contents)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
             None => Ok(JournalFile::default()),
         }
     }
 
     fn write(&self, file: &JournalFile) -> io::Result<()> {
-        let bytes =
-            serde_json::to_vec_pretty(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let bytes = serde_json::to_vec_pretty(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Unlike `AiSettingsStore::write_while_locked`, no caller here reacts
         // to a write failure by deleting a resource the new content might
         // already reference (`recover`'s decisions are always re-derived
@@ -132,7 +136,10 @@ impl CredentialJournal {
     /// (or, for a `delete`, the operation whose `old_credential_ref` matches
     /// and has no `new_credential_ref`) as `SettingsSwapped` once the
     /// non-secret `AiSettings` replace durably landed.
-    fn mark_settings_swapped_matching(&self, matches: impl Fn(&CredentialOperation) -> bool) -> io::Result<()> {
+    fn mark_settings_swapped_matching(
+        &self,
+        matches: impl Fn(&CredentialOperation) -> bool,
+    ) -> io::Result<()> {
         let mut file = self.read()?;
         for op in &mut file.operations {
             if op.state == JournalOperationState::PendingNew && matches(op) {
@@ -142,15 +149,31 @@ impl CredentialJournal {
         self.write(&file)
     }
 
-    pub fn mark_update_settings_swapped(&self, new_credential_ref: &CredentialRef) -> io::Result<()> {
+    pub fn mark_update_settings_swapped(
+        &self,
+        new_credential_ref: &CredentialRef,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut targets = FAIL_NEXT_UPDATE_MARK_FOR.lock().unwrap();
+            if let Some(index) = targets.iter().position(|path| path == &self.path) {
+                targets.remove(index);
+                return Err(io::Error::other("injected journal update stage failure"));
+            }
+        }
         self.mark_settings_swapped_matching(|op| {
-            op.kind == JournalOperationKind::Update && op.new_credential_ref.as_ref() == Some(new_credential_ref)
+            op.kind == JournalOperationKind::Update
+                && op.new_credential_ref.as_ref() == Some(new_credential_ref)
         })
     }
 
-    pub fn mark_delete_settings_swapped(&self, old_credential_ref: &CredentialRef) -> io::Result<()> {
+    pub fn mark_delete_settings_swapped(
+        &self,
+        old_credential_ref: &CredentialRef,
+    ) -> io::Result<()> {
         self.mark_settings_swapped_matching(|op| {
-            op.kind == JournalOperationKind::Delete && op.old_credential_ref.as_ref() == Some(old_credential_ref)
+            op.kind == JournalOperationKind::Delete
+                && op.old_credential_ref.as_ref() == Some(old_credential_ref)
         })
     }
 
@@ -162,10 +185,20 @@ impl CredentialJournal {
         old_credential_ref: Option<&CredentialRef>,
     ) -> io::Result<()> {
         let mut file = self.read()?;
-        file.operations
-            .retain(|op| !(op.new_credential_ref.as_ref() == new_credential_ref && op.old_credential_ref.as_ref() == old_credential_ref));
+        file.operations.retain(|op| {
+            !(op.new_credential_ref.as_ref() == new_credential_ref
+                && op.old_credential_ref.as_ref() == old_credential_ref)
+        });
         self.write(&file)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_update_settings_swapped_for(journal: &CredentialJournal) {
+    FAIL_NEXT_UPDATE_MARK_FOR
+        .lock()
+        .unwrap()
+        .push(journal.path.clone());
 }
 
 #[derive(Debug)]
@@ -242,7 +275,11 @@ pub fn recover(
                 if current_credential_ref == op.new_credential_ref.as_ref() {
                     // The new side won: retry deleting the now-unreferenced
                     // old credential (idempotent if already gone).
-                    if delete_and_complete(op.old_credential_ref.as_ref(), op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())? {
+                    if delete_and_complete(
+                        op.old_credential_ref.as_ref(),
+                        op.new_credential_ref.as_ref(),
+                        op.old_credential_ref.as_ref(),
+                    )? {
                         completed += 1;
                     } else {
                         deletion_failed += 1;
@@ -251,7 +288,11 @@ pub fn recover(
                     // The old side is still active: the settings swap never
                     // landed. Clean up the unreferenced new credential
                     // instead of leaking it.
-                    if delete_and_complete(op.new_credential_ref.as_ref(), op.new_credential_ref.as_ref(), op.old_credential_ref.as_ref())? {
+                    if delete_and_complete(
+                        op.new_credential_ref.as_ref(),
+                        op.new_credential_ref.as_ref(),
+                        op.old_credential_ref.as_ref(),
+                    )? {
                         completed += 1;
                     } else {
                         deletion_failed += 1;
@@ -269,7 +310,11 @@ pub fn recover(
                     // durably landed. Ask the caller to retry that specific
                     // write; only proceed to cleanup once it confirms.
                     if on_pending_settings_swap(&op)? {
-                        if delete_and_complete(op.old_credential_ref.as_ref(), None, op.old_credential_ref.as_ref())? {
+                        if delete_and_complete(
+                            op.old_credential_ref.as_ref(),
+                            None,
+                            op.old_credential_ref.as_ref(),
+                        )? {
                             completed += 1;
                         } else {
                             deletion_failed += 1;
@@ -280,7 +325,11 @@ pub fn recover(
                 } else if current_credential_ref.is_none() {
                     // credential_ref already cleared: retry deleting the
                     // now-unreferenced secret.
-                    if delete_and_complete(op.old_credential_ref.as_ref(), None, op.old_credential_ref.as_ref())? {
+                    if delete_and_complete(
+                        op.old_credential_ref.as_ref(),
+                        None,
+                        op.old_credential_ref.as_ref(),
+                    )? {
                         completed += 1;
                     } else {
                         deletion_failed += 1;
@@ -295,7 +344,12 @@ pub fn recover(
         }
     }
 
-    Ok(RecoveryOutcome { completed, left_for_diagnosis, deletion_failed, pending_settings_swap })
+    Ok(RecoveryOutcome {
+        completed,
+        left_for_diagnosis,
+        deletion_failed,
+        pending_settings_swap,
+    })
 }
 
 #[cfg(test)]
@@ -307,7 +361,10 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("hane-ai-journal-test-{}-{name}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-journal-test-{}-{name}-{n}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         CredentialJournal::new(dir.join("credential-journal.json"))
     }
@@ -338,8 +395,14 @@ mod tests {
         // the bytes actually written to disk so a future field addition
         // that accidentally serializes a secret is caught here.
         let on_disk = std::fs::read_to_string(&journal.path).unwrap();
-        assert!(!on_disk.to_ascii_lowercase().contains("sk-"), "journal file must never contain an API key: {on_disk}");
-        assert!(!on_disk.to_ascii_lowercase().contains("authorization"), "journal file must never contain an Authorization value: {on_disk}");
+        assert!(
+            !on_disk.to_ascii_lowercase().contains("sk-"),
+            "journal file must never contain an API key: {on_disk}"
+        );
+        assert!(
+            !on_disk.to_ascii_lowercase().contains("authorization"),
+            "journal file must never contain an Authorization value: {on_disk}"
+        );
     }
 
     #[test]
@@ -389,8 +452,14 @@ mod tests {
         assert_eq!(outcome.completed, 1);
         assert_eq!(outcome.left_for_diagnosis, 0);
         assert!(journal.is_empty().unwrap());
-        assert!(store.get(&old_ref).unwrap().is_none(), "old credential must be cleaned up");
-        assert!(store.get(&new_ref).unwrap().is_some(), "new credential must be kept");
+        assert!(
+            store.get(&old_ref).unwrap().is_none(),
+            "old credential must be cleaned up"
+        );
+        assert!(
+            store.get(&new_ref).unwrap().is_some(),
+            "new credential must be kept"
+        );
     }
 
     #[test]
@@ -417,8 +486,14 @@ mod tests {
 
         assert_eq!(outcome.completed, 1);
         assert!(journal.is_empty().unwrap());
-        assert!(store.get(&new_ref).unwrap().is_none(), "unreferenced new credential must be cleaned up");
-        assert!(store.get(&old_ref).unwrap().is_some(), "old credential must be kept");
+        assert!(
+            store.get(&new_ref).unwrap().is_none(),
+            "unreferenced new credential must be cleaned up"
+        );
+        assert!(
+            store.get(&old_ref).unwrap().is_some(),
+            "old credential must be kept"
+        );
     }
 
     #[test]
@@ -442,7 +517,10 @@ mod tests {
 
         assert_eq!(outcome.completed, 0);
         assert_eq!(outcome.left_for_diagnosis, 1);
-        assert!(!journal.is_empty().unwrap(), "an unresolvable entry must not be silently dropped");
+        assert!(
+            !journal.is_empty().unwrap(),
+            "an unresolvable entry must not be silently dropped"
+        );
     }
 
     #[test]
@@ -514,7 +592,10 @@ mod tests {
         assert_eq!(outcome.completed, 0);
         assert_eq!(outcome.pending_settings_swap, 1);
         assert!(!journal.is_empty().unwrap());
-        assert!(store.get(&old_ref).unwrap().is_some(), "credential must not be deleted before the replace is confirmed");
+        assert!(
+            store.get(&old_ref).unwrap().is_some(),
+            "credential must not be deleted before the replace is confirmed"
+        );
     }
 
     /// A [`CredentialStore`] that always fails `delete` (backed by a real
@@ -523,19 +604,32 @@ mod tests {
     struct DeleteAlwaysFailsStore(FakeCredentialStore);
 
     impl CredentialStore for DeleteAlwaysFailsStore {
-        fn set(&self, credential_ref: &CredentialRef, secret: &str) -> Result<(), crate::secrets::CredentialStoreError> {
+        fn set(
+            &self,
+            credential_ref: &CredentialRef,
+            secret: &str,
+        ) -> Result<(), crate::secrets::CredentialStoreError> {
             self.0.set(credential_ref, secret)
         }
-        fn get(&self, credential_ref: &CredentialRef) -> Result<Option<String>, crate::secrets::CredentialStoreError> {
+        fn get(
+            &self,
+            credential_ref: &CredentialRef,
+        ) -> Result<Option<String>, crate::secrets::CredentialStoreError> {
             self.0.get(credential_ref)
         }
-        fn delete(&self, _credential_ref: &CredentialRef) -> Result<(), crate::secrets::CredentialStoreError> {
-            Err(crate::secrets::CredentialStoreError::Backend("simulated delete failure".to_string()))
+        fn delete(
+            &self,
+            _credential_ref: &CredentialRef,
+        ) -> Result<(), crate::secrets::CredentialStoreError> {
+            Err(crate::secrets::CredentialStoreError::Backend(
+                "simulated delete failure".to_string(),
+            ))
         }
     }
 
     #[test]
-    fn recover_update_where_deleting_the_now_unreferenced_credential_fails_leaves_the_entry_pending() {
+    fn recover_update_where_deleting_the_now_unreferenced_credential_fails_leaves_the_entry_pending()
+     {
         let journal = unique_journal("recover_delete_fails_fail_closed");
         let store = DeleteAlwaysFailsStore(FakeCredentialStore::new());
         let new_ref = CredentialRef::generate();

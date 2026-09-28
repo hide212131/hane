@@ -100,6 +100,10 @@ fn main() {
 
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
+    let critical_notification_count: usize = env::var("FAKE_SERVER_CRITICAL_NOTIFICATION_COUNT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
     let echo_received_file = env::var("FAKE_SERVER_ECHO_RECEIVED_FILE").ok();
     let timeout_once_marker = env::var("FAKE_SERVER_TIMEOUT_ONCE_MARKER").ok();
@@ -122,10 +126,17 @@ fn main() {
             None => true,
         };
     let mut pending_initialize_id: Option<serde_json::Value> = None;
+    let mut account_signed_in = false;
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
-        .and_then(|marker_path| std::fs::OpenOptions::new().create(true).append(true).open(marker_path).ok())
+        .and_then(|marker_path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(marker_path)
+                .ok()
+        })
     {
         let _ = writeln!(file, "{}", std::process::id());
     }
@@ -170,7 +181,10 @@ fn main() {
         match (id, method) {
             (Some(id), Some(method)) if method == "initialize" => {
                 if let Some(path) = &record_init_file {
-                    let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     append_record(path, &format!("INIT_PARAMS:{params}"));
                 }
                 if mode == "never_respond" {
@@ -188,8 +202,7 @@ fn main() {
                     break;
                 }
                 if emit_server_request {
-                    let request =
-                        serde_json::json!({"id": "srv-1", "method": "test/serverRequest", "params": {}});
+                    let request = serde_json::json!({"id": "srv-1", "method": "test/serverRequest", "params": {}});
                     if writeln!(stdout, "{request}").is_err() || stdout.flush().is_err() {
                         break;
                     }
@@ -202,12 +215,14 @@ fn main() {
                     // to actually observe `Ready` first, instead of racing
                     // that confirmation against a close that happens right
                     // after this reply is written.
-                    thread::spawn(move || loop {
-                        if std::path::Path::new(&path).exists() {
-                            close_stdout();
-                            break;
+                    thread::spawn(move || {
+                        loop {
+                            if std::path::Path::new(&path).exists() {
+                                close_stdout();
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
                         }
-                        thread::sleep(Duration::from_millis(10));
                     });
                 }
             }
@@ -221,8 +236,81 @@ fn main() {
                     }
                     continue;
                 }
-                let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = value
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let response = serde_json::json!({"id": id, "result": params});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/read" => {
+                let account = if account_signed_in {
+                    serde_json::json!({"type":"chatgpt", "email":"fake-user@example.invalid", "planType":"plus"})
+                } else {
+                    serde_json::Value::Null
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"account": account, "requiresOpenaiAuth": !account_signed_in}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/login/start" => {
+                let login_id = "fake-login-1";
+                account_signed_in = true;
+                // Deliberately send completion before the start response so
+                // service integration tests cover the notification/ACK race.
+                let notification = serde_json::json!({
+                    "method":"account/login/completed",
+                    "params":{"loginId":login_id, "success":true, "error":null}
+                });
+                if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "type":"chatgpt",
+                        "loginId":login_id,
+                        "authUrl":"https://auth.openai.com/oauth/authorize?state=fake"
+                    }
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/login/cancel" => {
+                let response = serde_json::json!({"id":id, "result":{"status":"notFound"}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/logout" => {
+                account_signed_in = false;
+                let response = serde_json::json!({"id":id, "result":{}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "model/list" => {
+                let response = serde_json::json!({
+                    "id":id,
+                    "result": {
+                        "data":[{
+                            "id":"catalog-internal-1",
+                            "model":"gpt-fake-text",
+                            "displayName":"Fake Text Model",
+                            "hidden":false,
+                            "inputModalities":["text"],
+                            "isDefault":true
+                        }],
+                        "nextCursor":null
+                    }
+                });
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
                 }
@@ -239,6 +327,15 @@ fn main() {
             (None, Some(method)) if method == "initialized" => {
                 if let Some(path) = &record_init_file {
                     append_record(path, "INITIALIZED");
+                }
+                for n in 0..critical_notification_count {
+                    let notification = serde_json::json!({
+                        "method": "turn/completed",
+                        "params": {"testSequence": n}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
                 }
             }
             _ => {
@@ -288,7 +385,11 @@ fn close_stdout() {
 }
 
 fn append_record(path: &str, line: &str) {
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "{line}");
     }
 }

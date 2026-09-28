@@ -51,6 +51,9 @@ fn fake_server_config(name: &str) -> (RuntimeConfig, PathBuf) {
     config.stop_grace_timeout = Duration::from_millis(500);
     config.stop_force_timeout = Duration::from_secs(5);
     config.codex_home = Some(dir.join("codex-home"));
+    config.working_directory = Some(dir.join("working-directory"));
+    std::fs::create_dir_all(config.codex_home.as_ref().unwrap()).unwrap();
+    std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
     (config, dir)
 }
 
@@ -1070,6 +1073,7 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
 
     let mut config = RuntimeConfig::new(PathBuf::from(binary), dir.join("runtime.lock"));
     config.codex_home = Some(codex_home);
+    config.working_directory = Some(probe_workspace.clone());
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
     // `HANE_TEST_CODEX_APP_SERVER_BIN` names the `codex` CLI, not the
@@ -1223,6 +1227,7 @@ fn observed_turn_against_mock_response(binary: &str, dir_name: &str, mock_respon
 
     let mut config = RuntimeConfig::new(PathBuf::from(binary), dir.join("runtime.lock"));
     config.codex_home = Some(codex_home);
+    config.working_directory = Some(probe_workspace.clone());
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
     // See the matching comment in
