@@ -35,6 +35,9 @@ jobs:
       - name: Test file-tab focused GUI procedure
         run: python3 scripts/tests/test_hosted_file_tabs_gui.py
 
+      - name: Test scroll-inertia focused GUI procedure
+        run: python3 scripts/tests/test_hosted_scroll_inertia_gui.py
+
       - name: Test AADW Jev contract
         if: ${{ hashFiles('scripts/tests/test_aadw_jev_contract.py') != '' }}
         run: python3 scripts/tests/test_aadw_jev_contract.py

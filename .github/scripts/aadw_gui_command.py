@@ -24,6 +24,7 @@ NORMAL_LIST_COMMAND_RE = re.compile(r"/gui-validate[ \t]+normal-list[ \t]+(head|
 CODE_BLOCK_COMMAND_RE = re.compile(r"/gui-validate[ \t]+code-block[ \t]+(head|merge)")
 SIDEBAR_CHROME_COMMAND_RE = re.compile(r"/gui-validate[ \t]+sidebar-chrome[ \t]+(head|merge)")
 FILE_TABS_COMMAND_RE = re.compile(r"/gui-validate[ \t]+file-tabs[ \t]+(head|merge)")
+SCROLL_INERTIA_COMMAND_RE = re.compile(r"/gui-validate[ \t]+scroll-inertia[ \t]+(head|merge)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 TRUSTED_PERMISSIONS = {"write", "maintain", "admin"}
 RUN_NAME_PREFIX = "AADW GUI"
@@ -55,6 +56,10 @@ TRUSTED_ROUTES = {
     "file-tabs": {
         "workflow_file": "aadw-gui-validation.yml",
         "procedure_path": "scripts/hosted_file_tabs_gui.py",
+    },
+    "scroll-inertia": {
+        "workflow_file": "aadw-gui-validation.yml",
+        "procedure_path": "scripts/hosted_scroll_inertia_gui.py",
     },
 }
 
@@ -111,9 +116,14 @@ def parse_route(body: str) -> dict[str, str] | None:
                     else:
                         file_tabs = FILE_TABS_COMMAND_RE.fullmatch(normalized)
                         if not file_tabs:
-                            return None
-                        validation_kind = "file-tabs"
-                        execution_context = file_tabs.group(1)
+                            scroll_inertia = SCROLL_INERTIA_COMMAND_RE.fullmatch(normalized)
+                            if not scroll_inertia:
+                                return None
+                            validation_kind = "scroll-inertia"
+                            execution_context = scroll_inertia.group(1)
+                        else:
+                            validation_kind = "file-tabs"
+                            execution_context = file_tabs.group(1)
 
     route = TRUSTED_ROUTES[validation_kind]
     return {
