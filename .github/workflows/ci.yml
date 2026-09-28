@@ -88,7 +88,7 @@ jobs:
           workspaces: ". -> target"
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
       - name: Test macOS fallback glyph rasterization
         run: cargo test --manifest-path vendor/gpui-pre-macos/Cargo.toml --features runtime_shaders,font-kit,test-support --lib hane_oblique
@@ -125,7 +125,7 @@ jobs:
           workspaces: ". -> target"
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
