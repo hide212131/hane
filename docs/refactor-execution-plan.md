@@ -401,20 +401,23 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 
 `crates/ui/src/view.rs` の該当 `impl EditorView` ブロックは、移動後に `text_input_render_state` の直後へ `set_text_input_bounds`、その直後へ `pub fn new` が続く形になった。両ファイルとも移動対象36シンボルが一度だけ定義され、`view.rs` 側に旧定義や委譲wrapperが残っていないことをシンボル名の再検索で確認した。body比較は、移動元の原文をそのまま新moduleへ転記し、rustfmtや条件式の書き換えを加えない方法で行った。入力先の優先順、IME、pending guard、path検査、ticket予約、二段spawn、`.detach()`、通知、保存再開とH1同期を含む既存の処理順はコード上変更していない。
 
-**検証の実施状況**
+**検証結果**
 
-current implementation head `a266285c6da4f139899fcf751ee7d80847b902fd` で、method-level比較は36/36の宣言・signature・直前のattributes/comments・body一致（仕様の2件だけvisibilityを正規化）、new module内36定義・親の旧定義0件・仕様順・pub(crate)28/pub(super)2/private6、共有parent methodsの維持、既存 `view.rs` test moduleのbyte-identicalを確認した。`git diff --check bbfc1d3e35f74826ea4f55d6fd36782802b021ea..a266285c6da4f139899fcf751ee7d80847b902fd` も成功した。
+2026-09-28、PR head `ac3d8750eba6ed18b0b464a88aebae04df623a86`（実装コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` と、その後の実行計画のみの更新）を対象にmacOS arm64上で実行した。実行toolchainは `rustc 1.98.1 (48a229cea 2026-09-01)` / `cargo 1.98.1 (797e8a9bc 2026-08-05)`。PATH上のHomebrew cargoは1.93.1だったため、インストール済みtoolchainを `~/.cargo/bin/rustup run 1.98.1` で明示した。各コマンドの終了コードは次のとおり。
 
-Claude workerはシェル・git・テスト実行・pushを行わない契約のため、cargo検証はこの時点で未実施である。current-head CIとCodeRabbit review、必要な場合のGUI Validatorは次工程で確認する。
+- `cargo test -p hane-ui --all-features --locked -- --list` — 終了コード0、213件を列挙（このコマンドは実行ではなく一覧表示）。
+- `cargo test -p hane-ui --all-features --locked rename` — 終了コード0、22 passed / 0 failed。
+- `cargo test -p hane-ui --all-features --locked sidebar_file_filter` — 終了コード0、2 passed / 0 failed。
+- `cargo test --workspace --locked` — 終了コード0、38 test-result groupsで合計776 passed / 0 failed / 0 ignored。
+- `cargo test --workspace --all-features --locked` — 終了コード0、38 test-result groupsで合計776 passed / 0 failed / 0 ignored。
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — 終了コード0。`block v0.1.6` の将来のRustで拒否される可能性に関するCargo future-incompat warningは出たが、clippy diagnosticsや失敗はない。
+- `git diff --check origin/main...HEAD` および作業treeに対する `git diff --check` — どちらも終了コード0。
 
-- `cargo test -p hane-ui --all-features --locked -- --list` / `rename` / `sidebar_file_filter`
-- `cargo test --workspace --locked` / `cargo test --workspace --all-features --locked`
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- `git diff --check`
-- current-head macOS/Windows CI
-- CodeRabbitによる通常レビュー、GUI検証要否の判断
+GitHub current-head CI run [36421117864](https://github.com/hide212131/hane/actions/runs/36421117864) は、同じPR head `ac3d8750eba6ed18b0b464a88aebae04df623a86` でmacOS / Windowsとも成功した。両OSのworkspace testsとclippy、macOS fallback glyph rasterization、macOS input source reactivationのcheckが成功。mainはbase `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` のまま。
 
-上記コマンドの実行結果・終了コード・実行環境・SHAは、実施後にこの節へ追記する。未実施のまま成功や完了とは記載しない。CodeRabbitの設計PRレビューにあるWindows renameの懸念は、設計PRが新たに導入する回帰ではない独立事項として扱う。current-head CIで意味変更が検出された場合は、本移動から分離して再判断する。
+GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。CodeRabbitによる最終PR headのfull reviewは未実施で、次に実施する。
+
+本節への今回の追記は文書のみであり、検証した製品コードから差分はない。追記後のcurrent-head CIとCodeRabbit reviewの結果はPR最終判断時に記録する。CodeRabbitの設計PRレビューにあるWindows renameの懸念は独立事項であり、本移動から生じた回帰として扱わない。
 
 **残件**
 
