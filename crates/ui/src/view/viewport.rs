@@ -226,10 +226,29 @@ impl EditorView {
     /// telescope back to that exact total regardless of where the sequence
     /// is split.
     ///
-    /// Each new event replaces rather than accumulates the velocity, so
-    /// scrolling the other way cancels the previous coast immediately
-    /// instead of fighting it.
+    /// A new event in the same direction as a still-live coast adds its
+    /// velocity to what remains of the old one instead of replacing it
+    /// (issue #389), so the previous event's not-yet-moved distance keeps
+    /// contributing rather than being dropped. This is exact, not just
+    /// approximate: the same telescoping identity that keeps one event's
+    /// combined movement equal to its own delta also holds when the velocity
+    /// fed into a later step already carries an earlier step's remaining
+    /// velocity, so a run of same-direction events still settles at the sum
+    /// of their deltas. A new event in the opposite direction, or arriving
+    /// while the previous coast has gone stale (`scroll_y` moved out from
+    /// under it since its last step, the same condition `step_scroll_inertia`
+    /// checks via `ScrollInertia::last_applied`), replaces the velocity
+    /// outright instead, so it cancels immediately rather than fighting or
+    /// inheriting a coast it should not be combined with.
     pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
+        let velocity = match self.scroll_inertia {
+            Some(inertia)
+                if self.scroll_y == inertia.last_applied && inertia.velocity * velocity > 0.0 =>
+            {
+                inertia.velocity + velocity
+            }
+            _ => velocity,
+        };
         match eased_scroll_inertia_step(velocity, SCROLL_INERTIA_MIN_FRAME_TIME) {
             Some((distance, next_velocity)) => {
                 self.scroll_y = clamp_scroll_y(

@@ -12939,6 +12939,84 @@ mod tests {
     }
 
     #[gpui::test]
+    fn repeated_same_direction_wheel_events_accumulate_the_unmoved_inertia_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        // Move well away from the document's start first (and, with 600
+        // lines, nowhere near its end either), then let that priming
+        // scroll's own inertia fully settle before the burst this test
+        // actually measures.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&event, window, cx);
+            }
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.step_scroll_inertia(window);
+            }
+        });
+        let (before, max_scroll_y) = view.read_with(cx, |view, _| {
+            (
+                view.scroll_y,
+                (view.scrollable_content_height() - view.viewport_height).max(0.0),
+            )
+        });
+        assert!(
+            before > 0.0 && before < max_scroll_y - 200.0,
+            "before={before}, max_scroll_y={max_scroll_y}"
+        );
+
+        // Two Lines events back to back, before either one's inertia has run
+        // any animation frame, so the second sees the first event's coast
+        // still live (issue #389).
+        let expected_total_delta = view.update_in(cx, |view, window, cx| {
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            view.on_scroll(&event, window, cx);
+            expected_delta * 2.0
+        });
+
+        let settled = view.update_in(cx, |view, window, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.step_scroll_inertia(window);
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            (total_moved - expected_total_delta).abs() < 1.0,
+            "settled displacement must reflect the sum of the burst's signed deltas, not drop \
+             an earlier event's unmoved coast distance: total_moved={total_moved}, \
+             expected_total_delta={expected_total_delta}"
+        );
+    }
+
+    #[gpui::test]
     fn reversing_wheel_direction_replaces_rather_than_accumulates_inertia_velocity(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12989,6 +13067,63 @@ mod tests {
         // Replacing, not accumulating, means the result exactly matches a
         // fresh event fired in the new direction alone.
         assert_eq!(reversed_velocity, -forward_velocity);
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_accumulated_inertia_still_replaces_the_velocity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        // Two same-direction events back to back accumulate inertia velocity
+        // instead of one replacing the other's remaining coast (issue #389).
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..2 {
+                view.on_scroll(
+                    &ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                        modifiers: gpui::Modifiers::none(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+        let accumulated_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("accumulated forward scroll must keep inertia armed")
+            .velocity;
+        assert!(accumulated_velocity > 0.0, "{accumulated_velocity}");
+
+        // Reversing direction must still cancel the accumulated coast
+        // outright rather than fighting or partially carrying it.
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        let reversed_velocity = view
+            .read_with(cx, |view, _| view.scroll_inertia)
+            .expect("the reversed scroll must still arm inertia")
+            .velocity;
+        assert!(
+            reversed_velocity < 0.0,
+            "reversing must not drag the accumulated forward velocity along: {reversed_velocity}"
+        );
     }
 
     #[gpui::test]
