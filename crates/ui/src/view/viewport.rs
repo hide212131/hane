@@ -251,8 +251,14 @@ impl EditorView {
     /// leaving the rest to animation frames that may be delayed (issue #389:
     /// the old direction's coast could otherwise still read as unchanged for
     /// several frames after a hard reversal). A brand new coast, with no
-    /// prior `ScrollInertia` to measure a gap against, still uses the nominal
-    /// `SCROLL_INERTIA_MIN_FRAME_TIME` for its own first step.
+    /// prior `ScrollInertia` to measure a gap against, uses the larger
+    /// `SCROLL_INERTIA_COLD_START_FRAME_TIME` instead of
+    /// `SCROLL_INERTIA_MIN_FRAME_TIME` for its own first step: unlike a
+    /// reversal, which arrives while a `request_animation_frame` loop is
+    /// already running (so the next real frame is imminent), this coast has
+    /// no such loop in flight yet, and understating that first real paint's
+    /// latency left it reading as unchanged on the actual first frame drawn
+    /// (issue #389's first-response regression).
     pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
         let (velocity, elapsed) = match self.scroll_inertia {
             Some(inertia) => {
@@ -266,7 +272,7 @@ impl EditorView {
                 };
                 (velocity, elapsed)
             }
-            None => (velocity, SCROLL_INERTIA_MIN_FRAME_TIME),
+            None => (velocity, SCROLL_INERTIA_COLD_START_FRAME_TIME),
         };
         match eased_scroll_inertia_step(velocity, elapsed) {
             Some((distance, next_velocity)) => {

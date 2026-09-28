@@ -152,7 +152,22 @@ const WHEEL_ZOOM_SETTLE_EPSILON: f32 = 0.001;
 const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(45);
 /// See `WHEEL_ZOOM_MIN_FRAME_TIME`: the same deterministic-at-120Hz clamp,
 /// kept separate so it stays scoped to scroll inertia's own animation frames.
+/// This floor only models the gap between two frames of an *already-running*
+/// `request_animation_frame` loop; see `SCROLL_INERTIA_COLD_START_FRAME_TIME`
+/// for the different, larger gap a coast armed from an idle view faces before
+/// its very first paint.
 const SCROLL_INERTIA_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
+/// The elapsed time `queue_scroll_inertia` assumes for a brand-new coast's own
+/// synchronous first step (issue #389), as opposed to a step that folds a
+/// still-live coast's real, measured gap (see `queue_scroll_inertia`'s own
+/// doc comment). A coast armed from an idle view has no
+/// `request_animation_frame` already in flight the way a still-running coast
+/// does, so `SCROLL_INERTIA_MIN_FRAME_TIME`'s 120Hz-optimistic
+/// already-animating gap understates how long `cx.notify()` actually takes to
+/// reach that first real paint. Using it anyway left the first frame actually
+/// painted after a plain Lines scroll still reading as unchanged. This models
+/// a conservative single 60Hz frame instead.
+const SCROLL_INERTIA_COLD_START_FRAME_TIME: Duration = Duration::from_micros(16_667);
 /// Stop scheduling scroll-inertia frames once the remaining coast distance
 /// would move the content by less than a device pixel.
 const SCROLL_INERTIA_SETTLE_EPSILON: f32 = 1.0;
@@ -12197,6 +12212,60 @@ mod tests {
     }
 
     #[gpui::test]
+    fn plain_wheel_lines_scroll_from_an_idle_view_uses_the_cold_start_frame_time(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a coast armed from an idle view (no coast already
+        // running `request_animation_frame`) previously sized its own
+        // synchronous first step off `SCROLL_INERTIA_MIN_FRAME_TIME`, the
+        // floor meant for the gap between two frames of an *already-running*
+        // animation loop. That understated how long the state actually takes
+        // to reach the first real paint and left that first frame reading as
+        // unchanged on screen. `queue_scroll_inertia` must instead use the
+        // larger `SCROLL_INERTIA_COLD_START_FRAME_TIME` for a brand-new
+        // coast's own first step.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, raw_velocity, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+                event.delta.pixel_delta(px(view.line_height())).y,
+            ));
+            view.on_scroll(&event, window, cx);
+            (before, raw_velocity, view.scroll_y)
+        });
+
+        let moved = immediate - before;
+        let (min_frame_time_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        let (cold_start_distance, _) =
+            eased_scroll_inertia_step(raw_velocity, SCROLL_INERTIA_COLD_START_FRAME_TIME)
+                .expect("a full-size delta must still be animating, not settled");
+        assert!(
+            (moved - cold_start_distance).abs() < 1e-3,
+            "moved={moved}, cold_start_distance={cold_start_distance}"
+        );
+        assert!(
+            moved > min_frame_time_distance,
+            "a brand-new coast's own first step must move further than the smaller \
+             already-animating frame gap would, or the first painted frame regresses to reading \
+             as unchanged: moved={moved}, min_frame_time_distance={min_frame_time_distance}"
+        );
+    }
+
+    #[gpui::test]
     fn plain_wheel_lines_scroll_settles_without_doubling_the_input_distance(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12477,6 +12546,16 @@ mod tests {
             .join("\n");
         let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
         let position = point(px(480.0), px(400.0));
+        let line_height = view.read_with(cx, |view, _| view.line_height());
+        let reverse_event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse_raw_velocity = scroll_inertia_velocity_for_lines_delta(-f32::from(
+            reverse_event.delta.pixel_delta(px(line_height)).y,
+        ));
 
         view.update_in(cx, |view, window, cx| {
             view.on_scroll(
@@ -12496,13 +12575,13 @@ mod tests {
             .velocity;
         assert!(forward_velocity > 0.0, "{forward_velocity}");
 
-        // `queue_scroll_inertia`'s immediate step is now sized off the real
-        // time since the coast's own last frame instead of a fixed nominal
-        // duration (issue #389), so pin that gap to "just now" here. That
-        // keeps this test's exact-equality assertion below deterministic
-        // regardless of how long the test harness itself took between the
-        // two `on_scroll` calls, while still exercising the same replace
-        // path a real, promptly-delivered reversal would take.
+        // `queue_scroll_inertia`'s immediate step for a *live, already
+        // in-flight* coast is sized off the real time since that coast's own
+        // last frame (issue #389), so pin that gap to "just now" here. That
+        // keeps this test's assertion below deterministic regardless of how
+        // long the test harness itself took between the two `on_scroll`
+        // calls, while still exercising the same replace path a real,
+        // promptly-delivered reversal would take.
         view.update(cx, |view, _| {
             if let Some(inertia) = view.scroll_inertia.as_mut() {
                 inertia.last_frame = Instant::now();
@@ -12512,25 +12591,25 @@ mod tests {
         // Scrolling the other way must cancel the old coast immediately
         // instead of fighting it.
         view.update_in(cx, |view, window, cx| {
-            view.on_scroll(
-                &ScrollWheelEvent {
-                    position,
-                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
-                    modifiers: gpui::Modifiers::none(),
-                    touch_phase: gpui::TouchPhase::Moved,
-                },
-                window,
-                cx,
-            );
+            view.on_scroll(&reverse_event, window, cx);
         });
         let reversed_velocity = view
             .read_with(cx, |view, _| view.scroll_inertia)
             .expect("the reversed scroll must still arm inertia")
             .velocity;
         assert!(reversed_velocity < 0.0, "{reversed_velocity}");
-        // Replacing, not accumulating, means the result exactly matches a
-        // fresh event fired in the new direction alone.
-        assert_eq!(reversed_velocity, -forward_velocity);
+        // Replacing, not accumulating, means the result depends only on the
+        // reversal's own input velocity and the real (here, near-zero, so
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME`) gap since the old
+        // coast's last touch, not on `forward_velocity`'s already-decayed
+        // remainder. `forward_velocity` itself now uses the larger, distinct
+        // `SCROLL_INERTIA_COLD_START_FRAME_TIME` (see `queue_scroll_inertia`),
+        // so it is deliberately no longer expected to equal
+        // `-reversed_velocity`.
+        let (_, expected_reversed_velocity) =
+            eased_scroll_inertia_step(reverse_raw_velocity, SCROLL_INERTIA_MIN_FRAME_TIME)
+                .expect("a full-size reversal delta must still be animating, not settled");
+        assert_eq!(reversed_velocity, expected_reversed_velocity);
     }
 
     #[gpui::test]
