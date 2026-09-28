@@ -68,6 +68,9 @@
 //!   placed in `RuntimeConfig::extra_env` actually reaches this child
 //!   process's own environment end-to-end through `AiRuntime`, without
 //!   requiring a real Codex binary or a real HTTP call.
+//! - Test-only files in the dedicated `CODEX_HOME` can select
+//!   `hold_login` or `complete_on_cancel` and persist the fake account across
+//!   fake process restarts. They are never read by the shipped runtime.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -98,6 +101,11 @@ fn main() {
         }
     }
 
+    if let Ok(cwd) = env::current_dir() {
+        let observed_home = env::var("CODEX_HOME").unwrap_or_else(|_| "<absent>".to_string());
+        let _ = std::fs::write(cwd.join(".hane-fake-app-server-codex-home"), observed_home);
+    }
+
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
     let critical_notification_count: usize = env::var("FAKE_SERVER_CRITICAL_NOTIFICATION_COUNT")
@@ -126,7 +134,20 @@ fn main() {
             None => true,
         };
     let mut pending_initialize_id: Option<serde_json::Value> = None;
-    let mut account_signed_in = false;
+    let fake_home = env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
+    if let Some(home) = &fake_home {
+        let _ = std::fs::create_dir_all(home);
+    }
+    let fake_scenario = fake_home
+        .as_ref()
+        .and_then(|home| std::fs::read_to_string(home.join(".hane-fake-app-server-scenario")).ok())
+        .unwrap_or_default();
+    let fake_account_state = fake_home
+        .as_ref()
+        .map(|home| home.join(".hane-fake-app-server-signed-in"));
+    let mut account_signed_in = fake_account_state
+        .as_ref()
+        .is_some_and(|path| path.exists());
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
@@ -261,15 +282,22 @@ fn main() {
             }
             (Some(id), Some(method)) if method == "account/login/start" => {
                 let login_id = "fake-login-1";
-                account_signed_in = true;
-                // Deliberately send completion before the start response so
-                // service integration tests cover the notification/ACK race.
-                let notification = serde_json::json!({
-                    "method":"account/login/completed",
-                    "params":{"loginId":login_id, "success":true, "error":null}
-                });
-                if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
-                    break;
+                if fake_scenario.trim() != "hold_login"
+                    && fake_scenario.trim() != "complete_on_cancel"
+                {
+                    account_signed_in = true;
+                    if let Some(path) = &fake_account_state {
+                        let _ = std::fs::write(path, b"signed-in");
+                    }
+                    // Deliberately send completion before the start response
+                    // so integration tests cover the notification/ACK race.
+                    let notification = serde_json::json!({
+                        "method":"account/login/completed",
+                        "params":{"loginId":login_id, "success":true, "error":null}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
                 }
                 let response = serde_json::json!({
                     "id": id,
@@ -284,13 +312,32 @@ fn main() {
                 }
             }
             (Some(id), Some(method)) if method == "account/login/cancel" => {
-                let response = serde_json::json!({"id":id, "result":{"status":"notFound"}});
+                let status = if fake_scenario.trim() == "complete_on_cancel" {
+                    account_signed_in = true;
+                    if let Some(path) = &fake_account_state {
+                        let _ = std::fs::write(path, b"signed-in");
+                    }
+                    let notification = serde_json::json!({
+                        "method":"account/login/completed",
+                        "params":{"loginId":"fake-login-1", "success":true, "error":null}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                    "notFound"
+                } else {
+                    "canceled"
+                };
+                let response = serde_json::json!({"id":id, "result":{"status":status}});
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
                 }
             }
             (Some(id), Some(method)) if method == "account/logout" => {
                 account_signed_in = false;
+                if let Some(path) = &fake_account_state {
+                    let _ = std::fs::remove_file(path);
+                }
                 let response = serde_json::json!({"id":id, "result":{}});
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
