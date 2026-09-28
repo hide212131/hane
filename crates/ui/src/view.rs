@@ -1753,6 +1753,13 @@ impl EditorView {
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
         self.cancel_text_selection_autoscroll();
+        // A coast belongs to the document it started on. Relying on the
+        // `scroll_y` staleness check in `advance_scroll_inertia` alone is not
+        // enough here: the incoming document can restore a `scroll_y` equal
+        // to the outgoing coast's `last_applied`, in which case that check
+        // would mistake the switch for an ordinary unmoved frame and let the
+        // old document's inertia keep coasting into the new one (issue #389).
+        self.scroll_inertia = None;
         // Whatever the sidebar had highlighted before, the document on
         // screen just changed to a specific file or draft, so that is what
         // should be highlighted now instead.
@@ -5468,6 +5475,12 @@ impl EditorView {
             viewport_height: self.viewport_height,
             content_height,
         });
+        // `advance_scroll_inertia` only detects a lost coast by comparing
+        // `scroll_y` against its own `last_applied` snapshot, which misses a
+        // drag that starts before the coast's next step has moved `scroll_y`
+        // away from that value. Clearing it explicitly here stops the coast
+        // from fighting the drag once it does resume (issue #389).
+        self.scroll_inertia = None;
         cx.stop_propagation();
         cx.notify();
     }
@@ -12860,6 +12873,86 @@ mod tests {
             "the stale inertia must be cancelled once it observes the position moved out from \
              under it"
         );
+    }
+
+    #[gpui::test]
+    fn starting_a_scrollbar_drag_cancels_a_live_inertia_coast_that_has_not_moved_yet(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A drag can start on the very frame a coast's next step has not run
+        // yet, so `scroll_y` still equals the coast's own `last_applied` and
+        // the floating-point staleness check `advance_scroll_inertia` relies
+        // on cannot by itself tell the drag apart from an ordinary unmoved
+        // frame (issue #389). `begin_editor_scrollbar_drag` must cancel the
+        // coast explicitly instead of depending on that check.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.begin_editor_scrollbar_drag(
+                &MouseDownEvent {
+                    position: point(px(950.0), px(400.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                },
+                600.0,
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "beginning a scrollbar drag must cancel a live coast even when scroll_y has not \
+             moved away from the coast's last_applied yet"
+        );
+    }
+
+    #[gpui::test]
+    fn replacing_the_document_cancels_a_live_inertia_coast_at_the_same_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The incoming document can restore a `scroll_y` equal to the
+        // outgoing coast's `last_applied` (e.g. both start at the top), in
+        // which case the floating-point staleness check `advance_scroll_inertia`
+        // relies on cannot tell the switch apart from an ordinary unmoved
+        // frame (issue #389). `on_document_replaced` must cancel the coast
+        // explicitly instead of depending on that check.
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.scroll_y = 0.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 0.0,
+            });
+
+            view.on_document_replaced();
+
+            assert!(
+                view.scroll_inertia.is_none(),
+                "replacing the document must cancel a live coast even when the new document's \
+                 scroll_y matches the coast's last_applied"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the cancelled coast must not resume advancing after the document switch"
+            );
+        });
     }
 
     #[gpui::test]
