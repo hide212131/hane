@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/2"
+PROCEDURE_VERSION = "hosted-scroll-inertia/3"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
     "逆方向入力への切替、文書先頭/末尾のクランプ、Pixels の直接追従と安定を実画面で確認する。"
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
+    "方向反転の2入力は対象プロセスへ直接配送し、画面応答の遅延を測る。"
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -104,7 +105,8 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
 
 
 def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frames: list[dict],
-                      initial_to_reverse_event_ms: Optional[float]) -> dict:
+                      initial_to_reverse_event_ms: Optional[float],
+                      event_route: Optional[str] = None) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
     valid = (baseline is not None and pre_reverse is not None
@@ -114,14 +116,15 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
         return step("direction_reversal", "blocked", "反転前後の可視行番号を十分に読み取れない",
                     baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
                     initial_to_reverse_event_ms=initial_to_reverse_event_ms,
-                    elapsed_ms=times, frames=frames)
+                    event_route=event_route, elapsed_ms=times, frames=frames)
     if initial_to_reverse_event_ms > LINES_INERTIA_WINDOW_MS:
         return step(
             "direction_reversal", "blocked",
             "初回Linesイベントから反対方向イベントまでが慣性の持続時間を超え、方向反転を判定できない",
             baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
             initial_to_reverse_event_ms=initial_to_reverse_event_ms,
-            inertia_window_ms=LINES_INERTIA_WINDOW_MS, elapsed_ms=times, frames=frames,
+            inertia_window_ms=LINES_INERTIA_WINDOW_MS, event_route=event_route,
+            elapsed_ms=times, frames=frames,
         )
     old_direction_started = pre_reverse > baseline
     prompt = offsets[0] <= pre_reverse + 1 and times[0] <= 55
@@ -142,7 +145,7 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
         baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
         initial_to_reverse_event_ms=initial_to_reverse_event_ms,
         inertia_window_ms=LINES_INERTIA_WINDOW_MS, elapsed_ms=times,
-        old_direction_started=old_direction_started, prompt=prompt,
+        event_route=event_route, old_direction_started=old_direction_started, prompt=prompt,
         reversed_direction=reversed_direction, no_old_coast=no_old_coast, frames=frames,
     )
 
@@ -216,9 +219,13 @@ def capture_ocr(interaction, helper, path: Path, helper_timeout: float) -> tuple
 
 def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     fields = {}
+    route = None
     for line in output.splitlines():
         name, separator, value = line.partition("=")
         if separator:
+            if name == "reversal_event_route":
+                route = value
+                continue
             try:
                 parsed = float(value)
             except ValueError:
@@ -231,6 +238,8 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     missing = sorted(required - fields.keys())
     if missing:
         raise ValueError(f"reversal helper timing is missing: {', '.join(missing)}")
+    if route != "target_pid":
+        raise ValueError("reversal helper did not target the Hane process")
     if not (fields["initial_event_elapsed_ms"] <= fields["pre_reverse_capture_elapsed_ms"]
             <= fields["reverse_event_elapsed_ms"]):
         raise ValueError("reversal helper event and pre-reversal capture times are out of order")
@@ -238,6 +247,7 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     if any(value < 0 for value in frame_times) or frame_times != sorted(frame_times):
         raise ValueError("reversal helper post-event frame times are invalid")
     return {
+        "event_route": route,
         "initial_to_reverse_event_ms": (
             fields["reverse_event_elapsed_ms"] - fields["initial_event_elapsed_ms"]
         ),
@@ -270,6 +280,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
             return [], None, str(exc)
         pre_reverse = {
             "path": str(pre_path),
+            "event_route": evidence["event_route"],
             "initial_to_reverse_event_ms": evidence["initial_to_reverse_event_ms"],
             "pre_reverse_capture_after_initial_ms": evidence["pre_reverse_capture_after_initial_ms"],
         }
@@ -398,20 +409,22 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                 if pre_frame and pre_frame.get("visible_lines"):
                     reversal_pre = min(pre_frame["visible_lines"])
                 if reversal_baseline_capture["result"] != "pass":
-                    steps.append(step("direction_reversal", "blocked",
-                                      reversal_baseline_capture.get("reason") or "反転基準画面を取得できない"))
+                    reversal_step = step("direction_reversal", "blocked",
+                                         reversal_baseline_capture.get("reason") or "反転基準画面を取得できない")
                 else:
                     reversal_step = (step("direction_reversal", "blocked", error) if error else
                                      evaluate_reversal(
                                          reversal_baseline, reversal_pre, reversal_frames,
                                          pre_frame.get("initial_to_reverse_event_ms") if pre_frame else None,
+                                         event_route=pre_frame.get("event_route") if pre_frame else None,
                                      ))
-                    reversal_step["baseline_visible_lines"] = reversal_baseline_lines
-                    reversal_step["baseline_text"] = reversal_baseline_text
-                    if pre_frame:
-                        reversal_step["pre_reverse_capture_after_initial_ms"] = pre_frame.get(
-                            "pre_reverse_capture_after_initial_ms")
-                    steps.append(reversal_step)
+                if pre_frame:
+                    reversal_step["event_route"] = pre_frame.get("event_route")
+                    reversal_step["pre_reverse_capture_after_initial_ms"] = pre_frame.get(
+                        "pre_reverse_capture_after_initial_ms")
+                reversal_step["baseline_visible_lines"] = reversal_baseline_lines
+                reversal_step["baseline_text"] = reversal_baseline_text
+                steps.append(reversal_step)
 
                 top_frames, _pre, top_error = capture_frames(
                     interaction, gui_validate, env, config, helper, pid, window_id,
