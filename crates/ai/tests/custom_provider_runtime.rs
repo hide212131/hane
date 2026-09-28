@@ -903,6 +903,61 @@ fn fixed_pong_response() -> String {
     )
 }
 
+/// The terminal outcome of waiting for a turn to finish, collected from the
+/// App Server's own `item/completed`/`turn/completed` notifications (per
+/// https://raw.githubusercontent.com/openai/codex/rust-v0.157.1/codex-rs/app-server-protocol/schema/json/v2/TurnCompletedNotification.json
+/// and .../ItemCompletedNotification.json): on Codex App Server 0.157.1,
+/// `turn/completed.turn.itemsView` can be `"notLoaded"` even on success, so
+/// the turn's final response text must be collected from `item/completed`
+/// items with `item.type == "agentMessage"` instead of read directly off
+/// `turn/completed`. Whether the turn actually succeeded or failed must
+/// instead come from `turn/completed.turn.status`/`turn.error`, never from
+/// the mere presence of "pong" text or a notification method name containing
+/// "fail".
+struct ObservedTurn {
+    /// The `turn` object from `turn/completed`, if one was observed before
+    /// the deadline.
+    turn: Option<serde_json::Value>,
+    /// Text accumulated, in order, from every `item/completed` notification
+    /// whose `item.type == "agentMessage"`.
+    agent_message_text: String,
+}
+
+/// Waits up to `timeout` for a `turn/completed` notification on `events_rx`,
+/// accumulating `agentMessage` text from any `item/completed` notifications
+/// observed along the way.
+fn wait_for_turn_completed(events_rx: &mpsc::Receiver<hane_ai::RuntimeEvent>, timeout: Duration) -> ObservedTurn {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut agent_message_text = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ObservedTurn { turn: None, agent_message_text };
+        }
+        let event = match events_rx.recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(_) => return ObservedTurn { turn: None, agent_message_text },
+        };
+        let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
+            continue;
+        };
+        let params = params.unwrap_or(serde_json::Value::Null);
+        match method.as_str() {
+            "item/completed" => {
+                if params["item"]["type"] == serde_json::json!("agentMessage") {
+                    if let Some(text) = params["item"]["text"].as_str() {
+                        agent_message_text.push_str(text);
+                    }
+                }
+            }
+            "turn/completed" => {
+                return ObservedTurn { turn: Some(params["turn"].clone()), agent_message_text };
+            }
+            _ => {}
+        }
+    }
+}
+
 fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<RecordedRequest>>>, response: &str) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -1068,28 +1123,19 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     // against it: `turn/completed` (mirroring the already-established
     // `thread/start`/`turn/start` naming) is delivered asynchronously as a
     // notification, not in `turn/start`'s own response.
-    let turn_completed_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let turn_completed_params = loop {
-        let remaining = turn_completed_deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for a turn/completed notification from the real App Server");
-        let event = events_rx
-            .recv_timeout(remaining)
-            .expect("timed out waiting for a turn/completed notification from the real App Server");
-        let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
-            continue;
-        };
-        assert!(
-            !method.contains("fail"),
-            "received a failure notification instead of turn/completed: {method} {params:?}"
-        );
-        if method == "turn/completed" {
-            break params.unwrap_or(serde_json::Value::Null);
-        }
-    };
-    let turn_completed_text = turn_completed_params.to_string();
+    let observed = wait_for_turn_completed(&events_rx, Duration::from_secs(30));
+    let turn = observed.turn.expect("timed out waiting for a turn/completed notification from the real App Server");
+    assert_eq!(
+        turn["status"],
+        serde_json::json!("completed"),
+        "turn/completed.turn.status should be \"completed\" on success, got: {turn}"
+    );
+    assert!(turn["error"].is_null(), "turn/completed.turn.error should be null on success, got: {turn}");
     assert!(
-        turn_completed_text.contains("pong"),
-        "turn/completed payload should include the mock Responses Provider's fixed \"pong\" reply, got: {turn_completed_text}"
+        observed.agent_message_text.contains("pong"),
+        "the agentMessage text collected from item/completed should include the mock Responses Provider's fixed \
+         \"pong\" reply, got: {:?}",
+        observed.agent_message_text
     );
 
     let _ = runtime.stop();
@@ -1124,26 +1170,39 @@ fn assert_mock_provider_received_the_probe_request(recorded: Option<RecordedRequ
     assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "{context}: request must target exactly the configured model");
 }
 
+/// Asserts that the App Server surfaced the Provider failure as a genuinely
+/// failed turn: a `turn/completed` notification was observed, its
+/// `turn.status` is `"failed"`, and `turn.error` is non-null (per the Turn
+/// schema, `error` is only populated when the Turn's status is failed). This
+/// must never be satisfied merely by the absence of "pong" text or by a
+/// notification method name happening to contain "fail".
+fn assert_turn_failed(observed: &ObservedTurn, context: &str) {
+    let turn = observed.turn.as_ref().unwrap_or_else(|| {
+        panic!("{context}: expected a turn/completed notification reporting the Provider failure, but none was observed")
+    });
+    assert_eq!(
+        turn["status"],
+        serde_json::json!("failed"),
+        "{context}: turn/completed.turn.status should be \"failed\", got: {turn}"
+    );
+    assert!(!turn["error"].is_null(), "{context}: turn/completed.turn.error should be non-null on failure, got: {turn}");
+}
+
 /// Spawns the real App Server (`binary`) against a Custom Provider config
 /// pointed at a mock Responses Provider that always replies with
-/// `mock_response`, runs one `thread/start`/`turn/start`, and reports
-/// whether a `turn/completed` notification carrying the fixed "pong" success
-/// text was observed within a bounded timeout, together with the request (if
-/// any) the mock Responses Provider actually received. Any other outcome --
-/// a `turn/start` RPC error, a `turn/completed`/other notification that does
-/// *not* contain "pong", or timing out without ever observing
-/// `turn/completed` -- is reported as `false` (not success): this crate
-/// cannot assume in advance exactly which of those shapes the bundled App
-/// Server uses to surface a given upstream failure, but "silently reports
-/// success anyway" must never be one of them. Callers must separately check
-/// the returned recorded request: a `false` result must mean the Provider
-/// error was actually surfaced as a failure, not merely that the App Server
-/// never reached the Provider at all.
-fn observed_successful_turn_against_mock_response(
-    binary: &str,
-    dir_name: &str,
-    mock_response: String,
-) -> (bool, Option<RecordedRequest>) {
+/// `mock_response`, runs one `thread/start`/`turn/start`, and waits for the
+/// resulting `turn/completed` notification, together with the request (if
+/// any) the mock Responses Provider actually received. Callers determine
+/// success/failure themselves from `ObservedTurn::turn`'s `status`/`error`
+/// fields (per `wait_for_turn_completed`'s ADR-0032/TurnCompletedNotification
+/// contract) rather than relying on this helper to guess. When `thread/start`
+/// or `turn/start` itself returns a JSON-RPC error before any turn ever
+/// started, `ObservedTurn::turn` is `None`: no `turn/completed` is possible
+/// in that case. Callers must separately check the returned recorded
+/// request: an absent or failed turn must mean the Provider error was
+/// actually surfaced as a failure, not merely that the App Server never
+/// reached the Provider at all.
+fn observed_turn_against_mock_response(binary: &str, dir_name: &str, mock_response: String) -> (ObservedTurn, Option<RecordedRequest>) {
     let (port, recorded, _http_thread) = spawn_mock_responses_provider(mock_response);
     let base_url = format!("http://127.0.0.1:{port}/v1");
 
@@ -1189,16 +1248,17 @@ fn observed_successful_turn_against_mock_response(
         })),
         Duration::from_secs(30),
     );
+    let empty_observed = || ObservedTurn { turn: None, agent_message_text: String::new() };
     let thread_start = match thread_start {
         Ok(v) => v,
         Err(_) => {
             let _ = runtime.stop();
-            return (false, recorded.lock().unwrap().take());
+            return (empty_observed(), recorded.lock().unwrap().take());
         }
     };
     let Some(thread_id) = thread_start["thread"]["id"].as_str().map(str::to_string) else {
         let _ = runtime.stop();
-        return (false, recorded.lock().unwrap().take());
+        return (empty_observed(), recorded.lock().unwrap().take());
     };
 
     let turn_start = runtime.call(
@@ -1211,33 +1271,13 @@ fn observed_successful_turn_against_mock_response(
     );
     if turn_start.is_err() {
         let _ = runtime.stop();
-        return (false, recorded.lock().unwrap().take());
+        return (empty_observed(), recorded.lock().unwrap().take());
     }
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let observed_success = loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break false;
-        }
-        let event = match events_rx.recv_timeout(remaining) {
-            Ok(event) => event,
-            Err(_) => break false,
-        };
-        let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
-            continue;
-        };
-        if method == "turn/completed" {
-            let text = params.unwrap_or(serde_json::Value::Null).to_string();
-            break text.contains("pong");
-        }
-        if method.contains("fail") {
-            break false;
-        }
-    };
+    let observed = wait_for_turn_completed(&events_rx, Duration::from_secs(30));
 
     let _ = runtime.stop();
-    (observed_success, recorded.lock().unwrap().take())
+    (observed, recorded.lock().unwrap().take())
 }
 
 #[test]
@@ -1253,13 +1293,9 @@ fn real_app_server_reports_failure_for_401_unauthorized_from_the_provider() {
         "401 Unauthorized",
         &serde_json::json!({"error": {"message": "invalid api key", "type": "invalid_request_error"}}),
     );
-    let (observed_success, recorded) =
-        observed_successful_turn_against_mock_response(&binary, "real_app_server_401", response);
+    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_401", response);
     assert_mock_provider_received_the_probe_request(recorded, "401 Unauthorized case");
-    assert!(
-        !observed_success,
-        "a 401 Unauthorized response from the Responses Provider must never be reported as a successful turn/completed"
-    );
+    assert_turn_failed(&observed, "401 Unauthorized case");
 }
 
 #[test]
@@ -1275,13 +1311,9 @@ fn real_app_server_reports_failure_for_403_forbidden_from_the_provider() {
         "403 Forbidden",
         &serde_json::json!({"error": {"message": "access denied", "type": "permission_error"}}),
     );
-    let (observed_success, recorded) =
-        observed_successful_turn_against_mock_response(&binary, "real_app_server_403", response);
+    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_403", response);
     assert_mock_provider_received_the_probe_request(recorded, "403 Forbidden case");
-    assert!(
-        !observed_success,
-        "a 403 Forbidden response from the Responses Provider must never be reported as a successful turn/completed"
-    );
+    assert_turn_failed(&observed, "403 Forbidden case");
 }
 
 #[test]
@@ -1297,13 +1329,9 @@ fn real_app_server_reports_failure_for_429_rate_limited_from_the_provider() {
         "429 Too Many Requests",
         &serde_json::json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}}),
     );
-    let (observed_success, recorded) =
-        observed_successful_turn_against_mock_response(&binary, "real_app_server_429", response);
+    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_429", response);
     assert_mock_provider_received_the_probe_request(recorded, "429 Too Many Requests case");
-    assert!(
-        !observed_success,
-        "a 429 Too Many Requests response from the Responses Provider must never be reported as a successful turn/completed"
-    );
+    assert_turn_failed(&observed, "429 Too Many Requests case");
 }
 
 #[test]
@@ -1316,14 +1344,9 @@ fn real_app_server_reports_failure_for_a_malformed_response_body_from_the_provid
         return;
     };
     let response = raw_response("200 OK", "this is not valid json {{{");
-    let (observed_success, recorded) =
-        observed_successful_turn_against_mock_response(&binary, "real_app_server_malformed", response);
+    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_malformed", response);
     assert_mock_provider_received_the_probe_request(recorded, "malformed response body case");
-    assert!(
-        !observed_success,
-        "a malformed, non-JSON 200 response body from the Responses Provider must never be reported as a \
-         successful turn/completed"
-    );
+    assert_turn_failed(&observed, "malformed response body case");
 }
 
 #[test]
@@ -1349,12 +1372,7 @@ fn real_app_server_reports_failure_for_a_responses_api_incompatible_body_from_th
             ]
         }),
     );
-    let (observed_success, recorded) =
-        observed_successful_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
+    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
     assert_mock_provider_received_the_probe_request(recorded, "Responses-API-incompatible body case");
-    assert!(
-        !observed_success,
-        "a Responses-API-incompatible (Chat Completions shaped) response body must never be reported as a \
-         successful turn/completed"
-    );
+    assert_turn_failed(&observed, "Responses-API-incompatible body case");
 }
