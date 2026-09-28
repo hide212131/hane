@@ -241,7 +241,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         pre_reverse = {"path": str(pre_path), "elapsed_ms": pre_elapsed,
                        "elapsed_through_reverse_post_ms": elapsed_through_reverse_post}
 
-    start = time.monotonic()
+    start = initial_event_started if reverse_delta is None else time.monotonic()
     captured = []
     for index, delay in enumerate(delays):
         deadline = start + delay / 1000
