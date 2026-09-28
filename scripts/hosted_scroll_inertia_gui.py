@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/2"
+PROCEDURE_VERSION = "hosted-scroll-inertia/3"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
     "逆方向入力への切替、文書先頭/末尾のクランプ、Pixels の直接追従と安定を実画面で確認する。"
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
+    "方向反転の2入力は対象プロセスへ直接配送し、画面応答の遅延を測る。"
 )
 EXIT_PASS = 0
 EXIT_NONPASS = 1
@@ -216,9 +217,13 @@ def capture_ocr(interaction, helper, path: Path, helper_timeout: float) -> tuple
 
 def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     fields = {}
+    route = None
     for line in output.splitlines():
         name, separator, value = line.partition("=")
         if separator:
+            if name == "reversal_event_route":
+                route = value
+                continue
             try:
                 parsed = float(value)
             except ValueError:
@@ -231,6 +236,8 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     missing = sorted(required - fields.keys())
     if missing:
         raise ValueError(f"reversal helper timing is missing: {', '.join(missing)}")
+    if route != "target_pid":
+        raise ValueError("reversal helper did not target the Hane process")
     if not (fields["initial_event_elapsed_ms"] <= fields["pre_reverse_capture_elapsed_ms"]
             <= fields["reverse_event_elapsed_ms"]):
         raise ValueError("reversal helper event and pre-reversal capture times are out of order")
@@ -238,6 +245,7 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
     if any(value < 0 for value in frame_times) or frame_times != sorted(frame_times):
         raise ValueError("reversal helper post-event frame times are invalid")
     return {
+        "event_route": route,
         "initial_to_reverse_event_ms": (
             fields["reverse_event_elapsed_ms"] - fields["initial_event_elapsed_ms"]
         ),
@@ -270,6 +278,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
             return [], None, str(exc)
         pre_reverse = {
             "path": str(pre_path),
+            "event_route": evidence["event_route"],
             "initial_to_reverse_event_ms": evidence["initial_to_reverse_event_ms"],
             "pre_reverse_capture_after_initial_ms": evidence["pre_reverse_capture_after_initial_ms"],
         }
