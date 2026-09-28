@@ -130,11 +130,12 @@ pub enum RuntimeError {
     NotReady,
     RestartBlocked,
     OwnerLockUnavailable,
-    /// An externally acquired [`OwnerLockGuard`] (via
-    /// [`AiRuntime::start_with_owner_lock`]) was acquired against a
-    /// different path than this runtime's own `RuntimeConfig::owner_lock_path`:
-    /// it proves ownership of a *different* runtime owner lock, not the one
-    /// this runtime is scoped to. Rejected before any child is spawned.
+    /// An [`OwnerLockGuard`] this runtime already holds, or was given (via
+    /// [`AiRuntime::start_with_owner_lock`]), does not match the
+    /// `RuntimeConfig::owner_lock_path` it is being used against: it proves
+    /// ownership of a *different* runtime owner lock, not the one this
+    /// runtime is scoped to. Rejected before any child is spawned or, for
+    /// [`AiRuntime::reconfigure`], before the active child is even stopped.
     OwnerLockPathMismatch,
     OwnerLock(Arc<io::Error>),
     Spawn(Arc<io::Error>),
@@ -677,60 +678,77 @@ fn run_coordinator(
                 let op_gen = operation_generation;
                 let result = match cmd {
                     LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation) => {
-                        // Stop whatever is active under the *old* config
-                        // first (its own stop timeouts still apply), then
-                        // swap `config` and start fresh under the new one.
-                        // `release_owner_lock: false` keeps `owner_guard`
-                        // held by this coordinator across the whole
-                        // stop-then-start sequence (see `do_start`'s own
-                        // handling of an already-held `owner_guard`), instead
-                        // of dropping and immediately re-acquiring the OS
-                        // lock file, which would open a window for a
-                        // different Hane process to become the owner in
-                        // between.
-                        match stop_active(
-                            &mut current,
-                            &mut generation,
-                            &mut owner_guard,
-                            &config,
-                            &shared,
-                            &events_tx,
-                            RuntimeState::Stopping,
-                            RuntimeState::Stopped,
-                            op_gen,
-                            false,
-                        ) {
-                            Ok(_) => {
-                                config = new_config;
-                                // Record the new config's generation as soon
-                                // as the swap itself happens, before the
-                                // restart below is even attempted: a caller
-                                // gating on `configured_settings_generation`
-                                // (see `crate::connect::with_generation_checked_lock`)
-                                // must never observe this coordinator still
-                                // reporting the *old* generation once it has
-                                // structurally moved on to a new `config`,
-                                // regardless of whether the restart below
-                                // goes on to succeed.
-                                {
-                                    let mut state = shared.lock().unwrap();
-                                    state.config_generation = new_configured_settings_generation;
+                        // A currently held `owner_guard` proves ownership of
+                        // `config.owner_lock_path`, not of whatever path
+                        // `new_config` carries. Carrying it forward into a
+                        // reconfigure under a different `owner_lock_path`
+                        // (see the `release_owner_lock: false` handoff below)
+                        // would let it stand in as proof of ownership for a
+                        // lock file it was never acquired against. Reject the
+                        // request outright, before touching `current`,
+                        // `config`, or `owner_guard`, whenever the two paths
+                        // disagree.
+                        if let Some(guard) = owner_guard.as_ref()
+                            && guard.path() != new_config.owner_lock_path
+                        {
+                            Some(Err(RuntimeError::OwnerLockPathMismatch))
+                        } else {
+                            // Stop whatever is active under the *old* config
+                            // first (its own stop timeouts still apply), then
+                            // swap `config` and start fresh under the new one.
+                            // `release_owner_lock: false` keeps `owner_guard`
+                            // held by this coordinator across the whole
+                            // stop-then-start sequence (see `do_start`'s own
+                            // handling of an already-held `owner_guard`),
+                            // instead of dropping and immediately
+                            // re-acquiring the OS lock file, which would open
+                            // a window for a different Hane process to
+                            // become the owner in between.
+                            match stop_active(
+                                &mut current,
+                                &mut generation,
+                                &mut owner_guard,
+                                &config,
+                                &shared,
+                                &events_tx,
+                                RuntimeState::Stopping,
+                                RuntimeState::Stopped,
+                                op_gen,
+                                false,
+                            ) {
+                                Ok(_) => {
+                                    config = new_config;
+                                    // Record the new config's generation as
+                                    // soon as the swap itself happens, before
+                                    // the restart below is even attempted: a
+                                    // caller gating on
+                                    // `configured_settings_generation` (see
+                                    // `crate::connect::with_generation_checked_lock`)
+                                    // must never observe this coordinator
+                                    // still reporting the *old* generation
+                                    // once it has structurally moved on to a
+                                    // new `config`, regardless of whether the
+                                    // restart below goes on to succeed.
+                                    {
+                                        let mut state = shared.lock().unwrap();
+                                        state.config_generation = new_configured_settings_generation;
+                                    }
+                                    do_start(
+                                        op_gen,
+                                        &mut current,
+                                        &mut generation,
+                                        &mut owner_guard,
+                                        None,
+                                        &config,
+                                        &handler,
+                                        &events_tx,
+                                        &self_tx,
+                                        &shared,
+                                        &reply,
+                                    )
                                 }
-                                do_start(
-                                    op_gen,
-                                    &mut current,
-                                    &mut generation,
-                                    &mut owner_guard,
-                                    None,
-                                    &config,
-                                    &handler,
-                                    &events_tx,
-                                    &self_tx,
-                                    &shared,
-                                    &reply,
-                                )
+                                Err(e) => Some(Err(e)),
                             }
-                            Err(e) => Some(Err(e)),
                         }
                     }
                     LifecycleCommand::StartWithOwnerLock(owner) => do_start(
@@ -1560,5 +1578,71 @@ mod tests {
             *released.lock().unwrap(),
             "resource must be released once try_wait confirms exit"
         );
+    }
+
+    /// Regression coverage for the root cause behind `Reconfigure`: a held
+    /// `owner_guard` proves ownership of the *old* `config.owner_lock_path`,
+    /// not of whatever path a new `RuntimeConfig` happens to carry. Gated to
+    /// `unix` because it needs a real spawnable process to reach `Ready` (and
+    /// thereby hold a real owner lock) — `/bin/sh` standing in for the App
+    /// Server here, replying to the `initialize` handshake and then just
+    /// echoing/discarding further stdin — which is not portable to the
+    /// `windows-latest` CI leg; `OwnerLock` and the mismatch check under test
+    /// are themselves fully cross-platform.
+    #[cfg(unix)]
+    #[test]
+    fn reconfigure_rejects_a_different_owner_lock_path_while_a_guard_is_held() {
+        use crate::rpc::RejectAllServerRequests;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-reconfigure-owner-lock-mismatch-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner_lock_path = dir.join("owner-a.lock");
+
+        // Replies to the first line (the `initialize` request) by echoing its
+        // numeric `id` back with an empty `result`, then just keeps reading
+        // (and discarding) stdin until it closes -- at which point
+        // `stop_active`'s `request_shutdown` (closing this coordinator's
+        // write side) makes it exit on its own, exactly like a well-behaved
+        // real App Server would.
+        let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
+        let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
+        config.args = vec!["-c".to_string(), script.to_string()];
+        config.start_timeout = Duration::from_secs(5);
+        config.stop_grace_timeout = Duration::from_millis(500);
+        config.stop_force_timeout = Duration::from_secs(2);
+
+        let (events_tx, _events_rx) = mpsc::sync_channel(8);
+        let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+        let runtime = AiRuntime::spawn(config, handler, events_tx);
+        let status = runtime.start().expect("start should succeed against the fake App Server");
+        assert_eq!(status.state, RuntimeState::Ready);
+
+        let mismatched_config = RuntimeConfig::new(
+            "/nonexistent/hane-ai-test-binary-must-never-be-spawned",
+            dir.join("owner-b.lock"),
+        );
+        let result = runtime.reconfigure(mismatched_config, 1);
+        assert!(
+            matches!(result, Err(RuntimeError::OwnerLockPathMismatch)),
+            "reconfigure against a different owner_lock_path than the held guard must be rejected, got {result:?}"
+        );
+
+        // The active runtime, its config, and the held owner lock must all be
+        // left completely untouched by the rejected reconfigure: still
+        // `Ready`, still reporting the original `configured_settings_generation`,
+        // and still holding the guard for the original path, not the
+        // rejected one.
+        assert_eq!(runtime.snapshot().state, RuntimeState::Ready);
+        assert_eq!(runtime.configured_settings_generation(), 0);
+        let held_path = runtime
+            .with_owner_lock(|owner| owner.map(|guard| guard.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(held_path, Some(owner_lock_path));
+
+        let _ = runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
