@@ -420,10 +420,14 @@ fn a_full_runtime_event_queue_stops_the_child_after_losing_a_critical_notificati
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(config, handler, events_tx);
 
-    let status = runtime.start().expect("initialize should complete before test notifications");
+    let status = runtime
+        .start()
+        .expect("initialize should complete before test notifications");
     assert_eq!(status.state, RuntimeState::Ready);
-    assert!(events_rx.recv_timeout(Duration::from_secs(5)).is_ok());
 
+    // Keep the bounded event queue full while the fake server emits both
+    // critical notifications. Draining the first event here races the second
+    // notification and can make this test pass without exercising overflow.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let status = runtime.snapshot();
@@ -431,9 +435,16 @@ fn a_full_runtime_event_queue_stops_the_child_after_losing_a_critical_notificati
             assert!(!status.restart_blocked);
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "critical notification loss was not handled");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "critical notification loss was not handled"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        events_rx.try_recv().is_ok(),
+        "first critical event should remain queued"
+    );
 }
 
 #[test]
