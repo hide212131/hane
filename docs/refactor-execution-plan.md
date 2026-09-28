@@ -393,7 +393,7 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 
 **実際の旧→新対応と可視性**
 
-実装はPR [#396](https://github.com/hide212131/hane/pull/396)、starting head `bbfc1d3e35f74826ea4f55d6fd36782802b021ea`（base commit `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` から分岐）に対して行った。許可された3ファイル `crates/ui/src/view.rs`、新規 `crates/ui/src/view/inline_rename.rs`、本書のみを変更した。
+実装はPR [#396](https://github.com/hide212131/hane/pull/396)、starting head `bbfc1d3e35f74826ea4f55d6fd36782802b021ea`（base commit `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` から分岐）に対して行った。製品コード移動を含む実装commit/headは `a266285c6da4f139899fcf751ee7d80847b902fd`。許可された3ファイル `crates/ui/src/view.rs`、新規 `crates/ui/src/view/inline_rename.rs`、本書のみを変更した。
 
 [実装仕様](refactor-rf2a-inline-rename-implementation-spec.md) 第3節の36メソッドは、同じ相対順のまま `crates/ui/src/view.rs` の元の一つの `impl EditorView` ブロック（`text_input_render_state` / `set_text_input_bounds` と共有していたブロック）から、新規 `crates/ui/src/view/inline_rename.rs` の新しい `impl EditorView` ブロックへ機械的に移した。署名・引数・戻り値・属性・コメント・bodyは変更していない。可視性は仕様どおり2件だけ変更した。`begin_inline_rename`（private→`pub(super)`、兄弟 `view/sidebar.rs` の2箇所のダブルクリックhandlerから呼ぶため）と `inline_rename_has_background_conflict`（private→`pub(super)`、親 `view.rs` の既存 `mod tests` 内のassertから呼ぶため）。他28件の `pub(crate)` と残り6件のprivateは維持した。
 
@@ -403,7 +403,9 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 
 **検証の実施状況**
 
-この実装を行ったworkerはシェル・git・テスト実行・pushを行わない契約のため、以下は本PRの本段階では未実施である。Commander / 次工程（current-head CIとCodeRabbit、必要な場合のGUI Validator）が確認する。
+current implementation head `a266285c6da4f139899fcf751ee7d80847b902fd` で、method-level比較は36/36の宣言・signature・直前のattributes/comments・body一致（仕様の2件だけvisibilityを正規化）、new module内36定義・親の旧定義0件・仕様順・pub(crate)28/pub(super)2/private6、共有parent methodsの維持、既存 `view.rs` test moduleのbyte-identicalを確認した。`git diff --check bbfc1d3e35f74826ea4f55d6fd36782802b021ea..a266285c6da4f139899fcf751ee7d80847b902fd` も成功した。
+
+Claude workerはシェル・git・テスト実行・pushを行わない契約のため、cargo検証はこの時点で未実施である。current-head CIとCodeRabbit review、必要な場合のGUI Validatorは次工程で確認する。
 
 - `cargo test -p hane-ui --all-features --locked -- --list` / `rename` / `sidebar_file_filter`
 - `cargo test --workspace --locked` / `cargo test --workspace --all-features --locked`
