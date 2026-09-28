@@ -452,11 +452,13 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — 終了コード0。`block v0.1.6` の将来のRustで拒否される可能性に関するCargo future-incompat warningは出たが、clippy diagnosticsや失敗はない。
 - `git diff --check origin/main...HEAD` および作業treeに対する `git diff --check` — どちらも終了コード0。
 
-GitHub current-head CI run [36421117864](https://github.com/hide212131/hane/actions/runs/36421117864) は、同じPR head `ac3d8750eba6ed18b0b464a88aebae04df623a86` でmacOS / Windowsとも成功した。両OSのworkspace testsとclippy、macOS fallback glyph rasterization、macOS input source reactivationのcheckが成功。mainはbase `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` のまま。
+current-head CI run [36425314180](https://github.com/hide212131/hane/actions/runs/36425314180) はPR head `ba49bf4ce4cbe10c96ef11b6e37be34eefad614f` でmacOS / Windowsとも成功した。両OSのworkspace testsとclippy、macOS fallback glyph rasterization、macOS input source reactivationのcheckが成功。より前のrun [36421117864](https://github.com/hide212131/hane/actions/runs/36421117864) も、製品コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` と同一のコードを含むheadで成功している。mainはbase `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` のまま。
 
-GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e8357196fb7415ccaac6fd105fe3b53e7ca94cc` を確認し、メソッド移動自体に不一致はないとしたうえで、実行計画に36件の個別対応が不足している点を指摘した。この節に上記一覧を追加した。CodeRabbitは移動した関数群のdocstring coverage 5.56%をwarningとして示したが、本PRでは既存コメント・属性を保持する機械的移動が受入条件であり、コメントを追加・変更しない。対応表追記後のcurrent-head CIとfull reviewを次に確認する。
+GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。
 
-本節への今回の追記は文書のみであり、検証した製品コードから差分はない。追記後のcurrent-head CIとCodeRabbit reviewの結果はPR最終判断時に記録する。CodeRabbitの設計PRレビューにあるWindows renameの懸念は独立事項であり、本移動から生じた回帰として扱わない。
+CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e8357196fb7415ccaac6fd105fe3b53e7ca94cc` でコード移動の不一致なしとしたが、実行計画の36件対応表不足を指摘したため、本節へ個別一覧を追加した。対応表を含むhead `ba49bf4ce4cbe10c96ef11b6e37be34eefad614f` に対するfull review run `31ffbd25-3836-4bc2-8070-c2ed4a31a740` はactionable commentsなし、Merge Risk Minimalとした。Docstring Coverageは36件のうち5.56%というwarning（inconclusive）を残した。本PRの受入条件は属性・既存コメント・本体を保つ機械的移動であり、関数コメントを新規追加することはこの範囲に含めない。独立したWindows renameの懸念も引き続き別作業として扱う。
+
+この節に対応表・検証結果・レビュー結果を追記した後のPR変更は文書のみで、製品コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` からコード差分はない。最終の文書更新後もcurrent-head CIとCodeRabbit full reviewを再確認し、PR上の結果をIssue #301へ報告する。
 
 **残件**
 
