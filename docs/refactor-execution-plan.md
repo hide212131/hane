@@ -459,6 +459,7 @@ GUI操作は実施しない。実差分とmethod-level比較で36件すべての
 CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e8357196fb7415ccaac6fd105fe3b53e7ca94cc` でコード移動の不一致なしとしたが、実行計画の36件対応表不足を指摘したため、本節へ個別一覧を追加した。対応表を含むhead `ba49bf4ce4cbe10c96ef11b6e37be34eefad614f` に対するfull review run `31ffbd25-3836-4bc2-8070-c2ed4a31a740` はactionable commentsなし、Merge Risk Minimalとした。Docstring Coverageは36件のうち5.56%というwarning（inconclusive）を残した。本PRの受入条件は属性・既存コメント・本体を保つ機械的移動であり、関数コメントを新規追加することはこの範囲に含めない。独立したWindows renameの懸念も引き続き別作業として扱う。
 
 この節に対応表・検証結果・レビュー結果を追記した後のPR変更は文書のみで、製品コードcommit `a266285c6da4f139899fcf751ee7d80847b902fd` からコード差分はない。最終の文書更新後もcurrent-head CIとCodeRabbit full reviewを再確認し、PR上の結果をIssue #301へ報告する。
+本PRの最終checks確認者は、このタスクを進めるHane Commander（ChatGPT Commander）である。merge直前にcurrent main/head、必要なCI checks、CodeRabbitの最終head review、作業treeをGitHubとcheckoutから再取得し、exact SHAと結果を照合して受入可否を確認する。Claude workerは実装担当、trusted finalizerはpush担当であり、この最終確認はworkerの報告に代替させない。
 
 **残件**
 
