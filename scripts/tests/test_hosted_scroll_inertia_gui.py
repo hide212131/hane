@@ -85,8 +85,10 @@ class DirectionReversalTests(unittest.TestCase):
     def test_accepts_prompt_opposite_direction(self):
         result = gui.evaluate_reversal(100, 108, frames([107, 105, 102, 100, 99, 99],
                                         [5, 24, 48, 80, 120, 180]),
-                                        initial_to_reverse_event_ms=90)
+                                        initial_to_reverse_event_ms=90,
+                                        event_route="target_pid")
         self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["event_route"], "target_pid")
         self.assertTrue(result["old_direction_started"])
         self.assertTrue(result["prompt"])
         self.assertTrue(result["reversed_direction"])
