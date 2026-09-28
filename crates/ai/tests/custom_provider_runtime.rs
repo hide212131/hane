@@ -944,10 +944,10 @@ fn wait_for_turn_completed(events_rx: &mpsc::Receiver<hane_ai::RuntimeEvent>, ti
         let params = params.unwrap_or(serde_json::Value::Null);
         match method.as_str() {
             "item/completed" => {
-                if params["item"]["type"] == serde_json::json!("agentMessage") {
-                    if let Some(text) = params["item"]["text"].as_str() {
-                        agent_message_text.push_str(text);
-                    }
+                if params["item"]["type"] == serde_json::json!("agentMessage")
+                    && let Some(text) = params["item"]["text"].as_str()
+                {
+                    agent_message_text.push_str(text);
                 }
             }
             "turn/completed" => {
