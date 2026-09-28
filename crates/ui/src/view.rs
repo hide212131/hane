@@ -12849,6 +12849,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn plain_wheel_lines_scroll_settles_without_doubling_the_input_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -5.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (before, expected_delta, immediate) = view.update_in(cx, |view, window, cx| {
+            let before = view.scroll_y;
+            let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+            view.on_scroll(&event, window, cx);
+            (before, expected_delta, view.scroll_y)
+        });
+        assert!(expected_delta > 0.0, "{expected_delta}");
+        // The main-panel scroll responds from the very first update, not
+        // after a delay for the inertia to ramp up.
+        assert!(immediate > before, "before={before}, immediate={immediate}");
+
+        // Run the coast to completion, as `step_scroll_inertia` would across
+        // real animation frames, until it settles on its own.
+        let settled = view.update_in(cx, |view, window, _cx| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.step_scroll_inertia(window);
+            }
+            view.scroll_y
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "the coast must settle instead of coasting forever"
+        );
+
+        let total_moved = settled - before;
+        assert!(
+            total_moved <= expected_delta + 1.0,
+            "combined immediate and inertial movement must not exceed a single plain scroll's \
+             pre-clamp distance: total_moved={total_moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            (total_moved - expected_delta).abs() < 1.0,
+            "the fully settled position must land at the same distance a single plain scroll of \
+             this delta would have, not double it: total_moved={total_moved}, \
+             expected_delta={expected_delta}"
+        );
+    }
+
+    #[gpui::test]
     fn repeated_same_direction_wheel_events_keep_refreshing_the_inertia(
         cx: &mut gpui::TestAppContext,
     ) {

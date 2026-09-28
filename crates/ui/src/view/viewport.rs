@@ -186,17 +186,22 @@ impl EditorView {
         }
         let delta = event.delta.pixel_delta(px(self.line_height()));
         let scroll_delta = -f32::from(delta.y);
-        self.scroll_y = clamp_scroll_y(
-            self.scroll_y + scroll_delta,
-            self.scrollable_content_height(),
-            self.viewport_height,
-        );
         match event.delta {
             ScrollDelta::Lines(_) => {
+                // The direct jump is folded into the coast's own first step
+                // instead of being applied on top of it (see
+                // `queue_scroll_inertia`), so the combined immediate and
+                // inertial movement matches a single plain scroll of this
+                // delta instead of doubling it (issue #389).
                 let velocity = scroll_inertia_velocity_for_lines_delta(scroll_delta);
                 self.queue_scroll_inertia(velocity, cx);
             }
             ScrollDelta::Pixels(_) => {
+                self.scroll_y = clamp_scroll_y(
+                    self.scroll_y + scroll_delta,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
                 // The OS already supplies trackpad momentum for pixel deltas;
                 // layering the app's own inertia on top would double it and
                 // fight direct tracking as the OS event stream itself
@@ -209,15 +214,39 @@ impl EditorView {
 
     /// Starts or replaces the short post-wheel inertia that continues a
     /// plain `ScrollDelta::Lines` scroll after the input stops (issue #389).
+    /// Applies the coast's own first exponential-decay step to `scroll_y`
+    /// immediately (so the response is visible from this same event instead
+    /// of waiting for the next animation frame), then queues the remaining,
+    /// already-decayed velocity for `step_scroll_inertia` to keep advancing.
+    /// Reusing `eased_scroll_inertia_step` for this first step, rather than
+    /// separately jumping `scroll_y` by the full delta before queuing a coast
+    /// sized off that same delta, is what keeps the combined movement equal
+    /// to `velocity * SCROLL_INERTIA_TIME_CONSTANT` (the delta itself)
+    /// instead of doubling it: the discrete steps of an exponential decay
+    /// telescope back to that exact total regardless of where the sequence
+    /// is split.
+    ///
     /// Each new event replaces rather than accumulates the velocity, so
     /// scrolling the other way cancels the previous coast immediately
     /// instead of fighting it.
     pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
-        self.scroll_inertia = Some(ScrollInertia {
-            velocity,
-            last_frame: Instant::now(),
-            last_applied: self.scroll_y,
-        });
+        match eased_scroll_inertia_step(velocity, SCROLL_INERTIA_MIN_FRAME_TIME) {
+            Some((distance, next_velocity)) => {
+                self.scroll_y = clamp_scroll_y(
+                    self.scroll_y + distance,
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
+                self.scroll_inertia = Some(ScrollInertia {
+                    velocity: next_velocity,
+                    last_frame: Instant::now(),
+                    last_applied: self.scroll_y,
+                });
+            }
+            None => {
+                self.scroll_inertia = None;
+            }
+        }
         cx.notify();
     }
 
