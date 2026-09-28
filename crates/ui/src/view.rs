@@ -12587,7 +12587,18 @@ mod tests {
         // `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner). This still
         // exercises the same replace path a real, promptly-delivered
         // reversal would take.
-        view.update_in(cx, |view, _window, cx| {
+        //
+        // `reversed_velocity` is read inside this same closure, immediately
+        // after `on_scroll_at`, rather than via a later, separate
+        // `read_with`: `cx.notify()` (from `queue_scroll_inertia_at`) can
+        // schedule a render before that later read runs, and `render` calls
+        // `step_scroll_inertia` unconditionally (see its doc comment), which
+        // would advance the coast again by however much real wall-clock time
+        // actually elapsed before that render — nondeterministic, and can
+        // exceed `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner,
+        // decaying the value this asserts against without changing any
+        // production real-time behavior.
+        let reversed_velocity = view.update_in(cx, |view, _window, cx| {
             let now = Instant::now();
             if let Some(inertia) = view.scroll_inertia.as_mut() {
                 inertia.last_frame = now;
@@ -12595,11 +12606,10 @@ mod tests {
             // Scrolling the other way must cancel the old coast immediately
             // instead of fighting it.
             view.on_scroll_at(&reverse_event, now, cx);
+            view.scroll_inertia
+                .expect("the reversed scroll must still arm inertia")
+                .velocity
         });
-        let reversed_velocity = view
-            .read_with(cx, |view, _| view.scroll_inertia)
-            .expect("the reversed scroll must still arm inertia")
-            .velocity;
         assert!(reversed_velocity < 0.0, "{reversed_velocity}");
         // Replacing, not accumulating, means the result depends only on the
         // reversal's own input velocity and the (here, exactly zero, so
