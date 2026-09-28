@@ -192,6 +192,12 @@ impl EditorView {
     /// runner and make the decay this measures nondeterministic.
     pub(super) fn on_scroll_at(&mut self, event: &ScrollWheelEvent, now: Instant, cx: &mut Context<Self>) {
         if event.modifiers.secondary() {
+            // A still-coasting scroll inertia must not keep advancing
+            // `scroll_y` underneath a zoom gesture started from the same
+            // wheel stream: `step_scroll_inertia` has no awareness of zoom
+            // and would otherwise keep scrolling every frame in parallel
+            // with the zoom animation (issue #389).
+            self.scroll_inertia = None;
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
             let window_offset = f32::from(event.position.y) - self.theme.header_height;
             self.queue_wheel_zoom_factor(factor, window_offset, cx);

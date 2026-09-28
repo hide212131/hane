@@ -12956,6 +12956,61 @@ mod tests {
     }
 
     #[gpui::test]
+    fn starting_a_wheel_zoom_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A modifier-wheel event that starts a zoom can arrive while a plain
+        // wheel scroll's inertia is still coasting (issue #389). Without
+        // cancelling that coast explicitly, `step_scroll_inertia` would keep
+        // advancing `scroll_y` every frame in parallel with the zoom
+        // animation instead of the zoom gesture taking over the wheel
+        // stream outright.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the zoom event arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 5.0)),
+                    modifiers: secondary_scroll_modifiers(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "switching to a modifier-wheel zoom must cancel the still-live scroll inertia coast"
+        );
+        assert!(
+            view.read_with(cx, |view, _| view.wheel_zoom_animation.is_some()),
+            "the zoom request itself must still be queued"
+        );
+    }
+
+    #[gpui::test]
     fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(cx: &mut gpui::TestAppContext) {
         // Issue #389: `render` calls `step_scroll_inertia` before laying out
         // and remeasuring visible blocks. When a block being remeasured (e.g.
