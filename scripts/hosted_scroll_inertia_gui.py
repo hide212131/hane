@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/5"
+PROCEDURE_VERSION = "hosted-scroll-inertia/6"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
     "逆方向入力への切替、文書先頭/末尾のクランプ、Pixels の直接追従と安定を実画面で確認する。"
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
-    "入力後の画面取得はイベントと同一helperの時計で計時する。反転入力は旧方向の可視応答後に送り、"
+    "入力後の画面取得はイベントと同一mach時計を使い、応答時刻にはWindowServerの表示時刻を使う。"
+    "反転入力はOCRを事前にwarm upし、旧方向の可視応答後に慣性窓内で送る。"
     "両入力は共通のcghidEventTap経路で送り、経路と画面応答を記録する。"
 )
 EXIT_PASS = 0
@@ -72,13 +73,15 @@ def last_visible(frame: dict) -> Optional[int]:
 def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
+    display_times = [frame.get("display_elapsed_ms", elapsed)
+                     for frame, elapsed in zip(frames, times)]
     valid = baseline is not None and len(offsets) >= 6 and all(value is not None for value in offsets)
     if not valid:
         return step("lines_coast", "blocked", "Lines 時系列の可視行番号を十分に読み取れない",
                     baseline=baseline, offsets=offsets, elapsed_ms=times, frames=frames)
     first_response_index = next(
-        (index for index, (offset, elapsed) in enumerate(zip(offsets, times))
-         if offset > baseline and elapsed <= 80),
+        (index for index, (offset, elapsed) in enumerate(zip(offsets, display_times))
+         if offset > baseline and 0 <= elapsed <= 80),
         None,
     )
     first_response = first_response_index is not None
@@ -106,6 +109,7 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
     return step(
         "lines_coast", "pass" if passed else "fail", None if passed else "。".join(reasons),
         baseline=baseline, offsets=offsets, elapsed_ms=times, first_response=first_response,
+        display_elapsed_ms=display_times,
         first_response_frame=first_response_index,
         continued_after_release=continued, monotonic=monotonic, early_lines_per_ms=early_rate,
         late_lines_per_ms=late_rate, decelerated=decelerated, settled=settled, frames=frames,
@@ -114,9 +118,12 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
 
 def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frames: list[dict],
                       initial_to_reverse_event_ms: Optional[float],
-                      event_route: Optional[str] = None) -> dict:
+                      event_route: Optional[str] = None,
+                      pre_reverse_display_after_initial_ms: Optional[float] = None) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
+    display_times = [frame.get("display_elapsed_ms", elapsed)
+                     for frame, elapsed in zip(frames, times)]
     valid = (baseline is not None and pre_reverse is not None
              and initial_to_reverse_event_ms is not None
              and len(offsets) >= 4 and all(value is not None for value in offsets))
@@ -134,8 +141,19 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
             inertia_window_ms=LINES_INERTIA_WINDOW_MS, event_route=event_route,
             elapsed_ms=times, frames=frames,
         )
+    if (pre_reverse_display_after_initial_ms is None
+            or not 0 <= pre_reverse_display_after_initial_ms <= LINES_INERTIA_WINDOW_MS):
+        return step(
+            "direction_reversal", "blocked",
+            "旧方向への動きが慣性窓内に表示された時刻を確認できない",
+            baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
+            initial_to_reverse_event_ms=initial_to_reverse_event_ms,
+            pre_reverse_display_after_initial_ms=pre_reverse_display_after_initial_ms,
+            inertia_window_ms=LINES_INERTIA_WINDOW_MS, event_route=event_route,
+            elapsed_ms=times, display_elapsed_ms=display_times, frames=frames,
+        )
     old_direction_started = pre_reverse > baseline
-    prompt = offsets[0] <= pre_reverse + 1 and times[0] <= 55
+    prompt = offsets[0] <= pre_reverse + 1 and 0 <= display_times[0] <= 55
     reversed_direction = offsets[-1] < pre_reverse
     no_old_coast = all(value <= pre_reverse + 1 for value in offsets)
     passed = old_direction_started and prompt and reversed_direction and no_old_coast
@@ -152,7 +170,9 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
         "direction_reversal", "pass" if passed else "fail", None if passed else "。".join(reasons),
         baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
         initial_to_reverse_event_ms=initial_to_reverse_event_ms,
+        pre_reverse_display_after_initial_ms=pre_reverse_display_after_initial_ms,
         inertia_window_ms=LINES_INERTIA_WINDOW_MS, elapsed_ms=times,
+        display_elapsed_ms=display_times,
         event_route=event_route, old_direction_started=old_direction_started, prompt=prompt,
         reversed_direction=reversed_direction, no_old_coast=no_old_coast, frames=frames,
     )
@@ -161,13 +181,15 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
 def evaluate_pixels(baseline: Optional[int], frames: list[dict]) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
+    display_times = [frame.get("display_elapsed_ms", elapsed)
+                     for frame, elapsed in zip(frames, times)]
     valid = baseline is not None and len(offsets) >= 3 and all(value is not None for value in offsets)
     if not valid:
         return step("pixels_direct_follow", "blocked", "Pixels 時系列の可視行番号を十分に読み取れない",
                     baseline=baseline, offsets=offsets, elapsed_ms=times, frames=frames)
     first_response_index = next(
-        (index for index, (offset, elapsed) in enumerate(zip(offsets, times))
-         if offset > baseline and elapsed <= 80),
+        (index for index, (offset, elapsed) in enumerate(zip(offsets, display_times))
+         if offset > baseline and 0 <= elapsed <= 80),
         None,
     )
     immediate = first_response_index is not None
@@ -183,6 +205,7 @@ def evaluate_pixels(baseline: Optional[int], frames: list[dict]) -> dict:
     return step(
         "pixels_direct_follow", "pass" if passed else "fail", None if passed else "。".join(reasons),
         baseline=baseline, offsets=offsets, elapsed_ms=times, immediate=immediate,
+        display_elapsed_ms=display_times,
         first_response_frame=first_response_index,
         stable_without_app_coast=stable, frames=frames,
     )
@@ -252,11 +275,13 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
         "initial_event_elapsed_ms",
         "pre_reverse_capture_started_elapsed_ms",
         "pre_reverse_capture_completed_elapsed_ms",
+        "pre_reverse_display_elapsed_ms",
         "reverse_event_elapsed_ms",
     }
     for index in range(expected_frames):
         required.add(f"frame_{index:02d}_capture_started_ms")
         required.add(f"frame_{index:02d}_capture_completed_ms")
+        required.add(f"frame_{index:02d}_display_elapsed_ms")
     missing = sorted(required - fields.keys())
     if missing:
         raise ValueError(f"reversal helper timing is missing: {', '.join(missing)}")
@@ -269,9 +294,17 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
         raise ValueError("reversal helper event and pre-reversal capture times are out of order")
     frame_started = [fields[f"frame_{index:02d}_capture_started_ms"] for index in range(expected_frames)]
     frame_completed = [fields[f"frame_{index:02d}_capture_completed_ms"] for index in range(expected_frames)]
+    frame_display = [fields[f"frame_{index:02d}_display_elapsed_ms"] for index in range(expected_frames)]
+    pre_display_from_command = (
+        fields["initial_event_elapsed_ms"] + fields["pre_reverse_display_elapsed_ms"]
+    )
+    if pre_display_from_command > fields["pre_reverse_capture_completed_elapsed_ms"]:
+        raise ValueError("reversal helper pre-reversal display time is after capture completion")
     if (any(start < 0 or completed < start for start, completed in zip(frame_started, frame_completed))
             or frame_started != sorted(frame_started)
-            or frame_completed != sorted(frame_completed)):
+            or frame_completed != sorted(frame_completed)
+            or any(display > completed for display, completed in zip(frame_display, frame_completed))
+            or frame_display != sorted(frame_display)):
         raise ValueError("reversal helper post-event frame times are invalid")
     return {
         "event_route": route,
@@ -284,9 +317,11 @@ def parse_reversal_helper_output(output: str, expected_frames: int) -> dict:
         "pre_reverse_capture_completed_after_initial_ms": (
             fields["pre_reverse_capture_completed_elapsed_ms"] - fields["initial_event_elapsed_ms"]
         ),
+        "pre_reverse_display_after_initial_ms": fields["pre_reverse_display_elapsed_ms"],
         "frame_elapsed_ms": frame_completed,
         "frame_capture_started_ms": frame_started,
         "frame_capture_completed_ms": frame_completed,
+        "frame_display_elapsed_ms": frame_display,
     }
 
 
@@ -310,6 +345,7 @@ def parse_scroll_capture_helper_output(output: str, expected_frames: int) -> dic
     for index in range(expected_frames):
         required.add(f"frame_{index:02d}_capture_started_ms")
         required.add(f"frame_{index:02d}_capture_completed_ms")
+        required.add(f"frame_{index:02d}_display_elapsed_ms")
     missing = sorted(required - fields.keys())
     if missing:
         raise ValueError(f"scroll helper timing is missing: {', '.join(missing)}")
@@ -317,9 +353,12 @@ def parse_scroll_capture_helper_output(output: str, expected_frames: int) -> dic
         raise ValueError("scroll helper did not use the cghidEventTap route")
     frame_started = [fields[f"frame_{index:02d}_capture_started_ms"] for index in range(expected_frames)]
     frame_completed = [fields[f"frame_{index:02d}_capture_completed_ms"] for index in range(expected_frames)]
+    frame_display = [fields[f"frame_{index:02d}_display_elapsed_ms"] for index in range(expected_frames)]
     if (any(start < 0 or completed < start for start, completed in zip(frame_started, frame_completed))
             or frame_started != sorted(frame_started)
-            or frame_completed != sorted(frame_completed)):
+            or frame_completed != sorted(frame_completed)
+            or any(display > completed for display, completed in zip(frame_display, frame_completed))
+            or frame_display != sorted(frame_display)):
         raise ValueError("scroll helper frame times are invalid")
     return {
         "event_route": route,
@@ -327,6 +366,7 @@ def parse_scroll_capture_helper_output(output: str, expected_frames: int) -> dic
         "frame_elapsed_ms": frame_completed,
         "frame_capture_started_ms": frame_started,
         "frame_capture_completed_ms": frame_completed,
+        "frame_display_elapsed_ms": frame_display,
     }
 
 
@@ -362,6 +402,9 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
             "pre_reverse_capture_completed_after_initial_ms": evidence[
                 "pre_reverse_capture_completed_after_initial_ms"
             ],
+            "pre_reverse_display_after_initial_ms": evidence[
+                "pre_reverse_display_after_initial_ms"
+            ],
         }
         lines, text, ocr_error = capture_ocr(interaction, helper, pre_path, helper_timeout)
         if ocr_error:
@@ -377,6 +420,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
             frames.append({"path": str(path),
                            "capture_started_elapsed_ms": evidence["frame_capture_started_ms"][index],
                            "elapsed_ms": elapsed,
+                           "display_elapsed_ms": evidence["frame_display_elapsed_ms"][index],
                            "capture_completed_elapsed_ms": evidence["frame_capture_completed_ms"][index],
                            "visible_lines": lines, "recognized_text": text})
         return frames, pre_reverse, None
@@ -402,6 +446,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         frames.append({"path": str(path),
                        "capture_started_elapsed_ms": evidence["frame_capture_started_ms"][index],
                        "elapsed_ms": elapsed,
+                       "display_elapsed_ms": evidence["frame_display_elapsed_ms"][index],
                        "capture_completed_elapsed_ms": evidence["frame_capture_completed_ms"][index],
                        "event_route": evidence["event_route"],
                        "visible_lines": lines, "recognized_text": text})
@@ -496,6 +541,10 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                                          reversal_baseline, reversal_pre, reversal_frames,
                                          pre_frame.get("initial_to_reverse_event_ms") if pre_frame else None,
                                          event_route=pre_frame.get("event_route") if pre_frame else None,
+                                         pre_reverse_display_after_initial_ms=(
+                                             pre_frame.get("pre_reverse_display_after_initial_ms")
+                                             if pre_frame else None
+                                         ),
                                      ))
                 if pre_frame:
                     reversal_step["event_route"] = pre_frame.get("event_route")
