@@ -50,7 +50,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::hover_card::HoverCard;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{Sizable, h_flex};
+use gpui_component::{Selectable, Sizable, h_flex};
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
@@ -87,6 +87,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
+mod ai_settings;
 mod inline_rename;
 mod sidebar;
 mod sidebar_filter;
@@ -590,6 +591,9 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     settings_open: bool,
+    settings_ai_page: bool,
+    settings_focus_handle: FocusHandle,
+    ai_settings: ai_settings::AiSettingsPage,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1258,6 +1262,9 @@ impl EditorView {
             stores,
             settings,
             settings_open: false,
+            settings_ai_page: false,
+            settings_focus_handle: cx.focus_handle(),
+            ai_settings: ai_settings::AiSettingsPage::default(),
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
@@ -2625,8 +2632,6 @@ impl EditorView {
 
     /// Handles a path delivered by another Hane process from Explorer.
     pub fn open_external_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.settings_open = false;
-        self.settings_error = None;
         if path.is_dir() {
             self.switch_to_work_folder(path.to_path_buf(), cx);
         } else {
@@ -2796,6 +2801,20 @@ impl EditorView {
         self.settings_open
     }
 
+    pub fn settings_is_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Installs a handle to the app-owned AI service. The service itself stays
+    /// in the application composition root and outlives this editor view.
+    pub fn attach_ai_service(
+        &mut self,
+        service: Option<hane_ai::AiServiceHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_settings.attach(service, cx);
+    }
+
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor().ime().is_some() {
             self.status = Some("入力変換を確定または取り消してから設定を開いてください".to_owned());
@@ -2814,6 +2833,8 @@ impl EditorView {
         crate::init_components(cx);
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
+        self.settings_ai_page = false;
+        self.ai_settings.begin_settings_session();
         self.settings_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
@@ -2833,7 +2854,7 @@ impl EditorView {
             });
         })
         .detach();
-        window.focus(&self.focus_handle, cx);
+        window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
@@ -2842,10 +2863,50 @@ impl EditorView {
             return;
         }
         self.settings_open = false;
+        self.settings_ai_page = false;
+        self.ai_settings.close_settings();
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.input_has_focus(window, cx) {
+            // A settings input owns Escape, including while an IME composition
+            // is active. The visible navigation remains available to leave.
+            return;
+        }
+        self.close_settings(window, cx);
+    }
+
+    fn select_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if ai && !self.settings_ai_page {
+            self.ai_settings.activate(cx);
+        }
+        self.settings_ai_page = ai;
+        window.focus(&self.settings_focus_handle, cx);
+        cx.notify();
+    }
+
+    fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::Close);
+            cx.notify();
+        } else {
+            self.close_settings(window, cx);
+        }
+    }
+
+    fn request_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && !ai && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::General);
+            cx.notify();
+        } else {
+            self.select_settings_category(ai, window, cx);
+        }
     }
 
     fn set_file_context_menu(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -2903,7 +2964,21 @@ impl EditorView {
         }
     }
 
-    fn settings_screen_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_screen_element(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        if let Some(target) = self.ai_settings.take_ready_route() {
+            match target {
+                ai_settings::LeaveTarget::General => {
+                    self.select_settings_category(false, window, cx)
+                }
+                ai_settings::LeaveTarget::Close => {
+                    self.close_settings(window, cx);
+                }
+            }
+        }
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -2911,9 +2986,70 @@ impl EditorView {
             .ghost()
             .tooltip("アプリに戻る")
             .on_click(move |_, window, app| {
-                view.update(app, |view, cx| view.close_settings(window, cx));
+                view.update(app, |view, cx| view.request_leave_settings(window, cx));
             });
 
+        let view = cx.entity();
+        let general_tab = Button::new("settings-category-general")
+            .label("一般")
+            .ghost()
+            .selected(!self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(false, window, cx)
+                });
+            });
+        let view = cx.entity();
+        let ai_tab = Button::new("settings-category-ai")
+            .label("AI")
+            .ghost()
+            .selected(self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(true, window, cx)
+                });
+            });
+
+        let body = if self.settings_ai_page {
+            self.ai_settings_render(window, cx).into_any_element()
+        } else {
+            self.general_settings_content(cx).into_any_element()
+        };
+        let content = div()
+            .id("settings-content")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .child(body);
+
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(rgb(self.theme.editor_background))
+            .text_color(rgb(self.theme.foreground))
+            .key_context("HaneEditor")
+            .track_focus(&self.settings_focus_handle);
+        let sidebar = div()
+            .id("settings-sidebar")
+            .debug_selector(|| "settings-sidebar".to_owned())
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .px(px(16.0))
+            .py(px(16.0))
+            .bg(rgb(self.theme.sidebar_background))
+            .child(back)
+            .child(general_tab)
+            .child(ai_tab);
+        install_action_listeners(root.child(sidebar).child(content), cx)
+    }
+
+    fn general_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let unsupported = matches!(
             self.file_context_menu_state,
             FileContextMenuState::Unsupported
@@ -2934,107 +3070,68 @@ impl EditorView {
                 .text_color(rgb(0xb42318))
                 .child(format!("登録に失敗しました: {error}"))
         });
-        let content = div()
-            .id("settings-content")
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(760.0))
-                    .px(px(32.0))
-                    .py(px(28.0))
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(22.0))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("一般"),
-                    )
-                    .child(
-                        div()
-                            .pt(px(16.0))
-                            .border_t_1()
-                            .border_color(rgb(self.theme.sidebar_active_background))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Windowsとの連携"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-file-context-menu-card")
-                                    .w_full()
-                                    .px(px(16.0))
-                                    .py(px(14.0))
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(self.theme.sidebar_active_background))
-                                    .bg(rgb(self.theme.code_background))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(checkbox)
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
-                                    )
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child(if busy {
-                                                "反映しています…"
-                                            } else {
-                                                self.file_context_menu_status()
-                                            }),
-                                    )
-                                    .children(error),
-                            ),
-                    ),
-            );
-        let root = div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .bg(rgb(self.theme.editor_background))
-            .text_color(rgb(self.theme.foreground))
-            .key_context("HaneEditor")
-            .track_focus(&self.focus_handle(cx));
-        let sidebar = div()
-            .id("settings-sidebar")
-            .debug_selector(|| "settings-sidebar".to_owned())
-            .w(px(self.sidebar_width))
-            .h_full()
-            .flex_none()
+        div()
+            .id("general-settings-content")
+            .w_full()
+            .max_w(px(760.0))
+            .px(px(32.0))
+            .py(px(28.0))
             .flex()
             .flex_col()
             .gap_4()
-            .px(px(16.0))
-            .py(px(16.0))
-            .bg(rgb(self.theme.sidebar_background))
-            .child(back)
             .child(
                 div()
-                    .id("settings-category-general")
-                    .w_full()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded_sm()
-                    .bg(rgb(self.theme.sidebar_active_background))
+                    .text_size(px(22.0))
+                    .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
-            );
-        install_action_listeners(root.child(sidebar).child(content), cx)
+            )
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Windowsとの連携"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-file-context-menu-card")
+                            .w_full()
+                            .px(px(16.0))
+                            .py(px(14.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .bg(rgb(self.theme.code_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(checkbox)
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
+                            )
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child(if busy {
+                                        "反映しています…"
+                                    } else {
+                                        self.file_context_menu_status()
+                                    }),
+                            )
+                            .children(error),
+                    ),
+            )
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3440,7 +3537,6 @@ impl EditorView {
         self.after_input(cx);
     }
 
-
     /// Invalidates shaped/layout caches for a new font generation. During an
     /// intermediate wheel-animation frame, keep the existing document-wide
     /// height estimates and let the visible blocks replace only their measured
@@ -3462,7 +3558,6 @@ impl EditorView {
             self.rebuild_height_estimates();
         }
     }
-
 
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
@@ -5790,7 +5885,7 @@ impl Render for EditorView {
         }
         self.step_wheel_zoom_animation(window);
         if self.settings_open {
-            return self.settings_screen_element(cx);
+            return self.settings_screen_element(window, cx);
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
