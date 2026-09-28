@@ -11,6 +11,7 @@ import AppKit
 import Carbon
 import CryptoKit
 import Foundation
+import ScreenCaptureKit
 import Vision
 
 func fail(_ message: String) -> Never {
@@ -575,7 +576,8 @@ func scrollUnit(_ name: String) -> CGScrollEventUnit {
     }
 }
 
-func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) {
+@discardableResult
+func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) -> TimeInterval {
     let bounds = windowBounds(pid)
     guard let event = CGEvent(
         scrollWheelEvent2Source: nil,
@@ -587,11 +589,159 @@ func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) {
     ) else { fail("could not create OS scroll event") }
     event.location = CGPoint(x: bounds.midX, y: bounds.midY)
     event.post(tap: .cghidEventTap)
+    return ProcessInfo.processInfo.systemUptime
+}
+
+final class WindowCapture: @unchecked Sendable {
+    let filter: SCContentFilter
+    let configuration: SCStreamConfiguration
+
+    init(filter: SCContentFilter, configuration: SCStreamConfiguration) {
+        self.filter = filter
+        self.configuration = configuration
+    }
+}
+
+final class WindowCaptureResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var capture: WindowCapture?
+    private var image: CGImage?
+    private var errorMessage: String?
+
+    func finish(capture: WindowCapture? = nil, image: CGImage? = nil, error: String? = nil) {
+        lock.lock()
+        self.capture = capture
+        self.image = image
+        errorMessage = error
+        lock.unlock()
+    }
+
+    func values() -> (WindowCapture?, CGImage?, String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (capture, image, errorMessage)
+    }
+}
+
+func prepareWindowCapture(_ windowID: CGWindowID) -> (WindowCapture?, String?) {
+    let result = WindowCaptureResult()
+    let completed = DispatchSemaphore(value: 0)
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+        guard let content else {
+            result.finish(error: error.map { String(describing: $0) } ?? "shareable window list unavailable")
+            completed.signal()
+            return
+        }
+        guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+            result.finish(error: "target window \(windowID) is not available to ScreenCaptureKit")
+            completed.signal()
+            return
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)))
+        configuration.height = max(1, Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)))
+        result.finish(capture: WindowCapture(filter: filter, configuration: configuration))
+        completed.signal()
+    }
+    guard completed.wait(timeout: .now() + 10) == .success else {
+        return (nil, "timed out while preparing ScreenCaptureKit window capture")
+    }
+    let (capture, _, error) = result.values()
+    return (capture, error)
+}
+
+func captureWindowImage(_ capture: WindowCapture) -> (CGImage?, String?) {
+    let result = WindowCaptureResult()
+    let completed = DispatchSemaphore(value: 0)
+    SCScreenshotManager.captureImage(contentFilter: capture.filter,
+                                     configuration: capture.configuration) { image, error in
+        result.finish(image: image, error: error.map { String(describing: $0) })
+        completed.signal()
+    }
+    guard completed.wait(timeout: .now() + 10) == .success else {
+        return (nil, "timed out while capturing the target window")
+    }
+    let (_, image, error) = result.values()
+    return (image, error)
+}
+
+func writeWindowImage(_ image: CGImage, path: String) {
+    let representation = NSBitmapImageRep(cgImage: image)
+    guard let png = representation.representation(using: .png, properties: [:]) else {
+        fail("could not encode window screenshot: \(path)")
+    }
+    do {
+        try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+    } catch {
+        fail("could not write window screenshot \(path): \(error)")
+    }
+}
+
+func milliseconds(_ seconds: TimeInterval) -> String {
+    String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), seconds * 1000)
+}
+
+func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
+                   _ reverseDelta: Int32, _ gapMs: Int, _ windowID: CGWindowID,
+                   _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
+    let (preparedCapture, captureError) = prepareWindowCapture(windowID)
+    guard captureError == nil else {
+        fail("could not prepare ScreenCaptureKit: \(captureError ?? "unknown error")")
+    }
+    guard let capture = preparedCapture else { fail("ScreenCaptureKit returned no capture context") }
+    // Warm ScreenCaptureKit before the timed interaction so framework startup
+    // cannot consume the app's inertia window.
+    let (warmImage, warmError) = captureWindowImage(capture)
+    guard warmImage != nil else { fail("ScreenCaptureKit preflight failed: \(warmError ?? "unknown error")") }
+
+    let commandStarted = ProcessInfo.processInfo.systemUptime
+    let firstPosted = postScroll(pid, unit, delta)
+    Thread.sleep(forTimeInterval: Double(gapMs) / 1000)
+
+    // Grab the pre-reversal state in memory so screenshot encoding and disk I/O
+    // do not consume the app's short inertia window before the opposite input.
+    let (preImage, preImageError) = captureWindowImage(capture)
+    guard let preImage else {
+        fail("could not capture pre-reversal window frame: \(preImageError ?? "unknown error")")
+    }
+    let preCaptured = ProcessInfo.processInfo.systemUptime
+    let reversePosted = postScroll(pid, unit, reverseDelta)
+
+    var frames: [(Int, CGImage, TimeInterval)] = []
+    for (index, delayMs) in frameDelays.enumerated() {
+        let deadline = reversePosted + Double(delayMs) / 1000
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+        let (image, error) = captureWindowImage(capture)
+        guard let image else {
+            fail("could not capture post-reversal window frame \(index): \(error ?? "unknown error")")
+        }
+        frames.append((index, image, ProcessInfo.processInfo.systemUptime))
+    }
+
+    writeWindowImage(preImage, path: prePath)
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    for (index, image, _) in frames {
+        let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "frame-%02d.png", index)).path
+        writeWindowImage(image, path: path)
+    }
+
+    print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
+    print("pre_reverse_capture_elapsed_ms=\(milliseconds(preCaptured - commandStarted))")
+    print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
+    for (index, _, capturedAt) in frames {
+        print(String(format: "frame_%02d_elapsed_ms=", index) + milliseconds(capturedAt - reversePosted))
+    }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -612,6 +762,24 @@ case "wheel-event":
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]) else { fail("wheel-event requires PID, lines|pixels and delta") }
     postScroll(pid, scrollUnit(arguments[2]), delta)
+case "wheel-reversal":
+    guard arguments.count == 10,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]),
+          let reverseDelta = Int32(arguments[4]),
+          let gapMs = Int(arguments[5]), gapMs > 0,
+          let windowID = UInt32(arguments[6]) else {
+        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, gap ms, window ID, pre-image path, frame directory and comma-separated delays")
+    }
+    let frameDelays = arguments[9].split(separator: ",").compactMap { Int($0) }
+    guard !frameDelays.isEmpty,
+          frameDelays.first == 0,
+          frameDelays == frameDelays.sorted(),
+          frameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
+        fail("wheel-reversal frame delays must be ascending milliseconds beginning at 0")
+    }
+    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, gapMs,
+                  windowID, arguments[7], arguments[8], frameDelays)
 case "current-source":
     print(currentSourceID())
 case "activate":
