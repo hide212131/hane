@@ -74,7 +74,7 @@ Issue #389 のホイールスクロール受け入れ条件だけを実画面で
 /gui-validate scroll-inertia merge
 ```
 
-このコマンドは `scripts/hosted_scroll_inertia_gui.py` の信頼済み手順へ振り分けられる。OSにLines/Pixelsを明示した入力を送り、Linesの初回応答・解放後の余韻と減速・方向反転、文書先頭/末尾のクランプ、Pixelsの直接追従と入力後の安定を時間差の画面キャプチャで確認し、可視行・イベント送信時刻・画面取得開始/完了時刻・スクリーンショットとfixtureの不変性をartifactに残す。入力と画面取得は同じOS helperの時計で計時する。方向反転は旧方向の動きが画面上で観測された後に反対入力を送り、両方のQuartzイベントを通常の`cghidEventTap`経路で記録する。デバイス種別は推測せず、通常の包括的なGUI検証も代替しない。
+このコマンドは `scripts/hosted_scroll_inertia_gui.py` の信頼済み手順へ振り分けられる。OSにLines/Pixelsを明示した入力を送り、Linesの初回応答・解放後の余韻と減速・方向反転、文書先頭/末尾のクランプ、Pixelsの直接追従と入力後の安定を時間差の画面キャプチャで確認し、可視行・イベント送信時刻・画面取得開始/完了時刻・WindowServerのフレーム表示時刻・スクリーンショットとfixtureの不変性をartifactに残す。入力と表示時刻は同じmach時計を使い、80ms以内の初回応答はWindowServerの表示時刻で判定する。方向反転はVision OCRを事前にwarm upし、旧方向の動きが慣性窓内に表示されたことを確認してから反対入力を送り、両方のQuartzイベントを通常の`cghidEventTap`経路で記録する。デバイス種別は推測せず、通常の包括的なGUI検証も代替しない。
 
 `head` は exact current PR head を検証する。`merge` は current target branch と current PR head から GitHub が作る current PR merge ref を検証する。文章中にコマンド文字列を書いた場合や、引数がない・未知の引数を付けた場合は起動しない。
 
@@ -82,7 +82,7 @@ comment router は trusted default branch の workflow / script だけを使い�
 
 procedure version は trusted default branch の `scripts/hosted_gui_interaction.py` にある `PROCEDURE_VERSION` を読み、人に転記させない。現在の総合 procedure は `hosted-gui-interaction/7` である。
 
-`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/5`) からtrusted routerが読み取る。
+`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/6`) からtrusted routerが読み取る。
 
 router が作る依頼は PR、exact head、router が観測した current base、execution context、procedure に結び付ける。同じ context の queued / in-progress / success run がすでにある場合は重複起動を抑止する。base SHA も識別に含めるため、head が同じまま target branch が進んだ場合に、古い base の成功 run を current evidence として自動再利用しない。
 
