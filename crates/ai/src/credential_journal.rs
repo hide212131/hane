@@ -220,10 +220,10 @@ pub fn recover(
                                     new_ref: Option<&CredentialRef>,
                                     old_ref: Option<&CredentialRef>|
      -> io::Result<bool> {
-        if let Some(target) = to_delete {
-            if let Err(_err) = store.delete(target) {
-                return Ok(false);
-            }
+        if let Some(target) = to_delete
+            && store.delete(target).is_err()
+        {
+            return Ok(false);
         }
         journal.complete(new_ref, old_ref)?;
         Ok(true)
