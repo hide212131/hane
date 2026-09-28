@@ -21,7 +21,9 @@ pub const ICON_CHEVRON_RIGHT: &str = "icons/work-folder/chevron-right.svg";
 /// Expanded folder disclosure chevron.
 pub const ICON_CHEVRON_DOWN: &str = "icons/work-folder/chevron-down.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
+/// Overrides `gpui-component`'s `IconName::ArrowLeft` glyph.
 pub const ICON_ARROW_LEFT: &str = "icons/arrow-left.svg";
+/// Overrides `gpui-component`'s `IconName::Check` glyph.
 pub const ICON_CHECK: &str = "icons/check.svg";
 
 const FILE_SVG: &[u8] = include_bytes!(concat!(

@@ -262,3 +262,52 @@ refactor(RF5-B): 表示キャッシュ・高さ索引・背景jobの更新責任
 このため #299 の最初の削除単位として、上記4 scriptと専用testだけを撤去する。現行経路が共有する `pipeline_api.py`、`gui_policy.py`、`claude_fix_state.py`、`aadw_notify.py`、observer/reconcile群は削除しない。これらには旧 `hane/final-judge` statusを履歴として認識する処理が残るが、旧scriptへの実行入口ではなく、現行機能と共有するため本削除単位の対象外とする。
 
 外部から旧scriptを直接起動するcurrentの文書化された手順・workflow入口はrepo内にない。self-hosted runnerのcurrent workflow入口はCodex usage-limit fallbackであり、旧 final 群を参照しない。削除後は current CI のPython検査を通し、検索で旧scriptの実行参照が履歴文書と本記録以外に残っていないことを確認する。問題時はこの削除PRをrevertし、旧経路を個別に再作成しない。
+
+### 9.7 RF1-B: 製品側未使用API・設定・assetsの追加確認（#300）
+
+2026年9月27日、main `970ac79d17c1772f192bfe72abb19436d839a62c`（PR #384のtable header background修正merge後）を基準に、RF1-B [#300](https://github.com/hide212131/hane/issues/300) の割当候補としてRF0-01/02/03/05/06/07/08/12を再確認した。この節はRF0-09〜11など他領域の判断を変えず、#300が扱う製品側API・設定・fixture・assetsの範囲に限定する。
+
+- RF0-01（[`crates/document/src/lib.rs`](../crates/document/src/lib.rs)）、RF0-02（[`crates/editor/src/lib.rs`](../crates/editor/src/lib.rs) 他）、RF0-06（[`crates/session/src/session.rs`](../crates/session/src/session.rs) 他）は、source byte・revision・範囲・anchorの所有、selection/IME/undo-redo、save/draft/conflict/ticket/世代の追跡が、9.2節・9.3節で確認したassertと呼出元（editor/markdown/presentation/session/UI各crateとテスト）で引き続き裏付けられる。分類は**維持**のまま変更しない。
+- RF0-03（[`crates/markdown/src/lib.rs`](../crates/markdown/src/lib.rs)、`block_index.rs`）とRF0-05（[`crates/ui/src/view.rs`](../crates/ui/src/view.rs)、`line.rs`）は、使用中のpublic API・fallback経路・test helperを**維持**する。#300の範囲でこれらを未使用として削除できる根拠は見つからなかった。純粋な責務分割（大きい`lib.rs`/`view.rs`をファイル単位に分けるだけの整理）はAPI削除候補と区別し、RF0-03の分割はMarkdown分割 [#303](https://github.com/hide212131/hane/issues/303) と解析/projection経路の整理 [#306](https://github.com/hide212131/hane/issues/306)、RF0-05の分割はEditorView分割 [#301](https://github.com/hide212131/hane/issues/301)、入力先判定 [#304](https://github.com/hide212131/hane/issues/304)、geometry接続 [#307](https://github.com/hide212131/hane/issues/307)、RF5-B [#368](https://github.com/hide212131/hane/issues/368) に割り当てる。
+- RF0-07（[`crates/benchmark`](../crates/benchmark)、[`crates/metrics`](../crates/metrics)、`crates/app`の`instrument`/`timing-probe` feature、`crates/app/examples/gpui_baseline.rs`）は、[`scripts/measure.sh`](../scripts/measure.sh)、[`scripts/prepare_issue23_fixtures.py`](../scripts/prepare_issue23_fixtures.py)、`hane-bench fixtures`（`cargo run --release -p hane-benchmark --bin hane-bench -- fixtures`）を通じて#23の測定手順に組み込まれていることを確認した。[`docs/baseline/issue23-current-main-2026-09-27.md`](baseline/issue23-current-main-2026-09-27.md)はこの経路を使った実測記録である。公開`distribution()`（[`crates/benchmark/src/lib.rs`](../crates/benchmark/src/lib.rs)）の戻り型として使う`pub type Distribution = DurationDistribution`は[`docs/baseline/public-api.md`](baseline/public-api.md)にも公開APIとして記録されており、外部consumerがこの型名に直接依存していないと断定できる根拠がないため、削除対象ではなく維持する。分類は**維持**とし、測定で示された局所最適化はRF8-A [#314](https://github.com/hide212131/hane/issues/314) に割り当てる。
+- RF0-08（`crates/*/tests`、`crates/app/examples/gpui_baseline.rs`、`vendor/gpui/examples`）は、テスト補助・examplesを**維持**する。vendorの全suiteや実OS/GUI証拠が必要な範囲は9.2節と同じく**未判断**のままとし、[#313](https://github.com/hide212131/hane/issues/313) へ割り当てる。
+- RF0-12（[`assets/`](../assets)、`Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml`）は、`WorkFolderIcons`/`AppAssets`（[`crates/ui/src/icons.rs`](../crates/ui/src/icons.rs)）が`crates/app/src/main.rs`の`Application::with_assets(AppAssets)`から登録され、設定画面の「アプリに戻る」ボタン（[`crates/ui/src/view.rs`](../crates/ui/src/view.rs)）が`gpui-component`の`IconName::ArrowLeft`を使い、`ICON_ARROW_LEFT`がそのglyphを上書きすることを確認した。work-folder SVG（file/folder/file-new/folder-new/chevron-right/chevron-down）とsettings/arrow-left/checkの各assetはいずれも`icons.rs`の`include_bytes!`から実際に参照されている。`assets/app-icon.ico`は[`crates/app/build.rs`](../crates/app/build.rs)のビルド時埋め込み、[`scripts/generate-windows-icon.sh`](../scripts/generate-windows-icon.sh)による生成、Windows shell-extensionのpackaging（[`windows/shell-extension/build-package.ps1`](../windows/shell-extension/build-package.ps1)）から参照される。`assets/phase4-feather.svg`は[`README.md`](../README.md)、`crates/app/src/main.rs`の`DEFAULT_DOCUMENT`、#23 fixture生成（[`scripts/prepare_issue23_fixtures.py`](../scripts/prepare_issue23_fixtures.py)）から参照される。2 assetとも参照の維持を確認した。#300の範囲で未使用と証明できた設定・assetは現時点でない。dependency/vendor patchの扱いは[#313](https://github.com/hide212131/hane/issues/313)、releaseの扱いは[#312](https://github.com/hide212131/hane/issues/312)に委ねる。外部から`AppAssets`のような公開経路が直接利用されるかは確認できておらず、不確実である旨を明記した上で維持する。
+
+- RF0-12のうち[`crates/ai`](../crates/ai)（`hane-ai`）はassetsとは別に扱う。workspace memberは10 crateだが、このcrateはAI連携基盤 [#378](https://github.com/hide212131/hane/issues/378) の機能範囲である。#378はopen、PR [#385](https://github.com/hide212131/hane/pull/385)はDraft、[ADR-0032](adr/0032-embedded-codex-app-server-ai-foundation.md)はProposedであることを確認した。分類は削除候補ではなく**別Issue #378**とし、#23測定対象のHaneアプリソースが`hane-ai`に依存しないという事実を、このcrate自体が不要である根拠には読み替えない。
+
+現行`Cargo.toml`のworkspace memberは10 crate（`crates/ai`を含む）である。[`docs/baseline/issue23-current-main-2026-09-27.md`](baseline/issue23-current-main-2026-09-27.md)は、#23測定対象のHaneアプリソースが`hane-ai`に依存しないことを記録している。[refactor-plan.md](refactor-plan.md)本文の「既存の9-crate構成」は策定当時の目標記述であり、本書冒頭に記した通り全文を変更せず保存する対象である。この節はcurrent `Cargo.toml`の実測（10 crate、`hane-ai`を含む）を、計画本文の9-crate記述とは別の現行観測として記録するものであり、どちらか一方をもう一方へ黙って書き換えることはしない。
+
+このRF1-B範囲の再確認で削除可能と立証できた項目はない。RF0-01/02/03/05/06/07/08/12の各候補は削除ではなく維持・別Issue（[#301](https://github.com/hide212131/hane/issues/301)/[#303](https://github.com/hide212131/hane/issues/303)/[#304](https://github.com/hide212131/hane/issues/304)/[#306](https://github.com/hide212131/hane/issues/306)/[#307](https://github.com/hide212131/hane/issues/307)/[#312](https://github.com/hide212131/hane/issues/312)/[#313](https://github.com/hide212131/hane/issues/313)/[#314](https://github.com/hide212131/hane/issues/314)/[#368](https://github.com/hide212131/hane/issues/368)/[#378](https://github.com/hide212131/hane/issues/378)）・未判断のいずれかに分類し、未確認の範囲と所有Issueをこの節でも隠さない。
+
+検証根拠は、#23のbaseline手順と[raw結果](baseline/issue23-current-main-2026-09-27.md)、および current main `970ac79d17c1772f192bfe72abb19436d839a62c`と同一tree hashで成功したPR #384のCI run [`36322153994`](https://github.com/hide212131/hane/actions/runs/36322153994)（macOS/Windows workspace tests・clippy）である。本PR（[#386](https://github.com/hide212131/hane/pull/386)）の最終変更はdocs-onlyのため、製品GUI確認は不要とする。
+
+### 9.8 RF2-A: EditorView機械的分割 第1PR — sidebar表示分離の旧→新対応（#301）
+
+PR [#387](https://github.com/hide212131/hane/pull/387)は、EditorViewの責務別機械的分割 [#301](https://github.com/hide212131/hane/issues/301) の第1PRとして、sidebarの表示に関わる責務を `crates/ui/src/view.rs` から新設の `crates/ui/src/view/sidebar.rs` へ移した。意味・処理順・条件式・状態の寿命は変更せず、公開API（`crate::view::EditorView`）と既存の呼出元記述も変更していない。
+
+**旧→新シンボル対応**（旧はいずれも `crates/ui/src/view.rs`、新はいずれも `crates/ui/src/view/sidebar.rs`）
+
+| シンボル | 新配置での可視性 | 可視性が必要な理由 |
+| --- | --- | --- |
+| `WorkFolderRow`（構造体） | `pub(super)`、`node`フィールドのみ`pub(super)`（`depth`は非公開のまま） | `view.rs`の`mod tests`が`row.node`を直接参照するため |
+| `flatten_work_folder_tree` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `flatten_filtered_work_folder_tree` | `pub(super)` | 同上 |
+| `EditorView::active_session_has_sidebar_row` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `EditorView::refresh_sidebar_date_badge_today` | `pub(super)` | `view.rs`側`EditorView::from_sessions`内の`_date_badge_refresh_task`生成コードから呼ぶため |
+| `EditorView::apply_sidebar_date_badge_today` | `pub(super)` | `view.rs`の`mod tests`から直接呼ぶため |
+| `EditorView::inline_rename_label` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `EditorView::work_folder_sidebar` | `pub(super)` | `view.rs`側`impl Render for EditorView::render`から呼ぶため |
+| `work_folder_root_display_name` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `DateBadgePosition`、`badge_renders_before_remainder` | 非公開 | `sidebar.rs`内でのみ使用（単体testも`sidebar.rs`側に移設） |
+| `file_name_label` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+| `DATE_BADGE_TODAY_BACKGROUND`ほか色定数一式、`DATE_BADGE_FOREGROUND` | 非公開 | `sidebar.rs`内でのみ使用 |
+| `date_badge_background`、`date_badge_chip` | 非公開 | 同上 |
+| `draft_preview` | 非公開 | `work_folder_sidebar`内でのみ使用 |
+
+`view.rs`には`mod sidebar;`と`use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};`だけを追加し、両関数の既存呼出元（テストを含む）の記述は変更していない。メソッド呼出し（`self.work_folder_sidebar(...)`等）はモジュールをまたいでも`use`不要でそのまま解決するため、呼出元の追加変更はない。`sidebar.rs`側は`use super::*;`で`view.rs`が持つ型・定数・importを再利用し、個別の`use`を追加していない。
+
+GPUIの`TestAppContext`を使わない純粋な`#[test]`のうち、移動した関数だけを検証する`date_badge_palette_has_visible_steps_and_readable_light_text`と`the_date_badge_renders_before_the_remainder_only_on_the_left`は`sidebar.rs`側の`#[cfg(test)] mod tests`へ移設した。`relative_luminance`ヘルパーは`view.rs`側の`active_file_tab_foreground_is_readable_in_both_themes`（タブ色のcontrast検証、date badgeとは無関係）とも共有していたため、削除せずに`sidebar.rs`のtest専用として複製した。`work_folder_sidebar`や`active_session_has_sidebar_row`等をGPUIの実harness越しに検証する`#[gpui::test]`群は、`EditorView`自体とそのtest fixture（`open_inline_rename_test_view`、`draft_test_root`等）が引き続き`view.rs`にあるため、`view.rs`の既存`mod tests`に残し、移動した`pub(super)`シンボルを直接呼び出す形のまま追従させた。テストは削除・削減していない。
+
+**親（`view.rs`）に残した責務**
+
+`EditorView`の定義・field・初期化（`EditorView::from_sessions`）、`_date_badge_refresh_task`の生成（`refresh_sidebar_date_badge_today`の呼出し元）、`impl Render for EditorView`全体、`sidebar_resizer`/`editor_scrollbar`/`sidebar_scrollbar`/`show_sidebar_scrollbar_briefly`などsidebar表示以外の入力処理・レイアウト・保存・background job・cacheは`view.rs`に残した。`lib.rs`、`actions.rs`、`input.rs`、`line.rs`、`shape.rs`は変更していない。
