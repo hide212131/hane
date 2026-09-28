@@ -378,7 +378,7 @@ mod tests {
             "schema_version": AI_SETTINGS_SCHEMA_VERSION + 1,
             "revision": 0,
             "settings_generation": 0,
-            "active_connection": "chatgpt",
+            "active_connection": "chat_gpt",
             "chatgpt": {},
         });
         std::fs::write(store.path(), serde_json::to_vec_pretty(&future).unwrap()).unwrap();
