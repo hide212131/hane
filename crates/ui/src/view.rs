@@ -12257,6 +12257,103 @@ mod tests {
         );
     }
 
+    fn assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(
+        cx: &mut gpui::TestAppContext,
+        lines: f32,
+    ) {
+        // Issue #389: a high-precision wheel/trackpad device can send a
+        // `ScrollDelta::Lines` event so small that its pixel-space distance
+        // never clears `eased_scroll_inertia_step`'s settle epsilon.
+        // `queue_scroll_inertia` must still apply that distance once instead
+        // of silently dropping it, and must not arm a new coast for it.
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, lines)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+
+        let (expected_delta, before, after, armed_inertia) =
+            view.update_in(cx, |view, window, cx| {
+                let expected_delta = -f32::from(event.delta.pixel_delta(px(view.line_height())).y);
+                assert!(
+                    (expected_delta * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32()).abs()
+                        <= SCROLL_INERTIA_SETTLE_EPSILON,
+                    "this test only exercises the settle-epsilon path: expected_delta={expected_delta}"
+                );
+                // Start away from both document edges so a small move in
+                // either direction is not itself clamped away, which would
+                // otherwise be indistinguishable from the drop this test
+                // guards against.
+                view.scroll_y = 500.0;
+                let before = view.scroll_y;
+                view.on_scroll(&event, window, cx);
+                (expected_delta, before, view.scroll_y, view.scroll_inertia)
+            });
+
+        let moved = after - before;
+        assert!(
+            (moved - expected_delta).abs() < 0.01,
+            "lines={lines}: a sub-settle-epsilon Lines input must still move scroll_y by its own \
+             delta instead of being dropped: moved={moved}, expected_delta={expected_delta}"
+        );
+        assert!(
+            armed_inertia.is_none(),
+            "lines={lines}: a sub-settle-epsilon input must not arm a new inertia coast"
+        );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_forward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, -0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_moves_scroll_y_backward(cx: &mut gpui::TestAppContext) {
+        assert_sub_settle_epsilon_wheel_lines_input_moves_scroll_y(cx, 0.02);
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_start(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        assert_eq!(view.read_with(cx, |view, _| view.scroll_y), 0.0);
+
+        // A small "scroll up" Lines input while already at the document
+        // start must clamp at 0 rather than going negative.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, 0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, 0.0,
+            "a sub-settle-epsilon input must clamp at the document start, not go negative"
+        );
+        assert!(armed_inertia.is_none());
+    }
+
     #[gpui::test]
     fn repeated_same_direction_wheel_events_keep_refreshing_the_inertia(
         cx: &mut gpui::TestAppContext,
@@ -12680,6 +12777,46 @@ mod tests {
             "scroll inertia must not carry scroll_y past the document end: after={after}, \
              max={max_scroll_y}"
         );
+    }
+
+    #[gpui::test]
+    fn sub_settle_epsilon_wheel_lines_input_clamps_at_the_document_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y;
+        });
+
+        // A small "scroll down" Lines input while already at the document
+        // end must clamp at max_scroll_y rather than overshooting it.
+        let (after, armed_inertia) = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -0.02)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+            (view.scroll_y, view.scroll_inertia)
+        });
+        assert_eq!(
+            after, max_scroll_y,
+            "a sub-settle-epsilon input must clamp at the document end, not overshoot it"
+        );
+        assert!(armed_inertia.is_none());
     }
 
     #[gpui::test]

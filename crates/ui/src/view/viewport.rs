@@ -263,6 +263,19 @@ impl EditorView {
                 });
             }
             None => {
+                // A settle-epsilon velocity means the coast has nothing left
+                // to animate, but `velocity * SCROLL_INERTIA_TIME_CONSTANT` is
+                // still the caller's actual input delta (see
+                // `scroll_inertia_velocity_for_lines_delta`'s doc comment) and
+                // must still land on `scroll_y` once; dropping it here silently
+                // ate every sub-pixel-precision wheel event (issue #389). This
+                // is a one-time application, not a new coast: `scroll_inertia`
+                // stays `None` so no further frames are scheduled for it.
+                self.scroll_y = clamp_scroll_y(
+                    self.scroll_y + velocity * SCROLL_INERTIA_TIME_CONSTANT.as_secs_f32(),
+                    self.scrollable_content_height(),
+                    self.viewport_height,
+                );
                 self.scroll_inertia = None;
             }
         }
