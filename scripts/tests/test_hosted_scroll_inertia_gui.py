@@ -86,9 +86,9 @@ class DirectionReversalTests(unittest.TestCase):
         result = gui.evaluate_reversal(100, 108, frames([107, 105, 102, 100, 99, 99],
                                         [5, 24, 48, 80, 120, 180]),
                                         initial_to_reverse_event_ms=90,
-                                        event_route="target_pid")
+                                        event_route="cghidEventTap")
         self.assertEqual(result["result"], "pass")
-        self.assertEqual(result["event_route"], "target_pid")
+        self.assertEqual(result["event_route"], "cghidEventTap")
         self.assertTrue(result["old_direction_started"])
         self.assertTrue(result["prompt"])
         self.assertTrue(result["reversed_direction"])
@@ -123,13 +123,13 @@ class ReversalHelperTimingTests(unittest.TestCase):
         evidence = gui.parse_reversal_helper_output(
             "initial_event_elapsed_ms=2.000\n"
             "pre_reverse_capture_elapsed_ms=37.500\n"
-            "reversal_event_route=target_pid\n"
+            "reversal_event_route=cghidEventTap\n"
             "reverse_event_elapsed_ms=40.250\n"
             "frame_00_elapsed_ms=4.100\n"
             "frame_01_elapsed_ms=25.000\n",
             expected_frames=2,
         )
-        self.assertEqual(evidence["event_route"], "target_pid")
+        self.assertEqual(evidence["event_route"], "cghidEventTap")
         self.assertEqual(evidence["initial_to_reverse_event_ms"], 38.25)
         self.assertEqual(evidence["pre_reverse_capture_after_initial_ms"], 35.5)
         self.assertEqual(evidence["frame_elapsed_ms"], [4.1, 25.0])
@@ -139,7 +139,7 @@ class ReversalHelperTimingTests(unittest.TestCase):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_elapsed_ms=8\n"
-                "reversal_event_route=target_pid\n"
+                "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=7\n"
                 "frame_00_elapsed_ms=3\n",
                 expected_frames=1,
@@ -150,28 +150,29 @@ class ReversalHelperTimingTests(unittest.TestCase):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_elapsed_ms=8\n"
-                "reversal_event_route=target_pid\n"
+                "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=9\n",
                 expected_frames=1,
             )
 
-    def test_rejects_global_event_routing(self):
-        with self.assertRaisesRegex(ValueError, "did not target the Hane process"):
+    def test_rejects_process_targeted_event_routing(self):
+        with self.assertRaisesRegex(ValueError, "did not use the cghidEventTap route"):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_elapsed_ms=8\n"
-                "reversal_event_route=global\n"
+                "reversal_event_route=target_pid\n"
                 "reverse_event_elapsed_ms=9\n"
                 "frame_00_elapsed_ms=3\n",
                 expected_frames=1,
             )
 
-    def test_reversal_helper_targets_both_scroll_events_to_hane(self):
+    def test_reversal_helper_keeps_both_events_on_global_route(self):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         reversal = source.split("func wheelReversal(", 1)[1].split("\n}", 1)[0]
-        self.assertEqual(reversal.count("targetProcess: true"), 2)
-        self.assertIn("event.postToPid(pid)", source)
-        self.assertIn('print("reversal_event_route=target_pid")', reversal)
+        self.assertEqual(reversal.count("postScroll(pid, unit,"), 2)
+        self.assertIn("event.post(tap: .cghidEventTap)", source)
+        self.assertNotIn("postToPid", source)
+        self.assertIn('print("reversal_event_route=cghidEventTap")', reversal)
 
 
 class PixelsDirectFollowTests(unittest.TestCase):

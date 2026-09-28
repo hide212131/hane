@@ -577,8 +577,7 @@ func scrollUnit(_ name: String) -> CGScrollEventUnit {
 }
 
 @discardableResult
-func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                targetProcess: Bool = false) -> TimeInterval {
+func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) -> TimeInterval {
     let bounds = windowBounds(pid)
     guard let event = CGEvent(
         scrollWheelEvent2Source: nil,
@@ -589,11 +588,7 @@ func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         wheel3: 0
     ) else { fail("could not create OS scroll event") }
     event.location = CGPoint(x: bounds.midX, y: bounds.midY)
-    if targetProcess {
-        event.postToPid(pid)
-    } else {
-        event.post(tap: .cghidEventTap)
-    }
+    event.post(tap: .cghidEventTap)
     return ProcessInfo.processInfo.systemUptime
 }
 
@@ -704,10 +699,9 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     guard warmImage != nil else { fail("ScreenCaptureKit preflight failed: \(warmError ?? "unknown error")") }
 
     let commandStarted = ProcessInfo.processInfo.systemUptime
-    // Target both reversal-probe inputs at Hane's process. This keeps the
-    // measured event-to-visible response from depending on global hit testing
-    // while still delivering Quartz scroll events through the OS input path.
-    let firstPosted = postScroll(pid, unit, delta, targetProcess: true)
+    // Keep both reversal-probe inputs on the same global Quartz event path as
+    // the other GUI scenarios, including normal window-server target routing.
+    let firstPosted = postScroll(pid, unit, delta)
     Thread.sleep(forTimeInterval: Double(gapMs) / 1000)
 
     // Grab the pre-reversal state in memory so screenshot encoding and disk I/O
@@ -717,7 +711,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         fail("could not capture pre-reversal window frame: \(preImageError ?? "unknown error")")
     }
     let preCaptured = ProcessInfo.processInfo.systemUptime
-    let reversePosted = postScroll(pid, unit, reverseDelta, targetProcess: true)
+    let reversePosted = postScroll(pid, unit, reverseDelta)
 
     var frames: [(Int, CGImage, TimeInterval)] = []
     for (index, delayMs) in frameDelays.enumerated() {
@@ -744,7 +738,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
 
     print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
     print("pre_reverse_capture_elapsed_ms=\(milliseconds(preCaptured - commandStarted))")
-    print("reversal_event_route=target_pid")
+    print("reversal_event_route=cghidEventTap")
     print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
     for (index, _, capturedAt) in frames {
         print(String(format: "frame_%02d_elapsed_ms=", index) + milliseconds(capturedAt - reversePosted))
