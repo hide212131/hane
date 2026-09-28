@@ -386,3 +386,23 @@ Issue [#389](https://github.com/hide212131/hane/issues/389) のホイールス�
 通常ホイールは従来どおり受け取ったdeltaを即時に `scroll_y` へ反映する。Ctrl/Cmd+wheelのtarget accumulation、display-linked interpolation、pinch takeover、100% snap、zoom anchor、animation中にdocument-wide height indexを毎frame再構築しない条件をそのまま保つ。既存testの名前・assert・件数は変更しない。
 
 検証は `cargo test --workspace`、`cargo test --workspace --all-features`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` と current head のmacOS/Windows CIを確認する。特にwheel zoom queue/reverse、plain wheelとの役割分担、pinch takeover、zoom anchor、scroll clampの既存回帰を維持する。CI結果とexact headはPR側で追記する。
+
+### 9.11 RF2-A: EditorView機械的分割 第4PR — inline rename分離（#301）
+
+PR #394で受入済みの設計に基づき、inline rename専用メソッドを `crates/ui/src/view/inline_rename.rs` へ移す実装PRを開始する。設計PR #394のmerge commitおよび実装branchの起点は `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97`。PR本文は `Refs #301` とし、#301全体は閉じない。
+
+**初期状態（draft PRの実装handoff前）**
+
+本節の追加時点では、実装PR用branchは受入済みmainから作成済みだが、製品コードはまだ変更していない。36メソッドの実移動、2件の可視性変更、移動前後body比較、テスト・clippy、macOS/Windows CI、GUI要否の判断はいずれも未実施である。以下は受入済み設計の対象と条件であり、完了結果として扱わない。実装完了後、actual base/head、旧→新対応、実際の可視性、検証コマンドと結果、未実施事項、残件をこの節へ記録する。
+
+**予定する変更範囲と境界**
+
+許可する製品側の変更は `crates/ui/src/view.rs` と新規 `crates/ui/src/view/inline_rename.rs`。本書の更新も含め、変更対象は3ファイルに限定する。移動対象36メソッドの完全一覧、署名・属性・コメント・body・相対順の維持要件はmain上の [実装仕様](refactor-rf2a-inline-rename-implementation-spec.md) 第3節を参照する。予定する可視性変更は `begin_inline_rename` のprivate→`pub(super)`（兄弟 `view/sidebar.rs` から呼ぶため）と `inline_rename_has_background_conflict` のprivate→`pub(super)`（親の既存テストから呼ぶため）の2件だけ。他の28件の `pub(crate)` と6件のprivate可視性を維持する。
+
+`EditorView`、field、inline rename関連型、初期化、共有helper、既存テスト、`text_input_render_state`、`set_text_input_bounds` は `view.rs` に残す。特にUTF-16/grapheme/selection helperはsidebar filterも使う。`actions.rs`、`input.rs`、`capture.rs`、sidebar/filter/viewport、描画、session crate、Cargo設定・lock、workflowは変更しない。入力先の優先順、IME、pending guard、path検査、ticket予約、二段spawn、`.detach()`、通知、保存再開とH1同期を含む現在の処理を変更しない。
+
+**検証と受入記録（未実施）**
+
+受入済み設計の指定どおり、36メソッドを同名対応で照合し、移動前後の処理body、文字列、条件式、戻り値、clone、spawn、notifyを比較する。新module内の一度だけの定義、親の旧定義・wrapperなし、共有dispatch・呼出元・テスト一覧の維持を確認する。指定された `cargo test -p hane-ui --all-features --locked -- --list`、`cargo test -p hane-ui --all-features --locked rename`、`cargo test -p hane-ui --all-features --locked sidebar_file_filter`、`cargo test --workspace --locked`、`cargo test --workspace --all-features --locked`、`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`、`git diff --check` を実施し、実行環境・toolchain・SHA・終了コードを記録する。current-head CIを確認し、純粋な移動と実差分を見た上でGUI検証の要否を判断する。
+
+この実装PRの初期headでは、検証・レビュー・GUI要否の判断はpendingである。CodeRabbitの設計PRレビューにあるWindows renameの懸念は、設計PRが新たに導入する回帰ではない独立事項として扱う。実装PRではWindows current-head checksを確認し、意味変更が検出された場合は本移動から分離して再判断する。受入後もsession I/O、background parse、height/cache、viewportの残り、settings、計測、render等を#301の残件として追跡する。revertはこの機械的移動PRを一単位で戻し、新配置に依存する後続がある場合は逆順に戻す。
