@@ -197,7 +197,27 @@ class ReversalHelperTimingTests(unittest.TestCase):
         self.assertNotIn("postToPid", source)
         self.assertIn('print("reversal_event_route=cghidEventTap")', reversal)
         self.assertIn("visibleLineNumbers(image)", reversal)
-        self.assertIn("$0 > baseline", reversal)
+        self.assertIn("preLines.min().map({ $0 > baseline }) == true", reversal)
+        self.assertIn("guard confirmedOldDirection, let confirmedPreImage = preImage else", reversal)
+        self.assertLess(
+            reversal.index("guard confirmedOldDirection"),
+            reversal.index("postScroll(pid, unit, reverseDelta)"),
+        )
+
+    def test_reversal_capture_does_not_send_input_without_baseline(self):
+        class NoHelperInteraction:
+            def run_helper(self, *_args):
+                raise AssertionError("helper must not run without a readable baseline")
+
+        frames, pre_frame, error = gui.capture_frames(
+            NoHelperInteraction(), None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-missing-scroll-baseline-test"), "lines", -8, (0, 24), 1.0,
+            reverse_delta=12, baseline=None,
+        )
+
+        self.assertEqual(frames, [])
+        self.assertIsNone(pre_frame)
+        self.assertIn("基準可視行", error)
 
     def test_normal_capture_parser_uses_same_process_timing_and_global_route(self):
         evidence = gui.parse_scroll_capture_helper_output(

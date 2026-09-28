@@ -335,6 +335,8 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
                    helper_timeout: float, reverse_delta: Optional[int] = None,
                    baseline: Optional[int] = None, first_probe_ms: int = 24,
                    probe_interval_ms: int = 12) -> tuple[list[dict], Optional[dict], Optional[str]]:
+    if reverse_delta is not None and baseline is None:
+        return [], None, "反転前の基準可視行を読み取れず、方向反転を実行できない"
     run_dir.mkdir(parents=True, exist_ok=True)
     if reverse_delta is not None:
         pre_path = run_dir / "pre-reversal.png"

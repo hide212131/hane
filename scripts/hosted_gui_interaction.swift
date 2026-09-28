@@ -783,6 +783,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     var preStarted: TimeInterval = 0
     var preCompleted: TimeInterval = 0
     var preLines: [Int] = []
+    var confirmedOldDirection = false
     let probeDeadline = firstPosted + 0.105
     while ProcessInfo.processInfo.systemUptime < probeDeadline {
         let (image, started, completed, error) = captureImageWithTimes(capture)
@@ -793,12 +794,17 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         preStarted = started
         preCompleted = completed
         preLines = visibleLineNumbers(image)
-        if preLines.contains(where: { $0 > baseline }) { break }
+        if preLines.min().map({ $0 > baseline }) == true {
+            confirmedOldDirection = true
+            break
+        }
         let nextProbe = completed + Double(probeIntervalMs) / 1000
         let remaining = min(nextProbe, probeDeadline) - ProcessInfo.processInfo.systemUptime
         if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
     }
-    guard let confirmedPreImage = preImage else { fail("no pre-reversal screen frame was captured") }
+    guard confirmedOldDirection, let confirmedPreImage = preImage else {
+        fail("old-direction movement was not visible before reversal")
+    }
     let reversePosted = postScroll(pid, unit, reverseDelta)
 
     var frames: [(Int, CGImage, TimeInterval, TimeInterval)] = []
