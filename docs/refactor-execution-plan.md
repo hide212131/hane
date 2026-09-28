@@ -359,3 +359,30 @@ filter用field一式（`sidebar_filter`、`sidebar_filter_selected_range`、`sid
 その後、CodeRabbit指摘に対するdocs-onlyの1行修正でcurrent head `aa3fab28289df649841e63ce119da493024bb4a0`（base `a810100b5b002ac5d88d70cd993a4dfc22ebfd4c`）へ進んだ。このcurrent headに対する[Actions run #36359108005](https://github.com/hide212131/hane/actions/runs/36359108005)では、macOS/Windows双方の`cargo test --workspace --all-features`と`cargo clippy --workspace --all-targets --all-features -- -D warnings`が成功し、macOS固有のfallback glyph rasterizationとinput source reactivationの2テストも成功した。このrunも`--all-features`構成のみを対象とし、通常features構成の`cargo test --workspace`は当該headに対しても未実施のまま区別する。同じcurrent head・baseを対象としたCodeRabbitのmanual full review（run ID `f63c74dd-7966-47a8-b1c0-e61688597a06`、[レビュー結果](https://github.com/hide212131/hane/pull/388#issuecomment-5857988001)）は、baseからheadまでの対象3ファイルでactionable指摘なしで完了した。Docstring Coverageは0%/80%基準に対してinconclusiveのままである。検証済みソースhead `aa3fab`は上記CI・CodeRabbit full reviewの対象であり、それに続く本節（9.9節）へのこの追記自体はdocs-onlyであって、`aa3fab`をさらに変更するものではない。この記録以降にheadが進んだ場合も、以前のpending表現へ戻さず、その時点のCommanderの観測結果を検証時点のheadとともに追記する。
 
 通常features構成の追加検証は、macOSのclean checkout・実装commit `5440fcecaf22cf23b172f7ee9f1dd4eeee1cfa15`を対象に、Rust 1.98.1で`cargo test --workspace -- --test-threads=1`を実行し、全workspaceのunit/integration/doc testsが成功した（`hane-ai` runtime_lifecycle 19件、`hane-ui` view 213件を含む）。同じtoolchainで通常の並列test harnessによる`cargo test --workspace`も2回試したが、変更対象外の`crates/ai/tests/runtime_lifecycle.rs`で不安定な失敗があり、初回は19件中2件、再試行は`owner_lock_blocks_a_second_owner_and_releases_after_drop`の1件が失敗した。test-threadを直列化した結果は成功し、各テスト内部で起動する並行処理の検証は維持されている。Rust 1.93.1のHomebrew toolchainでは依存crateの`std::hint::cold_path`をコンパイルできなかったため、上記結果はrustup toolchain 1.98.1で採取した。
+
+
+### 9.10 RF2-A: EditorView機械的分割 第3PR — viewport scroll / zoom 分離（#301）
+
+Issue [#389](https://github.com/hide212131/hane/issues/389) のホイールスクロール慣性を実装する前提として、メインエディタの通常スクロールとzoom入力の既存実装を、挙動を変えずに `crates/ui/src/view/viewport.rs` へ移す。基準 `main` は `e4a47e303445958e656e78f839ee54e086ea2495`（PR #388 merge commit）。このPRには#389の慣性state・減衰式・入力分類を含めない。
+
+**旧→新シンボル対応**（旧はいずれも `crates/ui/src/view.rs`、新はいずれも `crates/ui/src/view/viewport.rs` の `impl EditorView`）
+
+| シンボル | 新配置での可視性 | 理由 |
+| --- | --- | --- |
+| `scrollable_content_height` | `pub(super)` | 親 `view.rs` のrender・height clampから呼ぶため |
+| `zoom_anchor_at` | `pub(super)` | viewport内部に加え既存 `view::tests` が直接検証するため |
+| `set_zoom_from_raw` | 非公開 | viewport内部だけで使用 |
+| `set_zoom` | `pub(super)` | `reset_zoom` と既存 `view::tests` から使用 |
+| `apply_zoom_factor` | 非公開 | viewport内部だけで使用 |
+| `apply_direct_zoom_factor` | `pub(super)` | pinch処理と既存testから使用 |
+| `queue_wheel_zoom_factor` | `pub(super)` | wheel処理と既存testから使用 |
+| `step_wheel_zoom_animation` | `pub(super)` | 親renderが各frame開始時に呼ぶため |
+| `reset_zoom` | `pub(crate)`（変更なし） | actions側の既存APIを維持 |
+| `scroll_y_for_zoom_anchor` | `pub(super)` | 親renderのanchor適用と既存testから使用 |
+| `on_scroll` / `on_pinch` | `pub(super)` | 親renderのevent listenerから使用 |
+
+親 `view.rs` には `mod viewport;` を追加する。zoomのheight/cache連携である `rebuild_height_estimates` / `invalidate_layout_font_revision`、`EditorView` のfield、`PendingZoomAnchor` / `WheelZoomAnimation`、純粋なscroll/zoom計算helperは所有権を変えない。カーソル追従、row hit-test、editor/sidebar scrollbar drag、sidebar resize、selection autoscrollも今回の移動対象外とする。
+
+通常ホイールは従来どおり受け取ったdeltaを即時に `scroll_y` へ反映する。Ctrl/Cmd+wheelのtarget accumulation、display-linked interpolation、pinch takeover、100% snap、zoom anchor、animation中にdocument-wide height indexを毎frame再構築しない条件をそのまま保つ。既存testの名前・assert・件数は変更しない。
+
+検証は `cargo test --workspace`、`cargo test --workspace --all-features`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` と current head のmacOS/Windows CIを確認する。特にwheel zoom queue/reverse、plain wheelとの役割分担、pinch takeover、zoom anchor、scroll clampの既存回帰を維持する。CI結果とexact headはPR側で追記する。
