@@ -12496,6 +12496,19 @@ mod tests {
             .velocity;
         assert!(forward_velocity > 0.0, "{forward_velocity}");
 
+        // `queue_scroll_inertia`'s immediate step is now sized off the real
+        // time since the coast's own last frame instead of a fixed nominal
+        // duration (issue #389), so pin that gap to "just now" here. That
+        // keeps this test's exact-equality assertion below deterministic
+        // regardless of how long the test harness itself took between the
+        // two `on_scroll` calls, while still exercising the same replace
+        // path a real, promptly-delivered reversal would take.
+        view.update(cx, |view, _| {
+            if let Some(inertia) = view.scroll_inertia.as_mut() {
+                inertia.last_frame = Instant::now();
+            }
+        });
+
         // Scrolling the other way must cancel the old coast immediately
         // instead of fighting it.
         view.update_in(cx, |view, window, cx| {
@@ -12574,6 +12587,98 @@ mod tests {
         assert!(
             reversed_velocity < 0.0,
             "reversing must not drag the accumulated forward velocity along: {reversed_velocity}"
+        );
+    }
+
+    #[gpui::test]
+    fn reversing_wheel_direction_after_a_delayed_event_moves_promptly_instead_of_staying_flat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue #389: a real reversal input does not always land exactly one
+        // nominal animation frame after the old coast's last step; delivery
+        // can lag noticeably (e.g. under system load). `queue_scroll_inertia`
+        // must fold that whole real gap into its own synchronous immediate
+        // step instead of only ever advancing by one nominal frame's worth,
+        // or the screen would still read as unchanged in the new direction
+        // for several subsequent frames after a hard reversal.
+        let text = (1..=600)
+            .map(|n| format!("line {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+        let forward = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, -8.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let reverse = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0.0, 12.0)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        };
+        let expected_reverse_delta =
+            -f32::from(reverse.delta.pixel_delta(px(view.read_with(cx, |view, _| view.line_height()))).y);
+        assert!(expected_reverse_delta < 0.0, "{expected_reverse_delta}");
+
+        // Prime well away from the document start (and, with 600 lines,
+        // nowhere near its end either) so the reversal below moves freely
+        // instead of clamping at an edge, which would make the assertions
+        // below indistinguishable from a genuine prompt-movement failure.
+        view.update_in(cx, |view, window, cx| {
+            for _ in 0..10 {
+                view.on_scroll(&forward, window, cx);
+            }
+        });
+        view.update(cx, |view, _| {
+            for _ in 0..64 {
+                let Some(inertia) = view.scroll_inertia.as_mut() else {
+                    break;
+                };
+                inertia.last_frame -= Duration::from_millis(16);
+                view.advance_scroll_inertia();
+            }
+        });
+        assert!(view.read_with(cx, |view, _| view.scroll_inertia.is_none()));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&forward, window, cx);
+        });
+        let before = view.read_with(cx, |view, _| view.scroll_y);
+
+        // Simulate the reversal event landing well after the old coast's own
+        // last recorded frame, the same gap `step_scroll_inertia` would
+        // otherwise need several real animation frames to close.
+        view.update(cx, |view, _| {
+            let inertia = view
+                .scroll_inertia
+                .as_mut()
+                .expect("forward scroll must arm inertia");
+            inertia.last_frame -= Duration::from_millis(120);
+        });
+
+        let after = view.update_in(cx, |view, window, cx| {
+            view.on_scroll(&reverse, window, cx);
+            view.scroll_y
+        });
+
+        let moved = after - before;
+        assert!(moved < 0.0, "before={before}, after={after}");
+        // A 120ms-old coast is most of the way through its three-time-constant
+        // (~135ms) window, so the reversal's own synchronous catch-up step
+        // must already cover most of its own total distance here, not the
+        // roughly 17% a fixed one-nominal-frame step would apply.
+        assert!(
+            moved.abs() > 0.5 * expected_reverse_delta.abs(),
+            "reversal must move promptly, not stay flat: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
+        );
+        assert!(
+            moved.abs() <= expected_reverse_delta.abs() + 1.0,
+            "reversal must not overshoot its own total coast distance: moved={moved}, \
+             expected_reverse_delta={expected_reverse_delta}"
         );
     }
 

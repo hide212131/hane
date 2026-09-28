@@ -240,16 +240,35 @@ impl EditorView {
     /// checks via `ScrollInertia::last_applied`), replaces the velocity
     /// outright instead, so it cancels immediately rather than fighting or
     /// inheriting a coast it should not be combined with.
+    ///
+    /// The immediate step below is sized off how long it has actually been
+    /// since a live coast last touched `scroll_y` (`ScrollInertia::last_frame`),
+    /// not a fixed nominal frame duration, so a reversal that arrives well
+    /// after the previous coast's last rendered step (a real input event can
+    /// land noticeably later than the animation-frame cadence, e.g. under
+    /// system load) folds that whole gap into this one synchronous call
+    /// instead of only ever advancing by one nominal frame's worth and
+    /// leaving the rest to animation frames that may be delayed (issue #389:
+    /// the old direction's coast could otherwise still read as unchanged for
+    /// several frames after a hard reversal). A brand new coast, with no
+    /// prior `ScrollInertia` to measure a gap against, still uses the nominal
+    /// `SCROLL_INERTIA_MIN_FRAME_TIME` for its own first step.
     pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
-        let velocity = match self.scroll_inertia {
-            Some(inertia)
-                if self.scroll_y == inertia.last_applied && inertia.velocity * velocity > 0.0 =>
-            {
-                inertia.velocity + velocity
+        let (velocity, elapsed) = match self.scroll_inertia {
+            Some(inertia) => {
+                let elapsed = Instant::now().saturating_duration_since(inertia.last_frame);
+                let velocity = if self.scroll_y == inertia.last_applied
+                    && inertia.velocity * velocity > 0.0
+                {
+                    inertia.velocity + velocity
+                } else {
+                    velocity
+                };
+                (velocity, elapsed)
             }
-            _ => velocity,
+            None => (velocity, SCROLL_INERTIA_MIN_FRAME_TIME),
         };
-        match eased_scroll_inertia_step(velocity, SCROLL_INERTIA_MIN_FRAME_TIME) {
+        match eased_scroll_inertia_step(velocity, elapsed) {
             Some((distance, next_velocity)) => {
                 self.scroll_y = clamp_scroll_y(
                     self.scroll_y + distance,
