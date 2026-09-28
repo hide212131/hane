@@ -219,7 +219,18 @@ impl AiSettingsStore {
     pub fn load(&self) -> io::Result<AiSettings> {
         match read_to_string_if_exists(&self.path)? {
             Some(contents) => {
-                serde_json::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                let settings: AiSettings = serde_json::from_str(&contents)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if settings.schema_version > AI_SETTINGS_SCHEMA_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "AI settings file has schema_version {}, which is newer than the highest version {} this build supports",
+                            settings.schema_version, AI_SETTINGS_SCHEMA_VERSION
+                        ),
+                    ));
+                }
+                Ok(settings)
             }
             None => Ok(AiSettings::default()),
         }
@@ -353,6 +364,42 @@ mod tests {
         let (store, _owner) = store("defaults");
         let loaded = store.load().unwrap();
         assert_eq!(loaded, AiSettings::default());
+    }
+
+    /// Regression coverage for the root cause behind `load` accepting a
+    /// settings file written by a future build with a newer schema: this
+    /// process must not guess at fields it does not understand, so it must
+    /// fail closed rather than silently proceeding with a possibly
+    /// misinterpreted `AiSettings`.
+    #[test]
+    fn load_rejects_a_future_schema_version() {
+        let (store, _owner) = store("future_schema_version");
+        let future = serde_json::json!({
+            "schema_version": AI_SETTINGS_SCHEMA_VERSION + 1,
+            "revision": 0,
+            "settings_generation": 0,
+            "active_connection": "chatgpt",
+            "chatgpt": {},
+        });
+        std::fs::write(store.path(), serde_json::to_vec_pretty(&future).unwrap()).unwrap();
+
+        let err = store.load().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(message.contains(&(AI_SETTINGS_SCHEMA_VERSION + 1).to_string()));
+        assert!(message.contains(&AI_SETTINGS_SCHEMA_VERSION.to_string()));
+    }
+
+    #[test]
+    fn load_accepts_the_current_schema_version() {
+        let (store, owner) = store("current_schema_version");
+        let mut settings = AiSettings::default();
+        settings.chatgpt.model_id = Some("gpt-test".to_string());
+        store.save(&owner, 0, settings.clone(), always_empty_journal).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.schema_version, AI_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(loaded.chatgpt.model_id, settings.chatgpt.model_id);
     }
 
     #[test]
