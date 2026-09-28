@@ -12577,21 +12577,24 @@ mod tests {
 
         // `queue_scroll_inertia`'s immediate step for a *live, already
         // in-flight* coast is sized off the real time since that coast's own
-        // last frame (issue #389), so pin that gap to "just now" here. That
-        // keeps this test's assertion below deterministic regardless of how
-        // long the test harness itself took between the two `on_scroll`
-        // calls, while still exercising the same replace path a real,
-        // promptly-delivered reversal would take.
-        view.update(cx, |view, _| {
+        // last frame (issue #389). Pin `last_frame` and the reversal's own
+        // "now" to the exact same `Instant`, read once inside a single
+        // closure, via `on_scroll_at` (see its doc comment), so the elapsed
+        // gap this test exercises is exactly zero — and thus deterministically
+        // floored to `SCROLL_INERTIA_MIN_FRAME_TIME` below — instead of
+        // depending on how long the test harness itself takes between two
+        // separate `Instant::now()` reads (which can exceed
+        // `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI runner). This still
+        // exercises the same replace path a real, promptly-delivered
+        // reversal would take.
+        view.update_in(cx, |view, _window, cx| {
+            let now = Instant::now();
             if let Some(inertia) = view.scroll_inertia.as_mut() {
-                inertia.last_frame = Instant::now();
+                inertia.last_frame = now;
             }
-        });
-
-        // Scrolling the other way must cancel the old coast immediately
-        // instead of fighting it.
-        view.update_in(cx, |view, window, cx| {
-            view.on_scroll(&reverse_event, window, cx);
+            // Scrolling the other way must cancel the old coast immediately
+            // instead of fighting it.
+            view.on_scroll_at(&reverse_event, now, cx);
         });
         let reversed_velocity = view
             .read_with(cx, |view, _| view.scroll_inertia)
@@ -12599,7 +12602,7 @@ mod tests {
             .velocity;
         assert!(reversed_velocity < 0.0, "{reversed_velocity}");
         // Replacing, not accumulating, means the result depends only on the
-        // reversal's own input velocity and the real (here, near-zero, so
+        // reversal's own input velocity and the (here, exactly zero, so
         // floored to `SCROLL_INERTIA_MIN_FRAME_TIME`) gap since the old
         // coast's last touch, not on `forward_velocity`'s already-decayed
         // remainder. `forward_velocity` itself now uses the larger, distinct

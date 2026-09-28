@@ -178,6 +178,19 @@ impl EditorView {
     }
 
     pub(super) fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.on_scroll_at(event, Instant::now(), cx);
+    }
+
+    /// Same as `on_scroll`, but takes the "now" instant that a live coast's
+    /// elapsed gap is measured against explicitly instead of reading
+    /// `Instant::now()` internally. `on_scroll` always passes a fresh
+    /// `Instant::now()`, so production behavior is unchanged; this split
+    /// only exists so tests can pin that instant themselves (see
+    /// `queue_scroll_inertia`'s doc comment) instead of depending on how
+    /// long the test harness takes between two separate real-clock reads,
+    /// which can exceed `SCROLL_INERTIA_MIN_FRAME_TIME` on a loaded CI
+    /// runner and make the decay this measures nondeterministic.
+    pub(super) fn on_scroll_at(&mut self, event: &ScrollWheelEvent, now: Instant, cx: &mut Context<Self>) {
         if event.modifiers.secondary() {
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
             let window_offset = f32::from(event.position.y) - self.theme.header_height;
@@ -194,7 +207,7 @@ impl EditorView {
                 // inertial movement matches a single plain scroll of this
                 // delta instead of doubling it (issue #389).
                 let velocity = scroll_inertia_velocity_for_lines_delta(scroll_delta);
-                self.queue_scroll_inertia(velocity, cx);
+                self.queue_scroll_inertia_at(velocity, now, cx);
             }
             ScrollDelta::Pixels(_) => {
                 self.scroll_y = clamp_scroll_y(
@@ -260,9 +273,21 @@ impl EditorView {
     /// latency left it reading as unchanged on the actual first frame drawn
     /// (issue #389's first-response regression).
     pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
+        self.queue_scroll_inertia_at(velocity, Instant::now(), cx);
+    }
+
+    /// Same as `queue_scroll_inertia`, but takes the "now" instant used both
+    /// to measure the elapsed gap since a live coast's `last_frame` and to
+    /// stamp the new `last_frame` explicitly, instead of reading
+    /// `Instant::now()` internally (twice). `queue_scroll_inertia` always
+    /// passes a fresh `Instant::now()`, so production behavior is
+    /// unchanged; this split exists purely as a test seam, so a test can
+    /// pin that instant itself rather than depending on wall-clock time
+    /// actually elapsing between separate real-clock reads.
+    pub(super) fn queue_scroll_inertia_at(&mut self, velocity: f32, now: Instant, cx: &mut Context<Self>) {
         let (velocity, elapsed) = match self.scroll_inertia {
             Some(inertia) => {
-                let elapsed = Instant::now().saturating_duration_since(inertia.last_frame);
+                let elapsed = now.saturating_duration_since(inertia.last_frame);
                 let velocity = if self.scroll_y == inertia.last_applied
                     && inertia.velocity * velocity > 0.0
                 {
@@ -283,7 +308,7 @@ impl EditorView {
                 );
                 self.scroll_inertia = Some(ScrollInertia {
                     velocity: next_velocity,
-                    last_frame: Instant::now(),
+                    last_frame: now,
                     last_applied: self.scroll_y,
                 });
             }
