@@ -61,6 +61,13 @@
 //!   `OWNER_LOCK_BUSY` to stdout, and exits immediately. Used to verify the
 //!   runtime owner lock is exclusive across real processes, not just across
 //!   handles within one process.
+//! - `FAKE_SERVER_RECORD_ENV_FILE=<path>`: on startup, records the value of
+//!   every environment variable named in `FAKE_SERVER_RECORD_ENV_VARS`
+//!   (comma-separated) as `ENV:<name>=<value>` (or `ENV:<name>:<absent>` if
+//!   unset), one line per variable. Used to verify a Custom Provider API key
+//!   placed in `RuntimeConfig::extra_env` actually reaches this child
+//!   process's own environment end-to-end through `AiRuntime`, without
+//!   requiring a real Codex binary or a real HTTP call.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -77,6 +84,18 @@ fn main() {
         }
         let _ = io::stdout().flush();
         return;
+    }
+
+    if let (Ok(path), Ok(names)) = (
+        env::var("FAKE_SERVER_RECORD_ENV_FILE"),
+        env::var("FAKE_SERVER_RECORD_ENV_VARS"),
+    ) {
+        for name in names.split(',').filter(|n| !n.is_empty()) {
+            match env::var(name) {
+                Ok(value) => append_record(&path, &format!("ENV:{name}={value}")),
+                Err(_) => append_record(&path, &format!("ENV:{name}:<absent>")),
+            }
+        }
     }
 
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
