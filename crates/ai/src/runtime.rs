@@ -807,9 +807,12 @@ fn run_coordinator(
                 // `f` is caller-supplied and runs synchronously on this
                 // coordinator thread; a panic inside it must not unwind this
                 // thread, which would tear down `current`/`owner_guard`
-                // (and, per `Drop`, kill any active child) mid-lifecycle
-                // while leaving the owner lock's underlying file handle
-                // silently unlocked. Catch it here so a panicking callback
+                // mid-lifecycle. Dropping `Child` does not kill the process
+                // (see `CoordinatorMessage::Shutdown` below), so an active
+                // child could keep running while `owner_guard`'s drop
+                // releases the owner lock's underlying file handle, letting
+                // another process observe the lock as free and start a
+                // second instance concurrently. Catch it here so a panicking callback
                 // only fails its own `with_owner_lock` call (the caller sees
                 // `CoordinatorUnavailable`, since the reply `tx` inside `f`
                 // is dropped without sending — see `AiRuntime::with_owner_lock`)
