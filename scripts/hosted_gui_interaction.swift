@@ -682,72 +682,163 @@ func milliseconds(_ seconds: TimeInterval) -> String {
     String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), seconds * 1000)
 }
 
-func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                   _ reverseDelta: Int32, _ gapMs: Int, _ windowID: CGWindowID,
-                   _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
-    // The compiled helper is a command-line process. Initialize AppKit's
-    // connection to the window server before ScreenCaptureKit requests images.
+func captureImageWithTimes(_ capture: WindowCapture) -> (CGImage?, TimeInterval, TimeInterval, String?) {
+    let started = ProcessInfo.processInfo.systemUptime
+    let (image, error) = captureWindowImage(capture)
+    let completed = ProcessInfo.processInfo.systemUptime
+    return (image, started, completed, error)
+}
+
+func visibleLineNumbers(_ image: CGImage) -> [Int] {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .fast
+    request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["en-US"]
+    do {
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+    } catch {
+        fail("could not inspect captured scroll frame: \(error)")
+    }
+    let pattern = try! NSRegularExpression(pattern: #"\bLINE\s+(\d+)\b"#, options: [.caseInsensitive])
+    return (request.results ?? []).compactMap { observation in
+        guard let candidate = observation.topCandidates(1).first else { return nil }
+        let text = candidate.string as NSString
+        let range = NSRange(location: 0, length: text.length)
+        guard let match = pattern.firstMatch(in: candidate.string, range: range),
+              let numberRange = Range(match.range(at: 1), in: candidate.string) else { return nil }
+        return Int(candidate.string[numberRange])
+    }.sorted()
+}
+
+func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
+    // ScreenCaptureKit setup and first-use framework latency must stay outside
+    // the timed input-to-frame interval.
     _ = NSApplication.shared
     let (preparedCapture, captureError) = prepareWindowCapture(windowID)
     guard captureError == nil else {
         fail("could not prepare ScreenCaptureKit: \(captureError ?? "unknown error")")
     }
     guard let capture = preparedCapture else { fail("ScreenCaptureKit returned no capture context") }
-    // Warm ScreenCaptureKit before the timed interaction so framework startup
-    // cannot consume the app's inertia window.
-    let (warmImage, warmError) = captureWindowImage(capture)
+    let (warmImage, warmStarted, warmCompleted, warmError) = captureImageWithTimes(capture)
     guard warmImage != nil else { fail("ScreenCaptureKit preflight failed: \(warmError ?? "unknown error")") }
+    guard warmCompleted >= warmStarted else { fail("ScreenCaptureKit warmup timing was invalid") }
+    return capture
+}
+
+func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
+                  _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int]) {
+    let capture = prepareWindowCaptureContext(windowID)
+    let commandStarted = ProcessInfo.processInfo.systemUptime
+    let eventPosted = postScroll(pid, unit, delta)
+    guard eventPosted >= commandStarted else { fail("scroll event timing was invalid") }
+
+    var frames: [(Int, CGImage, TimeInterval, TimeInterval)] = []
+    for (index, delayMs) in frameDelays.enumerated() {
+        let deadline = eventPosted + Double(delayMs) / 1000
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+        let (image, started, completed, error) = captureImageWithTimes(capture)
+        guard let image else {
+            fail("could not capture scroll frame \(index): \(error ?? "unknown error")")
+        }
+        frames.append((index, image, started, completed))
+    }
+
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    for (index, image, _, _) in frames {
+        let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "frame-%02d.png", index)).path
+        writeWindowImage(image, path: path)
+    }
+    print("event_route=cghidEventTap")
+    print("event_post_elapsed_ms=\(milliseconds(eventPosted - commandStarted))")
+    for (index, _, started, completed) in frames {
+        print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(started - eventPosted))
+        print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(completed - eventPosted))
+    }
+}
+
+func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
+                   _ reverseDelta: Int32, _ baseline: Int, _ firstProbeMs: Int,
+                   _ probeIntervalMs: Int, _ windowID: CGWindowID,
+                   _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
+    guard firstProbeMs > 0, probeIntervalMs > 0 else { fail("reversal probe intervals must be positive") }
+    let capture = prepareWindowCaptureContext(windowID)
 
     let commandStarted = ProcessInfo.processInfo.systemUptime
     // Keep both reversal-probe inputs on the same global Quartz event path as
     // the other GUI scenarios, including normal window-server target routing.
     let firstPosted = postScroll(pid, unit, delta)
-    Thread.sleep(forTimeInterval: Double(gapMs) / 1000)
+    let firstProbeDeadline = firstPosted + Double(firstProbeMs) / 1000
+    let firstProbeRemaining = firstProbeDeadline - ProcessInfo.processInfo.systemUptime
+    if firstProbeRemaining > 0 { Thread.sleep(forTimeInterval: firstProbeRemaining) }
 
-    // Grab the pre-reversal state in memory so screenshot encoding and disk I/O
-    // do not consume the app's short inertia window before the opposite input.
-    let (preImage, preImageError) = captureWindowImage(capture)
-    guard let preImage else {
-        fail("could not capture pre-reversal window frame: \(preImageError ?? "unknown error")")
+    // Wait for an old-direction frame before reversing. This makes the
+    // reversal scenario measure response to a visible Lines movement instead
+    // of sending both events before the first one reaches the screen.
+    var preImage: CGImage?
+    var preStarted: TimeInterval = 0
+    var preCompleted: TimeInterval = 0
+    var preLines: [Int] = []
+    let probeDeadline = firstPosted + 0.105
+    while ProcessInfo.processInfo.systemUptime < probeDeadline {
+        let (image, started, completed, error) = captureImageWithTimes(capture)
+        guard let image else {
+            fail("could not capture pre-reversal window frame: \(error ?? "unknown error")")
+        }
+        preImage = image
+        preStarted = started
+        preCompleted = completed
+        preLines = visibleLineNumbers(image)
+        if preLines.contains(where: { $0 > baseline }) { break }
+        let nextProbe = completed + Double(probeIntervalMs) / 1000
+        let remaining = min(nextProbe, probeDeadline) - ProcessInfo.processInfo.systemUptime
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
     }
-    let preCaptured = ProcessInfo.processInfo.systemUptime
+    guard let confirmedPreImage = preImage else { fail("no pre-reversal screen frame was captured") }
     let reversePosted = postScroll(pid, unit, reverseDelta)
 
-    var frames: [(Int, CGImage, TimeInterval)] = []
+    var frames: [(Int, CGImage, TimeInterval, TimeInterval)] = []
     for (index, delayMs) in frameDelays.enumerated() {
         let deadline = reversePosted + Double(delayMs) / 1000
         let remaining = deadline - ProcessInfo.processInfo.systemUptime
         if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
-        let (image, error) = captureWindowImage(capture)
+        let (image, started, completed, error) = captureImageWithTimes(capture)
         guard let image else {
             fail("could not capture post-reversal window frame \(index): \(error ?? "unknown error")")
         }
-        frames.append((index, image, ProcessInfo.processInfo.systemUptime))
+        frames.append((index, image, started, completed))
     }
 
-    writeWindowImage(preImage, path: prePath)
+    writeWindowImage(confirmedPreImage, path: prePath)
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
     )
-    for (index, image, _) in frames {
+    for (index, image, _, _) in frames {
         let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
             .appendingPathComponent(String(format: "frame-%02d.png", index)).path
         writeWindowImage(image, path: path)
     }
 
     print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
-    print("pre_reverse_capture_elapsed_ms=\(milliseconds(preCaptured - commandStarted))")
+    print("pre_reverse_capture_started_elapsed_ms=\(milliseconds(preStarted - commandStarted))")
+    print("pre_reverse_capture_completed_elapsed_ms=\(milliseconds(preCompleted - commandStarted))")
+    print("pre_reverse_visible_lines=\(preLines.map(String.init).joined(separator: ","))")
     print("reversal_event_route=cghidEventTap")
     print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
-    for (index, _, capturedAt) in frames {
-        print(String(format: "frame_%02d_elapsed_ms=", index) + milliseconds(capturedAt - reversePosted))
+    for (index, _, started, completed) in frames {
+        print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(started - reversePosted))
+        print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(completed - reversePosted))
     }
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|wheel-capture|wheel-reversal|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -768,24 +859,41 @@ case "wheel-event":
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]) else { fail("wheel-event requires PID, lines|pixels and delta") }
     postScroll(pid, scrollUnit(arguments[2]), delta)
+case "wheel-capture":
+    guard arguments.count == 7,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]),
+          let windowID = UInt32(arguments[4]) else {
+        fail("wheel-capture requires PID, lines|pixels, delta, window ID, frame directory and comma-separated delays")
+    }
+    let frameDelays = arguments[6].split(separator: ",").compactMap { Int($0) }
+    guard !frameDelays.isEmpty,
+          frameDelays.first == 0,
+          frameDelays == frameDelays.sorted(),
+          frameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
+        fail("wheel-capture frame delays must be ascending milliseconds beginning at 0")
+    }
+    wheelCapture(pid, scrollUnit(arguments[2]), delta, windowID, arguments[5], frameDelays)
 case "wheel-reversal":
-    guard arguments.count == 10,
+    guard arguments.count == 12,
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]),
           let reverseDelta = Int32(arguments[4]),
-          let gapMs = Int(arguments[5]), gapMs > 0,
-          let windowID = UInt32(arguments[6]) else {
-        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, gap ms, window ID, pre-image path, frame directory and comma-separated delays")
+          let baseline = Int(arguments[5]),
+          let firstProbeMs = Int(arguments[6]), firstProbeMs > 0,
+          let probeIntervalMs = Int(arguments[7]), probeIntervalMs > 0,
+          let windowID = UInt32(arguments[8]) else {
+        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, baseline line, first probe ms, probe interval ms, window ID, pre-image path, frame directory and comma-separated delays")
     }
-    let frameDelays = arguments[9].split(separator: ",").compactMap { Int($0) }
+    let frameDelays = arguments[11].split(separator: ",").compactMap { Int($0) }
     guard !frameDelays.isEmpty,
           frameDelays.first == 0,
           frameDelays == frameDelays.sorted(),
           frameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
         fail("wheel-reversal frame delays must be ascending milliseconds beginning at 0")
     }
-    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, gapMs,
-                  windowID, arguments[7], arguments[8], frameDelays)
+    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, baseline,
+                  firstProbeMs, probeIntervalMs, windowID, arguments[9], arguments[10], frameDelays)
 case "current-source":
     print(currentSourceID())
 case "activate":
