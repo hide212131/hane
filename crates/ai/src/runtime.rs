@@ -907,10 +907,10 @@ fn do_start(
     // else: a guard acquired against a different path must be rejected
     // outright, never silently accepted (and possibly carried into
     // `owner_guard`) as if it were equivalent proof.
-    if let Some(external) = &external_owner {
-        if external.path() != config.owner_lock_path {
-            return Some(Err(RuntimeError::OwnerLockPathMismatch));
-        }
+    if let Some(external) = &external_owner
+        && external.path() != config.owner_lock_path
+    {
+        return Some(Err(RuntimeError::OwnerLockPathMismatch));
     }
 
     if current.is_some() {
