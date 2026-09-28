@@ -84,7 +84,7 @@ class DirectionReversalTests(unittest.TestCase):
     def test_accepts_prompt_opposite_direction(self):
         result = gui.evaluate_reversal(100, 108, frames([107, 105, 102, 100, 99, 99],
                                         [5, 24, 48, 80, 120, 180]),
-                                        elapsed_through_reverse_post_ms=90)
+                                        initial_to_reverse_event_ms=90)
         self.assertEqual(result["result"], "pass")
         self.assertTrue(result["old_direction_started"])
         self.assertTrue(result["prompt"])
@@ -94,7 +94,7 @@ class DirectionReversalTests(unittest.TestCase):
     def test_rejects_old_direction_after_reversal(self):
         result = gui.evaluate_reversal(100, 108, frames([110, 109, 106, 104, 103, 103],
                                         [5, 24, 48, 80, 120, 180]),
-                                        elapsed_through_reverse_post_ms=90)
+                                        initial_to_reverse_event_ms=90)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["prompt"])
         self.assertFalse(result["no_old_coast"])
@@ -102,7 +102,7 @@ class DirectionReversalTests(unittest.TestCase):
     def test_blocks_when_capture_delays_reversal_past_inertia_window(self):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
-            elapsed_through_reverse_post_ms=136,
+            initial_to_reverse_event_ms=136,
         )
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(result["inertia_window_ms"], gui.LINES_INERTIA_WINDOW_MS)
@@ -110,9 +110,43 @@ class DirectionReversalTests(unittest.TestCase):
     def test_blocks_when_reversal_timing_is_unavailable(self):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
-            elapsed_through_reverse_post_ms=None,
+            initial_to_reverse_event_ms=None,
         )
         self.assertEqual(result["result"], "blocked")
+
+
+class ReversalHelperTimingTests(unittest.TestCase):
+    def test_parses_event_interval_and_frame_times(self):
+        evidence = gui.parse_reversal_helper_output(
+            "initial_event_elapsed_ms=2.000\n"
+            "pre_reverse_capture_elapsed_ms=37.500\n"
+            "reverse_event_elapsed_ms=40.250\n"
+            "frame_00_elapsed_ms=4.100\n"
+            "frame_01_elapsed_ms=25.000\n",
+            expected_frames=2,
+        )
+        self.assertEqual(evidence["initial_to_reverse_event_ms"], 38.25)
+        self.assertEqual(evidence["pre_reverse_capture_after_initial_ms"], 35.5)
+        self.assertEqual(evidence["frame_elapsed_ms"], [4.1, 25.0])
+
+    def test_rejects_out_of_order_pre_reversal_capture(self):
+        with self.assertRaisesRegex(ValueError, "out of order"):
+            gui.parse_reversal_helper_output(
+                "initial_event_elapsed_ms=2\n"
+                "pre_reverse_capture_elapsed_ms=8\n"
+                "reverse_event_elapsed_ms=7\n"
+                "frame_00_elapsed_ms=3\n",
+                expected_frames=1,
+            )
+
+    def test_rejects_missing_frame_timing(self):
+        with self.assertRaisesRegex(ValueError, "frame_00_elapsed_ms"):
+            gui.parse_reversal_helper_output(
+                "initial_event_elapsed_ms=2\n"
+                "pre_reverse_capture_elapsed_ms=8\n"
+                "reverse_event_elapsed_ms=9\n",
+                expected_frames=1,
+            )
 
 
 class PixelsDirectFollowTests(unittest.TestCase):
