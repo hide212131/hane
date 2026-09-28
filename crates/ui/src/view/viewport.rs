@@ -185,12 +185,71 @@ impl EditorView {
             return;
         }
         let delta = event.delta.pixel_delta(px(self.line_height()));
+        let scroll_delta = -f32::from(delta.y);
         self.scroll_y = clamp_scroll_y(
-            self.scroll_y - f32::from(delta.y),
+            self.scroll_y + scroll_delta,
             self.scrollable_content_height(),
             self.viewport_height,
         );
+        match event.delta {
+            ScrollDelta::Lines(_) => {
+                let velocity = scroll_inertia_velocity_for_lines_delta(scroll_delta);
+                self.queue_scroll_inertia(velocity, cx);
+            }
+            ScrollDelta::Pixels(_) => {
+                // The OS already supplies trackpad momentum for pixel deltas;
+                // layering the app's own inertia on top would double it and
+                // fight direct tracking as the OS event stream itself
+                // decelerates.
+                self.scroll_inertia = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Starts or replaces the short post-wheel inertia that continues a
+    /// plain `ScrollDelta::Lines` scroll after the input stops (issue #389).
+    /// Each new event replaces rather than accumulates the velocity, so
+    /// scrolling the other way cancels the previous coast immediately
+    /// instead of fighting it.
+    pub(super) fn queue_scroll_inertia(&mut self, velocity: f32, cx: &mut Context<Self>) {
+        self.scroll_inertia = Some(ScrollInertia {
+            velocity,
+            last_frame: Instant::now(),
+            last_applied: self.scroll_y,
+        });
         cx.notify();
+    }
+
+    /// Runs once per requested animation frame, before `render`'s own
+    /// `scroll_y` clamp (which also bounds whatever this step adds, so
+    /// inertia can never carry the position past a document edge or survive
+    /// a viewport-height remeasurement that clamped it away). Stops silently
+    /// the moment something else has moved `scroll_y` since the last step
+    /// (see `ScrollInertia::last_applied`), so stale wheel momentum never
+    /// overwrites cursor-follow, selection autoscroll, a scrollbar drag, a
+    /// document switch, zoom, or a pinch.
+    pub(super) fn step_scroll_inertia(&mut self, window: &Window) {
+        let Some(mut inertia) = self.scroll_inertia else {
+            return;
+        };
+        if self.scroll_y != inertia.last_applied {
+            self.scroll_inertia = None;
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(inertia.last_frame);
+        let Some((distance, next_velocity)) = eased_scroll_inertia_step(inertia.velocity, elapsed)
+        else {
+            self.scroll_inertia = None;
+            return;
+        };
+        self.scroll_y += distance;
+        inertia.velocity = next_velocity;
+        inertia.last_frame = now;
+        inertia.last_applied = self.scroll_y;
+        self.scroll_inertia = Some(inertia);
+        window.request_animation_frame();
     }
 
     /// macOS trackpad pinch. `event.delta` is the incremental scale
