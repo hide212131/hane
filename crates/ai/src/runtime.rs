@@ -563,6 +563,27 @@ impl AiRuntime {
     /// file. Serialized with every other lifecycle command on the same
     /// coordinator thread, so `f` can never observe the guard disappearing
     /// partway through.
+    ///
+    /// `f` runs directly on the coordinator thread, before any later queued
+    /// lifecycle command: calling `start`/`stop`/`restart`/`reconfigure`/
+    /// `start_with_owner_lock`/`shutdown` (or another `with_owner_lock`) on
+    /// *this same* `AiRuntime` from inside `f` deadlocks, because each of
+    /// those blocks its caller waiting for a reply the coordinator can only
+    /// send after it finishes processing `f` — which cannot happen while `f`
+    /// is itself blocked waiting for that reply. Only call such methods on a
+    /// *different* `AiRuntime` from inside `f`, or defer the call until
+    /// after `with_owner_lock` returns.
+    ///
+    /// If `f` panics, that panic is caught on the coordinator thread — it
+    /// does not propagate to the caller of `with_owner_lock`, does not
+    /// unwind (and therefore does not tear down) the coordinator thread, and
+    /// leaves `current`/`owner_guard` exactly as they were, so this
+    /// runtime's state (e.g. an already-`Ready` child and its held owner
+    /// lock) and every later queued lifecycle command are unaffected. The
+    /// panicking call itself returns `Err(RuntimeError::CoordinatorUnavailable)`
+    /// to its caller, indistinguishable from the coordinator actually being
+    /// gone, since the reply channel `f` was supposed to send on is simply
+    /// dropped without a value once `f` panics before reaching that send.
     pub fn with_owner_lock<F, R>(&self, f: F) -> Result<R, RuntimeError>
     where
         F: FnOnce(Option<&OwnerLockGuard>) -> R + Send + 'static,
@@ -783,7 +804,22 @@ fn run_coordinator(
                 }
             }
             CoordinatorMessage::WithOwnerLock(f) => {
-                f(owner_guard.as_ref());
+                // `f` is caller-supplied and runs synchronously on this
+                // coordinator thread; a panic inside it must not unwind this
+                // thread, which would tear down `current`/`owner_guard`
+                // (and, per `Drop`, kill any active child) mid-lifecycle
+                // while leaving the owner lock's underlying file handle
+                // silently unlocked. Catch it here so a panicking callback
+                // only fails its own `with_owner_lock` call (the caller sees
+                // `CoordinatorUnavailable`, since the reply `tx` inside `f`
+                // is dropped without sending — see `AiRuntime::with_owner_lock`)
+                // while this coordinator keeps running, `current` and
+                // `owner_guard` untouched, ready for the next queued
+                // lifecycle command exactly as before.
+                let owner_ref = owner_guard.as_ref();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    f(owner_ref);
+                }));
             }
             CoordinatorMessage::ChildEnded {
                 generation: g,
@@ -1641,6 +1677,75 @@ mod tests {
             .with_owner_lock(|owner| owner.map(|guard| guard.path().to_path_buf()))
             .unwrap();
         assert_eq!(held_path, Some(owner_lock_path));
+
+        let _ = runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression coverage for the root cause behind this fix: a panic
+    /// inside a `with_owner_lock` callback must not unwind the coordinator
+    /// thread and tear down an already-`Ready` child or release the owner
+    /// lock it holds. Gated to `unix` for the same reason as
+    /// `reconfigure_rejects_a_different_owner_lock_path_while_a_guard_is_held`:
+    /// it needs a real spawnable process to reach `Ready` (and thereby hold a
+    /// real owner lock).
+    #[cfg(unix)]
+    #[test]
+    fn with_owner_lock_callback_panic_does_not_lose_the_coordinator_or_the_owner_lock() {
+        use crate::rpc::RejectAllServerRequests;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-with-owner-lock-panic-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner_lock_path = dir.join("owner.lock");
+
+        // Same fake App Server as the reconfigure mismatch test: replies
+        // once to `initialize`, then just reads (and discards) stdin until
+        // `stop_active`'s `request_shutdown` closes it, at which point it
+        // exits on its own.
+        let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
+        let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
+        config.args = vec!["-c".to_string(), script.to_string()];
+        config.start_timeout = Duration::from_secs(5);
+        config.stop_grace_timeout = Duration::from_millis(500);
+        config.stop_force_timeout = Duration::from_secs(2);
+
+        let (events_tx, _events_rx) = mpsc::sync_channel(8);
+        let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+        let runtime = AiRuntime::spawn(config, handler, events_tx);
+        let status = runtime.start().expect("start should succeed against the fake App Server");
+        assert_eq!(status.state, RuntimeState::Ready);
+
+        let panic_result = runtime.with_owner_lock(|_owner| {
+            panic!("boom: simulated with_owner_lock callback panic");
+        });
+        assert!(
+            matches!(panic_result, Err(RuntimeError::CoordinatorUnavailable)),
+            "a panicking callback must surface as CoordinatorUnavailable, got {panic_result:?}"
+        );
+
+        // The coordinator thread must still be alive, the child still
+        // `Ready`, and the owner lock still held by this same runtime.
+        assert_eq!(
+            runtime.snapshot().state,
+            RuntimeState::Ready,
+            "a panicking with_owner_lock callback must not lose the Ready state"
+        );
+        let held_path = runtime
+            .with_owner_lock(|owner| owner.map(|guard| guard.path().to_path_buf()))
+            .expect("coordinator must still be responsive after the earlier callback panic");
+        assert_eq!(
+            held_path,
+            Some(owner_lock_path),
+            "the owner lock must still be held after the earlier callback panic"
+        );
+
+        // A subsequent ordinary lifecycle command must still be processed
+        // normally by the same coordinator thread.
+        let stop_status = runtime.stop().expect("stop should still succeed after the earlier callback panic");
+        assert_eq!(stop_status.state, RuntimeState::Stopped);
 
         let _ = runtime.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
