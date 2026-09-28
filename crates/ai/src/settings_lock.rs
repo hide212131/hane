@@ -36,7 +36,7 @@ pub struct AiSettingsLock {
 /// settings lock: no other process holds it in either shared or exclusive
 /// mode. Dropping it (or the process exiting) releases the OS-level lock.
 pub struct AiSettingsExclusiveGuard {
-    _file: File,
+    file: File,
 }
 
 /// Holding this guard means the current process holds the **shared** AI
@@ -44,7 +44,38 @@ pub struct AiSettingsExclusiveGuard {
 /// other processes may concurrently hold it in shared mode too. Dropping it
 /// (or the process exiting) releases the OS-level lock.
 pub struct AiSettingsSharedGuard {
-    _file: File,
+    file: File,
+}
+
+impl Drop for AiSettingsExclusiveGuard {
+    /// Explicitly releases the OS-level lock before the file handle itself is
+    /// closed. On Unix this matters because a caller may `fork`+`exec` a
+    /// child process (e.g. the embedded App Server) while holding this
+    /// guard: between those two steps the freshly forked child holds its own
+    /// inherited copy of this file descriptor, referring to the very same
+    /// open file description as ours -- `FD_CLOEXEC` (set by `std::fs::File`
+    /// by default) only closes that copy at the child's `exec`, not at
+    /// `fork`. `flock` locks are owned by the open file description, not by
+    /// any single file descriptor or process, and are released either by an
+    /// explicit `LOCK_UN` on *any* fd referring to that description, or once
+    /// *every* such fd has been closed. Relying on plain `close` here (i.e.
+    /// just dropping `file`) would therefore leave the lock held until the
+    /// child's own copy is also closed -- which does not happen until it
+    /// execs (or exits) -- blocking this lock's critical section from ending
+    /// when it semantically should. An explicit `LOCK_UN` releases it
+    /// immediately regardless of who else still holds the description open.
+    /// See `platform::unlock_before_close`.
+    fn drop(&mut self) {
+        platform::unlock_before_close(&self.file);
+    }
+}
+
+impl Drop for AiSettingsSharedGuard {
+    /// See [`AiSettingsExclusiveGuard`]'s `Drop` impl: the same fork-inherited
+    /// open file description hazard applies to the shared lock.
+    fn drop(&mut self) {
+        platform::unlock_before_close(&self.file);
+    }
 }
 
 impl AiSettingsLock {
@@ -70,7 +101,7 @@ impl AiSettingsLock {
     pub fn try_acquire_exclusive(&self) -> io::Result<Option<AiSettingsExclusiveGuard>> {
         let file = self.open()?;
         if platform::try_lock(&file, true)? {
-            Ok(Some(AiSettingsExclusiveGuard { _file: file }))
+            Ok(Some(AiSettingsExclusiveGuard { file }))
         } else {
             Ok(None)
         }
@@ -83,7 +114,7 @@ impl AiSettingsLock {
     pub fn try_acquire_shared(&self) -> io::Result<Option<AiSettingsSharedGuard>> {
         let file = self.open()?;
         if platform::try_lock(&file, false)? {
-            Ok(Some(AiSettingsSharedGuard { _file: file }))
+            Ok(Some(AiSettingsSharedGuard { file }))
         } else {
             Ok(None)
         }
@@ -109,6 +140,21 @@ mod platform {
             } else {
                 Err(err)
             }
+        }
+    }
+
+    /// Explicitly unlocks before `file` is closed. See
+    /// [`super::AiSettingsExclusiveGuard`]'s `Drop` impl for why this is
+    /// necessary: a plain `close` (dropping `file` with no explicit unlock)
+    /// only releases an `flock` once every fd referring to the same open file
+    /// description is closed, which a forked-but-not-yet-exec'd child's own
+    /// inherited copy can delay well past this guard's drop. Best-effort:
+    /// there is nothing useful to do with an error here, and the fd is
+    /// closed right after regardless.
+    pub fn unlock_before_close(file: &File) {
+        let fd = file.as_raw_fd();
+        unsafe {
+            let _ = libc::flock(fd, libc::LOCK_UN);
         }
     }
 }
@@ -170,6 +216,18 @@ mod platform {
             }
         }
     }
+
+    /// No-op: unlike Unix `flock`, `LockFileEx`'s lock belongs to the
+    /// specific handle it was taken on, not to some shared, fork-inherited
+    /// open file description. `std::fs::File`'s underlying `HANDLE` is
+    /// created non-inheritable (`bInheritHandle == FALSE`), and
+    /// `std::process::Command` only ever makes the explicit stdio handles it
+    /// wires up inheritable, so a spawned child process never receives a
+    /// duplicate of this handle in the first place. A plain `CloseHandle`
+    /// (via dropping `file`) therefore already releases the lock as soon as
+    /// this guard is dropped, with no equivalent to Unix's fork-before-exec
+    /// window to work around.
+    pub fn unlock_before_close(_file: &File) {}
 }
 
 #[cfg(test)]
@@ -240,5 +298,173 @@ mod tests {
 
         drop(exclusive);
         assert!(lock_b.try_acquire_shared().unwrap().is_some());
+    }
+
+    /// Regression coverage for the root cause behind
+    /// `custom_provider_runtime`'s generation-gate test occasionally seeing
+    /// `SettingsBusy` instead of the expected `NotReady`: a caller can
+    /// `fork`+`exec` a child process (e.g. the embedded App Server) while
+    /// holding this exclusive guard, and between those two steps the child
+    /// holds its own inherited copy of the lock file's fd, referring to the
+    /// very same `flock`-tracked open file description as the parent's --
+    /// `FD_CLOEXEC` only closes that copy at `exec`, not at `fork`.
+    /// Reproduces exactly that pre-exec window deterministically (no
+    /// timing-dependent sleeps): a real forked child holds its inherited
+    /// copy of the lock fd open and signals so over a pipe before the parent
+    /// drops its own guard and immediately tries to reacquire.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_guard_can_be_reacquired_immediately_after_drop_even_while_a_forked_child_still_holds_the_inherited_pre_exec_fd()
+    {
+        let path = unique_lock_path("excl_reacquire_across_fork_pre_exec");
+        let lock = AiSettingsLock::new(&path);
+        let guard = lock.try_acquire_exclusive().unwrap().expect("first acquire must succeed");
+
+        // Two pipes synchronize with the forked child without relying on
+        // sleeps: `ready` lets the child tell the parent it is alive and
+        // still holding its inherited copy of the lock fd; `go` lets the
+        // parent tell the child it may now exit.
+        let mut ready_fds = [0i32; 2];
+        let mut go_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0, "pipe() for readiness signal failed");
+        assert_eq!(unsafe { libc::pipe(go_fds.as_mut_ptr()) }, 0, "pipe() for exit signal failed");
+        let [ready_r, ready_w] = ready_fds;
+        let [go_r, go_w] = go_fds;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            // Child: still holds its own inherited copy of the lock file's
+            // fd. Only raw syscalls from here on (no Rust allocation, no
+            // std locks) since this is a forked copy of a multi-threaded
+            // test process. Signal alive, block until told to exit, then
+            // `_exit` directly rather than unwinding back through the test
+            // harness.
+            unsafe {
+                libc::close(ready_r);
+                libc::close(go_w);
+                let byte: u8 = 1;
+                libc::write(ready_w, &byte as *const u8 as *const libc::c_void, 1);
+                let mut buf: u8 = 0;
+                libc::read(go_r, &mut buf as *mut u8 as *mut libc::c_void, 1);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent.
+        unsafe {
+            libc::close(ready_w);
+            libc::close(go_r);
+        }
+        let mut buf: u8 = 0;
+        let n = unsafe { libc::read(ready_r, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        assert_eq!(n, 1, "child must signal it is alive, still holding its inherited fd, before the parent proceeds");
+        unsafe { libc::close(ready_r) };
+
+        // The child now holds its own inherited fd referring to the same
+        // open file description as `guard`'s, without ever having exec'd.
+        // Dropping `guard` here must release the lock immediately via the
+        // explicit `LOCK_UN` in its `Drop` impl, rather than only once every
+        // fd sharing that description (including the child's) is closed.
+        drop(guard);
+
+        let reacquired = lock.try_acquire_exclusive().unwrap();
+
+        // Let the child exit and reap it regardless of the assertion below,
+        // so a failure does not leak a zombie process.
+        unsafe {
+            let byte: u8 = 1;
+            libc::write(go_w, &byte as *const u8 as *const libc::c_void, 1);
+            libc::close(go_w);
+            let mut status: i32 = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        assert!(
+            reacquired.is_some(),
+            "must be able to reacquire the exclusive AI settings lock immediately after dropping the guard, \
+             even while a forked child still holds an inherited pre-exec copy of the lock fd"
+        );
+    }
+
+    /// Same fork-inherited open file description hazard as above, but for
+    /// the shared guard: confirms an exclusive acquire is still correctly
+    /// rejected while the shared guard (and its forked child's inherited
+    /// copy of the fd) are outstanding, and that dropping the shared guard
+    /// releases the lock immediately -- letting an exclusive acquire succeed
+    /// without waiting for the still-running child to exit.
+    #[cfg(unix)]
+    #[test]
+    fn shared_guard_can_be_exclusively_reacquired_immediately_after_drop_even_while_a_forked_child_still_holds_the_inherited_pre_exec_fd()
+    {
+        let path = unique_lock_path("shared_reacquire_across_fork_pre_exec");
+        let lock = AiSettingsLock::new(&path);
+        let guard = lock.try_acquire_shared().unwrap().expect("first acquire must succeed");
+
+        let mut ready_fds = [0i32; 2];
+        let mut go_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0, "pipe() for readiness signal failed");
+        assert_eq!(unsafe { libc::pipe(go_fds.as_mut_ptr()) }, 0, "pipe() for exit signal failed");
+        let [ready_r, ready_w] = ready_fds;
+        let [go_r, go_w] = go_fds;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            unsafe {
+                libc::close(ready_r);
+                libc::close(go_w);
+                let byte: u8 = 1;
+                libc::write(ready_w, &byte as *const u8 as *const libc::c_void, 1);
+                let mut buf: u8 = 0;
+                libc::read(go_r, &mut buf as *mut u8 as *mut libc::c_void, 1);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent.
+        unsafe {
+            libc::close(ready_w);
+            libc::close(go_r);
+        }
+        let mut buf: u8 = 0;
+        let n = unsafe { libc::read(ready_r, &mut buf as *mut u8 as *mut libc::c_void, 1) };
+        assert_eq!(n, 1, "child must signal it is alive, still holding its inherited fd, before the parent proceeds");
+        unsafe { libc::close(ready_r) };
+
+        // While the shared guard (and the forked child's inherited copy of
+        // its fd) are both still outstanding, a settings save must still be
+        // rejected immediately.
+        let other = AiSettingsLock::new(&path);
+        assert!(
+            other.try_acquire_exclusive().unwrap().is_none(),
+            "exclusive acquire must be rejected while the shared guard is still held"
+        );
+
+        // Dropping `guard` here must release the lock immediately via the
+        // explicit `LOCK_UN` in its `Drop` impl, rather than only once every
+        // fd sharing that description (including the still-running child's)
+        // is closed.
+        drop(guard);
+
+        let reacquired = other.try_acquire_exclusive().unwrap();
+
+        // Let the child exit and reap it regardless of the assertion below,
+        // so a failure does not leak a zombie process.
+        unsafe {
+            let byte: u8 = 1;
+            libc::write(go_w, &byte as *const u8 as *const libc::c_void, 1);
+            libc::close(go_w);
+            let mut status: i32 = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        assert!(
+            reacquired.is_some(),
+            "must be able to exclusively acquire the AI settings lock immediately after dropping the shared guard, \
+             without waiting for a forked child still holding an inherited pre-exec copy of the lock fd to exit"
+        );
     }
 }
