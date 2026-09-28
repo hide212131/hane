@@ -180,9 +180,10 @@ fn app_service_handles_early_login_completion_models_logout_and_view_recreation(
 
     let snapshot = handle.snapshot();
     assert!(matches!(snapshot.account, AccountState::SignedIn { .. }));
+    let expected_codex_home = data_root.join("ai").join("codex-chatgpt");
     assert_eq!(
         observed_fake_codex_home(&data_root).as_deref(),
-        data_root.join("ai/codex-chatgpt").to_str(),
+        expected_codex_home.to_str(),
         "the child must receive Hane's dedicated CODEX_HOME"
     );
     assert_eq!(
