@@ -103,22 +103,23 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
 
 
 def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frames: list[dict],
-                      elapsed_before_reverse_ms: Optional[float]) -> dict:
+                      elapsed_through_reverse_post_ms: Optional[float]) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
-    valid = (baseline is not None and pre_reverse is not None and elapsed_before_reverse_ms is not None
+    valid = (baseline is not None and pre_reverse is not None
+             and elapsed_through_reverse_post_ms is not None
              and len(offsets) >= 4 and all(value is not None for value in offsets))
     if not valid:
         return step("direction_reversal", "blocked", "反転前後の可視行番号を十分に読み取れない",
                     baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
-                    elapsed_before_reverse_ms=elapsed_before_reverse_ms,
+                    elapsed_through_reverse_post_ms=elapsed_through_reverse_post_ms,
                     elapsed_ms=times, frames=frames)
-    if elapsed_before_reverse_ms > LINES_INERTIA_WINDOW_MS:
+    if elapsed_through_reverse_post_ms > LINES_INERTIA_WINDOW_MS:
         return step(
             "direction_reversal", "blocked",
-            "初回のLines入力から反転入力までが慣性の持続時間を超え、方向反転を判定できない",
+            "初回のLines入力から反転helper完了までが慣性の持続時間を超え、方向反転を判定できない",
             baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
-            elapsed_before_reverse_ms=elapsed_before_reverse_ms,
+            elapsed_through_reverse_post_ms=elapsed_through_reverse_post_ms,
             inertia_window_ms=LINES_INERTIA_WINDOW_MS, elapsed_ms=times, frames=frames,
         )
     old_direction_started = pre_reverse > baseline
@@ -138,7 +139,7 @@ def evaluate_reversal(baseline: Optional[int], pre_reverse: Optional[int], frame
     return step(
         "direction_reversal", "pass" if passed else "fail", None if passed else "。".join(reasons),
         baseline=baseline, pre_reverse=pre_reverse, offsets=offsets,
-        elapsed_before_reverse_ms=elapsed_before_reverse_ms,
+        elapsed_through_reverse_post_ms=elapsed_through_reverse_post_ms,
         inertia_window_ms=LINES_INERTIA_WINDOW_MS, elapsed_ms=times,
         old_direction_started=old_direction_started, prompt=prompt,
         reversed_direction=reversed_direction, no_old_coast=no_old_coast, frames=frames,
@@ -230,13 +231,15 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
             return [], None, pre_capture.get("reason") or "反転前画面の撮影に失敗した"
         pre_elapsed = (time.monotonic() - initial_event_started) * 1000
         time.sleep(gap_ms / 1000)
-        elapsed_before_reverse = (time.monotonic() - initial_event_started) * 1000
         ok, _output, error = interaction.run_helper(
             helper, ["wheel-event", str(pid), unit, str(reverse_delta)], helper_timeout)
         if not ok:
             return [], None, error
+        # The helper returns only after posting the wheel event, so including its
+        # startup and completion time makes a late reversal block conservatively.
+        elapsed_through_reverse_post = (time.monotonic() - initial_event_started) * 1000
         pre_reverse = {"path": str(pre_path), "elapsed_ms": pre_elapsed,
-                       "elapsed_before_reverse_ms": elapsed_before_reverse}
+                       "elapsed_through_reverse_post_ms": elapsed_through_reverse_post}
 
     start = time.monotonic()
     captured = []
@@ -349,7 +352,7 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                     reversal_step = (step("direction_reversal", "blocked", error) if error else
                                      evaluate_reversal(
                                          reversal_baseline, reversal_pre, reversal_frames,
-                                         pre_frame.get("elapsed_before_reverse_ms") if pre_frame else None,
+                                         pre_frame.get("elapsed_through_reverse_post_ms") if pre_frame else None,
                                      ))
                     reversal_step["baseline_visible_lines"] = reversal_baseline_lines
                     reversal_step["baseline_text"] = reversal_baseline_text

@@ -63,8 +63,8 @@ class LinesCoastTests(unittest.TestCase):
 class DirectionReversalTests(unittest.TestCase):
     def test_accepts_prompt_opposite_direction(self):
         result = gui.evaluate_reversal(100, 108, frames([107, 105, 102, 100, 99, 99],
-                                                        [5, 24, 48, 80, 120, 180]),
-                                        elapsed_before_reverse_ms=90)
+                                        [5, 24, 48, 80, 120, 180]),
+                                        elapsed_through_reverse_post_ms=90)
         self.assertEqual(result["result"], "pass")
         self.assertTrue(result["old_direction_started"])
         self.assertTrue(result["prompt"])
@@ -73,8 +73,8 @@ class DirectionReversalTests(unittest.TestCase):
 
     def test_rejects_old_direction_after_reversal(self):
         result = gui.evaluate_reversal(100, 108, frames([110, 109, 106, 104, 103, 103],
-                                                        [5, 24, 48, 80, 120, 180]),
-                                        elapsed_before_reverse_ms=90)
+                                        [5, 24, 48, 80, 120, 180]),
+                                        elapsed_through_reverse_post_ms=90)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["prompt"])
         self.assertFalse(result["no_old_coast"])
@@ -82,7 +82,7 @@ class DirectionReversalTests(unittest.TestCase):
     def test_blocks_when_capture_delays_reversal_past_inertia_window(self):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
-            elapsed_before_reverse_ms=136,
+            elapsed_through_reverse_post_ms=136,
         )
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(result["inertia_window_ms"], gui.LINES_INERTIA_WINDOW_MS)
@@ -90,7 +90,7 @@ class DirectionReversalTests(unittest.TestCase):
     def test_blocks_when_reversal_timing_is_unavailable(self):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
-            elapsed_before_reverse_ms=None,
+            elapsed_through_reverse_post_ms=None,
         )
         self.assertEqual(result["result"], "blocked")
 
