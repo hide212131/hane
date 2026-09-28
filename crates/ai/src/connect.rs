@@ -94,6 +94,15 @@ pub enum ConnectError {
     /// depend on, so this is rejected before any journal/credential side
     /// effect instead of trusting the caller-supplied ref.
     CredentialRefMismatch { current: Box<AiSettings> },
+    /// The caller-supplied new settings do not actually reflect the
+    /// credential operation being performed: `update_custom_credential`'s
+    /// `build_new_settings` result did not reference the freshly generated
+    /// `CredentialRef` (or had no Custom connection at all), or
+    /// `delete_custom_credential`'s `new_settings_without_credential` still
+    /// referenced a credential. Detected before `journal.begin`, so no
+    /// journal entry, credential store write/delete, or settings replace is
+    /// ever attempted.
+    InvalidNewSettings,
     /// `write_codex_config`'s atomic replace's `rename` already landed --
     /// `config.toml` may already reference the new Base URL/model/env key --
     /// but its parent directory's own crash-durability fsync could not be
@@ -126,6 +135,10 @@ impl std::fmt::Display for ConnectError {
             ConnectError::CredentialRefMismatch { .. } => write!(
                 f,
                 "the credential being deleted no longer matches the current Custom Provider connection; reload before retrying"
+            ),
+            ConnectError::InvalidNewSettings => write!(
+                f,
+                "the new Custom Provider settings do not match the credential operation being performed"
             ),
             ConnectError::ConfigDurabilityUnconfirmed(e) => write!(
                 f,
@@ -243,9 +256,22 @@ pub fn update_custom_credential(
     }
     let settings_generation_before = current.settings_generation;
 
-    // Step 1-2: assign the new identifier and durably record the pending
-    // operation before the secret is written anywhere.
+    // Step 1: assign the new identifier and build the settings that will
+    // reference it, *before* the journal is touched. Validate that the
+    // caller-built settings actually reference this exact `new_ref`: a
+    // `build_new_settings` bug (wrong/missing `credential_ref`, or no Custom
+    // connection at all) checked only later would still leave a `PendingNew`
+    // journal entry and a freshly written secret behind, indistinguishable
+    // from a genuine crash-mid-operation to a later `recover` pass.
     let new_ref = CredentialRef::generate();
+    let new_settings = build_new_settings(&new_ref);
+    let new_credential_ref = new_settings.custom.as_ref().and_then(|c| c.credential_ref.clone());
+    if new_credential_ref.as_ref() != Some(&new_ref) {
+        return Err(ConnectError::InvalidNewSettings);
+    }
+
+    // Step 2: durably record the pending operation before the secret is
+    // written anywhere.
     journal
         .begin(CredentialOperation {
             kind: JournalOperationKind::Update,
@@ -263,7 +289,6 @@ pub fn update_custom_credential(
 
     // Step 4: atomically replace the non-secret settings to reference the
     // new credential.
-    let new_settings = build_new_settings(&new_ref);
     let saved = match settings_store.write_while_locked(owner, &guard, expected.revision, new_settings) {
         Ok(saved) => saved,
         Err(SaveError::PersistedDurabilityUnconfirmed(e)) => {
@@ -337,6 +362,16 @@ pub fn delete_custom_credential(
         return Err(ConnectError::CredentialRefMismatch { current: Box::new(current) });
     }
     let settings_generation_before = current.settings_generation;
+
+    // Validate that `new_settings_without_credential` actually has no
+    // credential_ref left, *before* the journal is touched: a caller bug that
+    // left the ref in place, checked only later, would still leave a
+    // `PendingNew` `Delete` journal entry behind, indistinguishable from a
+    // genuine crash-mid-operation to a later `recover` pass.
+    let leftover_credential_ref = new_settings_without_credential.custom.as_ref().and_then(|c| c.credential_ref.clone());
+    if leftover_credential_ref.is_some() {
+        return Err(ConnectError::InvalidNewSettings);
+    }
 
     journal
         .begin(CredentialOperation {
@@ -868,6 +903,88 @@ mod tests {
             Some("sk-first"),
             "the existing credential must not be orphaned"
         );
+    }
+
+    #[test]
+    fn update_whose_built_settings_do_not_reference_the_new_credential_ref_is_rejected_without_side_effects() {
+        let (store, owner, journal, _dir) = store_and_journal("update_invalid_new_settings");
+        let credential_store = FakeCredentialStore::new();
+
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            // Deliberately does not reference `new_ref` at all.
+            |_new_ref| custom_settings(None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::InvalidNewSettings));
+
+        assert!(journal.is_empty().unwrap(), "invalid new settings must never leave a journal entry behind");
+        assert!(credential_store.is_empty(), "invalid new settings must never write a new secret");
+        assert_eq!(store.load().unwrap(), AiSettings::default(), "invalid new settings must never touch persisted settings");
+    }
+
+    #[test]
+    fn update_whose_built_settings_have_no_custom_connection_is_rejected_without_side_effects() {
+        let (store, owner, journal, _dir) = store_and_journal("update_invalid_new_settings_no_custom");
+        let credential_store = FakeCredentialStore::new();
+
+        let err = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |_new_ref| AiSettings::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::InvalidNewSettings));
+
+        assert!(journal.is_empty().unwrap(), "invalid new settings must never leave a journal entry behind");
+        assert!(credential_store.is_empty(), "invalid new settings must never write a new secret");
+        assert_eq!(store.load().unwrap(), AiSettings::default(), "invalid new settings must never touch persisted settings");
+    }
+
+    #[test]
+    fn delete_whose_new_settings_still_reference_a_credential_is_rejected_without_side_effects() {
+        let (store, owner, journal, _dir) = store_and_journal("delete_invalid_new_settings");
+        let credential_store = FakeCredentialStore::new();
+
+        let saved = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState { revision: 0, credential_ref: None },
+            "sk-first",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        )
+        .unwrap();
+        let credential_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+
+        // Deliberately still references the credential being deleted instead
+        // of clearing it.
+        let still_referencing = saved.clone();
+        let err = delete_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            saved.revision,
+            credential_ref.clone(),
+            still_referencing,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConnectError::InvalidNewSettings));
+
+        assert!(journal.is_empty().unwrap(), "invalid new settings must never leave a journal entry behind");
+        assert_eq!(credential_store.len(), 1, "invalid new settings must never delete the credential");
+        assert_eq!(store.load().unwrap(), saved, "invalid new settings must never touch persisted settings");
     }
 
     /// Regression coverage for the root cause behind a mismatched `owner`
