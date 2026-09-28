@@ -433,16 +433,18 @@ pub fn recover_at_startup(
             // `recover_at_startup` call re-reads `current` from disk, so if
             // it did land, `current_credential_ref` will already show that
             // and this closure will not even be invoked on that next pass.
-            // `OwnerLockMismatch` should not occur here in practice --
-            // `recover_at_startup` already checked `owner` against this same
-            // store via `check_owner` before acquiring the exclusive lock --
-            // but it is handled the same conservative way rather than
-            // treated as a settings replace or a credential/journal
-            // completion.
+            // `OwnerLockMismatch` and `SettingsLockMismatch` should not occur
+            // here in practice -- `recover_at_startup` already checked
+            // `owner` against this same store via `check_owner` before
+            // acquiring the exclusive lock, and `guard` came from this same
+            // store's own `acquire_exclusive` call above -- but they are
+            // handled the same conservative way rather than treated as a
+            // settings replace or a credential/journal completion.
             Err(SaveError::RevisionConflict { .. }
             | SaveError::Busy
             | SaveError::PendingCredentialJournal
             | SaveError::OwnerLockMismatch
+            | SaveError::SettingsLockMismatch
             | SaveError::PersistedDurabilityUnconfirmed(_)) => Ok(false),
         }
     })

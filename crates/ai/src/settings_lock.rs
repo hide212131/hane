@@ -37,6 +37,12 @@ pub struct AiSettingsLock {
 /// mode. Dropping it (or the process exiting) releases the OS-level lock.
 pub struct AiSettingsExclusiveGuard {
     file: File,
+    /// The path of the [`AiSettingsLock`] this guard was acquired from. Lets
+    /// a caller holding multiple `AiSettingsStore`s (each with its own lock
+    /// file) confirm a guard actually proves exclusive ownership of *this*
+    /// store's own lock, rather than some other store's, before trusting it
+    /// to guard a write. See [`AiSettingsExclusiveGuard::path`].
+    path: PathBuf,
 }
 
 /// Holding this guard means the current process holds the **shared** AI
@@ -45,6 +51,13 @@ pub struct AiSettingsExclusiveGuard {
 /// (or the process exiting) releases the OS-level lock.
 pub struct AiSettingsSharedGuard {
     file: File,
+}
+
+impl AiSettingsExclusiveGuard {
+    /// The path of the [`AiSettingsLock`] this guard was acquired from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for AiSettingsExclusiveGuard {
@@ -101,7 +114,7 @@ impl AiSettingsLock {
     pub fn try_acquire_exclusive(&self) -> io::Result<Option<AiSettingsExclusiveGuard>> {
         let file = self.open()?;
         if platform::try_lock(&file, true)? {
-            Ok(Some(AiSettingsExclusiveGuard { file }))
+            Ok(Some(AiSettingsExclusiveGuard { file, path: self.path.clone() }))
         } else {
             Ok(None)
         }

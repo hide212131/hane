@@ -128,6 +128,12 @@ pub enum SaveError {
     /// lock → AI settings lock" acquisition order for this store. Rejected
     /// before the settings file is read or written.
     OwnerLockMismatch,
+    /// `guard` was acquired against a different [`AiSettingsLock`] path than
+    /// this store's own settings lock: it proves exclusive ownership of
+    /// *some* AI settings lock, but not the one this store is scoped to, so
+    /// it cannot serve as proof that this store's write is exclusively
+    /// guarded. Rejected before the settings file is read or written.
+    SettingsLockMismatch,
     /// The atomic replace's `rename` durably landed — any reader opening the
     /// settings file now observes `new_settings` — but this process could
     /// not confirm the parent directory entry's own crash-durability fsync.
@@ -153,6 +159,9 @@ impl std::fmt::Display for SaveError {
             }
             SaveError::OwnerLockMismatch => {
                 write!(f, "the supplied runtime owner lock guard does not belong to this AI settings store")
+            }
+            SaveError::SettingsLockMismatch => {
+                write!(f, "the supplied AI settings lock guard does not belong to this AI settings store")
             }
             SaveError::PersistedDurabilityUnconfirmed(e) => write!(
                 f,
@@ -292,7 +301,12 @@ impl AiSettingsStore {
     /// `owner` is the same runtime-owner-lock proof [`Self::save`] requires;
     /// see its documentation. Rejected with [`SaveError::OwnerLockMismatch`]
     /// before the settings file is even read if `owner` was acquired against
-    /// a different path than this store's own `owner_lock_path`.
+    /// a different path than this store's own `owner_lock_path`. Likewise
+    /// rejected with [`SaveError::SettingsLockMismatch`] before the settings
+    /// file is read if `guard` was acquired from a different
+    /// [`crate::settings_lock::AiSettingsLock`] path than this store's own,
+    /// i.e. it proves exclusive ownership of some AI settings lock but not
+    /// the one this store is scoped to.
     pub fn write_while_locked(
         &self,
         owner: &OwnerLockGuard,
@@ -300,9 +314,11 @@ impl AiSettingsStore {
         expected_revision: u64,
         mut new_settings: AiSettings,
     ) -> Result<AiSettings, SaveError> {
-        let _ = guard;
         if owner.path() != self.owner_lock_path {
             return Err(SaveError::OwnerLockMismatch);
+        }
+        if guard.path() != self.lock.path() {
+            return Err(SaveError::SettingsLockMismatch);
         }
         let current = self.load().map_err(SaveError::Io)?;
         if current.revision != expected_revision {
@@ -556,6 +572,28 @@ mod tests {
         // must not have taken it.
         let shared = store.settings_lock().try_acquire_shared().unwrap();
         assert!(shared.is_some(), "the settings lock must never be acquired for a mismatched owner");
+    }
+
+    /// Regression coverage for the root cause behind `write_while_locked`
+    /// discarding `guard` (`let _ = guard;`) instead of verifying it was
+    /// acquired from *this* store's own [`AiSettingsLock`]: a guard proving
+    /// exclusive ownership of a different `AiSettingsLock` must not be
+    /// accepted as proof of exclusive ownership of this store's lock, and
+    /// this store's persisted settings must be left untouched.
+    #[test]
+    fn write_while_locked_rejects_a_guard_acquired_from_a_different_settings_lock_path() {
+        let (store, owner) = store("settings_lock_mismatch");
+        let other_dir = unique_dir("settings_lock_mismatch_other");
+        let other_lock = crate::settings_lock::AiSettingsLock::new(other_dir.join("ai-settings.lock"));
+        let other_guard = other_lock.try_acquire_exclusive().unwrap().unwrap();
+
+        let err = store.write_while_locked(&owner, &other_guard, 0, AiSettings::default()).unwrap_err();
+        assert!(matches!(err, SaveError::SettingsLockMismatch));
+        assert_eq!(
+            store.load().unwrap(),
+            AiSettings::default(),
+            "a guard from a different settings lock must never write this store's settings"
+        );
     }
 
     #[test]
