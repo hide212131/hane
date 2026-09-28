@@ -153,6 +153,14 @@ mod platform {
             n_number_of_bytes_to_lock_high: u32,
             lp_overlapped: *mut Overlapped,
         ) -> i32;
+
+        fn UnlockFileEx(
+            h_file: *mut core::ffi::c_void,
+            dw_reserved: u32,
+            n_number_of_bytes_to_unlock_low: u32,
+            n_number_of_bytes_to_unlock_high: u32,
+            lp_overlapped: *mut Overlapped,
+        ) -> i32;
     }
 
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
@@ -189,17 +197,26 @@ mod platform {
         }
     }
 
-    /// No-op: unlike Unix `flock`, `LockFileEx`'s lock belongs to the
-    /// specific handle it was taken on, not to some shared, fork-inherited
-    /// open file description. `std::fs::File`'s underlying `HANDLE` is
-    /// created non-inheritable (`bInheritHandle == FALSE`), and
+    /// Explicitly releases the byte range locked by `try_lock_exclusive`
+    /// before `file` is closed. Unlike Unix `flock`, `LockFileEx`'s lock
+    /// belongs to the specific handle it was taken on, not to some shared,
+    /// fork-inherited open file description, so there is no equivalent to
+    /// Unix's fork-before-exec window here: `std::fs::File`'s underlying
+    /// `HANDLE` is created non-inheritable (`bInheritHandle == FALSE`), and
     /// `std::process::Command` only ever makes the explicit stdio handles it
     /// wires up inheritable, so the App Server child this process spawns
-    /// never receives a duplicate of this handle in the first place. A plain
-    /// `CloseHandle` (via dropping `file`) therefore already releases the
-    /// lock as soon as this guard is dropped, with no equivalent to Unix's
-    /// fork-before-exec window to work around.
-    pub fn unlock_before_close(_file: &File) {}
+    /// never receives a duplicate of this handle. Still, releasing the lock
+    /// explicitly here (rather than relying on `CloseHandle` when `file` is
+    /// dropped) matches the same offset/length `try_lock_exclusive` used to
+    /// acquire it. Best-effort: there is nothing useful to do with an error
+    /// here, and the handle is closed right after regardless.
+    pub fn unlock_before_close(file: &File) {
+        let handle = file.as_raw_handle();
+        let mut overlapped: Overlapped = unsafe { std::mem::zeroed() };
+        unsafe {
+            let _ = UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+        }
+    }
 }
 
 #[cfg(test)]
