@@ -157,9 +157,9 @@ const SCROLL_INERTIA_TIME_CONSTANT: Duration = Duration::from_millis(45);
 /// for the different, larger gap a coast armed from an idle view faces before
 /// its very first paint.
 const SCROLL_INERTIA_MIN_FRAME_TIME: Duration = Duration::from_micros(8_333);
-/// The elapsed time `queue_scroll_inertia` assumes for a brand-new coast's own
-/// synchronous first step (issue #389), as opposed to a step that folds a
-/// still-live coast's real, measured gap (see `queue_scroll_inertia`'s own
+/// The elapsed time `queue_scroll_inertia_at` assumes for a brand-new coast's
+/// own synchronous first step (issue #389), as opposed to a step that folds a
+/// still-live coast's real, measured gap (see `queue_scroll_inertia_at`'s own
 /// doc comment). A coast armed from an idle view has no
 /// `request_animation_frame` already in flight the way a still-running coast
 /// does, so `SCROLL_INERTIA_MIN_FRAME_TIME`'s 120Hz-optimistic
@@ -12221,7 +12221,7 @@ mod tests {
         // floor meant for the gap between two frames of an *already-running*
         // animation loop. That understated how long the state actually takes
         // to reach the first real paint and left that first frame reading as
-        // unchanged on screen. `queue_scroll_inertia` must instead use the
+        // unchanged on screen. `queue_scroll_inertia_at` must instead use the
         // larger `SCROLL_INERTIA_COLD_START_FRAME_TIME` for a brand-new
         // coast's own first step.
         let text = (1..=60)
@@ -12333,7 +12333,7 @@ mod tests {
         // Issue #389: a high-precision wheel/trackpad device can send a
         // `ScrollDelta::Lines` event so small that its pixel-space distance
         // never clears `eased_scroll_inertia_step`'s settle epsilon.
-        // `queue_scroll_inertia` must still apply that distance once instead
+        // `queue_scroll_inertia_at` must still apply that distance once instead
         // of silently dropping it, and must not arm a new coast for it.
         let text = (1..=60)
             .map(|n| format!("line {n:02}"))
@@ -12575,7 +12575,7 @@ mod tests {
             .velocity;
         assert!(forward_velocity > 0.0, "{forward_velocity}");
 
-        // `queue_scroll_inertia`'s immediate step for a *live, already
+        // `queue_scroll_inertia_at`'s immediate step for a *live, already
         // in-flight* coast is sized off the real time since that coast's own
         // last frame (issue #389). Pin `last_frame` and the reversal's own
         // "now" to the exact same `Instant`, read once inside a single
@@ -12616,7 +12616,7 @@ mod tests {
         // floored to `SCROLL_INERTIA_MIN_FRAME_TIME`) gap since the old
         // coast's last touch, not on `forward_velocity`'s already-decayed
         // remainder. `forward_velocity` itself now uses the larger, distinct
-        // `SCROLL_INERTIA_COLD_START_FRAME_TIME` (see `queue_scroll_inertia`),
+        // `SCROLL_INERTIA_COLD_START_FRAME_TIME` (see `queue_scroll_inertia_at`),
         // so it is deliberately no longer expected to equal
         // `-reversed_velocity`.
         let (_, expected_reversed_velocity) =
@@ -12688,7 +12688,7 @@ mod tests {
     ) {
         // Issue #389: a real reversal input does not always land exactly one
         // nominal animation frame after the old coast's last step; delivery
-        // can lag noticeably (e.g. under system load). `queue_scroll_inertia`
+        // can lag noticeably (e.g. under system load). `queue_scroll_inertia_at`
         // must fold that whole real gap into its own synchronous immediate
         // step instead of only ever advancing by one nominal frame's worth,
         // or the screen would still read as unchanged in the new direction
