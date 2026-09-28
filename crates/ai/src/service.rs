@@ -25,6 +25,7 @@ use crate::connect::{
 use crate::credential_journal::CredentialJournal;
 use crate::owner_lock::{OwnerLock, OwnerLockGuard};
 use crate::paths::AiPaths;
+use crate::probe::{ProbeErrorCode, ProbeResult, ProbeStatus, execute_probe};
 use crate::provider::ShellEnvironmentPolicyFormat;
 use crate::rpc::RejectAllServerRequests;
 use crate::runtime::{AiRuntime, RuntimeEvent, RuntimeEventKind, RuntimeState};
@@ -49,6 +50,7 @@ pub enum ServiceBusyReason {
     Login,
     Account,
     Models,
+    Probe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,8 @@ pub struct AiSnapshot {
     pub last_result: Option<(OperationId, SafeOperationResult)>,
     pub recovery_required: bool,
     pub persistence: PersistenceState,
+    pub probe_status: ProbeStatus,
+    pub probe_result: Option<ProbeResult>,
 }
 
 impl Default for AiSnapshot {
@@ -132,6 +136,8 @@ impl Default for AiSnapshot {
             last_result: None,
             recovery_required: false,
             persistence: PersistenceState::Clean,
+            probe_status: ProbeStatus::NotRun,
+            probe_result: None,
         }
     }
 }
@@ -144,13 +150,21 @@ pub enum AdmissionError {
     WrongOperation,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiCommand {
     OpenSettings,
-    RefreshAccount { refresh_token: bool },
+    RefreshAccount {
+        refresh_token: bool,
+    },
     StartLogin,
     Logout,
     RefreshModels,
+    Restart,
+    Probe,
+    /// Explicitly retries stopping a runtime isolated after an unconfirmed
+    /// Probe cancellation/timeout. Other AI operations remain unavailable
+    /// until this operation confirms the child is gone.
+    RetryProbeStop,
 }
 
 #[derive(Clone)]
@@ -212,11 +226,27 @@ impl AiServiceHandle {
     }
 
     pub fn try_submit(&self, command: AiCommand) -> Result<OperationId, AdmissionError> {
+        let snapshot = self.shared.snapshot.lock().unwrap();
+        let isolated = snapshot.probe_status == ProbeStatus::Isolated;
+        let owned_elsewhere = snapshot.ownership == OwnershipState::OwnedElsewhere;
+        drop(snapshot);
+        if owned_elsewhere && command != AiCommand::OpenSettings {
+            return Err(AdmissionError::Unavailable);
+        }
+        if isolated && command != AiCommand::RetryProbeStop {
+            return Err(AdmissionError::Unavailable);
+        }
+        if !isolated && command == AiCommand::RetryProbeStop {
+            return Err(AdmissionError::WrongOperation);
+        }
         let reason = match command {
             AiCommand::OpenSettings => ServiceBusyReason::Recovering,
             AiCommand::RefreshAccount { .. } | AiCommand::Logout => ServiceBusyReason::Account,
             AiCommand::StartLogin => ServiceBusyReason::Login,
             AiCommand::RefreshModels => ServiceBusyReason::Models,
+            AiCommand::Restart => ServiceBusyReason::Recovering,
+            AiCommand::Probe => ServiceBusyReason::Probe,
+            AiCommand::RetryProbeStop => ServiceBusyReason::Recovering,
         };
         self.enqueue(WorkerCommand::Action(command), reason)
     }
@@ -277,6 +307,12 @@ impl AiServiceHandle {
         if !*self.shared.available.lock().unwrap() {
             return Err(AdmissionError::Unavailable);
         }
+        let is_open_settings = matches!(&command, WorkerCommand::Action(AiCommand::OpenSettings));
+        if self.shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere
+            && !is_open_settings
+        {
+            return Err(AdmissionError::Unavailable);
+        }
         let mut busy = self.shared.busy.lock().unwrap();
         if busy.is_some() {
             return Err(AdmissionError::Busy);
@@ -308,7 +344,10 @@ impl AiServiceHandle {
     /// operation admission gate.
     pub fn cancel(&self, target: OperationId) -> Result<(), AdmissionError> {
         let busy = *self.shared.busy.lock().unwrap();
-        if busy != Some((target, ServiceBusyReason::Login)) {
+        if !matches!(
+            busy,
+            Some((id, ServiceBusyReason::Login | ServiceBusyReason::Probe)) if id == target
+        ) {
             return Err(AdmissionError::WrongOperation);
         }
         self.cancel_tx
@@ -427,6 +466,7 @@ struct WorkerState {
     attempt: Option<LoginAttempt>,
     early_login_events: VecDeque<(u64, Option<Value>, usize)>,
     early_login_bytes: usize,
+    deferred_runtime_events: VecDeque<RuntimeEvent>,
 }
 
 fn service_worker(
@@ -450,6 +490,7 @@ fn service_worker(
         attempt: None,
         early_login_events: VecDeque::new(),
         early_login_bytes: 0,
+        deferred_runtime_events: VecDeque::new(),
     };
     let mut settings = AiSettings::default();
     let mut shutdown = false;
@@ -503,6 +544,9 @@ fn service_worker(
                 &shared,
                 &mut state,
                 &mut settings,
+                &cancel_rx,
+                &shutdown_rx,
+                &mut shutdown,
             ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
@@ -525,6 +569,9 @@ fn handle_command(
     shared: &Arc<SharedServiceState>,
     state: &mut WorkerState,
     settings: &mut AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
 ) {
     if state.attempt.is_some()
         && !matches!(
@@ -775,6 +822,51 @@ fn handle_command(
                 }
             }
         }
+        WorkerCommand::Action(AiCommand::Probe) => {
+            run_probe_command(
+                queued.id,
+                config,
+                paths,
+                settings_store,
+                shared,
+                state,
+                settings,
+                cancel_rx,
+                shutdown_rx,
+                shutdown,
+            );
+        }
+        WorkerCommand::Action(AiCommand::Restart) => {
+            if !settings_actions_allowed(shared) {
+                finish(
+                    shared,
+                    queued.id,
+                    SafeOperationResult::Failed("recovery_required"),
+                    LoginState::Idle,
+                );
+                return;
+            }
+            publish_busy(shared, queued.id, ServiceBusyReason::Recovering);
+            let result = ensure_runtime(config, paths, settings, state)
+                .and_then(|runtime| runtime.restart().map_err(|_| ()))
+                .map(|_| ());
+            if let Some(runtime) = state.runtime.as_ref() {
+                sync_runtime_snapshot(shared, runtime);
+            }
+            finish(
+                shared,
+                queued.id,
+                if result.is_ok() {
+                    SafeOperationResult::Succeeded
+                } else {
+                    SafeOperationResult::Failed("runtime_unavailable")
+                },
+                LoginState::Idle,
+            );
+        }
+        WorkerCommand::Action(AiCommand::RetryProbeStop) => {
+            retry_probe_stop(queued.id, shared, state);
+        }
         WorkerCommand::SaveSettings {
             expected_revision,
             settings: proposed,
@@ -828,6 +920,270 @@ fn handle_command(
                 settings,
             );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Probe owns the runtime/settings locks for this full logical operation.
+fn run_probe_command(
+    id: OperationId,
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) {
+    let snapshot = shared.snapshot.lock().unwrap().clone();
+    let model = match probe_model(settings, &snapshot, config.credential_store.as_ref()) {
+        Ok(model) => model,
+        Err(code) => {
+            mutate(shared, |snapshot| {
+                snapshot.probe_status = ProbeStatus::Failed(code);
+                snapshot.probe_result = None;
+            });
+            finish(
+                shared,
+                id,
+                SafeOperationResult::Failed(code.stable_code()),
+                LoginState::Idle,
+            );
+            return;
+        }
+    };
+    publish_busy(shared, id, ServiceBusyReason::Probe);
+    mutate(shared, |snapshot| {
+        snapshot.probe_status = ProbeStatus::Running;
+        snapshot.probe_result = None;
+    });
+
+    if ensure_runtime(config, paths, settings, state).is_err() {
+        let owner_elsewhere = state
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.snapshot().state == RuntimeState::Failed)
+            && state.owner_guard.is_none();
+        let (status, code) = if owner_elsewhere {
+            (
+                ProbeStatus::Failed(ProbeErrorCode::OwnedElsewhere),
+                ProbeErrorCode::OwnedElsewhere,
+            )
+        } else {
+            (
+                ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable),
+                ProbeErrorCode::RuntimeUnavailable,
+            )
+        };
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = status;
+            snapshot.probe_result = None;
+            if owner_elsewhere {
+                snapshot.ownership = OwnershipState::OwnedElsewhere;
+            }
+        });
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(code.stable_code()),
+            LoginState::Idle,
+        );
+        return;
+    }
+    let runtime = state
+        .runtime
+        .as_ref()
+        .expect("ensure_runtime returned Ready runtime");
+    let Some(events_rx) = state.runtime_events.as_ref() else {
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable);
+            snapshot.probe_result = None;
+        });
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code()),
+            LoginState::Idle,
+        );
+        return;
+    };
+    let workspace = match paths.create_probe_workspace() {
+        Ok(workspace) => workspace,
+        Err(_) => {
+            mutate(shared, |snapshot| {
+                snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::RuntimeUnavailable);
+                snapshot.probe_result = None;
+            });
+            finish(
+                shared,
+                id,
+                SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code()),
+                LoginState::Idle,
+            );
+            return;
+        }
+    };
+
+    let mut shutdown_seen = false;
+    let execution = execute_probe(
+        settings_store,
+        runtime,
+        events_rx,
+        cancel_rx,
+        shutdown_rx,
+        &mut shutdown_seen,
+        id,
+        settings.active_connection,
+        model,
+        &workspace,
+        settings.settings_generation,
+        snapshot.auth_epoch,
+    );
+    // The process may still be running after an isolation result. Keep its
+    // working directory in that case until a later confirmed stop.
+    if !execution.isolated {
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+    *shutdown |= shutdown_seen;
+    state
+        .deferred_runtime_events
+        .extend(execution.deferred_events);
+    if execution.isolated {
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = ProbeStatus::Isolated;
+            snapshot.probe_result = None;
+            snapshot.ownership = OwnershipState::Unavailable;
+        });
+        sync_runtime_snapshot(shared, runtime);
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code()),
+            LoginState::Idle,
+        );
+        return;
+    }
+    let operation_result = match &execution.status {
+        ProbeStatus::Succeeded => SafeOperationResult::Succeeded,
+        ProbeStatus::Canceled => SafeOperationResult::Canceled,
+        ProbeStatus::TimedOut => SafeOperationResult::TimedOut,
+        ProbeStatus::Failed(code) => SafeOperationResult::Failed(code.stable_code()),
+        ProbeStatus::Stale => {
+            SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code())
+        }
+        ProbeStatus::Isolated => {
+            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code())
+        }
+        ProbeStatus::NotRun | ProbeStatus::Running => {
+            SafeOperationResult::Failed(ProbeErrorCode::ProtocolMismatch.stable_code())
+        }
+    };
+    let owns_runtime_lock = runtime
+        .with_owner_lock(|owner| owner.is_some())
+        .unwrap_or(false);
+    sync_runtime_snapshot(shared, runtime);
+    mutate(shared, |snapshot| {
+        snapshot.probe_status = execution.status;
+        snapshot.probe_result = execution.result;
+        snapshot.ownership = if owns_runtime_lock {
+            OwnershipState::Owned
+        } else {
+            OwnershipState::Unknown
+        };
+    });
+    finish(shared, id, operation_result, LoginState::Idle);
+}
+
+fn probe_model(
+    settings: &AiSettings,
+    snapshot: &AiSnapshot,
+    credential_store: &dyn CredentialStore,
+) -> Result<String, ProbeErrorCode> {
+    if snapshot.ownership != OwnershipState::Owned {
+        return Err(if snapshot.ownership == OwnershipState::OwnedElsewhere {
+            ProbeErrorCode::OwnedElsewhere
+        } else {
+            ProbeErrorCode::RuntimeUnavailable
+        });
+    }
+    if snapshot.recovery_required
+        || matches!(
+            snapshot.persistence,
+            PersistenceState::CleanupPending
+                | PersistenceState::DurabilityUnconfirmed
+                | PersistenceState::RecoveryRequired
+        )
+    {
+        return Err(ProbeErrorCode::InvalidConfiguration);
+    }
+    match settings.active_connection {
+        ActiveConnection::ChatGpt => {
+            if !matches!(snapshot.account, AccountState::SignedIn { .. })
+                || snapshot.account_refresh_failed
+            {
+                return Err(ProbeErrorCode::AccountUnavailable);
+            }
+            let model = settings
+                .chatgpt
+                .model_id
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or(ProbeErrorCode::ModelUnavailable)?;
+            if !matches!(
+                &snapshot.model_list,
+                ModelListState::Loaded(models)
+                    if crate::models::saved_model_is_available(Some(model), models) == Some(true)
+            ) {
+                return Err(ProbeErrorCode::ModelUnavailable);
+            }
+            Ok(model.to_owned())
+        }
+        ActiveConnection::Custom => {
+            let custom = settings
+                .custom
+                .as_ref()
+                .ok_or(ProbeErrorCode::InvalidConfiguration)?;
+            let credential_ref = custom
+                .credential_ref
+                .as_ref()
+                .ok_or(ProbeErrorCode::CredentialUnavailable)?;
+            match credential_store.get(credential_ref) {
+                Ok(Some(_secret)) => Ok(custom.model_id.clone()),
+                Ok(None) | Err(_) => Err(ProbeErrorCode::CredentialUnavailable),
+            }
+        }
+    }
+}
+
+fn retry_probe_stop(id: OperationId, shared: &Arc<SharedServiceState>, state: &mut WorkerState) {
+    publish_busy(shared, id, ServiceBusyReason::Recovering);
+    let confirmed = state.runtime.as_ref().is_some_and(|runtime| {
+        runtime.stop().is_ok_and(|status| {
+            status.state == RuntimeState::Stopped
+                || (status.state == RuntimeState::Failed && !status.restart_blocked)
+        })
+    });
+    if confirmed {
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = ProbeStatus::NotRun;
+            snapshot.probe_result = None;
+            snapshot.ownership = OwnershipState::Unknown;
+        });
+        if let Some(runtime) = state.runtime.as_ref() {
+            sync_runtime_snapshot(shared, runtime);
+        }
+        finish(shared, id, SafeOperationResult::Succeeded, LoginState::Idle);
+    } else {
+        mutate(shared, |snapshot| {
+            snapshot.probe_status = ProbeStatus::Isolated
+        });
+        finish(
+            shared,
+            id,
+            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code()),
+            LoginState::Idle,
+        );
     }
 }
 
@@ -1718,7 +2074,7 @@ fn drain_runtime_events(
     shared: &Arc<SharedServiceState>,
     state: &mut WorkerState,
 ) {
-    let mut ready = Vec::new();
+    let mut ready = state.deferred_runtime_events.drain(..).collect::<Vec<_>>();
     if let Some(events) = state.runtime_events.as_ref() {
         while let Ok(event) = events.try_recv() {
             ready.push(event);
@@ -2019,6 +2375,17 @@ fn mutate(shared: &Arc<SharedServiceState>, apply: impl FnOnce(&mut AiSnapshot))
     let snapshot = {
         let mut snapshot = shared.snapshot.lock().unwrap();
         apply(&mut snapshot);
+        if snapshot.probe_status == ProbeStatus::Succeeded
+            && snapshot.probe_result.as_ref().is_some_and(|result| {
+                result.settings_generation != snapshot.settings.settings_generation
+                    || result.runtime_generation != snapshot.runtime_generation
+                    || result.auth_epoch != snapshot.auth_epoch
+                    || result.connection != snapshot.settings.active_connection
+                    || current_model(&snapshot.settings) != Some(result.model.as_str())
+            })
+        {
+            snapshot.probe_status = ProbeStatus::Stale;
+        }
         snapshot.state_version = snapshot.state_version.saturating_add(1);
         snapshot.clone()
     };
@@ -2027,6 +2394,16 @@ fn mutate(shared: &Arc<SharedServiceState>, apply: impl FnOnce(&mut AiSnapshot))
         Ok(()) | Err(TrySendError::Full(_)) => true,
         Err(TrySendError::Disconnected(_)) => false,
     });
+}
+
+fn current_model(settings: &AiSettings) -> Option<&str> {
+    match settings.active_connection {
+        ActiveConnection::ChatGpt => settings.chatgpt.model_id.as_deref(),
+        ActiveConnection::Custom => settings
+            .custom
+            .as_ref()
+            .map(|custom| custom.model_id.as_str()),
+    }
 }
 
 #[cfg(test)]
@@ -2055,6 +2432,38 @@ mod tests {
             Err(AdmissionError::Busy)
         );
         assert_eq!(handle.cancel(id), Err(AdmissionError::WrongOperation));
+    }
+
+    #[test]
+    fn isolated_probe_runtime_admits_only_explicit_stop_recovery() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(2);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let snapshot = AiSnapshot {
+            probe_status: ProbeStatus::Isolated,
+            ..AiSnapshot::default()
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(snapshot),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared,
+        };
+
+        assert_eq!(
+            handle.try_submit(AiCommand::Probe),
+            Err(AdmissionError::Unavailable)
+        );
+        assert_eq!(
+            handle.try_submit(AiCommand::Logout),
+            Err(AdmissionError::Unavailable)
+        );
+        assert!(handle.try_submit(AiCommand::RetryProbeStop).is_ok());
     }
 
     #[test]

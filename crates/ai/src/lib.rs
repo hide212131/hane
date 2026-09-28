@@ -12,6 +12,7 @@ mod credential_journal;
 mod models;
 mod owner_lock;
 mod paths;
+mod probe;
 mod protocol;
 mod provider;
 mod rpc;
@@ -38,6 +39,7 @@ pub use credential_journal::{
 pub use models::{ChatGptModel, ModelListError, fetch_chatgpt_models, saved_model_is_available};
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use paths::AiPaths;
+pub use probe::{ProbeErrorCode, ProbeResult, ProbeStatus};
 pub use protocol::{ErrorObject, IncomingMessage, ParseError, RequestId};
 pub use provider::{
     CUSTOM_PROVIDER_ENV_KEY, CUSTOM_PROVIDER_ID, CustomProviderConfigError, CustomProviderMaterial,

@@ -266,6 +266,146 @@ fn main() {
                     break;
                 }
             }
+            (Some(id), Some(method)) if method == "thread/start" => {
+                if let Some(home) = &fake_home {
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        &format!("THREAD_START:{params}"),
+                    );
+                }
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"thread": {"id": "fake-thread-1"}}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "turn/start" => {
+                if let Some(home) = &fake_home {
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        &format!("TURN_START:{params}"),
+                    );
+                }
+                match fake_scenario.trim() {
+                    "probe_success" => {
+                        for (method, params) in [
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"foreign-turn","item":{"id":"foreign","type":"agentMessage","text":"must-not-leak"}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-1","type":"agentMessage","text":"Mock "}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-1","type":"agentMessage","text":"duplicate"}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-2","type":"agentMessage","text":"reply"}}),
+                            ),
+                            (
+                                "turn/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turn":{"id":"foreign-turn","status":"completed","error":null}}),
+                            ),
+                            (
+                                "turn/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turn":{"id":"fake-turn-1","status":"completed","error":null}}),
+                            ),
+                        ] {
+                            let notification = serde_json::json!({"method":method,"params":params});
+                            if writeln!(stdout, "{notification}").is_err()
+                                || stdout.flush().is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    "probe_401" | "probe_403" | "probe_429" => {
+                        let status = match fake_scenario.trim() {
+                            "probe_401" => 401,
+                            "probe_403" => 403,
+                            _ => 429,
+                        };
+                        let notification = serde_json::json!({
+                            "method":"turn/completed",
+                            "params":{
+                                "threadId":"fake-thread-1",
+                                "turn":{"id":"fake-turn-1","status":"failed","error":{
+                                    "message":"provider rejected bearer sk-fake-secret",
+                                    "codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":status}}
+                                }}
+                            }
+                        });
+                        let _ = writeln!(stdout, "{notification}");
+                        let _ = stdout.flush();
+                    }
+                    "probe_tool_item" => {
+                        let notification = serde_json::json!({
+                            "method":"item/started",
+                            "params":{"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"cmd-1","type":"commandExecution"}}
+                        });
+                        let _ = writeln!(stdout, "{notification}");
+                        let _ = stdout.flush();
+                    }
+                    _ => {}
+                }
+                if fake_scenario.trim() == "probe_turn_timeout" {
+                    // Keep the RPC pending so the runtime's bounded request
+                    // timeout path is exercised without a 90-second turn wait.
+                    continue;
+                }
+                let turn = if fake_scenario.trim() == "probe_invalid_turn_ack" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"id":"fake-turn-1"})
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"turn": turn}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "turn/interrupt" => {
+                let response = serde_json::json!({"id":id,"result":{}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+                if let Some(home) = &fake_home {
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        "INTERRUPT_ACK",
+                    );
+                }
+                if fake_scenario.trim() != "probe_cancel_ack_only" {
+                    let notification = serde_json::json!({
+                        "method":"turn/completed",
+                        "params":{"threadId":"fake-thread-1","turn":{"id":"fake-turn-1","status":"interrupted","error":null}}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+            }
             (Some(id), Some(method)) if method == "account/read" => {
                 let account = if account_signed_in {
                     serde_json::json!({"type":"chatgpt", "email":"fake-user@example.invalid", "planType":"plus"})
