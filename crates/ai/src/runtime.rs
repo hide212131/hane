@@ -388,7 +388,7 @@ type OwnerLockCallback = Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>;
 
 enum CoordinatorMessage {
     Lifecycle(
-        LifecycleCommand,
+        Box<LifecycleCommand>,
         Sender<Result<RuntimeStatus, RuntimeError>>,
     ),
     CriticalEventOverflow {
@@ -465,7 +465,7 @@ impl AiRuntime {
     fn send_lifecycle(&self, cmd: LifecycleCommand) -> Result<RuntimeStatus, RuntimeError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
-            .send(CoordinatorMessage::Lifecycle(cmd, reply_tx))
+            .send(CoordinatorMessage::Lifecycle(Box::new(cmd), reply_tx))
             .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
         reply_rx
             .recv()
@@ -807,7 +807,7 @@ fn run_coordinator(
             CoordinatorMessage::Lifecycle(cmd, reply) => {
                 operation_generation += 1;
                 let op_gen = operation_generation;
-                let result = match cmd {
+                let result = match *cmd {
                     LifecycleCommand::Reconfigure(
                         new_config,
                         new_configured_settings_generation,
