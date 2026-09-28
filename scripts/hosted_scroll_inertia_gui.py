@@ -281,7 +281,11 @@ def capture_single(interaction, module, env, config, helper, window_id: str,
         return capture, None, ""
     image_path = run_dir / f"{label}.png"
     lines, text, error = capture_ocr(interaction, helper, image_path, helper_timeout)
-    return capture, lines, text if not error else error
+    if error:
+        capture["result"] = "blocked"
+        capture["reason"] = f"OCR に失敗した: {error}"
+        return capture, lines, error
+    return capture, lines, text
 
 
 def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helper,

@@ -28,6 +28,26 @@ class VisibleLinesTests(unittest.TestCase):
         self.assertEqual(gui.visible_lines("line one\nLINE xyz\n"), [])
 
 
+class CaptureSingleTests(unittest.TestCase):
+    def test_ocr_failure_marks_capture_blocked_with_reason(self):
+        class FailingOcrInteraction:
+            def capture_named(self, *_args):
+                return {"result": "pass"}
+
+            def run_helper(self, *_args):
+                return False, "", "OCR helper unavailable"
+
+        capture, visible, recognized = gui.capture_single(
+            FailingOcrInteraction(), None, None, None, None, "window",
+            Path(__file__).parent, "baseline", 1.0,
+        )
+
+        self.assertEqual(capture["result"], "blocked")
+        self.assertIn("OCR helper unavailable", capture["reason"])
+        self.assertIsNone(visible)
+        self.assertEqual(recognized, "OCR helper unavailable")
+
+
 class LinesCoastTests(unittest.TestCase):
     def test_accepts_immediate_coast_deceleration_and_settling(self):
         result = gui.evaluate_lines_coast(
