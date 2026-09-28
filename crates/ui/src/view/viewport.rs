@@ -314,6 +314,50 @@ impl EditorView {
         true
     }
 
+    /// Re-anchors `scroll_y` to the same item and intra-item offset
+    /// `height_anchor` captured before this frame's visible blocks were
+    /// remeasured (see the `render` call site), so a wrapped row's corrected
+    /// height does not visibly move the document. `height_anchor` is `None`
+    /// when there is nothing to anchor to (line granularity, or an empty
+    /// document).
+    ///
+    /// `scroll_inertia_tracks_layout` tells this call whether a live inertia
+    /// coast still owned `scroll_y` going into this frame's layout, i.e.
+    /// nothing else (the render-entry clamp, cursor follow, a scrollbar drag,
+    /// a document switch, zoom, or a pinch) had already moved it away from
+    /// the coast's own `last_applied`. When that holds, this correction's own
+    /// `scroll_y` change is resynced onto the coast's `last_applied`; left
+    /// unsynced, the next frame's staleness check in `advance_scroll_inertia`
+    /// would mistake this frame's own height-anchor correction for an
+    /// unrelated ownership change and cancel a coast that never actually lost
+    /// ownership of the position (issue #389).
+    pub(super) fn apply_height_anchor(
+        &mut self,
+        height_anchor: Option<(usize, f32)>,
+        scroll_inertia_tracks_layout: bool,
+    ) {
+        let Some((old_ordinal, intra)) = height_anchor else {
+            return;
+        };
+        let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
+        let inside = if ordinal + 1 == self.heights.len() {
+            // At the document's last item, `intra` can already be carrying
+            // the `CARET_MODE_BADGE_HEIGHT` clearance `scroll_cursor_into_view`
+            // reserved past its bottom. Clamping it to the item's own height
+            // would throw that clearance away before the badge is ever drawn
+            // (issue #240); the clamp below still bounds the result.
+            intra.max(0.0)
+        } else {
+            self.heights
+                .height(ordinal)
+                .map_or(0.0, |height| intra.clamp(0.0, height))
+        };
+        self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+        if scroll_inertia_tracks_layout && let Some(inertia) = self.scroll_inertia.as_mut() {
+            inertia.last_applied = self.scroll_y;
+        }
+    }
+
     /// macOS trackpad pinch. `event.delta` is the incremental scale
     /// change since the previous event in the same gesture (see
     /// `gpui::PinchEvent`), so it is applied directly as a multiplicative

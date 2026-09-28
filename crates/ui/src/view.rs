@@ -428,12 +428,16 @@ struct ScrollInertia {
     /// `scroll_y`, per second.
     velocity: f32,
     last_frame: Instant,
-    /// The `scroll_y` this animation itself produced as of `last_frame`. If
+    /// The `scroll_y` this animation itself produced, as of `last_frame`
+    /// unless `Render::render`'s height-anchor recompute has since resynced
+    /// it (issue #389: that recompute runs after this frame's step and can
+    /// nudge `scroll_y` on its own, which is not a change of ownership). If
     /// `scroll_y` no longer matches this when the next frame steps, some
     /// other action (cursor follow, selection autoscroll, a scrollbar drag,
-    /// a document switch, zoom, or a pinch) has taken ownership of the
-    /// position since, and the stale inertia must stop instead of layering a
-    /// further step on top of it.
+    /// a document switch, zoom, a pinch, or a render-time clamp against a
+    /// shrunk document/viewport) has taken ownership of the position since,
+    /// and the stale inertia must stop instead of layering a further step on
+    /// top of it.
     last_applied: f32,
 }
 
@@ -6547,6 +6551,16 @@ impl Render for EditorView {
         }
         self.step_wheel_zoom_animation(window);
         self.step_scroll_inertia(window);
+        // Whether a live coast is still eligible to resync onto the
+        // height-anchor recompute below instead of reading as stale on the
+        // next frame (issue #389). Tracked separately from
+        // `self.scroll_inertia` so the render-entry clamp further down can
+        // disqualify it: if that clamp itself moves `scroll_y`, this is a
+        // genuine external change (e.g. a viewport shrink), not the
+        // height-anchor's own correction, and the coast must still stop.
+        let mut scroll_inertia_tracks_layout = self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
             return self.settings_screen_element(cx);
         }
@@ -6588,6 +6602,9 @@ impl Render for EditorView {
             self.scrollable_content_height(),
             self.viewport_height,
         );
+        scroll_inertia_tracks_layout &= self
+            .scroll_inertia
+            .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         let visible =
             self.heights
                 .visible_range(self.scroll_y, self.viewport_height, self.theme.overscan);
@@ -6679,22 +6696,8 @@ impl Render for EditorView {
         // same block and the same position inside it at the top instead of
         // letting those corrections visibly move the document, unless the
         // zoom gesture has a more specific pointer/pinch anchor.
-        if !zoom_anchor_applied && let Some((old_ordinal, intra)) = height_anchor {
-            let ordinal = old_ordinal.min(self.heights.len().saturating_sub(1));
-            let inside = if ordinal + 1 == self.heights.len() {
-                // At the document's last item, `intra` can already be
-                // carrying the `CARET_MODE_BADGE_HEIGHT` clearance
-                // `scroll_cursor_into_view` reserved past its bottom.
-                // Clamping it to the item's own height would throw that
-                // clearance away before the badge is ever drawn (issue
-                // #240); the clamp below still bounds the result.
-                intra.max(0.0)
-            } else {
-                self.heights
-                    .height(ordinal)
-                    .map_or(0.0, |height| intra.clamp(0.0, height))
-            };
-            self.scroll_y = self.heights.prefix_sum(ordinal) + inside;
+        if !zoom_anchor_applied {
+            self.apply_height_anchor(height_anchor, scroll_inertia_tracks_layout);
         }
         // A newly measured block can shrink at the old bottom. Anchoring
         // preserves its block-relative position, which can now sit below the
@@ -13242,6 +13245,80 @@ mod tests {
             "the stale inertia must be cancelled once it observes the position moved out from \
              under it"
         );
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // Issue #389: `render` calls `step_scroll_inertia` before laying out
+        // and remeasuring visible blocks. When a block being remeasured (e.g.
+        // mid-resize) has a different height than before, the height-anchor
+        // recompute below moves `scroll_y` again in the same frame. A coast
+        // that still owned `scroll_y` going into that recompute must not then
+        // read as stale on the next frame just because of this frame's own
+        // correction.
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 50.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), true);
+
+            assert_eq!(
+                view.scroll_y, 20.0,
+                "the anchor moves scroll_y to the corrected position"
+            );
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(20.0),
+                "a still-tracking coast's last_applied must resync onto this frame's own \
+                 height-anchor correction"
+            );
+            assert!(
+                view.advance_scroll_inertia(),
+                "the coast must keep running instead of reading this frame's own correction as \
+                 an unrelated ownership change"
+            );
+            assert!(view.scroll_inertia.is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn height_anchor_recompute_does_not_resync_inertia_that_already_lost_scroll_y(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The render-entry clamp (or any other direct assignment) moving
+        // `scroll_y` before layout is a genuine change of ownership; the
+        // height-anchor recompute must not paper over that by resyncing
+        // anyway.
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("one\ntwo\nthree\n", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.heights = HeightIndex::new([100.0, 100.0, 100.0]);
+            view.scroll_y = 50.0;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 500.0,
+                last_frame: Instant::now(),
+                last_applied: 999.0,
+            });
+
+            view.apply_height_anchor(Some((0, 20.0)), false);
+
+            assert_eq!(view.scroll_y, 20.0);
+            assert_eq!(
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                Some(999.0),
+                "an already-stale coast's last_applied must not be resynced"
+            );
+            assert!(
+                !view.advance_scroll_inertia(),
+                "the coast must still stop once it observes the position moved out from under it"
+            );
+            assert!(view.scroll_inertia.is_none());
+        });
     }
 
     #[gpui::test]
