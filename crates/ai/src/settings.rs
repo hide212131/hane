@@ -379,9 +379,11 @@ mod tests {
             model_id: "gpt-test".to_string(),
             credential_ref: None,
         };
-        let mut settings = AiSettings::default();
-        settings.active_connection = ActiveConnection::Custom;
-        settings.custom = Some(custom.clone());
+        let settings = AiSettings {
+            active_connection: ActiveConnection::Custom,
+            custom: Some(custom.clone()),
+            ..AiSettings::default()
+        };
         let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
         assert_eq!(saved.settings_generation, 1);
 
@@ -403,9 +405,11 @@ mod tests {
             model_id: "gpt-test".to_string(),
             credential_ref: None,
         };
-        let mut settings = AiSettings::default();
-        settings.active_connection = ActiveConnection::Custom;
-        settings.custom = Some(custom.clone());
+        let settings = AiSettings {
+            active_connection: ActiveConnection::Custom,
+            custom: Some(custom.clone()),
+            ..AiSettings::default()
+        };
         let saved = store.save(&owner, 0, settings, always_empty_journal).unwrap();
 
         let mut changed = saved.clone();
