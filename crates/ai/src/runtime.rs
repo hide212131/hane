@@ -1846,13 +1846,18 @@ mod tests {
 
     #[test]
     fn spawning_requires_hane_owned_codex_home_and_working_directory() {
-        let missing_home = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock")
+        // Use an absolute executable path native to the host OS. Unix-style
+        // paths such as `/opt/hane/codex` are not absolute Windows paths, so
+        // they would fail the earlier binary-path validation instead.
+        let binary_path = std::env::current_exe().expect("test executable path is absolute");
+        let owner_lock_path = std::env::temp_dir().join("hane-ai-test-owner.lock");
+        let missing_home = RuntimeConfig::new(&binary_path, &owner_lock_path)
             .spawn_child()
             .unwrap_err();
         assert_eq!(missing_home.kind(), io::ErrorKind::InvalidInput);
         assert!(missing_home.to_string().contains("CODEX_HOME"));
 
-        let mut missing_cwd = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+        let mut missing_cwd = RuntimeConfig::new(&binary_path, &owner_lock_path);
         missing_cwd.codex_home = Some(PathBuf::from("/tmp/hane-ai-codex-home"));
         let missing_cwd = missing_cwd.spawn_child().unwrap_err();
         assert_eq!(missing_cwd.kind(), io::ErrorKind::InvalidInput);
