@@ -56,3 +56,22 @@ no external context, and no execution for unexpected tool responses.
 This run was a Custom mock test only. It is not ChatGPT OAuth evidence, a
 Windows run, or GUI evidence. Full request bodies, host instructions,
 credentials, and raw authorization values were not retained in this file.
+
+## Commander acceptance and re-evaluation
+
+On 2026-09-28, the Commander explicitly accepted the presence of provider
+tool definitions and the additional developer input block as product behavior
+that is allowed and not itself a problem. This supersedes the original T00
+failure classification for those two observations; the observations above
+remain unchanged. The design PR was not modified.
+
+Under that accepted criterion, this recorded fixture passes: the configured
+Custom endpoint/model/key were used, the fixed user input was sent, the nearby
+sentinel was absent from the provider request, and the unexpected
+`exec_command` function call was rejected as unsupported with no marker file
+created. `thread/start` also returned no instruction sources. This is a scoped
+result for the tested `exec_command` response; it does not claim that the tool
+list was empty or prove the behavior of every possible tool call. The
+Commander accepted the presence of the tool definitions and developer input
+block, while this evidence retains only the negative-call behavior actually
+observed.
