@@ -9,8 +9,6 @@
 
 import AppKit
 import Carbon
-import CoreImage
-import CoreMedia
 import CryptoKit
 import Darwin
 import Foundation
@@ -622,23 +620,20 @@ final class WindowCaptureResult: @unchecked Sendable {
     private let lock = NSLock()
     private var capture: WindowCapture?
     private var image: CGImage?
-    private var displayTime: TimeInterval?
     private var errorMessage: String?
 
-    func finish(capture: WindowCapture? = nil, image: CGImage? = nil,
-                displayTime: TimeInterval? = nil, error: String? = nil) {
+    func finish(capture: WindowCapture? = nil, image: CGImage? = nil, error: String? = nil) {
         lock.lock()
         self.capture = capture
         self.image = image
-        self.displayTime = displayTime
         errorMessage = error
         lock.unlock()
     }
 
-    func values() -> (WindowCapture?, CGImage?, TimeInterval?, String?) {
+    func values() -> (WindowCapture?, CGImage?, String?) {
         lock.lock()
         defer { lock.unlock() }
-        return (capture, image, displayTime, errorMessage)
+        return (capture, image, errorMessage)
     }
 }
 
@@ -666,7 +661,7 @@ func prepareWindowCapture(_ windowID: CGWindowID) -> (WindowCapture?, String?) {
     guard completed.wait(timeout: .now() + 10) == .success else {
         return (nil, "timed out while preparing ScreenCaptureKit window capture")
     }
-    let (capture, _, _, error) = result.values()
+    let (capture, _, error) = result.values()
     return (capture, error)
 }
 
@@ -674,48 +669,21 @@ struct CapturedWindowFrame {
     let image: CGImage
     let started: TimeInterval
     let completed: TimeInterval
-    let displayed: TimeInterval
 }
 
-let screenshotImageContext = CIContext()
-
-func captureWindowImage(_ capture: WindowCapture) -> (CGImage?, TimeInterval?, String?) {
+func captureWindowImage(_ capture: WindowCapture) -> (CGImage?, String?) {
     let result = WindowCaptureResult()
     let completed = DispatchSemaphore(value: 0)
-    SCScreenshotManager.captureSampleBuffer(contentFilter: capture.filter,
-                                            configuration: capture.configuration) { sampleBuffer, error in
-        guard let sampleBuffer, error == nil else {
-            result.finish(error: error.map { String(describing: $0) } ?? "screenshot sample buffer unavailable")
-            completed.signal()
-            return
-        }
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(
-            sampleBuffer, createIfNecessary: false
-        ) as? [[SCStreamFrameInfo: Any]]
-        guard let displayTicks = attachments?.first?[.displayTime] as? UInt64 else {
-            result.finish(error: "ScreenCaptureKit frame has no window-server display timestamp")
-            completed.signal()
-            return
-        }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            result.finish(error: "ScreenCaptureKit sample buffer has no image buffer")
-            completed.signal()
-            return
-        }
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let image = screenshotImageContext.createCGImage(ciImage, from: ciImage.extent) else {
-            result.finish(error: "could not convert ScreenCaptureKit sample buffer to CGImage")
-            completed.signal()
-            return
-        }
-        result.finish(image: image, displayTime: Double(displayTicks) * machSecondsPerTick)
+    SCScreenshotManager.captureImage(contentFilter: capture.filter,
+                                     configuration: capture.configuration) { image, error in
+        result.finish(image: image, error: error.map { String(describing: $0) })
         completed.signal()
     }
     guard completed.wait(timeout: .now() + 10) == .success else {
-        return (nil, nil, "timed out while capturing the target window")
+        return (nil, "timed out while capturing the target window")
     }
-    let (_, image, displayTime, error) = result.values()
-    return (image, displayTime, error)
+    let (_, image, error) = result.values()
+    return (image, error)
 }
 
 func writeWindowImage(_ image: CGImage, path: String) {
@@ -736,10 +704,10 @@ func milliseconds(_ seconds: TimeInterval) -> String {
 
 func captureImageWithTimes(_ capture: WindowCapture) -> (CapturedWindowFrame?, String?) {
     let started = monotonicSeconds()
-    let (image, displayed, error) = captureWindowImage(capture)
+    let (image, error) = captureWindowImage(capture)
     let completed = monotonicSeconds()
-    guard let image, let displayed else { return (nil, error ?? "screenshot display time unavailable") }
-    return (CapturedWindowFrame(image: image, started: started, completed: completed, displayed: displayed), nil)
+    guard let image else { return (nil, error ?? "screenshot unavailable") }
+    return (CapturedWindowFrame(image: image, started: started, completed: completed), nil)
 }
 
 func visibleLineNumbers(_ image: CGImage) -> [Int] {
@@ -774,10 +742,7 @@ func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
     guard let capture = preparedCapture else { fail("ScreenCaptureKit returned no capture context") }
     let (warmFrame, warmError) = captureImageWithTimes(capture)
     guard let warmFrame else { fail("ScreenCaptureKit preflight failed: \(warmError ?? "unknown error")") }
-    guard warmFrame.completed >= warmFrame.started,
-          warmFrame.displayed <= warmFrame.completed else {
-        fail("ScreenCaptureKit warmup timing was invalid")
-    }
+    guard warmFrame.completed >= warmFrame.started else { fail("ScreenCaptureKit warmup timing was invalid") }
     // Warm Vision before any timed scroll probe so the first OCR request does
     // not consume the inertia window while analyzing a frame already captured.
     _ = visibleLineNumbers(warmFrame.image)
@@ -817,7 +782,6 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - eventPosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - eventPosted))
-        print(String(format: "frame_%02d_display_elapsed_ms=", index) + milliseconds(frame.displayed - eventPosted))
     }
 }
 
@@ -842,7 +806,6 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     var preImage: CGImage?
     var preStarted: TimeInterval = 0
     var preCompleted: TimeInterval = 0
-    var preDisplayed: TimeInterval = 0
     var preLines: [Int] = []
     var confirmedOldDirection = false
     let probeDeadline = firstPosted + 0.105
@@ -854,7 +817,6 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         preImage = frame.image
         preStarted = frame.started
         preCompleted = frame.completed
-        preDisplayed = frame.displayed
         preLines = visibleLineNumbers(frame.image)
         if preLines.min().map({ $0 > baseline }) == true {
             confirmedOldDirection = true
@@ -898,14 +860,12 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
     print("pre_reverse_capture_started_elapsed_ms=\(milliseconds(preStarted - commandStarted))")
     print("pre_reverse_capture_completed_elapsed_ms=\(milliseconds(preCompleted - commandStarted))")
-    print("pre_reverse_display_elapsed_ms=\(milliseconds(preDisplayed - firstPosted))")
     print("pre_reverse_visible_lines=\(preLines.map(String.init).joined(separator: ","))")
     print("reversal_event_route=cghidEventTap")
     print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - reversePosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - reversePosted))
-        print(String(format: "frame_%02d_display_elapsed_ms=", index) + milliseconds(frame.displayed - reversePosted))
     }
 }
 
