@@ -702,6 +702,9 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     // Grab the pre-reversal state in memory so screenshot encoding and disk I/O
     // do not consume the app's short inertia window before the opposite input.
     let (preImage, preImageError) = captureWindowImage(capture)
+    guard let preImage else {
+        fail("could not capture pre-reversal window frame: \(preImageError ?? "unknown error")")
+    }
     let preCaptured = ProcessInfo.processInfo.systemUptime
     let reversePosted = postScroll(pid, unit, reverseDelta)
 
@@ -717,9 +720,6 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         frames.append((index, image, ProcessInfo.processInfo.systemUptime))
     }
 
-    guard let preImage else {
-        fail("could not capture pre-reversal window frame: \(preImageError ?? "unknown error")")
-    }
     writeWindowImage(preImage, path: prePath)
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
