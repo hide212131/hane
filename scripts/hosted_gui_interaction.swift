@@ -685,6 +685,9 @@ func milliseconds(_ seconds: TimeInterval) -> String {
 func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                    _ reverseDelta: Int32, _ gapMs: Int, _ windowID: CGWindowID,
                    _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
+    // The compiled helper is a command-line process. Initialize AppKit's
+    // connection to the window server before ScreenCaptureKit requests images.
+    _ = NSApplication.shared
     let (preparedCapture, captureError) = prepareWindowCapture(windowID)
     guard captureError == nil else {
         fail("could not prepare ScreenCaptureKit: \(captureError ?? "unknown error")")
