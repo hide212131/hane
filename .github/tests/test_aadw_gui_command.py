@@ -244,12 +244,12 @@ class TrustedProcedureTests(unittest.TestCase):
         assert route is not None
         self.assertEqual(
             command.trusted_procedure(REPOSITORY_ROOT / route["procedure_path"]),
-            "hosted-scroll-inertia/4",
+            "hosted-scroll-inertia/5",
         )
         workflow = (REPOSITORY_ROOT / ".github" / "workflows" / route["workflow_file"]).read_text(
             encoding="utf-8"
         )
-        self.assertIn("'hosted-scroll-inertia/4'", workflow)
+        self.assertIn("'hosted-scroll-inertia/5'", workflow)
         self.assertIn(route["procedure_path"], workflow)
         self.assertIn("HANE_SCROLL_INERTIA_GUI_TARGET_DIR", workflow)
 
