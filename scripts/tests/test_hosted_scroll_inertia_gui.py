@@ -14,14 +14,11 @@ gui = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gui)
 
 
-def frames(offsets, times, display_times=None):
-    result = []
-    for index, (offset, elapsed) in enumerate(zip(offsets, times)):
-        frame = {"visible_lines": [offset, offset + 1, offset + 2], "elapsed_ms": elapsed}
-        if display_times is not None:
-            frame["display_elapsed_ms"] = display_times[index]
-        result.append(frame)
-    return result
+def frames(offsets, times):
+    return [
+        {"visible_lines": [offset, offset + 1, offset + 2], "elapsed_ms": elapsed}
+        for offset, elapsed in zip(offsets, times)
+    ]
 
 
 class VisibleLinesTests(unittest.TestCase):
@@ -100,7 +97,7 @@ class DirectionReversalTests(unittest.TestCase):
                                         [5, 24, 48, 80, 120, 180]),
                                         initial_to_reverse_event_ms=90,
                                         event_route="cghidEventTap",
-                                        pre_reverse_display_after_initial_ms=70)
+                                        pre_reverse_capture_completed_after_initial_ms=70)
         self.assertEqual(result["result"], "pass")
         self.assertEqual(result["event_route"], "cghidEventTap")
         self.assertTrue(result["old_direction_started"])
@@ -112,7 +109,7 @@ class DirectionReversalTests(unittest.TestCase):
         result = gui.evaluate_reversal(100, 108, frames([110, 109, 106, 104, 103, 103],
                                         [5, 24, 48, 80, 120, 180]),
                                         initial_to_reverse_event_ms=90,
-                                        pre_reverse_display_after_initial_ms=70)
+                                        pre_reverse_capture_completed_after_initial_ms=70)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["prompt"])
         self.assertFalse(result["no_old_coast"])
@@ -121,7 +118,7 @@ class DirectionReversalTests(unittest.TestCase):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
             initial_to_reverse_event_ms=136,
-            pre_reverse_display_after_initial_ms=100,
+            pre_reverse_capture_completed_after_initial_ms=100,
         )
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(result["inertia_window_ms"], gui.LINES_INERTIA_WINDOW_MS)
@@ -130,15 +127,15 @@ class DirectionReversalTests(unittest.TestCase):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100, 99, 99], [5, 24, 48, 80, 120, 180]),
             initial_to_reverse_event_ms=None,
-            pre_reverse_display_after_initial_ms=90,
+            pre_reverse_capture_completed_after_initial_ms=90,
         )
         self.assertEqual(result["result"], "blocked")
 
-    def test_blocks_when_old_direction_is_displayed_after_inertia_window(self):
+    def test_blocks_when_old_direction_capture_finishes_after_inertia_window(self):
         result = gui.evaluate_reversal(
             100, 108, frames([107, 105, 102, 100], [5, 24, 48, 80]),
             initial_to_reverse_event_ms=90,
-            pre_reverse_display_after_initial_ms=136,
+            pre_reverse_capture_completed_after_initial_ms=136,
         )
         self.assertEqual(result["result"], "blocked")
 
@@ -149,27 +146,22 @@ class ReversalHelperTimingTests(unittest.TestCase):
             "initial_event_elapsed_ms=2.000\n"
             "pre_reverse_capture_started_elapsed_ms=36.500\n"
             "pre_reverse_capture_completed_elapsed_ms=37.500\n"
-            "pre_reverse_display_elapsed_ms=35.000\n"
             "pre_reverse_visible_lines=100,108\n"
             "reversal_event_route=cghidEventTap\n"
             "reverse_event_elapsed_ms=40.250\n"
             "frame_00_capture_started_ms=4.100\n"
             "frame_00_capture_completed_ms=5.100\n"
-            "frame_00_display_elapsed_ms=4.800\n"
             "frame_01_capture_started_ms=25.000\n"
-            "frame_01_capture_completed_ms=26.000\n"
-            "frame_01_display_elapsed_ms=25.800\n",
+            "frame_01_capture_completed_ms=26.000\n",
             expected_frames=2,
         )
         self.assertEqual(evidence["event_route"], "cghidEventTap")
         self.assertEqual(evidence["initial_to_reverse_event_ms"], 38.25)
         self.assertEqual(evidence["pre_reverse_capture_after_initial_ms"], 34.5)
         self.assertEqual(evidence["pre_reverse_capture_completed_after_initial_ms"], 35.5)
-        self.assertEqual(evidence["pre_reverse_display_after_initial_ms"], 35.0)
         self.assertEqual(evidence["frame_elapsed_ms"], [5.1, 26.0])
         self.assertEqual(evidence["frame_capture_started_ms"], [4.1, 25.0])
         self.assertEqual(evidence["frame_capture_completed_ms"], [5.1, 26.0])
-        self.assertEqual(evidence["frame_display_elapsed_ms"], [4.8, 25.8])
 
     def test_rejects_out_of_order_pre_reversal_capture(self):
         with self.assertRaisesRegex(ValueError, "out of order"):
@@ -177,12 +169,10 @@ class ReversalHelperTimingTests(unittest.TestCase):
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_started_elapsed_ms=8\n"
                 "pre_reverse_capture_completed_elapsed_ms=9\n"
-                "pre_reverse_display_elapsed_ms=7\n"
                 "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=7\n"
                 "frame_00_capture_started_ms=3\n"
-                "frame_00_capture_completed_ms=4\n"
-                "frame_00_display_elapsed_ms=3.5\n",
+                "frame_00_capture_completed_ms=4\n",
                 expected_frames=1,
             )
 
@@ -192,7 +182,6 @@ class ReversalHelperTimingTests(unittest.TestCase):
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_started_elapsed_ms=8\n"
                 "pre_reverse_capture_completed_elapsed_ms=8.5\n"
-                "pre_reverse_display_elapsed_ms=7.5\n"
                 "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=9\n"
                 "frame_00_capture_started_ms=3\n",
@@ -205,12 +194,10 @@ class ReversalHelperTimingTests(unittest.TestCase):
                 "initial_event_elapsed_ms=2\n"
                 "pre_reverse_capture_started_elapsed_ms=8\n"
                 "pre_reverse_capture_completed_elapsed_ms=8.5\n"
-                "pre_reverse_display_elapsed_ms=7.5\n"
                 "reversal_event_route=target_pid\n"
                 "reverse_event_elapsed_ms=9\n"
                 "frame_00_capture_started_ms=3\n"
-                "frame_00_capture_completed_ms=4\n"
-                "frame_00_display_elapsed_ms=3.5\n",
+                "frame_00_capture_completed_ms=4\n",
                 expected_frames=1,
             )
 
@@ -234,8 +221,8 @@ class ReversalHelperTimingTests(unittest.TestCase):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         prepare = source.split("func prepareWindowCaptureContext(", 1)[1].split("\n}", 1)[0]
         self.assertIn("visibleLineNumbers(warmFrame.image)", prepare)
-        self.assertIn("CMSampleBufferGetSampleAttachmentsArray", source)
-        self.assertIn("[.displayTime]", source)
+        self.assertIn("SCScreenshotManager.captureImage", source)
+        self.assertNotIn("captureSampleBuffer", source)
         self.assertIn("mach_absolute_time()", source)
 
     def test_reversal_capture_does_not_send_input_without_baseline(self):
@@ -259,17 +246,14 @@ class ReversalHelperTimingTests(unittest.TestCase):
             "event_post_elapsed_ms=1.250\n"
             "frame_00_capture_started_ms=0.500\n"
             "frame_00_capture_completed_ms=4.500\n"
-            "frame_00_display_elapsed_ms=4.200\n"
             "frame_01_capture_started_ms=24.100\n"
-            "frame_01_capture_completed_ms=27.100\n"
-            "frame_01_display_elapsed_ms=26.700\n",
+            "frame_01_capture_completed_ms=27.100\n",
             expected_frames=2,
         )
         self.assertEqual(evidence["event_route"], "cghidEventTap")
         self.assertEqual(evidence["frame_elapsed_ms"], [4.5, 27.1])
         self.assertEqual(evidence["frame_capture_started_ms"], [0.5, 24.1])
         self.assertEqual(evidence["frame_capture_completed_ms"], [4.5, 27.1])
-        self.assertEqual(evidence["frame_display_elapsed_ms"], [4.2, 26.7])
 
     def test_normal_frame_capture_posts_and_captures_inside_one_helper(self):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
@@ -293,16 +277,20 @@ class PixelsDirectFollowTests(unittest.TestCase):
         self.assertEqual(result["first_response_frame"], 1)
         self.assertTrue(result["stable_without_app_coast"])
 
-    def test_uses_window_server_display_time_for_80ms_response_threshold(self):
-        after_deadline_capture = frames([104, 104, 104], [87, 120, 200], [79, 119, 199])
-        result = gui.evaluate_pixels(100, after_deadline_capture)
+    def test_requires_screenshot_to_complete_inside_80ms_response_threshold(self):
+        within_deadline_capture = frames([104, 104, 104], [77, 119, 199])
+        result = gui.evaluate_pixels(100, within_deadline_capture)
         self.assertEqual(result["result"], "pass")
         self.assertTrue(result["immediate"])
 
-        straddling_capture = frames([104, 104, 104], [88, 120, 200], [80.1, 119, 199])
+        straddling_capture = frames([104, 104, 104], [80.1, 119, 199])
         result = gui.evaluate_pixels(100, straddling_capture)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["immediate"])
+
+    def test_samples_near_the_initial_response_deadline(self):
+        self.assertIn(40, gui.FRAME_DELAYS_MS)
+        self.assertIn(40, gui.PIXELS_FRAME_DELAYS_MS)
 
     def test_rejects_app_side_coast_after_pixels_event(self):
         result = gui.evaluate_pixels(100, frames([104, 106, 109], [8, 50, 200]))
