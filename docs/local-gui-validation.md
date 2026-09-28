@@ -64,11 +64,25 @@ Issue #270 の fenced code block 表示・直接編集だけを確認する場�
 
 このコマンドは `scripts/hosted_code_block_gui.py` の信頼済み手順へ振り分けられる。1 fixture / 1 launch だけを使い、inactive 表示で raw opening / closing fence と info string が見えず、コード本文が見えること、focused screenshot evidence、hidden opening fence の source position を実 OS keyboard で直接編集・保存できること、Undo/Save で元 Markdown bytes に戻ることを確認する。日本語 IME、一般 inline syntax、list、sidebar、再起動などの包括的な回帰は実行しないため、`/gui-validate head|merge` の代替ではない。
 
+Issue #389 のホイールスクロール受け入れ条件だけを実画面で確認する場合は、専用手順を使う。
+
+```text
+/gui-validate scroll-inertia head
+```
+
+```text
+/gui-validate scroll-inertia merge
+```
+
+このコマンドは `scripts/hosted_scroll_inertia_gui.py` の信頼済み手順へ振り分けられる。OSにLines/Pixelsを明示した入力を送り、Linesの初回応答・解放後の余韻と減速・方向反転、文書先頭/末尾のクランプ、Pixelsの直接追従と入力後の安定を時間差の画面キャプチャで確認し、可視行・経過時間・スクリーンショットとfixtureの不変性をartifactに残す。デバイス種別は推測せず、通常の包括的なGUI検証も代替しない。
+
 `head` は exact current PR head を検証する。`merge` は current target branch と current PR head から GitHub が作る current PR merge ref を検証する。文章中にコマンド文字列を書いた場合や、引数がない・未知の引数を付けた場合は起動しない。
 
 comment router は trusted default branch の workflow / script だけを使い、コメントイベントから PR 番号を取得する。GitHub API から current PR metadata を取得し、コメント投稿者が `write` / `maintain` / `admin` のいずれかであること、PR が open かつ non-draft であること、same-repository PR であることを確認する。head SHA と current target branch SHA は人に入力させず、その時点の GitHub facts から解決する。
 
 procedure version は trusted default branch の `scripts/hosted_gui_interaction.py` にある `PROCEDURE_VERSION` を読み、人に転記させない。現在の総合 procedure は `hosted-gui-interaction/7` である。
+
+`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/1`) からtrusted routerが読み取る。
 
 router が作る依頼は PR、exact head、router が観測した current base、execution context、procedure に結び付ける。同じ context の queued / in-progress / success run がすでにある場合は重複起動を抑止する。base SHA も識別に含めるため、head が同じまま target branch が進んだ場合に、古い base の成功 run を current evidence として自動再利用しない。
 
