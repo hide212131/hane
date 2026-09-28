@@ -330,8 +330,11 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                     interaction, gui_validate, env, config, helper, pid, window_id,
                     scenario_dir / "lines-coast",
                     "lines", -8, FRAME_DELAYS_MS, helper_timeout)
-                steps.append(step("lines_coast", "blocked", error) if error else
-                             evaluate_lines_coast(baseline, frames))
+                if error:
+                    steps.append(step("lines_coast", "blocked", error))
+                    time.sleep(FRAME_DELAYS_MS[-1] / 1000)
+                else:
+                    steps.append(evaluate_lines_coast(baseline, frames))
 
                 reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
                     interaction, gui_validate, env, config, helper, window_id,
