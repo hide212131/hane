@@ -12,6 +12,7 @@ SPEC = importlib.util.spec_from_file_location("aadw_gui_command", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 command = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(command)
+REPOSITORY_ROOT = MODULE_PATH.parents[2]
 
 SHA = "a" * 40
 BASE = "b" * 40
@@ -49,6 +50,8 @@ class ParseCommandTests(unittest.TestCase):
         self.assertIsNone(command.parse_command("/gui-validate code-block merge"))
         self.assertIsNone(command.parse_command("/gui-validate file-tabs head"))
         self.assertIsNone(command.parse_command("/gui-validate file-tabs merge"))
+        self.assertIsNone(command.parse_command("/gui-validate scroll-inertia head"))
+        self.assertIsNone(command.parse_command("/gui-validate scroll-inertia merge"))
 
     def test_accepts_outer_whitespace_but_not_embedded_prose(self):
         self.assertEqual(command.parse_command(" \r\n/gui-validate merge\r\n "), "merge")
@@ -169,6 +172,24 @@ class ParseRouteTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_routes_scroll_inertia_focused_commands(self):
+        for context in ("head", "merge"):
+            with self.subTest(context=context):
+                expected = {
+                    "validation_kind": "scroll-inertia",
+                    "execution_context": context,
+                    "workflow_file": "aadw-gui-validation.yml",
+                    "procedure_path": "scripts/hosted_scroll_inertia_gui.py",
+                }
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate scroll-inertia {context}"),
+                    expected,
+                )
+                self.assertEqual(
+                    command.parse_route(f"/gui-validate\tscroll-inertia\t{context}"),
+                    expected,
+                )
+
     def test_sidebar_chrome_route_rejects_non_whitespace_separators(self):
         self.assertIsNone(command.parse_route("/gui-validatettsidebar-chromethead"))
         self.assertIsNone(command.parse_route(r"/gui-validate\sidebar-chrome\head"))
@@ -194,6 +215,10 @@ class ParseRouteTests(unittest.TestCase):
             "/gui-validate file-tabs merge extra",
             "このPRは /gui-validate file-tabs merge してください",
             "/gui-validate file-tabs\nmerge",
+            "/gui-validate scroll-inertia",
+            "/gui-validate scroll-inertia merge extra",
+            "このPRは /gui-validate scroll-inertia merge してください",
+            "/gui-validate scroll-inertia\nmerge",
             "/gui-validate comprehensive merge",
         )
         for body in invalid:
@@ -213,6 +238,20 @@ class TrustedProcedureTests(unittest.TestCase):
             self._procedure('PROCEDURE_VERSION = "hosted-gui-interaction/7"\n'),
             "hosted-gui-interaction/7",
         )
+
+    def test_scroll_inertia_route_points_to_its_trusted_versioned_procedure(self):
+        route = command.parse_route("/gui-validate scroll-inertia merge")
+        assert route is not None
+        self.assertEqual(
+            command.trusted_procedure(REPOSITORY_ROOT / route["procedure_path"]),
+            "hosted-scroll-inertia/1",
+        )
+        workflow = (REPOSITORY_ROOT / ".github" / "workflows" / route["workflow_file"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("'hosted-scroll-inertia/1'", workflow)
+        self.assertIn(route["procedure_path"], workflow)
+        self.assertIn("HANE_SCROLL_INERTIA_GUI_TARGET_DIR", workflow)
 
     def test_rejects_missing_or_duplicate_procedure_version(self):
         for source in (

@@ -567,9 +567,31 @@ func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
     print("OS wheel at \(point.x),\(point.y), pixels=\(pixels)")
 }
 
+func scrollUnit(_ name: String) -> CGScrollEventUnit {
+    switch name {
+    case "lines": return .line
+    case "pixels": return .pixel
+    default: fail("scroll unit must be lines or pixels")
+    }
+}
+
+func postScroll(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32) {
+    let bounds = windowBounds(pid)
+    guard let event = CGEvent(
+        scrollWheelEvent2Source: nil,
+        units: unit,
+        wheelCount: 1,
+        wheel1: delta,
+        wheel2: 0,
+        wheel3: 0
+    ) else { fail("could not create OS scroll event") }
+    event.location = CGPoint(x: bounds.midX, y: bounds.midY)
+    event.post(tap: .cghidEventTap)
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let command = arguments.first else {
-    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
+    fail("usage: hosted_gui_interaction.swift <ocr|image-digest|wheel|wheel-event|focus-editor|current-source|list-sources|select-source|activate|deactivate|select-all-type-save|undo-save|redo-save|force-save|type-romaji-commit-save|type-romaji-at-caret-commit-save|type-romaji-at-caret-commit|type-romaji-at-caret-cancel-save|click-text|drag-select-text|type-save|press-key|move-doc-start|move-caret|shift-select|delete-selection-save|end-doc-type-save> ...")
 }
 
 switch command {
@@ -582,6 +604,14 @@ case "image-digest":
 case "wheel":
     guard arguments.count == 3, let pid = pid_t(arguments[1]), let pixels = Int32(arguments[2]) else { fail("wheel requires PID and pixels") }
     scrollEditor(pid, pixels)
+case "focus-editor":
+    guard arguments.count == 2, let pid = pid_t(arguments[1]) else { fail("focus-editor requires PID") }
+    focusEditor(pid)
+case "wheel-event":
+    guard arguments.count == 4,
+          let pid = pid_t(arguments[1]),
+          let delta = Int32(arguments[3]) else { fail("wheel-event requires PID, lines|pixels and delta") }
+    postScroll(pid, scrollUnit(arguments[2]), delta)
 case "current-source":
     print(currentSourceID())
 case "activate":
