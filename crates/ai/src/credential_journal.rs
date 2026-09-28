@@ -183,6 +183,12 @@ pub struct RecoveryOutcome {
     /// marked complete) instead of being dropped as if cleanup had
     /// succeeded, so a later `recover` retries the same idempotent delete.
     pub deletion_failed: usize,
+    /// A pending `delete`'s settings replace (dropping `credential_ref`) has
+    /// not yet been confirmed to durably land: `on_pending_settings_swap`
+    /// returned `Ok(false)`. The journal entry is left in place for a later
+    /// `recover` to retry; this is distinct from `left_for_diagnosis`, which
+    /// marks an inconsistency neither settings side can safely confirm.
+    pub pending_settings_swap: usize,
 }
 
 /// Recovers every pending journal entry against the already-durable
@@ -208,6 +214,7 @@ pub fn recover(
     let mut completed = 0usize;
     let mut left_for_diagnosis = 0usize;
     let mut deletion_failed = 0usize;
+    let mut pending_settings_swap = 0usize;
 
     // Deletes the now-unreferenced credential (if any) and completes the
     // journal entry only when that delete actually succeeded (idempotently
@@ -267,6 +274,8 @@ pub fn recover(
                         } else {
                             deletion_failed += 1;
                         }
+                    } else {
+                        pending_settings_swap += 1;
                     }
                 } else if current_credential_ref.is_none() {
                     // credential_ref already cleared: retry deleting the
@@ -286,7 +295,7 @@ pub fn recover(
         }
     }
 
-    Ok(RecoveryOutcome { completed, left_for_diagnosis, deletion_failed })
+    Ok(RecoveryOutcome { completed, left_for_diagnosis, deletion_failed, pending_settings_swap })
 }
 
 #[cfg(test)]
@@ -503,6 +512,7 @@ mod tests {
         let outcome = recover(&journal, Some(&old_ref), &store, |_| Ok(false)).unwrap();
 
         assert_eq!(outcome.completed, 0);
+        assert_eq!(outcome.pending_settings_swap, 1);
         assert!(!journal.is_empty().unwrap());
         assert!(store.get(&old_ref).unwrap().is_some(), "credential must not be deleted before the replace is confirmed");
     }
