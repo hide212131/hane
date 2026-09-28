@@ -397,6 +397,45 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 
 [実装仕様](refactor-rf2a-inline-rename-implementation-spec.md) 第3節の36メソッドは、同じ相対順のまま `crates/ui/src/view.rs` の元の一つの `impl EditorView` ブロック（`text_input_render_state` / `set_text_input_bounds` と共有していたブロック）から、新規 `crates/ui/src/view/inline_rename.rs` の新しい `impl EditorView` ブロックへ機械的に移した。署名・引数・戻り値・属性・コメント・bodyは変更していない。可視性は仕様どおり2件だけ変更した。`begin_inline_rename`（private→`pub(super)`、兄弟 `view/sidebar.rs` の2箇所のダブルクリックhandlerから呼ぶため）と `inline_rename_has_background_conflict`（private→`pub(super)`、親 `view.rs` の既存 `mod tests` 内のassertから呼ぶため）。他28件の `pub(crate)` と残り6件のprivateは維持した。
 
+移動した36件の個別対応は次のとおり。各行で旧定義 `crates/ui/src/view.rs::<method>` を同名の新定義 `crates/ui/src/view/inline_rename.rs::<method>` へ移した。順序は設計仕様第3節と一致する。
+
+1. `inline_rename_active`
+2. `inline_rename_render_state`
+3. `set_inline_rename_input_bounds`
+4. `inline_rename_character_index_for_point`
+5. `move_inline_rename_to_point`
+6. `inline_rename_has_composition`
+7. `inline_rename_text_for_range`
+8. `inline_rename_selection`
+9. `inline_rename_marked_range`
+10. `replace_inline_rename_text`
+11. `replace_and_mark_inline_rename_text`
+12. `commit_inline_rename_composition`
+13. `cancel_inline_rename_composition`
+14. `selected_inline_rename_text`
+15. `move_inline_rename_left`
+16. `move_inline_rename_right`
+17. `move_inline_rename_horizontal`
+18. `select_inline_rename_left`
+19. `select_inline_rename_right`
+20. `select_all_inline_rename`
+21. `select_inline_rename_home`
+22. `select_inline_rename_end`
+23. `move_inline_rename_home`
+24. `move_inline_rename_end`
+25. `move_inline_rename_to`
+26. `backspace_inline_rename`
+27. `delete_inline_rename`
+28. `delete_inline_rename_with_direction`
+29. `begin_inline_rename_from_selection`
+30. `begin_inline_rename`
+31. `inline_rename_has_background_conflict`
+32. `reserve_inline_rename_tickets`
+33. `confirm_inline_rename`
+34. `finish_inline_rename`
+35. `follow_inline_rename_paths`
+36. `cancel_inline_rename`
+
 `view.rs` には `mod inline_rename;` を既存の `mod sidebar; mod sidebar_filter; mod viewport;` の直前に追加した。`EditorView` の型・field・初期化（`new` / `from_sessions`）、`InlineRename` / `InlineRenameKind` / `InlineRenameComposition` / `InlineRenameRenderState` / `SidebarFilterComposition`、UTF-16/grapheme/selection共有helper（`inline_rename_parts`、`valid_inline_rename_name`、`rebase_ui_path`、`byte_offset_from_utf16`、`utf16_offset_from_byte`、`byte_range_from_utf16`、`inline_rename_selected_range`、`range_to_utf16`、`previous_inline_rename_boundary`、`next_inline_rename_boundary`、`inline_rename_cursor`、`select_inline_rename_to`、`select_inline_rename_to_fields`）、`text_input_render_state`、`set_text_input_bounds`、既存 `mod tests` は `view.rs` に残した。新moduleの冒頭は既存の兄弟module（`view/sidebar.rs` 等）と同じ `use super::*;` を使い、`shape_inline_rename_line` / `InlineRenameInput`（`input.rs` 由来で `view.rs` が再exportしているもの）や上記共有型・helperを、兄弟 `view/sidebar_filter.rs` が既に使っているのと同じ経路で参照する。`actions.rs`、`input.rs`、`capture.rs`、`view/sidebar.rs`、`view/sidebar_filter.rs`、`view/viewport.rs`、session crate、Cargo設定・lock、workflowは変更していない。
 
 `crates/ui/src/view.rs` の該当 `impl EditorView` ブロックは、移動後に `text_input_render_state` の直後へ `set_text_input_bounds`、その直後へ `pub fn new` が続く形になった。両ファイルとも移動対象36シンボルが一度だけ定義され、`view.rs` 側に旧定義や委譲wrapperが残っていないことをシンボル名の再検索で確認した。body比較は、移動元の原文をそのまま新moduleへ転記し、rustfmtや条件式の書き換えを加えない方法で行った。入力先の優先順、IME、pending guard、path検査、ticket予約、二段spawn、`.detach()`、通知、保存再開とH1同期を含む既存の処理順はコード上変更していない。
@@ -415,7 +454,7 @@ PR #394で受入済みの設計に基づき、inline rename専用メソッドを
 
 GitHub current-head CI run [36421117864](https://github.com/hide212131/hane/actions/runs/36421117864) は、同じPR head `ac3d8750eba6ed18b0b464a88aebae04df623a86` でmacOS / Windowsとも成功した。両OSのworkspace testsとclippy、macOS fallback glyph rasterization、macOS input source reactivationのcheckが成功。mainはbase `b6b7a8b3fc072b60bbd7b1886ec64006d8872d97` のまま。
 
-GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。CodeRabbitによる最終PR headのfull reviewは未実施で、次に実施する。
+GUI操作は実施しない。実差分とmethod-level比較で36件すべての宣言・signature・属性/comment・bodyの同等性を確認し、動作変更は2件のmodule内可視性調整だけであること、呼出元・入力配線・IME・描画・非同期処理を変更していないことを確認した。macOS / Windows CIと該当テストも成功しており、画面挙動を変える差分がないためGUI validationを追加しない。CodeRabbit full review run `18c5ded6-cac5-4e49-9c21-7fe1813d0430` はhead `4e8357196fb7415ccaac6fd105fe3b53e7ca94cc` を確認し、メソッド移動自体に不一致はないとしたうえで、実行計画に36件の個別対応が不足している点を指摘した。この節に上記一覧を追加した。CodeRabbitは移動した関数群のdocstring coverage 5.56%をwarningとして示したが、本PRでは既存コメント・属性を保持する機械的移動が受入条件であり、コメントを追加・変更しない。対応表追記後のcurrent-head CIとfull reviewを次に確認する。
 
 本節への今回の追記は文書のみであり、検証した製品コードから差分はない。追記後のcurrent-head CIとCodeRabbit reviewの結果はPR最終判断時に記録する。CodeRabbitの設計PRレビューにあるWindows renameの懸念は独立事項であり、本移動から生じた回帰として扱わない。
 
