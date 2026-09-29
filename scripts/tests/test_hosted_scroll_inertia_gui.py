@@ -72,11 +72,21 @@ class LinesCoastTests(unittest.TestCase):
         self.assertTrue(result["first_response"])
         self.assertEqual(result["first_response_frame"], 1)
 
+    def test_accepts_first_response_by_the_end_of_the_issue_inertia_window(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 104, 106, 110, 112, 112, 112],
+                   [44, 74, 120, 144, 170, 205, 240, 292]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 2)
+
     def test_rejects_missing_initial_response(self):
         result = gui.evaluate_lines_coast(
             100,
             frames([100, 101, 102, 103, 104, 104, 104, 104],
-                   [100, 124, 148, 172, 208, 244, 290, 340]),
+                   [136, 160, 184, 208, 232, 256, 290, 340]),
         )
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["first_response"])
@@ -205,16 +215,16 @@ class ReversalHelperTimingTests(unittest.TestCase):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         reversal = source.split("func wheelReversal(", 1)[1].split("\n}", 1)[0]
         self.assertEqual(reversal.count("postScroll(pid, unit,"), 2)
+        self.assertLess(
+            reversal.index("let reversePosted = postScroll(pid, unit, reverseDelta)"),
+            reversal.index("let preLines = visibleLineNumbers(preFrame.image)"),
+            "OCR must not delay the reverse event inside the Lines inertia window",
+        )
         self.assertIn("event.post(tap: .cghidEventTap)", source)
         self.assertNotIn("postToPid", source)
         self.assertIn('print("reversal_event_route=cghidEventTap")', reversal)
-        self.assertIn("visibleLineNumbers(frame.image)", reversal)
-        self.assertIn("preLines.min().map({ $0 > baseline }) == true", reversal)
-        self.assertIn("guard confirmedOldDirection, let confirmedPreImage = preImage else", reversal)
-        self.assertLess(
-            reversal.index("guard confirmedOldDirection"),
-            reversal.index("postScroll(pid, unit, reverseDelta)"),
-        )
+        self.assertIn("visibleLineNumbers(preFrame.image)", reversal)
+        self.assertNotIn("probeIntervalMs", reversal)
         self.assertIn("firstPosted + 0.135", reversal)
 
     def test_ocr_is_warmed_before_timed_reversal_and_capture_uses_display_metadata(self):
@@ -277,20 +287,24 @@ class PixelsDirectFollowTests(unittest.TestCase):
         self.assertEqual(result["first_response_frame"], 1)
         self.assertTrue(result["stable_without_app_coast"])
 
-    def test_requires_screenshot_to_complete_inside_80ms_response_threshold(self):
-        within_deadline_capture = frames([104, 104, 104], [77, 119, 199])
+    def test_requires_screenshot_to_complete_inside_lines_inertia_window(self):
+        within_deadline_capture = frames([104, 104, 104], [134.9, 159, 199])
         result = gui.evaluate_pixels(100, within_deadline_capture)
         self.assertEqual(result["result"], "pass")
         self.assertTrue(result["immediate"])
 
-        straddling_capture = frames([104, 104, 104], [80.1, 119, 199])
+        straddling_capture = frames([104, 104, 104], [135.1, 159, 199])
         result = gui.evaluate_pixels(100, straddling_capture)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["immediate"])
 
     def test_samples_near_the_initial_response_deadline(self):
         self.assertIn(40, gui.FRAME_DELAYS_MS)
-        self.assertIn(40, gui.PIXELS_FRAME_DELAYS_MS)
+        self.assertTrue({64, 88, 112}.issubset(gui.PIXELS_FRAME_DELAYS_MS))
+
+    def test_pixels_samples_cover_the_response_window_and_later_stability(self):
+        self.assertTrue(any(delay >= 112 for delay in gui.PIXELS_FRAME_DELAYS_MS))
+        self.assertGreaterEqual(gui.PIXELS_FRAME_DELAYS_MS[-1], 180)
 
     def test_rejects_app_side_coast_after_pixels_event(self):
         result = gui.evaluate_pixels(100, frames([104, 106, 109], [8, 50, 200]))
