@@ -353,3 +353,25 @@ The user reported that the native Hane page still differed substantially from th
 
 - Actions run [36607939093](https://github.com/hide212131/hane/actions/runs/36607939093) at exact head `1a75819cb1dee072f3ef8720d0e3eeecddaf2273`: **pass**. The required-check detector, macOS workspace tests / macOS-specific tests / Clippy, and Windows workspace tests / Clippy all passed.
 - CodeRabbit remains skipped because PR #397 is Draft. The run is CI evidence only and does not include native GUI inspection. PR #397 remains Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
+
+## 2026-09-30 UI alignment refinement after user review (product commit `344e3a5b3b27f20d552c742a252bee0ca6e2667d`)
+
+The user reported that the native page still looked substantially different from PR #410's HTML. This refinement works on the shared product content area; the HTML preview bar, demo sidebar, and sample-only controls remain excluded as required by the PR #410 README.
+
+- The current-settings card now follows the reference hierarchy more closely: status title/icon and badge, three side-by-side values, then one icon-led state message. Its dark surfaces, borders, and card radius match the HTML palette more closely. No confirmation timestamp is displayed because `ProbeResult` has no timestamp contract; the HTML's sample time is not copied into the product UI.
+- The connection cards use the reference's two-column sizing, radio treatment, shorter subtitles, selected/unselected fills, border, and corner radius. ChatGPT account information now has the reference-style account icon and identity row. Model controls remain hidden behind a lock prompt until account state is signed in; a UI regression assertion covers this. Once signed in, the model list and manual model ID remain available, including repeated selection before saving.
+- The Custom Provider service choice is now a dropdown like the HTML select. The key row and connection-details disclosure have separators, and the form panel and test-response box use the reference spacing and dark surfaces. The response panel shows the validated status without rendering the probe response body as an extra line.
+- No service/runtime/OAuth/provider safety behavior changed. T29 and T30 remain **reported complete by the user**, and no live OAuth or provider request was performed during this UI refinement.
+
+### Acceptance evidence for product commit `344e3a5`
+
+- **T24 — partial:** `cargo test -p hane-ui --locked` passed **221 tests**. The suite includes `view::ai_settings::tests::ai_settings_show_only_the_selected_connection_and_keep_savebar_visible` (now checks that the signed-out view shows the model lock and hides model controls) and `view::ai_settings::tests::chatgpt_model_selection_can_be_changed_multiple_times_before_saving`. This is GPUI automation, not a substitute for live account/provider success. Log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-test-hane-ui.log`.
+- **T25–T28 — unchanged prior evidence:** this layout refinement does not change editor-input isolation, external-open behavior, document-session state, or recovery contracts. Their prior status and limitations remain recorded above.
+- **T29/T30 — user-reported complete; not rerun:** no real account login, provider connection, or API key operation was performed for this UI-only work.
+- **T31 — partial:** the rebuilt isolated app is running at `/tmp/hane379-ui-410-20260930-v3/Hane-UI-Review.app`. Its state and disposable Markdown workspace remain in `/tmp/hane379-ui-410-20260930-v3/state` and `/tmp/hane379-ui-410-20260930-v3/workspace`. The built binary SHA-256 is `0cab4e2bd88b7056002e92fb4f5d7f4a40eae9bdeee589f6963fe7485394ea5a`; build log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-build-hane.log`. The user can review this build in Settings → AI. CUA still reports the Mac locked, so no agent-side visual inspection is claimed. Windows GUI and Japanese IME/Tab checks remain unverified.
+- `cargo test -p hane-ai --locked`: **pass**, 181 tests (134 unit, 11 account-service, 16 Custom Provider runtime, 20 runtime lifecycle). Log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-test-hane-ai.log`.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: **pass**. Log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-clippy-workspace.log`.
+- Focused `rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs` and `git diff --check`: **pass**.
+- Required `cargo fmt --all -- --check`: **fail** on existing repository-wide formatting differences; `ai_settings.rs` is absent from the output. Log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-fmt-check.log`.
+
+GitHub Actions for the exact product/evidence head are pending after the branch update and will be recorded below. PR #397 remains the implementation PR and will remain Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
