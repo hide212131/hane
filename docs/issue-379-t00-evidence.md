@@ -255,3 +255,18 @@ navigate the isolated app to Settings → AI before the OAuth handoff can resume
 Remaining Commander inputs for P5 are the selected Windows GUI device and the
 Custom Provider Base URL/model ID. The API key must be entered directly into
 the isolated Hane UI; it must not be sent in chat or written to logs.
+
+### Verification refresh at documentation head `ac4d8ff813c71a47e2f433ab5f9440454a3b61ff`
+
+This commit changes only this evidence file; product code is unchanged from
+the tested gate commit `21a64d5393cab4ee1709b7bfbd3f2d47e1f5f412`.
+
+- `cargo test -p hane-ai`: **pass** (134 unit, 11 account-service, 16 Custom
+  Provider runtime, 20 runtime-lifecycle); log:
+  `/tmp/hane379-p5-20260929/cargo-test-hane-ai-ac4d8ff.log`.
+- `cargo fmt --all -- --check`: **fail** on the same existing repository-wide
+  formatting differences, including `atomic_file.rs`, `credential_journal.rs`,
+  `owner_lock.rs`, `protocol.rs`, and `provider.rs`; log:
+  `/tmp/hane379-p5-20260929/cargo-fmt-all-check-ac4d8ff.log`.
+- GitHub Actions run `36521157048` at this head: **pass** for macOS and Windows
+  workspace tests and Clippy, including both macOS-specific tests.
