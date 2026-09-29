@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Hane｜AI設定・画面仕様</title>
+<style>
+:root{--bg:#191b1f;--rail:#15171b;--panel:#22252a;--field:#1b1e23;--line:#373b43;--text:#f0f1f4;--sub:#b1b6c0;--muted:#858c99;--accent:#c4b5fd;--accent-ink:#201934;--green:#a2ddc5;--amber:#f1d094;--red:#ffb2b5;--preview:56px;--sidebar:214px;--footer:82px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK JP","Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;font-synthesis:none}
+*{box-sizing:border-box}html{scroll-padding-top:calc(var(--preview) + 18px);scroll-padding-bottom:calc(var(--footer) + 18px)}body{margin:0;background:var(--bg);color:var(--text);font-size:14px;line-height:1.65}button,input,select{font:inherit}button,a,input,select,summary{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{cursor:not-allowed}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}[hidden]{display:none!important}h1,h2,h3,p{margin:0}svg{display:inline-block;vertical-align:middle;flex-shrink:0}.icon{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}.small-icon{width:15px;height:15px}.preview-bar{height:var(--preview);position:fixed;inset:0 0 auto;z-index:40;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 24px;background:#101216;border-bottom:1px solid #33373f}.preview-label{display:flex;align-items:center;gap:12px;white-space:nowrap}.preview-tag{font-size:10px;letter-spacing:.08em;font-weight:700;padding:3px 7px;border:1px solid #5d5276;color:#d6c9f6;border-radius:5px}.preview-title{font-size:12px;font-weight:600}.preview-note{font-size:11px;color:var(--sub)}.preview-actions{display:flex;align-items:center;gap:8px}.preview-actions label{font-size:11px;color:var(--sub);white-space:nowrap}.preview-actions select{font-size:12px;height:32px;width:201px;padding:0 28px 0 10px;background:#1e2127;color:var(--text);border:1px solid var(--line);border-radius:6px}.preview-actions .btn{font-size:12px;min-height:32px;padding:4px 11px}.sidebar{position:fixed;top:var(--preview);bottom:0;left:0;width:var(--sidebar);padding:27px 18px 20px;background:var(--rail);border-right:1px solid #2a2e35;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:10px;margin:0 14px 33px;font-size:23px;font-weight:680;letter-spacing:.015em}.brand-mark{width:30px;height:30px;color:var(--accent)}.back{display:flex;align-items:center;gap:7px;text-decoration:none;color:var(--sub);font-size:12px;padding:8px 10px;border:0;background:transparent;border-radius:7px;text-align:left}.back:hover{background:#22252b;color:var(--text)}.nav-label{margin:32px 12px 11px;color:var(--muted);font-size:11px;letter-spacing:.07em}.nav-item{height:43px;display:flex;align-items:center;gap:10px;padding:0 13px;border-radius:7px;color:var(--sub);font-size:13px;margin-bottom:5px}.nav-item.active{background:#302b40;color:#e2d8ff;font-weight:600}.nav-item.inactive{color:#8e95a2}.nav-note{font-size:10px;line-height:1.9;color:var(--muted);margin:12px 12px 0}.side-foot{margin-top:auto;padding:18px 12px 2px;color:var(--muted);font-size:11px;border-top:1px solid #2a2e35}.side-foot strong{display:block;color:var(--sub);font-weight:500;margin-bottom:4px}.workspace{margin-left:var(--sidebar);padding-top:var(--preview);min-height:100vh}.content{max-width:948px;margin:0 auto;padding:29px 38px calc(var(--footer) + 31px)}.page-head{margin-bottom:22px;display:flex;align-items:center;justify-content:space-between;gap:20px}.page-head h1{font-size:27px;line-height:1.4;font-weight:670;letter-spacing:.025em}.page-head p{font-size:12px;color:var(--sub);margin-top:6px}.head-icon{height:40px;width:40px;border:1px solid var(--line);border-radius:12px;display:grid;place-items:center;color:var(--accent);background:#25232f}.head-icon .icon{width:21px;height:21px}.current-card{background:linear-gradient(115deg,#25282f,#22262c);border:1px solid #44454f;border-radius:11px;padding:17px 20px 14px;margin-bottom:25px;position:relative;overflow:hidden}.current-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}.current-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.eyebrow{font-size:12px;font-weight:650;color:#dedce6;display:flex;align-items:center;gap:7px}.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:5px;font-size:11px;line-height:1.55;font-weight:550;white-space:nowrap}.badge.success{color:var(--green);background:#223a33}.badge.warn{color:var(--amber);background:#3b3225}.badge.neutral{background:#343841;color:#c7cbd4}.badge.error{color:var(--red);background:#412b31}.badge.purple{background:#3a314f;color:#dfd2ff}.dot{display:inline-block;width:5px;height:5px;flex-shrink:0;border-radius:50%;background:currentColor}.current-grid{display:grid;grid-template-columns:1.3fr 1fr 1.3fr;gap:15px}.kv-label{font-size:10px;color:var(--sub);margin-bottom:3px}.kv-value{font-size:15px;font-weight:600;overflow-wrap:anywhere}.kv-value.model{font-family:ui-monospace,SFMono-Regular,Consolas,"Noto Sans Mono CJK JP",monospace;font-size:14px}.current-bottom{margin-top:14px;padding-top:11px;border-top:1px solid #3a3e46;display:flex;justify-content:space-between;gap:12px;font-size:11px;color:var(--sub)}.current-result{display:flex;align-items:flex-start;gap:6px}.current-result .icon{margin-top:2px;color:var(--green)}.current-time{white-space:nowrap;font-size:10px;color:var(--muted)}.current-empty-title{font-size:17px;font-weight:600;margin-bottom:5px}.current-empty-desc{font-size:12px;color:var(--sub)}.section-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:6px}.section-heading h2{font-size:16px;font-weight:640}.section-hint{color:var(--sub);font-size:12px;margin-bottom:13px}.method-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}.method-choice{position:relative;display:block;cursor:pointer}.method-choice input{position:absolute;opacity:0;width:1px;height:1px}.method-body{display:flex;gap:11px;padding:14px 14px 13px;border:1px solid var(--line);border-radius:9px;background:#1d2025;min-height:91px;transition:border-color .12s,background .12s}.method-choice input:checked+.method-body{border-color:#a997e5;background:#2b263b;box-shadow:inset 0 0 0 1px #a997e522}.method-choice input:focus-visible+.method-body{outline:2px solid var(--accent);outline-offset:3px}.method-choice:hover .method-body{border-color:#747383}.radio-dot{border:1.5px solid #747988;border-radius:50%;width:16px;height:16px;margin-top:4px;flex-shrink:0;display:grid;place-items:center}.method-choice input:checked+.method-body .radio-dot{border-color:var(--accent)}.method-choice input:checked+.method-body .radio-dot:after{content:"";background:var(--accent);width:8px;height:8px;border-radius:50%}.method-copy{flex:1;min-width:0}.method-title{font-size:13px;font-weight:600}.method-subtitle{font-size:11px;color:var(--sub);margin-top:3px;line-height:1.65}.method-current{display:block;color:#c9bbf3;font-size:10px;margin-top:5px}.fields{border:0;padding:0;margin:0;min-width:0}.fields:disabled{opacity:.65}.form-panel{border:1px solid var(--line);background:#202328;border-radius:9px;padding:18px 19px;margin-bottom:20px}.panel-top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:16px}.panel-top h3{font-size:13px;font-weight:650}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field-label{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;font-weight:550;margin-bottom:7px}.optional{font-size:10px;font-weight:400;color:var(--muted)}.field-input,.field-select{height:39px;width:100%;border:1px solid #494e59;border-radius:6px;padding:0 11px;color:var(--text);background:var(--field);font-size:13px}.field-input:hover,.field-select:hover{border-color:#6e7380}.field-input[readonly]{color:var(--sub);background:#23262c}.field-input::placeholder{color:#878e9b}.field-input.invalid,.field-select.invalid{border-color:var(--red)}.field-help{font-size:10px;color:var(--sub);line-height:1.75;margin-top:5px}.field-error{font-size:11px;color:var(--red);line-height:1.7;margin-top:5px}.key-row{margin-top:17px;display:flex;justify-content:space-between;align-items:center;gap:14px;padding-top:15px;border-top:1px solid #363b43}.key-main{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.key-label{font-size:12px;font-weight:550;display:flex;align-items:center;gap:7px}.key-privacy{font-size:10px;color:var(--sub);margin-top:3px}.key-actions{display:flex;gap:5px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:35px;padding:6px 13px;border:1px solid #484d59;border-radius:6px;background:#2c3038;color:var(--text);font-size:12px;font-weight:550;line-height:1.6;white-space:nowrap}.btn:hover{background:#393e48}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:650}.btn.primary:hover{background:#d1c5ff}.btn:disabled{background:#272a31;border-color:#373b44;color:#838a97}.btn.ghost{background:transparent;border-color:transparent;color:var(--sub)}.btn.ghost:hover:not(:disabled){background:#30343c;color:var(--text)}.btn.outline{background:transparent}.btn.danger{color:var(--red)}.btn.danger.solid{background:#65393f;color:#fff0f0;border-color:#a5646c}.btn.small{min-height:30px;font-size:11px;padding:4px 9px}.text-btn{font-size:11px;color:#ccbcf6;border:0;padding:0;background:transparent;text-decoration:none;text-underline-offset:3px}.text-btn:hover{text-decoration:underline}.text-btn:disabled{color:var(--muted);text-decoration:none}.key-edit{margin-top:13px;padding:13px;border:1px solid #56496c;border-radius:6px;background:#282432}.input-actions{display:flex;align-items:center;gap:8px}.input-actions .field-input{flex:1;min-width:0}.notice{display:flex;align-items:flex-start;gap:8px;margin-top:12px;padding:10px 12px;background:#312c23;border:1px solid #514731;color:var(--amber);border-radius:6px;font-size:11px;line-height:1.75}.notice .icon{margin-top:2px;flex-shrink:0}.notice.error{background:#35262b;border-color:#623c45;color:var(--red)}.notice.info{background:#272737;border-color:#47415f;color:#d6cbec}.details{margin-top:13px;padding-top:11px;border-top:1px solid #363b43}.details>summary{cursor:pointer;font-size:11px;color:var(--sub);list-style:none;display:flex;align-items:center;gap:6px;user-select:none}.details>summary::-webkit-details-marker{display:none}.details>summary .chevron{transition:transform .15s}.details[open]>summary .chevron{transform:rotate(90deg)}.details-body{padding-top:14px}.full-field{margin-top:12px}.account-box{display:flex;align-items:center;gap:12px}.account-icon{width:38px;height:38px;display:grid;place-items:center;border:1px solid #514d61;background:#302b3c;border-radius:9px;color:#d8c8ff}.account-text{flex:1}.account-title{font-size:13px;font-weight:600}.account-sub{font-size:11px;color:var(--sub);margin-top:3px}.account-auth-actions{margin-top:13px;display:flex;align-items:center;gap:12px}.model-section{padding-top:16px;margin-top:16px;border-top:1px solid #363b43}.model-lock{font-size:11px;color:var(--sub);padding-top:15px;margin-top:15px;border-top:1px solid #363b43;display:flex;align-items:center;gap:7px}.manual-model{margin-top:10px}.response-section{margin-bottom:18px}.response-section .section-heading{margin-bottom:9px}.test-box{border:1px solid var(--line);border-radius:8px;padding:14px 16px;background:#1e2126}.test-head{display:flex;align-items:center;justify-content:space-between;gap:18px}.test-target{font-size:12px;font-weight:550;display:flex;align-items:center;gap:7px}.test-note{font-size:10px;line-height:1.8;color:var(--sub);margin-top:4px;max-width:550px}.test-reason{color:var(--amber);font-size:11px;margin-top:8px;line-height:1.75}.test-result{padding-top:10px;margin-top:11px;border-top:1px solid #363b43;display:flex;align-items:flex-start;gap:7px;color:var(--green);font-size:11px;line-height:1.75}.test-result.error{color:var(--red)}.test-result .icon{margin-top:2px}.diagnostics{margin-top:0;padding:12px 0 0;border-top:1px solid #333740}.diagnostics>summary{color:#9fa5b1;font-size:11px}.diag-grid{display:grid;grid-template-columns:170px 1fr;gap:8px;font-size:11px;padding:15px 16px;background:#15181d;border:1px solid #30353e;border-radius:6px}.diag-grid dt{color:var(--muted)}.diag-grid dd{margin:0;overflow-wrap:anywhere;color:var(--sub)}.diag-grid code{font-size:11px;color:#dacdf6}.savebar{position:fixed;bottom:0;left:var(--sidebar);right:0;z-index:30;background:#1c1f24f5;backdrop-filter:blur(14px);border-top:1px solid #3b3f49;min-height:var(--footer);display:flex;align-items:center}.savebar-inner{width:100%;max-width:948px;margin:0 auto;padding:14px 38px;display:flex;align-items:center;justify-content:space-between;gap:20px}.save-state{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:550}.save-state .icon{color:var(--sub)}.save-state.dirty{color:#decfff}.save-state.dirty .icon{color:var(--accent)}.save-sub{font-size:10px;color:var(--sub);margin-top:3px}.save-buttons{display:flex;gap:9px}.save-buttons .btn{min-height:38px}.spinner{display:inline-block;width:12px;height:12px;border:1.8px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .75s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.toast{position:fixed;bottom:calc(var(--footer) + 14px);left:calc(var(--sidebar) + (100% - var(--sidebar))/2);transform:translate(-50%,8px);background:#e4e0ef;color:#25212d;border:1px solid #c8bfdf;border-radius:8px;padding:10px 16px;box-shadow:0 8px 28px #0005;font-size:12px;opacity:0;pointer-events:none;z-index:70;max-width:calc(100vw - 50px);transition:opacity .16s,transform .16s}.toast.visible{opacity:1;transform:translate(-50%,0)}dialog{border:1px solid #50535f;border-radius:12px;padding:0;color:var(--text);background:#202329;box-shadow:0 28px 90px #0008;max-height:calc(100vh - 60px)}dialog::backdrop{background:#06070ac7;backdrop-filter:blur(3px)}.spec-dialog{width:min(780px,calc(100vw - 36px))}.dialog-head{position:sticky;top:0;background:#24272f;z-index:2;display:flex;justify-content:space-between;align-items:center;padding:18px 23px;border-bottom:1px solid #3d424b}.dialog-head h2{font-size:17px}.dialog-head p{font-size:11px;color:var(--sub);margin-top:4px}.spec-body{padding:22px 25px 30px;font-size:12px;line-height:1.95}.spec-body h3{font-size:14px;margin:26px 0 10px;padding-top:17px;border-top:1px solid #393e47}.spec-body h3:first-of-type{border:0;margin-top:8px;padding-top:0}.spec-body p{color:#c7ccd5;margin:7px 0}.spec-body strong{color:#eeedf6}.spec-meta{color:#c9bced;font-size:10px;letter-spacing:.04em;margin-bottom:11px}.spec-table{border-collapse:collapse;width:100%;font-size:11px;margin:13px 0}.spec-table th,.spec-table td{border:1px solid #40454f;padding:10px 11px;vertical-align:top;text-align:left;line-height:1.85}.spec-table th{background:#2d313a;font-weight:600;color:#f0eafc}.spec-table td{color:#c8cdd6}.spec-table td:first-child{width:23%;color:#eceaf3}.spec-callout{padding:12px 14px;border:1px solid #544867;border-radius:7px;background:#2c2739;margin-bottom:19px;color:#dcd1ef}.spec-code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#16191e;padding:14px 16px;border:1px solid #373c46;border-radius:6px;font-size:11px;line-height:1.9;white-space:pre-wrap;color:#d4cbeb}.confirm-dialog{width:min(440px,calc(100vw - 36px));padding:25px}.confirm-dialog h2{font-size:17px;margin-bottom:10px}.confirm-dialog p{font-size:12px;color:var(--sub);line-height:1.9;white-space:pre-line}.confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:23px}.mobile-brand{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(min-width:1500px){.content{padding-top:37px}.page-head{margin-bottom:26px}.current-card{margin-bottom:29px}.form-panel{padding:20px 21px}.method-body{padding:16px}}
+@media(max-width:1100px){:root{--sidebar:180px}.sidebar{padding-left:12px;padding-right:12px}.content{padding-left:28px;padding-right:28px}.savebar-inner{padding-left:28px;padding-right:28px}.preview-note{display:none}.preview-bar{padding:0 17px}.brand{font-size:21px}}
+@media(max-width:780px){:root{--sidebar:0px;--preview:94px;--footer:93px}.sidebar{display:none}.preview-bar{padding:10px 16px;height:var(--preview);flex-wrap:wrap;gap:5px}.preview-label{gap:8px;width:100%;justify-content:space-between}.preview-title{font-size:11px}.preview-tag{font-size:9px}.preview-actions{width:100%;justify-content:flex-end;gap:6px}.preview-actions select{width:auto;min-width:0;flex:1;max-width:270px}.preview-actions .btn{padding:4px 8px;font-size:11px}.preview-actions label{display:none}.preview-note{display:block;font-size:9px}.content{padding:22px 20px calc(var(--footer) + 25px);max-width:650px}.page-head h1{font-size:23px}.page-head p{font-size:11px}.page-head{margin-bottom:18px}.head-icon{display:none}.current-grid{grid-template-columns:1fr 1fr;gap:11px}.current-grid>div:last-child{grid-column:1/-1}.current-card{padding:15px 17px;margin-bottom:22px}.current-bottom{display:block}.current-time{margin-top:5px;display:block;padding-left:21px}.method-grid{gap:9px}.method-body{padding:12px 10px;gap:8px;min-height:103px}.method-title{font-size:12px}.method-subtitle{font-size:10px}.method-current{font-size:9px}.form-panel{padding:15px}.panel-top{align-items:flex-start;flex-direction:column;gap:5px}.form-grid{grid-template-columns:1fr;gap:14px}.key-row{gap:10px}.key-main{gap:7px}.savebar-inner{padding:13px 20px;gap:12px}.save-sub{max-width:210px;font-size:9px}.save-buttons{gap:6px}.save-buttons .btn{font-size:11px;padding:7px 10px}.save-buttons .ghost{padding:7px 5px}.test-head{align-items:flex-start}.test-head>.btn{margin-top:2px;padding:6px 9px}.test-note{font-size:10px}.section-heading h2{font-size:15px}.section-hint{font-size:11px}.diag-grid{grid-template-columns:1fr;gap:4px}.diag-grid dd{margin-bottom:7px}.toast{font-size:11px;max-width:calc(100vw - 36px);width:max-content}.spec-body{padding:15px 18px 25px}.spec-table th,.spec-table td{padding:8px 7px}.spec-table{font-size:10px}.dialog-head{padding:14px 18px}.dialog-head h2{font-size:15px}}
+@media(max-width:430px){.preview-note{display:none}.preview-label{justify-content:flex-start}.method-body{min-height:111px}.current-top{gap:5px}.badge{font-size:10px}.eyebrow{font-size:11px}.kv-value{font-size:13px}.key-row{align-items:flex-start}.key-actions{gap:0}.key-actions .btn{padding:4px 6px}.key-main{display:block}.key-main .badge{margin-top:5px}.savebar-inner{padding:12px 16px;align-items:flex-start}.save-state{font-size:11px}.save-sub{max-width:170px}.save-buttons{flex-direction:column-reverse;gap:3px}.save-buttons .btn{min-height:29px;padding:4px 9px}.test-head{display:block}.test-head>.btn{margin-top:12px}.account-auth-actions{align-items:flex-start;flex-direction:column;gap:7px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation-duration:1ms!important}.spinner{animation-duration:1.5s!important}}
+@media print{.preview-bar,.sidebar,.savebar,.toast{display:none}.workspace{padding:0;margin:0}.content{padding:20px;max-width:none}body{background:#fff;color:#111}dialog[open]{position:static;max-height:none;box-shadow:none;width:100%}.spec-dialog[open]~*{display:none}}
+</style>
+</head>
+<body>
+<svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden"><defs>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M19 12H5m6-6-6 6 6 6"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.1"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="9" r="4"/><path d="m11 12 9 9m-3-3 3-3m-6 0 3-3"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M5.7 7A8 8 0 0 1 20 11M4 13a8 8 0 0 0 14.3 4"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3v.1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><path d="m10 3-1 3-3 1-2 3 2 3v3l3 2 1 3h4l1-3 3-2v-3l2-3-2-3-3-1-1-3h-4Z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="m4 16 12-12 4 4L8 20H4v-4Zm10-10 4 4"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5V3Zm9 0v6h5M9 13h6m-6 4h6"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4m-4 5v2"/></symbol>
+</defs></svg>
+<header class="preview-bar" aria-label="画面仕様サンプルの操作">
+  <div class="preview-label"><span class="preview-tag">画面仕様 01</span><span class="preview-title">Hane / AI設定</span><span class="preview-note">実通信なし・実際のAPIキーは入力しないでください</span></div>
+  <div class="preview-actions"><label for="sceneSelect">表示する状態</label><select id="sceneSelect" aria-label="表示する状態を選択"><option value="confirmed">応答確認済み</option><option value="first">初回・未設定</option><option value="unverified">適用済み・応答未確認</option><option value="response-error">応答確認エラー</option><option value="apply-error">保存済み・適用エラー</option><option value="logged-out">ChatGPT・未ログイン</option></select><button class="btn outline" id="openSpec"><svg class="icon small-icon"><use href="#i-file"/></svg>仕様を読む</button><button class="btn ghost" id="resetDemo" aria-label="選択した状態を最初から表示" title="選択した状態を最初から表示"><svg class="icon small-icon"><use href="#i-refresh"/></svg></button></div>
+</header>
+<aside class="sidebar" aria-label="設定メニュー">
+  <div class="brand"><svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M26.7 5.1C18.5 4 9.6 9.3 7.4 19.3L13 17.6l-3 6.7c10-1.6 16.7-9.2 16.7-19.2Z" fill="currentColor" opacity=".92"/><path d="M5 28 22 10" stroke="#15171b" stroke-width="1.8" stroke-linecap="round"/><path d="m5 28 9.7-10.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>Hane</div>
+  <button class="back" id="backButton"><svg class="icon small-icon"><use href="#i-arrow"/></svg>アプリに戻る</button>
+  <div class="nav-label">設定</div>
+  <div class="nav-item inactive" aria-label="一般、このサンプルでは対象外"><svg class="icon"><use href="#i-gear"/></svg>一般</div>
+  <div class="nav-item inactive" aria-label="エディター、このサンプルでは対象外"><svg class="icon"><use href="#i-edit"/></svg>エディター</div>
+  <div class="nav-item active" aria-current="page"><svg class="icon"><use href="#i-spark"/></svg>AI接続</div>
+  <p class="nav-note">このサンプルでは<br>AI接続のみ操作できます。</p>
+  <div class="side-foot"><strong>Hane の画面設計案</strong>設定・ログイン・応答は模擬動作です。実際のAPIキーは入力しないでください。</div>
+</aside>
+<main class="workspace"><div class="content">
+  <div class="page-head"><div><h1>AI設定</h1><p>使うAIを選び、接続を確認します。</p></div><div class="head-icon" aria-hidden="true"><svg class="icon"><use href="#i-spark"/></svg></div></div>
+  <section class="current-card" aria-labelledby="currentTitle">
+    <div class="current-top"><h2 class="eyebrow" id="currentTitle"><svg class="icon small-icon"><use href="#i-check"/></svg>現在有効な設定</h2><span id="currentBadge" class="badge success"></span></div>
+    <div class="current-grid" id="currentValues"><div><div class="kv-label">接続方法</div><div class="kv-value" id="currentMethod"></div></div><div><div class="kv-label">接続先</div><div class="kv-value" id="currentProvider"></div></div><div><div class="kv-label">モデル</div><div class="kv-value model" id="currentModel"></div></div></div>
+    <div id="currentEmpty" hidden><div class="current-empty-title">AI接続はまだ設定されていません</div><p class="current-empty-desc">下で接続方法を選び、必要な項目を設定してください。</p></div>
+    <div class="current-bottom"><div class="current-result"><svg class="icon small-icon" id="currentResultIcon"><use href="#i-check"/></svg><span id="currentMessage"></span></div><time class="current-time" id="currentTime"></time></div>
+  </section>
+  <section aria-labelledby="setupTitle">
+    <div class="section-heading"><h2 id="setupTitle">使うAIの設定</h2><span id="draftBadge" class="badge neutral">変更なし</span></div>
+    <p class="section-hint" id="draftHint">変更は「保存して適用」を押した後に有効になります。</p>
+    <fieldset class="fields" id="settingsFields"><legend class="sr-only">接続方法と接続設定</legend>
+    <div class="method-grid" role="radiogroup" aria-label="使用する接続方法">
+      <label class="method-choice"><input type="radio" name="method" value="chatgpt" id="methodChatGPT"><span class="method-body"><span class="radio-dot" aria-hidden="true"></span><span class="method-copy"><span class="method-title">ChatGPTアカウント</span><span class="method-subtitle" style="display:block">ログインして接続します。</span><span class="method-current" id="currentChatGPTTag" hidden>現在の接続方法</span></span></span></label>
+      <label class="method-choice"><input type="radio" name="method" value="api" id="methodAPI"><span class="method-body"><span class="radio-dot" aria-hidden="true"></span><span class="method-copy"><span class="method-title">APIキー</span><span class="method-subtitle" style="display:block">AIサービスのキーで接続します。</span><span class="method-current" id="currentAPITag">現在の接続方法</span></span></span></label>
+    </div>
+    <div class="form-panel" id="apiPanel">
+      <div class="panel-top"><h3>APIキーで接続</h3><span class="optional">サービス側のAPI利用料金がかかる場合があります。</span></div>
+      <div class="form-grid">
+        <div><label class="field-label" for="apiService">AIサービス</label><select id="apiService" class="field-select"><option value="openai">OpenAI</option><option value="custom">その他の接続先</option></select><p class="field-help" id="serviceHelp">OpenAIの接続先を自動で設定します。</p></div>
+        <div><label class="field-label" for="apiModel">モデルID</label><input id="apiModel" class="field-input" type="text" spellcheck="false" autocomplete="off" placeholder="サービスが指定するモデルID" aria-describedby="apiModelHelp apiModelError"><p class="field-help" id="apiModelHelp">利用するモデルのIDを入力してください。</p><p id="apiModelError" class="field-error" hidden></p></div>
+      </div>
+      <div class="key-row"><div><div class="key-main"><span class="key-label"><svg class="icon small-icon"><use href="#i-key"/></svg>APIキー</span><span class="badge neutral" id="keyStatus">登録済み</span></div><p class="key-privacy" id="keyPrivacy">登録済みのキーは表示しません。</p></div><div class="key-actions"><button type="button" class="btn outline small" id="editKey">変更</button><button type="button" class="btn ghost danger small" id="deleteKey">削除</button><button type="button" class="btn ghost small" id="undoKey" hidden>元に戻す</button></div></div>
+      <div class="key-edit" id="keyEditBox" hidden><label for="newKey" class="field-label">新しいAPIキー</label><div class="input-actions"><input id="newKey" class="field-input" type="password" autocomplete="off" spellcheck="false" placeholder="サンプル用の任意の文字を入力" aria-describedby="newKeyHelp keyError"><button type="button" class="btn ghost small" id="cancelKey">やめる</button></div><p class="field-help" id="newKeyHelp">実際のキーは入力しないでください。サンプルでは任意の文字で試せます。</p></div>
+      <p class="field-error" id="keyError" hidden></p>
+      <div class="notice" id="keyWarning" hidden><svg class="icon small-icon"><use href="#i-alert"/></svg><span id="keyWarningText"></span></div>
+      <details class="details" id="apiDetails"><summary><svg class="icon small-icon chevron"><use href="#i-chevron"/></svg><span id="apiDetailsLabel">接続先の詳細</span></summary><div class="details-body">
+        <div><label class="field-label" for="apiName">接続名<span class="optional">画面に表示する名前</span></label><input id="apiName" class="field-input" type="text" placeholder="例：開発用のAI" autocomplete="off" aria-describedby="apiNameError"><p class="field-error" id="apiNameError" hidden></p></div>
+        <div class="full-field"><label class="field-label" for="apiEndpoint">接続先URL</label><input id="apiEndpoint" class="field-input" type="url" spellcheck="false" autocomplete="off" aria-describedby="endpointHelp endpointError"><p id="endpointHelp" class="field-help">OpenAIを選んだ場合は変更不要です。別の接続先には「その他の接続先」を選びます。</p><p class="field-error" id="endpointError" hidden></p></div>
+      </div></details>
+    </div>
+    <div class="form-panel" id="chatgptPanel" hidden>
+      <div class="panel-top"><h3>ChatGPTアカウントで接続</h3><span class="badge neutral" id="accountBadge">未ログイン</span></div>
+      <div class="account-box"><div class="account-icon"><svg class="icon"><use href="#i-user"/></svg></div><div class="account-text"><div class="account-title" id="accountTitle">ChatGPTにログインしてください</div><p class="account-sub" id="accountSub">ログインして、利用するモデルを選びます。</p></div><button type="button" class="btn ghost small" id="logoutButton" hidden>ログアウト</button></div>
+      <div class="account-auth-actions" id="loginActions"><button type="button" class="btn outline" id="loginButton"><svg class="icon small-icon"><use href="#i-user"/></svg><span id="loginButtonText">ChatGPTにログイン</span></button><span class="field-help" style="margin:0" id="loginSideNote">接続方法は、保存・適用するまで切り替わりません。</span></div>
+      <div class="model-lock" id="modelLock"><svg class="icon small-icon"><use href="#i-lock"/></svg>ログインすると、利用するモデルを選べます。</div>
+      <div class="model-section" id="chatModelSection" hidden><label class="field-label" for="chatModel">モデル<button type="button" class="text-btn" id="refreshModels">一覧を更新</button></label><select id="chatModel" class="field-select"><option value="gpt-6-luna">gpt-6-luna（表示例）</option><option value="__manual">モデルIDを手入力する</option></select><p class="field-help" id="modelListNote">ログイン先から取得したモデルを表示します。このサンプルの一覧は表示例です。</p><div class="manual-model" id="manualChatBox" hidden><label class="field-label" for="chatManual">モデルID</label><input id="chatManual" class="field-input" type="text" spellcheck="false" autocomplete="off" placeholder="モデルIDを入力" aria-describedby="chatModelError"></div><p class="field-error" id="chatModelError" hidden></p></div>
+      <div class="notice info" id="accountSideEffect" hidden><svg class="icon small-icon"><use href="#i-info"/></svg><span>ログイン状態は、設定の変更を破棄しても保持されます。</span></div>
+    </div>
+    </fieldset>
+  </section>
+  <section class="response-section" aria-labelledby="responseTitle"><div class="section-heading"><h2 id="responseTitle">応答を確認</h2><span class="optional">保存・適用済みの設定が対象です</span></div><div class="test-box"><div class="test-head"><div><div class="test-target"><svg class="icon small-icon"><use href="#i-spark"/></svg><span id="testTarget"></span></div><p class="test-note">短いテストメッセージを送信します。文書は送信しません。<br>利用料金・利用枠を消費する場合があります。</p></div><button class="btn outline" id="testButton" aria-describedby="testReason"><span id="testButtonText">応答を確認</span></button></div><p class="test-reason" id="testReason" hidden></p><div class="test-result" id="testResult" hidden><svg class="icon small-icon" id="testResultIcon"><use href="#i-check"/></svg><span id="testResultText"></span></div></div></section>
+  <details class="details diagnostics" id="diagnostics"><summary><svg class="icon small-icon chevron"><use href="#i-chevron"/></svg>診断情報を表示<span class="optional" style="margin-left:5px">接続できないときに確認します</span></summary><dl class="diag-grid"><dt>AI接続機能</dt><dd>デモのため、App Serverは起動しません。</dd><dt>接続先URL</dt><dd id="diagEndpoint"></dd><dt>保存と適用の状態</dt><dd id="diagApply"></dd><dt>テストの対象</dt><dd id="diagTarget"></dd><dt>最後の模擬応答</dt><dd id="diagResponse"></dd><dt>このサンプルの制限</dt><dd>実際の認証・通信・課金は行いません。入力内容は、このHTMLを再読み込みすると失われます。</dd></dl></details>
+</div></main>
+<footer class="savebar"><div class="savebar-inner"><div aria-live="polite" aria-atomic="true"><div class="save-state" id="saveState"><svg class="icon small-icon" id="saveStateIcon"><use href="#i-check"/></svg><span id="saveStateText">すべての設定を保存・適用済みです</span></div><p class="save-sub" id="saveSub">変更はありません。</p></div><div class="save-buttons"><button class="btn ghost" id="discardButton">変更を破棄</button><button class="btn primary" id="saveButton"><span id="saveButtonText">保存して適用</span></button></div></div></footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div><div class="sr-only" aria-live="polite" id="announcement"></div>
+<dialog class="spec-dialog" id="specDialog" aria-labelledby="specTitle"><div class="dialog-head"><div><h2 id="specTitle">AI設定画面の仕様</h2><p>表示する情報・操作の意味・状態の変化を定義します。</p></div><button class="btn ghost" id="closeSpec" aria-label="仕様を閉じる"><svg class="icon"><use href="#i-x"/></svg></button></div><div class="spec-body">
+  <div class="spec-meta">HANE · UI PROPOSAL 01 · 2026-09-30</div>
+  <div class="spec-callout">これは、提示された画面と先の改善案に基づく<strong>画面・操作の提案</strong>です。現在のHaneの実装や、実際の接続状態を示すものではありません。上部の状態切り替えと「仕様を読む」は、サンプル専用の操作です。</div>
+  <h3>1. 画面の役割と配置</h3>
+  <p>利用者が、<strong>「いま何が有効か」「あと何が必要か」「次に何を押すか」</strong>を推測せず判断できる画面にします。現在の状態を読む場所と、設定を編集する場所を分けます。</p>
+  <table class="spec-table"><thead><tr><th>表示領域</th><th>表示・操作の定義</th></tr></thead><tbody>
+  <tr><td>現在有効な設定</td><td>実際に適用できた接続方法・接続先・モデル・その組み合わせでの確認結果を表示します。入力中や保存中の値では書き換えません。未設定時は、次に行う設定を案内します。</td></tr>
+  <tr><td>接続方法の選択</td><td>「ChatGPTアカウント」「APIキー」の二択です。ラジオマークと枠で選択状態を示します。「現在の接続方法」は実際の適用状態を示し、編集上の選択とは区別します。非選択側の保存済み設定は保持して、入力欄は閉じます。入力途中で接続方法を切り替えるときは、未保存の入力を破棄する確認を挟みます。</td></tr>
+  <tr><td>接続の設定</td><td>選択側の項目だけを表示します。すべての入力欄に常時見えるラベルを付けます。OpenAIは接続先を自動設定し、その他の接続先では接続名・URLを展開します。</td></tr>
+  <tr><td>応答を確認</td><td>保存・適用済みの接続先とモデルを明示して、明示的な操作でテストします。未保存の変更がある間は実行できず、保存・適用または破棄を案内します。料金・利用枠と文書送信の有無はボタンの近くに示します。</td></tr>
+  <tr><td>保存操作</td><td>画面下に固定し、未保存・適用中・適用失敗を表示します。「保存して適用」と「変更を破棄」をまとめます。変更がないときは無効にし、その理由を併記します。</td></tr>
+  <tr><td>診断情報</td><td>内部の起動状態、バージョン、通信先、応答原文などは閉じた領域へ移します。ただし、利用を妨げる問題とその解決操作は、診断情報を開かなくても分かる場所に表示します。</td></tr>
+  </tbody></table>
+  <h3>2. 保存・適用・確認は別の状態として扱う</h3>
+  <p><strong>編集中の設定、保存できた設定、実際に適用できた設定</strong>を別に保持します。保存が成功しただけでは「現在有効」を更新しません。適用失敗時は、最後に適用できた設定を残し、「保存済み・未適用」と再試行を示します。</p>
+  <div class="spec-code">編集 → 入力を検証 → 保存 → 接続設定を適用 → 応答を確認（任意）
+                  保存に失敗：編集中の内容を残して再試行
+                         適用に失敗：現在の設定を維持して再試行
+                                                確認に失敗：原因と対処を表示</div>
+  <table class="spec-table"><thead><tr><th>状態</th><th>画面に表示する内容と、次の操作</th></tr></thead><tbody>
+  <tr><td>初回・未設定</td><td>「AI接続はまだ設定されていません」。選択した接続の入力またはログインを案内します。応答確認はできません。</td></tr>
+  <tr><td>未保存の変更あり</td><td>「未保存の変更があります」。現在有効な設定は変えません。「保存して適用」を主操作にします。無効な値は、保存時に項目の近くへ理由を表示します。</td></tr>
+  <tr><td>保存中・適用中</td><td>進行中の処理を表示し、重複操作を防ぎます。保存後は「保存済み・適用中」と示します。完了まで現在有効な設定を変えません。</td></tr>
+  <tr><td>保存済み・適用失敗</td><td>現在有効な設定を残して「保存した設定を適用できませんでした」。下部に「適用を再試行」を表示します。このサンプルでは、再試行で復旧します。</td></tr>
+  <tr><td>適用済み・未確認</td><td>「応答はまだ確認していません」。認証の前提を満たす場合に「応答を確認」を実行できます。保存だけではテストしません。</td></tr>
+  <tr><td>応答確認成功</td><td>成功した対象と確認日時を表示します。接続先・モデル・認証情報が変わった後に、以前の成功を流用しません。</td></tr>
+  <tr><td>応答確認失敗</td><td>理由を平易に示し、設定変更や再試行を案内します。直近の確認が失敗したのに、以前の成功を現在の結果として表示しません。</td></tr>
+  <tr><td>認証が必要</td><td>「ログインが必要」または「APIキー未登録」。必要な操作を案内し、応答確認は無効にします。他方の接続へ勝手に切り替えません。</td></tr>
+  </tbody></table>
+  <p>確認結果は、<strong>接続方法・通信先・モデル・認証情報の識別情報</strong>と結び付けます。キーそのものを履歴に残しません。表示名だけの変更では、同じ通信設定の確認結果を無効にする必要はありません。</p>
+  <h3>3. 接続方法ごとの操作</h3>
+  <p><strong>ChatGPTアカウント：</strong>ログイン → モデル選択 → 保存して適用 → 必要に応じて応答確認、の順です。この提案では、ログインを接続方法の適用から分離し、ログインしただけでは有効な接続を切り替えません。ログイン状態は独立して保持し、設定の破棄ではログアウトしません。ログアウトは確認を挟み、有効な接続への影響を説明します。</p>
+  <p><strong>APIキー：</strong>AIサービス、モデルID、APIキーを指定します。その他の接続先には、接続名とURLも必要です。「登録済みキーを維持」の操作は設けず、何もしなければ保持します。「変更」でだけ入力欄を開きます。「削除」は予約として示し、保存・適用時に確定します。登録中のキーを表示しません。</p>
+  <p><strong>接続先の変更：</strong>登録済みのキーを異なる通信先へ自動で流用しません。新しい接続先に合うキーの登録を案内します。キー削除を明示して適用したときは「APIキー未登録」とし、再登録までAI接続を停止します。</p>
+  <p><strong>モデル：</strong>ChatGPT側は、取得した一覧から選ぶ操作と手入力を分けます。API側は、サービスが指定するモデルIDを入力します。このサンプルの「gpt-6-luna」は提示画像にある文字列を使った表示例で、実在・提供状況・利用可能性を保証しません。一覧取得が失敗した場合は、理由と再試行、利用可能なら手入力の経路を示す必要があります。</p>
+  <h3>4. 説明と操作を近づける</h3>
+  <p>無効な操作には、すぐ近くで理由と次の操作を示します。未保存なら「保存・適用または破棄」、未ログインなら「ログイン」、キー未登録なら「登録して保存・適用」を案内します。エラーを画面下の一時通知だけに置きません。</p>
+  <p>保存成功は画面下で一時的に知らせ、現在の状態は固定の表示で確認できるようにします。「準備完了」「未確認」「成功」のような、対象が分からない単独の文言は避けます。</p>
+  <p>「アプリに戻る」とページ離脱では、未保存の変更がある場合に破棄の確認をします。ログイン・ログアウトは独立した操作なので、破棄で取り消されると誤解させません。狭い画面では入力項目を1列にし、ラベルや説明を切り落としません。</p>
+  <h3>5. 実装前に確認すること・完了条件</h3>
+  <p><strong>実装前の確認：</strong>現在のHaneのコードは、このサンプル作成では確認していません。①既存接続を保ったままログイン準備できるか、②適用失敗時に旧設定での動作を維持できるか、③保存・適用・認証・確認結果を別々に取得できるか、を実装側で確認します。この画面が要求する振る舞いであり、既存機能の断定ではありません。</p>
+  <p>既存接続を保ったままログインできない場合は、切り替えが必要な理由と影響を事前に表示します。実際には旧接続を維持できなかったのに「現在の接続は変わりません」と表示してはいけません。</p>
+  <p><strong>完了条件：</strong>画面を開くだけで現在の接続・モデル・確認状態が分かること。編集しても保存・適用前に現在の表示が変わらないこと。非選択側の未設定を現在の問題と誤解しないこと。通信に関わる変更後に古い成功が残らないこと。進めないときに原因と次の操作が分かることを、画面操作で確認します。</p>
+  <p><strong>サンプルの範囲：</strong>接続方法の選択、条件に応じた入力、キーの変更・削除予約、模擬ログイン、保存と適用、適用エラーの再試行、応答確認、応答エラー、破棄確認を操作できます。実際のネットワーク通信・アカウント認証・キー保存は行いません。保存失敗やモデル一覧の取得失敗は仕様のみで、サンプルには発生操作を設けていません。</p>
+</div></dialog>
+<dialog class="confirm-dialog" id="confirmDialog" aria-labelledby="confirmTitle"><h2 id="confirmTitle"></h2><p id="confirmBody"></p><div class="confirm-actions"><button class="btn outline" id="confirmCancel">やめる</button><button class="btn primary" id="confirmOK">続ける</button></div></dialog>
+<script>
+'use strict';
+// Single-file UI proposal. No fetch, network calls, storage APIs or real credentials.
+const $=id=>document.getElementById(id);
+const clone=value=>JSON.parse(JSON.stringify(value));
+const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+const OPENAI_URL='https://api.openai.com/v1';
+let state, generation=0, toastTimer, confirmAction=null, sceneStarted=Date.now();
+const DEMO_START=Date.parse('2026-09-30T08:18:00+09:00');
+const demoNow=()=>DEMO_START+(Date.now()-sceneStarted);
+const normalizeURL=url=>String(url||'').trim().replace(/\/+$/,'');
+function baseline(){return{method:'api',api:{service:'openai',name:'OpenAI',endpoint:OPENAI_URL,model:'gpt-6-luna',hasKey:true,keyVersion:1,keyScope:OPENAI_URL},chatgpt:{model:'gpt-6-luna',manual:false}};}
+function effectiveOf(settings){return settings.method==='api'?{method:'api',...clone(settings.api)}:{method:'chatgpt',...clone(settings.chatgpt)};}
+function fingerprint(effective){if(!effective)return'';return effective.method==='api'?JSON.stringify(['api',normalizeURL(effective.endpoint),effective.model.trim(),effective.hasKey,effective.keyVersion]):JSON.stringify(['chatgpt',effective.model.trim(),state.auth.revision,state.auth.signedIn]);}
+function methodName(method){return method==='api'?'APIキー':'ChatGPTアカウント';}
+function providerName(effective){return !effective?'未設定':effective.method==='api'?(effective.name||'名前未設定'):'ChatGPT';}
+function timeLabel(iso){if(!iso)return'';return new Intl.DateTimeFormat('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Tokyo'}).format(new Date(iso));}
+function loadScene(scene){
+  generation++;sceneStarted=Date.now();const saved=baseline();
+  state={scene,saved:clone(saved),draft:clone(saved),effective:effectiveOf(saved),exists:true,auth:{signedIn:false,revision:1,email:'sample-user@example.invalid'},keyAction:'keep',keyValue:'',keyEditing:false,errors:{},busy:null,applyFailed:false,latest:null,lastRaw:null,authChanged:false};
+  if(scene==='first'){state.saved.api.model='';state.saved.api.hasKey=false;state.saved.api.keyVersion=0;state.saved.api.keyScope='';state.draft=clone(state.saved);state.effective=null;state.exists=false;}
+  if(scene==='logged-out'){state.saved.method='chatgpt';state.draft=clone(state.saved);state.effective=effectiveOf(state.saved);}
+  if(scene==='apply-error'){state.saved.api.model='example-model';state.draft=clone(state.saved);state.applyFailed=true;}
+  if(scene==='confirmed'||scene==='apply-error'){state.latest={fingerprint:fingerprint(state.effective),status:'success',at:new Date(demoNow()-180000).toISOString()};state.lastRaw='HANE_AI_OK（模擬応答）';}
+  if(scene==='response-error'){state.latest={fingerprint:fingerprint(state.effective),status:'error',at:new Date(demoNow()-60000).toISOString(),message:'応答を待ちましたが、時間内に完了しませんでした。しばらく待ってから、もう一度確認してください。'};state.lastRaw='TIMEOUT（模擬エラー）';}
+  $('sceneSelect').value=scene;$('apiDetails').open=false;$('diagnostics').open=false;
+  $('newKey').value='';hideToast();render();
+}
+function isDirty(){return!same(state.saved,state.draft)||state.keyAction!=='keep';}
+function currentKeyMatches(){const api=state.draft.api;return api.hasKey&&normalizeURL(api.keyScope)===normalizeURL(api.endpoint);}
+function hasDraftKey(){return state.keyAction==='replace'?Boolean(state.keyValue.trim()):state.keyAction==='delete'?false:currentKeyMatches();}
+function readiness(){const e=state.effective;if(!e)return'not-configured';if(e.method==='chatgpt'&&!state.auth.signedIn)return'login';if(e.method==='api'&&!e.hasKey)return'key';return'ready';}
+function matchingResult(){return state.latest&&state.latest.fingerprint===fingerprint(state.effective)?state.latest:null;}
+function text(id,value){$(id).textContent=value;}
+function visible(id,show){$(id).hidden=!show;}
+function value(id,val){if($(id).value!==String(val))$(id).value=val;}
+function icon(id,name){$(id).querySelector('use').setAttribute('href','#i-'+name);}
+function badge(id,label,tone){const el=$(id);el.className='badge '+tone;el.replaceChildren();const d=document.createElement('span');d.className='dot';el.append(d,document.createTextNode(label));}
+function render(){
+  const s=state,dirty=isDirty(),busy=Boolean(s.busy),e=s.effective,r=matchingResult(),ready=readiness();
+  $('settingsFields').disabled=busy;$('sceneSelect').disabled=busy;$('resetDemo').disabled=busy;
+  visible('currentValues',Boolean(e));visible('currentEmpty',!e);
+  if(e){text('currentMethod',methodName(e.method));text('currentProvider',providerName(e));text('currentModel',e.model||'未選択');}
+  if(ready==='not-configured'){badge('currentBadge','未設定','neutral');text('currentMessage','接続方法を選び、必要な項目を設定してください。');icon('currentResultIcon','info');}
+  else if(ready==='login'){badge('currentBadge','ログインが必要','warn');text('currentMessage','ChatGPTへのログインが必要です。下の設定からログインしてください。');icon('currentResultIcon','alert');}
+  else if(ready==='key'){badge('currentBadge','APIキー未登録','warn');text('currentMessage','APIキーを登録して、保存・適用してください。');icon('currentResultIcon','alert');}
+  else if(s.busy==='test'){badge('currentBadge','応答を確認中','purple');text('currentMessage','この設定で、テスト応答を確認しています。');icon('currentResultIcon','refresh');}
+  else if(r&&r.status==='success'){badge('currentBadge','応答確認済み','success');text('currentMessage','この接続先・モデルで、テスト応答を確認しました。');icon('currentResultIcon','check');}
+  else if(r&&r.status==='error'){badge('currentBadge','応答確認に失敗','error');text('currentMessage','設定は適用済みです。応答確認の結果を下で確認してください。');icon('currentResultIcon','alert');}
+  else{badge('currentBadge','応答は未確認','warn');text('currentMessage','設定は適用済みです。この設定での応答はまだ確認していません。');icon('currentResultIcon','info');}
+  $('currentResultIcon').style.color=ready==='ready'&&r&&r.status==='success'?'var(--green)':ready==='ready'&&r&&r.status==='error'?'var(--red)':'var(--sub)';
+  text('currentTime',r?(s.busy==='test'?'前回確認 ':'最終確認 ')+timeLabel(r.at)+' · 表示例':'');
+  $('methodAPI').checked=s.draft.method==='api';$('methodChatGPT').checked=s.draft.method==='chatgpt';
+  visible('currentAPITag',Boolean(e&&e.method==='api'));visible('currentChatGPTTag',Boolean(e&&e.method==='chatgpt'));
+  visible('apiPanel',s.draft.method==='api');visible('chatgptPanel',s.draft.method==='chatgpt');
+  text('draftBadge',dirty?'未保存の変更':s.applyFailed?'保存済み・未適用':!s.exists?'初回の設定':'変更なし');$('draftBadge').className='badge '+(dirty?'purple':s.applyFailed?'warn':'neutral');
+  text('draftHint',dirty&&e&&s.draft.method!==e.method?'接続方法はまだ切り替わっていません。「保存して適用」で反映します。':'変更は「保存して適用」を押した後に有効になります。');
+  value('apiService',s.draft.api.service);value('apiModel',s.draft.api.model);value('apiName',s.draft.api.name);value('apiEndpoint',s.draft.api.endpoint);
+  $('apiEndpoint').readOnly=s.draft.api.service==='openai';
+  text('serviceHelp',s.draft.api.service==='openai'?'OpenAIの接続先を自動で設定します。':'下の「接続先の詳細」で、接続名とURLを指定します。');
+  text('apiDetailsLabel',s.draft.api.service==='openai'?'接続先の詳細':'接続先の詳細（接続名・URLが必要です）');
+  text('endpointHelp',s.draft.api.service==='openai'?'OpenAIを選んだ場合は変更不要です。別の接続先には「その他の接続先」を選びます。':'利用するサービスの接続先を指定します。登録済みのキーを別の接続先に自動で流用しません。');
+  const replaced=s.keyAction==='replace',deleted=s.keyAction==='delete',mismatch=s.draft.api.hasKey&&!currentKeyMatches();
+  badge('keyStatus',deleted?'削除予定':replaced?(s.keyValue.trim()?'入力済み・未保存':'入力中'):currentKeyMatches()?'登録済み':'未登録',deleted?'warn':replaced?'purple':currentKeyMatches()?'neutral':'warn');
+  text('keyPrivacy',deleted?'保存・適用すると、キーが削除されます。':replaced?'新しいキーは、まだ適用されていません。':currentKeyMatches()?'登録済みのキーは表示しません。':'この接続先で使うキーを登録してください。');
+  text('editKey',currentKeyMatches()?'変更':'登録');visible('editKey',!s.keyEditing&&!deleted);visible('deleteKey',!s.keyEditing&&!deleted&&currentKeyMatches());visible('undoKey',deleted);visible('keyEditBox',s.keyEditing);value('newKey',s.keyValue);
+  visible('keyWarning',deleted||(mismatch&&!replaced));
+  text('keyWarningText',deleted?'保存・適用後は、APIキーを再登録するまでこの接続を利用できません。':'接続先が変わりました。この接続先に合うAPIキーを登録してください。');
+  badge('accountBadge',s.auth.signedIn?'ログイン済み':'未ログイン',s.auth.signedIn?'success':'neutral');
+  text('accountTitle',s.auth.signedIn?s.auth.email:'ChatGPTにログインしてください');text('accountSub',s.auth.signedIn?'アカウント表示はサンプルです。':'ログインして、利用するモデルを選びます。');
+  visible('loginActions',!s.auth.signedIn);visible('logoutButton',s.auth.signedIn);visible('modelLock',!s.auth.signedIn);visible('chatModelSection',s.auth.signedIn);visible('accountSideEffect',s.authChanged&&s.auth.signedIn);
+  text('loginSideNote',e&&e.method==='chatgpt'?'ログイン後、この設定で応答を確認できます。':'接続方法は、保存・適用するまで切り替わりません。');
+  text('loginButtonText',s.busy==='login'?'ログインしています…':'ChatGPTにログイン');
+  value('chatModel',s.draft.chatgpt.manual?'__manual':'gpt-6-luna');value('chatManual',s.draft.chatgpt.model);visible('manualChatBox',s.draft.chatgpt.manual);
+  text('refreshModels',s.busy==='models'?'取得中…':'一覧を更新');
+  for(const[key,id]of Object.entries({apiModel:'apiModelError',apiName:'apiNameError',endpoint:'endpointError',key:'keyError',chatModel:'chatModelError'})){
+    visible(id,Boolean(s.errors[key]));text(id,s.errors[key]||'');
+  }
+  for(const[id,key]of Object.entries({apiModel:'apiModel',apiName:'apiName',apiEndpoint:'endpoint',newKey:'key',chatManual:'chatModel'})){
+    $(id).classList.toggle('invalid',Boolean(s.errors[key]));$(id).setAttribute('aria-invalid',String(Boolean(s.errors[key])));
+  }
+  text('testTarget',e?providerName(e)+' / '+(e.model||'モデル未選択'):'対象の接続はまだありません');
+  let reason='';
+  if(s.busy==='test')reason='現在有効な設定で、テスト応答を待っています。（模擬動作）';
+  else if(s.busy==='save'||s.busy==='apply')reason='保存・適用が終わるまでお待ちください。';
+  else if(s.busy)reason='進行中の操作が終わるまでお待ちください。';
+  else if(dirty)reason='未保存の変更があります。先に「保存して適用」するか、変更を破棄してください。';
+  else if(s.applyFailed)reason='保存した設定はまだ適用されていません。先に「適用を再試行」してください。';
+  else if(ready==='not-configured')reason='接続を設定し、「保存して適用」してください。';
+  else if(ready==='login')reason='上の設定でChatGPTにログインしてください。';
+  else if(ready==='key')reason='APIキーを登録し、「保存して適用」してください。';
+  $('testButton').disabled=Boolean(reason);text('testButtonText',s.busy==='test'?'確認中…':r&&r.status==='error'?'もう一度確認':'応答を確認');
+  text('testReason',reason);visible('testReason',Boolean(reason));
+  visible('testResult',Boolean(r)&&s.busy!=='test');
+  if(r){$('testResult').className='test-result '+(r.status==='error'?'error':'');icon('testResultIcon',r.status==='success'?'check':'alert');text('testResultText',r.status==='success'?'テスト応答を確認できました。最終確認 '+timeLabel(r.at)+'（表示例）':r.message);}
+  renderSavebar();
+  text('diagEndpoint',e&&e.method==='api'?e.endpoint:'ChatGPTアカウント接続／未設定');text('diagApply',s.applyFailed?'保存済み・適用に失敗。直前の設定を維持。':s.busy==='save'?'保存中':s.busy==='apply'?'保存済み・適用中':dirty?'編集中。適用済み設定は未変更。':s.exists?'保存・適用済み':'未設定');
+  text('diagTarget',e?providerName(e)+' / '+e.model:'なし');text('diagResponse',s.lastRaw||'まだ確認していません。');
+}
+function renderSavebar(){
+  const dirty=isDirty(),busy=Boolean(state.busy);let title,sub,button='保存して適用',symbol='check';
+  if(state.busy==='save'){title='設定を保存しています…';sub='現在の接続は、まだ変わりません。';button='保存中…';symbol='refresh';}
+  else if(state.busy==='apply'){title='保存済み・設定を適用しています…';sub='適用が完了してから、現在有効な設定を更新します。';button='適用中…';symbol='refresh';}
+  else if(dirty){title='未保存の変更があります';sub=state.effective?'現在の接続はまだ変わっていません。':'保存・適用すると、この設定が有効になります。';symbol='edit';}
+  else if(state.applyFailed){title='保存した設定を適用できませんでした';sub='現在の接続は維持しています。適用を再試行してください。';button='適用を再試行';symbol='alert';}
+  else if(!state.exists){title='AI接続を設定してください';sub='接続方法を選び、必要な項目を入力します。';symbol='info';}
+  else{title='すべての設定を保存・適用済みです';sub=readiness()==='login'?'ChatGPTへのログインが必要です。':readiness()==='key'?'APIキーの登録が必要です。':'変更はありません。';}
+  text('saveStateText',title);text('saveSub',sub);text('saveButtonText',button);icon('saveStateIcon',symbol);$('saveState').className='save-state '+(dirty?'dirty':'');
+  $('saveButton').disabled=busy||(!dirty&&!state.applyFailed&&state.exists);$('discardButton').disabled=busy||!dirty;
+}
+function notify(message){clearTimeout(toastTimer);text('toast',message);$('toast').classList.add('visible');toastTimer=setTimeout(hideToast,4000);}
+function hideToast(){$('toast').classList.remove('visible');}
+function announce(message){text('announcement',message);}
+function changed(errorKey){if(errorKey)delete state.errors[errorKey];render();}
+function ask(title,body,label,action,danger=false){confirmAction=action;text('confirmTitle',title);text('confirmBody',body);text('confirmOK',label);$('confirmOK').className='btn '+(danger?'danger solid':'primary');$('confirmDialog').showModal();$('confirmCancel').focus();}
+function clearKeyDraft(){state.keyAction='keep';state.keyValue='';state.keyEditing=false;$('newKey').value='';delete state.errors.key;}
+function discard(){state.draft=clone(state.saved);clearKeyDraft();state.errors={};$('apiDetails').open=state.draft.api.service==='custom';render();notify('設定の変更を破棄しました。ログイン状態は変わりません。');}
+function validate(){
+  state.errors={};const d=state.draft;
+  if(d.method==='api'){
+    if(!d.api.model.trim())state.errors.apiModel='利用するモデルのIDを入力してください。';
+    if(!d.api.name.trim())state.errors.apiName='画面に表示する接続名を入力してください。';
+    try{const url=new URL(d.api.endpoint);if(!['https:','http:'].includes(url.protocol)||url.username||url.password)throw new Error('url');}catch{state.errors.endpoint='http:// または https:// で始まる接続先URLを入力してください。認証情報はURLに含めません。';}
+    if(!hasDraftKey()&&state.keyAction!=='delete')state.errors.key='この接続先で使うAPIキーを登録してください。サンプルでは任意の文字で試せます。';
+  }else{
+    if(!state.auth.signedIn){render();notify('先にChatGPTにログインしてください。');$('loginButton').focus();return false;}
+    if(!d.chatgpt.model.trim())state.errors.chatModel='利用するモデルのIDを入力してください。';
+  }
+  if(Object.keys(state.errors).length){if(state.errors.apiName||state.errors.endpoint)$('apiDetails').open=true;if(state.errors.key&&d.method==='api'){state.keyAction='replace';state.keyEditing=true;}render();const focusMap={apiModel:'apiModel',apiName:'apiName',endpoint:'apiEndpoint',key:'newKey',chatModel:'chatManual'};$(focusMap[Object.keys(state.errors)[0]]).focus();announce('入力内容を確認してください。');return false;}
+  return true;
+}
+function commitDraft(){
+  const next=clone(state.draft);next.api.model=next.api.model.trim();next.api.name=next.api.name.trim();next.api.endpoint=normalizeURL(next.api.endpoint);next.chatgpt.model=next.chatgpt.model.trim();
+  if(state.keyAction==='replace'){next.api.hasKey=Boolean(state.keyValue.trim());next.api.keyVersion++;next.api.keyScope=next.api.endpoint;}
+  else if(state.keyAction==='delete'){next.api.hasKey=false;next.api.keyVersion++;next.api.keyScope='';}
+  // Raw key text is intentionally never copied into saved/effective settings.
+  state.saved=next;state.draft=clone(next);state.exists=true;clearKeyDraft();
+}
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function saveAndApply(){
+  if(state.busy)return;const retry=state.applyFailed&&!isDirty();if(!retry&&!validate())return;
+  if(state.keyAction==='delete'){
+    ask('APIキーの削除を確定しますか？','保存・適用すると、APIキーを再登録するまでこの接続を利用できなくなります。','削除して適用',()=>performSaveAndApply(false),true);return;
+  }
+  await performSaveAndApply(retry);
+}
+async function performSaveAndApply(retry){
+  const token=generation;
+  if(!retry){state.busy='save';render();await wait(430);if(token!==generation)return;commitDraft();}
+  state.busy='apply';render();await wait(750);if(token!==generation)return;
+  const next=effectiveOf(state.saved),previousFingerprint=fingerprint(state.effective);state.effective=next;state.applyFailed=false;state.busy=null;
+  if(previousFingerprint!==fingerprint(next)){state.latest=null;state.lastRaw=null;}
+  render();notify(retry?'保存済みの設定を適用しました。':'設定を保存・適用しました。テストメッセージは送信していません。');announce('設定の適用が完了しました。');
+}
+async function login(){if(state.busy)return;const token=generation;state.busy='login';render();await wait(900);if(token!==generation)return;state.auth.signedIn=true;state.auth.revision++;state.authChanged=true;state.busy=null;render();notify('模擬ログインが完了しました。使うモデルを確認してください。');announce('ログインしました。モデルを選べます。');}
+async function testResponse(){
+  if($('testButton').disabled)return;const token=generation,targetFingerprint=fingerprint(state.effective);state.busy='test';render();await wait(1100);if(token!==generation)return;
+  state.latest={fingerprint:targetFingerprint,status:'success',at:new Date(demoNow()).toISOString()};state.lastRaw='HANE_AI_OK（模擬応答）';state.busy=null;render();notify('テスト応答を確認できました。（模擬動作）');announce('テスト応答の確認が完了しました。');
+}
+function changeMethod(next){
+  const outgoing=state.draft.method;
+  const edited=!same(state.saved[outgoing],state.draft[outgoing])||(outgoing==='api'&&state.keyAction!=='keep');
+  if(edited){
+    render();
+    ask('入力中の変更を破棄して切り替えますか？','この接続方法で入力中の変更を破棄します。保存済みの接続情報とログイン状態は保持されます。','破棄して切り替える',()=>{
+      state.draft[outgoing]=clone(state.saved[outgoing]);
+      if(outgoing==='api')clearKeyDraft();
+      state.draft.method=next;state.errors={};render();
+    });
+  }else{state.draft.method=next;state.errors={};render();}
+}
+$('methodAPI').addEventListener('change',()=>changeMethod('api'));
+$('methodChatGPT').addEventListener('change',()=>changeMethod('chatgpt'));
+$('apiService').addEventListener('change',event=>{const v=event.target.value;state.draft.api.service=v;if(v==='openai'){state.draft.api.name='OpenAI';state.draft.api.endpoint=OPENAI_URL;if(!state.draft.api.model)state.draft.api.model='gpt-6-luna';}else{state.draft.api.name='';state.draft.api.endpoint='';}$('apiDetails').open=v==='custom';clearKeyDraft();state.errors={};render();});
+for(const[id,prop,error]of[['apiModel','model','apiModel'],['apiName','name','apiName'],['apiEndpoint','endpoint','endpoint']]){$(id).addEventListener('input',event=>{state.draft.api[prop]=event.target.value;changed(error);});}
+$('editKey').addEventListener('click',()=>{state.keyAction='replace';state.keyEditing=true;state.keyValue='';render();$('newKey').focus();});
+$('newKey').addEventListener('input',event=>{state.keyValue=event.target.value;changed('key');});
+$('cancelKey').addEventListener('click',()=>{clearKeyDraft();render();$('editKey').focus();});
+$('deleteKey').addEventListener('click',()=>{state.keyAction='delete';state.keyEditing=false;state.keyValue='';render();announce('APIキーの削除を予約しました。保存・適用するまでは削除されません。');});
+$('undoKey').addEventListener('click',()=>{clearKeyDraft();render();});
+$('loginButton').addEventListener('click',login);
+$('logoutButton').addEventListener('click',()=>ask('ChatGPTからログアウトしますか？',state.effective&&state.effective.method==='chatgpt'?'現在、このアカウントを使う接続が有効です。ログアウトすると、再ログインするまでAI接続を利用できません。\nこの操作は「変更を破棄」では取り消せません。':'現在のAPIキー接続は変わりません。ChatGPTアカウントの接続を使うときは、再ログインが必要です。\nこの操作は「変更を破棄」では取り消せません。','ログアウト',()=>{state.auth.signedIn=false;state.auth.revision++;state.authChanged=true;if(state.effective&&state.effective.method==='chatgpt'){state.latest=null;state.lastRaw=null;}render();notify('ログアウトしました。（模擬動作）');},true));
+$('chatModel').addEventListener('change',event=>{state.draft.chatgpt.manual=event.target.value==='__manual';if(!state.draft.chatgpt.manual)state.draft.chatgpt.model=event.target.value;changed('chatModel');if(state.draft.chatgpt.manual)$('chatManual').focus();});
+$('chatManual').addEventListener('input',event=>{state.draft.chatgpt.model=event.target.value;changed('chatModel');});
+$('refreshModels').addEventListener('click',async()=>{if(state.busy)return;const token=generation;state.busy='models';render();await wait(650);if(token!==generation)return;state.busy=null;render();notify('モデル一覧を更新しました。表示はサンプルです。');});
+$('saveButton').addEventListener('click',saveAndApply);
+$('discardButton').addEventListener('click',()=>ask('設定の変更を破棄しますか？','入力中の設定を、最後に保存した内容へ戻します。現在有効な接続とログイン状態は変わりません。','変更を破棄',discard));
+$('testButton').addEventListener('click',testResponse);
+$('sceneSelect').addEventListener('change',event=>{const next=event.target.value;if(isDirty()){event.target.value=state.scene;ask('表示する状態を切り替えますか？','このサンプルで編集中の内容はリセットされます。','切り替える',()=>loadScene(next));}else loadScene(next);});
+$('resetDemo').addEventListener('click',()=>{if(isDirty())ask('サンプルを最初に戻しますか？','編集中の内容を破棄して、選択した状態からやり直します。','最初に戻す',()=>loadScene(state.scene));else{loadScene(state.scene);notify('選択した状態を最初から表示しました。');}});
+$('backButton').addEventListener('click',()=>{if(isDirty())ask('変更を破棄して戻りますか？','未保存の変更があります。現在有効な設定は変わりません。','破棄して戻る',()=>{discard();notify('このサンプルはAI設定画面のみです。実装時は編集画面に戻ります。');});else notify('このサンプルはAI設定画面のみです。実装時は編集画面に戻ります。');});
+$('openSpec').addEventListener('click',()=>$('specDialog').showModal());$('closeSpec').addEventListener('click',()=>$('specDialog').close());
+$('confirmCancel').addEventListener('click',()=>{confirmAction=null;$('confirmDialog').close();});
+$('confirmOK').addEventListener('click',()=>{const action=confirmAction;confirmAction=null;$('confirmDialog').close();if(action)action();});
+$('confirmDialog').addEventListener('cancel',()=>{confirmAction=null;});
+for(const id of['specDialog','confirmDialog'])$(id).addEventListener('click',event=>{if(event.target!==$(id))return;const r=$(id).getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)$(id).close();});
+window.addEventListener('beforeunload',event=>{if(isDirty()){event.preventDefault();event.returnValue='';}});
+loadScene('confirmed');
+</script>
+</body>
+</html>
