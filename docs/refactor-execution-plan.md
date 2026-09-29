@@ -478,10 +478,10 @@ session I/O、background parse、height/cache、viewportの残りのpointer/pane
 - `schedule_autosave` — 親 `view.rs` に残る `after_input`（既存の呼び出し）と `toggle_autosave` から呼ぶ。
 - `schedule_draft_save` — 親 `view.rs` に残る `after_input` から呼ぶ。
 - `schedule_title_sync` — 親 `view.rs` に残る `after_input` から呼ぶ。
-- `save_session` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `confirm_inline_rename`（`queued_saves`の再開）から呼ぶ。
-- `retry_deferred_title_sync` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `confirm_inline_rename` と `cancel_inline_rename` から呼ぶ。
+- `save_session` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `finish_inline_rename` が `queued_saves` の保存を再開するときに呼ぶ。
+- `retry_deferred_title_sync` — 兄弟 `crates/ui/src/view/inline_rename.rs` の `finish_inline_rename` と `cancel_inline_rename` から呼ぶ。
 
-既存の公開範囲は変更していない。`flush_pending_drafts` は元から `pub fn` で、別crateの `crates/app/src/main.rs` の app-quit hookから呼ぶため維持した。`save_current` / `save_or_prompt` / `prompt_save_as` は元から `pub(crate) fn` で、`crates/ui/src/actions.rs` と `view.rs` 内の既存 `mod tests` から呼ぶため維持した。残り9件（`run_title_sync`、`begin_title_create`、`begin_title_rename`、`finish_title_rename`、`retire_work_folder_draft`、`apply_pending_title_sync`、`retry_title_sync`、`save_active`、`finish_save`）は移動した18件の内部だけから呼ばれるためprivateのまま維持した。
+既存の公開範囲は変更していない。`flush_pending_drafts` は元から `pub fn` で、別crateの `crates/app/src/main.rs` にあるwindow-close callbackと、親 `view.rs` の `from_sessions` が登録するapp-quit hookおよび `switch_to_work_folder` の文書切替前flushから呼ぶため維持した。window-close callbackはapp-quit hookとは別の終了経路である。`save_current` / `save_or_prompt` / `prompt_save_as` は元から `pub(crate) fn` で、`crates/ui/src/actions.rs` と `view.rs` 内の既存 `mod tests` から呼ぶため維持した。残り9件（`run_title_sync`、`begin_title_create`、`begin_title_rename`、`finish_title_rename`、`retire_work_folder_draft`、`apply_pending_title_sync`、`retry_title_sync`、`save_active`、`finish_save`）は移動した18件の内部だけから呼ばれるためprivateのまま維持した。
 
 移動した18件の個別対応は次のとおり。各行で旧定義 `crates/ui/src/view.rs::<method>` を同名の新定義 `crates/ui/src/view/session_save.rs::<method>` へ移した。
 
