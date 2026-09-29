@@ -261,7 +261,7 @@ function validate(){
   if(d.method==='api'){
     if(!d.api.model.trim())state.errors.apiModel='利用するモデルのIDを入力してください。';
     if(!d.api.name.trim())state.errors.apiName='画面に表示する接続名を入力してください。';
-    try{const url=new URL(d.api.endpoint);if(!['https:','http:'].includes(url.protocol)||url.username||url.password)throw new Error('url');}catch{state.errors.endpoint='http:// または https:// で始まる接続先URLを入力してください。認証情報はURLに含めません。';}
+    try{const url=new URL(d.api.endpoint);const host=url.hostname.replace(/^\[|\]$/g,'');const isLocalDev=host==='localhost'||host==='127.0.0.1'||host==='::1';if(!['https:','http:'].includes(url.protocol)||url.username||url.password||(url.protocol==='http:'&&!isLocalDev))throw new Error('url');}catch{state.errors.endpoint='https:// で始まる接続先URLを入力してください（ローカル開発用の localhost・127.0.0.1・::1 に限り http:// も使えます）。認証情報はURLに含めません。';}
     if(!hasDraftKey()&&state.keyAction!=='delete')state.errors.key='この接続先で使うAPIキーを登録してください。サンプルでは任意の文字で試せます。';
   }else{
     if(!state.auth.signedIn){render();notify('先にChatGPTにログインしてください。');$('loginButton').focus();return false;}
