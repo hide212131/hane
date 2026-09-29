@@ -32,6 +32,38 @@ enum CredentialEdit {
     Delete,
 }
 
+fn connection_name(connection: ActiveConnection) -> &'static str {
+    match connection {
+        ActiveConnection::ChatGpt => "ChatGPT / Codex",
+        ActiveConnection::Custom => "Custom Provider",
+    }
+}
+
+fn custom_key_action_label(registered: bool) -> &'static str {
+    if registered {
+        "API keyを置き換える"
+    } else {
+        "API keyを登録"
+    }
+}
+
+fn custom_key_guidance(edit: CredentialEdit, registered: bool) -> &'static str {
+    match (edit, registered) {
+        (CredentialEdit::Keep, true) => {
+            "API keyを変更するには「API keyを置き換える」を押し、入力欄に新しいkeyを入力して、画面下の「保存」を押してください。keyは保存後も表示しません。接続確認は別操作です。"
+        }
+        (CredentialEdit::Keep, false) => {
+            "API keyを登録するには「API keyを登録」を押し、表示された入力欄にkeyを入力して、画面下の「保存」を押してください。keyは保存後も表示しません。接続確認は別操作です。"
+        }
+        (CredentialEdit::Replace, _) => {
+            "入力欄に新しいkeyを入力し、画面下の「保存」を押してください。keyは保存後も表示しません。保存だけでは接続確認を行いません。"
+        }
+        (CredentialEdit::Delete, _) => {
+            "keyの削除は画面下の「保存」で反映されます。保存前なら「登録済みkeyを維持」を押して取り消せます。"
+        }
+    }
+}
+
 struct AiInputs {
     chatgpt_model: Entity<InputState>,
     custom_name: Entity<InputState>,
@@ -569,13 +601,17 @@ impl AiSettingsPage {
             .child(
                 div()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child("使用する接続"),
+                    .child("AIの接続先"),
             )
+            .child(format!("保存済み: {}", connection_name(saved)))
+            .child(format!("選択中: {}", connection_name(draft)))
             .child(if draft == saved {
-                "保存済みの接続"
+                "選択中の接続は保存済みです。"
             } else {
-                "未保存の接続変更"
+                "選択中の接続は未保存です。画面下の「保存」で切り替わります。"
             })
+            .child("ChatGPT / CodexはChatGPTアカウントで接続します。Custom Providerはここで設定したURL・model ID・API keyを使います。")
+            .child("このボタンを押すだけでは接続・ログインしません。保存後、選択した接続先がAIリクエストに使われます。接続確認は下の「固定入力で接続を確認」から別に実行します。")
             .child(div().flex().gap_2().child(chatgpt).child(custom))
     }
 
@@ -767,6 +803,12 @@ impl AiSettingsPage {
                     .child("ChatGPT / Codex"),
             )
             .child(format!("アカウント: {account}"))
+            .child("この状態はChatGPT / Codexのログイン状況です。Custom ProviderのAPI key状態とは別です。")
+            .child(if active_saved {
+                ""
+            } else {
+                "ChatGPT / Codexは保存済み接続ではありません。上で選択して「保存」すると、ログイン操作が使えるようになります。"
+            })
             .child(
                 div().flex().gap_2().children(
                     [
@@ -818,7 +860,11 @@ impl AiSettingsPage {
         let disabled = !editable || self.snapshot.busy.is_some();
         let view = cx.entity();
         let keep_key = Button::new("ai-custom-key-keep")
-            .label("登録済みkeyを維持")
+            .label(if registered {
+                "登録済みkeyを維持"
+            } else {
+                "keyを変更しない"
+            })
             .small()
             .selected(self.credential_edit == CredentialEdit::Keep)
             .on_click(move |_, window, app| {
@@ -832,7 +878,7 @@ impl AiSettingsPage {
             });
         let view = cx.entity();
         let replace_key = Button::new("ai-custom-key-replace")
-            .label("keyを置き換える")
+            .label(custom_key_action_label(registered))
             .small()
             .selected(self.credential_edit == CredentialEdit::Replace)
             .disabled(disabled)
@@ -842,6 +888,10 @@ impl AiSettingsPage {
                     cx.notify();
                 })
             });
+        let replace_key = div()
+            .id("ai-custom-key-replace-wrapper")
+            .debug_selector(|| "ai-custom-key-replace".to_owned())
+            .child(replace_key);
         let view = cx.entity();
         let delete_key = Button::new("ai-custom-key-delete")
             .label("保存済みkeyを削除")
@@ -859,10 +909,15 @@ impl AiSettingsPage {
             });
         let key_input = if self.credential_edit == CredentialEdit::Replace {
             Some(
-                Input::new(&inputs.custom_api_key)
-                    .aria_label("Custom Provider API key")
-                    .content_type(InputContentType::NewPassword)
-                    .disabled(disabled),
+                div()
+                    .id("ai-custom-api-key-input")
+                    .debug_selector(|| "ai-custom-api-key-input".to_owned())
+                    .child(
+                        Input::new(&inputs.custom_api_key)
+                            .aria_label("Custom Provider API key")
+                            .content_type(InputContentType::NewPassword)
+                            .disabled(disabled),
+                    ),
             )
         } else {
             None
@@ -877,6 +932,7 @@ impl AiSettingsPage {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("Custom Provider"),
             )
+            .child("ここでは接続先URL・model ID・API keyを設定します。ChatGPT / Codexのログイン情報とは別に保存します。")
             .child(
                 div().child(
                     Input::new(&inputs.custom_name)
@@ -912,6 +968,7 @@ impl AiSettingsPage {
                     .child(delete_key),
             )
             .children(key_input)
+            .child(custom_key_guidance(self.credential_edit, registered))
             .child(
                 if self.snapshot.settings.active_connection == ActiveConnection::Custom && dirty {
                     "変更はまだ保存されていません。"
@@ -1154,6 +1211,58 @@ mod tests {
     use hane_document::TextBuffer;
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn connection_and_api_key_choices_explain_when_they_take_effect() {
+        assert_eq!(
+            connection_name(ActiveConnection::ChatGpt),
+            "ChatGPT / Codex"
+        );
+        assert_eq!(connection_name(ActiveConnection::Custom), "Custom Provider");
+        assert_eq!(custom_key_action_label(false), "API keyを登録");
+        assert_eq!(custom_key_action_label(true), "API keyを置き換える");
+        assert!(custom_key_guidance(CredentialEdit::Keep, false).contains("画面下の「保存」"));
+        assert!(custom_key_guidance(CredentialEdit::Keep, false).contains("接続確認は別操作"));
+        assert!(
+            custom_key_guidance(CredentialEdit::Replace, true).contains("保存だけでは接続確認")
+        );
+        assert!(custom_key_guidance(CredentialEdit::Delete, true).contains("「保存」で反映"));
+    }
+
+    #[gpui::test]
+    fn register_api_key_button_reveals_the_masked_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            view.ai_settings.snapshot.settings.active_connection = ActiveConnection::Custom;
+            view.ai_settings.snapshot.settings.custom = Some(CustomConnectionSettings {
+                id: "custom".to_owned(),
+                name: "Test Provider".to_owned(),
+                base_url: "https://provider.example/v1".to_owned(),
+                model_id: "model-id".to_owned(),
+                credential_ref: None,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("ai-custom-api-key-input").is_none());
+        let register_button = cx
+            .debug_bounds("ai-custom-key-replace")
+            .expect("API key registration button is rendered");
+        cx.simulate_click(register_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("ai-custom-api-key-input").is_some());
+        assert!(view.read_with(cx, |view, _| {
+            view.ai_settings.credential_edit == CredentialEdit::Replace
+        }));
+    }
 
     #[gpui::test]
     fn fixed_probe_button_submits_a_probe_command(cx: &mut gpui::TestAppContext) {
