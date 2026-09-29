@@ -195,7 +195,63 @@ an empty list.
 above.** The finding that default configuration loaded the AGENTS sentinel led
 to the isolation-profile change; both generated Hane provider profiles now
 set the controls that prevent that path. The negative execution check remains
-limited to the unadvertised `exec_command` call. The Probe UI remains disabled
-pending the Commander's review and next-stage assignment; this result does not
-authorize OAuth/Custom live connection work, GUI work, review triggering, or
-changing the Draft state.
+limited to the unadvertised `exec_command` call. On 2026-09-29 the Commander
+accepted this scoped result and assigned P5. Commit `21a64d5393cab4ee1709b7bfbd3f2d47e1f5f412`
+enables the fixed-response Probe gate on that basis; enabling it does not
+constitute P5 OAuth, Custom Provider, or native GUI evidence.
+
+### P5 status at head `21a64d5393cab4ee1709b7bfbd3f2d47e1f5f412`
+
+- Current implementation PR #397 remains Draft/Open on
+  `feat/379-chatgpt-codex-oauth-ai-settings`; Issue #379 remains open. The
+  design-only PR #392 remains open at
+  `025c53d0d03a9ecc2a221d80257d88e59b6c5dfd`.
+- `cargo test -p hane-ai`: **pass** (134 unit, 11 account-service, 16 Custom
+  Provider runtime, 20 runtime-lifecycle tests); log:
+  `/tmp/hane379-p5-20260929/cargo-test-hane-ai.log`.
+- `cargo test -p hane-ui view::ai_settings::tests`: **pass** (3 tests); log:
+  `/tmp/hane379-p5-20260929/cargo-test-hane-ui-ai-settings.log`.
+- `rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs`:
+  **pass**; log `/tmp/hane379-p5-20260929/rustfmt-ai-settings.log`.
+- `cargo build -p hane`: **pass**; log
+  `/tmp/hane379-p5-20260929/cargo-build-hane.log`; built binary SHA-256
+  `91496f4f706926a70107608c848cee9deca8a0c2d8557af34dc342a77b255873`.
+- `cargo fmt --all -- --check`: **fail** due existing repository-wide
+  rustfmt differences; the AI settings file itself passes the focused check.
+  Log `/tmp/hane379-p5-20260929/cargo-fmt-all-check.log`.
+- GitHub Actions run `36518580844` at this exact head: **pass** for macOS and
+  Windows workspace tests and Clippy, including macOS-only fallback glyph and
+  input-source tests. This CI result is not native GUI evidence.
+- T29 actual ChatGPT OAuth is **not accepted as pass**. A first temporary UI
+  attempt was not counted because state isolation was not established, and the
+  visible account state remained signed out. A new app copy with
+  `HANE_STATE_DIR=/tmp/hane379-p5-20260929/app-state-clean` and a disposable
+  workspace was launched, but it remained at “Opening work folder…” and the AI
+  settings view was not reached. No successful sign-in, fixed response,
+  logout, or re-login was demonstrated. No credential was copied into test
+  logs or the evidence file.
+- T30 real Custom Provider connection is **not run**. The provider Base URL,
+  model ID, and direct UI key entry are still required. The passing mock
+  runtime tests are not evidence of a real provider connection.
+- T31 is **partial**: exact-head CI passed; macOS native GUI is blocked at the
+  steps above; no Windows device was selected; CodeRabbit did not review this
+  Draft PR (the status context is not a review). GitHub reported no submitted
+  PR reviews. The PR remains Draft; no review trigger, readiness change,
+  merge, or Issue close was performed.
+
+### P5 GUI reproduction and remaining inputs
+
+For the macOS reproduction, build `hane` at the recorded head, copy it into a
+temporary `.app` with bundle ID `io.github.hide212131.hane.p5isolated`, set
+`LSEnvironment.HANE_STATE_DIR` to a new mode-0700 directory under
+`/tmp/hane379-p5-20260929`, and point its isolated `settings.conf` default
+folder at a one-file temporary Markdown workspace. On this run, the app
+remained at “Opening work folder…” for more than three minutes; the window can
+be observed, but CUA click actions return `noWindowsAvailable`, so Settings → AI
+cannot be exercised through the current automation session. The app’s state
+root and workspace are separate from Hane’s normal user state. The user must
+navigate the isolated app to Settings → AI before the OAuth handoff can resume.
+
+Remaining Commander inputs for P5 are the selected Windows GUI device and the
+Custom Provider Base URL/model ID. The API key must be entered directly into
+the isolated Hane UI; it must not be sent in chat or written to logs.
