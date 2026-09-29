@@ -786,27 +786,34 @@ func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
 }
 
 func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
-                   _ reverseDelta: Int32, _ firstProbeMs: Int, _ windowID: CGWindowID,
-                   _ prePath: String, _ frameDirectory: String, _ frameDelays: [Int]) {
-    guard firstProbeMs > 0, firstProbeMs <= 105 else { fail("reversal pre-capture delay must be between 1 and 105 ms") }
+                   _ reverseDelta: Int32, _ preProbeDelaysMs: [Int], _ windowID: CGWindowID,
+                   _ preFrameDirectory: String, _ frameDirectory: String, _ frameDelays: [Int]) {
     let capture = prepareWindowCaptureContext(windowID)
 
     let commandStarted = monotonicSeconds()
     // Keep both reversal-probe inputs on the same global Quartz event path as
     // the other GUI scenarios, including normal window-server target routing.
     let firstPosted = postScroll(pid, unit, delta)
-    // Capture one candidate frame close to the first visible update. Do not
-    // run Vision OCR in this timing window: OCR can take longer than the
-    // remaining Lines coast and would postpone the reverse input itself.
-    let preDeadline = firstPosted + Double(firstProbeMs) / 1000
-    let preRemaining = preDeadline - monotonicSeconds()
-    if preRemaining > 0 { Thread.sleep(forTimeInterval: preRemaining) }
-    let (preFrame, preError) = captureImageWithTimes(capture)
-    guard let preFrame else {
-        fail("could not capture pre-reversal window frame: \(preError ?? "unknown error")")
-    }
-    guard monotonicSeconds() < firstPosted + 0.135 else {
-        fail("pre-reversal screen capture exceeded the Lines inertia window")
+
+    // Capture every pre-reversal candidate frame before sending the reverse
+    // input. A single candidate can miss the old-direction motion depending
+    // on exactly when it lands, so multiple candidates are captured and the
+    // reverse input is sent right after the latest one. Vision OCR does not
+    // run in this loop: it can take longer than the remaining Lines coast
+    // and would postpone the reverse input itself.
+    var preFrames: [(Int, CapturedWindowFrame)] = []
+    for (index, delayMs) in preProbeDelaysMs.enumerated() {
+        let deadline = firstPosted + Double(delayMs) / 1000
+        let remaining = deadline - monotonicSeconds()
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+        let (frame, error) = captureImageWithTimes(capture)
+        guard let frame else {
+            fail("could not capture pre-reversal window frame \(index): \(error ?? "unknown error")")
+        }
+        guard frame.completed < firstPosted + 0.135 else {
+            fail("pre-reversal screen capture exceeded the Lines inertia window")
+        }
+        preFrames.append((index, frame))
     }
     let reversePosted = postScroll(pid, unit, reverseDelta)
 
@@ -822,13 +829,19 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         frames.append((index, frame))
     }
 
-    // OCR is intentionally after the reverse event and post-reversal frames;
-    // `preFrame` was captured before the reverse event, so this preserves the
-    // evidence ordering without spending the inertia window on recognition.
-    let preLines = visibleLineNumbers(preFrame.image)
-    guard !preLines.isEmpty else { fail("pre-reversal screen image contains no readable line numbers") }
-
-    writeWindowImage(preFrame.image, path: prePath)
+    // OCR is intentionally after the reverse event and every timed capture
+    // (pre- and post-reversal); all frames were captured before this point,
+    // so this preserves the evidence ordering without spending the inertia
+    // window on recognition. The caller runs OCR on the written images.
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: preFrameDirectory, isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    for (index, frame) in preFrames {
+        let path = URL(fileURLWithPath: preFrameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "pre-frame-%02d.png", index)).path
+        writeWindowImage(frame.image, path: path)
+    }
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
@@ -840,11 +853,12 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     }
 
     print("initial_event_elapsed_ms=\(milliseconds(firstPosted - commandStarted))")
-    print("pre_reverse_capture_started_elapsed_ms=\(milliseconds(preFrame.started - commandStarted))")
-    print("pre_reverse_capture_completed_elapsed_ms=\(milliseconds(preFrame.completed - commandStarted))")
-    print("pre_reverse_visible_lines=\(preLines.map(String.init).joined(separator: ","))")
     print("reversal_event_route=cghidEventTap")
     print("reverse_event_elapsed_ms=\(milliseconds(reversePosted - commandStarted))")
+    for (index, frame) in preFrames {
+        print(String(format: "pre_frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - commandStarted))
+        print(String(format: "pre_frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - commandStarted))
+    }
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ms=", index) + milliseconds(frame.started - reversePosted))
         print(String(format: "frame_%02d_capture_completed_ms=", index) + milliseconds(frame.completed - reversePosted))
@@ -894,9 +908,14 @@ case "wheel-reversal":
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]),
           let reverseDelta = Int32(arguments[4]),
-          let firstProbeMs = Int(arguments[5]), firstProbeMs > 0, firstProbeMs <= 105,
           let windowID = UInt32(arguments[6]) else {
-        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, pre-capture delay ms, window ID, pre-image path, frame directory and comma-separated delays")
+        fail("wheel-reversal requires PID, lines|pixels, delta, reverse delta, comma-separated pre-reverse probe delays ms, window ID, pre-frame directory, frame directory and comma-separated delays")
+    }
+    let preProbeDelays = arguments[5].split(separator: ",").compactMap { Int($0) }
+    guard !preProbeDelays.isEmpty,
+          preProbeDelays == preProbeDelays.sorted(),
+          preProbeDelays.allSatisfy({ $0 > 0 && $0 <= 130 }) else {
+        fail("wheel-reversal pre-reverse probe delays must be ascending milliseconds within the Lines inertia window")
     }
     let frameDelays = arguments[9].split(separator: ",").compactMap { Int($0) }
     guard !frameDelays.isEmpty,
@@ -905,7 +924,7 @@ case "wheel-reversal":
           frameDelays.allSatisfy({ $0 >= 0 && $0 <= 1000 }) else {
         fail("wheel-reversal frame delays must be ascending milliseconds beginning at 0")
     }
-    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, firstProbeMs,
+    wheelReversal(pid, scrollUnit(arguments[2]), delta, reverseDelta, preProbeDelays,
                   windowID, arguments[7], arguments[8], frameDelays)
 case "current-source":
     print(currentSourceID())
