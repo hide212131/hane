@@ -3019,9 +3019,17 @@ impl EditorView {
             .id("settings-content")
             .flex_1()
             .min_w(px(0.0))
-            .h_full()
-            .overflow_y_scroll()
-            .child(body);
+            .h_full();
+        let content = if self.settings_ai_page {
+            content
+                .flex()
+                .flex_col()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(body)
+        } else {
+            content.overflow_y_scroll().child(body)
+        };
 
         let root = div()
             .size_full()

@@ -1,17 +1,20 @@
 use super::EditorView;
+use crate::theme::Theme;
 use gpui::{
     App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Styled, Window, div, px, rgb,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use gpui_component::Disableable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputContentType, InputState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::radio::Radio;
 use gpui_component::{Selectable, Sizable};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
-    OperationId, OwnershipState, PersistenceState, ProbeStatus, SafeOperationResult,
-    ServiceBusyReason,
+    OperationId, OwnershipState, PersistenceState, ProbeErrorCode, ProbeStatus,
+    SafeOperationResult, ServiceBusyReason,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -32,36 +35,64 @@ enum CredentialEdit {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CustomProviderPreset {
+    OpenAi,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingConfirmation {
+    Logout,
+    DeleteKey(Option<LeaveTarget>),
+}
+
+const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const OPENAI_PROVIDER_URL: &str = "https://api.openai.com/v1";
+
 fn connection_name(connection: ActiveConnection) -> &'static str {
     match connection {
         ActiveConnection::ChatGpt => "ChatGPT / Codex",
-        ActiveConnection::Custom => "Custom Provider",
+        ActiveConnection::Custom => "APIキー接続",
     }
 }
 
 fn custom_key_action_label(registered: bool) -> &'static str {
-    if registered {
-        "API keyを置き換える"
-    } else {
-        "API keyを登録"
-    }
+    if registered { "変更" } else { "登録" }
 }
 
 fn custom_key_guidance(edit: CredentialEdit, registered: bool) -> &'static str {
     match (edit, registered) {
         (CredentialEdit::Keep, true) => {
-            "API keyを変更するには「API keyを置き換える」を押し、入力欄に新しいkeyを入力して、画面下の「保存」を押してください。keyは保存後も表示しません。接続確認は別操作です。"
+            "登録済みのAPIキーは「変更」または「削除」するまで保持されます。値は画面に表示しません。応答確認は別の操作です。"
         }
         (CredentialEdit::Keep, false) => {
-            "API keyを登録するには「API keyを登録」を押し、表示された入力欄にkeyを入力して、画面下の「保存」を押してください。keyは保存後も表示しません。接続確認は別操作です。"
+            "「登録」を押すと入力欄が開きます。入力後に「保存して適用」を押してください。APIキーは保存後も表示しません。接続確認は別操作です。"
         }
         (CredentialEdit::Replace, _) => {
-            "入力欄に新しいkeyを入力し、画面下の「保存」を押してください。keyは保存後も表示しません。保存だけでは接続確認を行いません。"
+            "新しいAPIキーを入力して「保存して適用」を押してください。キーは保存後も表示しません。保存・適用だけでは接続確認を行いません。"
         }
         (CredentialEdit::Delete, _) => {
-            "keyの削除は画面下の「保存」で反映されます。保存前なら「登録済みkeyを維持」を押して取り消せます。"
+            "削除は「保存して適用」を押した後に確定します。保存前なら「元に戻す」で取り消せます。"
         }
     }
+}
+
+fn custom_settings_match_openai(name: &str, base_url: &str) -> bool {
+    name.trim() == OPENAI_PROVIDER_NAME
+        && base_url.trim().trim_end_matches('/') == OPENAI_PROVIDER_URL
+}
+
+fn endpoint_changed_with_registered_key(
+    saved: Option<&CustomConnectionSettings>,
+    draft_base_url: &str,
+    credential_edit: CredentialEdit,
+) -> bool {
+    saved.is_some_and(|saved| {
+        saved.credential_ref.is_some()
+            && credential_edit == CredentialEdit::Keep
+            && saved.base_url.trim() != draft_base_url.trim()
+    })
 }
 
 struct AiInputs {
@@ -77,9 +108,14 @@ pub(super) struct AiSettingsPage {
     snapshot: AiSnapshot,
     inputs: Option<AiInputs>,
     active_connection: ActiveConnection,
+    custom_preset: CustomProviderPreset,
+    custom_details_open: bool,
     credential_edit: CredentialEdit,
     message: Option<String>,
     leave_prompt: Option<LeaveTarget>,
+    pending_connection_switch: Option<ActiveConnection>,
+    pending_confirmation: Option<PendingConfirmation>,
+    diagnostics_open: bool,
     save_then_leave: Option<(OperationId, LeaveTarget)>,
     route_ready: Option<LeaveTarget>,
     subscription_started: bool,
@@ -92,9 +128,14 @@ impl Default for AiSettingsPage {
             snapshot: AiSnapshot::default(),
             inputs: None,
             active_connection: ActiveConnection::ChatGpt,
+            custom_preset: CustomProviderPreset::Other,
+            custom_details_open: false,
             credential_edit: CredentialEdit::Keep,
             message: None,
             leave_prompt: None,
+            pending_connection_switch: None,
+            pending_confirmation: None,
+            diagnostics_open: false,
             save_then_leave: None,
             route_ready: None,
             subscription_started: false,
@@ -161,9 +202,25 @@ impl AiSettingsPage {
     pub(super) fn begin_settings_session(&mut self) {
         self.inputs = None;
         self.active_connection = self.snapshot.settings.active_connection;
+        self.custom_preset =
+            self.snapshot
+                .settings
+                .custom
+                .as_ref()
+                .map_or(CustomProviderPreset::Other, |custom| {
+                    if custom_settings_match_openai(&custom.name, &custom.base_url) {
+                        CustomProviderPreset::OpenAi
+                    } else {
+                        CustomProviderPreset::Other
+                    }
+                });
         self.credential_edit = CredentialEdit::Keep;
+        self.custom_details_open = false;
         self.message = None;
         self.leave_prompt = None;
+        self.pending_connection_switch = None;
+        self.pending_confirmation = None;
+        self.diagnostics_open = false;
         self.save_then_leave = None;
         self.route_ready = None;
     }
@@ -173,7 +230,10 @@ impl AiSettingsPage {
         // It does not cancel app-owned OAuth or Probe operations.
         self.inputs = None;
         self.credential_edit = CredentialEdit::Keep;
+        self.custom_details_open = false;
         self.leave_prompt = None;
+        self.pending_connection_switch = None;
+        self.pending_confirmation = None;
         self.save_then_leave = None;
         self.route_ready = None;
     }
@@ -219,18 +279,140 @@ impl AiSettingsPage {
             return false;
         };
         let saved = &self.snapshot.settings;
-        let custom = saved.custom.as_ref();
+        let (custom_name, custom_base_url, custom_model) = self.custom_draft_values(inputs, cx);
         self.active_connection != saved.active_connection
             || value(&inputs.chatgpt_model, cx)
                 != saved.chatgpt.model_id.as_deref().unwrap_or_default()
-            || value(&inputs.custom_name, cx) != custom.map_or("", |custom| custom.name.as_str())
-            || value(&inputs.custom_base_url, cx)
-                != custom.map_or("", |custom| custom.base_url.as_str())
-            || value(&inputs.custom_model, cx)
-                != custom.map_or("", |custom| custom.model_id.as_str())
+            || custom_name
+                != saved
+                    .custom
+                    .as_ref()
+                    .map_or("", |custom| custom.name.as_str())
+            || custom_base_url
+                != saved
+                    .custom
+                    .as_ref()
+                    .map_or("", |custom| custom.base_url.as_str())
+            || custom_model
+                != saved
+                    .custom
+                    .as_ref()
+                    .map_or("", |custom| custom.model_id.as_str())
             || self.credential_edit != CredentialEdit::Keep
-            || (self.credential_edit == CredentialEdit::Replace
-                && !value(&inputs.custom_api_key, cx).is_empty())
+    }
+
+    fn connection_draft_is_dirty(&self, connection: ActiveConnection, cx: &App) -> bool {
+        let Some(inputs) = &self.inputs else {
+            return false;
+        };
+        match connection {
+            ActiveConnection::ChatGpt => {
+                value(&inputs.chatgpt_model, cx)
+                    != self
+                        .snapshot
+                        .settings
+                        .chatgpt
+                        .model_id
+                        .as_deref()
+                        .unwrap_or_default()
+            }
+            ActiveConnection::Custom => {
+                let saved = self.snapshot.settings.custom.as_ref();
+                let (name, base_url, model) = self.custom_draft_values(inputs, cx);
+                name != saved.map_or("", |custom| custom.name.as_str())
+                    || base_url != saved.map_or("", |custom| custom.base_url.as_str())
+                    || model != saved.map_or("", |custom| custom.model_id.as_str())
+                    || self.credential_edit != CredentialEdit::Keep
+            }
+        }
+    }
+
+    fn custom_draft_values(&self, inputs: &AiInputs, cx: &App) -> (String, String, String) {
+        let (name, base_url) = match self.custom_preset {
+            CustomProviderPreset::OpenAi => (
+                OPENAI_PROVIDER_NAME.to_owned(),
+                OPENAI_PROVIDER_URL.to_owned(),
+            ),
+            CustomProviderPreset::Other => (
+                value(&inputs.custom_name, cx),
+                value(&inputs.custom_base_url, cx),
+            ),
+        };
+        (name, base_url, value(&inputs.custom_model, cx))
+    }
+
+    fn request_connection_switch(
+        &mut self,
+        next: ActiveConnection,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+    ) {
+        if next == self.active_connection {
+            return;
+        }
+        if self.connection_draft_is_dirty(self.active_connection, cx) {
+            self.pending_connection_switch = Some(next);
+        } else {
+            self.active_connection = next;
+            self.message = None;
+        }
+        let _ = window;
+    }
+
+    fn discard_connection_draft(
+        &mut self,
+        connection: ActiveConnection,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+    ) {
+        let Some(inputs) = &self.inputs else {
+            return;
+        };
+        match connection {
+            ActiveConnection::ChatGpt => set_value(
+                &inputs.chatgpt_model,
+                self.snapshot
+                    .settings
+                    .chatgpt
+                    .model_id
+                    .as_deref()
+                    .unwrap_or_default(),
+                window,
+                cx,
+            ),
+            ActiveConnection::Custom => {
+                let saved = self.snapshot.settings.custom.as_ref();
+                set_value(
+                    &inputs.custom_name,
+                    saved.map_or("", |custom| custom.name.as_str()),
+                    window,
+                    cx,
+                );
+                set_value(
+                    &inputs.custom_base_url,
+                    saved.map_or("", |custom| custom.base_url.as_str()),
+                    window,
+                    cx,
+                );
+                set_value(
+                    &inputs.custom_model,
+                    saved.map_or("", |custom| custom.model_id.as_str()),
+                    window,
+                    cx,
+                );
+                set_value(&inputs.custom_api_key, "", window, cx);
+                self.custom_preset = saved.map_or(CustomProviderPreset::Other, |custom| {
+                    if custom_settings_match_openai(&custom.name, &custom.base_url) {
+                        CustomProviderPreset::OpenAi
+                    } else {
+                        CustomProviderPreset::Other
+                    }
+                });
+                self.credential_edit = CredentialEdit::Keep;
+            }
+        }
+        self.pending_connection_switch = None;
+        self.message = None;
     }
 
     pub(super) fn confirm_leave(&mut self, target: LeaveTarget) {
@@ -270,6 +452,13 @@ impl AiSettingsPage {
         let custom_base_url = custom.map_or("", |custom| custom.base_url.as_str());
         let custom_model = custom.map_or("", |custom| custom.model_id.as_str());
         self.active_connection = settings.active_connection;
+        self.custom_preset = if custom
+            .is_some_and(|custom| custom_settings_match_openai(&custom.name, &custom.base_url))
+        {
+            CustomProviderPreset::OpenAi
+        } else {
+            CustomProviderPreset::Other
+        };
         self.inputs = Some(AiInputs {
             chatgpt_model: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -293,7 +482,7 @@ impl AiSettingsPage {
             }),
             custom_api_key: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("新しいAPI key")
+                    .placeholder("新しいAPIキー")
                     .masked(true)
             }),
         });
@@ -331,8 +520,18 @@ impl AiSettingsPage {
         );
         set_value(&inputs.custom_api_key, "", window, cx);
         self.active_connection = settings.active_connection;
+        self.custom_preset = custom.map_or(CustomProviderPreset::Other, |custom| {
+            if custom_settings_match_openai(&custom.name, &custom.base_url) {
+                CustomProviderPreset::OpenAi
+            } else {
+                CustomProviderPreset::Other
+            }
+        });
         self.credential_edit = CredentialEdit::Keep;
+        self.custom_details_open = false;
         self.leave_prompt = None;
+        self.pending_connection_switch = None;
+        self.pending_confirmation = None;
         self.message = None;
     }
 
@@ -345,9 +544,7 @@ impl AiSettingsPage {
             model_id: (!model.is_empty()).then_some(model),
         };
         let existing = proposed.custom.as_ref();
-        let name = value(&inputs.custom_name, cx);
-        let base_url = value(&inputs.custom_base_url, cx);
-        let model_id = value(&inputs.custom_model, cx);
+        let (name, base_url, model_id) = self.custom_draft_values(inputs, cx);
         if !name.is_empty() || !base_url.is_empty() || !model_id.is_empty() || existing.is_some() {
             proposed.custom = Some(CustomConnectionSettings {
                 id: existing.map_or_else(
@@ -369,6 +566,25 @@ impl AiSettingsPage {
         cx: &mut Context<EditorView>,
         target: Option<LeaveTarget>,
     ) {
+        self.save_inner(window, cx, target, false);
+    }
+
+    fn save_confirmed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+        target: Option<LeaveTarget>,
+    ) {
+        self.save_inner(window, cx, target, true);
+    }
+
+    fn save_inner(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+        target: Option<LeaveTarget>,
+        delete_confirmed: bool,
+    ) {
         self.message = None;
         let Some(service) = &self.service else {
             self.message = Some("AIサービスを利用できません。".to_owned());
@@ -379,6 +595,28 @@ impl AiSettingsPage {
                 Some("AI設定を読み込めていません。もう一度開き直してください。".to_owned());
             return;
         };
+        let existing_custom = self.snapshot.settings.custom.as_ref();
+        let proposed_base_url = proposed
+            .custom
+            .as_ref()
+            .map_or("", |custom| custom.base_url.as_str());
+        if endpoint_changed_with_registered_key(
+            existing_custom,
+            proposed_base_url,
+            self.credential_edit,
+        ) {
+            self.message = Some(
+                "接続先が変わっています。安全のため、登録済みkeyは新しい接続先へ引き継ぎません。新しいkeyを登録するか、keyを削除してから保存してください。"
+                    .to_owned(),
+            );
+            return;
+        }
+        if self.active_connection == ActiveConnection::Custom
+            && let Err(error) = hane_ai::validate_base_url(proposed_base_url)
+        {
+            self.message = Some(base_url_validation_message(error).to_owned());
+            return;
+        }
         if self.active_connection == ActiveConnection::Custom
             && !proposed.custom.as_ref().is_some_and(|custom| {
                 !custom.name.trim().is_empty()
@@ -392,21 +630,39 @@ impl AiSettingsPage {
             );
             return;
         }
-        let expected_revision = self.snapshot.settings.revision;
         let old_credential = self
             .snapshot
             .settings
             .custom
             .as_ref()
             .and_then(|custom| custom.credential_ref.clone());
+        if self.active_connection == ActiveConnection::Custom
+            && old_credential.is_none()
+            && self.credential_edit == CredentialEdit::Keep
+        {
+            self.message = Some(
+                "APIキーが未登録です。「登録」から入力し、「保存して適用」を押してください。"
+                    .to_owned(),
+            );
+            return;
+        }
+        let expected_revision = self.snapshot.settings.revision;
+        if self.credential_edit == CredentialEdit::Delete
+            && old_credential.is_some()
+            && !delete_confirmed
+        {
+            self.pending_confirmation = Some(PendingConfirmation::DeleteKey(target));
+            return;
+        }
+        if delete_confirmed {
+            self.pending_confirmation = None;
+        }
         let result = match self.credential_edit {
             CredentialEdit::Replace => {
                 let Some(inputs) = &self.inputs else { return };
                 let secret = value(&inputs.custom_api_key, cx);
                 if secret.is_empty() {
-                    self.message = Some(
-                        "新しいAPI keyを入力するか、「変更しない」を選択してください。".to_owned(),
-                    );
+                    self.message = Some("新しいAPIキーを入力してください。".to_owned());
                     return;
                 }
                 let Some(custom) = proposed.custom.as_mut() else {
@@ -444,6 +700,7 @@ impl AiSettingsPage {
                 if let Some(target) = target {
                     self.save_then_leave = Some((operation, target));
                 }
+                self.pending_confirmation = None;
             }
             Err(error) => self.message = Some(admission_message(error)),
         }
@@ -453,6 +710,7 @@ impl AiSettingsPage {
         &mut self,
         window: &mut Window,
         cx: &mut Context<EditorView>,
+        theme: Theme,
     ) -> impl IntoElement {
         self.ensure_inputs(window, cx);
         let editable = self.snapshot.ownership == OwnershipState::Owned
@@ -468,28 +726,40 @@ impl AiSettingsPage {
         let dirty = self.is_dirty(cx);
         let view = cx.entity();
         let recover = Button::new("ai-settings-retry-open")
-            .label("AI状態を再確認")
+            .label(if self.snapshot.recovery_required {
+                "設定の復旧を再試行"
+            } else {
+                "AI状態を再確認"
+            })
             .small()
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| view.ai_settings.activate(cx));
             });
-        let status = self.status_element();
         let mut body = div()
-            .id("ai-settings-page")
+            .id("ai-settings-page-content")
             .w_full()
-            .max_w(px(760.0))
-            .px(px(32.0))
-            .py(px(28.0))
+            .max_w(px(948.0))
+            .px(px(38.0))
+            .py(px(29.0))
             .flex()
             .flex_col()
             .gap_4()
             .child(
-                div()
-                    .text_size(px(22.0))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("AI"),
+                div().flex().items_center().justify_between().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(27.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("AI設定"),
+                        )
+                        .child("使うAIを選び、接続を確認します。"),
+                ),
             )
-            .child(status);
+            .child(self.current_connection_section(theme, cx));
         if matches!(
             self.snapshot.ownership,
             OwnershipState::Unknown | OwnershipState::OwnedElsewhere | OwnershipState::Unavailable
@@ -499,11 +769,46 @@ impl AiSettingsPage {
         }
         if ready {
             body = body
-                .child(self.connection_section(cx, editable))
-                .child(self.chatgpt_section(cx, dirty, editable, window))
-                .child(self.custom_section(cx, dirty, editable))
-                .child(self.probe_section(cx, dirty))
-                .child(self.save_section(window, cx, dirty, editable));
+                .child(
+                    div()
+                        .id("ai-settings-draft-heading")
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("使うAIの設定"),
+                                )
+                                .child(self.draft_badge(theme, dirty)),
+                        )
+                        .child(if dirty {
+                            if self.active_connection != self.snapshot.settings.active_connection {
+                                "接続方法はまだ切り替わっていません。「保存して適用」で反映します。"
+                            } else {
+                                "変更は「保存して適用」を押した後に有効になります。"
+                            }
+                        } else if self.snapshot.settings.revision == 0 {
+                            "接続方法を選び、必要な項目を設定してください。"
+                        } else {
+                            "選択した接続方法の設定を確認できます。"
+                        }),
+                )
+                .child(self.connection_section(cx, dirty, editable, theme));
+            if self.active_connection == ActiveConnection::ChatGpt {
+                body = body.child(self.chatgpt_section(cx, dirty, editable, window, theme));
+            } else {
+                body = body.child(self.custom_section(cx, dirty, editable, theme));
+            }
+            body = body.child(self.probe_section(cx, dirty, theme));
+            body = body.child(self.diagnostics_toggle_section(theme, cx));
         } else if self.snapshot.ownership == OwnershipState::Owned
             && !self.snapshot.recovery_required
         {
@@ -521,17 +826,524 @@ impl AiSettingsPage {
                     .child(message.clone()),
             );
         }
-        let _ = window;
-        body
+        if let Some(next) = self.pending_connection_switch {
+            body = body.child(self.connection_switch_confirmation(next, window, cx, theme));
+        }
+        if let Some(confirmation) = self.pending_confirmation {
+            body = body.child(self.action_confirmation(confirmation, window, cx, theme));
+        }
+        let scroll = div()
+            .id("ai-settings-scroll-area")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .child(body);
+        let savebar = ready.then(|| self.save_section(window, cx, dirty, editable, theme));
+        div()
+            .id("ai-settings-page")
+            .size_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(scroll)
+            .children(savebar)
     }
 
-    fn status_element(&self) -> impl IntoElement {
-        let ownership = match self.snapshot.ownership {
-            OwnershipState::Unknown => "AIサービス状態を確認しています。",
-            OwnershipState::Owned => "このHaneがAI runtimeを管理しています。",
-            OwnershipState::OwnedElsewhere => "AIは別のHaneプロセスで使用中です。",
-            OwnershipState::Unavailable => "AI状態を読み込めません。",
+    fn current_connection_section(
+        &self,
+        theme: Theme,
+        cx: &mut Context<EditorView>,
+    ) -> impl IntoElement {
+        let applied = self.saved_configuration_is_applied();
+        let has_saved_settings = self.snapshot.settings.revision > 0;
+        let model = match self.snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => self
+                .snapshot
+                .settings
+                .chatgpt
+                .model_id
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("モデル未選択"),
+            ActiveConnection::Custom => self
+                .snapshot
+                .settings
+                .custom
+                .as_ref()
+                .map(|custom| custom.model_id.as_str())
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("モデル未選択"),
         };
+        let provider = match self.snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => "ChatGPT",
+            ActiveConnection::Custom => self
+                .snapshot
+                .settings
+                .custom
+                .as_ref()
+                .map(|custom| custom.name.as_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("接続先未設定"),
+        };
+        let status_label = if !has_saved_settings {
+            "未設定"
+        } else if self.snapshot.settings.active_connection == ActiveConnection::Custom
+            && self
+                .snapshot
+                .settings
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.credential_ref.as_ref())
+                .is_none()
+        {
+            "APIキー未登録"
+        } else if !self.saved_connection_is_configured() {
+            "未設定"
+        } else if !applied {
+            if self.snapshot.runtime_state == hane_ai::RuntimeState::Failed {
+                "保存済み・未適用"
+            } else {
+                "適用状態を確認できません"
+            }
+        } else if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
+            && !matches!(self.snapshot.account, AccountState::SignedIn { .. })
+        {
+            "ログインが必要"
+        } else {
+            match self.snapshot.probe_status {
+                ProbeStatus::Succeeded if self.probe_summary().contains("で成功しました。") => {
+                    "応答確認済み"
+                }
+                ProbeStatus::Failed(_) | ProbeStatus::TimedOut | ProbeStatus::Isolated => {
+                    "応答確認に失敗"
+                }
+                ProbeStatus::Running => "応答を確認中",
+                _ => "応答は未確認",
+            }
+        };
+        let is_dark = theme.editor_background < 0x888888;
+        let (badge_background, badge_foreground) = match status_label {
+            "応答確認済み" => {
+                if is_dark {
+                    (0x223a33, 0xa2ddc5)
+                } else {
+                    (0xe0f2e8, 0x1c6843)
+                }
+            }
+            "ログインが必要" | "APIキー未登録" | "未設定" | "応答は未確認" => {
+                if is_dark {
+                    (0x3b3225, 0xf1d094)
+                } else {
+                    (0xfff0d3, 0x744d0c)
+                }
+            }
+            "応答確認に失敗" | "保存済み・未適用" => {
+                if is_dark {
+                    (0x412b31, 0xffb2b5)
+                } else {
+                    (0xfbe4e5, 0x9b2832)
+                }
+            }
+            _ => (theme.sidebar_active_background, theme.foreground),
+        };
+        let view = cx.entity();
+        let retry_apply = Button::new("ai-settings-retry-apply")
+            .label("適用を再試行")
+            .small()
+            .disabled(
+                self.snapshot.ownership != OwnershipState::Owned
+                    || self.snapshot.busy.is_some()
+                    || self.snapshot.recovery_required
+                    || self.is_dirty(cx),
+            )
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    if let Some(service) = &view.ai_settings.service
+                        && let Err(error) = service.try_submit(AiCommand::Restart)
+                    {
+                        view.ai_settings.message = Some(admission_message(error));
+                        cx.notify();
+                    }
+                });
+            });
+        let runtime_needs_retry = !applied
+            && self.saved_connection_is_configured()
+            && (self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
+                || self
+                    .snapshot
+                    .settings
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.credential_ref.as_ref())
+                    .is_some())
+            && self.snapshot.ownership == OwnershipState::Owned
+            && !self.snapshot.recovery_required;
+        let saved_note = if has_saved_settings && !applied {
+            Some("現在有効な接続設定は確認できません。下の項目は保存済みの値です。")
+        } else {
+            None
+        };
+        let fields = if has_saved_settings {
+            let method_label = if applied {
+                "接続方法"
+            } else {
+                "保存済みの接続方法"
+            };
+            let provider_label = if applied {
+                "接続先"
+            } else {
+                "保存済みの接続先"
+            };
+            let model_label = if applied {
+                "モデル"
+            } else {
+                "保存済みのモデル"
+            };
+            div()
+                .id("ai-current-values")
+                .flex()
+                .flex_wrap()
+                .gap_4()
+                .child(current_value_cell(
+                    method_label,
+                    connection_name(self.snapshot.settings.active_connection),
+                ))
+                .child(current_value_cell(provider_label, provider))
+                .child(current_value_cell(model_label, model))
+                .into_any_element()
+        } else {
+            div()
+                .id("ai-current-empty")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(17.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("AI接続はまだ設定されていません"),
+                )
+                .child("下で接続方法を選び、必要な項目を設定してください。")
+                .into_any_element()
+        };
+        let status = div()
+            .id("ai-runtime-status")
+            .debug_selector(|| "ai-runtime-status".to_owned())
+            .w_full()
+            .px(px(20.0))
+            .py(px(17.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.code_background))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("現在有効な設定"),
+                    )
+                    .child(
+                        div()
+                            .px(px(9.0))
+                            .py(px(3.0))
+                            .rounded_sm()
+                            .bg(rgb(badge_background))
+                            .text_color(rgb(badge_foreground))
+                            .text_size(px(11.0))
+                            .child(status_label),
+                    ),
+            )
+            .children(saved_note)
+            .child(fields)
+            .child(self.current_auth_summary())
+            .child(self.probe_summary())
+            .child(self.current_next_step(applied))
+            .children(runtime_needs_retry.then_some(retry_apply));
+        div()
+            .id("ai-current-connection-card")
+            .debug_selector(|| "ai-current-connection-card".to_owned())
+            .flex()
+            .flex_col()
+            .child(status)
+    }
+
+    fn draft_badge(&self, theme: Theme, dirty: bool) -> impl IntoElement {
+        let (label, background, foreground) = if dirty {
+            (
+                "未保存の変更",
+                theme.sidebar_active_background,
+                theme.sidebar_foreground,
+            )
+        } else if self.snapshot.settings.revision == 0 {
+            ("初回の設定", theme.code_background, theme.foreground)
+        } else {
+            ("変更なし", theme.code_background, theme.foreground)
+        };
+        div()
+            .id("ai-settings-draft-badge")
+            .px(px(9.0))
+            .py(px(3.0))
+            .rounded_sm()
+            .bg(rgb(background))
+            .text_color(rgb(foreground))
+            .text_size(px(11.0))
+            .child(label)
+    }
+
+    fn diagnostics_toggle_section(
+        &self,
+        theme: Theme,
+        cx: &mut Context<EditorView>,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let toggle = Button::new("ai-diagnostics-toggle")
+            .label(if self.diagnostics_open {
+                "診断情報を隠す"
+            } else {
+                "診断情報を表示"
+            })
+            .small()
+            .ghost()
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.diagnostics_open = !view.ai_settings.diagnostics_open;
+                    cx.notify();
+                });
+            });
+        let mut section = div()
+            .id("ai-diagnostics-toggle-section")
+            .w_full()
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(rgb(theme.table_border))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(toggle)
+            .child("接続できないときに確認します。");
+        if self.diagnostics_open {
+            section = section.child(self.diagnostics_section(theme));
+        }
+        section
+    }
+
+    fn saved_connection_description(&self) -> String {
+        match self.snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => {
+                let model = self
+                    .snapshot
+                    .settings
+                    .chatgpt
+                    .model_id
+                    .as_deref()
+                    .filter(|model| !model.trim().is_empty());
+                match model {
+                    Some(model) if self.snapshot.settings.revision > 0 => {
+                        format!("ChatGPT / Codex · {model}")
+                    }
+                    _ => "ChatGPT / Codex · モデル未選択".to_owned(),
+                }
+            }
+            ActiveConnection::Custom => match self.snapshot.settings.custom.as_ref() {
+                Some(custom)
+                    if self.snapshot.settings.revision > 0
+                        && !custom.name.trim().is_empty()
+                        && !custom.model_id.trim().is_empty()
+                        && !custom.base_url.trim().is_empty() =>
+                {
+                    format!("APIキー接続 · {} · {}", custom.name, custom.model_id)
+                }
+                _ => "APIキー接続 · 接続先を設定してください".to_owned(),
+            },
+        }
+    }
+
+    fn saved_connection_is_configured(&self) -> bool {
+        if self.snapshot.settings.revision == 0 {
+            return false;
+        }
+        match self.snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => self
+                .snapshot
+                .settings
+                .chatgpt
+                .model_id
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty()),
+            ActiveConnection::Custom => {
+                self.snapshot
+                    .settings
+                    .custom
+                    .as_ref()
+                    .is_some_and(|custom| {
+                        !custom.name.trim().is_empty()
+                            && !custom.base_url.trim().is_empty()
+                            && !custom.model_id.trim().is_empty()
+                    })
+            }
+        }
+    }
+
+    fn saved_configuration_is_applied(&self) -> bool {
+        self.saved_connection_is_configured()
+            && self.snapshot.ownership == OwnershipState::Owned
+            && self.snapshot.runtime_state == hane_ai::RuntimeState::Ready
+            && self.snapshot.configured_settings_generation
+                == self.snapshot.settings.settings_generation
+            && !self.snapshot.recovery_required
+            && matches!(
+                self.snapshot.persistence,
+                PersistenceState::Clean | PersistenceState::Saved
+            )
+    }
+
+    fn current_auth_summary(&self) -> String {
+        match self.snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => match &self.snapshot.account {
+                AccountState::SignedIn { .. } if self.snapshot.account_refresh_failed => {
+                    "ChatGPTアカウント: 直近の状態を確認できません。状態を更新してください。"
+                        .to_owned()
+                }
+                AccountState::SignedIn { .. } => {
+                    "ChatGPTアカウント: ログイン済み。応答確認の成功は別に確認してください。"
+                        .to_owned()
+                }
+                AccountState::SignedOut => {
+                    "ChatGPTアカウント: 未ログインです。ログイン後に応答を確認できます。".to_owned()
+                }
+                AccountState::ApiKey => "ChatGPTアカウント: OAuth状態を確認できません。".to_owned(),
+                AccountState::Unknown => {
+                    "ChatGPTアカウント: 状態は未確認です。ログインまたは状態更新を行ってください。"
+                        .to_owned()
+                }
+            },
+            ActiveConnection::Custom => {
+                let registered = self
+                    .snapshot
+                    .settings
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.credential_ref.as_ref())
+                    .is_some();
+                if registered {
+                    "APIキー: 登録済み（値は表示しません）。応答確認は未確認です。".to_owned()
+                } else {
+                    "APIキー: 未登録です。接続を使うにはキーを登録して保存・適用してください。"
+                        .to_owned()
+                }
+            }
+        }
+    }
+
+    fn current_next_step(&self, applied: bool) -> String {
+        match self.snapshot.persistence {
+            PersistenceState::NotCommitted => {
+                "設定の保存に失敗しました。入力内容を確認して保存を再試行してください。".to_owned()
+            }
+            PersistenceState::CleanupPending | PersistenceState::RecoveryRequired => {
+                "設定の復旧が必要です。上の「設定の復旧を再試行」を実行してください。".to_owned()
+            }
+            PersistenceState::DurabilityUnconfirmed => {
+                "保存結果を確定できません。AI接続を使わず、設定の復旧を再試行してください。"
+                    .to_owned()
+            }
+            _ if !self.saved_connection_is_configured() => {
+                "次の操作: 接続方式を選び、必要な項目を入力して「保存して適用」を押してください。"
+                    .to_owned()
+            }
+            _ if self.snapshot.settings.active_connection == ActiveConnection::Custom
+                && self
+                    .snapshot
+                    .settings
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.credential_ref.as_ref())
+                    .is_none() =>
+            {
+                "次の操作: APIキーの「登録」を押して入力し、「保存して適用」を押してください。"
+                    .to_owned()
+            }
+            _ if !applied => {
+                "保存済み設定の適用を確認できません。「適用を再試行」を押してください。".to_owned()
+            }
+            _ if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
+                && !matches!(self.snapshot.account, AccountState::SignedIn { .. }) =>
+            {
+                "次の操作: この接続を使うにはChatGPTにログインしてください。".to_owned()
+            }
+            _ => "必要なら「応答を確認」を実行してください。設定保存だけでは通信しません。"
+                .to_owned(),
+        }
+    }
+
+    fn probe_summary(&self) -> String {
+        match self.snapshot.probe_status {
+            ProbeStatus::NotRun => return "応答確認: まだ実行していません。".to_owned(),
+            ProbeStatus::Running => return "応答確認: 実行中です。".to_owned(),
+            ProbeStatus::Failed(code) => {
+                return format!("応答確認: {}", probe_error_message(code));
+            }
+            ProbeStatus::Canceled => return "応答確認: 取り消されました。".to_owned(),
+            ProbeStatus::TimedOut => {
+                return "応答確認: 時間切れです。設定と接続先を確認して再試行してください。"
+                    .to_owned();
+            }
+            ProbeStatus::Stale => {
+                return "応答確認: 設定変更により、前回結果は古くなっています。".to_owned();
+            }
+            ProbeStatus::Isolated => {
+                return "応答確認: 子プロセスの停止が未確認のため、AI操作を停止しています。"
+                    .to_owned();
+            }
+            ProbeStatus::Succeeded => {}
+        }
+        let Some(result) = self.snapshot.probe_result.as_ref() else {
+            return "応答確認: 成功結果を取得できません。再確認してください。".to_owned();
+        };
+        let matches = result.connection == self.snapshot.settings.active_connection
+            && result.settings_generation == self.snapshot.settings.settings_generation
+            && result.runtime_generation == self.snapshot.runtime_generation
+            && result.auth_epoch == self.snapshot.auth_epoch
+            && match result.connection {
+                ActiveConnection::ChatGpt => self
+                    .snapshot
+                    .settings
+                    .chatgpt
+                    .model_id
+                    .as_deref()
+                    .is_some_and(|model| model == result.model),
+                ActiveConnection::Custom => self
+                    .snapshot
+                    .settings
+                    .custom
+                    .as_ref()
+                    .is_some_and(|custom| custom.model_id == result.model),
+            };
+        if self.snapshot.probe_status == ProbeStatus::Succeeded && matches {
+            format!(
+                "応答確認: {} / {} で成功しました。",
+                connection_name(result.connection),
+                result.model
+            )
+        } else {
+            "応答確認: 設定または認証情報の変更により、前回結果は現在の接続には使えません。"
+                .to_owned()
+        }
+    }
+
+    fn diagnostics_section(&self, theme: Theme) -> impl IntoElement {
         let runtime = match self.snapshot.runtime_state {
             hane_ai::RuntimeState::Stopped => "停止中",
             hane_ai::RuntimeState::Starting => "起動中",
@@ -540,79 +1352,268 @@ impl AiSettingsPage {
             hane_ai::RuntimeState::Stopping => "停止中",
             hane_ai::RuntimeState::Failed => "エラー",
         };
-        let persistence = match self.snapshot.persistence {
-            PersistenceState::Clean => "保存済みの設定です。",
-            PersistenceState::NotCommitted => "設定は保存されていません。",
-            PersistenceState::Saved => "設定を保存しました。接続確認は実行していません。",
-            PersistenceState::CleanupPending => {
-                "設定は保存済みです。秘密情報の後処理が残っているため、復旧が必要です。"
-            }
-            PersistenceState::DurabilityUnconfirmed => {
-                "保存処理は反映された可能性がありますが、耐久性を確認できません。"
-            }
-            PersistenceState::RecoveryRequired => {
-                "復旧が必要です。復旧完了まで設定を変更できません。"
-            }
+        let ownership = match self.snapshot.ownership {
+            OwnershipState::Unknown => "確認中",
+            OwnershipState::Owned => "このHaneが管理中",
+            OwnershipState::OwnedElsewhere => "別のHaneが管理中",
+            OwnershipState::Unavailable => "利用不可",
         };
         div()
-            .id("ai-runtime-status")
+            .id("ai-diagnostics-section")
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
             .flex()
             .flex_col()
             .gap_1()
-            .child(ownership)
-            .child(format!("Runtime: {runtime} / App Serverの同梱版は未確認"))
-            .child(persistence)
+            .child("診断情報")
+            .child(format!("AI runtime: {runtime} / 所有状態: {ownership}"))
+            .child(format!(
+                "設定世代: 保存 {} / runtime適用 {} / runtime実行 {}",
+                self.snapshot.settings.settings_generation,
+                self.snapshot.configured_settings_generation,
+                self.snapshot.runtime_generation
+            ))
+            .child("Codex App Server同梱版と実行中バージョン: 画面からは確認できません")
+            .child("秘密のAPI key、token、auth URLは表示・記録しません")
     }
 
     fn connection_section(
         &mut self,
         cx: &mut Context<EditorView>,
+        _dirty: bool,
         editable: bool,
+        theme: Theme,
     ) -> impl IntoElement {
         let saved = self.snapshot.settings.active_connection;
         let draft = self.active_connection;
+        let applied = self.saved_configuration_is_applied();
         let view = cx.entity();
-        let chatgpt = Button::new("ai-connection-chatgpt")
-            .label("ChatGPT / Codex")
-            .selected(draft == ActiveConnection::ChatGpt)
+        let chatgpt_selected = draft == ActiveConnection::ChatGpt;
+        let chatgpt = Radio::new("ai-connection-chatgpt-radio")
+            .label("ChatGPTアカウント")
+            .accessibility_label("ChatGPTアカウント。ログインして接続します。")
+            .checked(chatgpt_selected)
             .disabled(!editable)
-            .on_click(move |_, _, app| {
+            .on_click(move |_, window, app| {
                 view.update(app, |view, cx| {
-                    view.ai_settings.active_connection = ActiveConnection::ChatGpt;
+                    view.ai_settings.request_connection_switch(
+                        ActiveConnection::ChatGpt,
+                        window,
+                        cx,
+                    );
                     cx.notify();
                 })
-            });
+            })
+            .w_full()
+            .min_w(px(250.0))
+            .px(px(14.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(if chatgpt_selected {
+                theme.link_foreground
+            } else {
+                theme.table_border
+            }))
+            .bg(rgb(if chatgpt_selected {
+                theme.sidebar_active_background
+            } else {
+                theme.code_background
+            }))
+            .child("ログインして接続します。ChatGPTアカウントを使います。")
+            .children(
+                (applied && saved == ActiveConnection::ChatGpt).then_some(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.link_foreground))
+                        .child("現在の接続方法"),
+                ),
+            );
         let view = cx.entity();
-        let custom = Button::new("ai-connection-custom")
-            .label("Custom Provider")
-            .selected(draft == ActiveConnection::Custom)
+        let custom_selected = draft == ActiveConnection::Custom;
+        let custom = Radio::new("ai-connection-custom-radio")
+            .label("APIキー")
+            .accessibility_label("APIキー。AIサービスのキーで接続します。")
+            .checked(custom_selected)
             .disabled(!editable)
-            .on_click(move |_, _, app| {
+            .on_click(move |_, window, app| {
                 view.update(app, |view, cx| {
-                    view.ai_settings.active_connection = ActiveConnection::Custom;
+                    view.ai_settings.request_connection_switch(
+                        ActiveConnection::Custom,
+                        window,
+                        cx,
+                    );
                     cx.notify();
                 })
-            });
+            })
+            .w_full()
+            .min_w(px(250.0))
+            .px(px(14.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(if custom_selected {
+                theme.link_foreground
+            } else {
+                theme.table_border
+            }))
+            .bg(rgb(if custom_selected {
+                theme.sidebar_active_background
+            } else {
+                theme.code_background
+            }))
+            .child("AIサービスのAPIキーを使います。OpenAIまたはその他の接続先を選べます。")
+            .children(
+                (applied && saved == ActiveConnection::Custom).then_some(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.link_foreground))
+                        .child("現在の接続方法"),
+                ),
+            );
         div()
             .id("ai-connection-section")
+            .debug_selector(|| "ai-connection-section".to_owned())
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap_3()
+            .child(
+                div()
+                    .id("ai-connection-chatgpt-wrapper")
+                    .debug_selector(|| "ai-connection-chatgpt".to_owned())
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .child(chatgpt),
+            )
+            .child(
+                div()
+                    .id("ai-connection-custom-wrapper")
+                    .debug_selector(|| "ai-connection-custom".to_owned())
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .child(custom),
+            )
+    }
+
+    fn connection_switch_confirmation(
+        &self,
+        next: ActiveConnection,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+        theme: Theme,
+    ) -> impl IntoElement {
+        let current = self.active_connection;
+        let view = cx.entity();
+        let discard = Button::new("ai-connection-switch-discard")
+            .label("入力を破棄して切り替える")
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings
+                        .discard_connection_draft(current, window, cx);
+                    view.ai_settings.active_connection = next;
+                    cx.notify();
+                });
+            });
+        let view = cx.entity();
+        let keep = Button::new("ai-connection-switch-cancel")
+            .label("編集を続ける")
+            .ghost()
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.pending_connection_switch = None;
+                    cx.notify();
+                });
+            });
+        let _ = window;
+        div()
+            .id("ai-connection-switch-confirmation")
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("AIの接続先"),
-            )
-            .child(format!("保存済み: {}", connection_name(saved)))
-            .child(format!("選択中: {}", connection_name(draft)))
-            .child(if draft == saved {
-                "選択中の接続は保存済みです。"
-            } else {
-                "選択中の接続は未保存です。画面下の「保存」で切り替わります。"
-            })
-            .child("ChatGPT / CodexはChatGPTアカウントで接続します。Custom Providerはここで設定したURL・model ID・API keyを使います。")
-            .child("このボタンを押すだけでは接続・ログインしません。保存後、選択した接続先がAIリクエストに使われます。接続確認は下の「固定入力で接続を確認」から別に実行します。")
-            .child(div().flex().gap_2().child(chatgpt).child(custom))
+            .child("この接続で未保存の入力があります。破棄して切り替えますか？保存済みの接続情報とログイン状態は残ります。")
+            .child(div().flex().gap_2().child(discard).child(keep))
+    }
+
+    fn action_confirmation(
+        &self,
+        confirmation: PendingConfirmation,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+        theme: Theme,
+    ) -> impl IntoElement {
+        let (title, message, confirm_label) = match confirmation {
+            PendingConfirmation::Logout => (
+                "ChatGPTからログアウトしますか？",
+                if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt {
+                    "現在の有効な接続はChatGPT / Codexです。ログアウト後は、再度ログインするまでこの接続を使えません。変更を破棄してもログイン状態は戻りません。"
+                } else {
+                    "現在のAPIキー接続には影響しません。ChatGPT / Codexを使うときは再度ログインが必要です。"
+                },
+                "ログアウト",
+            ),
+            PendingConfirmation::DeleteKey(_) => (
+                "APIキーを削除しますか？",
+                "保存して適用すると登録済みキーを削除します。この接続はキーを再登録するまで利用できません。",
+                "削除して適用",
+            ),
+        };
+        let view = cx.entity();
+        let confirm = Button::new("ai-confirmation-confirm")
+            .label(confirm_label)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    match confirmation {
+                        PendingConfirmation::Logout => {
+                            view.ai_settings.pending_confirmation = None;
+                            if let Some(service) = &view.ai_settings.service
+                                && let Err(error) = service.try_submit(AiCommand::Logout)
+                            {
+                                view.ai_settings.message = Some(admission_message(error));
+                            }
+                        }
+                        PendingConfirmation::DeleteKey(target) => {
+                            view.ai_settings.save_confirmed(window, cx, target);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        let view = cx.entity();
+        let cancel = Button::new("ai-confirmation-cancel")
+            .label("やめる")
+            .ghost()
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.pending_confirmation = None;
+                    cx.notify();
+                });
+            });
+        let _ = window;
+        div()
+            .id("ai-settings-confirmation")
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().font_weight(gpui::FontWeight::BOLD).child(title))
+            .child(message)
+            .child(div().flex().gap_2().child(confirm).child(cancel))
     }
 
     fn chatgpt_section(
@@ -621,6 +1622,7 @@ impl AiSettingsPage {
         dirty: bool,
         editable: bool,
         window: &Window,
+        theme: Theme,
     ) -> gpui::AnyElement {
         let Some(inputs) = &self.inputs else {
             return div().into_any_element();
@@ -643,47 +1645,72 @@ impl AiSettingsPage {
             AccountState::ApiKey => "API key接続".to_owned(),
         };
         let model_list = match &self.snapshot.model_list {
-            ModelListState::NotLoaded => "モデル一覧は未取得です。".to_owned(),
+            ModelListState::NotLoaded => {
+                "モデル一覧は未取得です。「モデル一覧を更新」から取得できます。".to_owned()
+            }
             ModelListState::Loading => "モデル一覧を取得しています…".to_owned(),
             ModelListState::Loaded(models) => format!("{}件のモデルを取得しました。", models.len()),
-            ModelListState::Failed(_) => {
-                "モデル一覧を取得できませんでした。保存済みモデルは変更していません。".to_owned()
-            }
+            ModelListState::Failed(error) => format!(
+                "モデル一覧を取得できませんでした（{}）。保存済みモデルは変更していません。再取得するか、下のモデルIDを手入力してください。",
+                model_list_error_message(error)
+            ),
         };
-        let view = cx.entity();
-        let mut models = div().flex().flex_col().gap_1();
         let draft_model = value(&inputs.chatgpt_model, cx);
-        if let ModelListState::Loaded(available) = &self.snapshot.model_list {
-            for model in available.iter().take(40) {
-                let value = model.model.clone();
-                let selected = value == draft_model;
-                let label = format!("{} ({})", model.display_name, model.model);
-                let selector = format!("ai-model-{}", models_hash(&value));
-                let view = view.clone();
-                let model_button = Button::new(selector.clone())
-                    .label(label)
-                    .small()
-                    .selected(selected)
-                    .disabled(!editable)
-                    .on_click(move |_, window, app| {
-                        view.update(app, |view, cx| {
-                            if let Some(inputs) = &view.ai_settings.inputs {
-                                inputs.chatgpt_model.update(cx, |state, cx| {
-                                    state.set_value(value.clone(), window, cx)
-                                });
-                            }
-                            cx.notify();
+        let model_items = match &self.snapshot.model_list {
+            ModelListState::Loaded(available) => available
+                .iter()
+                .take(40)
+                .map(|model| (model.model.clone(), model.display_name.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let model_items_available = !model_items.is_empty();
+        let selected_model_label = if draft_model.trim().is_empty() {
+            "モデルを選択".to_owned()
+        } else {
+            draft_model.clone()
+        };
+        let view_for_models = cx.entity();
+        let model_picker = Button::new("ai-chatgpt-model-picker")
+            .label(selected_model_label)
+            .disabled(!editable || !model_items_available)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (model, display_name) in &model_items {
+                    let model = model.clone();
+                    let label = format!("{display_name} ({model})");
+                    let item_id = format!("ai-model-{}", models_hash(&model));
+                    let selector = item_id;
+                    let current_model = draft_model.clone();
+                    let view = view_for_models.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            let selector = selector.clone();
+                            div()
+                                .id(selector.clone())
+                                .debug_selector(move || selector.clone())
+                                .px(px(5.0))
+                                .py(px(3.0))
+                                .child(label.clone())
                         })
-                    });
-                let debug_selector = selector.clone();
-                models = models.child(
-                    div()
-                        .id(format!("{selector}-wrapper"))
-                        .debug_selector(move || debug_selector.clone())
-                        .child(model_button),
-                );
-            }
-        }
+                        .checked(model == current_model)
+                        .on_click(move |_, window, app| {
+                            view.update(app, |view, cx| {
+                                if let Some(inputs) = &view.ai_settings.inputs {
+                                    inputs.chatgpt_model.update(cx, |state, cx| {
+                                        state.set_value(model.clone(), window, cx)
+                                    });
+                                }
+                                cx.notify();
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        let model_picker = div()
+            .id("ai-chatgpt-model-picker-wrapper")
+            .debug_selector(|| "ai-chatgpt-model-picker".to_owned())
+            .child(model_picker);
         let service = self.service.clone();
         let view_for_login = cx.entity();
         let login_label = match self.snapshot.login {
@@ -746,7 +1773,6 @@ impl AiSettingsPage {
                     });
                 }
             });
-        let service = self.service.clone();
         let view = cx.entity();
         let logout = Button::new("ai-chatgpt-logout")
             .label("ログアウト")
@@ -755,14 +1781,11 @@ impl AiSettingsPage {
                 !actions_allowed || !matches!(self.snapshot.account, AccountState::SignedIn { .. }),
             )
             .on_click(move |_, _, app| {
-                if let Some(service) = &service
-                    && let Err(error) = service.try_submit(AiCommand::Logout)
-                {
-                    view.update(app, |view, cx| {
-                        view.ai_settings.message = Some(admission_message(error));
-                        cx.notify();
-                    });
-                }
+                view.update(app, |view, cx| {
+                    view.ai_settings.pending_confirmation = Some(PendingConfirmation::Logout);
+                    view.ai_settings.message = None;
+                    cx.notify();
+                });
             });
         let service = self.service.clone();
         let view = cx.entity();
@@ -794,53 +1817,120 @@ impl AiSettingsPage {
         let _ = window;
         div()
             .id("ai-chatgpt-section")
+            .debug_selector(|| "ai-chatgpt-section".to_owned())
+            .w_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("ChatGPT / Codex"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("ChatGPTアカウントで接続"),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded_sm()
+                            .bg(rgb(theme.sidebar_active_background))
+                            .text_size(px(11.0))
+                            .child(account.clone()),
+                    ),
             )
-            .child(format!("アカウント: {account}"))
-            .child("この状態はChatGPT / Codexのログイン状況です。Custom ProviderのAPI key状態とは別です。")
-            .child(if active_saved {
-                ""
-            } else {
-                "ChatGPT / Codexは保存済み接続ではありません。上で選択して「保存」すると、ログイン操作が使えるようになります。"
-            })
             .child(
-                div().flex().gap_2().children(
-                    [
-                        Some(login),
-                        cancel_login,
-                        Some(refresh_account),
-                        Some(logout),
-                    ]
-                    .into_iter()
-                    .flatten(),
-                ),
+                div()
+                    .id("ai-chatgpt-account-card")
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .rounded_sm()
+                    .bg(rgb(theme.code_background))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().font_weight(gpui::FontWeight::MEDIUM).child(match &self.snapshot.account {
+                        AccountState::SignedIn { email, .. } => email.clone().unwrap_or_else(|| "ChatGPTにログイン済み".to_owned()),
+                        AccountState::SignedOut => "ChatGPTにログインしてください".to_owned(),
+                        AccountState::ApiKey => "OAuthログイン状態を確認できません".to_owned(),
+                        AccountState::Unknown => "ChatGPTアカウントの状態は未確認です".to_owned(),
+                    }))
+                    .child("ChatGPTのログイン状態はAPIキー接続とは別に保持されます。"),
             )
-            .child(model_list)
             .child(
-                div().child(
-                    Input::new(&inputs.chatgpt_model)
-                        .aria_label("ChatGPT model ID")
-                        .disabled(
-                            !editable_field(
-                                self.snapshot.ownership,
-                                self.snapshot.recovery_required,
-                            ) || self.snapshot.busy.is_some(),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children(
+                                [Some(login), cancel_login, Some(refresh_account), Some(logout)]
+                                    .into_iter()
+                                    .flatten(),
+                            ),
+                    )
+                    .child(if active_saved {
+                        "保存済みのChatGPT接続にログインします。ログインだけでは応答確認を行いません。"
+                    } else {
+                        "ChatGPTを選んで「保存して適用」すると、この画面からログインできます。"
+                    }),
+            )
+            .child(
+                div()
+                    .id("ai-chatgpt-model-section")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(div().font_weight(gpui::FontWeight::BOLD).child("モデル"))
+                            .child(refresh_models),
+                    )
+                    .child(model_list)
+                    .child(model_picker)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("モデルID（一覧にないモデルを使う場合）")
+                            .child(
+                                Input::new(&inputs.chatgpt_model)
+                                    .aria_label("ChatGPT model ID")
+                                    .disabled(
+                                        !editable_field(
+                                            self.snapshot.ownership,
+                                            self.snapshot.recovery_required,
+                                        ) || self.snapshot.busy.is_some(),
+                                    ),
+                            ),
+                    )
+                    .children(model_stale.then_some(
+                        div().text_color(rgb(0xb54708)).child(
+                            "保存済みモデルは一覧で見つかりません。自動変更していません。IDを確認するか、一覧を更新してください。",
                         ),
-                ),
+                    ))
+                    .child("モデル一覧から選ぶか、下にモデルIDを入力してください。"),
             )
-            .child(if model_stale {
-                "保存済みモデルは一覧で見つかりません。自動変更はしていません。"
-            } else {
-                "モデル一覧から選択するか、model IDを入力してください。"
-            })
-            .child(models)
-            .child(refresh_models)
             .into_any_element()
     }
 
@@ -849,6 +1939,7 @@ impl AiSettingsPage {
         cx: &mut Context<EditorView>,
         dirty: bool,
         editable: bool,
+        theme: Theme,
     ) -> gpui::AnyElement {
         let Some(inputs) = &self.inputs else {
             return div().into_any_element();
@@ -858,30 +1949,57 @@ impl AiSettingsPage {
             .and_then(|custom| custom.credential_ref.as_ref())
             .is_some();
         let disabled = !editable || self.snapshot.busy.is_some();
+        let (_, draft_base_url, _) = self.custom_draft_values(inputs, cx);
+        let endpoint_changed =
+            endpoint_changed_with_registered_key(custom, &draft_base_url, self.credential_edit);
+        let endpoint_error = if self.custom_preset == CustomProviderPreset::Other
+            && !draft_base_url.trim().is_empty()
+        {
+            hane_ai::validate_base_url(&draft_base_url)
+                .err()
+                .map(base_url_validation_message)
+        } else {
+            None
+        };
+
         let view = cx.entity();
-        let keep_key = Button::new("ai-custom-key-keep")
-            .label(if registered {
-                "登録済みkeyを維持"
-            } else {
-                "keyを変更しない"
-            })
-            .small()
-            .selected(self.credential_edit == CredentialEdit::Keep)
+        let openai_preset = Button::new("ai-custom-service-openai")
+            .label("OpenAI")
+            .selected(self.custom_preset == CustomProviderPreset::OpenAi)
+            .disabled(disabled)
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.custom_preset = CustomProviderPreset::OpenAi;
+                    view.ai_settings.custom_details_open = false;
+                    cx.notify();
+                });
+            });
+        let view = cx.entity();
+        let other_preset = Button::new("ai-custom-service-other")
+            .label("その他の接続先")
+            .selected(self.custom_preset == CustomProviderPreset::Other)
+            .disabled(disabled)
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| {
-                    view.ai_settings.credential_edit = CredentialEdit::Keep;
-                    if let Some(input) = &view.ai_settings.inputs {
-                        set_value(&input.custom_api_key, "", window, cx);
+                    let saved = view.ai_settings.snapshot.settings.custom.as_ref();
+                    if let Some(saved) = saved
+                        && custom_settings_match_openai(&saved.name, &saved.base_url)
+                        && let Some(inputs) = &view.ai_settings.inputs
+                    {
+                        set_value(&inputs.custom_name, &saved.name, window, cx);
+                        set_value(&inputs.custom_base_url, &saved.base_url, window, cx);
                     }
+                    view.ai_settings.custom_preset = CustomProviderPreset::Other;
+                    view.ai_settings.custom_details_open = true;
                     cx.notify();
-                })
+                });
             });
+
         let view = cx.entity();
         let replace_key = Button::new("ai-custom-key-replace")
             .label(custom_key_action_label(registered))
             .small()
-            .selected(self.credential_edit == CredentialEdit::Replace)
-            .disabled(disabled)
+            .disabled(disabled || self.credential_edit == CredentialEdit::Delete)
             .on_click(move |_, _, app| {
                 view.update(app, |view, cx| {
                     view.ai_settings.credential_edit = CredentialEdit::Replace;
@@ -893,113 +2011,330 @@ impl AiSettingsPage {
             .debug_selector(|| "ai-custom-key-replace".to_owned())
             .child(replace_key);
         let view = cx.entity();
-        let delete_key = Button::new("ai-custom-key-delete")
-            .label("保存済みkeyを削除")
-            .small()
-            .selected(self.credential_edit == CredentialEdit::Delete)
-            .disabled(disabled || !registered)
-            .on_click(move |_, window, app| {
-                view.update(app, |view, cx| {
-                    view.ai_settings.credential_edit = CredentialEdit::Delete;
-                    if let Some(input) = &view.ai_settings.inputs {
-                        set_value(&input.custom_api_key, "", window, cx);
-                    }
-                    cx.notify();
-                })
-            });
-        let key_input = if self.credential_edit == CredentialEdit::Replace {
+        let delete_key = if registered && self.credential_edit != CredentialEdit::Delete {
             Some(
-                div()
-                    .id("ai-custom-api-key-input")
-                    .debug_selector(|| "ai-custom-api-key-input".to_owned())
-                    .child(
-                        Input::new(&inputs.custom_api_key)
-                            .aria_label("Custom Provider API key")
-                            .content_type(InputContentType::NewPassword)
-                            .disabled(disabled),
-                    ),
+                Button::new("ai-custom-key-delete")
+                    .label("削除")
+                    .small()
+                    .disabled(disabled)
+                    .on_click(move |_, window, app| {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.credential_edit = CredentialEdit::Delete;
+                            if let Some(input) = &view.ai_settings.inputs {
+                                set_value(&input.custom_api_key, "", window, cx);
+                            }
+                            cx.notify();
+                        });
+                    }),
             )
         } else {
             None
         };
-        div()
-            .id("ai-custom-section")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
+        let view = cx.entity();
+        let undo_delete = if self.credential_edit == CredentialEdit::Delete {
+            Some(
+                Button::new("ai-custom-key-undo-delete")
+                    .label("元に戻す")
+                    .small()
+                    .disabled(disabled)
+                    .on_click(move |_, window, app| {
+                        view.update(app, |view, cx| {
+                            view.ai_settings.credential_edit = CredentialEdit::Keep;
+                            if let Some(input) = &view.ai_settings.inputs {
+                                set_value(&input.custom_api_key, "", window, cx);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            )
+        } else {
+            None
+        };
+        let key_status = if self.credential_edit == CredentialEdit::Delete {
+            "削除予定"
+        } else if self.credential_edit == CredentialEdit::Replace {
+            "新しいキーを入力中"
+        } else if registered {
+            "登録済み"
+        } else {
+            "未登録"
+        };
+        let key_input = if self.credential_edit == CredentialEdit::Replace {
+            let view = cx.entity();
+            let cancel = div()
+                .id("ai-custom-key-cancel-wrapper")
+                .debug_selector(|| "ai-custom-key-cancel".to_owned())
+                .child(
+                    Button::new("ai-custom-key-cancel")
+                        .label("やめる")
+                        .small()
+                        .ghost()
+                        .disabled(disabled)
+                        .on_click(move |_, window, app| {
+                            view.update(app, |view, cx| {
+                                view.ai_settings.credential_edit = CredentialEdit::Keep;
+                                if let Some(input) = &view.ai_settings.inputs {
+                                    set_value(&input.custom_api_key, "", window, cx);
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            Some(
                 div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("Custom Provider"),
+                    .id("ai-custom-api-key-input")
+                    .debug_selector(|| "ai-custom-api-key-input".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child("新しいAPIキー")
+                            .child(cancel),
+                    )
+                    .child(
+                        Input::new(&inputs.custom_api_key)
+                            .aria_label("Custom Provider APIキー")
+                            .content_type(InputContentType::NewPassword)
+                            .disabled(disabled),
+                    )
+                    .child("キーは伏字で入力され、保存後は画面に表示しません。"),
             )
-            .child("ここでは接続先URL・model ID・API keyを設定します。ChatGPT / Codexのログイン情報とは別に保存します。")
-            .child(
-                div().child(
-                    Input::new(&inputs.custom_name)
-                        .aria_label("Provider name")
-                        .disabled(disabled),
-                ),
-            )
-            .child(
-                div().child(
-                    Input::new(&inputs.custom_base_url)
-                        .aria_label("Provider base URL")
-                        .disabled(disabled),
-                ),
-            )
-            .child(
-                div().child(
-                    Input::new(&inputs.custom_model)
-                        .aria_label("Custom model ID")
-                        .disabled(disabled),
-                ),
-            )
-            .child(if registered {
-                "API key: 登録済み（値は表示しません）"
+        } else {
+            None
+        };
+
+        let details_open = self.custom_details_open;
+        let view = cx.entity();
+        let details_toggle_button = Button::new("ai-custom-details-toggle-button")
+            .label(if details_open {
+                "接続先の詳細を隠す"
+            } else if self.custom_preset == CustomProviderPreset::Other {
+                "接続先の詳細（接続名・URLが必要です）"
             } else {
-                "API key: 未登録"
+                "接続先の詳細"
             })
+            .small()
+            .ghost()
+            .disabled(disabled)
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.custom_details_open = !view.ai_settings.custom_details_open;
+                    cx.notify();
+                });
+            });
+        let details_toggle = div()
+            .id("ai-custom-details-toggle-wrapper")
+            .debug_selector(|| "ai-custom-details-toggle".to_owned())
+            .child(details_toggle_button);
+        let provider_details = if details_open {
+            if self.custom_preset == CustomProviderPreset::OpenAi {
+                div()
+                    .id("ai-custom-openai-details")
+                    .debug_selector(|| "ai-custom-openai-details".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("接続先URL")
+                    .child(OPENAI_PROVIDER_URL)
+                    .into_any_element()
+            } else {
+                div()
+                    .id("ai-custom-provider-details")
+                    .debug_selector(|| "ai-custom-provider-details".to_owned())
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(250.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("接続名")
+                            .child(
+                                Input::new(&inputs.custom_name)
+                                    .aria_label("Provider name")
+                                    .disabled(disabled),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(250.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("接続先URL")
+                            .child(
+                                Input::new(&inputs.custom_base_url)
+                                    .aria_label("Provider base URL")
+                                    .disabled(disabled),
+                            )
+                            .child("HTTPSを使用してください。HTTPはlocalhost・127.0.0.1・::1での開発に限られます。URLに認証情報を含めないでください.")
+                            .children(endpoint_error.map(|message| {
+                                div()
+                                    .id("ai-custom-base-url-error")
+                                    .text_color(rgb(0xb42318))
+                                    .child(message)
+                            })),
+                    )
+                    .into_any_element()
+            }
+        } else {
+            div().into_any_element()
+        };
+
+        let key_actions = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children((self.credential_edit != CredentialEdit::Replace).then_some(replace_key))
+            .children(delete_key)
+            .children(undo_delete);
+        let key_row = div()
+            .id("ai-custom-key-row")
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_3()
             .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .child(keep_key)
-                    .child(replace_key)
-                    .child(delete_key),
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().font_weight(gpui::FontWeight::BOLD).child("APIキー"))
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(2.0))
+                                    .rounded_sm()
+                                    .bg(rgb(theme.sidebar_active_background))
+                                    .text_size(px(11.0))
+                                    .child(key_status),
+                            ),
+                    )
+                    .child(if registered {
+                        "登録済みのキーは表示しません。"
+                    } else {
+                        "この接続先で使うAPIキーを登録してください。"
+                    }),
             )
-            .children(key_input)
-            .child(custom_key_guidance(self.credential_edit, registered))
+            .child(key_actions);
+
+        let service_model = div()
+            .flex()
+            .flex_wrap()
+            .gap_3()
             .child(
-                if self.snapshot.settings.active_connection == ActiveConnection::Custom && dirty {
-                    "変更はまだ保存されていません。"
-                } else {
-                    "Custom設定はChatGPT接続と別に保持されます。"
-                },
+                div()
+                    .id("ai-custom-service-choice")
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("AIサービス")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(openai_preset)
+                            .child(other_preset),
+                    )
+                    .child(if self.custom_preset == CustomProviderPreset::OpenAi {
+                        "OpenAIの接続先を自動で設定します。"
+                    } else {
+                        "接続名とURLは「接続先の詳細」で指定します。"
+                    }),
             )
+            .child(
+                div()
+                    .id("ai-custom-model-field")
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("モデルID")
+                    .child(
+                        Input::new(&inputs.custom_model)
+                            .aria_label("Custom model ID")
+                            .disabled(disabled),
+                    )
+                    .child("利用するモデルIDを入力してください。"),
+            );
+
+        div()
+            .id("ai-custom-section")
+            .debug_selector(|| "ai-custom-section".to_owned())
+            .w_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("APIキーで接続"),
+                    )
+                    .child("サービス側のAPI利用料金がかかる場合があります。"),
+            )
+            .child(service_model)
+            .child(key_row)
+            .children(key_input)
+            .children(endpoint_changed.then_some(
+                div()
+                    .id("ai-custom-key-endpoint-changed")
+                    .text_color(rgb(0xb54708))
+                    .child("接続先が変わりました。この接続先に合うAPIキーを登録してください。登録済みキーは別の接続先へ自動では引き継ぎません。"),
+            ))
+            .child(details_toggle)
+            .child(provider_details)
+            .child(custom_key_guidance(self.credential_edit, registered))
+            .child(if self.snapshot.settings.active_connection == ActiveConnection::Custom && dirty {
+                "未保存の変更です。保存・適用するまでは、現在の接続状態は変わりません。"
+            } else {
+                "APIキー接続は、ChatGPTアカウントのログイン状態とは別に保存されます。"
+            })
             .into_any_element()
     }
 
-    fn probe_section(&self, cx: &mut Context<EditorView>, dirty: bool) -> impl IntoElement {
-        let result = match &self.snapshot.probe_status {
-            ProbeStatus::NotRun => "まだ接続確認を実行していません。",
-            ProbeStatus::Running => "固定入力で応答を確認しています…",
-            ProbeStatus::Succeeded => "最後の固定入力確認は成功しました。",
-            ProbeStatus::Canceled => "接続確認を取り消しました。",
-            ProbeStatus::TimedOut => "接続確認が時間切れになりました。",
-            ProbeStatus::Stale => "前回結果は設定変更により古くなっています。",
-            ProbeStatus::Isolated => "子プロセスの停止が未確認のため、AI操作を隔離しています。",
-            ProbeStatus::Failed(_) => "接続確認に失敗しました。別Providerへの再送はしていません。",
+    fn probe_section(
+        &self,
+        cx: &mut Context<EditorView>,
+        dirty: bool,
+        theme: Theme,
+    ) -> impl IntoElement {
+        let result = self.probe_summary();
+        let probe_disabled_reason = self.probe_disabled_reason(dirty);
+        let probe_enabled = probe_disabled_reason.is_none();
+        let target = if self.saved_configuration_is_applied() {
+            self.saved_connection_description()
+        } else {
+            "保存済み設定は適用状態を確認できません".to_owned()
         };
-        let probe_enabled = T00_PROBE_GATE_PASSED
-            && self.service.is_some()
-            && !dirty
-            && self.snapshot.busy.is_none()
-            && self.snapshot.ownership == OwnershipState::Owned
-            && !self.snapshot.recovery_required
-            && matches!(
-                self.snapshot.persistence,
-                PersistenceState::Clean | PersistenceState::Saved
-            );
         let (action, action_selector) =
             if let Some((operation, ServiceBusyReason::Probe)) = self.snapshot.busy {
                 let service = self.service.clone();
@@ -1024,11 +2359,7 @@ impl AiSettingsPage {
                 let view = cx.entity();
                 (
                     Button::new("ai-probe-run")
-                        .label(if T00_PROBE_GATE_PASSED {
-                            "固定入力で接続を確認"
-                        } else {
-                            "接続確認は安全性の確認後に利用できます"
-                        })
+                        .label("応答を確認")
                         .disabled(!probe_enabled)
                         .on_click(move |_, _, app| {
                             if let Some(service) = &service
@@ -1047,23 +2378,131 @@ impl AiSettingsPage {
             .id(format!("{action_selector}-wrapper"))
             .debug_selector(|| action_selector.to_owned())
             .child(action);
+        let response_is_current = self.probe_summary().contains("で成功しました。");
+        let response = if response_is_current {
+            self.snapshot.probe_result.as_ref().map_or_else(
+                || div().into_any_element(),
+                |result| {
+                    div()
+                        .id("ai-probe-plain-response")
+                        .text_color(rgb(theme.link_foreground))
+                        .child(format!(
+                            "{} / {}: {}",
+                            connection_name(result.connection),
+                            result.model,
+                            result.text
+                        ))
+                        .into_any_element()
+                },
+            )
+        } else {
+            div().into_any_element()
+        };
         div()
             .id("ai-probe-section")
+            .w_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
             .flex()
             .flex_col()
-            .gap_2()
-            .child(div().font_weight(gpui::FontWeight::BOLD).child("接続・応答確認"))
-            .child("固定入力のみを送ります。現在の文書や選択範囲は添付しません。利用料金や利用枠を消費する場合があります。")
-            .child(result)
-            .child(if let Some(result) = &self.snapshot.probe_result {
-                div().id("ai-probe-plain-response").child(result.text.clone()).into_any_element()
-            } else { div().into_any_element() })
-            .child(action)
-            .child(if dirty {
-                "先にAI設定を保存するか、変更を破棄してください。"
-            } else {
-                ""
-            })
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("応答を確認"),
+                    )
+                    .child("保存・適用済みの設定が対象です"),
+            )
+            .child(
+                div()
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .rounded_sm()
+                    .bg(rgb(theme.code_background))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(250.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().font_weight(gpui::FontWeight::MEDIUM).child(target))
+                            .child("短いテストメッセージを送信します。文書は送信しません。")
+                            .child("利用料金・利用枠を消費する場合があります。"),
+                    )
+                    .child(action),
+            )
+            .child(
+                div()
+                    .id("ai-probe-result")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(result)
+                    .child(response),
+            )
+            .children(probe_disabled_reason)
+    }
+
+    fn probe_disabled_reason(&self, dirty: bool) -> Option<String> {
+        if !T00_PROBE_GATE_PASSED {
+            Some("安全プロファイルの確認が終わるまで応答確認は使えません。".to_owned())
+        } else if self.service.is_none() {
+            Some("AIサービスを利用できません。Markdown編集は引き続き利用できます。".to_owned())
+        } else if dirty {
+            Some(
+                "未保存の変更があります。先に「保存して適用」するか、「変更を破棄」してください。"
+                    .to_owned(),
+            )
+        } else if self.snapshot.ownership != OwnershipState::Owned {
+            Some("このHaneがAI runtimeを管理できないため、応答確認は使えません。状態を再確認してください。".to_owned())
+        } else if self.snapshot.recovery_required
+            || !matches!(
+                self.snapshot.persistence,
+                PersistenceState::Clean | PersistenceState::Saved
+            )
+        {
+            Some("設定の保存・復旧が必要です。上の案内に従ってください。".to_owned())
+        } else if !self.saved_connection_is_configured() {
+            Some("先に接続設定とモデルを入力し、「保存して適用」してください。".to_owned())
+        } else if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
+            && !matches!(self.snapshot.account, AccountState::SignedIn { .. })
+        {
+            Some("ChatGPTにログインしてから応答を確認してください。".to_owned())
+        } else if self.snapshot.settings.active_connection == ActiveConnection::Custom
+            && self
+                .snapshot
+                .settings
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.credential_ref.as_ref())
+                .is_none()
+        {
+            Some("APIキーの「登録」を押して入力し、「保存して適用」を押してください。".to_owned())
+        } else if !self.saved_configuration_is_applied() {
+            Some(
+                "保存済み設定の適用を確認できません。「適用を再試行」を押してください。".to_owned(),
+            )
+        } else if self.snapshot.busy.is_some() {
+            Some("AIの別操作が進行中です。完了後に再試行してください。".to_owned())
+        } else {
+            None
+        }
     }
 
     fn save_section(
@@ -1072,11 +2511,57 @@ impl AiSettingsPage {
         cx: &mut Context<EditorView>,
         dirty: bool,
         editable: bool,
+        theme: Theme,
     ) -> impl IntoElement {
+        let endpoint_changed = self.inputs.as_ref().is_some_and(|inputs| {
+            let (_, base_url, _) = self.custom_draft_values(inputs, cx);
+            endpoint_changed_with_registered_key(
+                self.snapshot.settings.custom.as_ref(),
+                &base_url,
+                self.credential_edit,
+            )
+        });
+        let replace_is_empty = self.credential_edit == CredentialEdit::Replace
+            && self
+                .inputs
+                .as_ref()
+                .is_some_and(|inputs| value(&inputs.custom_api_key, cx).is_empty());
+        let key_is_missing = self.active_connection == ActiveConnection::Custom
+            && self
+                .snapshot
+                .settings
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.credential_ref.as_ref())
+                .is_none()
+            && self.credential_edit == CredentialEdit::Keep;
+        let disabled_reason = if endpoint_changed {
+            "接続先変更後は、新しいkeyの登録またはkey削除が必要です。"
+        } else if replace_is_empty {
+            "新しいAPIキーを入力してから保存してください。"
+        } else if key_is_missing {
+            "APIキーを登録してから保存してください。"
+        } else if !dirty {
+            "保存する変更はありません。"
+        } else if !editable {
+            "AI操作中または復旧中のため、いまは設定を変更できません。"
+        } else {
+            ""
+        };
         let view = cx.entity();
+        let save_label = if self
+            .snapshot
+            .busy
+            .is_some_and(|(_, reason)| reason == ServiceBusyReason::Saving)
+        {
+            "保存・適用中…"
+        } else {
+            "保存して適用"
+        };
         let save = Button::new("ai-settings-save")
-            .label("保存")
-            .disabled(!dirty || !editable)
+            .label(save_label)
+            .primary()
+            .disabled(!dirty || !editable || endpoint_changed || replace_is_empty || key_is_missing)
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.ai_settings.save(window, cx, None))
             });
@@ -1091,17 +2576,96 @@ impl AiSettingsPage {
                 })
             });
         let _ = window;
-        div()
-            .id("ai-settings-save-section")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(if dirty {
-                "未保存の変更があります。"
+        let (state_label, state_note) = if let Some((_, reason)) = self.snapshot.busy {
+            match reason {
+                ServiceBusyReason::Saving => (
+                    "保存・適用中です",
+                    "完了後に、適用された接続の状態を更新します。",
+                ),
+                ServiceBusyReason::Recovering => (
+                    "設定を復旧しています",
+                    "復旧が終わるまで設定の変更や応答確認はできません。",
+                ),
+                ServiceBusyReason::Login => (
+                    "ChatGPTへログイン中です",
+                    "ブラウザーでの認証が終わるまで、この画面を開いたままにできます。",
+                ),
+                ServiceBusyReason::Account => (
+                    "アカウント状態を更新中です",
+                    "完了するとChatGPTのログイン状態を表示します。",
+                ),
+                ServiceBusyReason::Models => (
+                    "モデル一覧を取得中です",
+                    "取得後に利用するモデルを選べます。",
+                ),
+                ServiceBusyReason::Probe => (
+                    "応答を確認中です",
+                    "保存済みの接続へ短いテストメッセージを送信しています。",
+                ),
+            }
+        } else if self.snapshot.persistence == PersistenceState::NotCommitted {
+            (
+                "設定を保存できませんでした",
+                "入力内容を確認して、もう一度「保存して適用」を押してください。",
+            )
+        } else if dirty {
+            (
+                "未保存の変更があります",
+                if disabled_reason.is_empty() {
+                    "保存するまでは、現在有効な接続設定は変わりません。"
+                } else {
+                    disabled_reason
+                },
+            )
+        } else if self.saved_connection_is_configured() && !self.saved_configuration_is_applied() {
+            if self.snapshot.runtime_state == hane_ai::RuntimeState::Failed {
+                (
+                    "保存した設定を適用できませんでした",
+                    "現在利用できる接続先は確認できません。「適用を再試行」から再起動できます。",
+                )
             } else {
-                "すべての変更は保存済みです。"
-            })
-            .child(div().flex().gap_2().child(save).child(discard))
+                (
+                    "保存済み・適用状態を確認中です",
+                    "保存済みの接続先とモデルは上部に表示しています。",
+                )
+            }
+        } else if self.snapshot.settings.revision == 0 {
+            (
+                "初回設定が必要です",
+                "接続方法と必要な項目を選び、「保存して適用」を押してください。",
+            )
+        } else if !self.saved_connection_is_configured() {
+            (
+                "設定が未完成です",
+                "必要な項目を入力し、「保存して適用」を押してください。",
+            )
+        } else {
+            ("設定は保存・適用済みです", disabled_reason)
+        };
+        div()
+            .id("ai-settings-savebar")
+            .debug_selector(|| "ai-settings-savebar".to_owned())
+            .w_full()
+            .flex_none()
+            .px(px(24.0))
+            .py(px(12.0))
+            .border_t_1()
+            .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.sidebar_background))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .id("ai-settings-save-state")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(state_label)
+                    .child(state_note),
+            )
+            .child(div().flex().gap_2().child(discard).child(save))
     }
 
     fn leave_confirmation(
@@ -1158,7 +2722,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        self.ai_settings.render(window, cx)
+        self.ai_settings.render(window, cx, self.theme)
     }
 }
 
@@ -1179,6 +2743,75 @@ fn editable_field(ownership: OwnershipState, recovery_required: bool) -> bool {
     ownership == OwnershipState::Owned && !recovery_required
 }
 
+fn base_url_validation_message(error: hane_ai::CustomProviderConfigError) -> &'static str {
+    match error {
+        hane_ai::CustomProviderConfigError::NonHttpsBaseUrl => {
+            "接続先URLはHTTPSが必要です。HTTPはlocalhost・127.0.0.1・::1での開発に限られます。"
+        }
+        hane_ai::CustomProviderConfigError::CredentialInUrl => {
+            "URLにユーザー名やパスワードを含めないでください。"
+        }
+        hane_ai::CustomProviderConfigError::InvalidField("base_url") => {
+            "接続先URLに改行などの制御文字は使えません。"
+        }
+        hane_ai::CustomProviderConfigError::InvalidField(_) => "接続先URLを確認してください。",
+    }
+}
+
+fn model_list_error_message(error: &hane_ai::ModelListError) -> &'static str {
+    match error {
+        hane_ai::ModelListError::Rpc => "通信エラー",
+        hane_ai::ModelListError::InvalidResponse => "応答形式の不一致",
+        hane_ai::ModelListError::CursorLoop => "一覧のページ移動エラー",
+        hane_ai::ModelListError::TooManyPages | hane_ai::ModelListError::TooManyModels => {
+            "一覧が対応上限を超えました"
+        }
+    }
+}
+
+fn probe_error_message(error: ProbeErrorCode) -> &'static str {
+    match error {
+        ProbeErrorCode::InvalidConfiguration => "設定値を確認してください。",
+        ProbeErrorCode::AccountUnavailable => {
+            "ChatGPTアカウント状態を取得できません。状態更新または再ログインをお試しください。"
+        }
+        ProbeErrorCode::ModelUnavailable => "モデルを利用できません。モデルIDを確認してください。",
+        ProbeErrorCode::CredentialUnavailable => {
+            "APIキーを取得できません。登録状態を確認してください。"
+        }
+        ProbeErrorCode::OwnedElsewhere => "別のHaneプロセスがAI runtimeを使用しています。",
+        ProbeErrorCode::Busy => "別のAI処理が進行中です。完了後に再試行してください。",
+        ProbeErrorCode::RuntimeUnavailable => {
+            "AI runtimeを利用できません。runtimeを再起動して再試行してください。"
+        }
+        ProbeErrorCode::StaleGeneration => {
+            "設定が更新されています。最新の状態で再試行してください。"
+        }
+        ProbeErrorCode::Unauthorized | ProbeErrorCode::Forbidden => {
+            "認証に失敗しました。ChatGPTは再ログイン、APIキー接続はキーの確認を行ってください。"
+        }
+        ProbeErrorCode::RateLimited => "利用制限に達しました。時間をおいて再試行してください。",
+        ProbeErrorCode::Network => {
+            "接続に失敗しました。ネットワークと接続先URLを確認してください。"
+        }
+        ProbeErrorCode::TimedOut => {
+            "時間内に応答しませんでした。設定と接続先を確認して再試行してください。"
+        }
+        ProbeErrorCode::ProtocolMismatch => "AIサービスの応答形式を確認できませんでした。",
+        ProbeErrorCode::NotificationOverflow => {
+            "処理結果の通知を確認できません。成功とは扱っていません。"
+        }
+        ProbeErrorCode::SafetyProfileUnsupported => {
+            "安全な応答確認を実行できません。このruntime設定では接続確認を止めています。"
+        }
+        ProbeErrorCode::ProviderFailed => {
+            "Providerが応答できませんでした。別の接続へ自動再送していません。"
+        }
+        ProbeErrorCode::Canceled => "応答確認を取り消しました。",
+        ProbeErrorCode::Isolated => "子プロセスの停止を確認できず、AI操作を停止しています。",
+    }
+}
+
 fn admission_message(error: AdmissionError) -> String {
     match error {
         AdmissionError::Busy => {
@@ -1192,6 +2825,22 @@ fn admission_message(error: AdmissionError) -> String {
         }
         AdmissionError::WrongOperation => "この操作は現在のAI処理に適用できません。".to_owned(),
     }
+}
+
+fn current_value_cell(label: &str, value: &str) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(150.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_size(px(11.0)).child(label.to_owned()))
+        .child(
+            div()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(value.to_owned()),
+        )
 }
 
 fn models_hash(value: &str) -> u64 {
@@ -1218,15 +2867,65 @@ mod tests {
             connection_name(ActiveConnection::ChatGpt),
             "ChatGPT / Codex"
         );
-        assert_eq!(connection_name(ActiveConnection::Custom), "Custom Provider");
-        assert_eq!(custom_key_action_label(false), "API keyを登録");
-        assert_eq!(custom_key_action_label(true), "API keyを置き換える");
-        assert!(custom_key_guidance(CredentialEdit::Keep, false).contains("画面下の「保存」"));
+        assert_eq!(connection_name(ActiveConnection::Custom), "APIキー接続");
+        assert_eq!(custom_key_action_label(false), "登録");
+        assert_eq!(custom_key_action_label(true), "変更");
+        assert!(custom_key_guidance(CredentialEdit::Keep, false).contains("「登録」を押す"));
         assert!(custom_key_guidance(CredentialEdit::Keep, false).contains("接続確認は別操作"));
         assert!(
-            custom_key_guidance(CredentialEdit::Replace, true).contains("保存だけでは接続確認")
+            custom_key_guidance(CredentialEdit::Replace, true)
+                .contains("保存・適用だけでは接続確認")
         );
-        assert!(custom_key_guidance(CredentialEdit::Delete, true).contains("「保存」で反映"));
+        assert!(
+            custom_key_guidance(CredentialEdit::Delete, true)
+                .contains("「保存して適用」を押した後に確定")
+        );
+    }
+
+    #[gpui::test]
+    fn ai_settings_show_only_the_selected_connection_and_keep_savebar_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            view.ai_settings.snapshot.settings.custom = Some(CustomConnectionSettings {
+                id: "custom".to_owned(),
+                name: "Test Provider".to_owned(),
+                base_url: "https://provider.example/v1".to_owned(),
+                model_id: "model-id".to_owned(),
+                credential_ref: Some(hane_ai::CredentialRef::from_persisted("credential-ref")),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("ai-chatgpt-section").is_some());
+        assert!(cx.debug_bounds("ai-custom-section").is_none());
+        assert!(cx.debug_bounds("ai-settings-savebar").is_some());
+
+        let api_key_connection = cx
+            .debug_bounds("ai-connection-custom")
+            .expect("API key connection selector is shown");
+        cx.simulate_click(api_key_connection.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("ai-chatgpt-section").is_none());
+        assert!(cx.debug_bounds("ai-custom-section").is_some());
+        assert!(cx.debug_bounds("ai-settings-savebar").is_some());
+        assert!(cx.debug_bounds("ai-custom-key-keep").is_none());
+        assert!(cx.debug_bounds("ai-custom-provider-details").is_none());
+        let details_button = cx
+            .debug_bounds("ai-custom-details-toggle")
+            .expect("collapsed connection details are discoverable");
+        cx.simulate_click(details_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("ai-custom-provider-details").is_some());
     }
 
     #[gpui::test]
@@ -1262,6 +2961,16 @@ mod tests {
         assert!(view.read_with(cx, |view, _| {
             view.ai_settings.credential_edit == CredentialEdit::Replace
         }));
+
+        let cancel_button = cx
+            .debug_bounds("ai-custom-key-cancel")
+            .expect("key entry has an explicit cancel action");
+        cx.simulate_click(cancel_button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("ai-custom-api-key-input").is_none());
+        assert!(view.read_with(cx, |view, _| {
+            view.ai_settings.credential_edit == CredentialEdit::Keep
+        }));
     }
 
     #[gpui::test]
@@ -1293,6 +3002,19 @@ mod tests {
             view.ai_settings.service = Some(handle.clone());
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
             view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            view.ai_settings.snapshot.settings.revision = 1;
+            view.ai_settings.snapshot.settings.settings_generation = 1;
+            view.ai_settings.snapshot.settings.active_connection = ActiveConnection::Custom;
+            view.ai_settings.snapshot.settings.custom = Some(CustomConnectionSettings {
+                id: "custom".to_owned(),
+                name: "Test Provider".to_owned(),
+                base_url: "https://provider.example/v1".to_owned(),
+                model_id: "model-id".to_owned(),
+                credential_ref: Some(hane_ai::CredentialRef::from_persisted("credential-ref")),
+            });
+            view.ai_settings.snapshot.runtime_state = hane_ai::RuntimeState::Ready;
+            view.ai_settings.snapshot.runtime_generation = 1;
+            view.ai_settings.snapshot.configured_settings_generation = 1;
             cx.notify();
         });
         cx.run_until_parked();
@@ -1357,9 +3079,14 @@ mod tests {
 
         let model_one_selector: &'static str =
             Box::leak(format!("ai-model-{}", models_hash("model-one")).into_boxed_str());
+        let picker = cx
+            .debug_bounds("ai-chatgpt-model-picker")
+            .expect("model selector is rendered");
+        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
         let model_one = cx
             .debug_bounds(model_one_selector)
-            .expect("first model button is rendered");
+            .expect("first model option is rendered in the selector");
         cx.simulate_click(model_one.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let first_draft = view.read_with(cx, |view, app| {
@@ -1377,9 +3104,14 @@ mod tests {
 
         let model_two_selector: &'static str =
             Box::leak(format!("ai-model-{}", models_hash("model-two")).into_boxed_str());
+        let picker = cx
+            .debug_bounds("ai-chatgpt-model-picker")
+            .expect("model selector remains available after the draft changes");
+        cx.simulate_click(picker.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
         let model_two = cx
             .debug_bounds(model_two_selector)
-            .expect("second model button remains rendered after draft changes");
+            .expect("second model option remains available after the draft changes");
         cx.simulate_click(model_two.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let second_draft = view.read_with(cx, |view, app| {
@@ -1436,6 +3168,7 @@ mod tests {
             view.settings_open = true;
             view.settings_ai_page = true;
             view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.settings.active_connection = ActiveConnection::Custom;
             view.ai_settings.credential_edit = CredentialEdit::Replace;
             cx.notify();
         });
