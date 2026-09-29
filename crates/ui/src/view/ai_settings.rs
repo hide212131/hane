@@ -9,7 +9,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputContentType, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::radio::Radio;
-use gpui_component::{Selectable, Sizable};
+use gpui_component::{Icon, Selectable, Sizable};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
@@ -744,20 +744,48 @@ impl AiSettingsPage {
             .flex()
             .flex_col()
             .gap_4()
+            .text_size(px(12.0))
             .child(
-                div().flex().items_center().justify_between().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(27.0))
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child("AI設定"),
-                        )
-                        .child("使うAIを選び、接続を確認します。"),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(27.0))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("AI設定"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(theme.quote_foreground))
+                                    .child("使うAIを選び、接続を確認します。"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(40.0))
+                            .flex_none()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(theme.table_border))
+                            .bg(rgb(theme.code_block_background))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(gpui_kit_assets::IconName::Sparkles)
+                                    .size(px(21.0))
+                                    .text_color(rgb(theme.link_foreground)),
+                            ),
+                    )
+                    .mb(px(6.0)),
             )
             .child(self.current_connection_section(theme, cx));
         if matches!(
@@ -891,6 +919,15 @@ impl AiSettingsPage {
         };
         let status_label = if !has_saved_settings {
             "未設定"
+        } else if self.snapshot.recovery_required
+            || matches!(
+                self.snapshot.persistence,
+                PersistenceState::CleanupPending
+                    | PersistenceState::RecoveryRequired
+                    | PersistenceState::DurabilityUnconfirmed
+            )
+        {
+            "設定の復旧が必要"
         } else if self.snapshot.settings.active_connection == ActiveConnection::Custom
             && self
                 .snapshot
@@ -941,7 +978,7 @@ impl AiSettingsPage {
                     (0xfff0d3, 0x744d0c)
                 }
             }
-            "応答確認に失敗" | "保存済み・未適用" => {
+            "応答確認に失敗" | "保存済み・未適用" | "設定の復旧が必要" => {
                 if is_dark {
                     (0x412b31, 0xffb2b5)
                 } else {
@@ -982,11 +1019,6 @@ impl AiSettingsPage {
                     .is_some())
             && self.snapshot.ownership == OwnershipState::Owned
             && !self.snapshot.recovery_required;
-        let saved_note = if has_saved_settings && !applied {
-            Some("現在有効な接続設定は確認できません。下の項目は保存済みの値です。")
-        } else {
-            None
-        };
         let fields = if has_saved_settings {
             let method_label = if applied {
                 "接続方法"
@@ -1007,20 +1039,21 @@ impl AiSettingsPage {
                 .id("ai-current-values")
                 .flex()
                 .flex_wrap()
-                .gap_4()
+                .gap_5()
                 .child(current_value_cell(
                     method_label,
                     connection_name(self.snapshot.settings.active_connection),
+                    theme,
                 ))
-                .child(current_value_cell(provider_label, provider))
-                .child(current_value_cell(model_label, model))
+                .child(current_value_cell(provider_label, provider, theme))
+                .child(current_value_cell(model_label, model, theme))
                 .into_any_element()
         } else {
             div()
                 .id("ai-current-empty")
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_2()
                 .child(
                     div()
                         .text_size(px(17.0))
@@ -1030,19 +1063,37 @@ impl AiSettingsPage {
                 .child("下で接続方法を選び、必要な項目を設定してください。")
                 .into_any_element()
         };
+        let status_message = self.current_connection_message(has_saved_settings, applied);
+        let status_bottom = has_saved_settings.then(|| {
+            let mut bottom = div()
+                .mt(px(2.0))
+                .pt(px(11.0))
+                .border_t_1()
+                .border_color(rgb(theme.table_border))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(220.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.quote_foreground))
+                        .child(status_message),
+                );
+            if runtime_needs_retry {
+                bottom = bottom.child(retry_apply);
+            }
+            bottom
+        });
         let status = div()
             .id("ai-runtime-status")
             .debug_selector(|| "ai-runtime-status".to_owned())
-            .w_full()
-            .px(px(20.0))
-            .py(px(17.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(rgb(theme.table_border))
-            .bg(rgb(theme.code_background))
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2()
             .child(
                 div()
                     .flex()
@@ -1051,6 +1102,8 @@ impl AiSettingsPage {
                     .gap_3()
                     .child(
                         div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(theme.quote_foreground))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("現在有効な設定"),
                     )
@@ -1065,18 +1118,30 @@ impl AiSettingsPage {
                             .child(status_label),
                     ),
             )
-            .children(saved_note)
             .child(fields)
-            .child(self.current_auth_summary())
-            .child(self.probe_summary())
-            .child(self.current_next_step(applied))
-            .children(runtime_needs_retry.then_some(retry_apply));
+            .children(status_bottom);
         div()
             .id("ai-current-connection-card")
             .debug_selector(|| "ai-current-connection-card".to_owned())
+            .w_full()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.code_block_background))
             .flex()
-            .flex_col()
-            .child(status)
+            .overflow_hidden()
+            .mb(px(9.0))
+            .child(div().w(px(3.0)).flex_none().bg(rgb(theme.link_foreground)))
+            .child(
+                div()
+                    .flex_1()
+                    .px(px(20.0))
+                    .py(px(17.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(status),
+            )
     }
 
     fn draft_badge(&self, theme: Theme, dirty: bool) -> impl IntoElement {
@@ -1209,40 +1274,44 @@ impl AiSettingsPage {
             )
     }
 
-    fn current_auth_summary(&self) -> String {
-        match self.snapshot.settings.active_connection {
-            ActiveConnection::ChatGpt => match &self.snapshot.account {
-                AccountState::SignedIn { .. } if self.snapshot.account_refresh_failed => {
-                    "ChatGPTアカウント: 直近の状態を確認できません。状態を更新してください。"
-                        .to_owned()
-                }
-                AccountState::SignedIn { .. } => {
-                    "ChatGPTアカウント: ログイン済み。応答確認の成功は別に確認してください。"
-                        .to_owned()
-                }
-                AccountState::SignedOut => {
-                    "ChatGPTアカウント: 未ログインです。ログイン後に応答を確認できます。".to_owned()
-                }
-                AccountState::ApiKey => "ChatGPTアカウント: OAuth状態を確認できません。".to_owned(),
-                AccountState::Unknown => {
-                    "ChatGPTアカウント: 状態は未確認です。ログインまたは状態更新を行ってください。"
-                        .to_owned()
-                }
-            },
-            ActiveConnection::Custom => {
-                let registered = self
-                    .snapshot
-                    .settings
-                    .custom
-                    .as_ref()
-                    .and_then(|custom| custom.credential_ref.as_ref())
-                    .is_some();
-                if registered {
-                    "APIキー: 登録済み（値は表示しません）。応答確認は未確認です。".to_owned()
-                } else {
-                    "APIキー: 未登録です。接続を使うにはキーを登録して保存・適用してください。"
-                        .to_owned()
-                }
+    fn current_connection_message(&self, has_saved_settings: bool, applied: bool) -> String {
+        if !has_saved_settings {
+            return "AI接続はまだ設定されていません。下で接続方法を選び、必要な項目を設定してください。"
+                .to_owned();
+        }
+        if self.snapshot.persistence == PersistenceState::NotCommitted
+            || self.snapshot.recovery_required
+            || matches!(
+                self.snapshot.persistence,
+                PersistenceState::CleanupPending
+                    | PersistenceState::RecoveryRequired
+                    | PersistenceState::DurabilityUnconfirmed
+            )
+        {
+            return self.current_next_step(applied);
+        }
+        if !self.saved_connection_is_configured() || !applied {
+            return self.current_next_step(applied);
+        }
+        if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt {
+            if self.snapshot.account_refresh_failed {
+                return "ChatGPTのログイン状態を確認できません。状態を更新してください。"
+                    .to_owned();
+            }
+            if !matches!(self.snapshot.account, AccountState::SignedIn { .. }) {
+                return self.current_next_step(applied);
+            }
+        }
+        match self.snapshot.probe_status {
+            ProbeStatus::Succeeded => self.probe_summary(),
+            ProbeStatus::Failed(_) | ProbeStatus::TimedOut | ProbeStatus::Stale => {
+                self.probe_summary()
+            }
+            ProbeStatus::Running => "応答を確認しています。完了をお待ちください。".to_owned(),
+            ProbeStatus::Canceled => "直近の応答確認は取り消されました。".to_owned(),
+            ProbeStatus::Isolated => self.probe_summary(),
+            ProbeStatus::NotRun => {
+                "応答はまだ確認していません。必要なら下の「応答を確認」で試せます。".to_owned()
             }
         }
     }
@@ -1408,7 +1477,7 @@ impl AiSettingsPage {
                     cx.notify();
                 })
             })
-            .w_full()
+            .flex_1()
             .min_w(px(250.0))
             .px(px(14.0))
             .py(px(14.0))
@@ -1450,7 +1519,7 @@ impl AiSettingsPage {
                     cx.notify();
                 })
             })
-            .w_full()
+            .flex_1()
             .min_w(px(250.0))
             .px(px(14.0))
             .py(px(14.0))
@@ -1824,6 +1893,8 @@ impl AiSettingsPage {
             .rounded_sm()
             .border_1()
             .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.code_block_background))
+            .text_size(px(12.0))
             .flex()
             .flex_col()
             .gap_3()
@@ -1835,7 +1906,7 @@ impl AiSettingsPage {
                     .gap_3()
                     .child(
                         div()
-                            .text_size(px(16.0))
+                            .text_size(px(13.0))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("ChatGPTアカウントで接続"),
                     )
@@ -2285,6 +2356,8 @@ impl AiSettingsPage {
             .rounded_sm()
             .border_1()
             .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.code_block_background))
+            .text_size(px(12.0))
             .flex()
             .flex_col()
             .gap_3()
@@ -2296,6 +2369,7 @@ impl AiSettingsPage {
                     .gap_3()
                     .child(
                         div()
+                            .text_size(px(13.0))
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("APIキーで接続"),
                     )
@@ -2398,17 +2472,66 @@ impl AiSettingsPage {
         } else {
             div().into_any_element()
         };
-        div()
-            .id("ai-probe-section")
+        let result_state =
+            (!matches!(&self.snapshot.probe_status, ProbeStatus::NotRun)).then(|| {
+                div()
+                    .id("ai-probe-result")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(result)
+                    .child(response)
+            });
+        let test_header = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().font_weight(gpui::FontWeight::MEDIUM).child(target))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child("短いテストメッセージを送信します。文書は送信しません。"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child("利用料金・利用枠を消費する場合があります。"),
+                    ),
+            )
+            .child(action);
+        let test_panel = div()
+            .id("ai-probe-test-box")
             .w_full()
-            .px(px(20.0))
-            .py(px(18.0))
+            .px(px(14.0))
+            .py(px(12.0))
             .rounded_sm()
             .border_1()
             .border_color(rgb(theme.table_border))
+            .bg(rgb(theme.code_background))
             .flex()
             .flex_col()
             .gap_3()
+            .child(test_header)
+            .children(probe_disabled_reason)
+            .children(result_state);
+        div()
+            .id("ai-probe-section")
+            .w_full()
+            .text_size(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_2()
             .child(
                 div()
                     .flex()
@@ -2421,42 +2544,14 @@ impl AiSettingsPage {
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("応答を確認"),
                     )
-                    .child("保存・適用済みの設定が対象です"),
-            )
-            .child(
-                div()
-                    .px(px(14.0))
-                    .py(px(12.0))
-                    .rounded_sm()
-                    .bg(rgb(theme.code_background))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(250.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().font_weight(gpui::FontWeight::MEDIUM).child(target))
-                            .child("短いテストメッセージを送信します。文書は送信しません。")
-                            .child("利用料金・利用枠を消費する場合があります。"),
-                    )
-                    .child(action),
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child("保存・適用済みの設定が対象です"),
+                    ),
             )
-            .child(
-                div()
-                    .id("ai-probe-result")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(result)
-                    .child(response),
-            )
-            .children(probe_disabled_reason)
+            .child(test_panel)
     }
 
     fn probe_disabled_reason(&self, dirty: bool) -> Option<String> {
@@ -2827,17 +2922,22 @@ fn admission_message(error: AdmissionError) -> String {
     }
 }
 
-fn current_value_cell(label: &str, value: &str) -> impl IntoElement {
+fn current_value_cell(label: &str, value: &str, theme: Theme) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(150.0))
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_size(px(11.0)).child(label.to_owned()))
         .child(
             div()
-                .text_size(px(14.0))
+                .text_size(px(10.0))
+                .text_color(rgb(theme.quote_foreground))
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child(value.to_owned()),
         )
