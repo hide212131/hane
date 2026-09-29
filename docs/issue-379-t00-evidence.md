@@ -349,4 +349,7 @@ The user reported that the native Hane page still differed substantially from th
 - `/Users/hide/.cargo/bin/rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs`: **pass**; `/Users/hide/.cargo/bin/cargo fmt --all -- --check`: **fail** on existing repository-wide formatting differences, with no `ai_settings.rs` entry. Logs: `/tmp/hane379-ui-410-20260930-v3/logs/rustfmt-ai-settings.log` and `/tmp/hane379-ui-410-20260930-v3/logs/cargo-fmt-check.log`.
 - `git diff --check`: **pass**. Log: `/tmp/hane379-ui-410-20260930-v3/logs/git-diff-check.log`.
 
-GitHub Actions and PR body updates for the pushed current head will be recorded in the following section. PR #397 remains Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
+### GitHub Actions at evidence head `1a75819`
+
+- Actions run [36607939093](https://github.com/hide212131/hane/actions/runs/36607939093) at exact head `1a75819cb1dee072f3ef8720d0e3eeecddaf2273`: **pass**. The required-check detector, macOS workspace tests / macOS-specific tests / Clippy, and Windows workspace tests / Clippy all passed.
+- CodeRabbit remains skipped because PR #397 is Draft. The run is CI evidence only and does not include native GUI inspection. PR #397 remains Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
