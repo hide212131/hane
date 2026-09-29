@@ -16,7 +16,8 @@ use hane_ai::{
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-const T00_PROBE_GATE_PASSED: bool = false;
+// T00 passed for the pinned standalone 0.157.1 profile; see the evidence log.
+const T00_PROBE_GATE_PASSED: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LeaveTarget {
