@@ -468,9 +468,9 @@ impl AiSettingsPage {
         if ready {
             body = body
                 .child(self.connection_section(cx, editable))
-                .child(self.chatgpt_section(cx, dirty, window))
+                .child(self.chatgpt_section(cx, dirty, editable, window))
                 .child(self.custom_section(cx, dirty, editable))
-                .child(self.probe_section())
+                .child(self.probe_section(cx, dirty))
                 .child(self.save_section(window, cx, dirty, editable));
         } else if self.snapshot.ownership == OwnershipState::Owned
             && !self.snapshot.recovery_required
@@ -583,6 +583,7 @@ impl AiSettingsPage {
         &self,
         cx: &mut Context<EditorView>,
         dirty: bool,
+        editable: bool,
         window: &Window,
     ) -> gpui::AnyElement {
         let Some(inputs) = &self.inputs else {
@@ -615,24 +616,19 @@ impl AiSettingsPage {
         };
         let view = cx.entity();
         let mut models = div().flex().flex_col().gap_1();
+        let draft_model = value(&inputs.chatgpt_model, cx);
         if let ModelListState::Loaded(available) = &self.snapshot.model_list {
             for model in available.iter().take(40) {
                 let value = model.model.clone();
-                let selected = value
-                    == self
-                        .snapshot
-                        .settings
-                        .chatgpt
-                        .model_id
-                        .as_deref()
-                        .unwrap_or_default();
+                let selected = value == draft_model;
                 let label = format!("{} ({})", model.display_name, model.model);
+                let selector = format!("ai-model-{}", models_hash(&value));
                 let view = view.clone();
-                let model_button = Button::new(format!("ai-model-{}", models_hash(&value)))
+                let model_button = Button::new(selector.clone())
                     .label(label)
                     .small()
                     .selected(selected)
-                    .disabled(!actions_allowed)
+                    .disabled(!editable)
                     .on_click(move |_, window, app| {
                         view.update(app, |view, cx| {
                             if let Some(inputs) = &view.ai_settings.inputs {
@@ -643,7 +639,13 @@ impl AiSettingsPage {
                             cx.notify();
                         })
                     });
-                models = models.child(model_button);
+                let debug_selector = selector.clone();
+                models = models.child(
+                    div()
+                        .id(format!("{selector}-wrapper"))
+                        .debug_selector(move || debug_selector.clone())
+                        .child(model_button),
+                );
             }
         }
         let service = self.service.clone();
@@ -920,7 +922,7 @@ impl AiSettingsPage {
             .into_any_element()
     }
 
-    fn probe_section(&self) -> impl IntoElement {
+    fn probe_section(&self, cx: &mut Context<EditorView>, dirty: bool) -> impl IntoElement {
         let result = match &self.snapshot.probe_status {
             ProbeStatus::NotRun => "まだ接続確認を実行していません。",
             ProbeStatus::Running => "固定入力で応答を確認しています…",
@@ -931,6 +933,63 @@ impl AiSettingsPage {
             ProbeStatus::Isolated => "子プロセスの停止が未確認のため、AI操作を隔離しています。",
             ProbeStatus::Failed(_) => "接続確認に失敗しました。別Providerへの再送はしていません。",
         };
+        let probe_enabled = T00_PROBE_GATE_PASSED
+            && self.service.is_some()
+            && !dirty
+            && self.snapshot.busy.is_none()
+            && self.snapshot.ownership == OwnershipState::Owned
+            && !self.snapshot.recovery_required
+            && matches!(
+                self.snapshot.persistence,
+                PersistenceState::Clean | PersistenceState::Saved
+            );
+        let (action, action_selector) =
+            if let Some((operation, ServiceBusyReason::Probe)) = self.snapshot.busy {
+                let service = self.service.clone();
+                let view = cx.entity();
+                (
+                    Button::new("ai-probe-cancel")
+                        .label("接続確認を取り消す")
+                        .on_click(move |_, _, app| {
+                            if let Some(service) = &service
+                                && let Err(error) = service.cancel(operation)
+                            {
+                                view.update(app, |view, cx| {
+                                    view.ai_settings.message = Some(admission_message(error));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                    "ai-probe-cancel",
+                )
+            } else {
+                let service = self.service.clone();
+                let view = cx.entity();
+                (
+                    Button::new("ai-probe-run")
+                        .label(if T00_PROBE_GATE_PASSED {
+                            "固定入力で接続を確認"
+                        } else {
+                            "接続確認は安全性の確認後に利用できます"
+                        })
+                        .disabled(!probe_enabled)
+                        .on_click(move |_, _, app| {
+                            if let Some(service) = &service
+                                && let Err(error) = service.try_submit(AiCommand::Probe)
+                            {
+                                view.update(app, |view, cx| {
+                                    view.ai_settings.message = Some(admission_message(error));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                    "ai-probe-run",
+                )
+            };
+        let action = div()
+            .id(format!("{action_selector}-wrapper"))
+            .debug_selector(|| action_selector.to_owned())
+            .child(action);
         div()
             .id("ai-probe-section")
             .flex()
@@ -942,9 +1001,12 @@ impl AiSettingsPage {
             .child(if let Some(result) = &self.snapshot.probe_result {
                 div().id("ai-probe-plain-response").child(result.text.clone()).into_any_element()
             } else { div().into_any_element() })
-            .child(Button::new("ai-probe-run")
-                .label(if T00_PROBE_GATE_PASSED { "固定入力で接続を確認" } else { "接続確認は安全性の確認後に利用できます" })
-                .disabled(!T00_PROBE_GATE_PASSED))
+            .child(action)
+            .child(if dirty {
+                "先にAI設定を保存するか、変更を破棄してください。"
+            } else {
+                ""
+            })
     }
 
     fn save_section(
@@ -1085,7 +1147,145 @@ fn models_hash(value: &str) -> u64 {
 mod tests {
     use super::*;
     use gpui::{Focusable, px};
+    use hane_ai::{
+        AiService, AiServiceConfig, FakeCredentialStore, ShellEnvironmentPolicyFormat,
+        SystemBrowserOpener,
+    };
     use hane_document::TextBuffer;
+    use std::sync::Arc;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[gpui::test]
+    fn fixed_probe_button_submits_a_probe_command(cx: &mut gpui::TestAppContext) {
+        let app_data_root = std::env::temp_dir().join(format!(
+            "hane-ui-fixed-probe-button-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&app_data_root).unwrap();
+        let service = AiService::spawn(AiServiceConfig {
+            app_data_root: app_data_root.clone(),
+            binary_path: app_data_root.join("missing-codex-app-server"),
+            credential_store: Arc::new(FakeCredentialStore::new()),
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        let handle = service.handle();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.service = Some(handle.clone());
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let button = cx
+            .debug_bounds("ai-probe-run")
+            .expect("fixed probe button is rendered");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = handle.snapshot();
+            if snapshot.busy.is_some() || snapshot.last_result.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "probe button did not submit a command"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let snapshot = handle.snapshot();
+        assert!(snapshot.busy.is_some() || snapshot.last_result.is_some());
+        assert_ne!(snapshot.probe_status, ProbeStatus::NotRun);
+
+        drop(handle);
+        drop(service);
+        std::fs::remove_dir_all(app_data_root).unwrap();
+    }
+
+    #[gpui::test]
+    fn chatgpt_model_selection_can_be_changed_multiple_times_before_saving(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            view.ai_settings.snapshot.settings.chatgpt.model_id = Some("saved-model".to_owned());
+            view.ai_settings.snapshot.model_list = ModelListState::Loaded(vec![
+                hane_ai::ChatGptModel {
+                    id: "catalog-id-one".to_owned(),
+                    model: "model-one".to_owned(),
+                    display_name: "Model One".to_owned(),
+                    is_default: false,
+                },
+                hane_ai::ChatGptModel {
+                    id: "catalog-id-two".to_owned(),
+                    model: "model-two".to_owned(),
+                    display_name: "Model Two".to_owned(),
+                    is_default: false,
+                },
+            ]);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let model_one_selector: &'static str =
+            Box::leak(format!("ai-model-{}", models_hash("model-one")).into_boxed_str());
+        let model_one = cx
+            .debug_bounds(model_one_selector)
+            .expect("first model button is rendered");
+        cx.simulate_click(model_one.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let first_draft = view.read_with(cx, |view, app| {
+            value(
+                &view
+                    .ai_settings
+                    .inputs
+                    .as_ref()
+                    .expect("AI settings inputs are initialized")
+                    .chatgpt_model,
+                app,
+            )
+        });
+        assert_eq!(first_draft, "model-one");
+
+        let model_two_selector: &'static str =
+            Box::leak(format!("ai-model-{}", models_hash("model-two")).into_boxed_str());
+        let model_two = cx
+            .debug_bounds(model_two_selector)
+            .expect("second model button remains rendered after draft changes");
+        cx.simulate_click(model_two.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let second_draft = view.read_with(cx, |view, app| {
+            value(
+                &view
+                    .ai_settings
+                    .inputs
+                    .as_ref()
+                    .expect("AI settings inputs are initialized")
+                    .chatgpt_model,
+                app,
+            )
+        });
+        assert_eq!(second_draft, "model-two");
+    }
 
     #[gpui::test]
     fn ai_secret_input_is_masked_and_editor_shortcuts_do_not_reach_document(
