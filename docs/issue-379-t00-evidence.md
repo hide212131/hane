@@ -327,3 +327,26 @@ The UI source does not alter the standalone Codex safety profile; the scoped T00
 
 - Actions run [36603564620](https://github.com/hide212131/hane/actions/runs/36603564620), exact submitted head `df432dab4ed18a1b40f3de310a7eaa0e30f1f88a`: **pass** for the macOS and Windows `cargo test / clippy` jobs. This run includes product commit `d64f9f2` and the UI evidence record. It is CI evidence, not native GUI evidence.
 - CodeRabbit's status context reported `Review skipped: draft pull request`; this was not a review. No manual review trigger or Draft-state change was made.
+
+## 2026-09-30 UI layout follow-up after user review (product commit `481c4141887b96b5e47f68f8a024c4be7a1c4520`)
+
+The user reported that the native Hane page still differed substantially from the HTML in PR #410. This follow-up keeps the existing implementation PR #397 and narrows the visible product UI toward the HTML's hierarchy. It does not change the Hane App Server contract or the #392 design-only PR.
+
+- At start, Issue #379 was Open; PR #397 was Draft/Open at `a94609be0d1a2a5b55bda050f1485e1aef5b4fd5`; PR #392 was Open at `025c53d0d03a9ecc2a221d80257d88e59b6c5dfd`; PR #410 was Open/non-Draft at `26178e13df11d572a814a9b7af30f7c6756bfb54`. The implementation branch matched its remote at `a94609b`; no uncommitted user changes were present. Current main was last observed at `5be310c6136e662119e2d208322f832b317e14c4`, and PR #397 still targets base `864802015ba943f4c68108a6c2cb88d557195a07`.
+- `現在有効な設定` is now a compact card with method, destination and model values, a status badge, and one short current-state message. Runtime details and generation values stay in the collapsed diagnostics section. Account/login state remains in the ChatGPT form, and API-key state remains in the API-key form.
+- The page title includes the HTML's small accent icon. Connection choices share a two-column row when the window has room. The selected ChatGPT/API-key form has a separate panel background. The response heading is outside its bordered test panel; target, privacy/cost note, action, and non-default result state stay together. `応答確認: まだ実行していません` is no longer redundantly rendered below the button before a test is run.
+- The existing Hane settings navigation remains the product chrome. The HTML's preview controls, demo sidebar, and sample-only controls were not copied. The current `ProbeResult` contract has no timestamp, so this UI does not invent a confirmation time.
+- T00 remains **pass within its documented standalone 0.157.1 scope**; this is a UI-only change and does not broaden or alter that evidence.
+
+### Acceptance evidence for product commit `481c414`
+
+- **T24 — partial:** `cargo test -p hane-ui --locked` passed all **221 tests**; the existing `view::ai_settings::tests` for selected forms, savebar, key registration/cancel, probe submission, and repeated model selection remain in the suite. This is automated GPUI evidence, not manual native-GUI review. Log: `/tmp/hane379-ui-410-20260930-v3/logs/cargo-test-hane-ui.log`.
+- **T25–T28 — unchanged prior evidence:** UI code in this follow-up does not change editor-input, external-open, document-session, or recovery contracts. Their existing partial/pass scope remains as in the sections above; native IME/Tab/focus scenarios remain unverified.
+- **T29/T30 — user-reported complete; not rerun:** no OAuth or real provider operation was performed in this UI-only follow-up. The preview has no API key and uses isolated state.
+- **T31 — partial:** the new app was built and launched for the user to inspect at `/tmp/hane379-ui-410-20260930-v3/Hane-UI-Review.app`, with state `/tmp/hane379-ui-410-20260930-v3/state` and a disposable Markdown workspace `/tmp/hane379-ui-410-20260930-v3/workspace`. The built executable SHA-256 is `346722eb0fbfa8a5200d6a4f58efc1ee7b62a90e2529ddadd94c1e8f781aa2df`. The screen-capture tool reported macOS locked, so no native visual inspection by the agent is claimed; the user's own inspection of this latest preview is pending. No Windows GUI or Japanese IME/Tab scenario was run.
+- `cargo test -p hane-ai --locked`: **pass**, 181 tests (134 unit, 11 account-service, 16 Custom Provider runtime, 20 runtime lifecycle). Log: `/tmp/hane379-ui-410-20260930-v3/logs/cargo-test-hane-ai.log`.
+- `/Users/hide/.cargo/bin/cargo build -p hane --locked` with the repository-pinned Rust 1.98.1: **pass**. Log: `/tmp/hane379-ui-410-20260930-v3/logs/cargo-build-hane.log`.
+- `/Users/hide/.cargo/bin/rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs`: **pass**; `/Users/hide/.cargo/bin/cargo fmt --all -- --check`: **fail** on existing repository-wide formatting differences, with no `ai_settings.rs` entry. Logs: `/tmp/hane379-ui-410-20260930-v3/logs/rustfmt-ai-settings.log` and `/tmp/hane379-ui-410-20260930-v3/logs/cargo-fmt-check.log`.
+- `git diff --check`: **pass**. Log: `/tmp/hane379-ui-410-20260930-v3/logs/git-diff-check.log`.
+
+GitHub Actions and PR body updates for the pushed current head will be recorded in the following section. PR #397 remains Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
