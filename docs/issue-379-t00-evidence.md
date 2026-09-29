@@ -374,4 +374,9 @@ The user reported that the native page still looked substantially different from
 - Focused `rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs` and `git diff --check`: **pass**.
 - Required `cargo fmt --all -- --check`: **fail** on existing repository-wide formatting differences; `ai_settings.rs` is absent from the output. Log: `/tmp/hane379-ui-410-20260930-v4/logs/cargo-fmt-check.log`.
 
-GitHub Actions for the exact product/evidence head are pending after the branch update and will be recorded below. PR #397 remains the implementation PR and will remain Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
+### GitHub Actions at source/evidence head `b93c5fd`
+
+- Actions run [36611486395](https://github.com/hide212131/hane/actions/runs/36611486395), exact head `b93c5fd37e9e9368a8a89e2fc2f2e6c286b82c27`, **attempt 2 passed** the required-check detector, macOS and Windows workspace tests/Clippy, and macOS-specific tests (`hane_oblique` and `hane_input_source`).
+- Attempt 1 of the same run passed Windows tests/Clippy but macOS workspace tests hit a timing-sensitive failure in the existing `cleanup_that_cannot_be_confirmed_within_the_timeout_blocks_restart` test (`crates/ai/tests/runtime_lifecycle.rs:773`); its zero-length kill timeouts did not produce `RestartBlocked` on that run. The failed macOS job was rerun; attempt 2 passed. The UI refinement did not modify `crates/ai` or this lifecycle test. Full first-attempt macOS log: `/tmp/hane379-ui-410-20260930-v4/logs/macos-job-attempt1.log`.
+
+PR #397 remains the implementation PR and Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
