@@ -290,3 +290,35 @@ the tested gate commit `21a64d5393cab4ee1709b7bfbd3f2d47e1f5f412`.
 - The Custom Provider section now labels the no-key action `API keyを登録` and the existing-key action `API keyを置き換える`. On selection, the page explains that the key field appears, the user enters the key, then presses the bottom `保存` button. It says the value stays hidden and connection testing is separate. The API-key button/input wrapper is exposed to the UI test harness.
 - `view::ai_settings::tests::connection_and_api_key_choices_explain_when_they_take_effect` and `view::ai_settings::tests::register_api_key_button_reveals_the_masked_input` pass as part of `cargo test -p hane-ui` (**220 passed**); log `/tmp/hane379-p5-20260929/cargo-test-hane-ui-ux-final.log`. `cargo test -p hane-ai`: **181 passed**; log `/tmp/hane379-p5-20260929/cargo-test-hane-ai-ux-final.log`.
 - `cargo build -p hane`, workspace Clippy, focused rustfmt for `crates/ui/src/view/ai_settings.rs`, and `git diff --check`: **pass**. `cargo fmt --all -- --check`: **fail** on existing formatting differences in other files; `ai_settings.rs` is absent from `/tmp/hane379-p5-20260929/cargo-fmt-all-ux-final.log`.
+
+### Issue #410 UI implementation follow-up (2026-09-30; product commit `d64f9f259b723c02cbc1a9d402ba87663e3a443c`)
+
+At start of this follow-up, Issue #379 was Open; PR #397 was Draft/Open at `217139dc0b049d69db801649cb536c1e37d83821`; the remote implementation branch matched that head. Design PR #392 remained Open at `025c53d0d03a9ecc2a221d80257d88e59b6c5dfd`. UI specification PR #410 remained Open/non-Draft at `26178e13df11d572a814a9b7af30f7c6756bfb54`. PR #397 had no submitted review and its CodeRabbit check said review skipped for a Draft PR. Current main was `5be310c6136e662119e2d208322f832b317e14c4`; PR #397 still targets its earlier recorded base. No rebase or change to the design-only PR was made.
+
+This product-only change preserves the Issue #379 service/runtime/auth contracts and applies the visible structure from #410:
+
+- The AI page is centered and scrolls above a fixed save bar. It presents `現在有効な設定`, draft status, two radio-style connection cards, only the selected connection form, `応答を確認`, then collapsed diagnostics.
+- The Custom Provider form presents AI service and model together, an API-key status row with `登録`/`変更`/`削除` and `元に戻す`, a masked key editor with `やめる`, and collapsible `接続先の詳細`. It has no “keep key” action. The key value is never read back.
+- ChatGPT model selection now uses a dropdown with a separate manual model-ID field. The user can select multiple models in the same unsaved edit. Account status and login actions are grouped, with the required saved-active-ChatGPT prerequisite explained.
+- Probe target, fixed-message/privacy/cost information, status, and a current-only result are grouped together. Stale probe text is not presented as the current connection result. Runtime diagnostics are collapsed by default. Save bar messages distinguish dirty, saving, incomplete, unapplied, and applied settings without claiming that an unconfirmed runtime is active.
+- T29 and T30 remain **reported complete by the user** as recorded in the earlier section. This follow-up did not redo real OAuth or a real Custom Provider connection. A temporary macOS app was opened for the user to inspect the updated screen; its state root and Markdown workspace are isolated under `/tmp/hane379-ui-410-20260930-v2`. The user has not yet reported a manual result for this latest preview. Windows GUI and native Japanese IME/Tab checks remain outstanding.
+
+#### Acceptance evidence at product commit `d64f9f2`
+
+- **T24 — partial:** UI structure and actions above are in place; `view::ai_settings::tests::ai_settings_show_only_the_selected_connection_and_keep_savebar_visible`, `view::ai_settings::tests::register_api_key_button_reveals_the_masked_input`, `view::ai_settings::tests::chatgpt_model_selection_can_be_changed_multiple_times_before_saving`, and `view::ai_settings::tests::fixed_probe_button_submits_a_probe_command` pass. Real account/provider success is not inferred from these UI tests. Evidence: `/tmp/hane379-ui410-20260930/workspace-test.log`.
+- **T25 — partial:** the masked key editor can be canceled without saving; secret masking/editor shortcut regression test remains passing. Native Japanese IME and Tab/focus behavior are unverified. Evidence: `view::ai_settings::tests::register_api_key_button_reveals_the_masked_input`, `view::ai_settings::tests::ai_secret_input_is_masked_and_editor_shortcuts_do_not_reach_document`; same workspace log.
+- **T26/T27/T28 — unchanged prior evidence:** their existing asynchronous external-open, document isolation, and recovery UI results remain as recorded above. The product change did not expand those claims.
+- **T29/T30 — user-reported complete; not rerun here:** see the supplied-screen qualification in the prior P5 GUI follow-up. The current isolated preview does not perform OAuth or contact a provider.
+- **T31 — partial:** local workspace/macOS CI-equivalent checks pass below; user inspection of the latest preview is pending and Windows GUI remains unverified.
+
+#### Local verification at this source state
+
+- `cargo test --workspace --all-features --locked`: **pass**, including 221 `hane-ui` tests; log `/tmp/hane379-ui410-20260930/workspace-test.log`.
+- `cargo test -p hane-ai`: **pass**, 134 unit + 11 account-service + 16 Custom Provider runtime + 20 lifecycle; log `/tmp/hane379-ui410-20260930/hane-ai-test.log`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: **pass**; log `/tmp/hane379-ui410-20260930/clippy.log`.
+- `cargo build -p hane`: **pass**; log `/tmp/hane379-ui410-20260930/build-hane.log`.
+- macOS-specific CI tests: **pass** — `hane_oblique` (2 tests) and `hane_input_source` (1 test); logs `/tmp/hane379-ui410-20260930/macos-hane-oblique.log` and `/tmp/hane379-ui410-20260930/macos-input-source.log`.
+- `rustfmt --edition 2024 --check crates/ui/src/view/ai_settings.rs` and `git diff --check`: **pass**.
+- Required `cargo fmt --all -- --check`: **fail** on repository-wide existing differences in 14 files, including unrelated sections of `crates/ui/src/view.rs` at lines 1074 and 10678+; the changed AI settings file is not in the report, and the edited settings-layout hunk in `view.rs` is not in the report. Full output: `/tmp/hane379-ui410-20260930/cargo-fmt-check.log`. Unrelated files were not reformatted.
+
+The UI source does not alter the standalone Codex safety profile; the scoped T00 result and limits remain unchanged above. PR #397 remains the implementation PR, Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
