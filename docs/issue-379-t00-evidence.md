@@ -322,3 +322,8 @@ This product-only change preserves the Issue #379 service/runtime/auth contracts
 - Required `cargo fmt --all -- --check`: **fail** on repository-wide existing differences in 14 files, including unrelated sections of `crates/ui/src/view.rs` at lines 1074 and 10678+; the changed AI settings file is not in the report, and the edited settings-layout hunk in `view.rs` is not in the report. Full output: `/tmp/hane379-ui410-20260930/cargo-fmt-check.log`. Unrelated files were not reformatted.
 
 The UI source does not alter the standalone Codex safety profile; the scoped T00 result and limits remain unchanged above. PR #397 remains the implementation PR, Draft/Open; no CodeRabbit trigger, Draft removal, merge, or Issue close was performed.
+
+### GitHub Actions result for Issue #410 UI follow-up
+
+- Actions run [36603564620](https://github.com/hide212131/hane/actions/runs/36603564620), exact submitted head `df432dab4ed18a1b40f3de310a7eaa0e30f1f88a`: **pass** for the macOS and Windows `cargo test / clippy` jobs. This run includes product commit `d64f9f2` and the UI evidence record. It is CI evidence, not native GUI evidence.
+- CodeRabbit's status context reported `Review skipped: draft pull request`; this was not a review. No manual review trigger or Draft-state change was made.
