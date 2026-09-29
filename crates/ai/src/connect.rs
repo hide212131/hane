@@ -45,7 +45,7 @@ use crate::owner_lock::OwnerLockGuard;
 use crate::paths::AiPaths;
 use crate::provider::{
     CustomProviderConfigError, ShellEnvironmentPolicyFormat, WriteCodexConfigError,
-    build_custom_provider_material, write_codex_config,
+    build_custom_provider_material, generate_chatgpt_config_toml, write_codex_config,
 };
 use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeError};
 use crate::secrets::{CredentialRef, CredentialStore, CredentialStoreError};
@@ -675,6 +675,10 @@ pub fn build_runtime_config_for_active_connection(
     match settings.active_connection {
         ActiveConnection::ChatGpt => {
             // ChatGPT auth and state are kept in its dedicated CODEX_HOME.
+            // Write the shared external-context isolation profile there too:
+            // the server would otherwise load project AGENTS.md files from
+            // the runtime cwd.
+            write_codex_config(&paths.chatgpt_codex_home(), &generate_chatgpt_config_toml())?;
         }
         ActiveConnection::Custom => {
             let custom = settings
@@ -1887,6 +1891,28 @@ mod tests {
         );
         assert!(configured.config.extra_env.is_empty());
         assert_eq!(configured.settings_generation, settings.settings_generation);
+        let written =
+            std::fs::read_to_string(paths.chatgpt_codex_home().join("config.toml")).unwrap();
+        let parsed: toml::Value = written.parse().expect("ChatGPT config must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|v| v.get("skip_host_skill_discovery"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1924,6 +1950,26 @@ mod tests {
         let written =
             std::fs::read_to_string(paths.custom_codex_home().join("config.toml")).unwrap();
         assert!(!written.contains("sk-super-secret-value"));
+        let parsed: toml::Value = written.parse().expect("Custom config must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|v| v.get("skip_host_skill_discovery"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]

@@ -75,3 +75,127 @@ list was empty or prove the behavior of every possible tool call. The
 Commander accepted the presence of the tool definitions and developer input
 block, while this evidence retains only the negative-call behavior actually
 observed.
+
+## 2026-09-29 standalone retest and isolation-profile fix
+
+This section records the follow-up assigned for P0/T00. It supersedes the
+earlier inference that absence of a sentinel from a provider request alone
+proved it had not been read. A baseline run with Codex's default nonzero
+`project_doc_max_bytes` did include the workspace `AGENTS.md` sentinel in the
+provider input. The generated Hane profile now sets the three explicit
+0.157.1 isolation controls listed below; the UI Probe gate remains disabled.
+
+### Pinned binary and generated profile
+
+- Platform: macOS 26.6.2, Apple Silicon.
+- Official release: `openai/codex` tag `rust-v0.157.1`, peeled source commit
+  `36650394c5b38c2990ccf2a3457165ca3e9d9726`.
+- Asset: `codex-app-server-aarch64-apple-darwin.tar.gz`, SHA-256
+  `a427487e775e3053feacb9dee699439e36e1dac2fe9516fa5c22e922fcc70d60`.
+- Extracted executable SHA-256:
+  `0e600652a21c97675a92b8410e350942e8bcd6f574788df5c8de2c0b909d549c`;
+  it reports `codex-app-server 0.157.1`.
+- Official config schema asset SHA-256:
+  `17fbda7e71603aa6a83e986608f2e13c27ea46ce1a4b889196ba81a07c39d907`.
+- The executable was run directly as the standalone binary with
+  `--strict-config --listen stdio:// --session-source mcp`. The full CLI's
+  `app-server` subcommand was not used.
+- `CODEX_HOME` was a fresh disposable directory, with a dummy Custom key and
+  loopback-only mock Responses provider. Real host plumbing variables for
+  app tools/session/permissions/MCP were absent from the child environment.
+  A deliberately unrelated `OPENAI_API_KEY` and `OPENAI_BASE_URL` pointed to a
+  separate loopback trap, to check that the selected Custom config controlled
+  destination and model.
+- The generated ChatGPT config and Custom config now both set
+  `project_doc_max_bytes = 0`, `project_root_markers = []`, and
+  `[features] skip_host_skill_discovery = true`. The Custom config retains its
+  configured provider/model. Unit tests parse both generated configs and
+  assert these values; `--strict-config` accepted the same profile in the
+  standalone run.
+
+### Reproduction and observations
+
+The sanitized harness and result summary were kept locally at
+`/tmp/hane379-t00-20260929/run_t00.py` and
+`/tmp/hane379-t00-20260929/t00-run-summary.json`. It creates disposable
+fixtures for a regular-file case, a FIFO tripwire case, and a negative tool
+case:
+
+1. Regular nearby-file case: the working directory contains an
+   `AGENTS.md` sentinel. Its parent contains a `.git` directory, a `.codex`
+   project config with a distinct developer sentinel, an invalid unknown
+   config key and a conflicting model/provider routed to the trap, and
+   sentinel skill files under both `.codex/skills` and `.agents/skills`.
+   The Responses mock records only request path/host/model, tool names/count,
+   boolean checks for the fixed input and sentinel strings, and whether its
+   dummy authorization matched. It never stores request bodies or auth
+   values.
+2. Read-tripwire case: those same external `AGENTS.md`, parent
+   `.codex/config.toml`, `.codex/skills/.../SKILL.md`, and
+   `.agents/skills/.../SKILL.md` locations are FIFO files with no writer.
+   An open/read path that waits for their contents would prevent the server
+   from completing initialization or the fixed turn.
+
+For each case, the harness sends JSON-RPC `initialize`, `thread/start`, and
+`turn/start` to the standalone App Server and a fixed user input to the mock
+Responses endpoint. In a third negative case, the mock instead returns an
+unadvertised `exec_command` function call whose proposed command would create
+a marker and POST to the separate trap endpoint.
+
+| Check | Result |
+| --- | --- |
+| Strict standalone startup and fixed response | **Pass** in regular-file and FIFO cases; both turns completed without a turn error. |
+| Destination, model, input, dummy credential | **Pass**; requests went to the configured loopback host at `/v1/responses`, model `gpt-p0-fixed`, with the fixed input and matching dummy bearer value. The unrelated OpenAI URL/key was not selected. |
+| Nearby sentinel contents | **Pass** for this profile; request input had none of the AGENTS/config/skill sentinel strings. |
+| External file read tripwires | **Pass, scoped**; initialization and the turn completed while the external config, AGENTS file, and both adjacent skill files were FIFOs with no writer. The regular-file case also showed no trap request or external provider/model selection. |
+| Unexpected `exec_command` response | **Pass for this named call**; server log indicated `unsupported call: exec_command`; the marker was absent; the separate trap recorded no paths. The turn completed and the server stopped with exit code 0. |
+| Other provider-visible tools | One `request_user_input` definition remained in each provider request. Commander has explicitly accepted provider tool definitions and extra developer input as product behavior; this result does not claim an empty tool list or prove every possible tool name/call. |
+| Child stop | **Pass**; all three tested App Server processes stopped and returned exit code 0 after the harness closed their stdio input. |
+
+### Pinned-source contract and limits
+
+The release schema permits `project_doc_max_bytes = 0` (minimum 0; default
+32768) and an empty `project_root_markers` array. In the pinned source at
+commit `36650394c5b38c2990ccf2a3457165ca3e9d9726`,
+`codex-rs/core/src/agents_md.rs` breaks before calling `read_agents_md` when
+the remaining instruction budget is zero. In
+`codex-rs/config/src/loader/mod.rs`, empty project-root markers return before
+walking cwd ancestors; root resolution then uses the current runtime cwd. The
+per-run cwd is a newly created empty Hane workspace. In
+`codex-rs/core/src/session/session.rs`, `skip_host_skill_discovery` returns
+before host skill discovery when no registered extension requires it; the
+fixture had no such extension. These contracts match the regular-file and
+FIFO observations.
+
+No kernel-level open trace was available: macOS `fs_usage` refused to run
+without root, and noninteractive sudo was unavailable. Therefore this record
+does not claim an OS syscall trace. The no-read finding is scoped to these
+Codex 0.157.1 paths and files, based on the pinned early-return contracts and
+the unopenable FIFO tripwires, plus the regular-file sentinel/routing checks.
+It does not establish behavior for every Codex version, arbitrary extensions,
+or every possible returned tool name. The app-server protocol did not provide
+`instructionSources` in these retest responses, so the new run does not claim
+an empty list.
+
+### Local code validation
+
+- `cargo test -p hane-ai`: **pass** — 134 unit, 11 account-service, 16 Custom
+  Provider, and 20 runtime-lifecycle tests. Output:
+  `/tmp/hane379-t00-20260929/cargo-test-hane-ai.log`.
+- `cargo fmt --all -- --check`: **fail** — rustfmt reports repository-wide
+  formatting differences in existing code, including older sections of
+  `provider.rs`; it was not applied wholesale to avoid unrelated changes.
+  The new code blocks in `provider.rs` are formatted, and a focused
+  `rustfmt --edition 2024 --check crates/ai/src/connect.rs` passed.
+- `git diff --check`: **pass** for this worktree.
+
+### T00 result
+
+**Pass for the tested Codex 0.157.1 standalone profile and the scoped cases
+above.** The finding that default configuration loaded the AGENTS sentinel led
+to the isolation-profile change; both generated Hane provider profiles now
+set the controls that prevent that path. The negative execution check remains
+limited to the unadvertised `exec_command` call. The Probe UI remains disabled
+pending the Commander's review and next-stage assignment; this result does not
+authorize OAuth/Custom live connection work, GUI work, review triggering, or
+changing the Draft state.
