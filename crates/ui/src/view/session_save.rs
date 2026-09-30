@@ -348,6 +348,7 @@ impl EditorView {
                 self.save_session(id, pending, cx);
             }
         }
+        self.resolve_pending_tab_close(id, cx);
         cx.notify();
     }
 
@@ -534,6 +535,7 @@ impl EditorView {
         {
             self.save_session(id, pending, cx);
         }
+        self.resolve_pending_tab_close(id, cx);
         cx.notify();
     }
 

@@ -83,6 +83,18 @@ command_actions! {
         if !view.inline_rename_active() { view.prompt_save_as(cx); }
     },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
+    NextFileTab ("ctrl-tab") => next_file_tab_action |view, _window, cx| {
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
+            return;
+        }
+        view.next_file_tab(cx);
+    },
+    PrevFileTab ("ctrl-shift-tab") => prev_file_tab_action |view, _window, cx| {
+        if view.sidebar_filter_is_focused() || view.inline_rename_active() || view.editor().ime().is_some() {
+            return;
+        }
+        view.prev_file_tab(cx);
+    },
     ResetZoom ("secondary-0") => reset_zoom_action |view, _window, cx| { view.reset_zoom(cx); },
     Rename ("f2") => rename |view, window, cx| { view.begin_inline_rename_from_selection(window, cx); },
     Newline ("enter") => newline |view, _window, cx| {
@@ -254,6 +266,9 @@ command_actions! {
             return;
         }
         if view.dismiss_file_tab_context_menu(cx) {
+            return;
+        }
+        if view.dismiss_tab_close_confirm(cx) {
             return;
         }
         if view.sidebar_filter_is_focused() {
