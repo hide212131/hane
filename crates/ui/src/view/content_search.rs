@@ -837,32 +837,25 @@ impl EditorView {
                 }
                 let remaining_text = MAX_SEARCH_RESULT_TEXT_BYTES
                     .saturating_sub(self.content_search.result_text_bytes);
-                let first_context_bytes = self
-                    .content_search
-                    .pending_file
-                    .as_ref()
-                    .and_then(|pending| pending.result.hits.first())
-                    .map_or(0, |hit| hit.context_source.len());
-                if first_context_bytes > remaining_text {
-                    self.content_search.stop_at_global_limit();
-                    break;
-                }
                 let (group_index, completion, take, hits) = {
                     let pending = self
                         .content_search
                         .pending_file
                         .as_mut()
                         .expect("pending result was checked above");
-                    let take = pending
-                        .result
-                        .hits
-                        .len()
-                        .min(MAX_SEARCH_ROWS_PER_FRAME - rows)
-                        .min(remaining_hits);
+                    let take = delivery_hit_count(
+                        &pending.result.hits,
+                        MAX_SEARCH_ROWS_PER_FRAME - rows,
+                        remaining_hits,
+                        remaining_text,
+                    );
                     let hits = pending.result.hits.drain(..take).collect::<Vec<_>>();
                     (pending.group_index, pending.result.completion, take, hits)
                 };
-                let _ = take;
+                if take == 0 {
+                    self.content_search.stop_at_global_limit();
+                    break;
+                }
                 for hit in hits {
                     self.content_search.result_text_bytes += hit.context_source.len();
                     self.content_search.result_hit_count += 1;
@@ -1963,6 +1956,25 @@ fn file_result_is_current(result: &FileSearchResult, view: &EditorView) -> bool 
     target_version_is_current(&result.target, result.version, view)
 }
 
+fn delivery_hit_count(
+    hits: &[hane_session::search::SearchHit],
+    rows_remaining: usize,
+    hits_remaining: usize,
+    text_bytes_remaining: usize,
+) -> usize {
+    let mut count = 0;
+    let mut text_bytes = 0usize;
+    for hit in hits.iter().take(rows_remaining.min(hits_remaining)) {
+        let next_text_bytes = text_bytes.saturating_add(hit.context_source.len());
+        if next_text_bytes > text_bytes_remaining {
+            break;
+        }
+        text_bytes = next_text_bytes;
+        count += 1;
+    }
+    count
+}
+
 fn target_version_is_current(
     target: &SearchTarget,
     version: SearchVersion,
@@ -2080,6 +2092,60 @@ mod tests {
             workspace_epoch: 4,
             query_epoch,
         }
+    }
+
+    fn search_hit(context_source: &str) -> hane_session::search::SearchHit {
+        hane_session::search::SearchHit {
+            range: SourceRange::new(0, 1),
+            line_number: 1,
+            context_range: SourceRange::new(0, context_source.len()),
+            context_source: context_source.to_owned(),
+        }
+    }
+
+    #[test]
+    fn result_delivery_respects_frame_hit_and_cumulative_text_limits() {
+        let hits = vec![
+            search_hit("a".repeat(700).as_str()),
+            search_hit("b".repeat(700).as_str()),
+        ];
+
+        assert_eq!(
+            delivery_hit_count(&hits, 128, 10_000, 1_000),
+            1,
+            "the sum of delivered excerpts must stay under the text budget"
+        );
+        assert_eq!(delivery_hit_count(&hits, 1, 10_000, 2_000), 1);
+        assert_eq!(delivery_hit_count(&hits, 128, 1, 2_000), 1);
+    }
+
+    #[test]
+    fn reaching_a_global_delivery_limit_is_reported_as_partial() {
+        let cancellation = SearchCancellationToken::new();
+        let (sender, _receiver) = mpsc::sync_channel(MAX_SEARCH_QUEUED_FILES);
+        let work = Arc::new(SearchWork {
+            key: key(1),
+            query: SearchQuery::new("query", false).unwrap(),
+            cancellation: cancellation.clone(),
+            sources: Arc::from([]),
+            next_source: AtomicUsize::new(0),
+            sender,
+        });
+        let mut state = ContentSearchState::default();
+        state.current_work = Some(work);
+        state.status = ContentSearchStatus::Searching;
+
+        state.stop_at_global_limit();
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(state.status, ContentSearchStatus::Partial);
+        assert!(state.current_work.is_none());
+        assert!(
+            state
+                .status_detail
+                .as_deref()
+                .is_some_and(|text| text.contains("上限"))
+        );
     }
 
     #[test]
@@ -2270,6 +2336,152 @@ mod tests {
     }
 
     #[gpui::test]
+    fn search_sources_include_hidden_buffer_and_work_folder_draft_without_disk_duplicate(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::{FileIdentity, LoadedFile, OsWorkFolderScanner, WorkFolderScanner};
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-414-buffer-sources-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Note.md");
+        std::fs::write(&path, "disk-only").unwrap();
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let mut sessions = SessionSet::with_untitled("draft-only", "Untitled");
+        let draft_id = sessions.active_id();
+        let file_id = sessions.apply_open(
+            None,
+            LoadedFile {
+                document: hane_document::RopeBuffer::from_text("buffer-only"),
+                identity: FileIdentity::lexical(&path),
+                stamp: None,
+            },
+        );
+        assert!(sessions.activate(draft_id));
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        let sources = view.update(cx, |view, _| {
+            view.work_folder = Some(folder);
+            view.work_folder_drafts.insert(
+                draft_id,
+                WorkFolderDraft {
+                    draft_id: hane_session::DraftId::generate(),
+                    target_directory: root.clone(),
+                },
+            );
+            assert_eq!(view.sessions.active_id(), draft_id);
+            assert!(view.sessions.get(file_id).is_some());
+            view.content_search_sources()
+        });
+
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| matches!(source, SearchSource::FileBuffer { path: candidate, .. } if candidate == &path))
+                .count(),
+            1
+        );
+        assert!(
+            !sources.iter().any(
+                |source| matches!(source, SearchSource::Disk(candidate) if candidate == &path)
+            )
+        );
+        assert!(sources.iter().any(
+            |source| matches!(source, SearchSource::Draft { session, .. } if *session == draft_id)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn selecting_a_draft_hit_preserves_dirty_text_and_undo_history(cx: &mut gpui::TestAppContext) {
+        let source = "before needle";
+        let start = source.find("needle").unwrap();
+        let end = start + "needle".len();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(source, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (session, generation, revision, edited_source) = view.update(cx, |view, cx| {
+            let session = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" edited").unwrap();
+            view.after_input(cx);
+            (
+                session,
+                view.sessions.active().generation(),
+                view.sessions.active().revision(),
+                view.editor().document().full_text(),
+            )
+        });
+        let context_range = SourceRange::new(0, edited_source.len());
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.initialize_content_search_input(window, cx);
+                view.work_folder_drafts.insert(
+                    session,
+                    WorkFolderDraft {
+                        draft_id: hane_session::DraftId::generate(),
+                        target_directory: PathBuf::from("/work"),
+                    },
+                );
+                view.content_search.mode = SidebarMode::Content;
+                view.content_search.query_text = "needle".to_owned();
+                let key = view.content_search.key();
+                view.content_search
+                    .displayed_files
+                    .push(DisplayedSearchFile {
+                        key,
+                        target: SearchTarget::Draft(session),
+                        version: SearchVersion::Buffer {
+                            session,
+                            generation,
+                            revision,
+                        },
+                        identity: None,
+                        label: "未保存のメモ".to_owned(),
+                        hits: vec![hane_session::search::SearchHit {
+                            range: SourceRange::new(start, end),
+                            line_number: 1,
+                            context_range,
+                            context_source: edited_source.clone(),
+                        }],
+                        completion: SearchFileCompletion::Complete,
+                    });
+                view.open_content_search_result(0, 0, window, cx);
+            });
+        });
+
+        view.read_with(cx, |view, _| {
+            let session = view.sessions.get(session).unwrap();
+            assert_eq!(view.editor().document().full_text(), edited_source);
+            assert!(session.is_dirty());
+            assert!(view.editor().can_undo());
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: SourceOffset(start),
+                    active: SourceOffset(end),
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
     fn a_disk_search_result_opens_through_the_existing_path_and_selects_its_utf8_range(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2349,6 +2561,123 @@ mod tests {
                 }
             );
             assert!(view.content_search.pending_navigation.is_none());
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_late_open_completion_does_not_override_the_newer_search_result_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::{OsWorkFolderScanner, WorkFolderScanner};
+
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hane-414-search-open-race-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("A.md");
+        let second = root.join("B.md");
+        let first_text = "先の文書 needle";
+        let second_text = "後の文書🙂 needle";
+        std::fs::write(&first, first_text).unwrap();
+        std::fs::write(&second, second_text).unwrap();
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let key = SearchKey {
+            workspace_epoch: 0,
+            query_epoch: 0,
+        };
+        let search_file = |path: &Path| {
+            let mut engine = SearchEngine::new(SearchRequest::new(
+                key,
+                SearchQuery::new("needle", false).unwrap(),
+                SearchCancellationToken::new(),
+            ))
+            .unwrap();
+            match engine.search_file(&OsFileService, path) {
+                SearchOutcome::File(result) => DisplayedSearchFile {
+                    key: result.key,
+                    target: result.target,
+                    version: result.version,
+                    identity: result.identity,
+                    label: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    hits: result.hits,
+                    completion: result.completion,
+                },
+                outcome => panic!("expected disk search result, got {outcome:?}"),
+            }
+        };
+        let first_result = search_file(&first);
+        let second_result = search_file(&second);
+        let second_start = second_text.find("needle").unwrap();
+        let second_end = second_start + "needle".len();
+        let second_hit = second_result.hits[0].clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.initialize_content_search_input(window, cx);
+                view.work_folder = Some(folder);
+                view.content_search.mode = SidebarMode::Content;
+                view.content_search.query_text = "needle".to_owned();
+                view.content_search.displayed_files = vec![first_result, second_result];
+                // Model two quick selections. The second navigation replaces
+                // the first before either load completion is applied.
+                let first_hit = view.content_search.displayed_files[0].hits[0].clone();
+                let first_navigation = PendingSearchNavigation {
+                    id: 1,
+                    key,
+                    target: SearchTarget::File(first.clone()),
+                    version: view.content_search.displayed_files[0].version,
+                    identity: view.content_search.displayed_files[0].identity.clone(),
+                    range: first_hit.range,
+                    context_range: first_hit.context_range,
+                    context_source: first_hit.context_source,
+                };
+                view.latest_open_target = Some(first.clone());
+                view.content_search.pending_navigation = Some(first_navigation);
+                view.content_search.authorized_navigation_id = Some(1);
+
+                let second_navigation = PendingSearchNavigation {
+                    id: 2,
+                    key,
+                    target: SearchTarget::File(second.clone()),
+                    version: view.content_search.displayed_files[1].version,
+                    identity: view.content_search.displayed_files[1].identity.clone(),
+                    range: second_hit.range,
+                    context_range: second_hit.context_range,
+                    context_source: second_hit.context_source,
+                };
+                view.latest_open_target = Some(second.clone());
+                view.content_search.pending_navigation = Some(second_navigation);
+                view.content_search.authorized_navigation_id = Some(2);
+
+                let generation = view.work_folder_generation;
+                view.finish_open(None, generation, &second, OsFileService.load(&second), cx);
+                // The first request completes after the user's newer choice.
+                view.finish_open(None, generation, &first, OsFileService.load(&first), cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active().path(), Some(second.as_path()));
+            assert_eq!(
+                view.editor().selection(),
+                Selection {
+                    anchor: SourceOffset(second_start),
+                    active: SourceOffset(second_end),
+                }
+            );
+            assert!(view.content_search.pending_navigation.is_none());
+            assert!(view.sessions.session_for_path(&first).is_some());
         });
         std::fs::remove_dir_all(root).unwrap();
     }
