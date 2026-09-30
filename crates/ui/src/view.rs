@@ -10784,6 +10784,112 @@ mod tests {
     }
 
     #[gpui::test]
+    fn copying_a_file_tabs_full_path_writes_it_to_the_clipboard(cx: &mut gpui::TestAppContext) {
+        // A directory and file name with both whitespace and Japanese text,
+        // to demonstrate the copied string is exactly `Path::display()`
+        // rather than something reassembled through a shell.
+        let path = PathBuf::from("メモ帳 用フォルダ/日本語 ノート.md");
+        let expected = path.display().to_string();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("body\n"),
+                identity: hane_session::FileIdentity::lexical(path),
+                stamp: None,
+            });
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("file tab rendered");
+        cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(expected)
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_none());
+            assert_eq!(view.status.as_deref(), Some("フルパスをコピーしました"));
+        });
+    }
+
+    #[gpui::test]
+    fn file_tab_context_menu_is_discarded_when_its_session_closes_through_a_work_folder_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let new_root = draft_test_root("context-menu-stale-switch");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(active_path),
+                stamp: None,
+            });
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_mouse_down(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            other_tab.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.file_tab_context_menu.is_some()));
+
+        // Switching work folders discards every old session wholesale,
+        // through a route other than the menu's own item handlers or
+        // `close_tab_now`, leaving behind a menu that still targets a
+        // `SessionId` the new `SessionSet` knows nothing about.
+        view.update(cx, |view, cx| {
+            view.switch_to_work_folder(new_root.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.file_tab_context_menu.is_none(),
+                "a menu left over from the discarded session must not linger"
+            );
+        });
+        assert!(cx.debug_bounds("file-tab-context-menu").is_none());
+
+        std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
     fn middle_click_closes_a_clean_non_active_tab_without_switching_active_session(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -11280,6 +11386,165 @@ mod tests {
         cx.simulate_keystrokes("ctrl-tab");
         cx.run_until_parked();
         assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), id);
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_the_sidebar_filter_is_focused(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        // Focus the editor's "HaneEditor" key context, which ctrl-tab is
+        // scoped to, the same way a real click would before typing, then
+        // move focus onto the sidebar filter the way a real click there
+        // does: setting the flag without changing the shared focus handle.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.sidebar_filter_focused = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.sidebar_filter_is_focused()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_inline_rename_is_active(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.inline_rename = Some(InlineRename {
+                kind: InlineRenameKind::File,
+                from: PathBuf::from("Alpha.md"),
+                text: "Alpha".to_owned(),
+                fixed_extension: Some("md".to_owned()),
+                selected_range: 0..5,
+                selection_reversed: false,
+                marked_range: None,
+                composition: None,
+                pending: false,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.inline_rename_active()));
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_during_ime_composition(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", Some(1..1))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(
+            view.read_with(cx, |view, _| view.editor().ime().is_some()),
+            "an in-progress IME composition must not be interrupted by the tab switch"
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_tab_does_not_switch_tabs_while_settings_is_open(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("one\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+
+        let first = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            view.sessions.open_untitled("two\n", "Second");
+            assert!(view.sessions.activate(first));
+            view.on_document_replaced();
+            cx.notify();
+            first
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+
+        cx.simulate_keystrokes("ctrl-tab");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |view, _| view.sessions.active_id()), first);
+        assert!(view.read_with(cx, |view, _| view.settings_open));
     }
 
     #[gpui::test]
