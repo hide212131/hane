@@ -432,3 +432,11 @@ PR #397 remains the implementation PR and Draft/Open; no CodeRabbit trigger, Dra
 - **T31 — partial.** Current-head CIはpass。ユーザーによるmacOS Settings → AI画面確認「問題なし」は前節のとおりユーザー報告として保持する。Windows native GUIは別セッションで検証中で、結果未受領。CodeRabbitはDraft PRのため`Review skipped: draft pull request`であり、submitted reviewはない。CIやmacOS画面確認をWindows GUIまたはreviewの代わりとは扱わない。
 
 この記録の対象head時点でIssue #379はOpen、PR #397はOpen/Draft、設計PR #392はOpen。T31のWindows GUI結果と、必要なcurrent-head review evidenceが揃うまで、完了・merge・Issue closeとは扱わない。
+
+### T00〜T31の検証対象commit対応
+
+- **T00:** profile生成コードは`f660763fe514ba734d722ca27af5bf1ea71a55c8`、実行対象は公式standalone `codex-app-server` `rust-v0.157.1`。実行・設定・request観測と限界は本書の2026-09-29 T00記録。
+- **T01〜T23:** AI backend automated tests。current source/evidence PR head `fcf2c3b131cef440a8bbfb4cdf6bdcba8c7be32e` のActions run [36740953612](https://github.com/hide212131/hane/actions/runs/36740953612) がworkspace testsを実行しpass。個別test名とpartial理由はPR #397の受入表に対応付ける。
+- **T24〜T28:** GPUI/UI automated testsも同じActions run `36740953612` / head `fcf2c3b131cef440a8bbfb4cdf6bdcba8c7be32e` のworkspace testsでpass。これらはnative Windows GUI/IMEの代用ではない。
+- **T29/T30:** 実OAuthと実Custom Providerの完了はユーザー報告。先行T29の観測記録は製品source commit `4f3d4113b3d5e2939c840e5efbce38f822251e27`のUI evidenceを含む。今回の完了報告に対応する各手動実行のbinary/source commitは別途記録されていないため、後から特定したかのようには記載しない。UI試験ではなく、PR表でユーザー報告passと明記する。
+- **T31:** CI対象headは`fcf2c3b131cef440a8bbfb4cdf6bdcba8c7be32e` / run `36740953612`。macOS Settings → AIのユーザー確認はproduct source `344e3a5b3b27f20d552c742a252bee0ca6e2667d`から作成したpreviewの報告。Windows native GUIは別セッションの結果未受領。CodeRabbitはDraftのため未レビュー。
