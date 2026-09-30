@@ -6107,12 +6107,19 @@ impl EditorView {
                 let label_element = div().min_w_0().truncate().child(label.clone());
                 let tab_content = if session.path().is_some() {
                     let full_path = session.label();
-                    HoverCard::new(format!("file-tab-path-{index}"))
+                    // Keyed by the session's own stable `SessionId`, not the
+                    // render `index`: closing or reordering an earlier tab
+                    // shifts later tabs into different indices every frame,
+                    // and an index-keyed `HoverCard` would let a session
+                    // that slides into a freed slot inherit whatever
+                    // hover/open UI state gpui already has cached under
+                    // that same id from the tab that used to live there.
+                    HoverCard::new(format!("file-tab-path-{}", id.0))
                         .anchor(Anchor::TopCenter)
                         .trigger(label_element)
                         .content(move |_, _, _| {
                             let path_for_copy = full_path.clone();
-                            let copy_button = Button::new(format!("copy-file-path-{index}"))
+                            let copy_button = Button::new(format!("copy-file-path-{}", id.0))
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Copy)
@@ -10887,6 +10894,236 @@ mod tests {
         assert!(cx.debug_bounds("file-tab-context-menu").is_none());
 
         std::fs::remove_dir_all(&new_root).unwrap();
+    }
+
+    #[gpui::test]
+    fn left_clicking_a_path_bearing_file_tab_activates_its_session(cx: &mut gpui::TestAppContext) {
+        // Both sessions have a real path, so both tabs render their label
+        // through the `HoverCard` trigger (`session.path().is_some()`)
+        // instead of the bare label used by path-less sessions. Left-click
+        // selection, driven by `TabBar::on_click`, must still reach the tab
+        // through that trigger.
+        let active_path = PathBuf::from("active.md");
+        let other_path = PathBuf::from("other.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("active\n"),
+                    identity: hane_session::FileIdentity::lexical(active_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let other = view.update(cx, |view, cx| {
+            let other = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+            other
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        let other_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("second tab rendered");
+        cx.simulate_click(other_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), other);
+        });
+    }
+
+    #[gpui::test]
+    fn a_file_tabs_identity_follows_its_own_session_after_an_earlier_tab_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Three path-bearing tabs. Closing the first one shifts the other
+        // two tabs' *index* down by one, while the `HoverCard` and its copy
+        // button are keyed by each session's own stable `SessionId` rather
+        // than that index. Left-click, middle-click and right-click on the
+        // tab that slides into the freed slot must all still resolve to the
+        // session actually showing there, with no path left over from the
+        // session that used to occupy that slot.
+        let first_path = PathBuf::from("first.md");
+        let second_path = PathBuf::from("second.md");
+        let third_path = PathBuf::from("third.md");
+        let expected_second_path = second_path.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("first\n"),
+                    identity: hane_session::FileIdentity::lexical(first_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        let (first, second, third) = view.update(cx, |view, cx| {
+            let first = view.sessions.active_id();
+            let second = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("second\n"),
+                    identity: hane_session::FileIdentity::lexical(second_path),
+                    stamp: None,
+                },
+            );
+            let third = view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("third\n"),
+                    identity: hane_session::FileIdentity::lexical(third_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(third));
+            cx.notify();
+            (first, second, third)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+
+        // Close the first (non-active) tab by the middle mouse button, the
+        // same way a user would.
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("first tab rendered");
+        cx.simulate_mouse_down(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            first_tab.center(),
+            MouseButton::Middle,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.sessions.get(first).is_none(),
+                "the closed tab's session must be gone"
+            );
+            assert_eq!(
+                view.sessions.active_id(),
+                third,
+                "closing a non-active tab must not switch the active session"
+            );
+        });
+
+        // `second` now renders at index 0 (`file-tab-first`), the slot the
+        // closed tab used to own. Left-click there must activate `second`,
+        // not leave the identity pointing at whatever used to live in that
+        // slot.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_click(reused_slot.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sessions.active_id(), second);
+        });
+
+        // Right-clicking that same reused slot must open a context menu
+        // targeting `second`'s own path, not a leftover reference to the
+        // closed tab or to `third`.
+        let reused_slot = cx
+            .debug_bounds("file-tab-first")
+            .expect("remaining first tab rendered");
+        cx.simulate_mouse_down(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            reused_slot.center(),
+            MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let menu_target_path = view
+                .file_tab_context_menu
+                .as_ref()
+                .and_then(|menu| view.sessions.get(menu.id))
+                .and_then(DocumentSession::path);
+            assert_eq!(menu_target_path, Some(expected_second_path.as_path()));
+        });
+    }
+
+    #[gpui::test]
+    fn a_long_path_file_tab_keeps_its_trigger_within_its_own_tab_bounds_in_a_narrow_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A very long absolute path, in a narrow window, so the
+        // always-visible tab trigger (as opposed to the `HoverCard`'s
+        // floating content, which this worker cannot drive a real hover
+        // into under `TestAppContext`) truncates to its own tab's width
+        // instead of pushing into, or overlapping, its neighbor, and does
+        // not grow the tab strip's fixed row height.
+        let long_path = PathBuf::from(
+            "very/deeply/nested/directory/structure/that/is/intentionally/long/document.md",
+        );
+        let other_path = PathBuf::from("b.md");
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(long_path),
+                    stamp: None,
+                }),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        view.update(cx, |view, cx| {
+            view.sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("body\n"),
+                    identity: hane_session::FileIdentity::lexical(other_path),
+                    stamp: None,
+                },
+            );
+            assert!(view.sessions.activate(SessionId(0)));
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(320.0), px(240.0)));
+        cx.run_until_parked();
+
+        let header_height = view.read_with(cx, |view, _| view.theme.header_height);
+        let header = cx.debug_bounds("file-tabs").expect("tab strip rendered");
+        let first_tab = cx
+            .debug_bounds("file-tab-first")
+            .expect("long-path tab rendered");
+        let last_tab = cx
+            .debug_bounds("file-tab-last")
+            .expect("other tab rendered");
+
+        assert!(
+            first_tab.right() <= last_tab.left(),
+            "the long-path tab's own trigger must not overlap its neighbor: {first_tab:?} vs {last_tab:?}"
+        );
+        assert_eq!(
+            header.size.height,
+            px(header_height),
+            "a long path must not grow the tab strip's fixed row height"
+        );
     }
 
     #[gpui::test]
