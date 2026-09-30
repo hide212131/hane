@@ -759,6 +759,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = temporary_directory("workfolder-search-targets");
+        #[cfg(unix)]
         let external = root.with_extension("external");
         fs::create_dir_all(root.join(".notes")).unwrap();
         fs::create_dir_all(root.join(".hane/drafts")).unwrap();
