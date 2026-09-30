@@ -11311,9 +11311,16 @@ mod tests {
     #[gpui::test]
     fn middle_click_dirty_tab_save_and_close_failure_leaves_it_open(cx: &mut gpui::TestAppContext) {
         let root = draft_test_root("tab-close-save-fails");
-        // The parent directory is deliberately never created, so the
-        // background write fails and the tab must not close.
-        let missing_path = root.join("missing-dir").join("note.md");
+        // `atomic_write` creates any missing parent directories on its own
+        // (needed so a save can recreate a folder deleted out from under a
+        // dirty session), so a merely-absent parent would not fail here. A
+        // plain file occupying the parent's name instead makes
+        // `fs::create_dir_all` fail for real, on every platform, so the
+        // write fails and the tab must not close.
+        std::fs::create_dir_all(&root).unwrap();
+        let blocking_file = root.join("missing-dir");
+        std::fs::write(&blocking_file, "blocking").unwrap();
+        let missing_path = blocking_file.join("note.md");
         let (view, cx) = cx.add_window_view(|_, cx| {
             EditorView::from_sessions(
                 SessionSet::with_loaded(LoadedFile {
@@ -11359,6 +11366,8 @@ mod tests {
             );
             assert!(view.status.as_deref().unwrap_or_default().contains("Save failed"));
         });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // A keystroke landing while the close-and-save write is already in
