@@ -198,7 +198,11 @@ impl EditorView {
     /// block granularity, and is what resolves a marker pair arbitrarily far
     /// apart in such a block without a fixed context window whose result
     /// would depend on where the viewport happens to sit.
-    pub(super) fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
+    pub(super) fn schedule_joined_parse(
+        &mut self,
+        blocks: &[IndexedBlock],
+        cx: &mut Context<Self>,
+    ) {
         let revision = self.editor().document().revision();
         for block in blocks {
             if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
