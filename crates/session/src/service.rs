@@ -1,7 +1,7 @@
 use crate::identity::{FileIdentity, FileStamp};
 use hane_document::RopeBuffer;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 #[cfg(any(target_os = "macos", windows, test))]
 use std::path::PathBuf;
@@ -15,6 +15,73 @@ pub struct LoadedFile {
     pub document: RopeBuffer,
     pub identity: FileIdentity,
     pub stamp: Option<FileStamp>,
+}
+
+/// A read-only file handle used by streaming features such as content search.
+/// It captures metadata before reading and can query the same open handle again
+/// after reading, without constructing a document session.
+pub struct ReadFile {
+    reader: Box<dyn StampedRead>,
+    stamp_at_open: Option<FileStamp>,
+    identity: FileIdentity,
+}
+
+impl ReadFile {
+    pub(crate) fn from_reader(
+        reader: impl StampedRead + 'static,
+        identity: FileIdentity,
+    ) -> io::Result<Self> {
+        let reader: Box<dyn StampedRead> = Box::new(reader);
+        let stamp_at_open = reader.current_stamp()?;
+        Ok(Self {
+            reader,
+            stamp_at_open,
+            identity,
+        })
+    }
+
+    /// Metadata captured from the opened handle before its first read.
+    #[must_use]
+    pub fn stamp_at_open(&self) -> Option<FileStamp> {
+        self.stamp_at_open
+    }
+
+    /// Metadata from the same open handle after a read has completed.
+    pub fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
+        self.reader.current_stamp()
+    }
+
+    /// File identity associated with the path used to open this handle.
+    #[must_use]
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+}
+
+impl Read for ReadFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buffer)
+    }
+}
+
+pub(crate) trait StampedRead: Read + Send {
+    fn current_stamp(&self) -> io::Result<Option<FileStamp>>;
+}
+
+struct OsStampedRead(fs::File);
+
+impl Read for OsStampedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl StampedRead for OsStampedRead {
+    fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
+        self.0
+            .metadata()
+            .map(|metadata| stamp_from_metadata(Some(metadata)))
+    }
 }
 
 /// The result of one successful write.
@@ -50,6 +117,9 @@ impl std::fmt::Display for SaveFailure {
 /// in an in-memory implementation without an async runtime.
 pub trait FileService: Send + Sync + 'static {
     fn load(&self, path: &Path) -> io::Result<LoadedFile>;
+
+    /// Opens a read-only stream without loading the document into a session.
+    fn open_reader(&self, path: &Path) -> io::Result<ReadFile>;
 
     /// Writes `document` to `path` atomically: a complete temporary file is
     /// renamed over the target, so a crash never leaves a half-written document.
@@ -114,6 +184,10 @@ pub enum OverwriteGuard {
 pub struct OsFileService;
 
 impl FileService for OsFileService {
+    fn open_reader(&self, path: &Path) -> io::Result<ReadFile> {
+        ReadFile::from_reader(OsStampedRead(fs::File::open(path)?), identity_for(path))
+    }
+
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {
         let file = fs::File::open(path)?;
         let stamp = stamp_from_metadata(file.metadata().ok());
@@ -480,6 +554,24 @@ mod tests {
         let loaded = OsFileService.load(&path).unwrap();
         assert!(saved.identity.is_same_file(&loaded.identity));
         assert_eq!(saved.stamp, loaded.stamp);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_streaming_reader_keeps_the_same_handle_for_both_stamps() {
+        let root = temporary_directory("streaming-reader");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("search.md");
+        fs::write(&path, "本文を少しずつ読む🙂\r\n").unwrap();
+
+        let mut reader = OsFileService.open_reader(&path).unwrap();
+        let before = reader.stamp_at_open().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        let after = reader.current_stamp().unwrap().unwrap();
+
+        assert_eq!(bytes, "本文を少しずつ読む🙂\r\n".as_bytes());
+        assert_eq!(before, after);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -359,6 +359,7 @@ impl EditorView {
         let Some(draft) = self.work_folder_drafts.remove(&id) else {
             return;
         };
+        self.content_search_workspace_changed(cx);
         let draft_id = draft.draft_id;
         let Some(root) = self
             .work_folder

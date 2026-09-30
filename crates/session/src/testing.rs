@@ -1,22 +1,99 @@
 //! In-memory doubles so the session rules can be tested without a filesystem.
 
 use crate::identity::{FileIdentity, FileStamp};
-use crate::service::{FileService, LoadedFile, SavedFile};
+use crate::service::{FileService, LoadedFile, ReadFile, SavedFile, StampedRead};
 use crate::workfolder::{WorkFolder, WorkFolderScanner};
 use hane_document::RopeBuffer;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+type MemoryFile = (Arc<[u8]>, u64);
 
 /// A filesystem that lives in a map. Writes bump a synthetic modification
 /// counter, so external-change detection can be exercised deterministically.
 #[derive(Debug, Default)]
 pub struct MemoryFileService {
-    files: Mutex<HashMap<PathBuf, (String, u64)>>,
+    files: Mutex<HashMap<PathBuf, MemoryFile>>,
     directories: Mutex<std::collections::HashSet<PathBuf>>,
+    reader_behaviors: Mutex<HashMap<PathBuf, MemoryReadBehavior>>,
+    load_calls: AtomicU64,
+    save_calls: AtomicU64,
     clock: AtomicU64,
+}
+
+/// Deterministic reader faults for tests of streaming search behavior.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryReadBehavior {
+    /// Largest byte count returned by one `read` call.
+    pub max_chunk_bytes: Option<usize>,
+    /// Return an I/O error after this many bytes have been read.
+    pub fail_after_bytes: Option<usize>,
+    /// Delay each non-empty read by this duration.
+    pub delay_per_read: Option<Duration>,
+    /// Report a changed stamp after this many bytes have been read.
+    pub change_stamp_after_bytes: Option<usize>,
+}
+
+struct MemoryStampedRead {
+    contents: Arc<[u8]>,
+    position: usize,
+    stamp: FileStamp,
+    behavior: MemoryReadBehavior,
+}
+
+impl io::Read for MemoryStampedRead {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if let Some(delay) = self.behavior.delay_per_read {
+            std::thread::sleep(delay);
+        }
+        if self
+            .behavior
+            .fail_after_bytes
+            .is_some_and(|limit| self.position >= limit)
+        {
+            return Err(io::Error::other("injected reader failure"));
+        }
+        let bytes = self.contents.as_ref();
+        if self.position == bytes.len() {
+            return Ok(0);
+        }
+        let mut count = buffer.len().min(bytes.len() - self.position);
+        if let Some(chunk_limit) = self.behavior.max_chunk_bytes {
+            count = count.min(chunk_limit.max(1));
+        }
+        if let Some(fail_after) = self.behavior.fail_after_bytes {
+            count = count.min(fail_after.saturating_sub(self.position));
+            if count == 0 {
+                return Err(io::Error::other("injected reader failure"));
+            }
+        }
+        buffer[..count].copy_from_slice(&bytes[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+impl StampedRead for MemoryStampedRead {
+    fn current_stamp(&self) -> io::Result<Option<FileStamp>> {
+        Ok(Some(
+            if self
+                .behavior
+                .change_stamp_after_bytes
+                .is_some_and(|limit| self.position >= limit)
+            {
+                FileStamp::new(self.stamp.len.wrapping_add(1), self.stamp.modified)
+            } else {
+                self.stamp
+            },
+        ))
+    }
 }
 
 impl MemoryFileService {
@@ -27,11 +104,35 @@ impl MemoryFileService {
     /// Seeds a file without going through the session, as if it were already on
     /// disk when the app started.
     pub fn write_externally(&self, path: impl AsRef<Path>, contents: &str) {
+        self.write_bytes_externally(path, contents.as_bytes());
+    }
+
+    /// Seeds arbitrary bytes, including invalid UTF-8, for reader tests.
+    pub fn write_bytes_externally(&self, path: impl AsRef<Path>, contents: &[u8]) {
         let version = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.files
             .lock()
             .expect("files lock")
-            .insert(canonical(path.as_ref()), (contents.to_owned(), version));
+            .insert(canonical(path.as_ref()), (Arc::from(contents), version));
+    }
+
+    /// Configures deterministic behavior for readers opened on `path`.
+    pub fn set_read_behavior(&self, path: impl AsRef<Path>, behavior: MemoryReadBehavior) {
+        self.reader_behaviors
+            .lock()
+            .expect("reader behaviors lock")
+            .insert(canonical(path.as_ref()), behavior);
+    }
+
+    /// Number of times `load` has been called, for asserting search does not
+    /// create document sessions by loading files.
+    pub fn load_calls(&self) -> u64 {
+        self.load_calls.load(Ordering::Relaxed)
+    }
+
+    /// Number of times `save` has been called.
+    pub fn save_calls(&self) -> u64 {
+        self.save_calls.load(Ordering::Relaxed)
     }
 
     pub fn delete(&self, path: impl AsRef<Path>) {
@@ -56,7 +157,7 @@ impl MemoryFileService {
             .lock()
             .expect("files lock")
             .get(&canonical(path.as_ref()))
-            .map(|(contents, _)| contents.clone())
+            .and_then(|(contents, _)| String::from_utf8(contents.to_vec()).ok())
     }
 
     /// Whether `create_dir` has been called for `path` (or an ancestor of it
@@ -70,13 +171,45 @@ impl MemoryFileService {
 }
 
 impl FileService for MemoryFileService {
+    fn open_reader(&self, path: &Path) -> io::Result<ReadFile> {
+        let key = canonical(path);
+        let (contents, version) = self
+            .files
+            .lock()
+            .expect("files lock")
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+        let behavior = self
+            .reader_behaviors
+            .lock()
+            .expect("reader behaviors lock")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let stamp = FileStamp::new((contents.len() as u64) ^ (version << 32), None);
+        ReadFile::from_reader(
+            MemoryStampedRead {
+                contents,
+                position: 0,
+                stamp,
+                behavior,
+            },
+            FileIdentity::lexical(path),
+        )
+    }
+
     fn load(&self, path: &Path) -> io::Result<LoadedFile> {
+        self.load_calls.fetch_add(1, Ordering::Relaxed);
         let files = self.files.lock().expect("files lock");
         let (contents, version) = files
             .get(&canonical(path))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
         Ok(LoadedFile {
-            document: RopeBuffer::from_text(contents),
+            document: RopeBuffer::from_text(
+                std::str::from_utf8(contents)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            ),
             identity: FileIdentity::lexical(path),
             stamp: Some(FileStamp::new(contents.len() as u64, None)).map(|stamp| FileStamp {
                 len: stamp.len ^ (*version << 32),
@@ -86,6 +219,7 @@ impl FileService for MemoryFileService {
     }
 
     fn save(&self, path: &Path, document: &RopeBuffer) -> io::Result<SavedFile> {
+        self.save_calls.fetch_add(1, Ordering::Relaxed);
         let mut contents = Vec::new();
         document.write_to(&mut contents)?;
         let contents = String::from_utf8(contents)
@@ -95,7 +229,7 @@ impl FileService for MemoryFileService {
         self.files
             .lock()
             .expect("files lock")
-            .insert(canonical(path), (contents, version));
+            .insert(canonical(path), (Arc::from(contents.into_bytes()), version));
         Ok(SavedFile {
             identity: FileIdentity::lexical(path),
             stamp: Some(stamp),

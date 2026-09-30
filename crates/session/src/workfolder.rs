@@ -754,6 +754,52 @@ mod tests {
     }
 
     #[test]
+    fn scanner_keeps_gitignored_and_hidden_notes_but_skips_root_state() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_directory("workfolder-search-targets");
+        let external = root.with_extension("external");
+        fs::create_dir_all(root.join(".notes")).unwrap();
+        fs::create_dir_all(root.join(".hane/drafts")).unwrap();
+        fs::create_dir_all(root.join("nested/.hane")).unwrap();
+        #[cfg(unix)]
+        fs::create_dir_all(&external).unwrap();
+        fs::write(root.join(".gitignore"), "Ignored.md\n").unwrap();
+        fs::write(root.join("Ignored.md"), "gitignored but indexed\n").unwrap();
+        fs::write(root.join(".notes/private.MD"), "hidden note\n").unwrap();
+        fs::write(root.join(".hane/drafts/draft.md"), "Hane state\n").unwrap();
+        fs::write(
+            root.join("nested/.hane/user.md"),
+            "nested Hane-looking notes\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::write(external.join("Outside.md"), "outside target\n").unwrap();
+        #[cfg(unix)]
+        symlink(&external, root.join("linked")).unwrap();
+
+        let folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let paths: Vec<_> = folder
+            .entries()
+            .into_iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect();
+
+        assert_eq!(
+            paths,
+            [
+                root.join(".notes/private.MD"),
+                root.join("Ignored.md"),
+                root.join("nested/.hane/user.md"),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+        #[cfg(unix)]
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
     fn a_missing_root_is_reported_as_an_error() {
         let root = temporary_directory("workfolder-missing");
         assert!(OsWorkFolderScanner.scan(&root).is_err());
