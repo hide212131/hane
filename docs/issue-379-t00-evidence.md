@@ -413,3 +413,22 @@ PR #397 remains the implementation PR and Draft/Open; no CodeRabbit trigger, Dra
 - Current PR head `989b1c6bbb0461723d259c7c049af1be40b36aef` の `cargo fmt --all -- --check` はfailし、150 formatter diffs / 15 filesを報告しました。log: `/tmp/hane379-final-20261001-cargo-fmt.log`。
 - Current base `main` `145188eef1f1353cfd903b0277458ece71ea8831` をdetached worktreeで同じcommandにかけてもfailし、339 formatter diffs / 22 filesを報告しました。PR head側に現れる15ファイルはすべてmain baseline側にも現れます。log: `/tmp/hane379-final-20261001-main-fmt.log`。
 - `crates/ai/tests/runtime_lifecycle.rs` のcurrent-head formatter hunksは既存の別箇所（source lines 737と873）で、今回変更した2テストにはかかっていません。今回の停止テスト修正に起因するfull-workspace format failureとは扱いません。全体の既存書式はこのIssue対応に混ぜて一括整形しません。
+
+## 2026-10-01 non-Windows completion pass at PR head `01a89af`
+
+開始時のGitHub facts: Issue #379 Open、PR #397 Open/Draft at `01a89af21868816637e1d5663b2e14eb21b131d1` / base `145188eef1f1353cfd903b0277458ece71ea8831`、設計PR #392 Open at `025c53d0d03a9ecc2a221d80257d88e59b6c5dfd`。実装branchは`feat/379-chatgpt-codex-oauth-ai-settings`で、検証開始時のworking treeはcleanでした。
+
+### Current-head verification
+
+- Cargo package名をtest target `hane_ai`で確認し、`cargo test -p hane-ai --locked`を実行: **pass, 181 tests**（134 unit、11 account-service、16 Custom Provider runtime、20 runtime lifecycle）。log: `/tmp/hane379-final-20261001-head-01a89/cargo-test-hane-ai.log`。
+- `cargo fmt --all -- --check`: **fail, 150 formatter diffs / 15 files**。log: `/tmp/hane379-final-20261001-head-01a89/cargo-fmt-all-check.log`。直前の比較では、current main `145188eef1f1353cfd903b0277458ece71ea8831`も339 diffs / 22 filesでfailし、PR側15ファイルはすべてbaselineにも存在した。比較log: `/tmp/hane379-final-20261001-main-fmt.log`。既存のworkspace-wide書式をこのIssueへ混ぜて一括整形していない。
+- Actions [run 36739984929](https://github.com/hide212131/hane/actions/runs/36739984929): exact head `01a89af21868816637e1d5663b2e14eb21b131d1`, base `145188eef1f1353cfd903b0277458ece71ea8831`。required-check detector、macOS/Windows workspace testsとClippy、macOS固有fallback glyph/input-source testsは **all pass**。
+- `git diff --check`: **pass**。PR branchはrun開始時点でclean。
+
+### Acceptance status and remaining GUI/review evidence
+
+- **T29 — user-reported complete.** 本会話でユーザーがT29完了を再確認。先行記録には実ChatGPT OAuth、モデル一覧、固定Probe応答の観測がある。今回のnon-Windows検証ではOAuthを再実行せず、token/account identifierは記録していない。
+- **T30 — user-reported complete.** 本会話でユーザーがT30完了を再確認。先行スクリーンショットは保存済みCustom設定/API keyの存在を示す一方、その撮影時点では応答確認が未実行だった。その後のユーザー完了報告を記録し、今回Providerへ再接続していない。endpoint、key、response bodyは記録していない。
+- **T31 — partial.** Current-head CIはpass。ユーザーによるmacOS Settings → AI画面確認「問題なし」は前節のとおりユーザー報告として保持する。Windows native GUIは別セッションで検証中で、結果未受領。CodeRabbitはDraft PRのため`Review skipped: draft pull request`であり、submitted reviewはない。CIやmacOS画面確認をWindows GUIまたはreviewの代わりとは扱わない。
+
+この記録の対象head時点でIssue #379はOpen、PR #397はOpen/Draft、設計PR #392はOpen。T31のWindows GUI結果と、必要なcurrent-head review evidenceが揃うまで、完了・merge・Issue closeとは扱わない。
