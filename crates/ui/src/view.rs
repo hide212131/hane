@@ -5920,11 +5920,10 @@ const REVEAL_IN_FILE_MANAGER_LABEL: &str = "Finderで保存場所を開く";
 const REVEAL_IN_FILE_MANAGER_LABEL: &str = "エクスプローラーで保存場所を開く";
 
 impl EditorView {
-    /// One row of the tab context menu. Always wired to `on_click` even when
-    /// `enabled` is false, the same as the pre-existing VSCode item: the
-    /// handler itself is what refuses a path-less document, so there is one
-    /// place that owns that rule instead of duplicating the check into every
-    /// caller that builds a row.
+    /// One row of the tab context menu. `on_click` is only wired when
+    /// `enabled` is true, so a path-less document (e.g. an untitled buffer)
+    /// does not connect a click action for path-dependent rows at all,
+    /// instead of relying on the handler to refuse the click after the fact.
     fn file_tab_context_menu_item(
         &self,
         key: &'static str,
@@ -5940,16 +5939,16 @@ impl EditorView {
             .px_2()
             .py_1()
             .rounded_sm()
-            .when(enabled, |element| {
+            .when(enabled, move |element| {
                 element
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(self.theme.sidebar_active_background)))
+                    .on_click(cx.listener(on_click))
             })
             .when(!enabled, |element| {
                 element.text_color(rgb(self.theme.quote_foreground))
             })
             .child(label)
-            .on_click(cx.listener(on_click))
     }
 
     fn file_tab_context_menu_element(
@@ -10725,7 +10724,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_tab_context_menu_handles_an_untitled_session_without_spawning(
+    fn file_tab_context_menu_disables_path_dependent_items_for_an_untitled_session(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
@@ -10738,9 +10737,12 @@ mod tests {
         cx.simulate_mouse_down(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.simulate_mouse_up(tab.center(), MouseButton::Right, gpui::Modifiers::none());
         cx.run_until_parked();
-        let item = cx
+        let vscode_item = cx
             .debug_bounds("file-tab-context-open-vscode")
             .expect("context menu item rendered");
+        let copy_item = cx
+            .debug_bounds("file-tab-context-copy-path")
+            .expect("copy-path item rendered");
         view.read_with(cx, |view, _| {
             let menu_target_path = view
                 .file_tab_context_menu
@@ -10750,15 +10752,23 @@ mod tests {
             assert!(menu_target_path.is_none());
         });
 
-        cx.simulate_click(item.center(), gpui::Modifiers::none());
+        // Path-dependent rows for an untitled document have no `on_click`
+        // wired at all, so clicking them must not invoke the handler, show
+        // a status message, or close the still-open menu.
+        cx.simulate_click(vscode_item.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            assert!(view.file_tab_context_menu.is_none());
-            assert_eq!(
-                view.status.as_deref(),
-                Some("VSCodeで開くにはファイルを保存してください")
-            );
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
         });
+
+        cx.simulate_click(copy_item.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.file_tab_context_menu.is_some());
+            assert_eq!(view.status, None);
+        });
+        assert_eq!(cx.read_from_clipboard().and_then(|item| item.text()), None);
     }
 
     #[gpui::test]
