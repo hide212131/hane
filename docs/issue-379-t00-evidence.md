@@ -407,3 +407,9 @@ PR #397 remains the implementation PR and Draft/Open; no CodeRabbit trigger, Dra
 - `cargo fmt --all -- --check`: **fail**。repository全体に残る既存format差分を検出し、`runtime_lifecycle.rs` も今回のテスト変更とは別の既存箇所にformat差分があります。今回編集したテスト関数は出力対象になっていません。log: `/tmp/hane379-ci-flake-cf0c6fc/cargo-fmt-all-check.log`。統合後headでの `git diff --check` はpass。
 - **T31 CI部分のみpass:** current-base Actionsはpassしましたが、Windows native GUI確認は別セッション待ちのためT31全体はpartialのままです。CI成功をnative GUIや実OAuth/Custom接続の証拠には使いません。T00のstandalone安全profileは変更していません。
 - PR #397はOpen/Draftのままです。CodeRabbit review起動、Draft解除、merge、Issue closeは行っていません。
+
+### cargo fmt baseline comparison (2026-10-01)
+
+- Current PR head `989b1c6bbb0461723d259c7c049af1be40b36aef` の `cargo fmt --all -- --check` はfailし、150 formatter diffs / 15 filesを報告しました。log: `/tmp/hane379-final-20261001-cargo-fmt.log`。
+- Current base `main` `145188eef1f1353cfd903b0277458ece71ea8831` をdetached worktreeで同じcommandにかけてもfailし、339 formatter diffs / 22 filesを報告しました。PR head側に現れる15ファイルはすべてmain baseline側にも現れます。log: `/tmp/hane379-final-20261001-main-fmt.log`。
+- `crates/ai/tests/runtime_lifecycle.rs` のcurrent-head formatter hunksは既存の別箇所（source lines 737と873）で、今回変更した2テストにはかかっていません。今回の停止テスト修正に起因するfull-workspace format failureとは扱いません。全体の既存書式はこのIssue対応に混ぜて一括整形しません。
