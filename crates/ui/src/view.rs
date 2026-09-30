@@ -11499,6 +11499,160 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // Issue #411: `is_dirty()` alone cannot gate whether the close-and-save
+    // request's *own* write succeeded, because an unrelated earlier save can
+    // already have left the document reading as clean by the time this
+    // write's result comes back. Here the setup save lands and cleans the
+    // document *before* the close-and-close request's write is even
+    // started, so the session is clean for the request's entire lifetime;
+    // that write still refuses as a conflict, and it alone — not the
+    // coincidentally clean document — must decide whether the tab closes.
+    #[gpui::test]
+    fn tab_close_after_save_drops_request_when_its_own_write_conflicts_although_the_document_already_reads_as_clean(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-after-clean");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.save_current(cx);
+            id
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().is_dirty(),
+                "the setup save must land and clean the document before the race begins"
+            );
+        });
+
+        // Someone else changes the file on disk only after the document is
+        // already clean, so nothing in the session's own state (revision,
+        // dirty flag) reflects the conflict the request's write is about to
+        // hit.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+
+        view.update(cx, |view, cx| {
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "a conflicting save must not close the tab merely because the document already read as clean"
+            );
+            assert!(!view.sessions.active().is_dirty());
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "a refused save must drop the close request rather than let a coincidentally clean document close it"
+            );
+            assert!(
+                view.status
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("changed on disk")
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's edit, longer than before",
+            "a refused save must never overwrite the conflicting content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Issue #411: a save queued behind the close-and-save write (in
+    // `DocumentSession`'s own `pending_save` slot, not a fresh, independent
+    // request) must not inherit a close request its predecessor already
+    // dropped. The predecessor here — the request's own write — refuses as a
+    // conflict; the queued save behind it is a resolved-conflict overwrite
+    // retry, which the requeue in `finish_save` starts immediately and which
+    // goes on to succeed. That success is real and unrelated to whether the
+    // *original* request should close anything, so it must not resurrect a
+    // close request `finish_save` already dropped for the conflict.
+    #[gpui::test]
+    fn a_save_queued_behind_a_conflicting_close_request_does_not_resurrect_the_dropped_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = draft_test_root("tab-close-save-conflict-then-queued-overwrite-succeeds");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+            view.confirm_save_and_close_tab(id, cx);
+            assert!(view.sessions.active().save_in_flight());
+            // Queued behind the close request's own write, which is still in
+            // flight: this is the same "save again to overwrite" retry the
+            // conflict status message below points the user at, arriving
+            // before that write's result is even known.
+            view.save_session(id, SaveIntent::Overwrite, cx);
+            id
+        });
+        // Someone else changes the file on disk before the close request's
+        // own write is polled, so its overwrite guard's stamp check fails
+        // it; the queued retry's `Force` guard is unaffected and must still
+        // land once it runs.
+        std::fs::write(&path, "someone else's edit, longer than before").unwrap();
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.len(),
+                1,
+                "the queued retry succeeding must not close a tab whose own close request conflicted"
+            );
+            assert!(!view.sessions.active().is_dirty(), "the queued retry must still land");
+            assert!(
+                !view.tab_close_after_save.contains_key(&id),
+                "the conflicting write must drop the close request rather than let a later, unrelated write's success act on it"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before after",
+            "the queued overwrite retry must still land its own content"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Canceling the Save As dialog that a close-and-save request opens for
     // an untitled document must leave the document open, the same as
     // canceling Save As any other time does; the close request must not
