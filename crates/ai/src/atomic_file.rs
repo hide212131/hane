@@ -99,11 +99,20 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Atomic
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(AtomicWriteError::NotPersisted)?;
-    let stem = path.file_name().and_then(|name| name.to_str()).unwrap_or("hane-ai");
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("hane-ai");
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(".{stem}.hane-ai-{}-{sequence}.tmp", std::process::id()));
+    let temporary = parent.join(format!(
+        ".{stem}.hane-ai-{}-{sequence}.tmp",
+        std::process::id()
+    ));
     let write_result: io::Result<()> = (|| {
-        let file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(bytes)?;
         writer.flush()?;
@@ -119,11 +128,12 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Atomic
             // reported distinctly from an outright "did not persist".
             #[cfg(test)]
             if fault_injection::take_should_fail(path) {
-                return Err(AtomicWriteError::RenameSucceededSyncFailed(io::Error::other(
-                    "injected parent directory fsync failure for testing",
-                )));
+                return Err(AtomicWriteError::RenameSucceededSyncFailed(
+                    io::Error::other("injected parent directory fsync failure for testing"),
+                ));
             }
-            fsync_parent_dir_after_rename(parent).map_err(AtomicWriteError::RenameSucceededSyncFailed)
+            fsync_parent_dir_after_rename(parent)
+                .map_err(AtomicWriteError::RenameSucceededSyncFailed)
         }
         Err(e) => {
             let _ = fs::remove_file(&temporary);
@@ -146,16 +156,23 @@ mod tests {
 
     #[test]
     fn atomic_write_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!("hane-ai-atomic-file-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hane-ai-atomic-file-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("value.json");
 
         assert_eq!(read_to_string_if_exists(&path).unwrap(), None);
         atomic_write_bytes(&path, b"{\"a\":1}").unwrap();
-        assert_eq!(read_to_string_if_exists(&path).unwrap().as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            read_to_string_if_exists(&path).unwrap().as_deref(),
+            Some("{\"a\":1}")
+        );
 
         atomic_write_bytes(&path, b"{\"a\":2}").unwrap();
-        assert_eq!(read_to_string_if_exists(&path).unwrap().as_deref(), Some("{\"a\":2}"));
+        assert_eq!(
+            read_to_string_if_exists(&path).unwrap().as_deref(),
+            Some("{\"a\":2}")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -167,7 +184,10 @@ mod tests {
         // replace its content each time (never merge/append) and must never
         // leave a `.<name>.hane-ai-*.tmp` sibling behind once a write
         // succeeds.
-        let dir = std::env::temp_dir().join(format!("hane-ai-atomic-file-test-replace-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-atomic-file-test-replace-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("value.json");
 
@@ -175,7 +195,10 @@ mod tests {
         atomic_write_bytes(&path, b"second-and-longer").unwrap();
         atomic_write_bytes(&path, b"third").unwrap();
 
-        assert_eq!(read_to_string_if_exists(&path).unwrap().as_deref(), Some("third"));
+        assert_eq!(
+            read_to_string_if_exists(&path).unwrap().as_deref(),
+            Some("third")
+        );
 
         let leftover_temp_files: Vec<_> = fs::read_dir(&dir)
             .unwrap()
@@ -197,8 +220,10 @@ mod tests {
         // case: the caller must be told this is not the same as "nothing was
         // written" (see `crate::connect::update_custom_credential`, which
         // must not delete a freshly written credential on this outcome).
-        let dir = std::env::temp_dir()
-            .join(format!("hane-ai-atomic-file-test-ambiguous-durability-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hane-ai-atomic-file-test-ambiguous-durability-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("value.json");
 
@@ -211,12 +236,18 @@ mod tests {
 
         // The rename itself must have landed regardless of the reported
         // error: any reader opening `path` now sees the new content.
-        assert_eq!(read_to_string_if_exists(&path).unwrap().as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            read_to_string_if_exists(&path).unwrap().as_deref(),
+            Some("{\"a\":1}")
+        );
 
         // The fault is consumed exactly once: the next write for the same
         // path is unaffected.
         atomic_write_bytes(&path, b"{\"a\":2}").unwrap();
-        assert_eq!(read_to_string_if_exists(&path).unwrap().as_deref(), Some("{\"a\":2}"));
+        assert_eq!(
+            read_to_string_if_exists(&path).unwrap().as_deref(),
+            Some("{\"a\":2}")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

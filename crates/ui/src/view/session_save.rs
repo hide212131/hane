@@ -440,7 +440,12 @@ impl EditorView {
 
     /// Hands one accepted write to the I/O boundary. The session decides whether
     /// there is a write to do at all; the view only reports what happened.
-    pub(super) fn save_session(&mut self, id: SessionId, intent: SaveIntent, cx: &mut Context<Self>) {
+    pub(super) fn save_session(
+        &mut self,
+        id: SessionId,
+        intent: SaveIntent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(decision) = self
             .sessions
             .get_mut(id)

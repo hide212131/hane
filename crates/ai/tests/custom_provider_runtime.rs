@@ -26,11 +26,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hane_ai::{
-    build_custom_provider_material, build_runtime_config_for_active_connection, call_with_generation_check,
-    update_custom_credential, with_generation_checked_lock, write_codex_config, ActiveConnection, AiPaths, AiSettings,
-    AiSettingsStore, AiRuntime, ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore,
-    CustomConnectionSettings, ExpectedCredentialState, FakeCredentialStore, RejectAllServerRequests, RuntimeConfig,
-    RuntimeError, RuntimeState, SaveError, ShellEnvironmentPolicyFormat, CUSTOM_PROVIDER_ENV_KEY,
+    ActiveConnection, AiPaths, AiRuntime, AiSettings, AiSettingsStore, CUSTOM_PROVIDER_ENV_KEY,
+    ChatGptConnectionSettings, ConnectError, CredentialJournal, CredentialStore,
+    CustomConnectionSettings, ExpectedCredentialState, FakeCredentialStore,
+    RejectAllServerRequests, RuntimeConfig, RuntimeError, RuntimeState, SaveError,
+    ShellEnvironmentPolicyFormat, build_custom_provider_material,
+    build_runtime_config_for_active_connection, call_with_generation_check,
+    update_custom_credential, with_generation_checked_lock, write_codex_config,
 };
 
 fn unique_dir(name: &str) -> PathBuf {
@@ -51,6 +53,9 @@ fn fake_server_config(name: &str) -> (RuntimeConfig, PathBuf) {
     config.stop_grace_timeout = Duration::from_millis(500);
     config.stop_force_timeout = Duration::from_secs(5);
     config.codex_home = Some(dir.join("codex-home"));
+    config.working_directory = Some(dir.join("working-directory"));
+    std::fs::create_dir_all(config.codex_home.as_ref().unwrap()).unwrap();
+    std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
     (config, dir)
 }
 
@@ -67,12 +72,14 @@ fn spawn_and_start(config: RuntimeConfig) -> AiRuntime {
 fn custom_provider_key_reaches_only_the_spawned_child_process_environment() {
     let (mut config, dir) = fake_server_config("env_routing");
     let record_file = dir.join("env-record.txt");
-    config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_FILE".to_string(), record_file.to_string_lossy().to_string()));
-    config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_VARS".to_string(), CUSTOM_PROVIDER_ENV_KEY.to_string()));
+    config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_FILE".to_string(),
+        record_file.to_string_lossy().to_string(),
+    ));
+    config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_VARS".to_string(),
+        CUSTOM_PROVIDER_ENV_KEY.to_string(),
+    ));
 
     let material = build_custom_provider_material(
         "My Provider",
@@ -99,12 +106,14 @@ fn custom_provider_key_reaches_only_the_spawned_child_process_environment() {
 fn rotating_the_custom_provider_key_never_reaches_the_old_child() {
     let (mut first_config, dir) = fake_server_config("key_rotation");
     let record_file = dir.join("env-record.txt");
-    first_config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_FILE".to_string(), record_file.to_string_lossy().to_string()));
-    first_config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_VARS".to_string(), CUSTOM_PROVIDER_ENV_KEY.to_string()));
+    first_config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_FILE".to_string(),
+        record_file.to_string_lossy().to_string(),
+    ));
+    first_config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_VARS".to_string(),
+        CUSTOM_PROVIDER_ENV_KEY.to_string(),
+    ));
     let first_material = build_custom_provider_material(
         "My Provider",
         "https://provider.example/v1",
@@ -113,7 +122,9 @@ fn rotating_the_custom_provider_key_never_reaches_the_old_child() {
         ShellEnvironmentPolicyFormat::Filters,
     )
     .unwrap();
-    first_config.extra_env.extend(first_material.extra_env.clone());
+    first_config
+        .extra_env
+        .extend(first_material.extra_env.clone());
 
     let first_runtime = spawn_and_start(first_config.clone());
     let _ = first_runtime.stop();
@@ -124,7 +135,9 @@ fn rotating_the_custom_provider_key_never_reaches_the_old_child() {
     // restarts the runtime with a freshly generated `RuntimeConfig`, never
     // reusing the old process or its environment).
     let mut second_config = first_config;
-    second_config.extra_env.retain(|(k, _)| k != CUSTOM_PROVIDER_ENV_KEY);
+    second_config
+        .extra_env
+        .retain(|(k, _)| k != CUSTOM_PROVIDER_ENV_KEY);
     let second_material = build_custom_provider_material(
         "My Provider",
         "https://provider.example/v1",
@@ -133,17 +146,23 @@ fn rotating_the_custom_provider_key_never_reaches_the_old_child() {
         ShellEnvironmentPolicyFormat::Filters,
     )
     .unwrap();
-    second_config.extra_env.extend(second_material.extra_env.clone());
+    second_config
+        .extra_env
+        .extend(second_material.extra_env.clone());
 
     let second_runtime = spawn_and_start(second_config);
     let _ = second_runtime.stop();
 
     let recorded = std::fs::read_to_string(&record_file).unwrap();
     let lines: Vec<&str> = recorded.lines().collect();
-    assert_eq!(lines, vec![
-        format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-first-secret"),
-        format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-second-secret"),
-    ], "each child must see only the key generated for its own generation, never the other's");
+    assert_eq!(
+        lines,
+        vec![
+            format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-first-secret"),
+            format!("ENV:{CUSTOM_PROVIDER_ENV_KEY}=sk-second-secret"),
+        ],
+        "each child must see only the key generated for its own generation, never the other's"
+    );
 }
 
 #[test]
@@ -157,12 +176,14 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
     // lock to a would-be new owner) in between.
     let (mut first_config, dir) = fake_server_config("reconfigure_rotation");
     let record_file = dir.join("env-record.txt");
-    first_config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_FILE".to_string(), record_file.to_string_lossy().to_string()));
-    first_config
-        .extra_env
-        .push(("FAKE_SERVER_RECORD_ENV_VARS".to_string(), CUSTOM_PROVIDER_ENV_KEY.to_string()));
+    first_config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_FILE".to_string(),
+        record_file.to_string_lossy().to_string(),
+    ));
+    first_config.extra_env.push((
+        "FAKE_SERVER_RECORD_ENV_VARS".to_string(),
+        CUSTOM_PROVIDER_ENV_KEY.to_string(),
+    ));
     let first_material = build_custom_provider_material(
         "My Provider",
         "https://provider.example/v1",
@@ -171,14 +192,18 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
         ShellEnvironmentPolicyFormat::Filters,
     )
     .unwrap();
-    first_config.extra_env.extend(first_material.extra_env.clone());
+    first_config
+        .extra_env
+        .extend(first_material.extra_env.clone());
     let first_owner_lock_path = first_config.owner_lock_path.clone();
 
     let runtime = spawn_and_start(first_config.clone());
     let first_status = runtime.snapshot();
 
     let mut second_config = first_config;
-    second_config.extra_env.retain(|(k, _)| k != CUSTOM_PROVIDER_ENV_KEY);
+    second_config
+        .extra_env
+        .retain(|(k, _)| k != CUSTOM_PROVIDER_ENV_KEY);
     let second_material = build_custom_provider_material(
         "My Provider",
         "https://provider.example/v1",
@@ -187,9 +212,13 @@ fn reconfigure_rotates_the_custom_provider_key_on_the_same_runtime_without_dropp
         ShellEnvironmentPolicyFormat::Filters,
     )
     .unwrap();
-    second_config.extra_env.extend(second_material.extra_env.clone());
+    second_config
+        .extra_env
+        .extend(second_material.extra_env.clone());
 
-    let reconfigured = runtime.reconfigure(second_config, 1).expect("reconfigure should succeed");
+    let reconfigured = runtime
+        .reconfigure(second_config, 1)
+        .expect("reconfigure should succeed");
     assert_eq!(reconfigured.state, RuntimeState::Ready);
     assert!(
         reconfigured.generation > first_status.generation,
@@ -236,8 +265,11 @@ fn with_owner_lock_lets_a_normal_settings_save_happen_while_this_runtime_holds_t
         "a separate OwnerLock instance must not be able to acquire the lock while this runtime is active"
     );
 
-    let settings_store =
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+    let settings_store = AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    );
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
 
@@ -276,10 +308,16 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
     let owner_lock_path = config.owner_lock_path.clone();
 
     let owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
-    let owner = owner_lock.try_acquire().unwrap().expect("no other process holds the owner lock yet");
+    let owner = owner_lock
+        .try_acquire()
+        .unwrap()
+        .expect("no other process holds the owner lock yet");
 
-    let settings_store =
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+    let settings_store = AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    );
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
     let saved = update_custom_credential(
@@ -287,7 +325,10 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
         &owner,
         &journal,
         &credential_store,
-        ExpectedCredentialState { revision: 0, credential_ref: None },
+        ExpectedCredentialState {
+            revision: 0,
+            credential_ref: None,
+        },
         "sk-boot",
         |new_ref| custom_settings_for(Some(new_ref.clone())),
     )
@@ -297,7 +338,9 @@ fn start_with_owner_lock_reuses_an_externally_acquired_owner_lock_without_a_gap(
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(config, handler, events_tx);
-    let status = runtime.start_with_owner_lock(owner).expect("start_with_owner_lock should succeed");
+    let status = runtime
+        .start_with_owner_lock(owner)
+        .expect("start_with_owner_lock should succeed");
     assert_eq!(status.state, RuntimeState::Ready);
 
     // A separate `OwnerLock` instance still cannot acquire it: the same
@@ -335,7 +378,11 @@ fn start_with_owner_lock_rejects_a_guard_acquired_against_a_different_path() {
         matches!(result, Err(RuntimeError::OwnerLockPathMismatch)),
         "expected OwnerLockPathMismatch, got {result:?}"
     );
-    assert_eq!(runtime.snapshot().state, RuntimeState::Stopped, "no child must be spawned on a mismatched guard");
+    assert_eq!(
+        runtime.snapshot().state,
+        RuntimeState::Stopped,
+        "no child must be spawned on a mismatched guard"
+    );
 
     // This runtime's own owner lock was never touched by the rejected guard,
     // so it is still free for its rightful owner to acquire.
@@ -352,7 +399,8 @@ fn start_with_owner_lock_rejects_a_guard_acquired_against_a_different_path() {
 /// the first is dropped, the lock becomes available and the new owner can
 /// save normally.
 #[test]
-fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner_releases_the_lock() {
+fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner_releases_the_lock()
+{
     let dir = unique_dir("non_owner_rejected");
     let owner_lock_path = dir.join("owner.lock");
     let first_owner_lock = hane_ai::OwnerLock::new(&owner_lock_path);
@@ -365,9 +413,15 @@ fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner
     );
 
     drop(first);
-    let second = second_owner_lock.try_acquire().unwrap().expect("the lock becomes available once the owner releases it");
-    let settings_store =
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
+    let second = second_owner_lock
+        .try_acquire()
+        .unwrap()
+        .expect("the lock becomes available once the owner releases it");
+    let settings_store = AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    );
     let journal = CredentialJournal::new(dir.join("credential-journal.json"));
     let credential_store = FakeCredentialStore::new();
     update_custom_credential(
@@ -375,7 +429,10 @@ fn a_non_owner_cannot_obtain_the_proof_required_to_save_settings_until_the_owner
         &second,
         &journal,
         &credential_store,
-        ExpectedCredentialState { revision: 0, credential_ref: None },
+        ExpectedCredentialState {
+            revision: 0,
+            credential_ref: None,
+        },
         "sk-new-owner",
         |new_ref| custom_settings_for(Some(new_ref.clone())),
     )
@@ -428,20 +485,25 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // section 8's "try-lock before an out-of-runtime save, hold it through
     // any necessary runtime (re)generation" contract -- there is no
     // `AiRuntime` yet to hold it internally for this very first save.
-    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path)
+        .try_acquire()
+        .unwrap()
+        .unwrap();
 
     // Step 1: settings/credential save.
-    let saved =
-        update_custom_credential(
-            &settings_store,
-            &owner,
-            &journal,
-            &*credential_store,
-            ExpectedCredentialState { revision: 0, credential_ref: None },
-            "sk-first",
-            |new_ref| custom_settings_for(Some(new_ref.clone())),
-        )
-        .expect("initial credential save should succeed");
+    let saved = update_custom_credential(
+        &settings_store,
+        &owner,
+        &journal,
+        &*credential_store,
+        ExpectedCredentialState {
+            revision: 0,
+            credential_ref: None,
+        },
+        "sk-first",
+        |new_ref| custom_settings_for(Some(new_ref.clone())),
+    )
+    .expect("initial credential save should succeed");
 
     // Step 2: settings reload, then Custom config generation from it.
     let reloaded = settings_store.load().unwrap();
@@ -462,8 +524,12 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // above and this runtime becoming its owner.
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
-    let runtime =
-        AiRuntime::spawn_with_configured_settings_generation(configured.config, configured.settings_generation, handler, events_tx);
+    let runtime = AiRuntime::spawn_with_configured_settings_generation(
+        configured.config,
+        configured.settings_generation,
+        handler,
+        events_tx,
+    );
     let status = runtime
         .start_with_owner_lock(owner)
         .expect("start_with_owner_lock should succeed against the generated Custom config");
@@ -488,7 +554,13 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // proof of that ownership from the running coordinator via
     // `with_owner_lock` instead of attempting (and failing) a second,
     // independent acquisition of the same lock file.
-    let old_ref = saved.custom.as_ref().unwrap().credential_ref.clone().unwrap();
+    let old_ref = saved
+        .custom
+        .as_ref()
+        .unwrap()
+        .credential_ref
+        .clone()
+        .unwrap();
     let saved_revision = saved.revision;
     let rotation_settings_store = settings_store.clone();
     let rotation_credential_store = credential_store.clone();
@@ -500,7 +572,10 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
                 owner,
                 &journal,
                 &*rotation_credential_store,
-                ExpectedCredentialState { revision: saved_revision, credential_ref: Some(old_ref) },
+                ExpectedCredentialState {
+                    revision: saved_revision,
+                    credential_ref: Some(old_ref),
+                },
                 "sk-second",
                 |new_ref| custom_settings_for(Some(new_ref.clone())),
             )
@@ -517,7 +592,10 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
         Some(serde_json::json!({"ping": true})),
         Duration::from_secs(5),
     );
-    assert!(matches!(stale_probe, Err(ConnectError::GenerationMismatch { .. })));
+    assert!(matches!(
+        stale_probe,
+        Err(ConnectError::GenerationMismatch { .. })
+    ));
 
     // Runtime re-generation for the rotated settings, then reconfigure and a
     // fresh generation-gated probe.
@@ -533,7 +611,10 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     .expect("building the runtime config for the rotated settings should succeed");
 
     let reconfigured_status = runtime
-        .reconfigure(reconfigured_runtime_config.config, reconfigured_runtime_config.settings_generation)
+        .reconfigure(
+            reconfigured_runtime_config.config,
+            reconfigured_runtime_config.settings_generation,
+        )
         .expect("reconfigure should succeed against the rotated Custom config");
     assert_eq!(reconfigured_status.state, RuntimeState::Ready);
 
@@ -545,7 +626,9 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
         Some(serde_json::json!({"ping": true})),
         Duration::from_secs(5),
     )
-    .expect("the probe must succeed again once the runtime was reconfigured for the new generation");
+    .expect(
+        "the probe must succeed again once the runtime was reconfigured for the new generation",
+    );
     assert_eq!(fresh_probe["ping"], serde_json::json!(true));
 
     // While a probe/turn holds the AI settings lock in shared mode, a
@@ -554,7 +637,11 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
     // `call_with_generation_check` itself relies on for every probe/turn
     // above). This save still needs the runtime owner lock proof, borrowed
     // the same way as the rotation above.
-    let shared_during_probe = settings_store.settings_lock().try_acquire_shared().unwrap().unwrap();
+    let shared_during_probe = settings_store
+        .settings_lock()
+        .try_acquire_shared()
+        .unwrap()
+        .unwrap();
     let busy_settings_store = settings_store.clone();
     let save_attempt = runtime.with_owner_lock(move |owner| {
         let owner = owner.expect("the active runtime must hold the owner lock while Ready");
@@ -581,12 +668,19 @@ fn internal_path_save_reconfigure_and_generation_gated_probe_compose_end_to_end(
 /// and is invoked exactly once the runtime is actually `Ready` for the exact
 /// matching generation.
 #[test]
-fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation() {
+fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_for_the_matching_generation()
+ {
     let dir = unique_dir("generation_gate_ready");
     let owner_lock_path = dir.join("owner.lock");
-    let settings_store =
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
-    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
+    let settings_store = AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    );
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path)
+        .try_acquire()
+        .unwrap()
+        .unwrap();
     let mut first = AiSettings::default();
     first.chatgpt.model_id = Some("gpt-a".to_string());
     let saved = settings_store.save(&owner, 0, first, || Ok(true)).unwrap();
@@ -595,12 +689,16 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
 
     let closure_calls = AtomicU64::new(0);
 
-    let (mut hang_config, _hang_dir) = fake_server_config("generation_gate_stopped_starting_failed");
-    hang_config.extra_env.push(("FAKE_SERVER_MODE".to_string(), "never_respond".to_string()));
+    let (mut hang_config, _hang_dir) =
+        fake_server_config("generation_gate_stopped_starting_failed");
+    hang_config
+        .extra_env
+        .push(("FAKE_SERVER_MODE".to_string(), "never_respond".to_string()));
     hang_config.start_timeout = Duration::from_millis(500);
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
-    let runtime = AiRuntime::spawn_with_configured_settings_generation(hang_config, 1, handler, events_tx);
+    let runtime =
+        AiRuntime::spawn_with_configured_settings_generation(hang_config, 1, handler, events_tx);
 
     let run_gate = |generation: u64| -> Result<(), ConnectError> {
         with_generation_checked_lock(&settings_store, &runtime, generation, || {
@@ -616,7 +714,11 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
         matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
         "Stopped: expected NotReady, got {result:?}"
     );
-    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run while Stopped");
+    assert_eq!(
+        closure_calls.load(Ordering::SeqCst),
+        calls_before,
+        "closure must not run while Stopped"
+    );
 
     // --- Starting/Initializing: start() in flight, handshake withheld. ---
     std::thread::scope(|scope| {
@@ -632,8 +734,8 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        let observed_in_flight_state =
-            observed_in_flight_state.expect("should observe Starting/Initializing before start_timeout elapses");
+        let observed_in_flight_state = observed_in_flight_state
+            .expect("should observe Starting/Initializing before start_timeout elapses");
 
         let calls_before = closure_calls.load(Ordering::SeqCst);
         let result = run_gate(1);
@@ -662,19 +764,31 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
         matches!(result, Err(ConnectError::Runtime(RuntimeError::NotReady))),
         "Failed: expected NotReady, got {result:?}"
     );
-    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run after a failed start");
+    assert_eq!(
+        closure_calls.load(Ordering::SeqCst),
+        calls_before,
+        "closure must not run after a failed start"
+    );
 
     // --- Ready for the matching generation: reconfigure onto a working config. ---
-    let (working_config, _working_dir) = fake_server_config("generation_gate_ready_after_reconfigure");
-    let ready_status = runtime
-        .reconfigure(working_config, 1)
-        .expect("reconfigure onto a working config should succeed once the handshake is not withheld");
+    let (working_config, _working_dir) =
+        fake_server_config("generation_gate_ready_after_reconfigure");
+    let ready_status = runtime.reconfigure(working_config, 1).expect(
+        "reconfigure onto a working config should succeed once the handshake is not withheld",
+    );
     assert_eq!(ready_status.state, RuntimeState::Ready);
 
     let calls_before = closure_calls.load(Ordering::SeqCst);
     let result = run_gate(1);
-    assert!(result.is_ok(), "Ready with the matching generation should allow the closure to run, got {result:?}");
-    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before + 1, "closure must run exactly once now");
+    assert!(
+        result.is_ok(),
+        "Ready with the matching generation should allow the closure to run, got {result:?}"
+    );
+    assert_eq!(
+        closure_calls.load(Ordering::SeqCst),
+        calls_before + 1,
+        "closure must run exactly once now"
+    );
 
     // --- Ready but a generation mismatch: still rejected, closure still not run. ---
     let calls_before = closure_calls.load(Ordering::SeqCst);
@@ -683,7 +797,11 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
         matches!(result, Err(ConnectError::GenerationMismatch { .. })),
         "a generation mismatch while Ready should still be rejected, got {result:?}"
     );
-    assert_eq!(closure_calls.load(Ordering::SeqCst), calls_before, "closure must not run on a generation mismatch");
+    assert_eq!(
+        closure_calls.load(Ordering::SeqCst),
+        calls_before,
+        "closure must not run on a generation mismatch"
+    );
 
     let _ = runtime.stop();
 }
@@ -705,18 +823,30 @@ fn generation_gate_never_runs_the_closure_before_the_runtime_is_actually_ready_f
 fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_not_just_one_call() {
     let dir = unique_dir("generation_checked_lock_holds_whole_turn");
     let owner_lock_path = dir.join("owner.lock");
-    let settings_store =
-        AiSettingsStore::new(dir.join("ai-settings.json"), dir.join("ai-settings.lock"), owner_lock_path.clone());
-    let owner = hane_ai::OwnerLock::new(&owner_lock_path).try_acquire().unwrap().unwrap();
-    let saved = settings_store.save(&owner, 0, AiSettings::default(), || Ok(true)).unwrap();
+    let settings_store = AiSettingsStore::new(
+        dir.join("ai-settings.json"),
+        dir.join("ai-settings.lock"),
+        owner_lock_path.clone(),
+    );
+    let owner = hane_ai::OwnerLock::new(&owner_lock_path)
+        .try_acquire()
+        .unwrap()
+        .unwrap();
+    let saved = settings_store
+        .save(&owner, 0, AiSettings::default(), || Ok(true))
+        .unwrap();
     let generation = saved.settings_generation;
     let revision = saved.revision;
 
     let (config, _config_dir) = fake_server_config("generation_checked_lock_holds_whole_turn");
     let (events_tx, _events_rx) = mpsc::sync_channel(64);
     let handler = Arc::new(RejectAllServerRequests);
-    let runtime = AiRuntime::spawn_with_configured_settings_generation(config, generation, handler, events_tx);
-    let status = runtime.start().expect("start should succeed against the fake app server");
+    let runtime = AiRuntime::spawn_with_configured_settings_generation(
+        config, generation, handler, events_tx,
+    );
+    let status = runtime
+        .start()
+        .expect("start should succeed against the fake app server");
     assert_eq!(status.state, RuntimeState::Ready);
 
     let (start_tx, start_rx) = mpsc::channel::<()>();
@@ -736,8 +866,11 @@ fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_no
             })
         });
 
-        start_rx.recv_timeout(Duration::from_secs(5)).expect("f should have started");
-        let save_attempt = settings_store.save(&owner, revision, AiSettings::default(), || Ok(true));
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("f should have started");
+        let save_attempt =
+            settings_store.save(&owner, revision, AiSettings::default(), || Ok(true));
         assert!(
             matches!(save_attempt, Err(SaveError::Busy)),
             "a settings save must be rejected while `f` is still in flight, not just during its first RPC call"
@@ -750,7 +883,9 @@ fn with_generation_checked_lock_holds_the_shared_lock_for_its_entire_duration_no
 
     // Once `f` has returned and the shared lock has been released, a save
     // succeeds again.
-    settings_store.save(&owner, revision, AiSettings::default(), || Ok(true)).unwrap();
+    settings_store
+        .save(&owner, revision, AiSettings::default(), || Ok(true))
+        .unwrap();
 
     let _ = runtime.stop();
 }
@@ -772,7 +907,13 @@ struct RecordedRequest {
 /// (success, 401/403/429, malformed, or Responses-API-incompatible) to
 /// confirm the App Server surfaces each distinctly rather than always
 /// reporting success.
-fn spawn_mock_responses_provider(response: String) -> (u16, Arc<Mutex<Option<RecordedRequest>>>, std::thread::JoinHandle<()>) {
+fn spawn_mock_responses_provider(
+    response: String,
+) -> (
+    u16,
+    Arc<Mutex<Option<RecordedRequest>>>,
+    std::thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a mock Responses Provider port");
     let port = listener.local_addr().unwrap().port();
     let recorded: Arc<Mutex<Option<RecordedRequest>>> = Arc::new(Mutex::new(None));
@@ -926,17 +1067,28 @@ struct ObservedTurn {
 /// Waits up to `timeout` for a `turn/completed` notification on `events_rx`,
 /// accumulating `agentMessage` text from any `item/completed` notifications
 /// observed along the way.
-fn wait_for_turn_completed(events_rx: &mpsc::Receiver<hane_ai::RuntimeEvent>, timeout: Duration) -> ObservedTurn {
+fn wait_for_turn_completed(
+    events_rx: &mpsc::Receiver<hane_ai::RuntimeEvent>,
+    timeout: Duration,
+) -> ObservedTurn {
     let deadline = std::time::Instant::now() + timeout;
     let mut agent_message_text = String::new();
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return ObservedTurn { turn: None, agent_message_text };
+            return ObservedTurn {
+                turn: None,
+                agent_message_text,
+            };
         }
         let event = match events_rx.recv_timeout(remaining) {
             Ok(event) => event,
-            Err(_) => return ObservedTurn { turn: None, agent_message_text },
+            Err(_) => {
+                return ObservedTurn {
+                    turn: None,
+                    agent_message_text,
+                };
+            }
         };
         let hane_ai::RuntimeEventKind::Notification { method, params } = event.kind else {
             continue;
@@ -951,14 +1103,21 @@ fn wait_for_turn_completed(events_rx: &mpsc::Receiver<hane_ai::RuntimeEvent>, ti
                 }
             }
             "turn/completed" => {
-                return ObservedTurn { turn: Some(params["turn"].clone()), agent_message_text };
+                return ObservedTurn {
+                    turn: Some(params["turn"].clone()),
+                    agent_message_text,
+                };
             }
             _ => {}
         }
     }
 }
 
-fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<RecordedRequest>>>, response: &str) {
+fn handle_one_request(
+    mut stream: TcpStream,
+    recorded: &Arc<Mutex<Option<RecordedRequest>>>,
+    response: &str,
+) {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
 
@@ -998,7 +1157,12 @@ fn handle_one_request(mut stream: TcpStream, recorded: &Arc<Mutex<Option<Recorde
     }
     let body = String::from_utf8_lossy(&body_bytes).to_string();
 
-    *recorded.lock().unwrap() = Some(RecordedRequest { method, path, authorization, body });
+    *recorded.lock().unwrap() = Some(RecordedRequest {
+        method,
+        path,
+        authorization,
+        body,
+    });
 
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
@@ -1063,13 +1227,19 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     let probe_workspace = dir.join("probe-workspace");
     std::fs::create_dir_all(&probe_workspace).unwrap();
 
-    let material =
-        build_custom_provider_material("My Provider", &base_url, "gpt-test-model", "sk-real-secret", ShellEnvironmentPolicyFormat::Filters)
-            .unwrap();
+    let material = build_custom_provider_material(
+        "My Provider",
+        &base_url,
+        "gpt-test-model",
+        "sk-real-secret",
+        ShellEnvironmentPolicyFormat::Filters,
+    )
+    .unwrap();
     write_codex_config(&codex_home, &material.config_toml).unwrap();
 
     let mut config = RuntimeConfig::new(PathBuf::from(binary), dir.join("runtime.lock"));
     config.codex_home = Some(codex_home);
+    config.working_directory = Some(probe_workspace.clone());
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
     // `HANE_TEST_CODEX_APP_SERVER_BIN` names the `codex` CLI, not the
@@ -1078,14 +1248,19 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     // config-compatibility validation per ADR-0032 section 10: the bundled
     // binary must accept the generated config under `--strict-config`, not
     // merely tolerate it silently.
-    config.args = vec!["app-server".to_string(), "--strict-config".to_string(), "--listen".to_string(), "stdio://".to_string()];
+    config.args = vec![
+        "app-server".to_string(),
+        "--strict-config".to_string(),
+        "--listen".to_string(),
+        "stdio://".to_string(),
+    ];
 
     let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(config, handler, events_tx);
-    let status = runtime
-        .start()
-        .expect("real App Server should reach Ready with the generated Custom config under --strict-config");
+    let status = runtime.start().expect(
+        "real App Server should reach Ready with the generated Custom config under --strict-config",
+    );
     assert_eq!(status.state, RuntimeState::Ready);
 
     let thread_start = runtime
@@ -1124,13 +1299,18 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
     // `thread/start`/`turn/start` naming) is delivered asynchronously as a
     // notification, not in `turn/start`'s own response.
     let observed = wait_for_turn_completed(&events_rx, Duration::from_secs(30));
-    let turn = observed.turn.expect("timed out waiting for a turn/completed notification from the real App Server");
+    let turn = observed
+        .turn
+        .expect("timed out waiting for a turn/completed notification from the real App Server");
     assert_eq!(
         turn["status"],
         serde_json::json!("completed"),
         "turn/completed.turn.status should be \"completed\" on success, got: {turn}"
     );
-    assert!(turn["error"].is_null(), "turn/completed.turn.error should be null on success, got: {turn}");
+    assert!(
+        turn["error"].is_null(),
+        "turn/completed.turn.error should be null on success, got: {turn}"
+    );
     assert!(
         observed.agent_message_text.contains("pong"),
         "the agentMessage text collected from item/completed should include the mock Responses Provider's fixed \
@@ -1153,9 +1333,13 @@ fn real_app_server_reaches_the_mock_responses_provider_with_the_configured_key()
 /// a `turn/start` RPC error or a timeout that occurs *before* the App Server
 /// ever reaches the Responses Provider would let a failure test pass without
 /// having exercised the Provider-error path it claims to.
-fn assert_mock_provider_received_the_probe_request(recorded: Option<RecordedRequest>, context: &str) {
-    let recorded = recorded
-        .unwrap_or_else(|| panic!("{context}: the mock Responses Provider should have observed exactly one request"));
+fn assert_mock_provider_received_the_probe_request(
+    recorded: Option<RecordedRequest>,
+    context: &str,
+) {
+    let recorded = recorded.unwrap_or_else(|| {
+        panic!("{context}: the mock Responses Provider should have observed exactly one request")
+    });
     assert_eq!(recorded.method, "POST", "{context}: request method");
     assert_eq!(
         recorded.path, "/v1/responses",
@@ -1164,10 +1348,18 @@ fn assert_mock_provider_received_the_probe_request(recorded: Option<RecordedRequ
     let auth = recorded
         .authorization
         .unwrap_or_else(|| panic!("{context}: request should carry an Authorization header"));
-    assert_eq!(auth, "Bearer sk-real-secret", "{context}: request must be authenticated with exactly the configured key");
-    let body_json: serde_json::Value = serde_json::from_str(&recorded.body)
-        .unwrap_or_else(|e| panic!("{context}: the Responses API request body should be valid JSON: {e}"));
-    assert_eq!(body_json["model"], serde_json::json!("gpt-test-model"), "{context}: request must target exactly the configured model");
+    assert_eq!(
+        auth, "Bearer sk-real-secret",
+        "{context}: request must be authenticated with exactly the configured key"
+    );
+    let body_json: serde_json::Value = serde_json::from_str(&recorded.body).unwrap_or_else(|e| {
+        panic!("{context}: the Responses API request body should be valid JSON: {e}")
+    });
+    assert_eq!(
+        body_json["model"],
+        serde_json::json!("gpt-test-model"),
+        "{context}: request must target exactly the configured model"
+    );
 }
 
 /// Asserts that the App Server surfaced the Provider failure as a genuinely
@@ -1185,7 +1377,10 @@ fn assert_turn_failed(observed: &ObservedTurn, context: &str) {
         serde_json::json!("failed"),
         "{context}: turn/completed.turn.status should be \"failed\", got: {turn}"
     );
-    assert!(!turn["error"].is_null(), "{context}: turn/completed.turn.error should be non-null on failure, got: {turn}");
+    assert!(
+        !turn["error"].is_null(),
+        "{context}: turn/completed.turn.error should be non-null on failure, got: {turn}"
+    );
 }
 
 /// Spawns the real App Server (`binary`) against a Custom Provider config
@@ -1202,7 +1397,11 @@ fn assert_turn_failed(observed: &ObservedTurn, context: &str) {
 /// request: an absent or failed turn must mean the Provider error was
 /// actually surfaced as a failure, not merely that the App Server never
 /// reached the Provider at all.
-fn observed_turn_against_mock_response(binary: &str, dir_name: &str, mock_response: String) -> (ObservedTurn, Option<RecordedRequest>) {
+fn observed_turn_against_mock_response(
+    binary: &str,
+    dir_name: &str,
+    mock_response: String,
+) -> (ObservedTurn, Option<RecordedRequest>) {
     let (port, recorded, _http_thread) = spawn_mock_responses_provider(mock_response);
     let base_url = format!("http://127.0.0.1:{port}/v1");
 
@@ -1223,20 +1422,26 @@ fn observed_turn_against_mock_response(binary: &str, dir_name: &str, mock_respon
 
     let mut config = RuntimeConfig::new(PathBuf::from(binary), dir.join("runtime.lock"));
     config.codex_home = Some(codex_home);
+    config.working_directory = Some(probe_workspace.clone());
     config.extra_env.extend(material.extra_env);
     config.start_timeout = Duration::from_secs(30);
     // See the matching comment in
     // `real_app_server_reaches_the_mock_responses_provider_with_the_configured_key`:
     // `HANE_TEST_CODEX_APP_SERVER_BIN` names the `codex` CLI, which needs the
     // `app-server` subcommand before `--strict-config`/`--listen stdio://`.
-    config.args = vec!["app-server".to_string(), "--strict-config".to_string(), "--listen".to_string(), "stdio://".to_string()];
+    config.args = vec![
+        "app-server".to_string(),
+        "--strict-config".to_string(),
+        "--listen".to_string(),
+        "stdio://".to_string(),
+    ];
 
     let (events_tx, events_rx) = mpsc::sync_channel(1024);
     let handler = Arc::new(RejectAllServerRequests);
     let runtime = AiRuntime::spawn(config, handler, events_tx);
-    let status = runtime
-        .start()
-        .expect("real App Server should reach Ready with the generated Custom config under --strict-config");
+    let status = runtime.start().expect(
+        "real App Server should reach Ready with the generated Custom config under --strict-config",
+    );
     assert_eq!(status.state, RuntimeState::Ready);
 
     let thread_start = runtime.call(
@@ -1248,7 +1453,10 @@ fn observed_turn_against_mock_response(binary: &str, dir_name: &str, mock_respon
         })),
         Duration::from_secs(30),
     );
-    let empty_observed = || ObservedTurn { turn: None, agent_message_text: String::new() };
+    let empty_observed = || ObservedTurn {
+        turn: None,
+        agent_message_text: String::new(),
+    };
     let thread_start = match thread_start {
         Ok(v) => v,
         Err(_) => {
@@ -1293,7 +1501,8 @@ fn real_app_server_reports_failure_for_401_unauthorized_from_the_provider() {
         "401 Unauthorized",
         &serde_json::json!({"error": {"message": "invalid api key", "type": "invalid_request_error"}}),
     );
-    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_401", response);
+    let (observed, recorded) =
+        observed_turn_against_mock_response(&binary, "real_app_server_401", response);
     assert_mock_provider_received_the_probe_request(recorded, "401 Unauthorized case");
     assert_turn_failed(&observed, "401 Unauthorized case");
 }
@@ -1311,7 +1520,8 @@ fn real_app_server_reports_failure_for_403_forbidden_from_the_provider() {
         "403 Forbidden",
         &serde_json::json!({"error": {"message": "access denied", "type": "permission_error"}}),
     );
-    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_403", response);
+    let (observed, recorded) =
+        observed_turn_against_mock_response(&binary, "real_app_server_403", response);
     assert_mock_provider_received_the_probe_request(recorded, "403 Forbidden case");
     assert_turn_failed(&observed, "403 Forbidden case");
 }
@@ -1329,7 +1539,8 @@ fn real_app_server_reports_failure_for_429_rate_limited_from_the_provider() {
         "429 Too Many Requests",
         &serde_json::json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}}),
     );
-    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_429", response);
+    let (observed, recorded) =
+        observed_turn_against_mock_response(&binary, "real_app_server_429", response);
     assert_mock_provider_received_the_probe_request(recorded, "429 Too Many Requests case");
     assert_turn_failed(&observed, "429 Too Many Requests case");
 }
@@ -1344,7 +1555,8 @@ fn real_app_server_reports_failure_for_a_malformed_response_body_from_the_provid
         return;
     };
     let response = raw_response("200 OK", "this is not valid json {{{");
-    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_malformed", response);
+    let (observed, recorded) =
+        observed_turn_against_mock_response(&binary, "real_app_server_malformed", response);
     assert_mock_provider_received_the_probe_request(recorded, "malformed response body case");
     assert_turn_failed(&observed, "malformed response body case");
 }
@@ -1372,7 +1584,11 @@ fn real_app_server_reports_failure_for_a_responses_api_incompatible_body_from_th
             ]
         }),
     );
-    let (observed, recorded) = observed_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
-    assert_mock_provider_received_the_probe_request(recorded, "Responses-API-incompatible body case");
+    let (observed, recorded) =
+        observed_turn_against_mock_response(&binary, "real_app_server_incompatible", response);
+    assert_mock_provider_received_the_probe_request(
+        recorded,
+        "Responses-API-incompatible body case",
+    );
     assert_turn_failed(&observed, "Responses-API-incompatible body case");
 }

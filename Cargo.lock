@@ -3039,6 +3039,7 @@ version = "0.20.0"
 dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
+ "hane-ai",
  "hane-document",
  "hane-editor",
  "hane-markdown",
@@ -3058,6 +3059,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.8.23",
+ "url",
 ]
 
 [[package]]
@@ -3132,6 +3134,7 @@ dependencies = [
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
+ "hane-ai",
  "hane-document",
  "hane-editor",
  "hane-markdown",
