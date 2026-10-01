@@ -671,7 +671,6 @@ pub fn build_runtime_config_for_active_connection(
         ActiveConnection::ChatGpt => paths.chatgpt_codex_home(),
         ActiveConnection::Custom => paths.custom_codex_home(),
     });
-    config.working_directory = Some(paths.create_probe_workspace().map_err(ConnectError::Io)?);
     match settings.active_connection {
         ActiveConnection::ChatGpt => {
             // ChatGPT auth and state are kept in its dedicated CODEX_HOME.
@@ -705,6 +704,10 @@ pub fn build_runtime_config_for_active_connection(
             config.extra_env = material.extra_env;
         }
     }
+    // Validate the connection and its credentials before creating a runtime
+    // workspace. The runtime removes it after confirmed child exit; the next
+    // owner also sweeps directories left by an abnormal process exit.
+    config.working_directory = Some(paths.create_probe_workspace().map_err(ConnectError::Io)?);
     Ok(ConfiguredRuntime {
         config,
         settings_generation: settings.settings_generation,
@@ -1889,6 +1892,9 @@ mod tests {
             configured.config.codex_home,
             Some(paths.chatgpt_codex_home())
         );
+        let workspace = configured.config.working_directory.as_ref().unwrap();
+        assert!(workspace.starts_with(paths.probe_workspace()));
+        assert!(std::fs::read_dir(workspace).unwrap().next().is_none());
         assert!(configured.config.extra_env.is_empty());
         assert_eq!(configured.settings_generation, settings.settings_generation);
         let written =
@@ -1940,6 +1946,9 @@ mod tests {
             configured.config.codex_home,
             Some(paths.custom_codex_home())
         );
+        let workspace = configured.config.working_directory.as_ref().unwrap();
+        assert!(workspace.starts_with(paths.probe_workspace()));
+        assert!(std::fs::read_dir(workspace).unwrap().next().is_none());
         assert_eq!(
             configured.config.extra_env,
             vec![(
@@ -1990,6 +1999,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ConnectError::CredentialNotFound));
+        assert!(!paths.probe_workspace().exists());
     }
 
     #[test]

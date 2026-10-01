@@ -378,7 +378,7 @@ fn spawn_reader(
     })
 }
 
-fn is_critical_notification(method: &str) -> bool {
+pub(crate) fn is_critical_notification(method: &str) -> bool {
     matches!(
         method,
         "account/login/completed"

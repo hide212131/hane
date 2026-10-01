@@ -157,6 +157,7 @@ impl AiSettingsPage {
         };
         self.snapshot = service.snapshot();
         let updates = Arc::new(Mutex::new(service.subscribe()));
+        let snapshot_service = service.clone();
         self.service = Some(service);
         if self.subscription_started {
             return;
@@ -176,9 +177,11 @@ impl AiSettingsPage {
                     })
                     .await;
                 match result {
-                    Ok(snapshot) => {
+                    Ok(()) => {
+                        let snapshot_service = snapshot_service.clone();
                         if view
-                            .update(cx, |view, cx| {
+                            .update(cx, move |view, cx| {
+                                let snapshot = snapshot_service.snapshot();
                                 view.ai_settings.apply_snapshot(snapshot);
                                 cx.notify();
                             })

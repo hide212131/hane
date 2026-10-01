@@ -85,6 +85,27 @@ impl AiPaths {
             }
         }
     }
+
+    /// Removes runtime workspaces left by a prior process after an abnormal
+    /// exit. The caller must hold the runtime owner lock and have no active
+    /// child, which proves that no App Server can still be using these paths.
+    pub fn cleanup_probe_workspaces(&self) -> std::io::Result<()> {
+        let base = self.probe_workspace();
+        let entries = match std::fs::read_dir(&base) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry.file_name().to_string_lossy().starts_with("runtime-")
+            {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +136,21 @@ mod tests {
         assert!(first.starts_with(paths.probe_workspace()));
         assert!(std::fs::read_dir(&first).unwrap().next().is_none());
         assert!(std::fs::read_dir(&second).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn stale_runtime_workspaces_are_removed_without_touching_other_entries() {
+        let root =
+            std::env::temp_dir().join(format!("hane-ai-path-cleanup-{}", std::process::id()));
+        let paths = AiPaths::new(&root);
+        let stale = paths.create_probe_workspace().unwrap();
+        std::fs::write(stale.join("stale.txt"), "fixture").unwrap();
+        let unrelated = paths.probe_workspace().join("keep-me");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        paths.cleanup_probe_workspaces().unwrap();
+
+        assert!(!stale.exists());
+        assert!(unrelated.is_dir());
     }
 }

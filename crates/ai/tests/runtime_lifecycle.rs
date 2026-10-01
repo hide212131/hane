@@ -34,7 +34,10 @@ fn base_config(name: &str) -> RuntimeConfig {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_fake_app_server"));
     let mut config = RuntimeConfig::new(binary, dir.join("runtime.lock"));
     config.codex_home = Some(dir.join("codex-home"));
-    config.working_directory = Some(dir.join("working-directory"));
+    config.working_directory = Some(
+        dir.join("probe-workspace")
+            .join(format!("runtime-{}-0", std::process::id())),
+    );
     std::fs::create_dir_all(config.codex_home.as_ref().unwrap()).unwrap();
     std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
     config.args = Vec::new();
@@ -53,6 +56,7 @@ fn spawn_runtime(config: RuntimeConfig) -> (AiRuntime, mpsc::Receiver<RuntimeEve
 #[test]
 fn initialize_barrier_reaches_ready_then_calls_and_stops_cleanly() {
     let config = base_config("initialize_barrier");
+    let working_directory = config.working_directory.clone().unwrap();
     let (runtime, _events) = spawn_runtime(config);
 
     let status = runtime.start().expect("start should succeed");
@@ -71,6 +75,10 @@ fn initialize_barrier_reaches_ready_then_calls_and_stops_cleanly() {
     let stopped = runtime.stop().expect("stop should succeed");
     assert_eq!(stopped.state, RuntimeState::Stopped);
     assert!(!stopped.restart_blocked);
+    assert!(
+        !working_directory.exists(),
+        "confirmed runtime stop removes its temporary workspace"
+    );
 }
 
 #[test]
@@ -126,6 +134,7 @@ fn crash_mid_request_fails_the_call_and_does_not_auto_restart() {
 #[test]
 fn owner_lock_blocks_a_second_owner_and_releases_after_drop() {
     let config = base_config("owner_lock");
+    let working_directory = config.working_directory.clone().unwrap();
     let lock_path = config.owner_lock_path.clone();
     let external_lock = OwnerLock::new(&lock_path);
     let external_guard = external_lock
@@ -137,6 +146,10 @@ fn owner_lock_blocks_a_second_owner_and_releases_after_drop() {
     let result = runtime.start();
     assert!(matches!(result, Err(RuntimeError::OwnerLockUnavailable)));
     assert_eq!(runtime.snapshot().state, RuntimeState::Stopped);
+    assert!(
+        !working_directory.exists(),
+        "a config unused because another process owns the runtime leaves no workspace"
+    );
 
     drop(external_guard);
 

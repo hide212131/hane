@@ -267,7 +267,8 @@ fn app_service_handles_early_login_completion_models_logout_and_view_recreation(
     drop(urls);
 
     let recreated_view = handle.subscribe();
-    let reopened = recreated_view.try_recv().unwrap();
+    recreated_view.try_recv().unwrap();
+    let reopened = handle.snapshot();
     assert!(matches!(reopened.account, AccountState::SignedIn { .. }));
     assert!(matches!(reopened.model_list, ModelListState::Loaded(_)));
 
@@ -747,6 +748,32 @@ fn failed_runtime_start_marks_ownership_unknown_and_allows_reopen() {
 
     open_settings(&service);
     assert_eq!(handle.snapshot().ownership, OwnershipState::Owned);
+
+    // A runtime-affecting save after reopening must pass the service's
+    // reacquired owner lock into a replacement coordinator. The failed
+    // scenario is changed before that replacement starts so it can succeed.
+    configure_fake_scenario(&data_root, "normal");
+    let mut settings = handle.snapshot().settings;
+    settings.chatgpt.model_id = Some("gpt-recovery-test".to_owned());
+    let save_id = handle
+        .try_save_settings(settings.revision, settings)
+        .unwrap();
+    assert_eq!(
+        wait_for_result(&service, save_id).0,
+        SafeOperationResult::Succeeded,
+        "runtime-affecting settings may be saved while the failed runtime is stopped"
+    );
+    let retry_login_id = handle.try_submit(AiCommand::StartLogin).unwrap();
+    assert_eq!(
+        wait_for_result(&service, retry_login_id).0,
+        SafeOperationResult::Succeeded,
+        "the next runtime start must reuse the service's reacquired owner lock"
+    );
+    assert_eq!(
+        handle.snapshot().runtime_state,
+        hane_ai::RuntimeState::Ready
+    );
+
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);
 }

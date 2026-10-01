@@ -33,7 +33,7 @@ use crate::secrets::{CredentialRef, CredentialStore};
 use crate::settings::{ActiveConnection, AiSettings, AiSettingsStore, SaveError};
 
 const COMMAND_CAPACITY: usize = 16;
-const SNAPSHOT_SUBSCRIBER_CAPACITY: usize = 8;
+const SUBSCRIBER_NOTIFICATION_CAPACITY: usize = 1;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const EVENT_POLL: Duration = Duration::from_millis(40);
@@ -178,7 +178,7 @@ struct SharedServiceState {
     snapshot: Mutex<AiSnapshot>,
     busy: Mutex<Option<(OperationId, ServiceBusyReason)>>,
     next_operation_id: AtomicU64,
-    subscribers: Mutex<Vec<SyncSender<AiSnapshot>>>,
+    subscribers: Mutex<Vec<SyncSender<()>>>,
     available: Mutex<bool>,
 }
 
@@ -217,10 +217,12 @@ impl AiServiceHandle {
         self.shared.snapshot.lock().unwrap().clone()
     }
 
-    pub fn subscribe(&self) -> Receiver<AiSnapshot> {
-        let (tx, rx) = mpsc::sync_channel(SNAPSHOT_SUBSCRIBER_CAPACITY);
+    /// Subscribes to state-change notifications. Notifications are wake-up
+    /// signals only; call `snapshot()` after receiving one to get current state.
+    pub fn subscribe(&self) -> Receiver<()> {
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_NOTIFICATION_CAPACITY);
         let mut subscribers = self.shared.subscribers.lock().unwrap();
-        let _ = tx.try_send(self.snapshot());
+        let _ = tx.try_send(());
         subscribers.push(tx);
         rx
     }
@@ -1681,6 +1683,11 @@ fn open_settings(
                 .ok_or(OwnerOpenError::Elsewhere)?,
         );
     }
+    if !runtime_owns && state.owner_guard.is_some() {
+        paths
+            .cleanup_probe_workspaces()
+            .map_err(|_| OwnerOpenError::Failed)?;
+    }
     if let Some(owner) = state.owner_guard.as_ref() {
         let recovery =
             recover_at_startup(settings_store, owner, journal, credential_store.as_ref())
@@ -1756,10 +1763,14 @@ fn ensure_runtime<'a>(
             if status.restart_blocked {
                 return Err(());
             }
-            if state.owner_guard.is_some() && status.state == RuntimeState::Stopped {
+            if state.owner_guard.is_some()
+                && matches!(status.state, RuntimeState::Stopped | RuntimeState::Failed)
+            {
                 // `OpenSettings` may have reacquired the owner lock after a
-                // prior stop. Keep that same guard across replacement of the
-                // stale coordinator and hand it to the new runtime at start.
+                // prior stop or confirmed runtime failure. Keep that same
+                // guard across replacement of the stale coordinator and hand
+                // it to the new runtime at start. `restart_blocked` above
+                // excludes failures whose child exit is still unconfirmed.
                 let old_runtime = state.runtime.take();
                 drop(old_runtime);
                 let (event_tx, event_rx) = mpsc::sync_channel(128);
@@ -2043,9 +2054,11 @@ fn reconcile_early_login_events(
     state: &mut WorkerState,
 ) {
     if state.early_login_bytes > MAX_EARLY_LOGIN_BYTES {
-        if let Some(attempt) = state.attempt.as_ref() {
+        let attempt_id = state.attempt.as_ref().map(|attempt| attempt.id);
+        reset_early_login_buffer(state);
+        if let Some(attempt_id) = attempt_id {
             handle_cancel(
-                attempt.id,
+                attempt_id,
                 config,
                 paths,
                 &dummy_settings_store(paths),
@@ -2071,6 +2084,11 @@ fn reconcile_early_login_events(
             break;
         }
     }
+}
+
+fn reset_early_login_buffer(state: &mut WorkerState) {
+    state.early_login_events.clear();
+    state.early_login_bytes = 0;
 }
 
 fn drain_runtime_events(
@@ -2379,7 +2397,7 @@ fn finish(
 }
 
 fn mutate(shared: &Arc<SharedServiceState>, apply: impl FnOnce(&mut AiSnapshot)) {
-    let snapshot = {
+    {
         let mut snapshot = shared.snapshot.lock().unwrap();
         apply(&mut snapshot);
         if snapshot.probe_status == ProbeStatus::Succeeded
@@ -2394,10 +2412,9 @@ fn mutate(shared: &Arc<SharedServiceState>, apply: impl FnOnce(&mut AiSnapshot))
             snapshot.probe_status = ProbeStatus::Stale;
         }
         snapshot.state_version = snapshot.state_version.saturating_add(1);
-        snapshot.clone()
-    };
+    }
     let mut subscribers = shared.subscribers.lock().unwrap();
-    subscribers.retain(|subscriber| match subscriber.try_send(snapshot.clone()) {
+    subscribers.retain(|subscriber| match subscriber.try_send(()) {
         Ok(()) | Err(TrySendError::Full(_)) => true,
         Err(TrySendError::Disconnected(_)) => false,
     });
@@ -2416,6 +2433,58 @@ fn current_model(settings: &AiSettings) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: Arc::new(SharedServiceState {
+                snapshot: Mutex::new(snapshot),
+                busy: Mutex::new(None),
+                next_operation_id: AtomicU64::new(1),
+                subscribers: Mutex::new(Vec::new()),
+                available: Mutex::new(true),
+            }),
+        }
+    }
+
+    #[test]
+    fn subscriber_notifications_coalesce_while_latest_snapshot_is_preserved() {
+        let handle = test_handle(AiSnapshot::default());
+        let updates = handle.subscribe();
+        assert_eq!(updates.try_recv(), Ok(()));
+
+        for _ in 0..SUBSCRIBER_NOTIFICATION_CAPACITY + 4 {
+            mutate(&handle.shared, |_| {});
+        }
+
+        assert_eq!(
+            handle.snapshot().state_version,
+            (SUBSCRIBER_NOTIFICATION_CAPACITY + 4) as u64
+        );
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert!(matches!(updates.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn early_login_overflow_reset_clears_events_and_byte_count() {
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: None,
+            attempt: None,
+            early_login_events: VecDeque::from([(1, None, 17)]),
+            early_login_bytes: MAX_EARLY_LOGIN_BYTES + 1,
+            deferred_runtime_events: VecDeque::new(),
+        };
+
+        reset_early_login_buffer(&mut state);
+
+        assert!(state.early_login_events.is_empty());
+        assert_eq!(state.early_login_bytes, 0);
+    }
 
     #[test]
     fn service_admission_is_bounded_and_cancellation_uses_a_separate_gate() {

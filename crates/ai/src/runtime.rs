@@ -55,7 +55,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
@@ -264,6 +264,7 @@ impl RuntimeConfig {
                 "AI runtime requires an explicit Hane-owned working directory; refusing to use the Editor cwd",
             )
         })?;
+        std::fs::create_dir_all(working_directory)?;
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
         cmd.env_clear();
@@ -357,6 +358,7 @@ struct SharedState {
 struct ActiveChild {
     generation: u64,
     operation_generation: u64,
+    working_directory: PathBuf,
     child: Child,
     transport: RpcTransport,
 }
@@ -1138,6 +1140,7 @@ fn do_start(
     if let Some(external) = &external_owner
         && external.path() != config.owner_lock_path
     {
+        cleanup_config_workspace(config, current.as_ref());
         return Some(Err(RuntimeError::OwnerLockPathMismatch));
     }
 
@@ -1151,6 +1154,7 @@ fn do_start(
             // must never be assigned to `owner_guard`, which would replace
             // (and thereby release) the guard actually backing the
             // already-active child.
+            cleanup_config_workspace(config, current.as_ref());
             return Some(Ok(status));
         }
         // A previous stop attempt could not confirm the old child had
@@ -1160,9 +1164,12 @@ fn do_start(
             try_reap(&mut active.child)
         };
         if reaped {
-            *current = None;
+            if let Some(active) = current.take() {
+                remove_runtime_workspace(&active.working_directory);
+            }
             *owner_guard = None;
         } else {
+            cleanup_config_workspace(config, current.as_ref());
             return Some(Err(RuntimeError::RestartBlocked));
         }
     }
@@ -1189,10 +1196,12 @@ fn do_start(
                 match lock.try_acquire() {
                     Ok(Some(g)) => g,
                     Ok(None) => {
+                        cleanup_config_workspace(config, current.as_ref());
                         set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
                         return Some(Err(RuntimeError::OwnerLockUnavailable));
                     }
                     Err(e) => {
+                        cleanup_config_workspace(config, current.as_ref());
                         set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
                         return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
                     }
@@ -1207,6 +1216,7 @@ fn do_start(
     let mut child = match config.spawn_child() {
         Ok(c) => c,
         Err(e) => {
+            cleanup_config_workspace(config, current.as_ref());
             set_status(shared, RuntimeState::Failed, false, g, op_gen);
             return Some(Err(RuntimeError::Spawn(Arc::new(e))));
         }
@@ -1251,8 +1261,7 @@ fn do_start(
             let is_critical = matches!(
                 &event,
                 RpcEvent::Notification { method, .. }
-                    if matches!(method.as_str(),
-                        "account/login/completed" | "account/updated" | "item/completed" | "turn/completed" | "turn/failed")
+                    if crate::rpc::is_critical_notification(method)
             );
             let kind = match event {
                 RpcEvent::Notification { method, params } => {
@@ -1315,6 +1324,11 @@ fn do_start(
     *current = Some(ActiveChild {
         generation: g,
         operation_generation: op_gen,
+        working_directory: config
+            .working_directory
+            .as_ref()
+            .expect("spawn_child validated working_directory")
+            .clone(),
         child,
         transport,
     });
@@ -1432,6 +1446,7 @@ fn stop_active(
 
     match outcome {
         StopOutcome::Exited => {
+            remove_runtime_workspace(&active.working_directory);
             drop(active);
             // `release_owner_lock` is `false` only for the `Reconfigure`
             // path: it needs the owner lock to stay held by this same
@@ -1492,7 +1507,13 @@ fn spawn_shutdown_cleanup_worker(
         let poll_interval = Duration::from_millis(20);
         wait_for_confirmation_then_release(
             (active, owner_guard),
-            |(active, _owner_guard)| matches!(active.child.try_wait(), Ok(Some(_))),
+            |(active, _owner_guard)| match active.child.try_wait() {
+                Ok(Some(_)) => {
+                    remove_runtime_workspace(&active.working_directory);
+                    true
+                }
+                Ok(None) | Err(_) => false,
+            },
             poll_interval,
             thread::sleep,
         );
@@ -1586,6 +1607,7 @@ fn reap_and_mark_failed(
 
     match outcome {
         StopOutcome::Exited => {
+            remove_runtime_workspace(&active.working_directory);
             drop(active);
             *owner_guard = None;
             // Same fresh-generation treatment as a confirmed `stop_active`
@@ -1607,6 +1629,28 @@ fn reap_and_mark_failed(
                     "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),
                 ),
             });
+        }
+    }
+}
+
+fn remove_runtime_workspace(path: &Path) {
+    let is_hane_runtime_workspace = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("runtime-"))
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "probe-workspace");
+    if is_hane_runtime_workspace {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+fn cleanup_config_workspace(config: &RuntimeConfig, active: Option<&ActiveChild>) {
+    if let Some(path) = config.working_directory.as_deref() {
+        let is_active = active.is_some_and(|child| child.working_directory == path);
+        if !is_active {
+            remove_runtime_workspace(path);
         }
     }
 }
