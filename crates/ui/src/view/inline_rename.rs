@@ -422,7 +422,11 @@ impl EditorView {
         cx.notify();
     }
 
-    pub(super) fn inline_rename_has_background_conflict(&self, from: &Path, kind: InlineRenameKind) -> bool {
+    pub(super) fn inline_rename_has_background_conflict(
+        &self,
+        from: &Path,
+        kind: InlineRenameKind,
+    ) -> bool {
         let belongs = |path: &Path| match kind {
             InlineRenameKind::File => path == from,
             InlineRenameKind::Folder => rebase_ui_path(path, from, from).is_some(),

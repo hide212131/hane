@@ -92,7 +92,10 @@ impl std::fmt::Display for RpcError {
             RpcError::Timeout => write!(f, "rpc call timed out"),
             RpcError::Disconnected => write!(f, "transport disconnected"),
             RpcError::Backpressure => {
-                write!(f, "rpc request rejected: too many pending requests or a full outgoing queue")
+                write!(
+                    f,
+                    "rpc request rejected: too many pending requests or a full outgoing queue"
+                )
             }
             RpcError::Remote(err) => write!(f, "remote error {}: {}", err.code, err.message),
         }
@@ -106,7 +109,10 @@ impl std::error::Error for RpcError {}
 /// responses).
 #[derive(Debug, Clone)]
 pub enum RpcEvent {
-    Notification { method: String, params: Option<Value> },
+    Notification {
+        method: String,
+        params: Option<Value>,
+    },
     Diagnostic(String),
 }
 
@@ -136,7 +142,12 @@ pub struct RpcCore {
 }
 
 impl RpcCore {
-    pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RpcError> {
+    pub fn call(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
         let (id, reply_rx) = {
             // Reserve the pending slot, encode the request and hand it to
             // the writer queue all under one lock. Holding the lock across
@@ -411,7 +422,8 @@ impl RpcTransport {
         });
 
         let writer_thread = spawn_writer(writer, writer_rx);
-        let reader_thread = spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
+        let reader_thread =
+            spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
         let stderr_thread = stderr.map(|s| spawn_stderr(s, events_tx.clone()));
 
         RpcTransport {
@@ -467,7 +479,12 @@ fn join_with_timeout(handle: Option<JoinHandle<()>>, name: &str, events_tx: &Syn
 /// through `events_tx` (best-effort, same drop-on-full/disconnected policy
 /// as every other diagnostic on this channel) so a stuck thread is visible
 /// instead of silently swallowed.
-fn join_with_deadline(handle: Option<JoinHandle<()>>, name: &str, events_tx: &SyncSender<RpcEvent>, deadline: Duration) {
+fn join_with_deadline(
+    handle: Option<JoinHandle<()>>,
+    name: &str,
+    events_tx: &SyncSender<RpcEvent>,
+    deadline: Duration,
+) {
     let Some(handle) = handle else { return };
     let (done_tx, done_rx) = mpsc::channel();
     thread::spawn(move || {
@@ -540,7 +557,11 @@ mod tests {
         });
 
         let result = core
-            .call("test/echo", Some(serde_json::json!({"a": 1})), Duration::from_secs(5))
+            .call(
+                "test/echo",
+                Some(serde_json::json!({"a": 1})),
+                Duration::from_secs(5),
+            )
             .unwrap();
         assert_eq!(result["echoed"], Value::Bool(true));
         responder.join().unwrap();
@@ -559,11 +580,23 @@ mod tests {
             let request: Value = serde_json::from_slice(&buf[..n]).unwrap();
             let id = request["id"].clone();
             // A notification arrives first, then the response.
-            writeln!(server_write, "{}", serde_json::json!({"method": "session/event", "params": {"n": 1}})).unwrap();
-            writeln!(server_write, "{}", serde_json::json!({"id": id, "result": "ok"})).unwrap();
+            writeln!(
+                server_write,
+                "{}",
+                serde_json::json!({"method": "session/event", "params": {"n": 1}})
+            )
+            .unwrap();
+            writeln!(
+                server_write,
+                "{}",
+                serde_json::json!({"id": id, "result": "ok"})
+            )
+            .unwrap();
         });
 
-        let result = core.call("initialize", None, Duration::from_secs(5)).unwrap();
+        let result = core
+            .call("initialize", None, Duration::from_secs(5))
+            .unwrap();
         assert_eq!(result, Value::String("ok".to_string()));
         responder.join().unwrap();
 
@@ -669,7 +702,12 @@ mod tests {
         let _core = transport.handle();
 
         writeln!(server_write, "not json").unwrap();
-        writeln!(server_write, "{}", serde_json::json!({"method": "after", "params": null})).unwrap();
+        writeln!(
+            server_write,
+            "{}",
+            serde_json::json!({"method": "after", "params": null})
+        )
+        .unwrap();
         server_write.flush().unwrap();
 
         // First event is a diagnostic about the malformed line.
@@ -691,7 +729,8 @@ mod tests {
             spawn_transport_over_pipes(handler);
         let core = transport.handle();
 
-        let call_thread = thread::spawn(move || core.call("test/echo", None, Duration::from_secs(30)));
+        let call_thread =
+            thread::spawn(move || core.call("test/echo", None, Duration::from_secs(30)));
 
         // Give the call time to register itself as pending before the peer
         // disappears, then simulate the child crashing mid-request.
@@ -837,7 +876,9 @@ mod tests {
         let mut in_flight = Vec::new();
         for _ in 0..MAX_PENDING_REQUESTS {
             let core = core.clone();
-            in_flight.push(thread::spawn(move || core.call("never_replied", None, Duration::from_secs(30))));
+            in_flight.push(thread::spawn(move || {
+                core.call("never_replied", None, Duration::from_secs(30))
+            }));
         }
 
         // Wait for confirmation that all MAX_PENDING_REQUESTS requests were
@@ -847,7 +888,9 @@ mod tests {
         // timeout that is sensitive to how fast threads get scheduled.
         all_registered_rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("all MAX_PENDING_REQUESTS filler calls should register well within this timeout");
+            .expect(
+                "all MAX_PENDING_REQUESTS filler calls should register well within this timeout",
+            );
 
         let result = core.call("one_too_many", None, Duration::from_secs(5));
         assert!(matches!(result, Err(RpcError::Backpressure)));
@@ -861,9 +904,10 @@ mod tests {
 
     #[test]
     fn request_shutdown_returns_promptly_and_releases_pending_even_when_the_writer_is_stuck_on_a_full_pipe_and_queue()
-    {
+     {
         let handler = Arc::new(RejectAllServerRequests);
-        let (transport, _server_write, server_read, _events, _closed) = spawn_transport_over_pipes(handler);
+        let (transport, _server_write, server_read, _events, _closed) =
+            spawn_transport_over_pipes(handler);
         let core = transport.handle();
 
         // Never read from `server_read`: the OS pipe buffer is finite, so
@@ -925,13 +969,18 @@ mod tests {
             core.call("after_shutdown", None, Duration::from_secs(5)),
             Err(RpcError::Disconnected)
         ));
-        assert!(matches!(core.notify("after_shutdown", None), Err(RpcError::Disconnected)));
+        assert!(matches!(
+            core.notify("after_shutdown", None),
+            Err(RpcError::Disconnected)
+        ));
     }
 
     #[test]
-    fn reader_eof_racing_with_request_shutdown_still_resolves_pending_calls_and_new_calls_fail_fast() {
+    fn reader_eof_racing_with_request_shutdown_still_resolves_pending_calls_and_new_calls_fail_fast()
+     {
         let handler = Arc::new(RejectAllServerRequests);
-        let (transport, server_write, _server_read, _events, closed_rx) = spawn_transport_over_pipes(handler);
+        let (transport, server_write, _server_read, _events, closed_rx) =
+            spawn_transport_over_pipes(handler);
         let core = transport.handle();
 
         let pending_call = {
@@ -958,7 +1007,10 @@ mod tests {
             core.call("after", None, Duration::from_secs(5)),
             Err(RpcError::Disconnected)
         ));
-        assert!(matches!(core.notify("after", None), Err(RpcError::Disconnected)));
+        assert!(matches!(
+            core.notify("after", None),
+            Err(RpcError::Disconnected)
+        ));
     }
 
     #[test]
@@ -1036,7 +1088,8 @@ mod tests {
     }
 
     #[test]
-    fn join_with_timeout_returns_promptly_and_emits_no_diagnostic_when_the_thread_finishes_in_time() {
+    fn join_with_timeout_returns_promptly_and_emits_no_diagnostic_when_the_thread_finishes_in_time()
+    {
         let (events_tx, events_rx) = mpsc::sync_channel(4);
         let handle = thread::spawn(|| {});
 

@@ -1072,12 +1072,11 @@ mod vscode_windows {
     use std::env;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use winreg::HKEY;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use winreg::HKEY;
 
-    const APP_PATHS_SUBKEY: &str =
-        r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
+    const APP_PATHS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
 
     pub(super) fn resolve_executable() -> OsString {
         resolve_from(&candidate_paths())
@@ -2582,7 +2581,6 @@ impl EditorView {
         self.after_input(cx);
     }
 
-
     /// Invalidates shaped/layout caches for a new font generation. During an
     /// intermediate wheel-animation frame, keep the existing document-wide
     /// height estimates and let the visible blocks replace only their measured
@@ -2604,7 +2602,6 @@ impl EditorView {
             self.rebuild_height_estimates();
         }
     }
-
 
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
@@ -9717,7 +9714,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -9764,7 +9765,11 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(partial), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Ok(partial),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -9816,7 +9821,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -9889,7 +9898,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
             // A save failure arriving well after the recovery warning was
@@ -10207,7 +10220,11 @@ mod tests {
         };
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(recovered), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
