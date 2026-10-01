@@ -278,10 +278,7 @@ fn with_owner_lock_lets_a_normal_settings_save_happen_while_this_runtime_holds_t
                 owner,
                 &journal,
                 &credential_store,
-                ExpectedCredentialState {
-                    revision: 0,
-                    credential_ref: None,
-                },
+                ExpectedCredentialState { revision: 0, credential_ref: None },
                 "sk-active",
                 |new_ref| custom_settings_for(Some(new_ref.clone())),
             )
