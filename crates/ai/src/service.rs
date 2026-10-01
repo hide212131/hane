@@ -865,7 +865,7 @@ fn handle_command(
             );
         }
         WorkerCommand::Action(AiCommand::RetryProbeStop) => {
-            retry_probe_stop(queued.id, shared, state);
+            retry_probe_stop(queued.id, paths, shared, state);
         }
         WorkerCommand::SaveSettings {
             expected_revision,
@@ -1153,7 +1153,12 @@ fn probe_model(
     }
 }
 
-fn retry_probe_stop(id: OperationId, shared: &Arc<SharedServiceState>, state: &mut WorkerState) {
+fn retry_probe_stop(
+    id: OperationId,
+    paths: &AiPaths,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+) {
     publish_busy(shared, id, ServiceBusyReason::Recovering);
     let confirmed = state.runtime.as_ref().is_some_and(|runtime| {
         runtime.stop().is_ok_and(|status| {
@@ -1165,11 +1170,11 @@ fn retry_probe_stop(id: OperationId, shared: &Arc<SharedServiceState>, state: &m
         mutate(shared, |snapshot| {
             snapshot.probe_status = ProbeStatus::NotRun;
             snapshot.probe_result = None;
-            snapshot.ownership = OwnershipState::Unknown;
         });
         if let Some(runtime) = state.runtime.as_ref() {
             sync_runtime_snapshot(shared, runtime);
         }
+        reacquire_owner_lock_after_runtime_stop(state, paths, shared);
         finish(shared, id, SafeOperationResult::Succeeded, LoginState::Idle);
     } else {
         mutate(shared, |snapshot| {
@@ -1652,6 +1657,14 @@ fn stop_runtime_for_recovery(
         return;
     }
 
+    reacquire_owner_lock_after_runtime_stop(state, paths, shared);
+}
+
+fn reacquire_owner_lock_after_runtime_stop(
+    state: &mut WorkerState,
+    paths: &AiPaths,
+    shared: &Arc<SharedServiceState>,
+) {
     if state.owner_guard.is_some() {
         mutate(shared, |snapshot| {
             snapshot.ownership = OwnershipState::Owned
@@ -2469,6 +2482,7 @@ fn current_model(settings: &AiSettings) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::RuntimeConfig;
 
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
@@ -2576,6 +2590,59 @@ mod tests {
             Err(AdmissionError::Unavailable)
         );
         assert!(handle.try_submit(AiCommand::RetryProbeStop).is_ok());
+    }
+
+    #[test]
+    fn retry_probe_stop_reacquires_owner_lock_after_confirmed_stop() {
+        static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+        let data_root = std::env::temp_dir().join(format!(
+            "hane-ai-retry-probe-stop-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let paths = AiPaths::new(&data_root);
+        let (events_tx, _events_rx) = mpsc::sync_channel(1);
+        let runtime = AiRuntime::spawn(
+            RuntimeConfig::new("unused-runtime-binary", paths.runtime_owner_lock_path()),
+            Arc::new(RejectAllServerRequests),
+            events_tx,
+        );
+        let mut state = WorkerState {
+            runtime: Some(runtime),
+            runtime_events: None,
+            owner_guard: None,
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+        };
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot {
+                probe_status: ProbeStatus::Isolated,
+                ..AiSnapshot::default()
+            }),
+            busy: Mutex::new(None),
+            next_operation_id: AtomicU64::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+
+        retry_probe_stop(OperationId(1), &paths, &shared, &mut state);
+
+        let snapshot = shared.snapshot.lock().unwrap();
+        assert_eq!(snapshot.probe_status, ProbeStatus::NotRun);
+        assert_eq!(snapshot.ownership, OwnershipState::Owned);
+        assert_eq!(
+            snapshot.last_result,
+            Some((OperationId(1), SafeOperationResult::Succeeded))
+        );
+        assert_eq!(
+            state.owner_guard.as_ref().map(OwnerLockGuard::path),
+            Some(paths.runtime_owner_lock_path().as_path())
+        );
+        drop(snapshot);
+        drop(state);
+        let _ = std::fs::remove_dir_all(data_root);
     }
 
     #[test]
