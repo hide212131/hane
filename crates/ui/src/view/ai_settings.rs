@@ -442,6 +442,18 @@ impl AiSettingsPage {
             && self.snapshot.persistence == PersistenceState::DurabilityUnconfirmed
     }
 
+    fn settings_editable(&self) -> bool {
+        let durability_reconfirmation = self.needs_durability_reconfirmation();
+        self.snapshot.ownership == OwnershipState::Owned
+            && self.snapshot.busy.is_none()
+            && (durability_reconfirmation
+                || (!self.snapshot.recovery_required
+                    && matches!(
+                        self.snapshot.persistence,
+                        PersistenceState::Clean | PersistenceState::Saved
+                    )))
+    }
+
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
         if self.inputs.is_some()
             || self.snapshot.ownership != OwnershipState::Owned
@@ -720,14 +732,7 @@ impl AiSettingsPage {
     ) -> impl IntoElement {
         self.ensure_inputs(window, cx);
         let durability_reconfirmation = self.needs_durability_reconfirmation();
-        let editable = self.snapshot.ownership == OwnershipState::Owned
-            && self.snapshot.busy.is_none()
-            && (durability_reconfirmation
-                || (!self.snapshot.recovery_required
-                    && matches!(
-                        self.snapshot.persistence,
-                        PersistenceState::Clean | PersistenceState::Saved
-                    )));
+        let editable = self.settings_editable();
         let ready = self.snapshot.ownership == OwnershipState::Owned
             && (!self.snapshot.recovery_required || durability_reconfirmation)
             && self.inputs.is_some();
@@ -2900,14 +2905,7 @@ impl AiSettingsPage {
         }
     }
 
-    fn save_section(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<EditorView>,
-        dirty: bool,
-        editable: bool,
-        theme: Theme,
-    ) -> impl IntoElement {
+    fn save_disabled_reason(&self, dirty: bool, editable: bool, cx: &App) -> &'static str {
         let durability_reconfirmation = self.needs_durability_reconfirmation();
         let endpoint_changed = self.inputs.as_ref().is_some_and(|inputs| {
             let (_, base_url, _) = self.custom_draft_values(inputs, cx);
@@ -2932,7 +2930,7 @@ impl AiSettingsPage {
                 .is_none()
             && self.credential_edit == CredentialEdit::Keep
             && !durability_reconfirmation;
-        let disabled_reason = if endpoint_changed {
+        if endpoint_changed {
             "接続先変更後は、新しいkeyの登録またはkey削除が必要です。"
         } else if replace_is_empty {
             "新しいAPIキーを入力してから保存してください。"
@@ -2944,7 +2942,19 @@ impl AiSettingsPage {
             "AI操作中または復旧中のため、いまは設定を変更できません。"
         } else {
             ""
-        };
+        }
+    }
+
+    fn save_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<EditorView>,
+        dirty: bool,
+        editable: bool,
+        theme: Theme,
+    ) -> impl IntoElement {
+        let durability_reconfirmation = self.needs_durability_reconfirmation();
+        let disabled_reason = self.save_disabled_reason(dirty, editable, cx);
         let view = cx.entity();
         let save_label = if self
             .snapshot
@@ -2960,20 +2970,10 @@ impl AiSettingsPage {
         let save = Button::new("ai-settings-save")
             .label(save_label)
             .primary()
-            .disabled(
-                (!dirty && !durability_reconfirmation)
-                    || !editable
-                    || endpoint_changed
-                    || replace_is_empty
-                    || key_is_missing,
-            )
+            .disabled(!disabled_reason.is_empty())
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.ai_settings.save(window, cx, None))
             });
-        let save = div()
-            .id("ai-settings-save-wrapper")
-            .debug_selector(|| "ai-settings-save".to_owned())
-            .child(save);
         let view = cx.entity();
         let discard = Button::new("ai-settings-discard")
             .label("変更を破棄")
@@ -3778,11 +3778,19 @@ mod tests {
             view.ai_settings.inputs.is_some()
                 && !view.ai_settings.is_dirty(app)
                 && view.ai_settings.needs_durability_reconfirmation()
+                && view.ai_settings.settings_editable()
+                && view
+                    .ai_settings
+                    .save_disabled_reason(
+                        view.ai_settings.is_dirty(app),
+                        view.ai_settings.settings_editable(),
+                        app,
+                    )
+                    .is_empty()
         }));
-        let save = cx
-            .debug_bounds("ai-settings-save")
-            .expect("durability recovery offers a re-save button");
-        cx.simulate_click(save.center(), gpui::Modifiers::none());
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.ai_settings.save(window, cx, None));
+        });
         cx.run_until_parked();
         assert_eq!(
             view.read_with(cx, |view, _| view.ai_settings.message.clone()),
