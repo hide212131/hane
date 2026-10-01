@@ -664,7 +664,7 @@ fn handle_command(
                 return;
             }
             publish_busy(shared, queued.id, ServiceBusyReason::Account);
-            let result = ensure_runtime(config, paths, settings, state)
+            let result = ensure_runtime(config, paths, settings, shared, state)
                 .and_then(|runtime| call_account_read(runtime, refresh_token));
             match result {
                 Ok(account) => {
@@ -720,12 +720,13 @@ fn handle_command(
                 return;
             }
             publish_busy(shared, queued.id, ServiceBusyReason::Account);
-            let result = ensure_runtime(config, paths, settings, state).and_then(|runtime| {
-                runtime
-                    .call("account/logout", None, RPC_TIMEOUT)
-                    .map_err(|_| ())?;
-                call_account_read(runtime, false)
-            });
+            let result =
+                ensure_runtime(config, paths, settings, shared, state).and_then(|runtime| {
+                    runtime
+                        .call("account/logout", None, RPC_TIMEOUT)
+                        .map_err(|_| ())?;
+                    call_account_read(runtime, false)
+                });
             match result {
                 Ok(account) => {
                     let signed_out = matches!(account, AccountState::SignedOut);
@@ -777,7 +778,7 @@ fn handle_command(
             mutate(shared, |snapshot| {
                 snapshot.model_list = ModelListState::Loading
             });
-            let result = match ensure_runtime(config, paths, settings, state) {
+            let result = match ensure_runtime(config, paths, settings, shared, state) {
                 Ok(runtime) => crate::models::fetch_chatgpt_models(|method, params| {
                     runtime
                         .call(method, Some(params), RPC_TIMEOUT)
@@ -847,7 +848,7 @@ fn handle_command(
                 return;
             }
             publish_busy(shared, queued.id, ServiceBusyReason::Recovering);
-            let result = ensure_runtime(config, paths, settings, state)
+            let result = ensure_runtime(config, paths, settings, shared, state)
                 .and_then(|runtime| runtime.restart().map_err(|_| ()))
                 .map(|_| ());
             if let Some(runtime) = state.runtime.as_ref() {
@@ -959,12 +960,9 @@ fn run_probe_command(
         snapshot.probe_result = None;
     });
 
-    if ensure_runtime(config, paths, settings, state).is_err() {
-        let owner_elsewhere = state
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.snapshot().state == RuntimeState::Failed)
-            && state.owner_guard.is_none();
+    if ensure_runtime(config, paths, settings, shared, state).is_err() {
+        let owner_elsewhere =
+            shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere;
         let (status, code) = if owner_elsewhere {
             (
                 ProbeStatus::Failed(ProbeErrorCode::OwnedElsewhere),
@@ -1734,6 +1732,7 @@ fn ensure_runtime<'a>(
     config: &AiServiceConfig,
     paths: &AiPaths,
     settings: &AiSettings,
+    shared: &Arc<SharedServiceState>,
     state: &'a mut WorkerState,
 ) -> Result<&'a AiRuntime, ()> {
     let needs_config = state.runtime.as_ref().is_none_or(|runtime| {
@@ -1772,7 +1771,12 @@ fn ensure_runtime<'a>(
                 );
                 state.runtime_events = Some(event_rx);
                 let owner = state.owner_guard.take().ok_or(())?;
-                runtime.start_with_owner_lock(owner).map_err(|_| ())?;
+                if runtime.start_with_owner_lock(owner).is_err() {
+                    mutate(shared, |snapshot| {
+                        snapshot.ownership = OwnershipState::Unknown
+                    });
+                    return Err(());
+                }
                 state.runtime = Some(runtime);
             } else {
                 runtime
@@ -1799,6 +1803,9 @@ fn ensure_runtime<'a>(
             runtime.start()
         };
         if result.is_err() {
+            mutate(shared, |snapshot| {
+                snapshot.ownership = OwnershipState::Unknown
+            });
             return Err(());
         }
     }
@@ -1860,7 +1867,7 @@ fn start_login(
     }
     publish_busy(shared, id, ServiceBusyReason::Login);
     mutate(shared, |snapshot| snapshot.login = LoginState::Starting);
-    let runtime = match ensure_runtime(config, paths, settings, state) {
+    let runtime = match ensure_runtime(config, paths, settings, shared, state) {
         Ok(runtime) => runtime,
         Err(()) => {
             finish(

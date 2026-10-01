@@ -2313,7 +2313,7 @@ impl EditorView {
             // is active. The visible navigation remains available to leave.
             return;
         }
-        self.close_settings(window, cx);
+        self.request_leave_settings(window, cx);
     }
 
     fn select_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {

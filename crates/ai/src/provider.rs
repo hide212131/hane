@@ -42,19 +42,15 @@ pub const PROJECT_DOC_MAX_BYTES: usize = 0;
 /// workspace instead of reading a nearby repository's `.codex/config.toml`.
 const PROJECT_ROOT_MARKERS: &str = "[]";
 
-/// Host/user skill discovery is outside Hane's connection settings and must
-/// not add adjacent skill files to a fixed-input AI operation.
-const SKIP_HOST_SKILL_DISCOVERY: bool = true;
-
 /// Minimal generated config for the ChatGPT-owned `CODEX_HOME`. It shares
 /// the same external-context isolation settings as the Custom Provider
 /// config, while leaving account authentication to the App Server API.
+/// User-level skills are isolated by the runtime's mandatory, Hane-owned
+/// `CODEX_HOME`; do not emit unrecognized feature flags into this config.
 pub fn generate_chatgpt_config_toml() -> String {
     format!(
         "project_doc_max_bytes = {PROJECT_DOC_MAX_BYTES}\n\
-         project_root_markers = {PROJECT_ROOT_MARKERS}\n\n\
-         [features]\n\
-         skip_host_skill_discovery = {SKIP_HOST_SKILL_DISCOVERY}\n"
+         project_root_markers = {PROJECT_ROOT_MARKERS}\n"
     )
 }
 
@@ -203,9 +199,6 @@ pub fn generate_custom_provider_toml(
          model = \"{escaped_model}\"\n\
          project_doc_max_bytes = {PROJECT_DOC_MAX_BYTES}\n\
          project_root_markers = {PROJECT_ROOT_MARKERS}\n\
-         \n\
-         [features]\n\
-         skip_host_skill_discovery = {SKIP_HOST_SKILL_DISCOVERY}\n\
          \n\
          [model_providers.{CUSTOM_PROVIDER_ID}]\n\
          name = \"{escaped_name}\"\n\
@@ -430,13 +423,7 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .is_some_and(Vec::is_empty)
         );
-        assert_eq!(
-            parsed
-                .get("features")
-                .and_then(|v| v.get("skip_host_skill_discovery"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(parsed.get("features").is_none());
 
         let provider = parsed
             .get("model_providers")
@@ -494,13 +481,7 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .is_some_and(Vec::is_empty)
         );
-        assert_eq!(
-            parsed
-                .get("features")
-                .and_then(|v| v.get("skip_host_skill_discovery"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(parsed.get("features").is_none());
         assert!(parsed.get("model_provider").is_none());
         assert!(parsed.get("model_providers").is_none());
     }

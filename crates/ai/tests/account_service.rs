@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiService, AiServiceConfig,
     AiSettingsLock, BrowserOpenError, BrowserOpener, CredentialStore, CustomConnectionSettings,
-    FakeCredentialStore, LoginState, ModelListState, OperationId, PersistenceState, ProbeErrorCode,
-    ProbeStatus, SafeOperationResult, ServiceBusyReason, ShellEnvironmentPolicyFormat,
+    FakeCredentialStore, LoginState, ModelListState, OperationId, OwnerLock, OwnershipState,
+    PersistenceState, ProbeErrorCode, ProbeStatus, SafeOperationResult, ServiceBusyReason,
+    ShellEnvironmentPolicyFormat,
 };
 
 #[derive(Default)]
@@ -713,4 +714,39 @@ fn a_new_service_reads_persisted_account_state_after_runtime_restart() {
         "restarted account snapshot: {:?}",
         restarted.handle().snapshot()
     );
+}
+
+#[test]
+fn failed_runtime_start_marks_ownership_unknown_and_allows_reopen() {
+    let data_root = unique_data_root();
+    configure_fake_scenario(&data_root, "crash_after_initialize");
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+    open_settings(&service);
+
+    let handle = service.handle();
+    let login_id = handle.try_submit(AiCommand::StartLogin).unwrap();
+    assert_eq!(
+        wait_for_result(&service, login_id).0,
+        SafeOperationResult::Failed("runtime_unavailable")
+    );
+    assert_eq!(handle.snapshot().ownership, OwnershipState::Unknown);
+
+    let owner_lock = OwnerLock::new(data_root.join("ai/runtime-owner.lock"));
+    let release_deadline = Instant::now() + Duration::from_secs(2);
+    let acquired = loop {
+        if let Some(acquired) = owner_lock.try_acquire().unwrap() {
+            break acquired;
+        }
+        assert!(
+            Instant::now() < release_deadline,
+            "failed startup must eventually release the lock instead of remaining Owned"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(acquired);
+
+    open_settings(&service);
+    assert_eq!(handle.snapshot().ownership, OwnershipState::Owned);
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
 }

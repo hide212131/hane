@@ -437,10 +437,15 @@ impl AiSettingsPage {
         })
     }
 
+    fn needs_durability_reconfirmation(&self) -> bool {
+        self.snapshot.recovery_required
+            && self.snapshot.persistence == PersistenceState::DurabilityUnconfirmed
+    }
+
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
         if self.inputs.is_some()
             || self.snapshot.ownership != OwnershipState::Owned
-            || self.snapshot.recovery_required
+            || (self.snapshot.recovery_required && !self.needs_durability_reconfirmation())
             || self.snapshot.busy.is_some()
         {
             return;
@@ -639,6 +644,7 @@ impl AiSettingsPage {
         if self.active_connection == ActiveConnection::Custom
             && old_credential.is_none()
             && self.credential_edit == CredentialEdit::Keep
+            && !self.needs_durability_reconfirmation()
         {
             self.message = Some(
                 "APIキーが未登録です。「登録」から入力し、「保存して適用」を押してください。"
@@ -713,15 +719,17 @@ impl AiSettingsPage {
         theme: Theme,
     ) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        let durability_reconfirmation = self.needs_durability_reconfirmation();
         let editable = self.snapshot.ownership == OwnershipState::Owned
-            && !self.snapshot.recovery_required
             && self.snapshot.busy.is_none()
-            && matches!(
-                self.snapshot.persistence,
-                PersistenceState::Clean | PersistenceState::Saved
-            );
+            && (durability_reconfirmation
+                || (!self.snapshot.recovery_required
+                    && matches!(
+                        self.snapshot.persistence,
+                        PersistenceState::Clean | PersistenceState::Saved
+                    )));
         let ready = self.snapshot.ownership == OwnershipState::Owned
-            && !self.snapshot.recovery_required
+            && (!self.snapshot.recovery_required || durability_reconfirmation)
             && self.inputs.is_some();
         let dirty = self.is_dirty(cx);
         let view = cx.entity();
@@ -1366,7 +1374,7 @@ impl AiSettingsPage {
                 "設定の復旧が必要です。上の「設定の復旧を再試行」を実行してください。".to_owned()
             }
             PersistenceState::DurabilityUnconfirmed => {
-                "保存結果を確定できません。AI接続を使わず、設定の復旧を再試行してください。"
+                "AI操作は無効です。現在の設定を「設定を再保存して復旧」から書き込み直してください。"
                     .to_owned()
             }
             _ if !self.saved_connection_is_configured() => {
@@ -2900,6 +2908,7 @@ impl AiSettingsPage {
         editable: bool,
         theme: Theme,
     ) -> impl IntoElement {
+        let durability_reconfirmation = self.needs_durability_reconfirmation();
         let endpoint_changed = self.inputs.as_ref().is_some_and(|inputs| {
             let (_, base_url, _) = self.custom_draft_values(inputs, cx);
             endpoint_changed_with_registered_key(
@@ -2921,14 +2930,15 @@ impl AiSettingsPage {
                 .as_ref()
                 .and_then(|custom| custom.credential_ref.as_ref())
                 .is_none()
-            && self.credential_edit == CredentialEdit::Keep;
+            && self.credential_edit == CredentialEdit::Keep
+            && !durability_reconfirmation;
         let disabled_reason = if endpoint_changed {
             "接続先変更後は、新しいkeyの登録またはkey削除が必要です。"
         } else if replace_is_empty {
             "新しいAPIキーを入力してから保存してください。"
         } else if key_is_missing {
             "APIキーを登録してから保存してください。"
-        } else if !dirty {
+        } else if !dirty && !durability_reconfirmation {
             "保存する変更はありません。"
         } else if !editable {
             "AI操作中または復旧中のため、いまは設定を変更できません。"
@@ -2942,13 +2952,21 @@ impl AiSettingsPage {
             .is_some_and(|(_, reason)| reason == ServiceBusyReason::Saving)
         {
             "保存・適用中…"
+        } else if durability_reconfirmation {
+            "設定を再保存して復旧"
         } else {
             "保存して適用"
         };
         let save = Button::new("ai-settings-save")
             .label(save_label)
             .primary()
-            .disabled(!dirty || !editable || endpoint_changed || replace_is_empty || key_is_missing)
+            .disabled(
+                (!dirty && !durability_reconfirmation)
+                    || !editable
+                    || endpoint_changed
+                    || replace_is_empty
+                    || key_is_missing,
+            )
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.ai_settings.save(window, cx, None))
             });
@@ -3704,6 +3722,69 @@ mod tests {
             "opened from Explorer\n"
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_prompts_before_discarding_a_dirty_ai_settings_draft(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.ai_settings.active_connection = ActiveConnection::Custom;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, app| view.ai_settings.is_dirty(app)));
+
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.handle_settings_escape(window, cx));
+        });
+
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.ai_settings.leave_prompt),
+            Some(LeaveTarget::Close)
+        );
+    }
+
+    #[gpui::test]
+    fn durability_unconfirmed_settings_can_be_resaved_without_edits(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(420.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_ai_page = true;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.recovery_required = true;
+            view.ai_settings.snapshot.persistence = PersistenceState::DurabilityUnconfirmed;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(view.read_with(cx, |view, app| {
+            view.ai_settings.inputs.is_some()
+                && !view.ai_settings.is_dirty(app)
+                && view.ai_settings.needs_durability_reconfirmation()
+        }));
+        let save = cx
+            .debug_bounds("ai-settings-save")
+            .expect("durability recovery offers a re-save button");
+        cx.simulate_click(save.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.ai_settings.message.clone()),
+            Some("AIサービスを利用できません。".to_owned()),
+            "the re-save button must be enabled even when the settings are unchanged"
+        );
     }
 
     #[gpui::test]

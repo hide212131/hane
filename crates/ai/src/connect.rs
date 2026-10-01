@@ -1906,13 +1906,7 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .is_some_and(Vec::is_empty)
         );
-        assert_eq!(
-            parsed
-                .get("features")
-                .and_then(|v| v.get("skip_host_skill_discovery"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(parsed.get("features").is_none());
     }
 
     #[test]
@@ -1963,13 +1957,7 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .is_some_and(Vec::is_empty)
         );
-        assert_eq!(
-            parsed
-                .get("features")
-                .and_then(|v| v.get("skip_host_skill_discovery"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(parsed.get("features").is_none());
     }
 
     #[test]

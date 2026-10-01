@@ -211,7 +211,9 @@ fn main() {
                 if mode == "never_respond" {
                     continue;
                 }
-                if mode == "crash_after_initialize" {
+                if mode == "crash_after_initialize"
+                    || fake_scenario.trim() == "crash_after_initialize"
+                {
                     std::process::exit(1);
                 }
                 if mode == "timeout_then_late_response" && is_timeout_once_first {
