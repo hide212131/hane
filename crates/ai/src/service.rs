@@ -1425,7 +1425,7 @@ fn handle_plain_save_error(
                 *settings = current.clone();
                 mutate(shared, |snapshot| snapshot.settings = current);
             }
-            stop_runtime_for_recovery(state, shared);
+            stop_runtime_for_recovery(state, paths, shared);
             mutate(shared, |snapshot| {
                 snapshot.recovery_required = true;
                 snapshot.persistence = PersistenceState::DurabilityUnconfirmed;
@@ -1533,7 +1533,7 @@ fn handle_credential_save_outcome(
                 *settings = current.clone();
                 mutate(shared, |snapshot| snapshot.settings = current);
             }
-            stop_runtime_for_recovery(state, shared);
+            stop_runtime_for_recovery(state, paths, shared);
             mutate(shared, |snapshot| {
                 snapshot.recovery_required = true;
                 snapshot.persistence = PersistenceState::DurabilityUnconfirmed;
@@ -1580,7 +1580,7 @@ fn finish_persisted_save(
     });
 
     if cleanup_pending {
-        stop_runtime_for_recovery(state, shared);
+        stop_runtime_for_recovery(state, paths, shared);
         finish(
             shared,
             id,
@@ -1591,6 +1591,7 @@ fn finish_persisted_save(
     }
 
     let mut apply_failed = false;
+    let mut stop_after_apply_failure = false;
     if runtime_affecting
         && let Some(runtime) = state.runtime.as_ref()
         && runtime.snapshot().state == RuntimeState::Ready
@@ -1614,9 +1615,12 @@ fn finish_persisted_save(
             }
             Err(_) => {
                 apply_failed = true;
-                let _ = runtime.stop();
+                stop_after_apply_failure = true;
             }
         }
+    }
+    if stop_after_apply_failure {
+        stop_runtime_for_recovery(state, paths, shared);
     }
     if let Some(runtime) = state.runtime.as_ref() {
         sync_runtime_snapshot(shared, runtime);
@@ -1633,10 +1637,45 @@ fn finish_persisted_save(
     );
 }
 
-fn stop_runtime_for_recovery(state: &mut WorkerState, shared: &Arc<SharedServiceState>) {
+fn stop_runtime_for_recovery(
+    state: &mut WorkerState,
+    paths: &AiPaths,
+    shared: &Arc<SharedServiceState>,
+) {
     if let Some(runtime) = state.runtime.as_ref() {
-        let _ = runtime.stop();
+        if runtime.stop().is_err() {
+            sync_runtime_snapshot(shared, runtime);
+            return;
+        }
         sync_runtime_snapshot(shared, runtime);
+    } else {
+        return;
+    }
+
+    if state.owner_guard.is_some() {
+        mutate(shared, |snapshot| {
+            snapshot.ownership = OwnershipState::Owned
+        });
+        return;
+    }
+
+    match OwnerLock::new(paths.runtime_owner_lock_path()).try_acquire() {
+        Ok(Some(owner)) => {
+            state.owner_guard = Some(owner);
+            mutate(shared, |snapshot| {
+                snapshot.ownership = OwnershipState::Owned
+            });
+        }
+        Ok(None) => {
+            mutate(shared, |snapshot| {
+                snapshot.ownership = OwnershipState::OwnedElsewhere
+            });
+        }
+        Err(_) => {
+            mutate(shared, |snapshot| {
+                snapshot.ownership = OwnershipState::Unavailable
+            });
+        }
     }
 }
 

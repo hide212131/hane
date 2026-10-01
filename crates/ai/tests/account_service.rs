@@ -367,6 +367,18 @@ fn app_service_handles_early_login_completion_models_logout_and_view_recreation(
     assert_eq!(deleted.runtime_state, hane_ai::RuntimeState::Stopped);
     assert_eq!(deleted.persistence, PersistenceState::Saved);
     assert!(credential_store.is_empty());
+
+    let mut recovered_settings = deleted.settings.clone();
+    recovered_settings.custom.as_mut().unwrap().name = "Recovered local mock".to_string();
+    let recovered_save_id = handle
+        .try_save_settings(deleted.settings.revision, recovered_settings)
+        .unwrap();
+    assert_eq!(
+        wait_for_result(&service, recovered_save_id).0,
+        SafeOperationResult::Succeeded,
+        "a confirmed runtime stop must return ownership to the service for later saves"
+    );
+    assert_eq!(handle.snapshot().ownership, OwnershipState::Owned);
 }
 
 #[test]
