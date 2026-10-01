@@ -1,0 +1,888 @@
+diff --git a/crates/ai/src/provider.rs b/crates/ai/src/provider.rs
+index 351f46250abba79371dff844e1b0002776056fe4..31008d23629cb2d298a7915ba22757905e571c52 100644
+--- a/crates/ai/src/provider.rs
++++ b/crates/ai/src/provider.rs
+@@ -18,7 +18,7 @@
+ use std::io;
+ use std::path::Path;
+ 
+-use crate::atomic_file::{atomic_write_bytes, AtomicWriteError};
++use crate::atomic_file::{AtomicWriteError, atomic_write_bytes};
+ 
+ /// The `model_providers` table key and `model_provider` selector Hane's
+ /// generated config always uses for the Custom Provider connection.
+@@ -50,13 +50,19 @@ impl std::fmt::Display for CustomProviderConfigError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+             CustomProviderConfigError::NonHttpsBaseUrl => {
+-                write!(f, "Custom Provider base URL must use https:// (or http:// to an explicit local host)")
++                write!(
++                    f,
++                    "Custom Provider base URL must use https:// (or http:// to an explicit local host)"
++                )
+             }
+             CustomProviderConfigError::CredentialInUrl => {
+                 write!(f, "Custom Provider base URL must not embed credentials")
+             }
+             CustomProviderConfigError::InvalidField(field) => {
+-                write!(f, "Custom Provider {field} is empty or contains a control character")
++                write!(
++                    f,
++                    "Custom Provider {field} is empty or contains a control character"
++                )
+             }
+         }
+     }
+@@ -124,7 +130,10 @@ pub fn validate_base_url(raw: &str) -> Result<(), CustomProviderConfigError> {
+     Ok(())
+ }
+ 
+-fn validate_toml_string_field(value: &str, field: &'static str) -> Result<(), CustomProviderConfigError> {
++fn validate_toml_string_field(
++    value: &str,
++    field: &'static str,
++) -> Result<(), CustomProviderConfigError> {
+     if value.is_empty() || value.chars().any(|c| c.is_control()) {
+         return Err(CustomProviderConfigError::InvalidField(field));
+     }
+@@ -187,8 +196,11 @@ pub struct CustomProviderMaterial {
+ 
+ impl std::fmt::Debug for CustomProviderMaterial {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        let redacted_env: Vec<(&str, &str)> =
+-            self.extra_env.iter().map(|(k, _)| (k.as_str(), "<redacted>")).collect();
++        let redacted_env: Vec<(&str, &str)> = self
++            .extra_env
++            .iter()
++            .map(|(k, _)| (k.as_str(), "<redacted>"))
++            .collect();
+         f.debug_struct("CustomProviderMaterial")
+             .field("config_toml", &self.config_toml)
+             .field("extra_env", &redacted_env)
+@@ -235,7 +247,9 @@ pub enum WriteCodexConfigError {
+ impl std::fmt::Display for WriteCodexConfigError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+-            WriteCodexConfigError::Io(e) => write!(f, "I/O error writing Custom Provider config: {e}"),
++            WriteCodexConfigError::Io(e) => {
++                write!(f, "I/O error writing Custom Provider config: {e}")
++            }
+             WriteCodexConfigError::PersistedDurabilityUnconfirmed(e) => write!(
+                 f,
+                 "Custom Provider config replace may have already taken effect, but its crash-durability \
+@@ -251,7 +265,10 @@ impl std::error::Error for WriteCodexConfigError {}
+ /// same-filesystem replace, so a reader (including the App Server itself, if
+ /// it were ever started concurrently with a regeneration) never observes a
+ /// torn file.
+-pub fn write_codex_config(codex_home: &Path, config_toml: &str) -> Result<(), WriteCodexConfigError> {
++pub fn write_codex_config(
++    codex_home: &Path,
++    config_toml: &str,
++) -> Result<(), WriteCodexConfigError> {
+     std::fs::create_dir_all(codex_home).map_err(WriteCodexConfigError::Io)?;
+     match atomic_write_bytes(&codex_home.join("config.toml"), config_toml.as_bytes()) {
+         Ok(()) => Ok(()),
+@@ -273,7 +290,10 @@ mod tests {
+ 
+     #[test]
+     fn plain_http_to_a_non_local_host_is_rejected() {
+-        assert_eq!(validate_base_url("http://provider.example/v1"), Err(CustomProviderConfigError::NonHttpsBaseUrl));
++        assert_eq!(
++            validate_base_url("http://provider.example/v1"),
++            Err(CustomProviderConfigError::NonHttpsBaseUrl)
++        );
+     }
+ 
+     #[test]
+@@ -301,7 +321,10 @@ mod tests {
+ 
+     #[test]
+     fn non_http_scheme_is_rejected() {
+-        assert_eq!(validate_base_url("ftp://provider.example/v1"), Err(CustomProviderConfigError::NonHttpsBaseUrl));
++        assert_eq!(
++            validate_base_url("ftp://provider.example/v1"),
++            Err(CustomProviderConfigError::NonHttpsBaseUrl)
++        );
+     }
+ 
+     #[test]
+@@ -333,7 +356,13 @@ mod tests {
+ 
+         assert!(!material.config_toml.contains("sk-super-secret-value"));
+         assert!(material.config_toml.contains(CUSTOM_PROVIDER_ENV_KEY));
+-        assert_eq!(material.extra_env, vec![(CUSTOM_PROVIDER_ENV_KEY.to_string(), "sk-super-secret-value".to_string())]);
++        assert_eq!(
++            material.extra_env,
++            vec![(
++                CUSTOM_PROVIDER_ENV_KEY.to_string(),
++                "sk-super-secret-value".to_string()
++            )]
++        );
+     }
+ 
+     #[test]
+@@ -346,25 +375,55 @@ mod tests {
+         )
+         .unwrap();
+ 
+-        let parsed: toml::Value = toml_text.parse().expect("generated config must be valid TOML");
+-        assert_eq!(parsed.get("model_provider").and_then(|v| v.as_str()), Some(CUSTOM_PROVIDER_ID));
+-        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some("gpt-test-model"));
++        let parsed: toml::Value = toml_text
++            .parse()
++            .expect("generated config must be valid TOML");
++        assert_eq!(
++            parsed.get("model_provider").and_then(|v| v.as_str()),
++            Some(CUSTOM_PROVIDER_ID)
++        );
++        assert_eq!(
++            parsed.get("model").and_then(|v| v.as_str()),
++            Some("gpt-test-model")
++        );
+ 
+         let provider = parsed
+             .get("model_providers")
+             .and_then(|v| v.get(CUSTOM_PROVIDER_ID))
+             .expect("model_providers.hane_custom table must be present");
+-        assert_eq!(provider.get("name").and_then(|v| v.as_str()), Some("My Provider"));
+-        assert_eq!(provider.get("base_url").and_then(|v| v.as_str()), Some("https://provider.example/v1"));
+-        assert_eq!(provider.get("wire_api").and_then(|v| v.as_str()), Some("responses"));
+-        assert_eq!(provider.get("env_key").and_then(|v| v.as_str()), Some(CUSTOM_PROVIDER_ENV_KEY));
+-        assert_eq!(provider.get("requires_openai_auth").and_then(|v| v.as_bool()), Some(false));
++        assert_eq!(
++            provider.get("name").and_then(|v| v.as_str()),
++            Some("My Provider")
++        );
++        assert_eq!(
++            provider.get("base_url").and_then(|v| v.as_str()),
++            Some("https://provider.example/v1")
++        );
++        assert_eq!(
++            provider.get("wire_api").and_then(|v| v.as_str()),
++            Some("responses")
++        );
++        assert_eq!(
++            provider.get("env_key").and_then(|v| v.as_str()),
++            Some(CUSTOM_PROVIDER_ENV_KEY)
++        );
++        assert_eq!(
++            provider
++                .get("requires_openai_auth")
++                .and_then(|v| v.as_bool()),
++            Some(false)
++        );
+ 
+         let filters = parsed
+             .get("shell_environment_policy")
+             .and_then(|v| v.get("filters"))
+             .expect("shell_environment_policy.filters table must be present");
+-        assert_eq!(filters.get(CUSTOM_PROVIDER_ENV_KEY).and_then(|v| v.as_str()), Some("exclude"));
++        assert_eq!(
++            filters
++                .get(CUSTOM_PROVIDER_ENV_KEY)
++                .and_then(|v| v.as_str()),
++            Some("exclude")
++        );
+     }
+ 
+     #[test]
+@@ -376,7 +435,9 @@ mod tests {
+             ShellEnvironmentPolicyFormat::LegacyExcludeList,
+         )
+         .unwrap();
+-        let parsed: toml::Value = toml_text.parse().expect("generated config must be valid TOML");
++        let parsed: toml::Value = toml_text
++            .parse()
++            .expect("generated config must be valid TOML");
+         let exclude_list = parsed
+             .get("shell_environment_policy")
+             .and_then(|v| v.get("exclude"))
+@@ -395,22 +456,43 @@ mod tests {
+             ShellEnvironmentPolicyFormat::Filters,
+         )
+         .unwrap();
+-        let parsed: toml::Value = toml_text.parse().expect("generated config must still be valid TOML");
+-        let provider = parsed.get("model_providers").and_then(|v| v.get(CUSTOM_PROVIDER_ID)).unwrap();
+-        assert_eq!(provider.get("name").and_then(|v| v.as_str()), Some("My \"Provider\" \\ co."));
++        let parsed: toml::Value = toml_text
++            .parse()
++            .expect("generated config must still be valid TOML");
++        let provider = parsed
++            .get("model_providers")
++            .and_then(|v| v.get(CUSTOM_PROVIDER_ID))
++            .unwrap();
++        assert_eq!(
++            provider.get("name").and_then(|v| v.as_str()),
++            Some("My \"Provider\" \\ co.")
++        );
+         // The injected quote must not have added a second, attacker-controlled
+         // key to the table.
+-        assert_eq!(provider.get("wire_api").and_then(|v| v.as_str()), Some("responses"));
++        assert_eq!(
++            provider.get("wire_api").and_then(|v| v.as_str()),
++            Some("responses")
++        );
+     }
+ 
+     #[test]
+     fn empty_or_control_character_fields_are_rejected_instead_of_generating_malformed_toml() {
+         assert!(matches!(
+-            generate_custom_provider_toml("", "https://provider.example/v1", "gpt", ShellEnvironmentPolicyFormat::Filters),
++            generate_custom_provider_toml(
++                "",
++                "https://provider.example/v1",
++                "gpt",
++                ShellEnvironmentPolicyFormat::Filters
++            ),
+             Err(CustomProviderConfigError::InvalidField("name"))
+         ));
+         assert!(matches!(
+-            generate_custom_provider_toml("Name", "https://provider.example/v1", "", ShellEnvironmentPolicyFormat::Filters),
++            generate_custom_provider_toml(
++                "Name",
++                "https://provider.example/v1",
++                "",
++                ShellEnvironmentPolicyFormat::Filters
++            ),
+             Err(CustomProviderConfigError::InvalidField("model_id"))
+         ));
+         assert!(matches!(
+@@ -426,7 +508,8 @@ mod tests {
+ 
+     #[test]
+     fn write_codex_config_persists_to_config_toml_under_codex_home() {
+-        let dir = std::env::temp_dir().join(format!("hane-ai-provider-test-{}", std::process::id()));
++        let dir =
++            std::env::temp_dir().join(format!("hane-ai-provider-test-{}", std::process::id()));
+         let codex_home = dir.join("codex-custom");
+         let toml_text = generate_custom_provider_toml(
+             "My Provider",
+diff --git a/crates/ai/src/rpc.rs b/crates/ai/src/rpc.rs
+index 1c4f3bea196d7db73fcf452fa790902fb7cc9110..a37026adc107882b5392ecb5719b0087e0e5e08b 100644
+--- a/crates/ai/src/rpc.rs
++++ b/crates/ai/src/rpc.rs
+@@ -92,7 +92,10 @@ impl std::fmt::Display for RpcError {
+             RpcError::Timeout => write!(f, "rpc call timed out"),
+             RpcError::Disconnected => write!(f, "transport disconnected"),
+             RpcError::Backpressure => {
+-                write!(f, "rpc request rejected: too many pending requests or a full outgoing queue")
++                write!(
++                    f,
++                    "rpc request rejected: too many pending requests or a full outgoing queue"
++                )
+             }
+             RpcError::Remote(err) => write!(f, "remote error {}: {}", err.code, err.message),
+         }
+@@ -106,7 +109,10 @@ impl std::error::Error for RpcError {}
+ /// responses).
+ #[derive(Debug, Clone)]
+ pub enum RpcEvent {
+-    Notification { method: String, params: Option<Value> },
++    Notification {
++        method: String,
++        params: Option<Value>,
++    },
+     Diagnostic(String),
+ }
+ 
+@@ -136,7 +142,12 @@ pub struct RpcCore {
+ }
+ 
+ impl RpcCore {
+-    pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RpcError> {
++    pub fn call(
++        &self,
++        method: &str,
++        params: Option<Value>,
++        timeout: Duration,
++    ) -> Result<Value, RpcError> {
+         let (id, reply_rx) = {
+             // Reserve the pending slot, encode the request and hand it to
+             // the writer queue all under one lock. Holding the lock across
+@@ -411,7 +422,8 @@ impl RpcTransport {
+         });
+ 
+         let writer_thread = spawn_writer(writer, writer_rx);
+-        let reader_thread = spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
++        let reader_thread =
++            spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
+         let stderr_thread = stderr.map(|s| spawn_stderr(s, events_tx.clone()));
+ 
+         RpcTransport {
+@@ -467,7 +479,12 @@ fn join_with_timeout(handle: Option<JoinHandle<()>>, name: &str, events_tx: &Syn
+ /// through `events_tx` (best-effort, same drop-on-full/disconnected policy
+ /// as every other diagnostic on this channel) so a stuck thread is visible
+ /// instead of silently swallowed.
+-fn join_with_deadline(handle: Option<JoinHandle<()>>, name: &str, events_tx: &SyncSender<RpcEvent>, deadline: Duration) {
++fn join_with_deadline(
++    handle: Option<JoinHandle<()>>,
++    name: &str,
++    events_tx: &SyncSender<RpcEvent>,
++    deadline: Duration,
++) {
+     let Some(handle) = handle else { return };
+     let (done_tx, done_rx) = mpsc::channel();
+     thread::spawn(move || {
+@@ -540,7 +557,11 @@ mod tests {
+         });
+ 
+         let result = core
+-            .call("test/echo", Some(serde_json::json!({"a": 1})), Duration::from_secs(5))
++            .call(
++                "test/echo",
++                Some(serde_json::json!({"a": 1})),
++                Duration::from_secs(5),
++            )
+             .unwrap();
+         assert_eq!(result["echoed"], Value::Bool(true));
+         responder.join().unwrap();
+@@ -559,11 +580,23 @@ mod tests {
+             let request: Value = serde_json::from_slice(&buf[..n]).unwrap();
+             let id = request["id"].clone();
+             // A notification arrives first, then the response.
+-            writeln!(server_write, "{}", serde_json::json!({"method": "session/event", "params": {"n": 1}})).unwrap();
+-            writeln!(server_write, "{}", serde_json::json!({"id": id, "result": "ok"})).unwrap();
++            writeln!(
++                server_write,
++                "{}",
++                serde_json::json!({"method": "session/event", "params": {"n": 1}})
++            )
++            .unwrap();
++            writeln!(
++                server_write,
++                "{}",
++                serde_json::json!({"id": id, "result": "ok"})
++            )
++            .unwrap();
+         });
+ 
+-        let result = core.call("initialize", None, Duration::from_secs(5)).unwrap();
++        let result = core
++            .call("initialize", None, Duration::from_secs(5))
++            .unwrap();
+         assert_eq!(result, Value::String("ok".to_string()));
+         responder.join().unwrap();
+ 
+@@ -669,7 +702,12 @@ mod tests {
+         let _core = transport.handle();
+ 
+         writeln!(server_write, "not json").unwrap();
+-        writeln!(server_write, "{}", serde_json::json!({"method": "after", "params": null})).unwrap();
++        writeln!(
++            server_write,
++            "{}",
++            serde_json::json!({"method": "after", "params": null})
++        )
++        .unwrap();
+         server_write.flush().unwrap();
+ 
+         // First event is a diagnostic about the malformed line.
+@@ -691,7 +729,8 @@ mod tests {
+             spawn_transport_over_pipes(handler);
+         let core = transport.handle();
+ 
+-        let call_thread = thread::spawn(move || core.call("test/echo", None, Duration::from_secs(30)));
++        let call_thread =
++            thread::spawn(move || core.call("test/echo", None, Duration::from_secs(30)));
+ 
+         // Give the call time to register itself as pending before the peer
+         // disappears, then simulate the child crashing mid-request.
+@@ -837,7 +876,9 @@ mod tests {
+         let mut in_flight = Vec::new();
+         for _ in 0..MAX_PENDING_REQUESTS {
+             let core = core.clone();
+-            in_flight.push(thread::spawn(move || core.call("never_replied", None, Duration::from_secs(30))));
++            in_flight.push(thread::spawn(move || {
++                core.call("never_replied", None, Duration::from_secs(30))
++            }));
+         }
+ 
+         // Wait for confirmation that all MAX_PENDING_REQUESTS requests were
+@@ -847,7 +888,9 @@ mod tests {
+         // timeout that is sensitive to how fast threads get scheduled.
+         all_registered_rx
+             .recv_timeout(Duration::from_secs(30))
+-            .expect("all MAX_PENDING_REQUESTS filler calls should register well within this timeout");
++            .expect(
++                "all MAX_PENDING_REQUESTS filler calls should register well within this timeout",
++            );
+ 
+         let result = core.call("one_too_many", None, Duration::from_secs(5));
+         assert!(matches!(result, Err(RpcError::Backpressure)));
+@@ -861,9 +904,10 @@ mod tests {
+ 
+     #[test]
+     fn request_shutdown_returns_promptly_and_releases_pending_even_when_the_writer_is_stuck_on_a_full_pipe_and_queue()
+-    {
++     {
+         let handler = Arc::new(RejectAllServerRequests);
+-        let (transport, _server_write, server_read, _events, _closed) = spawn_transport_over_pipes(handler);
++        let (transport, _server_write, server_read, _events, _closed) =
++            spawn_transport_over_pipes(handler);
+         let core = transport.handle();
+ 
+         // Never read from `server_read`: the OS pipe buffer is finite, so
+@@ -925,13 +969,18 @@ mod tests {
+             core.call("after_shutdown", None, Duration::from_secs(5)),
+             Err(RpcError::Disconnected)
+         ));
+-        assert!(matches!(core.notify("after_shutdown", None), Err(RpcError::Disconnected)));
++        assert!(matches!(
++            core.notify("after_shutdown", None),
++            Err(RpcError::Disconnected)
++        ));
+     }
+ 
+     #[test]
+-    fn reader_eof_racing_with_request_shutdown_still_resolves_pending_calls_and_new_calls_fail_fast() {
++    fn reader_eof_racing_with_request_shutdown_still_resolves_pending_calls_and_new_calls_fail_fast()
++     {
+         let handler = Arc::new(RejectAllServerRequests);
+-        let (transport, server_write, _server_read, _events, closed_rx) = spawn_transport_over_pipes(handler);
++        let (transport, server_write, _server_read, _events, closed_rx) =
++            spawn_transport_over_pipes(handler);
+         let core = transport.handle();
+ 
+         let pending_call = {
+@@ -958,7 +1007,10 @@ mod tests {
+             core.call("after", None, Duration::from_secs(5)),
+             Err(RpcError::Disconnected)
+         ));
+-        assert!(matches!(core.notify("after", None), Err(RpcError::Disconnected)));
++        assert!(matches!(
++            core.notify("after", None),
++            Err(RpcError::Disconnected)
++        ));
+     }
+ 
+     #[test]
+@@ -1036,7 +1088,8 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn join_with_timeout_returns_promptly_and_emits_no_diagnostic_when_the_thread_finishes_in_time() {
++    fn join_with_timeout_returns_promptly_and_emits_no_diagnostic_when_the_thread_finishes_in_time()
++    {
+         let (events_tx, events_rx) = mpsc::sync_channel(4);
+         let handle = thread::spawn(|| {});
+ 
+diff --git a/crates/ai/src/runtime.rs b/crates/ai/src/runtime.rs
+index 60cb65d51b8ab6b7311e8a40e0ea8a263741b624..8f07906cce76facc7cee99d848fabd261dbe248e 100644
+--- a/crates/ai/src/runtime.rs
++++ b/crates/ai/src/runtime.rs
+@@ -121,7 +121,10 @@ pub struct RuntimeEvent {
+ 
+ #[derive(Debug, Clone)]
+ pub enum RuntimeEventKind {
+-    Notification { method: String, params: Option<Value> },
++    Notification {
++        method: String,
++        params: Option<Value>,
++    },
+     Diagnostic(String),
+ }
+ 
+@@ -156,7 +159,10 @@ impl std::fmt::Display for RuntimeError {
+                 write!(f, "AI runtime is owned by another Hane process")
+             }
+             RuntimeError::OwnerLockPathMismatch => {
+-                write!(f, "the supplied runtime owner lock guard does not belong to this runtime")
++                write!(
++                    f,
++                    "the supplied runtime owner lock guard does not belong to this runtime"
++                )
+             }
+             RuntimeError::OwnerLock(e) => write!(f, "failed to acquire runtime owner lock: {e}"),
+             RuntimeError::Spawn(e) => write!(f, "failed to start the App Server process: {e}"),
+@@ -197,8 +203,11 @@ pub struct RuntimeConfig {
+ 
+ impl std::fmt::Debug for RuntimeConfig {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        let redacted_env: Vec<(&str, &str)> =
+-            self.extra_env.iter().map(|(k, _)| (k.as_str(), "<redacted>")).collect();
++        let redacted_env: Vec<(&str, &str)> = self
++            .extra_env
++            .iter()
++            .map(|(k, _)| (k.as_str(), "<redacted>"))
++            .collect();
+         f.debug_struct("RuntimeConfig")
+             .field("binary_path", &self.binary_path)
+             .field("args", &self.args)
+@@ -312,8 +321,14 @@ enum LifecycleCommand {
+ type OwnerLockCallback = Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>;
+ 
+ enum CoordinatorMessage {
+-    Lifecycle(LifecycleCommand, Sender<Result<RuntimeStatus, RuntimeError>>),
+-    ChildEnded { generation: u64, operation_generation: u64 },
++    Lifecycle(
++        LifecycleCommand,
++        Sender<Result<RuntimeStatus, RuntimeError>>,
++    ),
++    ChildEnded {
++        generation: u64,
++        operation_generation: u64,
++    },
+     /// Runs `f` synchronously on the coordinator thread, passing it the
+     /// owner lock guard this coordinator currently holds (if any). See
+     /// [`AiRuntime::with_owner_lock`].
+@@ -361,7 +376,14 @@ impl AiRuntime {
+         }));
+         let shared_for_thread = shared.clone();
+         let coordinator = thread::spawn(move || {
+-            run_coordinator(cmd_rx, self_tx, shared_for_thread, config, handler, events_tx);
++            run_coordinator(
++                cmd_rx,
++                self_tx,
++                shared_for_thread,
++                config,
++                handler,
++                events_tx,
++            );
+         });
+         AiRuntime {
+             cmd_tx,
+@@ -375,7 +397,9 @@ impl AiRuntime {
+         self.cmd_tx
+             .send(CoordinatorMessage::Lifecycle(cmd, reply_tx))
+             .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+-        reply_rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?
++        reply_rx
++            .recv()
++            .map_err(|_| RuntimeError::CoordinatorUnavailable)?
+     }
+ 
+     /// Starts the runtime. Concurrent `start()` callers are coalesced: only
+@@ -404,7 +428,9 @@ impl AiRuntime {
+         };
+ 
+         if !is_leader {
+-            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
++            return rx
++                .recv()
++                .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+         }
+ 
+         let result = self.send_lifecycle(LifecycleCommand::Start);
+@@ -445,7 +471,9 @@ impl AiRuntime {
+         };
+ 
+         if !is_leader {
+-            return rx.recv().map_err(|_| RuntimeError::CoordinatorUnavailable)?;
++            return rx
++                .recv()
++                .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
+         }
+ 
+         let result = self.send_lifecycle(LifecycleCommand::Restart);
+@@ -493,7 +521,10 @@ impl AiRuntime {
+         new_config: RuntimeConfig,
+         new_configured_settings_generation: u64,
+     ) -> Result<RuntimeStatus, RuntimeError> {
+-        self.send_lifecycle(LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation))
++        self.send_lifecycle(LifecycleCommand::Reconfigure(
++            new_config,
++            new_configured_settings_generation,
++        ))
+     }
+ 
+     /// Returns the `settings_generation` the `RuntimeConfig` *currently
+@@ -545,7 +576,10 @@ impl AiRuntime {
+     /// already `Ready`, `owner` is simply dropped (releasing whatever
+     /// separate OS lock file handle it held) and the current status is
+     /// returned, exactly like [`Self::start`].
+-    pub fn start_with_owner_lock(&self, owner: OwnerLockGuard) -> Result<RuntimeStatus, RuntimeError> {
++    pub fn start_with_owner_lock(
++        &self,
++        owner: OwnerLockGuard,
++    ) -> Result<RuntimeStatus, RuntimeError> {
+         self.send_lifecycle(LifecycleCommand::StartWithOwnerLock(owner))
+     }
+ 
+@@ -603,7 +637,12 @@ impl AiRuntime {
+     /// thread against the current generation's transport, independent of
+     /// the lifecycle coordinator, so it never blocks a concurrent stop or
+     /// restart and is never retried automatically on failure.
+-    pub fn call(&self, method: &str, params: Option<Value>, timeout: Duration) -> Result<Value, RuntimeError> {
++    pub fn call(
++        &self,
++        method: &str,
++        params: Option<Value>,
++        timeout: Duration,
++    ) -> Result<Value, RuntimeError> {
+         let core = {
+             let guard = self.shared.lock().unwrap();
+             match (guard.status, &guard.ready_transport) {
+@@ -611,7 +650,8 @@ impl AiRuntime {
+                 _ => return Err(RuntimeError::NotReady),
+             }
+         };
+-        core.call(method, params, timeout).map_err(RuntimeError::Rpc)
++        core.call(method, params, timeout)
++            .map_err(RuntimeError::Rpc)
+     }
+ 
+     pub fn snapshot(&self) -> RuntimeStatus {
+@@ -698,7 +738,10 @@ fn run_coordinator(
+                 operation_generation += 1;
+                 let op_gen = operation_generation;
+                 let result = match cmd {
+-                    LifecycleCommand::Reconfigure(new_config, new_configured_settings_generation) => {
++                    LifecycleCommand::Reconfigure(
++                        new_config,
++                        new_configured_settings_generation,
++                    ) => {
+                         // A currently held `owner_guard` proves ownership of
+                         // `config.owner_lock_path`, not of whatever path
+                         // `new_config` carries. Carrying it forward into a
+@@ -752,7 +795,8 @@ fn run_coordinator(
+                                     // restart below goes on to succeed.
+                                     {
+                                         let mut state = shared.lock().unwrap();
+-                                        state.config_generation = new_configured_settings_generation;
++                                        state.config_generation =
++                                            new_configured_settings_generation;
+                                     }
+                                     do_start(
+                                         op_gen,
+@@ -832,8 +876,10 @@ fn run_coordinator(
+                 // applies to the exact `Child` (and the exact operation that
+                 // spawned it) `current` still holds, never to whatever a
+                 // later operation has since moved on to.
+-                let matches_current =
+-                    current.as_ref().map(|c| (c.generation, c.operation_generation)) == Some((g, og));
++                let matches_current = current
++                    .as_ref()
++                    .map(|c| (c.generation, c.operation_generation))
++                    == Some((g, og));
+                 if matches_current {
+                     reap_and_mark_failed(
+                         &mut current,
+@@ -898,7 +944,17 @@ fn handle_lifecycle(
+ ) -> Option<Result<RuntimeStatus, RuntimeError>> {
+     match cmd {
+         LifecycleCommand::Start => do_start(
+-            op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
++            op_gen,
++            current,
++            generation,
++            owner_guard,
++            None,
++            config,
++            handler,
++            events_tx,
++            self_tx,
++            shared,
++            reply,
+         ),
+         LifecycleCommand::Stop => Some(stop_active(
+             current,
+@@ -928,14 +984,28 @@ fn handle_lifecycle(
+                 return Some(Err(e));
+             }
+             do_start(
+-                op_gen, current, generation, owner_guard, None, config, handler, events_tx, self_tx, shared, reply,
++                op_gen,
++                current,
++                generation,
++                owner_guard,
++                None,
++                config,
++                handler,
++                events_tx,
++                self_tx,
++                shared,
++                reply,
+             )
+         }
+         LifecycleCommand::Reconfigure(_, _) => {
+-            unreachable!("Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle")
++            unreachable!(
++                "Reconfigure is handled directly in run_coordinator, before reaching handle_lifecycle"
++            )
+         }
+         LifecycleCommand::StartWithOwnerLock(_) => {
+-            unreachable!("StartWithOwnerLock is handled directly in run_coordinator, before reaching handle_lifecycle")
++            unreachable!(
++                "StartWithOwnerLock is handled directly in run_coordinator, before reaching handle_lifecycle"
++            )
+         }
+     }
+ }
+@@ -1042,8 +1112,14 @@ fn do_start(
+     };
+ 
+     let stdin = child.stdin.take().expect("child spawned with piped stdin");
+-    let stdout = child.stdout.take().expect("child spawned with piped stdout");
+-    let stderr = child.stderr.take().expect("child spawned with piped stderr");
++    let stdout = child
++        .stdout
++        .take()
++        .expect("child spawned with piped stdout");
++    let stderr = child
++        .stderr
++        .take()
++        .expect("child spawned with piped stderr");
+ 
+     let self_tx_clone = self_tx.clone();
+     let on_closed: Box<dyn FnOnce() + Send> = Box::new(move || {
+@@ -1058,7 +1134,9 @@ fn do_start(
+     thread::spawn(move || {
+         for event in bridge_rx {
+             let kind = match event {
+-                RpcEvent::Notification { method, params } => RuntimeEventKind::Notification { method, params },
++                RpcEvent::Notification { method, params } => {
++                    RuntimeEventKind::Notification { method, params }
++                }
+                 RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
+             };
+             // Non-blocking: a slow caller-side consumer must never stall
+@@ -1067,7 +1145,10 @@ fn do_start(
+             // threads' own `try_send`). A full queue drops this one event;
+             // a disconnected receiver means nobody will ever read again, so
+             // stop draining the bridge instead of looping forever.
+-            match runtime_events_tx.try_send(RuntimeEvent { generation: g, kind }) {
++            match runtime_events_tx.try_send(RuntimeEvent {
++                generation: g,
++                kind,
++            }) {
+                 Ok(()) | Err(TrySendError::Full(_)) => {}
+                 Err(TrySendError::Disconnected(_)) => break,
+             }
+@@ -1348,7 +1429,13 @@ fn reap_and_mark_failed(
+     // Publish `Failed` before running the stop sequence below: leaving the
+     // published state at `Ready` while cleanup is still in flight would let
+     // callers observe a stale, already-wrong status.
+-    set_status(shared, RuntimeState::Failed, false, child_generation, op_gen);
++    set_status(
++        shared,
++        RuntimeState::Failed,
++        false,
++        child_generation,
++        op_gen,
++    );
+     {
+         let mut state = shared.lock().unwrap();
+         state.ready_transport = None;
+@@ -1426,7 +1513,12 @@ where
+     StopOutcome::RestartBlocked
+ }
+ 
+-fn wait_until<C, F>(handle: &mut C, try_wait: &mut F, timeout: Duration, poll_interval: Duration) -> bool
++fn wait_until<C, F>(
++    handle: &mut C,
++    try_wait: &mut F,
++    timeout: Duration,
++    poll_interval: Duration,
++) -> bool
+ where
+     F: FnMut(&mut C) -> io::Result<bool>,
+ {
+@@ -1523,14 +1615,19 @@ mod tests {
+     #[test]
+     fn spawn_child_rejects_a_non_absolute_binary_path_instead_of_falling_back_to_path_lookup() {
+         let config = RuntimeConfig::new("codex-app-server", "/tmp/hane-ai-test-owner.lock");
+-        let err = config.spawn_child().expect_err("a bare filename must be rejected");
++        let err = config
++            .spawn_child()
++            .expect_err("a bare filename must be rejected");
+         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+     }
+ 
+     #[test]
+     fn default_args_invoke_the_standalone_binary_without_an_app_server_subcommand() {
+         let config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+-        assert_eq!(config.args, vec!["--listen".to_string(), "stdio://".to_string()]);
++        assert_eq!(
++            config.args,
++            vec!["--listen".to_string(), "stdio://".to_string()]
++        );
+     }
+ 
+     #[test]
+@@ -1543,7 +1640,8 @@ mod tests {
+             "with_owner_lock_reports_none_before_the_runtime_ever_starts"
+         ));
+         std::fs::create_dir_all(&dir).unwrap();
+-        let config = RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
++        let config =
++            RuntimeConfig::new("/nonexistent/hane-ai-test-binary", dir.join("runtime.lock"));
+         let (events_tx, _events_rx) = mpsc::sync_channel(8);
+         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+         let runtime = AiRuntime::spawn(config, handler, events_tx);
+@@ -1551,7 +1649,10 @@ mod tests {
+         // Never started: no `Start`/`StartWithOwnerLock` was ever issued, so
+         // this coordinator does not (and must not) hold the owner lock yet.
+         let has_owner = runtime.with_owner_lock(|owner| owner.is_some()).unwrap();
+-        assert!(!has_owner, "no owner lock should be held before Start is ever issued");
++        assert!(
++            !has_owner,
++            "no owner lock should be held before Start is ever issued"
++        );
+ 
+         let _ = runtime.shutdown();
+         let _ = std::fs::remove_dir_all(&dir);
+@@ -1560,11 +1661,15 @@ mod tests {
+     #[test]
+     fn debug_formatting_never_prints_an_extra_env_secret_value() {
+         let mut config = RuntimeConfig::new("/opt/hane/codex", "/tmp/hane-ai-test-owner.lock");
+-        config
+-            .extra_env
+-            .push(("HANE_AI_PROVIDER_KEY".to_string(), "sk-super-secret-value".to_string()));
++        config.extra_env.push((
++            "HANE_AI_PROVIDER_KEY".to_string(),
++            "sk-super-secret-value".to_string(),
++        ));
+         let formatted = format!("{config:?}");
+-        assert!(formatted.contains("HANE_AI_PROVIDER_KEY"), "env var name should still be visible");
++        assert!(
++            formatted.contains("HANE_AI_PROVIDER_KEY"),
++            "env var name should still be visible"
++        );
+         assert!(
+             !formatted.contains("sk-super-secret-value"),
+             "extra_env values must never appear in Debug output, got: {formatted}"
+@@ -1612,7 +1717,10 @@ mod tests {
+             |_| {},
+         );
+ 
+-        assert_eq!(attempts, 3, "try_wait should be polled until it first reports exit confirmed");
++        assert_eq!(
++            attempts, 3,
++            "try_wait should be polled until it first reports exit confirmed"
++        );
+         assert!(
+             *released.lock().unwrap(),
+             "resource must be released once try_wait confirms exit"
+@@ -1656,7 +1764,9 @@ mod tests {
+         let (events_tx, _events_rx) = mpsc::sync_channel(8);
+         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+         let runtime = AiRuntime::spawn(config, handler, events_tx);
+-        let status = runtime.start().expect("start should succeed against the fake App Server");
++        let status = runtime
++            .start()
++            .expect("start should succeed against the fake App Server");
+         assert_eq!(status.state, RuntimeState::Ready);
+ 
+         let mismatched_config = RuntimeConfig::new(
+@@ -1718,7 +1828,9 @@ mod tests {
+         let (events_tx, _events_rx) = mpsc::sync_channel(8);
+         let handler: Arc<dyn ServerRequestHandler> = Arc::new(RejectAllServerRequests);
+         let runtime = AiRuntime::spawn(config, handler, events_tx);
+-        let status = runtime.start().expect("start should succeed against the fake App Server");
++        let status = runtime
++            .start()
++            .expect("start should succeed against the fake App Server");
+         assert_eq!(status.state, RuntimeState::Ready);
+ 
+         let panic_result = runtime.with_owner_lock(|_owner| {
+@@ -1747,7 +1859,9 @@ mod tests {
+ 
+         // A subsequent ordinary lifecycle command must still be processed
+         // normally by the same coordinator thread.
+-        let stop_status = runtime.stop().expect("stop should still succeed after the earlier callback panic");
++        let stop_status = runtime
++            .stop()
++            .expect("stop should still succeed after the earlier callback panic");
+         assert_eq!(stop_status.state, RuntimeState::Stopped);
+ 
+         let _ = runtime.shutdown();
