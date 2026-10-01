@@ -2232,7 +2232,8 @@ impl AiSettingsPage {
 
         let service_picker = self.custom_service_picker(cx, disabled);
 
-        let (key_row, key_input) = self.custom_key_content(cx, disabled, registered, divider, theme);
+        let (key_row, key_input) =
+            self.custom_key_content(cx, disabled, registered, divider, theme);
 
         let details_open = self.custom_details_open;
         let view = cx.entity();

@@ -1260,9 +1260,10 @@ fn do_start(
                 }
                 RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
             };
-            // Never block the App Server reader. A lost critical event
-            // schedules an independent coordinator wake that stops this
-            // exact child generation; diagnostics remain best-effort.
+            // Never block the App Server reader: a slow caller-side consumer
+            // cannot stall this forwarding thread. Losing a critical event
+            // schedules an independent coordinator wake that stops this exact
+            // child generation; diagnostics remain best-effort.
             match runtime_events_tx.try_send(RuntimeEvent {
                 generation: g,
                 kind,

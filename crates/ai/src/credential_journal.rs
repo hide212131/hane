@@ -257,8 +257,8 @@ pub fn recover(
     // it, rather than the journal silently forgetting a credential store
     // entry that may still exist.
     let delete_and_complete = |to_delete: Option<&CredentialRef>,
-                                    new_ref: Option<&CredentialRef>,
-                                    old_ref: Option<&CredentialRef>|
+                               new_ref: Option<&CredentialRef>,
+                               old_ref: Option<&CredentialRef>|
      -> io::Result<bool> {
         if let Some(target) = to_delete
             && store.delete(target).is_err()
