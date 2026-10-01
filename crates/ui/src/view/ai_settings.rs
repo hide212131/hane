@@ -2970,6 +2970,10 @@ impl AiSettingsPage {
             .on_click(move |_, window, app| {
                 view.update(app, |view, cx| view.ai_settings.save(window, cx, None))
             });
+        let save = div()
+            .id("ai-settings-save-wrapper")
+            .debug_selector(|| "ai-settings-save".to_owned())
+            .child(save);
         let view = cx.entity();
         let discard = Button::new("ai-settings-discard")
             .label("変更を破棄")
