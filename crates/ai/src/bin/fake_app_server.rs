@@ -68,6 +68,9 @@
 //!   placed in `RuntimeConfig::extra_env` actually reaches this child
 //!   process's own environment end-to-end through `AiRuntime`, without
 //!   requiring a real Codex binary or a real HTTP call.
+//! - Test-only files in the dedicated `CODEX_HOME` can select
+//!   `hold_login` or `complete_on_cancel` and persist the fake account across
+//!   fake process restarts. They are never read by the shipped runtime.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -98,8 +101,17 @@ fn main() {
         }
     }
 
+    if let Ok(cwd) = env::current_dir() {
+        let observed_home = env::var("CODEX_HOME").unwrap_or_else(|_| "<absent>".to_string());
+        let _ = std::fs::write(cwd.join(".hane-fake-app-server-codex-home"), observed_home);
+    }
+
     let mode = env::var("FAKE_SERVER_MODE").unwrap_or_else(|_| "normal".to_string());
     let emit_server_request = env::var("FAKE_SERVER_EMIT_SERVER_REQUEST").is_ok();
+    let critical_notification_count: usize = env::var("FAKE_SERVER_CRITICAL_NOTIFICATION_COUNT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let record_init_file = env::var("FAKE_SERVER_RECORD_INIT_FILE").ok();
     let echo_received_file = env::var("FAKE_SERVER_ECHO_RECEIVED_FILE").ok();
     let timeout_once_marker = env::var("FAKE_SERVER_TIMEOUT_ONCE_MARKER").ok();
@@ -122,6 +134,20 @@ fn main() {
             None => true,
         };
     let mut pending_initialize_id: Option<serde_json::Value> = None;
+    let fake_home = env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
+    if let Some(home) = &fake_home {
+        let _ = std::fs::create_dir_all(home);
+    }
+    let fake_scenario = fake_home
+        .as_ref()
+        .and_then(|home| std::fs::read_to_string(home.join(".hane-fake-app-server-scenario")).ok())
+        .unwrap_or_default();
+    let fake_account_state = fake_home
+        .as_ref()
+        .map(|home| home.join(".hane-fake-app-server-signed-in"));
+    let mut account_signed_in = fake_account_state
+        .as_ref()
+        .is_some_and(|path| path.exists());
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
@@ -185,7 +211,9 @@ fn main() {
                 if mode == "never_respond" {
                     continue;
                 }
-                if mode == "crash_after_initialize" {
+                if mode == "crash_after_initialize"
+                    || fake_scenario.trim() == "crash_after_initialize"
+                {
                     std::process::exit(1);
                 }
                 if mode == "timeout_then_late_response" && is_timeout_once_first {
@@ -240,6 +268,242 @@ fn main() {
                     break;
                 }
             }
+            (Some(id), Some(method)) if method == "thread/start" => {
+                if let Some(home) = &fake_home {
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        &format!("THREAD_START:{params}"),
+                    );
+                }
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"thread": {"id": "fake-thread-1"}}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "turn/start" => {
+                if let Some(home) = &fake_home {
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        &format!("TURN_START:{params}"),
+                    );
+                }
+                match fake_scenario.trim() {
+                    "probe_success" => {
+                        for (method, params) in [
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"foreign-turn","item":{"id":"foreign","type":"agentMessage","text":"must-not-leak"}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-1","type":"agentMessage","text":"Mock "}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-1","type":"agentMessage","text":"duplicate"}}),
+                            ),
+                            (
+                                "item/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"message-2","type":"agentMessage","text":"reply"}}),
+                            ),
+                            (
+                                "turn/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turn":{"id":"foreign-turn","status":"completed","error":null}}),
+                            ),
+                            (
+                                "turn/completed",
+                                serde_json::json!({"threadId":"fake-thread-1","turn":{"id":"fake-turn-1","status":"completed","error":null}}),
+                            ),
+                        ] {
+                            let notification = serde_json::json!({"method":method,"params":params});
+                            if writeln!(stdout, "{notification}").is_err()
+                                || stdout.flush().is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    "probe_401" | "probe_403" | "probe_429" => {
+                        let status = match fake_scenario.trim() {
+                            "probe_401" => 401,
+                            "probe_403" => 403,
+                            _ => 429,
+                        };
+                        let notification = serde_json::json!({
+                            "method":"turn/completed",
+                            "params":{
+                                "threadId":"fake-thread-1",
+                                "turn":{"id":"fake-turn-1","status":"failed","error":{
+                                    "message":"provider rejected bearer sk-fake-secret",
+                                    "codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":status}}
+                                }}
+                            }
+                        });
+                        let _ = writeln!(stdout, "{notification}");
+                        let _ = stdout.flush();
+                    }
+                    "probe_tool_item" => {
+                        let notification = serde_json::json!({
+                            "method":"item/started",
+                            "params":{"threadId":"fake-thread-1","turnId":"fake-turn-1","item":{"id":"cmd-1","type":"commandExecution"}}
+                        });
+                        let _ = writeln!(stdout, "{notification}");
+                        let _ = stdout.flush();
+                    }
+                    _ => {}
+                }
+                if fake_scenario.trim() == "probe_turn_timeout" {
+                    // Keep the RPC pending so the runtime's bounded request
+                    // timeout path is exercised without a 90-second turn wait.
+                    continue;
+                }
+                let turn = if fake_scenario.trim() == "probe_invalid_turn_ack" {
+                    serde_json::json!({})
+                } else {
+                    serde_json::json!({"id":"fake-turn-1"})
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"turn": turn}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "turn/interrupt" => {
+                let response = serde_json::json!({"id":id,"result":{}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+                if let Some(home) = &fake_home {
+                    append_record(
+                        &home
+                            .join(".hane-fake-app-server-probe-record")
+                            .to_string_lossy(),
+                        "INTERRUPT_ACK",
+                    );
+                }
+                if fake_scenario.trim() != "probe_cancel_ack_only" {
+                    let notification = serde_json::json!({
+                        "method":"turn/completed",
+                        "params":{"threadId":"fake-thread-1","turn":{"id":"fake-turn-1","status":"interrupted","error":null}}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+            }
+            (Some(id), Some(method)) if method == "account/read" => {
+                let account = if account_signed_in {
+                    serde_json::json!({"type":"chatgpt", "email":"fake-user@example.invalid", "planType":"plus"})
+                } else {
+                    serde_json::Value::Null
+                };
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {"account": account, "requiresOpenaiAuth": !account_signed_in}
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/login/start" => {
+                let login_id = "fake-login-1";
+                if fake_scenario.trim() != "hold_login"
+                    && fake_scenario.trim() != "complete_on_cancel"
+                {
+                    account_signed_in = true;
+                    if let Some(path) = &fake_account_state {
+                        let _ = std::fs::write(path, b"signed-in");
+                    }
+                    // Deliberately send completion before the start response
+                    // so integration tests cover the notification/ACK race.
+                    let notification = serde_json::json!({
+                        "method":"account/login/completed",
+                        "params":{"loginId":login_id, "success":true, "error":null}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+                let response = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "type":"chatgpt",
+                        "loginId":login_id,
+                        "authUrl":"https://auth.openai.com/oauth/authorize?state=fake"
+                    }
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/login/cancel" => {
+                let status = if fake_scenario.trim() == "complete_on_cancel" {
+                    account_signed_in = true;
+                    if let Some(path) = &fake_account_state {
+                        let _ = std::fs::write(path, b"signed-in");
+                    }
+                    let notification = serde_json::json!({
+                        "method":"account/login/completed",
+                        "params":{"loginId":"fake-login-1", "success":true, "error":null}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                    "notFound"
+                } else {
+                    "canceled"
+                };
+                let response = serde_json::json!({"id":id, "result":{"status":status}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "account/logout" => {
+                account_signed_in = false;
+                if let Some(path) = &fake_account_state {
+                    let _ = std::fs::remove_file(path);
+                }
+                let response = serde_json::json!({"id":id, "result":{}});
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
+            (Some(id), Some(method)) if method == "model/list" => {
+                let response = serde_json::json!({
+                    "id":id,
+                    "result": {
+                        "data":[{
+                            "id":"catalog-internal-1",
+                            "model":"gpt-fake-text",
+                            "displayName":"Fake Text Model",
+                            "hidden":false,
+                            "inputModalities":["text"],
+                            "isDefault":true
+                        }],
+                        "nextCursor":null
+                    }
+                });
+                if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
+                    break;
+                }
+            }
             (Some(id), Some(method)) => {
                 let response = serde_json::json!({
                     "id": id,
@@ -252,6 +516,15 @@ fn main() {
             (None, Some(method)) if method == "initialized" => {
                 if let Some(path) = &record_init_file {
                     append_record(path, "INITIALIZED");
+                }
+                for n in 0..critical_notification_count {
+                    let notification = serde_json::json!({
+                        "method": "turn/completed",
+                        "params": {"testSequence": n}
+                    });
+                    if writeln!(stdout, "{notification}").is_err() || stdout.flush().is_err() {
+                        break;
+                    }
                 }
             }
             _ => {

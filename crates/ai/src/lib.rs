@@ -5,31 +5,41 @@
 //! the UI toolchain. See `docs/adr/0032-embedded-codex-app-server-ai-foundation.md`
 //! for the design this implements.
 
+mod account;
 mod atomic_file;
 mod connect;
 mod credential_journal;
+mod models;
 mod owner_lock;
 mod paths;
+mod probe;
 mod protocol;
 mod provider;
 mod rpc;
 mod runtime;
 mod secrets;
+mod service;
 mod settings;
 mod settings_lock;
 
+pub use account::{
+    AccountError, AccountState, CancelStatus, account_read_params, completed_login_matches,
+    parse_account_read, parse_cancel_status, parse_chatgpt_login_start,
+};
 pub use connect::{
-    ConfiguredRuntime, ConnectError, ExpectedCredentialState,
+    ConfiguredRuntime, ConnectError, ExpectedCredentialState, SaveOutcome,
     build_runtime_config_for_active_connection, call_with_generation_check,
-    delete_custom_credential, recover_at_startup, update_custom_credential,
-    with_generation_checked_lock,
+    delete_custom_credential, delete_custom_credential_detailed, recover_at_startup,
+    update_custom_credential, update_custom_credential_detailed, with_generation_checked_lock,
 };
 pub use credential_journal::{
     CredentialJournal, CredentialOperation, JournalOperationKind, JournalOperationState,
     RecoveryOutcome, recover as recover_credential_journal,
 };
+pub use models::{ChatGptModel, ModelListError, fetch_chatgpt_models, saved_model_is_available};
 pub use owner_lock::{OwnerLock, OwnerLockGuard};
 pub use paths::AiPaths;
+pub use probe::{ProbeErrorCode, ProbeResult, ProbeStatus};
 pub use protocol::{ErrorObject, IncomingMessage, ParseError, RequestId};
 pub use provider::{
     CUSTOM_PROVIDER_ENV_KEY, CUSTOM_PROVIDER_ID, CustomProviderConfigError, CustomProviderMaterial,
@@ -44,6 +54,11 @@ pub use runtime::{
 pub use secrets::{
     CredentialRef, CredentialStore, CredentialStoreError, FakeCredentialStore, OsCredentialStore,
     UnavailableCredentialStore,
+};
+pub use service::{
+    AdmissionError, AiCommand, AiService, AiServiceConfig, AiServiceHandle, AiSnapshot,
+    BrowserOpenError, BrowserOpener, LoginState, ModelListState, OperationId, OwnershipState,
+    PersistenceState, SafeOperationResult, ServiceBusyReason, SystemBrowserOpener,
 };
 pub use settings::{
     AI_SETTINGS_SCHEMA_VERSION, ActiveConnection, AiSettings, AiSettingsStore,

@@ -31,6 +31,36 @@ pub const CUSTOM_PROVIDER_ID: &str = "hane_custom";
 /// TOML itself.
 pub const CUSTOM_PROVIDER_ENV_KEY: &str = "HANE_AI_PROVIDER_KEY";
 
+/// Codex's default project-instruction budget is nonzero, which lets the
+/// App Server load `AGENTS.md` from its runtime cwd and add that file to a
+/// turn. Hane's AI runtime must never inherit instructions from its probe
+/// workspace or another nearby project.
+pub const PROJECT_DOC_MAX_BYTES: usize = 0;
+
+/// The App Server otherwise searches parent directories for project config.
+/// An empty marker list confines project discovery to Hane's fresh runtime
+/// workspace instead of reading a nearby repository's `.codex/config.toml`.
+const PROJECT_ROOT_MARKERS: &str = "[]";
+
+/// Codex 0.157.1 separately discovers skills from the OS home directory
+/// (`~/.agents/skills`), not just from `CODEX_HOME`. Disable host skill
+/// snapshots for Hane's standalone runtime; the pinned App Server supports
+/// this feature when no registered extension requires host discovery.
+const SKIP_HOST_SKILL_DISCOVERY: bool = true;
+
+/// Minimal generated config for the ChatGPT-owned `CODEX_HOME`. It shares
+/// the same external-context isolation settings as the Custom Provider
+/// config, while leaving account authentication to the App Server API.
+pub fn generate_chatgpt_config_toml() -> String {
+    format!(
+        "project_doc_max_bytes = {PROJECT_DOC_MAX_BYTES}\n\
+         project_root_markers = {PROJECT_ROOT_MARKERS}\n\
+         \n\
+         [features]\n\
+         skip_host_skill_discovery = {SKIP_HOST_SKILL_DISCOVERY}\n"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomProviderConfigError {
     /// The Base URL uses a scheme other than `https://`, or `http://` to a
@@ -174,6 +204,11 @@ pub fn generate_custom_provider_toml(
     Ok(format!(
         "model_provider = \"{CUSTOM_PROVIDER_ID}\"\n\
          model = \"{escaped_model}\"\n\
+         project_doc_max_bytes = {PROJECT_DOC_MAX_BYTES}\n\
+         project_root_markers = {PROJECT_ROOT_MARKERS}\n\
+         \n\
+         [features]\n\
+         skip_host_skill_discovery = {SKIP_HOST_SKILL_DISCOVERY}\n\
          \n\
          [model_providers.{CUSTOM_PROVIDER_ID}]\n\
          name = \"{escaped_name}\"\n\
@@ -386,6 +421,25 @@ mod tests {
             parsed.get("model").and_then(|v| v.as_str()),
             Some("gpt-test-model")
         );
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|features| features.get("skip_host_skill_discovery"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
 
         let provider = parsed
             .get("model_providers")
@@ -424,6 +478,34 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("exclude")
         );
+    }
+
+    #[test]
+    fn chatgpt_toml_uses_the_same_external_context_isolation_profile() {
+        let parsed: toml::Value = generate_chatgpt_config_toml()
+            .parse()
+            .expect("ChatGPT config must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|features| features.get("skip_host_skill_discovery"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert!(parsed.get("model_provider").is_none());
+        assert!(parsed.get("model_providers").is_none());
     }
 
     #[test]

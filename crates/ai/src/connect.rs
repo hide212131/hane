@@ -45,7 +45,7 @@ use crate::owner_lock::OwnerLockGuard;
 use crate::paths::AiPaths;
 use crate::provider::{
     CustomProviderConfigError, ShellEnvironmentPolicyFormat, WriteCodexConfigError,
-    build_custom_provider_material, write_codex_config,
+    build_custom_provider_material, generate_chatgpt_config_toml, write_codex_config,
 };
 use crate::runtime::{AiRuntime, RuntimeConfig, RuntimeError};
 use crate::secrets::{CredentialRef, CredentialStore, CredentialStoreError};
@@ -226,6 +226,23 @@ pub struct ExpectedCredentialState {
     pub credential_ref: Option<CredentialRef>,
 }
 
+/// Outcome of a credential-backed settings transaction. `NotCommitted`
+/// means the settings replace did not land. `Committed` always carries the
+/// newly persisted settings even when journal cleanup still needs recovery;
+/// callers must block another save until that cleanup is resolved.
+#[derive(Debug)]
+pub enum SaveOutcome {
+    NotCommitted(ConnectError),
+    Committed {
+        settings: AiSettings,
+        cleanup_pending: bool,
+    },
+    DurabilityUnconfirmed {
+        observed: Option<AiSettings>,
+        error: ConnectError,
+    },
+}
+
 /// Creates or rotates the Custom Provider credential and lands the settings
 /// replace that references it, as one journal-guarded transaction (ADR-0032
 /// section 7.3 steps 1-7, `update` shape). `build_new_settings` receives the
@@ -237,7 +254,7 @@ pub struct ExpectedCredentialState {
 /// [`AiSettingsStore::save`] for why this is required at the type level, per
 /// ADR-0032 section 8's fixed "runtime owner lock → AI settings lock"
 /// acquisition order).
-pub fn update_custom_credential(
+pub fn update_custom_credential_detailed(
     settings_store: &AiSettingsStore,
     owner: &OwnerLockGuard,
     journal: &CredentialJournal,
@@ -245,10 +262,17 @@ pub fn update_custom_credential(
     expected: ExpectedCredentialState,
     new_secret: &str,
     build_new_settings: impl FnOnce(&CredentialRef) -> AiSettings,
-) -> Result<AiSettings, ConnectError> {
-    settings_store.check_owner(owner)?;
-    let guard = acquire_exclusive(settings_store)?;
-    reject_if_journal_pending(journal)?;
+) -> SaveOutcome {
+    if let Err(error) = settings_store.check_owner(owner) {
+        return SaveOutcome::NotCommitted(error.into());
+    }
+    let guard = match acquire_exclusive(settings_store) {
+        Ok(guard) => guard,
+        Err(error) => return SaveOutcome::NotCommitted(error),
+    };
+    if let Err(error) = reject_if_journal_pending(journal) {
+        return SaveOutcome::NotCommitted(error);
+    }
 
     // Compare `expected.revision` against the just-reloaded current settings
     // *before* any journal/credential side effect. Checking this only deep
@@ -258,12 +282,17 @@ pub fn update_custom_credential(
     // indistinguishable from a genuine crash-mid-operation to a later
     // `recover` pass and could see it retried/completed instead of
     // discarded.
-    let current = settings_store.load().map_err(ConnectError::Io)?;
+    let current = match settings_store.load() {
+        Ok(current) => current,
+        Err(error) => return SaveOutcome::NotCommitted(ConnectError::Io(error)),
+    };
     if current.revision != expected.revision {
-        return Err(SaveError::RevisionConflict {
-            current: Box::new(current),
-        }
-        .into());
+        return SaveOutcome::NotCommitted(
+            SaveError::RevisionConflict {
+                current: Box::new(current),
+            }
+            .into(),
+        );
     }
     // Compare the full `Option<CredentialRef>`, not just the `Some` case:
     // `expected.credential_ref == None` must also be rejected when current
@@ -279,7 +308,7 @@ pub fn update_custom_credential(
         .as_ref()
         .and_then(|c| c.credential_ref.clone());
     if current_credential_ref != expected.credential_ref {
-        return Err(ConnectError::CredentialRefMismatch {
+        return SaveOutcome::NotCommitted(ConnectError::CredentialRefMismatch {
             current: Box::new(current),
         });
     }
@@ -299,25 +328,27 @@ pub fn update_custom_credential(
         .as_ref()
         .and_then(|c| c.credential_ref.clone());
     if new_credential_ref.as_ref() != Some(&new_ref) {
-        return Err(ConnectError::InvalidNewSettings);
+        return SaveOutcome::NotCommitted(ConnectError::InvalidNewSettings);
     }
 
     // Step 2: durably record the pending operation before the secret is
     // written anywhere.
-    journal
-        .begin(CredentialOperation {
-            kind: JournalOperationKind::Update,
-            state: JournalOperationState::PendingNew,
-            new_credential_ref: Some(new_ref.clone()),
-            old_credential_ref: expected.credential_ref.clone(),
-            settings_generation_before,
-        })
-        .map_err(ConnectError::Io)?;
+    if let Err(error) = journal.begin(CredentialOperation {
+        kind: JournalOperationKind::Update,
+        state: JournalOperationState::PendingNew,
+        new_credential_ref: Some(new_ref.clone()),
+        old_credential_ref: expected.credential_ref.clone(),
+        settings_generation_before,
+    }) {
+        return SaveOutcome::NotCommitted(ConnectError::Io(error));
+    }
 
     // Step 3: write the new secret. A failure here leaves the `PendingNew`
     // entry for the next startup's `recover` to diagnose/retry; the old
     // credential and old settings are untouched.
-    credential_store.set(&new_ref, new_secret)?;
+    if let Err(error) = credential_store.set(&new_ref, new_secret) {
+        return SaveOutcome::NotCommitted(error.into());
+    }
 
     // Step 4: atomically replace the non-secret settings to reference the
     // new credential.
@@ -331,18 +362,24 @@ pub fn update_custom_credential(
                 // on. Leave the journal's `PendingNew` entry in place: startup
                 // recovery re-reads the (already-updated) persisted settings and
                 // resolves this exactly like a normal "new side won" success.
-                return Err(SaveError::PersistedDurabilityUnconfirmed(e).into());
+                return SaveOutcome::DurabilityUnconfirmed {
+                    observed: settings_store.load().ok(),
+                    error: SaveError::PersistedDurabilityUnconfirmed(e).into(),
+                };
             }
             Err(e) => {
                 let _ = credential_store.delete(&new_ref);
-                return Err(e.into());
+                return SaveOutcome::NotCommitted(e.into());
             }
         };
 
     // Step 5: the settings replace durably landed.
-    journal
-        .mark_update_settings_swapped(&new_ref)
-        .map_err(ConnectError::Io)?;
+    if journal.mark_update_settings_swapped(&new_ref).is_err() {
+        return SaveOutcome::Committed {
+            settings: saved,
+            cleanup_pending: true,
+        };
+    }
 
     // Step 6-7: clean up the now-unreferenced old credential (if any) and
     // only then remove the journal entry. A failed delete leaves the entry
@@ -352,13 +389,43 @@ pub fn update_custom_credential(
         Some(old) => credential_store.delete(old).is_ok(),
         None => true,
     };
-    if delete_ok {
-        journal
+    let cleanup_pending = !delete_ok
+        || journal
             .complete(Some(&new_ref), expected.credential_ref.as_ref())
-            .map_err(ConnectError::Io)?;
-    }
+            .is_err();
 
-    Ok(saved)
+    SaveOutcome::Committed {
+        settings: saved,
+        cleanup_pending,
+    }
+}
+
+/// Compatibility wrapper for callers that only need the settings value.
+/// New UI/service code should use [`update_custom_credential_detailed`] so it
+/// can distinguish committed cleanup from a failed save.
+pub fn update_custom_credential(
+    settings_store: &AiSettingsStore,
+    owner: &OwnerLockGuard,
+    journal: &CredentialJournal,
+    credential_store: &dyn CredentialStore,
+    expected: ExpectedCredentialState,
+    new_secret: &str,
+    build_new_settings: impl FnOnce(&CredentialRef) -> AiSettings,
+) -> Result<AiSettings, ConnectError> {
+    match update_custom_credential_detailed(
+        settings_store,
+        owner,
+        journal,
+        credential_store,
+        expected,
+        new_secret,
+        build_new_settings,
+    ) {
+        SaveOutcome::NotCommitted(error) | SaveOutcome::DurabilityUnconfirmed { error, .. } => {
+            Err(error)
+        }
+        SaveOutcome::Committed { settings, .. } => Ok(settings),
+    }
 }
 
 /// Removes the Custom Provider credential entirely and lands the settings
@@ -368,7 +435,7 @@ pub fn update_custom_credential(
 ///
 /// `owner` proves the caller already holds the runtime owner lock (see
 /// [`update_custom_credential`]).
-pub fn delete_custom_credential(
+pub fn delete_custom_credential_detailed(
     settings_store: &AiSettingsStore,
     owner: &OwnerLockGuard,
     journal: &CredentialJournal,
@@ -376,10 +443,17 @@ pub fn delete_custom_credential(
     expected_revision: u64,
     old_credential_ref: CredentialRef,
     new_settings_without_credential: AiSettings,
-) -> Result<AiSettings, ConnectError> {
-    settings_store.check_owner(owner)?;
-    let guard = acquire_exclusive(settings_store)?;
-    reject_if_journal_pending(journal)?;
+) -> SaveOutcome {
+    if let Err(error) = settings_store.check_owner(owner) {
+        return SaveOutcome::NotCommitted(error.into());
+    }
+    let guard = match acquire_exclusive(settings_store) {
+        Ok(guard) => guard,
+        Err(error) => return SaveOutcome::NotCommitted(error),
+    };
+    if let Err(error) = reject_if_journal_pending(journal) {
+        return SaveOutcome::NotCommitted(error);
+    }
 
     // Same pre-check as `update_custom_credential`: compare
     // `expected_revision`, and confirm `old_credential_ref` actually matches
@@ -390,19 +464,24 @@ pub fn delete_custom_credential(
     // (e.g. the concurrent write that won was unrelated to it), a later
     // `recover` cannot tell that apart from a genuine crash mid-delete, and
     // would finish deleting a credential settings still depend on.
-    let current = settings_store.load().map_err(ConnectError::Io)?;
+    let current = match settings_store.load() {
+        Ok(current) => current,
+        Err(error) => return SaveOutcome::NotCommitted(ConnectError::Io(error)),
+    };
     if current.revision != expected_revision {
-        return Err(SaveError::RevisionConflict {
-            current: Box::new(current),
-        }
-        .into());
+        return SaveOutcome::NotCommitted(
+            SaveError::RevisionConflict {
+                current: Box::new(current),
+            }
+            .into(),
+        );
     }
     let current_credential_ref = current
         .custom
         .as_ref()
         .and_then(|c| c.credential_ref.clone());
     if current_credential_ref.as_ref() != Some(&old_credential_ref) {
-        return Err(ConnectError::CredentialRefMismatch {
+        return SaveOutcome::NotCommitted(ConnectError::CredentialRefMismatch {
             current: Box::new(current),
         });
     }
@@ -418,37 +497,79 @@ pub fn delete_custom_credential(
         .as_ref()
         .and_then(|c| c.credential_ref.clone());
     if leftover_credential_ref.is_some() {
-        return Err(ConnectError::InvalidNewSettings);
+        return SaveOutcome::NotCommitted(ConnectError::InvalidNewSettings);
     }
 
-    journal
-        .begin(CredentialOperation {
-            kind: JournalOperationKind::Delete,
-            state: JournalOperationState::PendingNew,
-            new_credential_ref: None,
-            old_credential_ref: Some(old_credential_ref.clone()),
-            settings_generation_before,
-        })
-        .map_err(ConnectError::Io)?;
+    if let Err(error) = journal.begin(CredentialOperation {
+        kind: JournalOperationKind::Delete,
+        state: JournalOperationState::PendingNew,
+        new_credential_ref: None,
+        old_credential_ref: Some(old_credential_ref.clone()),
+        settings_generation_before,
+    }) {
+        return SaveOutcome::NotCommitted(ConnectError::Io(error));
+    }
 
-    let saved = settings_store.write_while_locked(
+    let saved = match settings_store.write_while_locked(
         owner,
         &guard,
         expected_revision,
         new_settings_without_credential,
-    )?;
+    ) {
+        Ok(saved) => saved,
+        Err(SaveError::PersistedDurabilityUnconfirmed(error)) => {
+            return SaveOutcome::DurabilityUnconfirmed {
+                observed: settings_store.load().ok(),
+                error: SaveError::PersistedDurabilityUnconfirmed(error).into(),
+            };
+        }
+        Err(error) => return SaveOutcome::NotCommitted(error.into()),
+    };
 
-    journal
+    if journal
         .mark_delete_settings_swapped(&old_credential_ref)
-        .map_err(ConnectError::Io)?;
-
-    if credential_store.delete(&old_credential_ref).is_ok() {
-        journal
-            .complete(None, Some(&old_credential_ref))
-            .map_err(ConnectError::Io)?;
+        .is_err()
+    {
+        return SaveOutcome::Committed {
+            settings: saved,
+            cleanup_pending: true,
+        };
     }
 
-    Ok(saved)
+    let cleanup_pending = credential_store.delete(&old_credential_ref).is_err()
+        || journal.complete(None, Some(&old_credential_ref)).is_err();
+
+    SaveOutcome::Committed {
+        settings: saved,
+        cleanup_pending,
+    }
+}
+
+/// Compatibility wrapper for callers that only need the settings value.
+/// New UI/service code should use [`delete_custom_credential_detailed`].
+pub fn delete_custom_credential(
+    settings_store: &AiSettingsStore,
+    owner: &OwnerLockGuard,
+    journal: &CredentialJournal,
+    credential_store: &dyn CredentialStore,
+    expected_revision: u64,
+    old_credential_ref: CredentialRef,
+    new_settings_without_credential: AiSettings,
+) -> Result<AiSettings, ConnectError> {
+    match delete_custom_credential_detailed(
+        settings_store,
+        owner,
+        journal,
+        credential_store,
+        expected_revision,
+        old_credential_ref,
+        new_settings_without_credential,
+    ) {
+        SaveOutcome::NotCommitted(error) | SaveOutcome::DurabilityUnconfirmed { error, .. } => {
+            Err(error)
+        }
+        SaveOutcome::Committed { settings, .. } => Ok(settings),
+    }
 }
 
 /// Runs credential operation journal recovery (ADR-0032 section 7.3 step 6)
@@ -508,6 +629,7 @@ pub fn recover_at_startup(
                     SaveError::RevisionConflict { .. }
                     | SaveError::Busy
                     | SaveError::PendingCredentialJournal
+                    | SaveError::CredentialRefMutationRequiresJournal
                     | SaveError::OwnerLockMismatch
                     | SaveError::SettingsLockMismatch
                     | SaveError::PersistedDurabilityUnconfirmed(_),
@@ -545,9 +667,17 @@ pub fn build_runtime_config_for_active_connection(
     shell_env_format: ShellEnvironmentPolicyFormat,
 ) -> Result<ConfiguredRuntime, ConnectError> {
     let mut config = RuntimeConfig::new(binary_path, owner_lock_path);
+    config.codex_home = Some(match settings.active_connection {
+        ActiveConnection::ChatGpt => paths.chatgpt_codex_home(),
+        ActiveConnection::Custom => paths.custom_codex_home(),
+    });
     match settings.active_connection {
         ActiveConnection::ChatGpt => {
-            config.codex_home = Some(paths.chatgpt_codex_home());
+            // ChatGPT auth and state are kept in its dedicated CODEX_HOME.
+            // Write the shared external-context isolation profile there too:
+            // the server would otherwise load project AGENTS.md files from
+            // the runtime cwd.
+            write_codex_config(&paths.chatgpt_codex_home(), &generate_chatgpt_config_toml())?;
         }
         ActiveConnection::Custom => {
             let custom = settings
@@ -574,6 +704,10 @@ pub fn build_runtime_config_for_active_connection(
             config.extra_env = material.extra_env;
         }
     }
+    // Validate the connection and its credentials before creating a runtime
+    // workspace. The runtime removes it after confirmed child exit; the next
+    // owner also sweeps directories left by an abnormal process exit.
+    config.working_directory = Some(paths.create_probe_workspace().map_err(ConnectError::Io)?);
     Ok(ConfiguredRuntime {
         config,
         settings_generation: settings.settings_generation,
@@ -682,7 +816,7 @@ mod tests {
     use super::*;
     use crate::rpc::RejectAllServerRequests;
     use crate::runtime::RuntimeState;
-    use crate::secrets::{FakeCredentialStore, UnavailableCredentialStore};
+    use crate::secrets::{CredentialStoreError, FakeCredentialStore, UnavailableCredentialStore};
     use crate::settings::{ChatGptConnectionSettings, CustomConnectionSettings};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -734,6 +868,224 @@ mod tests {
                 credential_ref,
             }),
         }
+    }
+
+    /// Seeds a persisted credential reference to model a prior build/crash
+    /// state. Ordinary saves now reject this mutation; production code must
+    /// reach it through the journaled update/delete helpers.
+    fn seed_preexisting_settings_with_reference(
+        store: &AiSettingsStore,
+        owner: &OwnerLockGuard,
+        settings: AiSettings,
+    ) -> AiSettings {
+        let guard = store
+            .settings_lock()
+            .try_acquire_exclusive()
+            .unwrap()
+            .unwrap();
+        store
+            .write_while_locked(owner, &guard, 0, settings)
+            .unwrap()
+    }
+
+    struct FailingDeleteStore {
+        inner: FakeCredentialStore,
+    }
+
+    impl crate::secrets::CredentialStore for FailingDeleteStore {
+        fn set(
+            &self,
+            credential_ref: &CredentialRef,
+            secret: &str,
+        ) -> Result<(), CredentialStoreError> {
+            self.inner.set(credential_ref, secret)
+        }
+
+        fn get(
+            &self,
+            credential_ref: &CredentialRef,
+        ) -> Result<Option<String>, CredentialStoreError> {
+            self.inner.get(credential_ref)
+        }
+
+        fn delete(&self, _credential_ref: &CredentialRef) -> Result<(), CredentialStoreError> {
+            Err(CredentialStoreError::Backend(
+                "injected delete failure".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_post_commit_credential_delete_failure_is_reported_as_committed_cleanup_pending() {
+        let (store, owner, journal, _dir) = store_and_journal("detailed_cleanup_pending");
+        let credential_store = FailingDeleteStore {
+            inner: FakeCredentialStore::new(),
+        };
+        let seeded = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store.inner,
+            ExpectedCredentialState {
+                revision: 0,
+                credential_ref: None,
+            },
+            "sk-old",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        )
+        .unwrap();
+        let old_ref = seeded
+            .custom
+            .as_ref()
+            .unwrap()
+            .credential_ref
+            .clone()
+            .unwrap();
+
+        let outcome = update_custom_credential_detailed(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState {
+                revision: seeded.revision,
+                credential_ref: Some(old_ref),
+            },
+            "sk-new",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        );
+
+        let SaveOutcome::Committed {
+            settings,
+            cleanup_pending,
+        } = outcome
+        else {
+            panic!("the settings replace landed and must not be shown as unsaved: {outcome:?}");
+        };
+        assert!(cleanup_pending);
+        assert_eq!(store.load().unwrap(), settings);
+        assert!(!journal.is_empty().unwrap());
+        assert!(matches!(
+            update_custom_credential_detailed(
+                &store,
+                &owner,
+                &journal,
+                &credential_store,
+                ExpectedCredentialState {
+                    revision: settings.revision,
+                    credential_ref: settings.custom.as_ref().unwrap().credential_ref.clone(),
+                },
+                "sk-third",
+                |new_ref| custom_settings(Some(new_ref.clone())),
+            ),
+            SaveOutcome::NotCommitted(ConnectError::Save(SaveError::PendingCredentialJournal))
+        ));
+    }
+
+    #[test]
+    fn a_post_commit_journal_stage_failure_keeps_the_new_credential_and_recovers_from_disk_settings()
+     {
+        let (store, owner, journal, _dir) = store_and_journal("detailed_stage_failure");
+        let credential_store = FakeCredentialStore::new();
+        let seeded = update_custom_credential(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState {
+                revision: 0,
+                credential_ref: None,
+            },
+            "sk-old",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        )
+        .unwrap();
+        let old_ref = seeded
+            .custom
+            .as_ref()
+            .unwrap()
+            .credential_ref
+            .clone()
+            .unwrap();
+        crate::credential_journal::fail_next_update_settings_swapped_for(&journal);
+
+        let outcome = update_custom_credential_detailed(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState {
+                revision: seeded.revision,
+                credential_ref: Some(old_ref.clone()),
+            },
+            "sk-new",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        );
+
+        let SaveOutcome::Committed {
+            settings,
+            cleanup_pending,
+        } = outcome
+        else {
+            panic!("the persisted replacement must remain committed: {outcome:?}");
+        };
+        assert!(cleanup_pending);
+        let new_ref = settings
+            .custom
+            .as_ref()
+            .unwrap()
+            .credential_ref
+            .as_ref()
+            .unwrap();
+        assert_ne!(new_ref, &old_ref);
+        assert_eq!(store.load().unwrap(), settings);
+        assert!(
+            credential_store.get(&old_ref).unwrap().is_some(),
+            "old key stays until recovery"
+        );
+        assert!(
+            credential_store.get(new_ref).unwrap().is_some(),
+            "new key remains referenced by disk settings"
+        );
+        assert!(!journal.is_empty().unwrap());
+
+        let recovered = recover_at_startup(&store, &owner, &journal, &credential_store).unwrap();
+        assert_eq!(recovered.completed, 1);
+        assert!(journal.is_empty().unwrap());
+        assert!(credential_store.get(&old_ref).unwrap().is_none());
+        assert!(credential_store.get(new_ref).unwrap().is_some());
+    }
+
+    #[test]
+    fn detailed_save_preserves_the_durability_unconfirmed_outcome_and_observed_settings() {
+        let (store, owner, journal, _dir) = store_and_journal("detailed_durability_unconfirmed");
+        let credential_store = FakeCredentialStore::new();
+        crate::atomic_file::fault_injection::fail_next_parent_dir_sync_for(store.path());
+
+        let outcome = update_custom_credential_detailed(
+            &store,
+            &owner,
+            &journal,
+            &credential_store,
+            ExpectedCredentialState {
+                revision: 0,
+                credential_ref: None,
+            },
+            "sk-new",
+            |new_ref| custom_settings(Some(new_ref.clone())),
+        );
+
+        let SaveOutcome::DurabilityUnconfirmed {
+            observed: Some(observed),
+            ..
+        } = outcome
+        else {
+            panic!(
+                "ambiguous durability must be separately surfaced with a fresh read: {outcome:?}"
+            );
+        };
+        assert_eq!(store.load().unwrap(), observed);
+        assert!(!journal.is_empty().unwrap());
     }
 
     #[test]
@@ -1386,11 +1738,11 @@ mod tests {
         let old_ref = CredentialRef::generate();
         credential_store.set(&old_ref, "old-secret").unwrap();
 
-        let saved = store
-            .save(&owner, 0, custom_settings(Some(old_ref.clone())), || {
-                Ok(true)
-            })
-            .unwrap();
+        let saved = seed_preexisting_settings_with_reference(
+            &store,
+            &owner,
+            custom_settings(Some(old_ref.clone())),
+        );
         journal
             .begin(CredentialOperation {
                 kind: JournalOperationKind::Delete,
@@ -1495,11 +1847,11 @@ mod tests {
         // Settings still reference the old credential: simulates a crash
         // between the journal's `Delete` `begin` and the settings replace
         // that would have dropped `credential_ref`.
-        let saved = store
-            .save(&owner, 0, custom_settings(Some(old_ref.clone())), || {
-                Ok(true)
-            })
-            .unwrap();
+        let saved = seed_preexisting_settings_with_reference(
+            &store,
+            &owner,
+            custom_settings(Some(old_ref.clone())),
+        );
         journal
             .begin(CredentialOperation {
                 kind: JournalOperationKind::Delete,
@@ -1540,8 +1892,33 @@ mod tests {
             configured.config.codex_home,
             Some(paths.chatgpt_codex_home())
         );
+        let workspace = configured.config.working_directory.as_ref().unwrap();
+        assert!(workspace.starts_with(paths.probe_workspace()));
+        assert!(std::fs::read_dir(workspace).unwrap().next().is_none());
         assert!(configured.config.extra_env.is_empty());
         assert_eq!(configured.settings_generation, settings.settings_generation);
+        let written =
+            std::fs::read_to_string(paths.chatgpt_codex_home().join("config.toml")).unwrap();
+        let parsed: toml::Value = written.parse().expect("ChatGPT config must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|features| features.get("skip_host_skill_discovery"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1569,6 +1946,9 @@ mod tests {
             configured.config.codex_home,
             Some(paths.custom_codex_home())
         );
+        let workspace = configured.config.working_directory.as_ref().unwrap();
+        assert!(workspace.starts_with(paths.probe_workspace()));
+        assert!(std::fs::read_dir(workspace).unwrap().next().is_none());
         assert_eq!(
             configured.config.extra_env,
             vec![(
@@ -1579,6 +1959,26 @@ mod tests {
         let written =
             std::fs::read_to_string(paths.custom_codex_home().join("config.toml")).unwrap();
         assert!(!written.contains("sk-super-secret-value"));
+        let parsed: toml::Value = written.parse().expect("Custom config must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("project_doc_max_bytes")
+                .and_then(|v| v.as_integer()),
+            Some(0)
+        );
+        assert!(
+            parsed
+                .get("project_root_markers")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|features| features.get("skip_host_skill_discovery"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1599,6 +1999,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ConnectError::CredentialNotFound));
+        assert!(!paths.probe_workspace().exists());
     }
 
     #[test]

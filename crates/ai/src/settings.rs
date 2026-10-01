@@ -123,6 +123,9 @@ pub enum SaveError {
     /// 7.3, no ordinary `AiSettings` save may proceed until journal recovery
     /// has completed and removed it.
     PendingCredentialJournal,
+    /// A plain save cannot add, replace or delete a credential reference:
+    /// those changes must use the journaled credential transaction API.
+    CredentialRefMutationRequiresJournal,
     /// `owner` was acquired against a different path than this store's own
     /// [`AiSettingsStore::new`] `owner_lock_path`: it proves ownership of
     /// *some* runtime owner lock, but not the one this store is scoped to,
@@ -165,6 +168,9 @@ impl std::fmt::Display for SaveError {
                     "a credential operation journal entry must be recovered before saving AI settings"
                 )
             }
+            SaveError::CredentialRefMutationRequiresJournal => f.write_str(
+                "Custom Provider credentials must be changed through the credential transaction",
+            ),
             SaveError::OwnerLockMismatch => {
                 write!(
                     f,
@@ -296,6 +302,24 @@ impl AiSettingsStore {
 
         if !journal_is_empty().map_err(SaveError::Io)? {
             return Err(SaveError::PendingCredentialJournal);
+        }
+
+        let current = self.load().map_err(SaveError::Io)?;
+        if current.revision != expected_revision {
+            return Err(SaveError::RevisionConflict {
+                current: Box::new(current),
+            });
+        }
+        let current_ref = current
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.credential_ref.as_ref());
+        let proposed_ref = new_settings
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.credential_ref.as_ref());
+        if current_ref != proposed_ref {
+            return Err(SaveError::CredentialRefMutationRequiresJournal);
         }
 
         self.write_while_locked(owner, &guard, expected_revision, new_settings)
@@ -501,6 +525,32 @@ mod tests {
             saved_again.settings_generation, 1,
             "a display-name-only change must not bump settings_generation"
         );
+    }
+
+    #[test]
+    fn ordinary_save_cannot_mutate_a_custom_credential_reference() {
+        let (store, owner) = store("credential_ref_requires_journal");
+        let mut settings = AiSettings {
+            custom: Some(CustomConnectionSettings {
+                id: "custom-1".to_string(),
+                name: "Local test".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                model_id: "test-model".to_string(),
+                credential_ref: None,
+            }),
+            ..AiSettings::default()
+        };
+        let first = store
+            .save(&owner, 0, settings.clone(), always_empty_journal)
+            .unwrap();
+
+        settings.custom.as_mut().unwrap().credential_ref =
+            Some(CredentialRef::from_persisted("secret-ref"));
+        assert!(matches!(
+            store.save(&owner, first.revision, settings, always_empty_journal),
+            Err(SaveError::CredentialRefMutationRequiresJournal)
+        ));
+        assert_eq!(store.load().unwrap(), first);
     }
 
     #[test]

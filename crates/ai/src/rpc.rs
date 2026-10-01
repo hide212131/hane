@@ -304,6 +304,7 @@ fn spawn_reader(
     core: Arc<RpcCore>,
     handler: Arc<dyn ServerRequestHandler>,
     events_tx: SyncSender<RpcEvent>,
+    on_critical_overflow: Arc<dyn Fn() + Send + Sync>,
     on_closed: Box<dyn FnOnce() + Send>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -342,7 +343,11 @@ fn spawn_reader(
                     }
                 }
                 Ok(IncomingMessage::Notification { method, params }) => {
-                    let _ = events_tx.try_send(RpcEvent::Notification { method, params });
+                    send_event(
+                        &events_tx,
+                        RpcEvent::Notification { method, params },
+                        &on_critical_overflow,
+                    );
                 }
                 Ok(IncomingMessage::ServerRequest { id, method, params }) => {
                     let outcome = handler.handle(&method, params);
@@ -371,6 +376,33 @@ fn spawn_reader(
         // on the normal-exit path, and would run them the same way if this
         // loop instead unwound out of a panicking `handler.handle` call.
     })
+}
+
+pub(crate) fn is_critical_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "account/login/completed"
+            | "account/updated"
+            | "item/completed"
+            | "turn/completed"
+            | "turn/failed"
+    )
+}
+
+fn send_event(
+    events_tx: &SyncSender<RpcEvent>,
+    event: RpcEvent,
+    on_critical_overflow: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let critical =
+        matches!(&event, RpcEvent::Notification { method, .. } if is_critical_notification(method));
+    match events_tx.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) if critical => {
+            on_critical_overflow()
+        }
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 fn spawn_stderr(reader: Box<dyn Read + Send>, events_tx: SyncSender<RpcEvent>) -> JoinHandle<()> {
@@ -406,12 +438,13 @@ pub struct RpcTransport {
 }
 
 impl RpcTransport {
-    pub fn spawn(
+    pub(crate) fn spawn_with_critical_overflow(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
         stderr: Option<Box<dyn Read + Send>>,
         handler: Arc<dyn ServerRequestHandler>,
         events_tx: SyncSender<RpcEvent>,
+        on_critical_overflow: Arc<dyn Fn() + Send + Sync>,
         on_closed: Box<dyn FnOnce() + Send>,
     ) -> RpcTransport {
         let (writer_tx, writer_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
@@ -422,8 +455,14 @@ impl RpcTransport {
         });
 
         let writer_thread = spawn_writer(writer, writer_rx);
-        let reader_thread =
-            spawn_reader(reader, core.clone(), handler, events_tx.clone(), on_closed);
+        let reader_thread = spawn_reader(
+            reader,
+            core.clone(),
+            handler,
+            events_tx.clone(),
+            on_critical_overflow,
+            on_closed,
+        );
         let stderr_thread = stderr.map(|s| spawn_stderr(s, events_tx.clone()));
 
         RpcTransport {
@@ -529,12 +568,13 @@ mod tests {
         let on_closed = Box::new(move || {
             let _ = closed_tx.send(());
         });
-        let transport = RpcTransport::spawn(
+        let transport = RpcTransport::spawn_with_critical_overflow(
             Box::new(to_client_r),
             Box::new(from_client_w),
             None,
             handler,
             events_tx,
+            Arc::new(|| {}),
             on_closed,
         );
         (transport, to_client_w, from_client_r, events_rx, closed_rx)
@@ -565,6 +605,26 @@ mod tests {
             .unwrap();
         assert_eq!(result["echoed"], Value::Bool(true));
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_rpc_event_queue_reports_lost_critical_notifications_out_of_band() {
+        let (events_tx, _events_rx) = mpsc::sync_channel(0);
+        let (overflow_tx, overflow_rx) = mpsc::channel();
+        let on_overflow: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = overflow_tx.send(());
+        });
+
+        send_event(
+            &events_tx,
+            RpcEvent::Notification {
+                method: "turn/completed".to_string(),
+                params: None,
+            },
+            &on_overflow,
+        );
+
+        assert_eq!(overflow_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
     }
 
     #[test]

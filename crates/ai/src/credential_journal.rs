@@ -34,6 +34,8 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use crate::atomic_file::{AtomicWriteError, atomic_write_bytes, read_to_string_if_exists};
 use crate::secrets::{CredentialRef, CredentialStore};
@@ -82,6 +84,9 @@ struct JournalFile {
 pub struct CredentialJournal {
     path: PathBuf,
 }
+
+#[cfg(test)]
+static FAIL_NEXT_UPDATE_MARK_FOR: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 impl CredentialJournal {
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -148,6 +153,14 @@ impl CredentialJournal {
         &self,
         new_credential_ref: &CredentialRef,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut targets = FAIL_NEXT_UPDATE_MARK_FOR.lock().unwrap();
+            if let Some(index) = targets.iter().position(|path| path == &self.path) {
+                targets.remove(index);
+                return Err(io::Error::other("injected journal update stage failure"));
+            }
+        }
         self.mark_settings_swapped_matching(|op| {
             op.kind == JournalOperationKind::Update
                 && op.new_credential_ref.as_ref() == Some(new_credential_ref)
@@ -178,6 +191,14 @@ impl CredentialJournal {
         });
         self.write(&file)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_update_settings_swapped_for(journal: &CredentialJournal) {
+    FAIL_NEXT_UPDATE_MARK_FOR
+        .lock()
+        .unwrap()
+        .push(journal.path.clone());
 }
 
 #[derive(Debug)]

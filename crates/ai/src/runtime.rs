@@ -53,9 +53,11 @@
 //! each other, so a long-running call cannot block a `stop`/`restart`
 //! request.
 
+use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -194,6 +196,9 @@ pub struct RuntimeConfig {
     pub binary_path: PathBuf,
     pub args: Vec<String>,
     pub codex_home: Option<PathBuf>,
+    /// The child process starts in a Hane-owned, empty AI workspace. This is
+    /// intentionally independent of the Editor's current document/worktree.
+    pub working_directory: Option<PathBuf>,
     pub extra_env: Vec<(String, String)>,
     pub owner_lock_path: PathBuf,
     pub start_timeout: Duration,
@@ -212,6 +217,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("binary_path", &self.binary_path)
             .field("args", &self.args)
             .field("codex_home", &self.codex_home)
+            .field("working_directory", &self.working_directory)
             .field("extra_env", &redacted_env)
             .field("owner_lock_path", &self.owner_lock_path)
             .field("start_timeout", &self.start_timeout)
@@ -227,6 +233,7 @@ impl RuntimeConfig {
             binary_path: binary_path.into(),
             args: vec!["--listen".to_string(), "stdio://".to_string()],
             codex_home: None,
+            working_directory: None,
             extra_env: Vec::new(),
             owner_lock_path: owner_lock_path.into(),
             start_timeout: Duration::from_secs(20),
@@ -245,17 +252,77 @@ impl RuntimeConfig {
                 ),
             ));
         }
+        let codex_home = self.codex_home.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AI runtime requires an explicit Hane-owned CODEX_HOME; refusing to use the user's Codex home",
+            )
+        })?;
+        let working_directory = self.working_directory.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AI runtime requires an explicit Hane-owned working directory; refusing to use the Editor cwd",
+            )
+        })?;
+        std::fs::create_dir_all(working_directory)?;
         let mut cmd = StdCommand::new(&self.binary_path);
         cmd.args(&self.args);
-        if let Some(home) = &self.codex_home {
-            cmd.env("CODEX_HOME", home);
-        }
+        cmd.env_clear();
+        cmd.envs(filtered_parent_environment(std::env::vars_os()));
+        cmd.env("CODEX_HOME", codex_home);
         cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd.current_dir(working_directory);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.spawn()
     }
+}
+
+/// Only OS/runtime variables with an explicit use in the Hane child remain
+/// inherited. In particular, do not pass Codex session/app tool plumbing,
+/// provider overrides, or other credential-bearing variables through from a
+/// parent application (which may itself have been launched by Codex).
+const CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "APPDATA",
+    "CURL_CA_BUNDLE",
+    "COMSPEC",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_RUNTIME_DIR",
+    "__CF_USER_TEXT_ENCODING",
+];
+
+fn filtered_parent_environment(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (OsString, OsString)> {
+    vars.into_iter().filter(|(key, _)| {
+        let key = key.to_string_lossy();
+        CHILD_ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+    })
 }
 
 struct SharedState {
@@ -291,6 +358,7 @@ struct SharedState {
 struct ActiveChild {
     generation: u64,
     operation_generation: u64,
+    working_directory: PathBuf,
     child: Child,
     transport: RpcTransport,
 }
@@ -322,9 +390,13 @@ type OwnerLockCallback = Box<dyn FnOnce(Option<&OwnerLockGuard>) + Send>;
 
 enum CoordinatorMessage {
     Lifecycle(
-        LifecycleCommand,
+        Box<LifecycleCommand>,
         Sender<Result<RuntimeStatus, RuntimeError>>,
     ),
+    CriticalEventOverflow {
+        generation: u64,
+        operation_generation: u64,
+    },
     ChildEnded {
         generation: u64,
         operation_generation: u64,
@@ -395,7 +467,7 @@ impl AiRuntime {
     fn send_lifecycle(&self, cmd: LifecycleCommand) -> Result<RuntimeStatus, RuntimeError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
-            .send(CoordinatorMessage::Lifecycle(cmd, reply_tx))
+            .send(CoordinatorMessage::Lifecycle(Box::new(cmd), reply_tx))
             .map_err(|_| RuntimeError::CoordinatorUnavailable)?;
         reply_rx
             .recv()
@@ -737,7 +809,7 @@ fn run_coordinator(
             CoordinatorMessage::Lifecycle(cmd, reply) => {
                 operation_generation += 1;
                 let op_gen = operation_generation;
-                let result = match cmd {
+                let result = match *cmd {
                     LifecycleCommand::Reconfigure(
                         new_config,
                         new_configured_settings_generation,
@@ -891,6 +963,37 @@ fn run_coordinator(
                     );
                 }
             }
+            CoordinatorMessage::CriticalEventOverflow {
+                generation: g,
+                operation_generation: og,
+            } => {
+                let matches_current = current
+                    .as_ref()
+                    .map(|child| (child.generation, child.operation_generation))
+                    == Some((g, og));
+                if matches_current {
+                    operation_generation += 1;
+                    let op_gen = operation_generation;
+                    let _ = events_tx.try_send(RuntimeEvent {
+                        generation: g,
+                        kind: RuntimeEventKind::Diagnostic(
+                            "critical App Server notification was lost; stopping and isolating the runtime".to_string(),
+                        ),
+                    });
+                    let _ = stop_active(
+                        &mut current,
+                        &mut generation,
+                        &mut owner_guard,
+                        &config,
+                        &shared,
+                        &events_tx,
+                        RuntimeState::Failed,
+                        RuntimeState::Failed,
+                        op_gen,
+                        true,
+                    );
+                }
+            }
             CoordinatorMessage::Shutdown => {
                 operation_generation += 1;
                 let op_gen = operation_generation;
@@ -1037,6 +1140,7 @@ fn do_start(
     if let Some(external) = &external_owner
         && external.path() != config.owner_lock_path
     {
+        cleanup_config_workspace(config, current.as_ref());
         return Some(Err(RuntimeError::OwnerLockPathMismatch));
     }
 
@@ -1050,6 +1154,7 @@ fn do_start(
             // must never be assigned to `owner_guard`, which would replace
             // (and thereby release) the guard actually backing the
             // already-active child.
+            cleanup_config_workspace(config, current.as_ref());
             return Some(Ok(status));
         }
         // A previous stop attempt could not confirm the old child had
@@ -1059,9 +1164,12 @@ fn do_start(
             try_reap(&mut active.child)
         };
         if reaped {
-            *current = None;
+            if let Some(active) = current.take() {
+                remove_runtime_workspace(&active.working_directory);
+            }
             *owner_guard = None;
         } else {
+            cleanup_config_workspace(config, current.as_ref());
             return Some(Err(RuntimeError::RestartBlocked));
         }
     }
@@ -1088,10 +1196,12 @@ fn do_start(
                 match lock.try_acquire() {
                     Ok(Some(g)) => g,
                     Ok(None) => {
+                        cleanup_config_workspace(config, current.as_ref());
                         set_status(shared, RuntimeState::Stopped, false, *generation, op_gen);
                         return Some(Err(RuntimeError::OwnerLockUnavailable));
                     }
                     Err(e) => {
+                        cleanup_config_workspace(config, current.as_ref());
                         set_status(shared, RuntimeState::Failed, false, *generation, op_gen);
                         return Some(Err(RuntimeError::OwnerLock(Arc::new(e))));
                     }
@@ -1106,6 +1216,7 @@ fn do_start(
     let mut child = match config.spawn_child() {
         Ok(c) => c,
         Err(e) => {
+            cleanup_config_workspace(config, current.as_ref());
             set_status(shared, RuntimeState::Failed, false, g, op_gen);
             return Some(Err(RuntimeError::Spawn(Arc::new(e))));
         }
@@ -1131,36 +1242,60 @@ fn do_start(
 
     let (bridge_tx, bridge_rx) = mpsc::sync_channel::<RpcEvent>(EVENTS_BRIDGE_CAPACITY);
     let runtime_events_tx = events_tx.clone();
+    let overflow_sent = Arc::new(AtomicBool::new(false));
+    let overflow_sender = self_tx.clone();
+    let on_critical_overflow: Arc<dyn Fn() + Send + Sync> = {
+        let overflow_sent = overflow_sent.clone();
+        Arc::new(move || {
+            if !overflow_sent.swap(true, Ordering::SeqCst) {
+                let _ = overflow_sender.send(CoordinatorMessage::CriticalEventOverflow {
+                    generation: g,
+                    operation_generation: op_gen,
+                });
+            }
+        })
+    };
+    let bridge_overflow = on_critical_overflow.clone();
     thread::spawn(move || {
         for event in bridge_rx {
+            let is_critical = matches!(
+                &event,
+                RpcEvent::Notification { method, .. }
+                    if crate::rpc::is_critical_notification(method)
+            );
             let kind = match event {
                 RpcEvent::Notification { method, params } => {
                     RuntimeEventKind::Notification { method, params }
                 }
                 RpcEvent::Diagnostic(msg) => RuntimeEventKind::Diagnostic(msg),
             };
-            // Non-blocking: a slow caller-side consumer must never stall
-            // this forwarding thread (which would in turn back up the
-            // bounded bridge above and eventually the reader/stderr
-            // threads' own `try_send`). A full queue drops this one event;
-            // a disconnected receiver means nobody will ever read again, so
-            // stop draining the bridge instead of looping forever.
+            // Never block the App Server reader: a slow caller-side consumer
+            // cannot stall this forwarding thread. Losing a critical event
+            // schedules an independent coordinator wake that stops this exact
+            // child generation; diagnostics remain best-effort.
             match runtime_events_tx.try_send(RuntimeEvent {
                 generation: g,
                 kind,
             }) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) if is_critical => bridge_overflow(),
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) if is_critical => {
+                    bridge_overflow();
+                    break;
+                }
                 Err(TrySendError::Disconnected(_)) => break,
             }
         }
     });
 
-    let transport = RpcTransport::spawn(
+    let transport = RpcTransport::spawn_with_critical_overflow(
         Box::new(stdout),
         Box::new(stdin),
         Some(Box::new(stderr)),
         handler.clone(),
         bridge_tx,
+        on_critical_overflow,
         on_closed,
     );
 
@@ -1189,6 +1324,11 @@ fn do_start(
     *current = Some(ActiveChild {
         generation: g,
         operation_generation: op_gen,
+        working_directory: config
+            .working_directory
+            .as_ref()
+            .expect("spawn_child validated working_directory")
+            .clone(),
         child,
         transport,
     });
@@ -1306,6 +1446,7 @@ fn stop_active(
 
     match outcome {
         StopOutcome::Exited => {
+            remove_runtime_workspace(&active.working_directory);
             drop(active);
             // `release_owner_lock` is `false` only for the `Reconfigure`
             // path: it needs the owner lock to stay held by this same
@@ -1366,7 +1507,13 @@ fn spawn_shutdown_cleanup_worker(
         let poll_interval = Duration::from_millis(20);
         wait_for_confirmation_then_release(
             (active, owner_guard),
-            |(active, _owner_guard)| matches!(active.child.try_wait(), Ok(Some(_))),
+            |(active, _owner_guard)| match active.child.try_wait() {
+                Ok(Some(_)) => {
+                    remove_runtime_workspace(&active.working_directory);
+                    true
+                }
+                Ok(None) | Err(_) => false,
+            },
             poll_interval,
             thread::sleep,
         );
@@ -1460,6 +1607,7 @@ fn reap_and_mark_failed(
 
     match outcome {
         StopOutcome::Exited => {
+            remove_runtime_workspace(&active.working_directory);
             drop(active);
             *owner_guard = None;
             // Same fresh-generation treatment as a confirmed `stop_active`
@@ -1481,6 +1629,28 @@ fn reap_and_mark_failed(
                     "runtime exited unexpectedly and cleanup could not be confirmed".to_string(),
                 ),
             });
+        }
+    }
+}
+
+fn remove_runtime_workspace(path: &Path) {
+    let is_hane_runtime_workspace = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("runtime-"))
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "probe-workspace");
+    if is_hane_runtime_workspace {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+fn cleanup_config_workspace(config: &RuntimeConfig, active: Option<&ActiveChild>) {
+    if let Some(path) = config.working_directory.as_deref() {
+        let is_active = active.is_some_and(|child| child.working_directory == path);
+        if !is_active {
+            remove_runtime_workspace(path);
         }
     }
 }
@@ -1538,6 +1708,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     struct FakeProcess {
         exited: bool,
@@ -1628,6 +1799,114 @@ mod tests {
             config.args,
             vec!["--listen".to_string(), "stdio://".to_string()]
         );
+    }
+
+    #[test]
+    fn child_environment_drops_codex_session_and_provider_overrides_but_keeps_os_network_settings()
+    {
+        let input = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("HOME"), OsString::from("/Users/test")),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.test:8080"),
+            ),
+            (
+                OsString::from("SSL_CERT_FILE"),
+                OsString::from("/tmp/ca.pem"),
+            ),
+            (
+                OsString::from("CODEX_HOME"),
+                OsString::from("/Users/test/.codex"),
+            ),
+            (
+                OsString::from("CODEX_APP_TOOLS_PIPE_PATH"),
+                OsString::from("/tmp/tools.sock"),
+            ),
+            (
+                OsString::from("CODEX_SESSION_ID"),
+                OsString::from("session-secret"),
+            ),
+            (
+                OsString::from("CODEX_THREAD_ID"),
+                OsString::from("thread-secret"),
+            ),
+            (
+                OsString::from("CODEX_PERMISSION_PROFILE"),
+                OsString::from("danger-full-access"),
+            ),
+            (
+                OsString::from("CODEX_MCP_NODE_PATH"),
+                OsString::from("/tmp/node"),
+            ),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("external-api-key"),
+            ),
+            (
+                OsString::from("OPENAI_BASE_URL"),
+                OsString::from("https://external.test/v1"),
+            ),
+            (
+                OsString::from("HANE_AI_PROVIDER_KEY"),
+                OsString::from("parent-key"),
+            ),
+        ];
+        let filtered: std::collections::HashMap<_, _> =
+            filtered_parent_environment(input).collect();
+
+        assert_eq!(
+            filtered.get(OsStr::new("PATH")),
+            Some(&OsString::from("/usr/bin"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("HOME")),
+            Some(&OsString::from("/Users/test"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.test:8080"))
+        );
+        assert_eq!(
+            filtered.get(OsStr::new("SSL_CERT_FILE")),
+            Some(&OsString::from("/tmp/ca.pem"))
+        );
+        for blocked in [
+            "CODEX_HOME",
+            "CODEX_APP_TOOLS_PIPE_PATH",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_PERMISSION_PROFILE",
+            "CODEX_MCP_NODE_PATH",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "HANE_AI_PROVIDER_KEY",
+        ] {
+            assert!(
+                !filtered.contains_key(OsStr::new(blocked)),
+                "unexpected inherited variable: {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawning_requires_hane_owned_codex_home_and_working_directory() {
+        // Use an absolute executable path native to the host OS. Unix-style
+        // paths such as `/opt/hane/codex` are not absolute Windows paths, so
+        // they would fail the earlier binary-path validation instead.
+        let binary_path = std::env::current_exe().expect("test executable path is absolute");
+        let owner_lock_path = std::env::temp_dir().join("hane-ai-test-owner.lock");
+        let missing_home = RuntimeConfig::new(&binary_path, &owner_lock_path)
+            .spawn_child()
+            .unwrap_err();
+        assert_eq!(missing_home.kind(), io::ErrorKind::InvalidInput);
+        assert!(missing_home.to_string().contains("CODEX_HOME"));
+
+        let mut missing_cwd = RuntimeConfig::new(&binary_path, &owner_lock_path);
+        missing_cwd.codex_home = Some(PathBuf::from("/tmp/hane-ai-codex-home"));
+        let missing_cwd = missing_cwd.spawn_child().unwrap_err();
+        assert_eq!(missing_cwd.kind(), io::ErrorKind::InvalidInput);
+        assert!(missing_cwd.to_string().contains("working directory"));
     }
 
     #[test]
@@ -1757,6 +2036,9 @@ mod tests {
         let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
         let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
         config.args = vec!["-c".to_string(), script.to_string()];
+        config.codex_home = Some(dir.join("codex-home"));
+        config.working_directory = Some(dir.join("probe-workspace"));
+        std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
         config.start_timeout = Duration::from_secs(5);
         config.stop_grace_timeout = Duration::from_millis(500);
         config.stop_force_timeout = Duration::from_secs(2);
@@ -1821,6 +2103,9 @@ mod tests {
         let script = r#"read line; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); printf '{"id":%s,"result":{}}\n' "$id"; while read _line; do :; done"#;
         let mut config = RuntimeConfig::new("/bin/sh", owner_lock_path.clone());
         config.args = vec!["-c".to_string(), script.to_string()];
+        config.codex_home = Some(dir.join("codex-home"));
+        config.working_directory = Some(dir.join("probe-workspace"));
+        std::fs::create_dir_all(config.working_directory.as_ref().unwrap()).unwrap();
         config.start_timeout = Duration::from_secs(5);
         config.stop_grace_timeout = Duration::from_millis(500);
         config.stop_force_timeout = Duration::from_secs(2);
