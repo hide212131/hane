@@ -104,7 +104,11 @@ impl AiSettingsLock {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        OpenOptions::new().create(true).write(true).truncate(false).open(&self.path)
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
     }
 
     /// Attempts to acquire the lock in exclusive mode without blocking.
@@ -114,7 +118,10 @@ impl AiSettingsLock {
     pub fn try_acquire_exclusive(&self) -> io::Result<Option<AiSettingsExclusiveGuard>> {
         let file = self.open()?;
         if platform::try_lock(&file, true)? {
-            Ok(Some(AiSettingsExclusiveGuard { file, path: self.path.clone() }))
+            Ok(Some(AiSettingsExclusiveGuard {
+                file,
+                path: self.path.clone(),
+            }))
         } else {
             Ok(None)
         }
@@ -142,7 +149,11 @@ mod platform {
 
     pub fn try_lock(file: &File, exclusive: bool) -> io::Result<bool> {
         let fd = file.as_raw_fd();
-        let mode = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+        let mode = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
         let ret = unsafe { libc::flock(fd, mode | libc::LOCK_NB) };
         if ret == 0 {
             Ok(true)
@@ -345,10 +356,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exclusive_guard_can_be_reacquired_immediately_after_drop_even_while_a_forked_child_still_holds_the_inherited_pre_exec_fd()
-    {
+     {
         let path = unique_lock_path("excl_reacquire_across_fork_pre_exec");
         let lock = AiSettingsLock::new(&path);
-        let guard = lock.try_acquire_exclusive().unwrap().expect("first acquire must succeed");
+        let guard = lock
+            .try_acquire_exclusive()
+            .unwrap()
+            .expect("first acquire must succeed");
 
         // Two pipes synchronize with the forked child without relying on
         // sleeps: `ready` lets the child tell the parent it is alive and
@@ -356,8 +370,16 @@ mod tests {
         // parent tell the child it may now exit.
         let mut ready_fds = [0i32; 2];
         let mut go_fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0, "pipe() for readiness signal failed");
-        assert_eq!(unsafe { libc::pipe(go_fds.as_mut_ptr()) }, 0, "pipe() for exit signal failed");
+        assert_eq!(
+            unsafe { libc::pipe(ready_fds.as_mut_ptr()) },
+            0,
+            "pipe() for readiness signal failed"
+        );
+        assert_eq!(
+            unsafe { libc::pipe(go_fds.as_mut_ptr()) },
+            0,
+            "pipe() for exit signal failed"
+        );
         let [ready_r, ready_w] = ready_fds;
         let [go_r, go_w] = go_fds;
 
@@ -389,7 +411,10 @@ mod tests {
         }
         let mut buf: u8 = 0;
         let n = unsafe { libc::read(ready_r, &mut buf as *mut u8 as *mut libc::c_void, 1) };
-        assert_eq!(n, 1, "child must signal it is alive, still holding its inherited fd, before the parent proceeds");
+        assert_eq!(
+            n, 1,
+            "child must signal it is alive, still holding its inherited fd, before the parent proceeds"
+        );
         unsafe { libc::close(ready_r) };
 
         // The child now holds its own inherited fd referring to the same
@@ -427,15 +452,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shared_guard_can_be_exclusively_reacquired_immediately_after_drop_even_while_a_forked_child_still_holds_the_inherited_pre_exec_fd()
-    {
+     {
         let path = unique_lock_path("shared_reacquire_across_fork_pre_exec");
         let lock = AiSettingsLock::new(&path);
-        let guard = lock.try_acquire_shared().unwrap().expect("first acquire must succeed");
+        let guard = lock
+            .try_acquire_shared()
+            .unwrap()
+            .expect("first acquire must succeed");
 
         let mut ready_fds = [0i32; 2];
         let mut go_fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0, "pipe() for readiness signal failed");
-        assert_eq!(unsafe { libc::pipe(go_fds.as_mut_ptr()) }, 0, "pipe() for exit signal failed");
+        assert_eq!(
+            unsafe { libc::pipe(ready_fds.as_mut_ptr()) },
+            0,
+            "pipe() for readiness signal failed"
+        );
+        assert_eq!(
+            unsafe { libc::pipe(go_fds.as_mut_ptr()) },
+            0,
+            "pipe() for exit signal failed"
+        );
         let [ready_r, ready_w] = ready_fds;
         let [go_r, go_w] = go_fds;
 
@@ -461,7 +497,10 @@ mod tests {
         }
         let mut buf: u8 = 0;
         let n = unsafe { libc::read(ready_r, &mut buf as *mut u8 as *mut libc::c_void, 1) };
-        assert_eq!(n, 1, "child must signal it is alive, still holding its inherited fd, before the parent proceeds");
+        assert_eq!(
+            n, 1,
+            "child must signal it is alive, still holding its inherited fd, before the parent proceeds"
+        );
         unsafe { libc::close(ready_r) };
 
         // While the shared guard (and the forked child's inherited copy of

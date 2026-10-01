@@ -34,10 +34,7 @@ impl CredentialRef {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        CredentialRef(format!(
-            "cred-{nanos:x}-{}-{counter:x}",
-            std::process::id()
-        ))
+        CredentialRef(format!("cred-{nanos:x}-{}-{counter:x}", std::process::id()))
     }
 
     /// Reconstructs a `CredentialRef` from a previously persisted identifier
@@ -89,7 +86,8 @@ impl std::error::Error for CredentialStoreError {}
 /// backing OS store (no plaintext fallback file, no log line containing the
 /// secret).
 pub trait CredentialStore: Send + Sync {
-    fn set(&self, credential_ref: &CredentialRef, secret: &str) -> Result<(), CredentialStoreError>;
+    fn set(&self, credential_ref: &CredentialRef, secret: &str)
+    -> Result<(), CredentialStoreError>;
     /// Returns `Ok(None)` when the platform's OS credential store is
     /// available but has no entry for `credential_ref` (e.g. it was already
     /// deleted), as opposed to [`CredentialStoreError::Unavailable`] when
@@ -117,13 +115,19 @@ pub struct OsCredentialStore {
 
 impl OsCredentialStore {
     pub fn new(service: impl Into<String>) -> Self {
-        OsCredentialStore { service: service.into() }
+        OsCredentialStore {
+            service: service.into(),
+        }
     }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl CredentialStore for OsCredentialStore {
-    fn set(&self, credential_ref: &CredentialRef, secret: &str) -> Result<(), CredentialStoreError> {
+    fn set(
+        &self,
+        credential_ref: &CredentialRef,
+        secret: &str,
+    ) -> Result<(), CredentialStoreError> {
         let entry = keyring::Entry::new(&self.service, credential_ref.as_str())
             .map_err(|e| CredentialStoreError::Backend(e.to_string()))?;
         entry
@@ -153,7 +157,11 @@ impl CredentialStore for OsCredentialStore {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl CredentialStore for OsCredentialStore {
-    fn set(&self, _credential_ref: &CredentialRef, _secret: &str) -> Result<(), CredentialStoreError> {
+    fn set(
+        &self,
+        _credential_ref: &CredentialRef,
+        _secret: &str,
+    ) -> Result<(), CredentialStoreError> {
         Err(CredentialStoreError::Unavailable(
             "no OS credential store backend is wired in on this platform".to_string(),
         ))
@@ -198,7 +206,11 @@ impl FakeCredentialStore {
 }
 
 impl CredentialStore for FakeCredentialStore {
-    fn set(&self, credential_ref: &CredentialRef, secret: &str) -> Result<(), CredentialStoreError> {
+    fn set(
+        &self,
+        credential_ref: &CredentialRef,
+        secret: &str,
+    ) -> Result<(), CredentialStoreError> {
         self.entries
             .lock()
             .unwrap()
@@ -207,7 +219,12 @@ impl CredentialStore for FakeCredentialStore {
     }
 
     fn get(&self, credential_ref: &CredentialRef) -> Result<Option<String>, CredentialStoreError> {
-        Ok(self.entries.lock().unwrap().get(credential_ref.as_str()).cloned())
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .get(credential_ref.as_str())
+            .cloned())
     }
 
     fn delete(&self, credential_ref: &CredentialRef) -> Result<(), CredentialStoreError> {
@@ -222,16 +239,26 @@ impl CredentialStore for FakeCredentialStore {
 pub struct UnavailableCredentialStore;
 
 impl CredentialStore for UnavailableCredentialStore {
-    fn set(&self, _credential_ref: &CredentialRef, _secret: &str) -> Result<(), CredentialStoreError> {
-        Err(CredentialStoreError::Unavailable("test double: always unavailable".to_string()))
+    fn set(
+        &self,
+        _credential_ref: &CredentialRef,
+        _secret: &str,
+    ) -> Result<(), CredentialStoreError> {
+        Err(CredentialStoreError::Unavailable(
+            "test double: always unavailable".to_string(),
+        ))
     }
 
     fn get(&self, _credential_ref: &CredentialRef) -> Result<Option<String>, CredentialStoreError> {
-        Err(CredentialStoreError::Unavailable("test double: always unavailable".to_string()))
+        Err(CredentialStoreError::Unavailable(
+            "test double: always unavailable".to_string(),
+        ))
     }
 
     fn delete(&self, _credential_ref: &CredentialRef) -> Result<(), CredentialStoreError> {
-        Err(CredentialStoreError::Unavailable("test double: always unavailable".to_string()))
+        Err(CredentialStoreError::Unavailable(
+            "test double: always unavailable".to_string(),
+        ))
     }
 }
 
@@ -251,7 +278,10 @@ mod tests {
         let store = FakeCredentialStore::new();
         let reference = CredentialRef::generate();
         store.set(&reference, "sk-test-secret").unwrap();
-        assert_eq!(store.get(&reference).unwrap().as_deref(), Some("sk-test-secret"));
+        assert_eq!(
+            store.get(&reference).unwrap().as_deref(),
+            Some("sk-test-secret")
+        );
         assert_eq!(store.len(), 1);
     }
 

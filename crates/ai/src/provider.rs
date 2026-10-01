@@ -18,7 +18,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::atomic_file::{atomic_write_bytes, AtomicWriteError};
+use crate::atomic_file::{AtomicWriteError, atomic_write_bytes};
 
 /// The `model_providers` table key and `model_provider` selector Hane's
 /// generated config always uses for the Custom Provider connection.
@@ -50,13 +50,19 @@ impl std::fmt::Display for CustomProviderConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CustomProviderConfigError::NonHttpsBaseUrl => {
-                write!(f, "Custom Provider base URL must use https:// (or http:// to an explicit local host)")
+                write!(
+                    f,
+                    "Custom Provider base URL must use https:// (or http:// to an explicit local host)"
+                )
             }
             CustomProviderConfigError::CredentialInUrl => {
                 write!(f, "Custom Provider base URL must not embed credentials")
             }
             CustomProviderConfigError::InvalidField(field) => {
-                write!(f, "Custom Provider {field} is empty or contains a control character")
+                write!(
+                    f,
+                    "Custom Provider {field} is empty or contains a control character"
+                )
             }
         }
     }
@@ -124,7 +130,10 @@ pub fn validate_base_url(raw: &str) -> Result<(), CustomProviderConfigError> {
     Ok(())
 }
 
-fn validate_toml_string_field(value: &str, field: &'static str) -> Result<(), CustomProviderConfigError> {
+fn validate_toml_string_field(
+    value: &str,
+    field: &'static str,
+) -> Result<(), CustomProviderConfigError> {
     if value.is_empty() || value.chars().any(|c| c.is_control()) {
         return Err(CustomProviderConfigError::InvalidField(field));
     }
@@ -187,8 +196,11 @@ pub struct CustomProviderMaterial {
 
 impl std::fmt::Debug for CustomProviderMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_env: Vec<(&str, &str)> =
-            self.extra_env.iter().map(|(k, _)| (k.as_str(), "<redacted>")).collect();
+        let redacted_env: Vec<(&str, &str)> = self
+            .extra_env
+            .iter()
+            .map(|(k, _)| (k.as_str(), "<redacted>"))
+            .collect();
         f.debug_struct("CustomProviderMaterial")
             .field("config_toml", &self.config_toml)
             .field("extra_env", &redacted_env)
@@ -235,7 +247,9 @@ pub enum WriteCodexConfigError {
 impl std::fmt::Display for WriteCodexConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteCodexConfigError::Io(e) => write!(f, "I/O error writing Custom Provider config: {e}"),
+            WriteCodexConfigError::Io(e) => {
+                write!(f, "I/O error writing Custom Provider config: {e}")
+            }
             WriteCodexConfigError::PersistedDurabilityUnconfirmed(e) => write!(
                 f,
                 "Custom Provider config replace may have already taken effect, but its crash-durability \
@@ -251,7 +265,10 @@ impl std::error::Error for WriteCodexConfigError {}
 /// same-filesystem replace, so a reader (including the App Server itself, if
 /// it were ever started concurrently with a regeneration) never observes a
 /// torn file.
-pub fn write_codex_config(codex_home: &Path, config_toml: &str) -> Result<(), WriteCodexConfigError> {
+pub fn write_codex_config(
+    codex_home: &Path,
+    config_toml: &str,
+) -> Result<(), WriteCodexConfigError> {
     std::fs::create_dir_all(codex_home).map_err(WriteCodexConfigError::Io)?;
     match atomic_write_bytes(&codex_home.join("config.toml"), config_toml.as_bytes()) {
         Ok(()) => Ok(()),
@@ -273,7 +290,10 @@ mod tests {
 
     #[test]
     fn plain_http_to_a_non_local_host_is_rejected() {
-        assert_eq!(validate_base_url("http://provider.example/v1"), Err(CustomProviderConfigError::NonHttpsBaseUrl));
+        assert_eq!(
+            validate_base_url("http://provider.example/v1"),
+            Err(CustomProviderConfigError::NonHttpsBaseUrl)
+        );
     }
 
     #[test]
@@ -301,7 +321,10 @@ mod tests {
 
     #[test]
     fn non_http_scheme_is_rejected() {
-        assert_eq!(validate_base_url("ftp://provider.example/v1"), Err(CustomProviderConfigError::NonHttpsBaseUrl));
+        assert_eq!(
+            validate_base_url("ftp://provider.example/v1"),
+            Err(CustomProviderConfigError::NonHttpsBaseUrl)
+        );
     }
 
     #[test]
@@ -333,7 +356,13 @@ mod tests {
 
         assert!(!material.config_toml.contains("sk-super-secret-value"));
         assert!(material.config_toml.contains(CUSTOM_PROVIDER_ENV_KEY));
-        assert_eq!(material.extra_env, vec![(CUSTOM_PROVIDER_ENV_KEY.to_string(), "sk-super-secret-value".to_string())]);
+        assert_eq!(
+            material.extra_env,
+            vec![(
+                CUSTOM_PROVIDER_ENV_KEY.to_string(),
+                "sk-super-secret-value".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -346,25 +375,55 @@ mod tests {
         )
         .unwrap();
 
-        let parsed: toml::Value = toml_text.parse().expect("generated config must be valid TOML");
-        assert_eq!(parsed.get("model_provider").and_then(|v| v.as_str()), Some(CUSTOM_PROVIDER_ID));
-        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some("gpt-test-model"));
+        let parsed: toml::Value = toml_text
+            .parse()
+            .expect("generated config must be valid TOML");
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some(CUSTOM_PROVIDER_ID)
+        );
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("gpt-test-model")
+        );
 
         let provider = parsed
             .get("model_providers")
             .and_then(|v| v.get(CUSTOM_PROVIDER_ID))
             .expect("model_providers.hane_custom table must be present");
-        assert_eq!(provider.get("name").and_then(|v| v.as_str()), Some("My Provider"));
-        assert_eq!(provider.get("base_url").and_then(|v| v.as_str()), Some("https://provider.example/v1"));
-        assert_eq!(provider.get("wire_api").and_then(|v| v.as_str()), Some("responses"));
-        assert_eq!(provider.get("env_key").and_then(|v| v.as_str()), Some(CUSTOM_PROVIDER_ENV_KEY));
-        assert_eq!(provider.get("requires_openai_auth").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            provider.get("name").and_then(|v| v.as_str()),
+            Some("My Provider")
+        );
+        assert_eq!(
+            provider.get("base_url").and_then(|v| v.as_str()),
+            Some("https://provider.example/v1")
+        );
+        assert_eq!(
+            provider.get("wire_api").and_then(|v| v.as_str()),
+            Some("responses")
+        );
+        assert_eq!(
+            provider.get("env_key").and_then(|v| v.as_str()),
+            Some(CUSTOM_PROVIDER_ENV_KEY)
+        );
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
 
         let filters = parsed
             .get("shell_environment_policy")
             .and_then(|v| v.get("filters"))
             .expect("shell_environment_policy.filters table must be present");
-        assert_eq!(filters.get(CUSTOM_PROVIDER_ENV_KEY).and_then(|v| v.as_str()), Some("exclude"));
+        assert_eq!(
+            filters
+                .get(CUSTOM_PROVIDER_ENV_KEY)
+                .and_then(|v| v.as_str()),
+            Some("exclude")
+        );
     }
 
     #[test]
@@ -376,7 +435,9 @@ mod tests {
             ShellEnvironmentPolicyFormat::LegacyExcludeList,
         )
         .unwrap();
-        let parsed: toml::Value = toml_text.parse().expect("generated config must be valid TOML");
+        let parsed: toml::Value = toml_text
+            .parse()
+            .expect("generated config must be valid TOML");
         let exclude_list = parsed
             .get("shell_environment_policy")
             .and_then(|v| v.get("exclude"))
@@ -395,22 +456,43 @@ mod tests {
             ShellEnvironmentPolicyFormat::Filters,
         )
         .unwrap();
-        let parsed: toml::Value = toml_text.parse().expect("generated config must still be valid TOML");
-        let provider = parsed.get("model_providers").and_then(|v| v.get(CUSTOM_PROVIDER_ID)).unwrap();
-        assert_eq!(provider.get("name").and_then(|v| v.as_str()), Some("My \"Provider\" \\ co."));
+        let parsed: toml::Value = toml_text
+            .parse()
+            .expect("generated config must still be valid TOML");
+        let provider = parsed
+            .get("model_providers")
+            .and_then(|v| v.get(CUSTOM_PROVIDER_ID))
+            .unwrap();
+        assert_eq!(
+            provider.get("name").and_then(|v| v.as_str()),
+            Some("My \"Provider\" \\ co.")
+        );
         // The injected quote must not have added a second, attacker-controlled
         // key to the table.
-        assert_eq!(provider.get("wire_api").and_then(|v| v.as_str()), Some("responses"));
+        assert_eq!(
+            provider.get("wire_api").and_then(|v| v.as_str()),
+            Some("responses")
+        );
     }
 
     #[test]
     fn empty_or_control_character_fields_are_rejected_instead_of_generating_malformed_toml() {
         assert!(matches!(
-            generate_custom_provider_toml("", "https://provider.example/v1", "gpt", ShellEnvironmentPolicyFormat::Filters),
+            generate_custom_provider_toml(
+                "",
+                "https://provider.example/v1",
+                "gpt",
+                ShellEnvironmentPolicyFormat::Filters
+            ),
             Err(CustomProviderConfigError::InvalidField("name"))
         ));
         assert!(matches!(
-            generate_custom_provider_toml("Name", "https://provider.example/v1", "", ShellEnvironmentPolicyFormat::Filters),
+            generate_custom_provider_toml(
+                "Name",
+                "https://provider.example/v1",
+                "",
+                ShellEnvironmentPolicyFormat::Filters
+            ),
             Err(CustomProviderConfigError::InvalidField("model_id"))
         ));
         assert!(matches!(
@@ -426,7 +508,8 @@ mod tests {
 
     #[test]
     fn write_codex_config_persists_to_config_toml_under_codex_home() {
-        let dir = std::env::temp_dir().join(format!("hane-ai-provider-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hane-ai-provider-test-{}", std::process::id()));
         let codex_home = dir.join("codex-custom");
         let toml_text = generate_custom_provider_toml(
             "My Provider",
