@@ -2415,6 +2415,18 @@ impl EditorView {
                 }
             }
         }
+        let body = if self.settings_ai_page {
+            self.ai_settings_render(window, cx).into_any_element()
+        } else {
+            self.general_settings_content(cx).into_any_element()
+        };
+        self.settings_screen_shell(body, cx)
+    }
+
+    // Build the page before allocating the settings shell's style temporaries.
+    // Both frames must not be live together on Windows' 1 MiB UI thread stack.
+    #[inline(never)]
+    fn settings_screen_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::Div {
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -2446,11 +2458,6 @@ impl EditorView {
                 });
             });
 
-        let body = if self.settings_ai_page {
-            self.ai_settings_render(window, cx).into_any_element()
-        } else {
-            self.general_settings_content(cx).into_any_element()
-        };
         let content = div()
             .id("settings-content")
             .flex_1()
