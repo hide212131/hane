@@ -25,7 +25,9 @@ pub struct AiPaths {
 
 impl AiPaths {
     pub fn new(app_data_root: impl AsRef<Path>) -> Self {
-        AiPaths { root: app_data_root.as_ref().join("ai") }
+        AiPaths {
+            root: app_data_root.as_ref().join("ai"),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -72,7 +74,10 @@ mod tests {
     fn paths_are_scoped_under_an_ai_subdirectory_and_kept_distinct() {
         let paths = AiPaths::new("/tmp/hane-app-data");
         assert_eq!(paths.root(), Path::new("/tmp/hane-app-data/ai"));
-        assert_eq!(paths.settings_path(), Path::new("/tmp/hane-app-data/ai/ai-settings.json"));
+        assert_eq!(
+            paths.settings_path(),
+            Path::new("/tmp/hane-app-data/ai/ai-settings.json")
+        );
         assert_ne!(paths.chatgpt_codex_home(), paths.custom_codex_home());
         assert_ne!(paths.probe_workspace(), paths.chatgpt_codex_home());
         assert_ne!(paths.probe_workspace(), paths.custom_codex_home());
