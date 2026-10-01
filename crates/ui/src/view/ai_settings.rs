@@ -2123,7 +2123,7 @@ impl AiSettingsPage {
         let model_stale = model_available
             && !matches!(&self.snapshot.model_list,
             ModelListState::Loaded(models) if models.iter().any(|model| model.model == saved_model));
-        let model_controls = if is_signed_in {
+        if is_signed_in {
             div()
                 .id("ai-chatgpt-model-section")
                 .debug_selector(|| "ai-chatgpt-model-section".to_owned())
@@ -2191,8 +2191,7 @@ impl AiSettingsPage {
                 )
                 .child("ログインすると、利用するモデルを選べます。")
                 .into_any_element()
-        };
-        model_controls
+        }
     }
 
     fn custom_section(
