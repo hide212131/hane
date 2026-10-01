@@ -1844,15 +1844,22 @@ impl EditorView {
         }
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
+
             let mut command = Command::new("explorer.exe");
-            // Explorer's `/select,` switch requires the path to be part of the
-            // same argument with no separating space; building it as one
-            // `OsString` keeps this a single argv entry (spawned without a
-            // shell), so spaces and non-ASCII characters in the path need no
-            // escaping of their own.
-            let mut argument = std::ffi::OsString::from("/select,");
+            // Explorer does not use standard argv parsing: it scans its raw
+            // command line for the literal `/select,` switch immediately
+            // followed by a quoted path, e.g. `/select,"C:\a b\file.txt"`.
+            // `Command::arg` would apply Rust's own Windows quoting, which
+            // wraps the whole `/select,<path>` token in quotes whenever the
+            // path contains a space, so Explorer no longer sees the switch.
+            // `raw_arg` appends the text verbatim (no shell, no escaping),
+            // so the path is quoted explicitly here instead, preserving the
+            // original Unicode `OsStr` without a lossy UTF-8 conversion.
+            let mut argument = std::ffi::OsString::from("/select,\"");
             argument.push(path.as_os_str());
-            command.arg(argument);
+            argument.push("\"");
+            command.raw_arg(argument);
             command
         }
     }
@@ -6515,6 +6522,36 @@ mod tests {
         assert_eq!(command.get_program(), std::ffi::OsStr::new("code"));
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(args, vec![path.as_os_str()]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn reveal_launch_command_quotes_the_path_for_the_platform_shell() {
+        let path = Path::new("/tmp/日本語 フォルダ/file with spaces.md");
+        let command = EditorView::reveal_launch_command(path);
+        let args: Vec<_> = command.get_args().collect();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("open"));
+            assert_eq!(
+                args,
+                vec![std::ffi::OsStr::new("-R"), path.as_os_str()]
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Explorer parses its raw command line itself: `/select,` must
+            // stay unquoted and directly adjacent to the quoted path, with
+            // no space in between, or the switch is not recognized.
+            let mut expected = std::ffi::OsString::from("/select,\"");
+            expected.push(path.as_os_str());
+            expected.push("\"");
+
+            assert_eq!(command.get_program(), std::ffi::OsStr::new("explorer.exe"));
+            assert_eq!(args, vec![expected.as_os_str()]);
+        }
     }
 
     #[test]
