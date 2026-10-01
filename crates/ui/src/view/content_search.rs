@@ -238,6 +238,12 @@ impl Drop for ContentSearchState {
 }
 
 impl ContentSearchState {
+    fn should_leave_on_escape(&self, editor_has_ime_composition: bool) -> bool {
+        self.input_focused
+            || self.results_focused
+            || (self.mode == SidebarMode::Content && !editor_has_ime_composition)
+    }
+
     fn key(&self) -> SearchKey {
         SearchKey {
             workspace_epoch: self.workspace_epoch,
@@ -432,6 +438,11 @@ impl EditorView {
 
     pub(crate) fn content_search_input_is_focused(&self) -> bool {
         self.content_search.input_focused
+    }
+
+    pub(crate) fn content_search_should_leave_on_escape(&self) -> bool {
+        self.content_search
+            .should_leave_on_escape(self.editor().ime().is_some())
     }
 
     pub(crate) fn open_content_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2186,6 +2197,19 @@ mod tests {
         assert_ne!(first_a, b);
         assert_ne!(b, second_a);
         assert_ne!(first_a, second_a);
+    }
+
+    #[test]
+    fn escape_leaves_search_after_navigation_but_preserves_editor_ime_composition() {
+        let mut state = ContentSearchState::default();
+        state.mode = SidebarMode::Content;
+
+        // Opening a hit clears both search focus flags while the sidebar stays
+        // in content-search mode. Escape must still return to file mode.
+        assert!(!state.input_focused);
+        assert!(!state.results_focused);
+        assert!(state.should_leave_on_escape(false));
+        assert!(!state.should_leave_on_escape(true));
     }
 
     #[test]

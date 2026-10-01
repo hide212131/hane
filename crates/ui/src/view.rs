@@ -89,9 +89,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_settings;
 mod background_parse;
+mod content_search;
 mod inline_rename;
 mod session_save;
-mod content_search;
 mod sidebar;
 mod sidebar_filter;
 mod viewport;
@@ -2231,11 +2231,7 @@ impl EditorView {
                             self.schedule_document_parse(cx);
                             match search_navigation_verification {
                                 Some(Ok(navigation_id)) => {
-                                    self.finish_pending_search_navigation(
-                                        navigation_id,
-                                        true,
-                                        cx,
-                                    );
+                                    self.finish_pending_search_navigation(navigation_id, true, cx);
                                 }
                                 Some(Err(())) => {
                                     self.discard_pending_search_navigation_for_path(path, cx);

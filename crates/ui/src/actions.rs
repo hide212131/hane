@@ -315,7 +315,7 @@ command_actions! {
         if view.dismiss_file_tab_context_menu(cx) {
             return;
         }
-        if view.content_search_input_is_focused() || view.content_search_results_focused() {
+        if view.content_search_should_leave_on_escape() {
             view.leave_content_search(cx);
             return;
         }
