@@ -1755,29 +1755,63 @@ impl AiSettingsPage {
             .child(div().flex().gap_2().child(confirm).child(cancel))
     }
 
+    #[inline(never)]
     fn chatgpt_section(
         &self,
         cx: &mut Context<EditorView>,
         dirty: bool,
         editable: bool,
-        window: &Window,
+        _window: &Window,
         theme: Theme,
     ) -> gpui::AnyElement {
-        let Some(inputs) = &self.inputs else {
+        let actions_allowed = self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
+            && !dirty
+            && self.snapshot.busy.is_none()
+            && !self.snapshot.recovery_required;
+        let is_signed_in = matches!(self.snapshot.account, AccountState::SignedIn { .. });
+        let account = self.chatgpt_account_content(cx, dirty, theme);
+        let models =
+            self.chatgpt_model_controls(cx, is_signed_in, editable, actions_allowed, theme);
+        let dark = theme.editor_background < 0x888888;
+        div()
+            .id("ai-chatgpt-section")
+            .debug_selector(|| "ai-chatgpt-section".to_owned())
+            .w_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(rgb(if dark { 0x373b43 } else { theme.table_border }))
+            .bg(rgb(if dark {
+                0x202328
+            } else {
+                theme.code_block_background
+            }))
+            .text_size(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(account)
+            .child(models)
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn chatgpt_account_content(
+        &self,
+        cx: &mut Context<EditorView>,
+        dirty: bool,
+        theme: Theme,
+    ) -> gpui::AnyElement {
+        if self.inputs.is_none() {
             return div().into_any_element();
-        };
+        }
         let active_saved = self.snapshot.settings.active_connection == ActiveConnection::ChatGpt;
         let actions_allowed = active_saved
             && !dirty
             && self.snapshot.busy.is_none()
             && !self.snapshot.recovery_required;
         let dark = theme.editor_background < 0x888888;
-        let panel_background = if dark {
-            0x202328
-        } else {
-            theme.code_block_background
-        };
-        let panel_border = if dark { 0x373b43 } else { theme.table_border };
         let account_background = if dark {
             0x1d2025
         } else {
@@ -1805,73 +1839,6 @@ impl AiSettingsPage {
         } else {
             "ログインして、利用するモデルを選びます。"
         };
-        let model_list = match &self.snapshot.model_list {
-            ModelListState::NotLoaded => {
-                "モデル一覧は未取得です。「モデル一覧を更新」から取得できます。".to_owned()
-            }
-            ModelListState::Loading => "モデル一覧を取得しています…".to_owned(),
-            ModelListState::Loaded(models) => format!("{}件のモデルを取得しました。", models.len()),
-            ModelListState::Failed(error) => format!(
-                "モデル一覧を取得できませんでした（{}）。保存済みモデルは変更していません。再取得するか、下のモデルIDを手入力してください。",
-                model_list_error_message(error)
-            ),
-        };
-        let draft_model = value(&inputs.chatgpt_model, cx);
-        let model_items = match &self.snapshot.model_list {
-            ModelListState::Loaded(available) => available
-                .iter()
-                .take(40)
-                .map(|model| (model.model.clone(), model.display_name.clone()))
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        };
-        let model_items_available = !model_items.is_empty();
-        let selected_model_label = if draft_model.trim().is_empty() {
-            "モデルを選択".to_owned()
-        } else {
-            draft_model.clone()
-        };
-        let view_for_models = cx.entity();
-        let model_picker = Button::new("ai-chatgpt-model-picker")
-            .label(selected_model_label)
-            .disabled(!editable || !model_items_available)
-            .dropdown_menu(move |mut menu, _, _| {
-                for (model, display_name) in &model_items {
-                    let model = model.clone();
-                    let label = format!("{display_name} ({model})");
-                    let item_id = format!("ai-model-{}", models_hash(&model));
-                    let selector = item_id;
-                    let current_model = draft_model.clone();
-                    let view = view_for_models.clone();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
-                            let selector = selector.clone();
-                            div()
-                                .id(selector.clone())
-                                .debug_selector(move || selector.clone())
-                                .px(px(5.0))
-                                .py(px(3.0))
-                                .child(label.clone())
-                        })
-                        .checked(model == current_model)
-                        .on_click(move |_, window, app| {
-                            view.update(app, |view, cx| {
-                                if let Some(inputs) = &view.ai_settings.inputs {
-                                    inputs.chatgpt_model.update(cx, |state, cx| {
-                                        state.set_value(model.clone(), window, cx)
-                                    });
-                                }
-                                cx.notify();
-                            });
-                        }),
-                    );
-                }
-                menu
-            });
-        let model_picker = div()
-            .id("ai-chatgpt-model-picker-wrapper")
-            .debug_selector(|| "ai-chatgpt-model-picker".to_owned())
-            .child(model_picker);
         let service = self.service.clone();
         let view_for_login = cx.entity();
         let login_label = match self.snapshot.login {
@@ -1948,6 +1915,187 @@ impl AiSettingsPage {
                     cx.notify();
                 });
             });
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("ChatGPTアカウントで接続"),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded_sm()
+                            .bg(rgb(theme.sidebar_active_background))
+                            .text_size(px(11.0))
+                            .child(account),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ai-chatgpt-account-card")
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .rounded(px(9.0))
+                    .bg(rgb(account_background))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(38.0))
+                            .flex_none()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(if theme.editor_background < 0x888888 {
+                                0x514d61
+                            } else {
+                                theme.table_border
+                            }))
+                            .bg(rgb(theme.sidebar_active_background))
+                            .text_color(rgb(theme.link_foreground))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(gpui_kit_assets::IconName::UserRound).size(px(18.0))),
+                    )
+                    .child(
+                        div()
+                            .id("ai-chatgpt-account-copy")
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(account_title.to_owned()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(theme.quote_foreground))
+                                    .child(account_subtitle),
+                            ),
+                    )
+                    .children(is_signed_in.then_some(logout)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children((!is_signed_in).then_some(login))
+                            .children(cancel_login)
+                            .child(refresh_account),
+                    )
+                    .child(if active_saved {
+                        "ログイン後、モデルを選びます。ログインだけでは応答確認を行いません。"
+                    } else {
+                        "ChatGPTを使うには、先に選んで「保存して適用」します。"
+                    }),
+            )
+            .into_any_element()
+    }
+
+    // Keep the model form out of the account-card stack frame. In debug builds,
+    // GPUI's large by-value style builders otherwise exhaust Windows' 1 MiB stack.
+    #[inline(never)]
+    fn chatgpt_model_controls(
+        &self,
+        cx: &mut Context<EditorView>,
+        is_signed_in: bool,
+        editable: bool,
+        actions_allowed: bool,
+        theme: Theme,
+    ) -> gpui::AnyElement {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return div().into_any_element();
+        };
+        let dark = theme.editor_background < 0x888888;
+        let model_list = match &self.snapshot.model_list {
+            ModelListState::NotLoaded => {
+                "モデル一覧は未取得です。「モデル一覧を更新」から取得できます。".to_owned()
+            }
+            ModelListState::Loading => "モデル一覧を取得しています…".to_owned(),
+            ModelListState::Loaded(models) => format!("{}件のモデルを取得しました。", models.len()),
+            ModelListState::Failed(error) => format!(
+                "モデル一覧を取得できませんでした（{}）。保存済みモデルは変更していません。再取得するか、下のモデルIDを手入力してください。",
+                model_list_error_message(error)
+            ),
+        };
+        let draft_model = value(&inputs.chatgpt_model, cx);
+        let model_items = match &self.snapshot.model_list {
+            ModelListState::Loaded(available) => available
+                .iter()
+                .take(40)
+                .map(|model| (model.model.clone(), model.display_name.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let model_items_available = !model_items.is_empty();
+        let selected_model_label = if draft_model.trim().is_empty() {
+            "モデルを選択".to_owned()
+        } else {
+            draft_model.clone()
+        };
+        let view_for_models = cx.entity();
+        let model_picker = Button::new("ai-chatgpt-model-picker")
+            .label(selected_model_label)
+            .disabled(!editable || !model_items_available)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (model, display_name) in &model_items {
+                    let model = model.clone();
+                    let label = format!("{display_name} ({model})");
+                    let item_id = format!("ai-model-{}", models_hash(&model));
+                    let selector = item_id;
+                    let current_model = draft_model.clone();
+                    let view = view_for_models.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            let selector = selector.clone();
+                            div()
+                                .id(selector.clone())
+                                .debug_selector(move || selector.clone())
+                                .px(px(5.0))
+                                .py(px(3.0))
+                                .child(label.clone())
+                        })
+                        .checked(model == current_model)
+                        .on_click(move |_, window, app| {
+                            view.update(app, |view, cx| {
+                                if let Some(inputs) = &view.ai_settings.inputs {
+                                    inputs.chatgpt_model.update(cx, |state, cx| {
+                                        state.set_value(model.clone(), window, cx)
+                                    });
+                                }
+                                cx.notify();
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        let model_picker = div()
+            .id("ai-chatgpt-model-picker-wrapper")
+            .debug_selector(|| "ai-chatgpt-model-picker".to_owned())
+            .child(model_picker);
         let service = self.service.clone();
         let view = cx.entity();
         let refresh_models = Button::new("ai-chatgpt-refresh-models")
@@ -2044,115 +2192,7 @@ impl AiSettingsPage {
                 .child("ログインすると、利用するモデルを選べます。")
                 .into_any_element()
         };
-        let _ = window;
-        div()
-            .id("ai-chatgpt-section")
-            .debug_selector(|| "ai-chatgpt-section".to_owned())
-            .w_full()
-            .px(px(20.0))
-            .py(px(18.0))
-            .rounded(px(9.0))
-            .border_1()
-            .border_color(rgb(panel_border))
-            .bg(rgb(panel_background))
-            .text_size(px(12.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("ChatGPTアカウントで接続"),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .rounded_sm()
-                            .bg(rgb(theme.sidebar_active_background))
-                            .text_size(px(11.0))
-                            .child(account),
-                    ),
-            )
-            .child(
-                div()
-                    .id("ai-chatgpt-account-card")
-                    .px(px(14.0))
-                    .py(px(12.0))
-                    .rounded(px(9.0))
-                    .bg(rgb(account_background))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size(px(38.0))
-                            .flex_none()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(if theme.editor_background < 0x888888 {
-                                0x514d61
-                            } else {
-                                theme.table_border
-                            }))
-                            .bg(rgb(theme.sidebar_active_background))
-                            .text_color(rgb(theme.link_foreground))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(gpui_kit_assets::IconName::UserRound).size(px(18.0))),
-                    )
-                    .child(
-                        div()
-                            .id("ai-chatgpt-account-copy")
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(account_title.to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(theme.quote_foreground))
-                                    .child(account_subtitle),
-                            ),
-                    )
-                    .children(is_signed_in.then_some(logout)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .children((!is_signed_in).then_some(login))
-                            .children(cancel_login)
-                            .child(refresh_account),
-                    )
-                    .child(if active_saved {
-                        "ログイン後、モデルを選びます。ログインだけでは応答確認を行いません。"
-                    } else {
-                        "ChatGPTを使うには、先に選んで「保存して適用」します。"
-                    }),
-            )
-            .child(model_controls)
-            .into_any_element()
+        model_controls
     }
 
     fn custom_section(
@@ -2191,6 +2231,98 @@ impl AiSettingsPage {
             None
         };
 
+        let service_picker = self.custom_service_picker(cx, disabled);
+
+        let (key_row, key_input) = self.custom_key_content(cx, disabled, registered, divider, theme);
+
+        let details_open = self.custom_details_open;
+        let view = cx.entity();
+        let details_toggle_button = Button::new("ai-custom-details-toggle-button")
+            .label(if details_open {
+                "接続先の詳細を隠す"
+            } else if self.custom_preset == CustomProviderPreset::Other {
+                "接続先の詳細（接続名・URLが必要です）"
+            } else {
+                "接続先の詳細"
+            })
+            .small()
+            .ghost()
+            .disabled(disabled)
+            .on_click(move |_, _, app| {
+                view.update(app, |view, cx| {
+                    view.ai_settings.custom_details_open = !view.ai_settings.custom_details_open;
+                    cx.notify();
+                });
+            });
+        let details_toggle = div()
+            .id("ai-custom-details-toggle-wrapper")
+            .debug_selector(|| "ai-custom-details-toggle".to_owned())
+            .pt(px(11.0))
+            .border_t_1()
+            .border_color(rgb(divider))
+            .child(details_toggle_button);
+        let provider_details = self.provider_details(disabled, endpoint_error);
+        let service_model = self.service_model(service_picker, disabled);
+
+        div()
+            .id("ai-custom-section")
+            .debug_selector(|| "ai-custom-section".to_owned())
+            .w_full()
+            .px(px(20.0))
+            .py(px(18.0))
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(rgb(form_border))
+            .bg(rgb(form_background))
+            .text_size(px(12.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("APIキーで接続"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.quote_foreground))
+                            .child("サービス側のAPI利用料金がかかる場合があります。"),
+                    ),
+            )
+            .child(service_model)
+            .child(key_row)
+            .children(key_input)
+            .children(endpoint_changed.then_some(
+                div()
+                    .id("ai-custom-key-endpoint-changed")
+                    .text_color(rgb(0xb54708))
+                    .child("接続先が変わりました。この接続先に合うAPIキーを登録してください。登録済みキーは別の接続先へ自動では引き継ぎません。"),
+            ))
+            .child(details_toggle)
+            .child(provider_details)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.quote_foreground))
+                    .child(custom_key_guidance(self.credential_edit, registered)),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn custom_service_picker(
+        &self,
+        cx: &mut Context<EditorView>,
+        disabled: bool,
+    ) -> gpui::AnyElement {
         let service_is_openai = self.custom_preset == CustomProviderPreset::OpenAi;
         let openai_view = cx.entity();
         let other_view = cx.entity();
@@ -2250,6 +2382,21 @@ impl AiSettingsPage {
                 )
             });
 
+        service_picker.into_any_element()
+    }
+
+    #[inline(never)]
+    fn custom_key_content(
+        &self,
+        cx: &mut Context<EditorView>,
+        disabled: bool,
+        registered: bool,
+        divider: u32,
+        theme: Theme,
+    ) -> (gpui::AnyElement, Option<gpui::AnyElement>) {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return (div().into_any_element(), None);
+        };
         let view = cx.entity();
         let replace_key = Button::new("ai-custom-key-replace")
             .label(custom_key_action_label(registered))
@@ -2363,32 +2510,27 @@ impl AiSettingsPage {
             None
         };
 
+        let key_actions = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children((self.credential_edit != CredentialEdit::Replace).then_some(replace_key))
+            .children(delete_key)
+            .children(undo_delete);
+        let key_row = self.key_row(key_actions, key_status, registered, divider, theme);
+        (key_row, key_input.map(IntoElement::into_any_element))
+    }
+
+    #[inline(never)]
+    fn provider_details(
+        &self,
+        disabled: bool,
+        endpoint_error: Option<&'static str>,
+    ) -> gpui::AnyElement {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return div().into_any_element();
+        };
         let details_open = self.custom_details_open;
-        let view = cx.entity();
-        let details_toggle_button = Button::new("ai-custom-details-toggle-button")
-            .label(if details_open {
-                "接続先の詳細を隠す"
-            } else if self.custom_preset == CustomProviderPreset::Other {
-                "接続先の詳細（接続名・URLが必要です）"
-            } else {
-                "接続先の詳細"
-            })
-            .small()
-            .ghost()
-            .disabled(disabled)
-            .on_click(move |_, _, app| {
-                view.update(app, |view, cx| {
-                    view.ai_settings.custom_details_open = !view.ai_settings.custom_details_open;
-                    cx.notify();
-                });
-            });
-        let details_toggle = div()
-            .id("ai-custom-details-toggle-wrapper")
-            .debug_selector(|| "ai-custom-details-toggle".to_owned())
-            .pt(px(11.0))
-            .border_t_1()
-            .border_color(rgb(divider))
-            .child(details_toggle_button);
         let provider_details = if details_open {
             if self.custom_preset == CustomProviderPreset::OpenAi {
                 div()
@@ -2448,13 +2590,62 @@ impl AiSettingsPage {
             div().into_any_element()
         };
 
-        let key_actions = div()
+        provider_details.into_any_element()
+    }
+
+    #[inline(never)]
+    fn service_model(&self, service_picker: impl IntoElement, disabled: bool) -> gpui::AnyElement {
+        let Some(inputs) = self.inputs.as_ref() else {
+            return div().into_any_element();
+        };
+        let service_model = div()
             .flex()
             .flex_wrap()
-            .gap_2()
-            .children((self.credential_edit != CredentialEdit::Replace).then_some(replace_key))
-            .children(delete_key)
-            .children(undo_delete);
+            .gap_3()
+            .child(
+                div()
+                    .id("ai-custom-service-choice")
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("AIサービス")
+                    .child(service_picker)
+                    .child(if self.custom_preset == CustomProviderPreset::OpenAi {
+                        "OpenAIの接続先を自動で設定します。"
+                    } else {
+                        "接続名とURLは「接続先の詳細」で指定します。"
+                    }),
+            )
+            .child(
+                div()
+                    .id("ai-custom-model-field")
+                    .flex_1()
+                    .min_w(px(250.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("モデルID")
+                    .child(
+                        Input::new(&inputs.custom_model)
+                            .aria_label("Custom model ID")
+                            .disabled(disabled),
+                    )
+                    .child("利用するモデルIDを入力してください。"),
+            );
+        service_model.into_any_element()
+    }
+
+    #[inline(never)]
+    fn key_row(
+        &self,
+        key_actions: impl IntoElement,
+        key_status: &'static str,
+        registered: bool,
+        divider: u32,
+        theme: Theme,
+    ) -> gpui::AnyElement {
         let key_row = div()
             .id("ai-custom-key-row")
             .mt(px(17.0))
@@ -2495,94 +2686,7 @@ impl AiSettingsPage {
             )
             .child(key_actions);
 
-        let service_model = div()
-            .flex()
-            .flex_wrap()
-            .gap_3()
-            .child(
-                div()
-                    .id("ai-custom-service-choice")
-                    .flex_1()
-                    .min_w(px(250.0))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child("AIサービス")
-                    .child(service_picker)
-                    .child(if self.custom_preset == CustomProviderPreset::OpenAi {
-                        "OpenAIの接続先を自動で設定します。"
-                    } else {
-                        "接続名とURLは「接続先の詳細」で指定します。"
-                    }),
-            )
-            .child(
-                div()
-                    .id("ai-custom-model-field")
-                    .flex_1()
-                    .min_w(px(250.0))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child("モデルID")
-                    .child(
-                        Input::new(&inputs.custom_model)
-                            .aria_label("Custom model ID")
-                            .disabled(disabled),
-                    )
-                    .child("利用するモデルIDを入力してください。"),
-            );
-
-        div()
-            .id("ai-custom-section")
-            .debug_selector(|| "ai-custom-section".to_owned())
-            .w_full()
-            .px(px(20.0))
-            .py(px(18.0))
-            .rounded(px(9.0))
-            .border_1()
-            .border_color(rgb(form_border))
-            .bg(rgb(form_background))
-            .text_size(px(12.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("APIキーで接続"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(theme.quote_foreground))
-                            .child("サービス側のAPI利用料金がかかる場合があります。"),
-                    ),
-            )
-            .child(service_model)
-            .child(key_row)
-            .children(key_input)
-            .children(endpoint_changed.then_some(
-                div()
-                    .id("ai-custom-key-endpoint-changed")
-                    .text_color(rgb(0xb54708))
-                    .child("接続先が変わりました。この接続先に合うAPIキーを登録してください。登録済みキーは別の接続先へ自動では引き継ぎません。"),
-            ))
-            .child(details_toggle)
-            .child(provider_details)
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(theme.quote_foreground))
-                    .child(custom_key_guidance(self.credential_edit, registered)),
-            )
-            .into_any_element()
+        key_row.into_any_element()
     }
 
     fn probe_section(
@@ -3178,6 +3282,7 @@ mod tests {
     fn ai_settings_show_only_the_selected_connection_and_keep_savebar_visible(
         cx: &mut gpui::TestAppContext,
     ) {
+        eprintln!("stack-budget scenario: create editor");
         let (view, cx) =
             cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
         cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
@@ -3195,7 +3300,9 @@ mod tests {
             });
             cx.notify();
         });
+        eprintln!("stack-budget scenario: render ChatGPT card");
         cx.run_until_parked();
+        eprintln!("stack-budget scenario: ChatGPT card rendered");
 
         assert!(cx.debug_bounds("ai-chatgpt-section").is_some());
         assert!(cx.debug_bounds("ai-custom-section").is_none());
@@ -3208,6 +3315,7 @@ mod tests {
             .expect("API key connection selector is shown");
         cx.simulate_click(api_key_connection.center(), gpui::Modifiers::none());
         cx.run_until_parked();
+        eprintln!("stack-budget scenario: custom card rendered");
 
         assert!(cx.debug_bounds("ai-chatgpt-section").is_none());
         assert!(cx.debug_bounds("ai-custom-section").is_some());
@@ -3219,7 +3327,32 @@ mod tests {
             .expect("collapsed connection details are discoverable");
         cx.simulate_click(details_button.center(), gpui::Modifiers::none());
         cx.run_until_parked();
+        eprintln!("stack-budget scenario: custom details rendered");
         assert!(cx.debug_bounds("ai-custom-provider-details").is_some());
+    }
+
+    #[test]
+    fn ai_settings_render_with_windows_stack_budget() {
+        // Run in a subprocess because a stack overflow aborts rather than unwinds.
+        // libtest creates its test thread using RUST_MIN_STACK; 1 MiB is the
+        // Windows executable's default main-thread reserve. Exercise both
+        // connection cards and the expanded custom form without a live service.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("RUST_MIN_STACK", "1048576")
+            .args([
+                "view::ai_settings::tests::ai_settings_show_only_the_selected_connection_and_keep_savebar_visible",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "AI settings exceeded the Windows stack budget: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[gpui::test]
