@@ -125,7 +125,13 @@ fn main() {
 
     if let Some(mut file) = env::var("FAKE_SERVER_SPAWN_MARKER_FILE")
         .ok()
-        .and_then(|marker_path| std::fs::OpenOptions::new().create(true).append(true).open(marker_path).ok())
+        .and_then(|marker_path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(marker_path)
+                .ok()
+        })
     {
         let _ = writeln!(file, "{}", std::process::id());
     }
@@ -170,7 +176,10 @@ fn main() {
         match (id, method) {
             (Some(id), Some(method)) if method == "initialize" => {
                 if let Some(path) = &record_init_file {
-                    let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    let params = value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     append_record(path, &format!("INIT_PARAMS:{params}"));
                 }
                 if mode == "never_respond" {
@@ -188,8 +197,7 @@ fn main() {
                     break;
                 }
                 if emit_server_request {
-                    let request =
-                        serde_json::json!({"id": "srv-1", "method": "test/serverRequest", "params": {}});
+                    let request = serde_json::json!({"id": "srv-1", "method": "test/serverRequest", "params": {}});
                     if writeln!(stdout, "{request}").is_err() || stdout.flush().is_err() {
                         break;
                     }
@@ -202,12 +210,14 @@ fn main() {
                     // to actually observe `Ready` first, instead of racing
                     // that confirmation against a close that happens right
                     // after this reply is written.
-                    thread::spawn(move || loop {
-                        if std::path::Path::new(&path).exists() {
-                            close_stdout();
-                            break;
+                    thread::spawn(move || {
+                        loop {
+                            if std::path::Path::new(&path).exists() {
+                                close_stdout();
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
                         }
-                        thread::sleep(Duration::from_millis(10));
                     });
                 }
             }
@@ -221,7 +231,10 @@ fn main() {
                     }
                     continue;
                 }
-                let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = value
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let response = serde_json::json!({"id": id, "result": params});
                 if writeln!(stdout, "{response}").is_err() || stdout.flush().is_err() {
                     break;
@@ -288,7 +301,11 @@ fn close_stdout() {
 }
 
 fn append_record(path: &str, line: &str) {
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "{line}");
     }
 }

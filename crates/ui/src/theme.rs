@@ -151,8 +151,14 @@ mod tests {
 
     #[test]
     fn resolves_dark_matches_explicit_preferences() {
-        assert!(!resolves_dark(ThemePreference::Light, WindowAppearance::Dark));
-        assert!(resolves_dark(ThemePreference::Dark, WindowAppearance::Light));
+        assert!(!resolves_dark(
+            ThemePreference::Light,
+            WindowAppearance::Dark
+        ));
+        assert!(resolves_dark(
+            ThemePreference::Dark,
+            WindowAppearance::Light
+        ));
     }
 
     #[test]

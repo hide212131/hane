@@ -109,7 +109,9 @@ pub(crate) fn apply(
                 .timer(Duration::from_secs(idle_seconds))
                 .await;
             let rss = hane_metrics::process_memory_bytes();
-            let _ = view.update(cx, |view, _| view.record_phase0_idle_memory(rss, idle_seconds));
+            let _ = view.update(cx, |view, _| {
+                view.record_phase0_idle_memory(rss, idle_seconds)
+            });
         })
         .detach();
     }
