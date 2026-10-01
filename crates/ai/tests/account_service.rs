@@ -285,6 +285,10 @@ fn app_service_handles_early_login_completion_models_logout_and_view_recreation(
         handle.snapshot().account,
         AccountState::SignedIn { .. }
     ));
+    assert!(
+        matches!(handle.snapshot().model_list, ModelListState::Loaded(_)),
+        "refreshing the same account must preserve its loaded model list"
+    );
 
     let logout_id = handle.try_submit(AiCommand::Logout).unwrap();
     assert_eq!(

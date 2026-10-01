@@ -670,16 +670,13 @@ fn handle_command(
                 .and_then(|runtime| call_account_read(runtime, refresh_token));
             match result {
                 Ok(account) => {
-                    let signed_in = matches!(account, AccountState::SignedIn { .. });
                     mutate(shared, |snapshot| {
                         if snapshot.account != account {
                             snapshot.auth_epoch += 1;
+                            snapshot.model_list = ModelListState::NotLoaded;
                         }
                         snapshot.account = account;
                         snapshot.account_refresh_failed = false;
-                        if signed_in {
-                            snapshot.model_list = ModelListState::NotLoaded;
-                        }
                     });
                     finish(
                         shared,
