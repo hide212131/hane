@@ -26,6 +26,15 @@ jobs:
       - name: Test Rust CI path filter
         run: python3 .github/tests/test_rust_ci_path_filter.py
 
+      - name: Test AADW action and diagnostic contract
+        run: python3 .github/tests/test_aadw_action_contract.py
+
+      - name: Test AADW prevention entrypoint wiring
+        run: python3 .github/tests/test_aadw_prevention_wiring.py
+
+      - name: Test GUI observation quality classification
+        run: python3 scripts/tests/test_aadw_gui_observation.py
+
       - name: Test AADW GUI command policy
         run: python3 .github/tests/test_aadw_gui_command.py
 
