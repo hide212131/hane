@@ -29,9 +29,10 @@ def assess_step(step: dict) -> dict:
         end = frame.get("capture_completed_elapsed_ms")
         elapsed = frame.get("elapsed_ms")
         rows = frame.get("visible_lines")
+        route = step.get("event_route") if name == "direction_reversal" else frame.get("event_route")
         if (not all(number(value) for value in (start, end, elapsed))
                 or not previous <= start <= end or elapsed != end
-                or frame.get("event_route") != "cghidEventTap"
+                or route != "cghidEventTap"
                 or not isinstance(rows, list) or not rows
                 or not all(type(row) is int and 1 <= row <= 500 for row in rows)):
             return {**result, "observation": "unavailable", "failure_class": "measurement",

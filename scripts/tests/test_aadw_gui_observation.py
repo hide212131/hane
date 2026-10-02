@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("observation", ROOT / "aadw_gui_observation.py")
@@ -13,17 +14,78 @@ spec.loader.exec_module(observation)
 
 
 def sample(name="lines_coast", result="pass", times=(20, 50, 200)):
-    return {"name": name, "result": result, "baseline": 1,
+    route_fields = {} if name == "direction_reversal" else {"event_route": "cghidEventTap"}
+    step = {"name": name, "result": result, "baseline": 1,
             "initial_to_reverse_event_ms": 120,
             "pre_reverse_capture_completed_after_initial_ms": 100,
             "frames": [{"capture_started_elapsed_ms": t - 1, "capture_completed_elapsed_ms": t,
-                        "elapsed_ms": t, "event_route": "cghidEventTap", "visible_lines": [2, 3]}
+                        "elapsed_ms": t, **route_fields, "visible_lines": [2, 3]}
                        for t in times]}
+    if name == "direction_reversal":
+        step["event_route"] = "cghidEventTap"
+    return step
 
 
 class ObservationTests(unittest.TestCase):
     def test_observed_success_is_preserved(self):
         self.assertEqual(observation.assess_step(sample())["observation"], "observed_pass")
+
+    def test_reversal_uses_scenario_route_not_frame_route(self):
+        self.assertEqual(observation.assess_step(sample("direction_reversal"))["observation"], "observed_pass")
+        for route in (None, "postToPid"):
+            with self.subTest(route=route):
+                step = sample("direction_reversal"); step["event_route"] = route
+                for frame in step["frames"]:
+                    frame["event_route"] = "cghidEventTap"
+                self.assertEqual(observation.assess_step(step)["failure_class"], "measurement")
+
+    def test_normal_scroll_still_requires_each_frame_route(self):
+        for name in ("lines_coast", "pixels_direct_follow"):
+            with self.subTest(name=name):
+                step = sample(name); step["event_route"] = "cghidEventTap"
+                del step["frames"][0]["event_route"]
+                self.assertEqual(observation.assess_step(step)["failure_class"], "measurement")
+
+    def test_real_producer_capture_and_evaluation_match_observation_contract(self):
+        # Exercise the repository's real record construction/evaluation; OS
+        # input, capture and OCR are mocked. This is not live GUI acceptance.
+        producer_spec = importlib.util.spec_from_file_location("scroll_producer", ROOT / "hosted_scroll_inertia_gui.py")
+        producer = importlib.util.module_from_spec(producer_spec)
+        producer_spec.loader.exec_module(producer)
+        times = (20, 50, 90, 120, 200, 240)
+        evidence = {"event_route": "cghidEventTap", "event_post_elapsed_ms": 0,
+                    "initial_to_reverse_event_ms": 120,
+                    "pre_frame_capture_started_after_initial_ms": [60, 90, 110],
+                    "pre_frame_capture_completed_after_initial_ms": [61, 91, 111],
+                    "frame_elapsed_ms": list(times),
+                    "frame_capture_started_ms": [t - 1 for t in times],
+                    "frame_capture_completed_ms": list(times)}
+        for name, offsets in (("lines_coast", [3, 6, 8, 9, 10, 10]),
+                              ("pixels_direct_follow", [3] * 6),
+                              ("direction_reversal", [6, 5, 4, 3, 2, 2])):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                interaction = MagicMock()
+                interaction.run_helper.return_value = (True, "mocked helper timings", None)
+                ocr_offsets = ([2, 4, 8] if name == "direction_reversal" else []) + offsets
+                with patch.object(producer, "parse_scroll_capture_helper_output", return_value=evidence), \
+                     patch.object(producer, "parse_reversal_helper_output", return_value=evidence), \
+                     patch.object(producer, "capture_ocr", side_effect=[([n, n + 1], "fixture", None) for n in ocr_offsets]):
+                    frames, pre, error = producer.capture_frames(
+                        interaction, None, None, None, "unused-helper", 1, "window", Path(temp),
+                        "pixels" if name == "pixels_direct_follow" else "lines", -8, times, 1,
+                        reverse_delta=12 if name == "direction_reversal" else None, baseline=1)
+                self.assertIsNone(error)
+                if name == "direction_reversal":
+                    self.assertTrue(all("event_route" not in frame for frame in frames))
+                    step = producer.evaluate_reversal(1, pre["selected"]["value"], frames,
+                        pre["initial_to_reverse_event_ms"], event_route=pre["event_route"],
+                        pre_reverse_capture_completed_after_initial_ms=pre["selected"]["capture_completed_after_initial_ms"])
+                elif name == "lines_coast":
+                    step = producer.evaluate_lines_coast(1, frames)
+                else:
+                    step = producer.evaluate_pixels(1, frames)
+                self.assertEqual(step["result"], "pass", step.get("reason"))
+                self.assertEqual(observation.assess_step(step)["observation"], "observed_pass")
 
     def test_producer_pass_after_80ms_remains_unproven(self):
         for name in ("lines_coast", "pixels_direct_follow"):
