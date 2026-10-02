@@ -521,6 +521,56 @@ class ScrollEventObservationAttachmentTests(unittest.TestCase):
         gui.attach_scroll_event_observation(step, {"observation": "observed_ordered"})
         self.assertNotIn("scroll_event_observation", step)
 
+    # Regression fixtures (Issue #427): the raw producer judgment
+    # (pass/fail/blocked from evaluate_lines_coast/evaluate_pixels) and the
+    # separate observer classification must stay independent in every
+    # combination below -- a disordered or unavailable observation can never
+    # upgrade a fail/blocked producer result to pass, and an ordered
+    # observation never downgrades or hides a fail/blocked one either.
+
+    def test_normal_ordered_observation_does_not_change_a_passing_producer_result(self):
+        step = gui.evaluate_lines_coast(
+            100,
+            frames([104, 106, 109, 111, 112, 113, 113, 113],
+                   [8, 24, 48, 72, 108, 144, 190, 240]),
+        )
+        self.assertEqual(step["result"], "pass")
+        observation = {"observation": "observed_ordered", "reason": None,
+                       "stages_ms": {}, "clock_consistent": True,
+                       "presentation_observation": "unavailable"}
+        attached = gui.attach_scroll_event_observation(step, observation)
+        self.assertEqual(attached["result"], "pass")
+        self.assertEqual(attached["scroll_event_observation"], observation)
+
+    def test_attaching_an_unavailable_observation_does_not_change_a_failing_producer_result(self):
+        step = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 100, 100, 100],
+                   [8, 24, 48, 72, 108, 144, 190, 240]),
+        )
+        self.assertEqual(step["result"], "fail")
+        observation = {"observation": "unavailable", "reason": "計測不能",
+                       "stages_ms": {}, "clock_consistent": False,
+                       "presentation_observation": "unavailable"}
+        attached = gui.attach_scroll_event_observation(step, observation)
+        self.assertEqual(attached["result"], "fail")
+        self.assertEqual(attached["scroll_event_observation"], observation)
+
+    def test_attaching_an_observation_does_not_change_a_blocked_producer_result(self):
+        step = gui.evaluate_lines_coast(100, frames([100], [8]))
+        self.assertEqual(step["result"], "blocked")
+        for observation in (
+            None,
+            {"observation": "unavailable", "reason": "計測不能", "stages_ms": {},
+             "clock_consistent": False, "presentation_observation": "unavailable"},
+            {"observation": "observed_ordered", "reason": None, "stages_ms": {},
+             "clock_consistent": True, "presentation_observation": "unavailable"},
+        ):
+            with self.subTest(observation=observation):
+                attached = gui.attach_scroll_event_observation(step, observation)
+                self.assertEqual(attached["result"], "blocked")
+                self.assertEqual(attached["scroll_event_observation"], observation)
+
 
 class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
     class _StubInteraction:
@@ -585,6 +635,30 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(observation_module.parse_calls, [(self.WHEEL_MEASURE_OUTPUT, 1)])
         self.assertEqual(observation, observation_module.assessed)
 
+    def test_wheel_measure_helper_failure_is_not_turned_into_a_pass(self):
+        # A Vision warm-up crash (or any other helper failure) surfaces
+        # through wheel-measure the same as wheel-capture: no frames, no
+        # observation, just the raw error for the caller to report as
+        # blocked/measurement-unavailable -- never silently as a pass.
+        def run_helper(_helper, args, _timeout):
+            if args[0] == "wheel-measure":
+                return False, "", "could not inspect captured scroll frame: Vision crashed"
+            raise AssertionError(f"unexpected helper command: {args[0]}")
+
+        interaction = self._StubInteraction("")
+        interaction.run_helper = run_helper
+        observation_module = self._StubObservationModule()
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-measure-failure-test"), "lines", -8, (0,), 1.0,
+            scroll_event_timing_path=Path("/tmp/hane-wheel-measure-failure-test/timing.log"),
+            scroll_event_observation_module=observation_module,
+        )
+        self.assertEqual(frames_out, [])
+        self.assertIsNone(observation)
+        self.assertEqual(error, "could not inspect captured scroll frame: Vision crashed")
+        self.assertEqual(observation_module.parse_calls, [])
+
     def test_without_scroll_event_timing_path_falls_back_to_wheel_capture_unchanged(self):
         def run_helper(_helper, args, _timeout):
             if args[0] == "wheel-capture":
@@ -633,6 +707,24 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNone(observation)
         self.assertEqual(len(frames_out), 1)
+
+
+class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
+    # Issue #427 gap: the pixels_direct_follow capture went through plain
+    # wheel-capture with no product-side correlation at all. Mocking the full
+    # run_focused_scenario flow (session/build/OCR) end to end would mostly
+    # exercise unrelated plumbing already covered elsewhere, so this checks
+    # the one relevant call site directly: the pixels capture_frames call
+    # must opt into the same wheel-measure path and shared timing file as
+    # lines_coast, the same way CaptureFramesScrollEventMeasurementTests
+    # above already proves that opt-in behaves correctly once made.
+    def test_pixels_capture_opts_into_wheel_measure_with_the_shared_timing_path(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def run_focused_scenario(", 1)[1]
+        pixels_call = body.split('"pixels", -180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', 1)[1]
+        pixels_call = pixels_call.split(")", 1)[0]
+        self.assertIn("scroll_event_timing_path=scroll_event_timing_path", pixels_call)
+        self.assertIn("scroll_event_observation_module=scroll_event_observation_module", pixels_call)
 
 
 class VisionWarmupFailsClosedTests(unittest.TestCase):

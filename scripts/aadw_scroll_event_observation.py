@@ -92,13 +92,25 @@ def _unavailable(reason: str) -> dict:
 def assess_wheel_measurement(record: dict) -> dict:
     """Classifies one `parse_wheel_measure_output` record. Never infers a
     missing stage from the others, and never returns a product pass/fail
-    verdict: only whether the four stages were established, and if so,
-    whether they appeared on the clock in the expected causal order (event
-    post, then receipt, then Hane's own frame paint/submission, then the
-    first screenshot capture's start). `product_frame_paint_ticks` is Hane's
-    paint/submission time, not compositor presentation; this function never
-    relabels or infers presentation from it, and always reports
-    `presentation_observation` as `"unavailable"`."""
+    verdict: only whether the stages were established, and if so, whether
+    Hane's own event post → ScrollWheelEvent receipt → frame paint/submission
+    chain appeared on the clock in that causal order.
+
+    The helper's screenshot captures are scheduled at fixed delays from the
+    event post, independent of when Hane actually paints; an early capture
+    (e.g. the 0ms-delay frame) legitimately starting before Hane's paint is
+    not a clock disorder, and a later one starting after paint is not proof
+    the capture shows the presented frame. Neither is compared against paint
+    to decide `observed_ordered` vs. `observed_disordered` — each frame's raw
+    timestamps are preserved alongside an informational
+    `captured_before_paint` classification instead, so a caller can see which
+    captures preceded Hane's response without that distinction ever being
+    read back as a pass/fail or as compositor presentation.
+
+    `product_frame_paint_ticks` is Hane's paint/submission time, not
+    compositor presentation; this function never relabels or infers
+    presentation from it, and always reports `presentation_observation` as
+    `"unavailable"`."""
     if record.get("event_route") != "cghidEventTap":
         return _unavailable("OSイベント経路がcghidEventTapではない。")
 
@@ -142,17 +154,25 @@ def assess_wheel_measurement(record: dict) -> dict:
     if any(value is None or not math.isfinite(value) for value in all_ms):
         return _unavailable("mach時刻をミリ秒へ変換できない。")
 
+    # Informational only: whether each capture's raw start time preceded
+    # Hane's paint. An early (e.g. 0ms-delay) frame starting before paint is
+    # expected, not a disorder; this is never used to decide the
+    # ordered/disordered verdict below, and never implies the frame matches
+    # the presented frame.
+    for frame in frame_stages:
+        frame["captured_before_paint"] = frame["capture_started_ms"] < paint_ms
+
     stages_ms = {
         "event_post_ms": event_post_ms,
         "scroll_receipt_ms": receipt_ms,
         "frame_paint_ms": paint_ms,
         "frames_ms": frame_stages,
     }
-    ordered = event_post_ms <= receipt_ms <= paint_ms <= frame_stages[0]["capture_started_ms"]
+    ordered = event_post_ms <= receipt_ms <= paint_ms
     if not ordered:
         return {
             "observation": "observed_disordered",
-            "reason": "event post → ScrollWheelEvent受信 → フレーム描画 → 画面取得開始の順序が成立していない。",
+            "reason": "event post → ScrollWheelEvent受信 → フレーム描画の順序が成立していない。",
             "stages_ms": stages_ms,
             "clock_consistent": True,
             "presentation_observation": "unavailable",
