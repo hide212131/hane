@@ -69,6 +69,8 @@ class WiringTests(unittest.TestCase):
     def test_staging_cannot_accept_pass_without_usable_samples(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / 'hane-gui-interaction'; source.mkdir()
+            context = b'{"requested_head_sha": "test-head", "workflow_run_id": "test-run"}\n'
+            (source / 'aadw-context.json').write_bytes(context)
             (source / 'result.json').write_text(json.dumps({
                 'verification_kind': 'scroll_inertia_focused', 'overall_result': 'pass'}))
             done = subprocess.run([sys.executable, '-I', str(ROOT / '.github/scripts/stage_gui_evidence.py')],
@@ -76,6 +78,38 @@ class WiringTests(unittest.TestCase):
             self.assertNotEqual(done.returncode, 0)
             dest = Path(temp) / 'hane-gui-artifact'
             self.assertEqual(json.loads((dest / 'result.json').read_text())['overall_result'], 'blocked')
+            self.assertEqual((dest / 'aadw-context.json').read_bytes(), context)
+            self.assertEqual(json.loads((dest / 'raw-result.json').read_text())['overall_result'], 'pass')
+
+
+    def test_staging_keeps_context_when_result_json_is_invalid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'hane-gui-interaction'; source.mkdir()
+            context = b'{"requested_head_sha": "test-head", "workflow_run_id": "test-run"}\n'
+            (source / 'aadw-context.json').write_bytes(context)
+            (source / 'result.json').write_text('{invalid-json', encoding='utf-8')
+            done = subprocess.run([sys.executable, '-I', str(ROOT / '.github/scripts/stage_gui_evidence.py')],
+                                  env={**os.environ, 'RUNNER_TEMP': temp}, capture_output=True, text=True)
+            self.assertNotEqual(done.returncode, 0)
+            dest = Path(temp) / 'hane-gui-artifact'
+            self.assertEqual((dest / 'aadw-context.json').read_bytes(), context)
+            self.assertEqual((dest / 'result.json').read_text(), '{invalid-json')
+
+    def test_staging_context_is_root_only_and_not_a_symlink(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as temp:
+                source = Path(temp) / 'hane-gui-interaction'; source.mkdir()
+                (source / 'state').mkdir()
+                private_context = source / 'state' / 'aadw-context.json'
+                private_context.write_text('private-session-state', encoding='utf-8')
+                if linked:
+                    (source / 'aadw-context.json').symlink_to(private_context)
+                done = subprocess.run([sys.executable, '-I', str(ROOT / '.github/scripts/stage_gui_evidence.py')],
+                                      env={**os.environ, 'RUNNER_TEMP': temp}, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                dest = Path(temp) / 'hane-gui-artifact'
+                self.assertFalse((dest / 'aadw-context.json').exists())
+                self.assertFalse((dest / 'state').exists())
 
 
 if __name__ == '__main__':
