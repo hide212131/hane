@@ -1,4 +1,5 @@
 """Integration smoke tests for the trusted entrypoints introduced by #408."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,29 @@ class WiringTests(unittest.TestCase):
                      '.github/tests/test_aadw_prevention_wiring.py',
                      'scripts/tests/test_aadw_gui_observation.py'):
             self.assertIn('python3 ' + path, text)
+
+    def test_existing_reversal_contract_checks_no_old_coast_before_55ms(self):
+        # Keep the existing producer contract: no old coast in the first
+        # <=55ms observation; reversed direction in the final observation.
+        modules = []
+        for name in ("hosted_scroll_inertia_gui", "aadw_gui_observation"):
+            spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            modules.append(module)
+        producer, observer = modules
+        frames = [{"capture_started_elapsed_ms": t - 1, "capture_completed_elapsed_ms": t,
+                   "elapsed_ms": t, "visible_lines": [offset, offset + 1]}
+                  for t, offset in zip((20, 50, 120, 200), (8, 8, 7, 6))]
+        passed = producer.evaluate_reversal(1, 8, frames, 120,
+            event_route="cghidEventTap", pre_reverse_capture_completed_after_initial_ms=100)
+        self.assertEqual(passed["result"], "pass")
+        self.assertEqual(observer.assess_step(passed)["observation"], "observed_pass")
+        frames[0]["visible_lines"] = [10, 11]
+        failed = producer.evaluate_reversal(1, 8, frames, 120,
+            event_route="cghidEventTap", pre_reverse_capture_completed_after_initial_ms=100)
+        self.assertEqual(failed["result"], "fail")
+        self.assertEqual(observer.assess_step(failed)["observation"], "observed_nonpass")
 
     def test_staging_preserves_raw_nonpass_and_adds_measurement_classification(self):
         with tempfile.TemporaryDirectory() as temp:
