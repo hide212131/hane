@@ -188,6 +188,7 @@ impl EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.record_scroll_receipt_for_measurement();
         self.on_scroll_at(event, Instant::now(), cx);
     }
 

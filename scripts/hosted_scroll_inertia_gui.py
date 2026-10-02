@@ -67,6 +67,15 @@ def skipped(name: str, reason: str) -> dict:
     return step(name, "skipped", reason)
 
 
+def attach_scroll_event_observation(step_result: dict, observation: Optional[dict]) -> dict:
+    """Adds Issue #427's separate mach-clock observer classification to an
+    already-judged step without ever reading or changing that step's own
+    `result`/`reason`, so a disordered or unavailable observation can never
+    upgrade a fail/blocked producer judgment into a pass, and an ordered
+    observation can never downgrade or hide one."""
+    return {**step_result, "scroll_event_observation": observation}
+
+
 def visible_lines(text: str) -> list[int]:
     return sorted({int(value) for value in re.findall(r"\bLINE\s+(\d+)\b", text, re.I)})
 
@@ -377,6 +386,64 @@ def parse_scroll_capture_helper_output(output: str, expected_frames: int) -> dic
     }
 
 
+def parse_wheel_measure_capture_output(output: str, expected_frames: int) -> dict:
+    """Converts `wheel-measure`'s raw mach-tick fields (Issue #427) into the
+    same elapsed-ms-since-event-post shape `parse_scroll_capture_helper_output`
+    already produces, so swapping the capture command for the measurement
+    build changes only how timing is extracted, never `evaluate_lines_coast`/
+    `evaluate_pixels`'s judgment itself."""
+    fields: dict[str, str] = {}
+    route = None
+    for line in output.splitlines():
+        name, separator, value = line.partition("=")
+        if not separator:
+            continue
+        if name == "event_route":
+            route = value
+            continue
+        fields[name] = value
+    if route != "cghidEventTap":
+        raise ValueError("scroll helper did not use the cghidEventTap route")
+
+    def uint(name: str) -> Optional[int]:
+        value = fields.get(name)
+        if value is None or value == "unavailable":
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    event_post_ticks = uint("event_post_ticks")
+    numer = uint("mach_timebase_numer")
+    denom = uint("mach_timebase_denom")
+    if event_post_ticks is None or not numer or not denom:
+        raise ValueError("scroll helper timing is missing: event_post_ticks/mach_timebase_numer/mach_timebase_denom")
+
+    def ticks_to_elapsed_ms(ticks: int) -> float:
+        return (ticks - event_post_ticks) * numer / denom / 1_000_000.0
+
+    frame_started = []
+    frame_completed = []
+    for index in range(expected_frames):
+        started = uint(f"frame_{index:02d}_capture_started_ticks")
+        completed = uint(f"frame_{index:02d}_capture_completed_ticks")
+        if started is None or completed is None:
+            raise ValueError(f"scroll helper timing is missing: frame_{index:02d}_capture_started/completed_ticks")
+        frame_started.append(ticks_to_elapsed_ms(started))
+        frame_completed.append(ticks_to_elapsed_ms(completed))
+    if (any(start < 0 or completed < start for start, completed in zip(frame_started, frame_completed))
+            or frame_started != sorted(frame_started)
+            or frame_completed != sorted(frame_completed)):
+        raise ValueError("scroll helper frame times are invalid")
+    return {
+        "event_route": route,
+        "frame_elapsed_ms": frame_completed,
+        "frame_capture_started_ms": frame_started,
+        "frame_capture_completed_ms": frame_completed,
+    }
+
+
 def select_old_direction_candidate(baseline: int, candidates: list[dict]) -> Optional[dict]:
     for candidate in reversed(candidates):
         lines = candidate.get("visible_lines")
@@ -393,7 +460,18 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
                    helper_timeout: float, reverse_delta: Optional[int] = None,
                    baseline: Optional[int] = None,
                    pre_reverse_probe_delays_ms: tuple[int, ...] = PRE_REVERSE_PROBE_DELAYS_MS,
+                   scroll_event_timing_path: Optional[Path] = None,
+                   scroll_event_observation_module: Optional[object] = None,
+                   scroll_event_poll_timeout_ms: int = 1500,
                    ) -> tuple[list[dict], Optional[dict], Optional[str]]:
+    """`scroll_event_timing_path`/`scroll_event_observation_module` opt a
+    plain (non-reversal) capture into Issue #427's `wheel-measure` helper
+    command instead of `wheel-capture`, so the exact same scroll input also
+    produces Hane's own mach-clock scroll-timing record and a separate
+    observer classification of it. The returned frames and the second tuple
+    element's existing contract are otherwise unchanged: callers that do not
+    pass these keep using `wheel-capture` and always get `None` back for
+    this slot, exactly as before."""
     if reverse_delta is not None and baseline is None:
         return [], None, "反転前の基準可視行を読み取れず、方向反転を実行できない"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -450,29 +528,51 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
 
     frame_dir = run_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
-    ok, output, error = interaction.run_helper(helper, [
-        "wheel-capture", str(pid), unit, str(delta), str(window_id), str(frame_dir),
-        ",".join(str(delay) for delay in delays),
-    ], helper_timeout)
-    if not ok:
-        return [], None, error
-    try:
-        evidence = parse_scroll_capture_helper_output(output, len(delays))
-    except ValueError as exc:
-        return [], None, str(exc)
+    scroll_event_observation = None
+    use_wheel_measure = scroll_event_timing_path is not None and scroll_event_observation_module is not None
+    if use_wheel_measure:
+        ok, output, error = interaction.run_helper(helper, [
+            "wheel-measure", str(pid), unit, str(delta), str(window_id), str(frame_dir),
+            ",".join(str(delay) for delay in delays),
+            str(scroll_event_timing_path), str(scroll_event_poll_timeout_ms),
+        ], helper_timeout)
+        if not ok:
+            return [], None, error
+        try:
+            evidence = parse_wheel_measure_capture_output(output, len(delays))
+        except ValueError as exc:
+            return [], None, str(exc)
+        # A separate observer classification of what the one shared scroll
+        # input established on the mach clock (Issue #427); never feeds back
+        # into `evidence`/the frames below, so it cannot change what
+        # evaluate_lines_coast/evaluate_pixels judge from this same capture.
+        scroll_event_observation = scroll_event_observation_module.assess_wheel_measurement(
+            scroll_event_observation_module.parse_wheel_measure_output(output, len(delays))
+        )
+    else:
+        ok, output, error = interaction.run_helper(helper, [
+            "wheel-capture", str(pid), unit, str(delta), str(window_id), str(frame_dir),
+            ",".join(str(delay) for delay in delays),
+        ], helper_timeout)
+        if not ok:
+            return [], None, error
+        try:
+            evidence = parse_scroll_capture_helper_output(output, len(delays))
+        except ValueError as exc:
+            return [], None, str(exc)
     frames = []
     for index, elapsed in enumerate(evidence["frame_elapsed_ms"]):
         path = frame_dir / f"frame-{index:02d}.png"
         lines, text, ocr_error = capture_ocr(interaction, helper, path, helper_timeout)
         if ocr_error:
-            return frames, None, ocr_error
+            return frames, scroll_event_observation, ocr_error
         frames.append({"path": str(path),
                        "capture_started_elapsed_ms": evidence["frame_capture_started_ms"][index],
                        "elapsed_ms": elapsed,
                        "capture_completed_elapsed_ms": evidence["frame_capture_completed_ms"][index],
                        "event_route": evidence["event_route"],
                        "visible_lines": lines, "recognized_text": text})
-    return frames, None, None
+    return frames, scroll_event_observation, None
 
 
 def capture_single(interaction, module, env, config, helper, window_id: str,
@@ -492,16 +592,23 @@ def capture_single(interaction, module, env, config, helper, window_id: str,
 def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helper,
                          run_dir: Path, binary_path: Path, expected_sha: str,
                          request_id: str, startup_timeout: float, window_timeout: float,
-                         helper_timeout: float, priority: dict[str, int]) -> dict:
+                         helper_timeout: float, priority: dict[str, int],
+                         scroll_event_observation_module: Optional[object] = None) -> dict:
     scenario_dir = run_dir / "scroll_inertia"
     scenario_dir.mkdir(parents=True, exist_ok=True)
     fixture = scenario_dir / "scroll-inertia-fixture.md"
     contents = "\n".join(f"LINE {number:03d}" for number in range(1, LINE_COUNT + 1)) + "\n"
     fixture.write_text(contents, encoding="utf-8")
+    # Issue #427: Hane writes its own mach-clock scroll-timing record to this
+    # path only when launched with HANE_SCROLL_EVENT_TIMING_PATH set; wiring
+    # it here lets the lines_coast capture below also produce a separate
+    # observer classification of the one scroll input both processes see.
+    scroll_event_timing_path = scenario_dir / "scroll-event-timing.log"
     config = interaction.make_config(
         gui_validate, workspace_dir=target_dir, scenario="scroll-inertia-focused",
         expected_sha=expected_sha, request_id=request_id, generation="1", run_dir=scenario_dir,
-        fixture_path=fixture, features=["timing-probe"], extra_env={},
+        fixture_path=fixture, features=["timing-probe"],
+        extra_env={"HANE_SCROLL_EVENT_TIMING_PATH": str(scroll_event_timing_path)},
         startup_timeout=startup_timeout, window_timeout=window_timeout,
     )
     steps: list[dict] = []
@@ -531,15 +638,20 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                                   recognized_text=baseline_text))
                 baseline = min(baseline_lines) if baseline_lines else None
 
-                frames, _pre, error = capture_frames(
+                frames, scroll_event_observation, error = capture_frames(
                     interaction, gui_validate, env, config, helper, pid, window_id,
                     scenario_dir / "lines-coast",
-                    "lines", -8, FRAME_DELAYS_MS, helper_timeout)
+                    "lines", -8, FRAME_DELAYS_MS, helper_timeout,
+                    scroll_event_timing_path=scroll_event_timing_path,
+                    scroll_event_observation_module=scroll_event_observation_module,
+                )
                 if error:
-                    steps.append(step("lines_coast", "blocked", error))
+                    steps.append(attach_scroll_event_observation(
+                        step("lines_coast", "blocked", error), scroll_event_observation))
                     time.sleep(FRAME_DELAYS_MS[-1] / 1000)
                 else:
-                    steps.append(evaluate_lines_coast(baseline, frames))
+                    steps.append(attach_scroll_event_observation(
+                        evaluate_lines_coast(baseline, frames), scroll_event_observation))
 
                 reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
                     interaction, gui_validate, env, config, helper, window_id,
@@ -674,6 +786,9 @@ def main() -> int:
 
     gui_validate = load_module(control_dir, "scripts/gui_validate.py", "scroll_gui_validate")
     interaction = load_module(control_dir, "scripts/hosted_gui_interaction.py", "scroll_gui_interaction")
+    scroll_event_observation = load_module(
+        control_dir, "scripts/aadw_scroll_event_observation.py", "scroll_event_observation"
+    )
     env = gui_validate.RealEnvironment()
     priority = gui_validate.RESULT_PRIORITY
     top_steps: list[dict] = []
@@ -717,7 +832,7 @@ def main() -> int:
             scenarios.append(run_focused_scenario(
                 gui_validate, interaction, env, target_dir, helper, run_dir, binary_path,
                 expected_sha, request_id, startup_timeout, window_timeout, helper_timeout,
-                priority))
+                priority, scroll_event_observation_module=scroll_event_observation))
 
         values = [item["result"] for item in top_steps + scenarios if item.get("result") in priority]
         overall = min(values, key=lambda value: priority[value]) if values else "blocked"
