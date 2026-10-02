@@ -52,6 +52,40 @@ pub fn process_memory_bytes() -> Option<u64> {
         .map(|kilobytes| kilobytes * 1_024)
 }
 
+/// Raw ticks from the system-wide monotonic mach clock: the same clock the
+/// macOS GUI measurement helper reads via `mach_absolute_time()`. This lets a
+/// product-side measurement timestamp and a separate helper-process
+/// measurement timestamp be compared directly, without assuming the two
+/// processes' `std::time::Instant` epochs agree. `None` off macOS, where
+/// there is no helper-comparable clock to correlate against.
+#[cfg(target_os = "macos")]
+pub fn mach_absolute_ticks() -> Option<u64> {
+    // SAFETY: `mach_absolute_time` has no preconditions and is safe to call from any thread.
+    Some(unsafe { mach2::mach_time::mach_absolute_time() })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mach_absolute_ticks() -> Option<u64> {
+    None
+}
+
+/// The mach clock's tick-to-nanosecond ratio (numerator, denominator), read
+/// fresh on every call so a caller can report exactly what it used to
+/// convert `mach_absolute_ticks` alongside the ticks it is reporting, rather
+/// than assuming a cached ratio still matches.
+#[cfg(target_os = "macos")]
+pub fn mach_timebase_ratio() -> Option<(u32, u32)> {
+    let mut info = mach2::mach_time::mach_timebase_info_data_t { numer: 0, denom: 0 };
+    // SAFETY: `info` is a valid, writable `mach_timebase_info_data_t` for the call to populate.
+    let status = unsafe { mach2::mach_time::mach_timebase_info(&raw mut info) };
+    (status == mach2::kern_return::KERN_SUCCESS && info.denom != 0).then_some((info.numer, info.denom))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mach_timebase_ratio() -> Option<(u32, u32)> {
+    None
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DurationDistribution {
     pub samples: usize,

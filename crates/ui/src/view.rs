@@ -4464,6 +4464,19 @@ impl EditorView {
         }
     }
 
+    /// Marks that this view just received a `ScrollWheelEvent`, so the next
+    /// `record_frame_instrumentation` call can pair it with that frame's own
+    /// mach-clock presentation time (Issue #427's measurement-only
+    /// correlation tool). Purely an observation hook: it records nothing
+    /// about what the scroll did and never changes scroll behavior.
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {
+        if self.instrumentation.scroll_event_timing.is_some()
+            && let Some(ticks) = hane_metrics::mach_absolute_ticks()
+        {
+            self.instrumentation.pending_scroll_receipt_ticks = Some(ticks);
+        }
+    }
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         measurements: &[InputMeasurement],
@@ -4471,6 +4484,13 @@ impl EditorView {
         layout: Option<Duration>,
     ) {
         let instrumentation = &mut self.instrumentation;
+        if let Some(receipt_ticks) = instrumentation.pending_scroll_receipt_ticks.take()
+            && let Some(presented_ticks) = hane_metrics::mach_absolute_ticks()
+            && let Some(output) = &mut instrumentation.scroll_event_timing
+            && let Err(error) = output.record(receipt_ticks, presented_ticks)
+        {
+            eprintln!("could not write scroll event timing: {error}");
+        }
         if instrumentation.ready_armed && !instrumentation.ready_reported {
             instrumentation.ready_reported = true;
             let startup = instrumentation.process_started.elapsed();
@@ -4584,6 +4604,8 @@ impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
 
     fn record_block_index_update(&mut self, _update: &BlockIndexUpdate) {}
+
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {}
 
     pub(crate) fn record_frame_instrumentation(
         &mut self,

@@ -41,6 +41,10 @@ pub struct InstrumentationConfig {
     pub measurement_idle_seconds: u64,
     pub measurement_cycle_folders: Vec<PathBuf>,
     pub measurement_cycles: usize,
+    /// Path the measurement-only scroll-event correlation tool reads
+    /// (Issue #427). `None` outside that tool's own GUI runs, matching
+    /// every other `HANE_*` instrumentation switch here.
+    pub scroll_event_timing_path: Option<PathBuf>,
 }
 
 impl InstrumentationConfig {
@@ -116,6 +120,8 @@ impl InstrumentationConfig {
                 .unwrap_or(30),
             measurement_cycle_folders: path_list("HANE_MEASUREMENT_CYCLE_FOLDERS"),
             measurement_cycles: usize_var("HANE_MEASUREMENT_CYCLES").unwrap_or_default(),
+            scroll_event_timing_path: std::env::var_os("HANE_SCROLL_EVENT_TIMING_PATH")
+                .map(PathBuf::from),
         }
     }
 }
@@ -135,6 +141,13 @@ pub(crate) struct Instrumentation {
     pub(crate) display_linked_scroll_direction: Option<f32>,
     pub(crate) layout_cache_hits: usize,
     pub(crate) layout_cache_misses: usize,
+    /// Measurement-only correlation output for Issue #427; `None` unless
+    /// `HANE_SCROLL_EVENT_TIMING_PATH` is set.
+    pub(crate) scroll_event_timing: Option<ScrollEventTimingOutput>,
+    /// Set when `on_scroll` observes a `ScrollWheelEvent` and cleared by the
+    /// next `record_frame_instrumentation` call, which pairs it with that
+    /// frame's own mach-clock presentation time.
+    pub(crate) pending_scroll_receipt_ticks: Option<u64>,
 }
 
 impl Instrumentation {
@@ -144,8 +157,14 @@ impl Instrumentation {
             eprintln!("could not open HANE_METRICS_CSV: {error}");
             None
         });
+        let scroll_event_timing = ScrollEventTimingOutput::new(&config).unwrap_or_else(|error| {
+            eprintln!("could not open HANE_SCROLL_EVENT_TIMING_PATH: {error}");
+            None
+        });
         Self {
             metrics_output,
+            scroll_event_timing,
+            pending_scroll_receipt_ticks: None,
             process_started: Instant::now(),
             #[cfg(feature = "instrument")]
             work_folder_scan_completed_at: None,
@@ -363,6 +382,47 @@ impl Phase0MetricsOutput {
             layout_misses,
             layout_misses,
         )?;
+        self.file.flush()
+    }
+}
+
+/// Correlatable mach-clock evidence for one scroll input (Issue #427): when
+/// `EditorView` received the `ScrollWheelEvent` and when the next frame it
+/// affected was actually painted. Both ticks use the same `mach_absolute_time`
+/// clock the GUI measurement helper reads, so a caller can line this
+/// process's record up with the helper's own event-post and screenshot
+/// timestamps. Measurement-only: nothing here changes scroll behavior or the
+/// existing 80ms/55ms/135ms scroll-inertia thresholds.
+pub(crate) struct ScrollEventTimingOutput {
+    file: File,
+}
+
+impl ScrollEventTimingOutput {
+    pub(crate) fn new(config: &InstrumentationConfig) -> io::Result<Option<Self>> {
+        let Some(path) = config.scroll_event_timing_path.as_deref() else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Some(Self { file }))
+    }
+
+    /// Reports the mach timebase ratio as `unavailable` when it cannot be
+    /// read, rather than guessing one, so the reader can only treat ticks as
+    /// convertible once it has actually seen the ratio used to produce them.
+    pub(crate) fn record(&mut self, receipt_ticks: u64, presented_ticks: u64) -> io::Result<()> {
+        match hane_metrics::mach_timebase_ratio() {
+            Some((numer, denom)) => writeln!(
+                self.file,
+                "scroll_receipt_ticks={receipt_ticks} scroll_frame_presented_ticks={presented_ticks} mach_timebase_numer={numer} mach_timebase_denom={denom}"
+            )?,
+            None => writeln!(
+                self.file,
+                "scroll_receipt_ticks={receipt_ticks} scroll_frame_presented_ticks={presented_ticks} mach_timebase_numer=unavailable mach_timebase_denom=unavailable"
+            )?,
+        }
         self.file.flush()
     }
 }

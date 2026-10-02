@@ -188,6 +188,7 @@ impl EditorView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.record_scroll_receipt_for_measurement();
         if event.modifiers.secondary() {
             let factor = zoom_factor_for_wheel(event.delta, self.line_height());
             let window_offset = f32::from(event.position.y) - self.theme.header_height;
