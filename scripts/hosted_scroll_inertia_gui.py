@@ -750,8 +750,10 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                     pixel_step["baseline_visible_lines"] = before_lines
                     pixel_step["baseline_text"] = before_text
                     if before_capture["result"] != "pass":
-                        pixel_step = step("pixels_direct_follow", "blocked",
-                                          before_capture.get("reason") or "Pixels前の画面を取得できない")
+                        pixel_step = attach_scroll_event_observation(
+                            step("pixels_direct_follow", "blocked",
+                                 before_capture.get("reason") or "Pixels前の画面を取得できない"),
+                            pixels_scroll_event_observation)
                     steps.append(pixel_step)
                 else:
                     steps.append(step("pixels_direct_follow", "blocked", reset_error))

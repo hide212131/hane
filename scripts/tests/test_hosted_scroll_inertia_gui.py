@@ -726,6 +726,25 @@ class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
         self.assertIn("scroll_event_timing_path=scroll_event_timing_path", pixels_call)
         self.assertIn("scroll_event_observation_module=scroll_event_observation_module", pixels_call)
 
+    # Issue #427 regression (PR #429 CodeRabbit review): when the pixels
+    # baseline screen itself fails to capture, pixel_step used to be replaced
+    # outright with a fresh blocked step(), dropping the
+    # pixels_scroll_event_observation already returned by the same
+    # capture_frames call. Unlike lines_coast's blocked branch, that
+    # observation never reached the final result. This checks the
+    # before_capture-failure branch re-attaches it with
+    # attach_scroll_event_observation, and that the branch still produces a
+    # literal "blocked" judgment (so a disordered/ordered observation can
+    # never upgrade it to pass -- see ScrollEventObservationAttachmentTests).
+    def test_before_capture_failure_reattaches_the_pixels_scroll_event_observation(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def run_focused_scenario(", 1)[1]
+        branch = body.split('if before_capture["result"] != "pass":', 1)[1]
+        branch = branch.split("steps.append(pixel_step)", 1)[0]
+        self.assertIn("attach_scroll_event_observation(", branch)
+        self.assertIn("pixels_scroll_event_observation)", branch)
+        self.assertIn('step("pixels_direct_follow", "blocked",', branch)
+
 
 class VisionWarmupFailsClosedTests(unittest.TestCase):
     def test_visible_line_numbers_surfaces_raw_vision_errors_through_fail(self):
