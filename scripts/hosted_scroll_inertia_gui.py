@@ -94,13 +94,30 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
         None,
     )
     first_response = first_response_index is not None
+    last_index = len(offsets) - 1
+    split_index = 4
+    if first_response_index is not None and first_response_index > split_index:
+        # The fixed split frame precedes the response here, so comparing
+        # against it would mix pre-response frames into the "early" rate.
+        # Split the remaining post-response frames instead; if too few
+        # remain to compare early vs. late speed, this is insufficient
+        # observation rather than a product failure.
+        remaining = last_index - first_response_index
+        if remaining < 2:
+            return step(
+                "lines_coast", "blocked",
+                "初回応答後に減速を判定できる十分な時系列区間がない",
+                baseline=baseline, offsets=offsets, elapsed_ms=times, first_response=first_response,
+                first_response_frame=first_response_index, frames=frames,
+            )
+        split_index = first_response_index + remaining // 2
     continued = any(after > before for before, after in zip(offsets, offsets[1:]))
     monotonic = all(after >= before - 1 for before, after in zip(offsets, offsets[1:]))
     early_start = first_response_index if first_response_index is not None else 0
-    early_elapsed = max(1.0, times[4] - times[early_start])
-    late_elapsed = max(1.0, times[-1] - times[4])
-    early_rate = max(0, offsets[4] - offsets[early_start]) / early_elapsed
-    late_rate = max(0, offsets[-1] - offsets[4]) / late_elapsed
+    early_elapsed = max(1.0, times[split_index] - times[early_start])
+    late_elapsed = max(1.0, times[-1] - times[split_index])
+    early_rate = max(0, offsets[split_index] - offsets[early_start]) / early_elapsed
+    late_rate = max(0, offsets[-1] - offsets[split_index]) / late_elapsed
     decelerated = early_rate > 0 and late_rate < early_rate
     settled = abs(offsets[-1] - offsets[-2]) <= 1 and times[-1] >= 180
     passed = first_response and continued and monotonic and decelerated and settled

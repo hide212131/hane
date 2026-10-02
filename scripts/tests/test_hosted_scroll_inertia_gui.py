@@ -91,6 +91,27 @@ class LinesCoastTests(unittest.TestCase):
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["first_response"])
 
+    def test_accepts_slow_but_in_window_response_using_post_response_rates(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 106, 109, 110, 110],
+                   [0, 24, 40, 64, 108, 120, 144, 190, 240]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 5)
+        self.assertTrue(result["decelerated"])
+        self.assertGreater(result["early_lines_per_ms"], result["late_lines_per_ms"])
+
+    def test_blocks_slow_response_with_too_few_frames_to_judge_deceleration(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 106, 108],
+                   [0, 24, 40, 64, 108, 120, 144]),
+        )
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["first_response_frame"], 5)
+
     def test_rejects_missing_afterglow(self):
         result = gui.evaluate_lines_coast(
             100,
