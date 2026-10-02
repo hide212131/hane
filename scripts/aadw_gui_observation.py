@@ -51,6 +51,17 @@ def assess_step(step: dict) -> dict:
                 "deadline_ms": deadline, "capture_completed_ms": times,
                 "reason": "期限内の撮影完了がない。期限後の画像から不合格原因を決めない。"}
     if step.get("result") == "pass":
+        if name in {"lines_coast", "pixels_direct_follow"}:
+            # The producer may use a different response deadline. A timely
+            # unchanged image cannot substantiate its later response as ours.
+            baseline = step.get("baseline")
+            if type(baseline) is not int or not 1 <= baseline <= 500:
+                return {**result, "observation": "unavailable", "failure_class": "measurement",
+                        "reason": "応答前の可視行が不明なため、期限内の応答を確認できない。"}
+            if not any(min(frames[i]["visible_lines"]) > baseline for i in timely):
+                return {**result, "observation": "observed_nonpass", "failure_class": "unknown",
+                        "deadline_ms": deadline, "timely_frames": timely,
+                        "reason": "期限内の画像に応答が見えず、別の応答期限による合格を採用できない。"}
         return {**result, "observation": "observed_pass", "failure_class": None,
                 "deadline_ms": deadline, "timely_frames": timely}
     # A timely unchanged screenshot is an observation, not proof that the app

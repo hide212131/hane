@@ -13,7 +13,7 @@ spec.loader.exec_module(observation)
 
 
 def sample(name="lines_coast", result="pass", times=(20, 50, 200)):
-    return {"name": name, "result": result,
+    return {"name": name, "result": result, "baseline": 1,
             "initial_to_reverse_event_ms": 120,
             "pre_reverse_capture_completed_after_initial_ms": 100,
             "frames": [{"capture_started_elapsed_ms": t - 1, "capture_completed_elapsed_ms": t,
@@ -24,6 +24,39 @@ def sample(name="lines_coast", result="pass", times=(20, 50, 200)):
 class ObservationTests(unittest.TestCase):
     def test_observed_success_is_preserved(self):
         self.assertEqual(observation.assess_step(sample())["observation"], "observed_pass")
+
+    def test_producer_pass_after_80ms_remains_unproven(self):
+        for name in ("lines_coast", "pixels_direct_follow"):
+            with self.subTest(name=name):
+                step = sample(name, times=(20, 50, 120, 200))
+                for frame in step["frames"][:2]:
+                    frame["visible_lines"] = [1, 2]
+                result = observation.assess_step(step)
+                self.assertEqual(result["observation"], "observed_nonpass")
+                self.assertEqual(result["failure_class"], "unknown")
+                self.assertFalse(result["product_cause_proven"])
+                report = {"verification_kind": "scroll_inertia_focused",
+                          "procedure_version": "hosted-scroll-inertia/8", "overall_result": "pass",
+                          "scenarios": [{"steps": [step, *[sample(other) for other in observation.TIMED if other != name]]}]}
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "result.json"
+                    path.write_text(json.dumps(report), encoding="utf-8")
+                    saved = observation.annotate(path)
+                    self.assertEqual(saved["overall_result"], "blocked")
+                    self.assertEqual(saved["original_judgment"], {"overall_result": "pass"})
+
+    def test_response_at_80ms_is_within_the_unchanged_deadline(self):
+        for name in ("lines_coast", "pixels_direct_follow"):
+            with self.subTest(name=name):
+                step = sample(name, times=(20, 80, 200))
+                step["frames"][0]["visible_lines"] = [1, 2]
+                self.assertEqual(observation.assess_step(step)["observation"], "observed_pass")
+
+    def test_pass_without_valid_baseline_is_measurement_unavailable(self):
+        for baseline in (None, True, 0, 501, "1"):
+            with self.subTest(baseline=baseline):
+                step = sample(); step["baseline"] = baseline
+                self.assertEqual(observation.assess_step(step)["failure_class"], "measurement")
 
     def test_no_deadline_sample_is_measurement_unavailable_not_product_failure(self):
         result = observation.assess_step(sample(result="fail", times=(90, 140, 200)))

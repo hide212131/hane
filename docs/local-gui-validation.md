@@ -74,7 +74,7 @@ Issue #389 のホイールスクロール受け入れ条件だけを実画面で
 /gui-validate scroll-inertia merge
 ```
 
-このコマンドは `scripts/hosted_scroll_inertia_gui.py` の信頼済み手順へ振り分けられる。OSにLines/Pixelsを明示した入力を送り、Linesの初回応答・解放後の余韻と減速・方向反転、文書先頭/末尾のクランプ、Pixelsの直接追従と入力後の安定を時間差の画面キャプチャで確認し、可視行・イベント送信時刻・画面取得開始/完了時刻・スクリーンショットとfixtureの不変性をartifactに残す。入力と撮影の開始・完了は同じmach時計で計り、80ms以内の応答は撮影完了時刻が80ms以内の画面でのみ認める。閾値近辺は間隔を狭めて観測し、撮影範囲が閾値をまたいだ場合は成功扱いしない。方向反転はVision OCRを事前にwarm upし、旧方向の動きを含む画面を撮影した完了時刻と反対方向イベントが慣性窓内にあることを確認する。両方のQuartzイベントは通常の`cghidEventTap`経路で記録する。デバイス種別は推測せず、通常の包括的なGUI検証も代替しない。
+このコマンドは `scripts/hosted_scroll_inertia_gui.py` の信頼済み手順へ振り分けられる。OSにLines/Pixelsを明示した入力を送り、Linesの初回応答・解放後の余韻と減速・方向反転、文書先頭/末尾のクランプ、Pixelsの直接追従と入力後の安定を時間差の画面キャプチャで確認し、可視行・イベント送信時刻・画面取得開始/完了時刻・スクリーンショットとfixtureの不変性をartifactに残す。入力と撮影の開始・完了は同じmach時計で計り、Linesの慣性窓内（135ms以内）に完了した画像で初回応答を判定する。Pixelsは応答付近を連続して撮影し、後半の安定も確認する。方向反転は旧方向の候補画面を撮影した直後に逆入力を送り、OCRは撮影と逆入力の後に実行して計測窓を消費しない。両方のQuartzイベントは通常の`cghidEventTap`経路で記録する。デバイス種別は推測せず、通常の包括的なGUI検証も代替しない。
 
 `head` は exact current PR head を検証する。`merge` は current target branch と current PR head から GitHub が作る current PR merge ref を検証する。文章中にコマンド文字列を書いた場合や、引数がない・未知の引数を付けた場合は起動しない。
 
@@ -82,7 +82,7 @@ comment router は trusted default branch の workflow / script だけを使い�
 
 procedure version は trusted default branch の `scripts/hosted_gui_interaction.py` にある `PROCEDURE_VERSION` を読み、人に転記させない。現在の総合 procedure は `hosted-gui-interaction/7` である。
 
-`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/7`) からtrusted routerが読み取る。
+`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/8`) からtrusted routerが読み取る。
 
 router が作る依頼は PR、exact head、router が観測した current base、execution context、procedure に結び付ける。同じ context の queued / in-progress / success run がすでにある場合は重複起動を抑止する。base SHA も識別に含めるため、head が同じまま target branch が進んだ場合に、古い base の成功 run を current evidence として自動再利用しない。
 
