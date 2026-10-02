@@ -3,8 +3,15 @@
 
 Distinguishes four points in time on the one mach clock both the GUI helper
 process and Hane's own product process read: the OS event post, Hane's
-`ScrollWheelEvent` receipt, the frame paint Hane committed in response, and
-the helper's screenshot capture start/end.
+`ScrollWheelEvent` receipt, the frame paint/submission Hane committed in
+response, and the helper's screenshot capture start/end.
+
+Hane's own timestamp is when `InputCapture::paint` ran, inside `Window::draw`
+and before the platform renderer commits/presents the frame (on macOS, an
+async Metal command buffer with its own completion handler) — it is not
+compositor presentation. This module never relabels or infers it as one:
+compositor presentation itself is always reported as a separate, unavailable
+observation.
 
 This module never judges Issue #389's product acceptance: a well-ordered
 measurement is not a pass for the 80ms/55ms/135ms scroll-inertia thresholds,
@@ -56,7 +63,7 @@ def parse_wheel_measure_output(output: str, expected_frames: int) -> dict:
         "helper_mach_timebase_numer": _uint(fields, "mach_timebase_numer"),
         "helper_mach_timebase_denom": _uint(fields, "mach_timebase_denom"),
         "product_scroll_receipt_ticks": _uint(fields, "product_scroll_receipt_ticks"),
-        "product_frame_presented_ticks": _uint(fields, "product_frame_presented_ticks"),
+        "product_frame_paint_ticks": _uint(fields, "product_frame_paint_ticks"),
         "product_mach_timebase_numer": _uint(fields, "product_mach_timebase_numer"),
         "product_mach_timebase_denom": _uint(fields, "product_mach_timebase_denom"),
         "frames": frames,
@@ -70,7 +77,16 @@ def _ticks_to_ms(ticks: Optional[int], numer: Optional[int], denom: Optional[int
 
 
 def _unavailable(reason: str) -> dict:
-    return {"observation": "unavailable", "reason": reason, "stages_ms": {}, "clock_consistent": False}
+    return {
+        "observation": "unavailable",
+        "reason": reason,
+        "stages_ms": {},
+        "clock_consistent": False,
+        # Compositor presentation is never measured on this clock; keep this
+        # explicit even for an unavailable record so no caller can read a
+        # missing key as "not yet reported" (Issue #427).
+        "presentation_observation": "unavailable",
+    }
 
 
 def assess_wheel_measurement(record: dict) -> dict:
@@ -78,8 +94,11 @@ def assess_wheel_measurement(record: dict) -> dict:
     missing stage from the others, and never returns a product pass/fail
     verdict: only whether the four stages were established, and if so,
     whether they appeared on the clock in the expected causal order (event
-    post, then receipt, then presentation, then the first screenshot
-    capture's start)."""
+    post, then receipt, then Hane's own frame paint/submission, then the
+    first screenshot capture's start). `product_frame_paint_ticks` is Hane's
+    paint/submission time, not compositor presentation; this function never
+    relabels or infers presentation from it, and always reports
+    `presentation_observation` as `"unavailable"`."""
     if record.get("event_route") != "cghidEventTap":
         return _unavailable("OSイベント経路がcghidEventTapではない。")
 
@@ -97,19 +116,19 @@ def assess_wheel_measurement(record: dict) -> dict:
 
     have_product = (
         record.get("product_scroll_receipt_ticks") is not None
-        and record.get("product_frame_presented_ticks") is not None
+        and record.get("product_frame_paint_ticks") is not None
         and bool(product_numer)
         and bool(product_denom)
     )
     if not have_product:
-        return _unavailable("Hane側のScrollWheelEvent受信またはフレーム提示の時刻が欠落している。")
+        return _unavailable("Hane側のScrollWheelEvent受信またはフレーム描画の時刻が欠落している。")
 
     if numer != product_numer or denom != product_denom:
         return _unavailable("ヘルパーとHaneで観測したmach timebaseの比が一致しない。")
 
     event_post_ms = _ticks_to_ms(record["event_post_ticks"], numer, denom)
     receipt_ms = _ticks_to_ms(record["product_scroll_receipt_ticks"], numer, denom)
-    presented_ms = _ticks_to_ms(record["product_frame_presented_ticks"], numer, denom)
+    paint_ms = _ticks_to_ms(record["product_frame_paint_ticks"], numer, denom)
     frame_stages = [
         {
             "capture_started_ms": _ticks_to_ms(frame["capture_started_ticks"], numer, denom),
@@ -117,7 +136,7 @@ def assess_wheel_measurement(record: dict) -> dict:
         }
         for frame in frames
     ]
-    all_ms = [event_post_ms, receipt_ms, presented_ms, *(
+    all_ms = [event_post_ms, receipt_ms, paint_ms, *(
         value for frame in frame_stages for value in frame.values()
     )]
     if any(value is None or not math.isfinite(value) for value in all_ms):
@@ -126,15 +145,22 @@ def assess_wheel_measurement(record: dict) -> dict:
     stages_ms = {
         "event_post_ms": event_post_ms,
         "scroll_receipt_ms": receipt_ms,
-        "frame_presented_ms": presented_ms,
+        "frame_paint_ms": paint_ms,
         "frames_ms": frame_stages,
     }
-    ordered = event_post_ms <= receipt_ms <= presented_ms <= frame_stages[0]["capture_started_ms"]
+    ordered = event_post_ms <= receipt_ms <= paint_ms <= frame_stages[0]["capture_started_ms"]
     if not ordered:
         return {
             "observation": "observed_disordered",
-            "reason": "event post → ScrollWheelEvent受信 → フレーム提示 → 画面取得開始の順序が成立していない。",
+            "reason": "event post → ScrollWheelEvent受信 → フレーム描画 → 画面取得開始の順序が成立していない。",
             "stages_ms": stages_ms,
             "clock_consistent": True,
+            "presentation_observation": "unavailable",
         }
-    return {"observation": "observed_ordered", "reason": None, "stages_ms": stages_ms, "clock_consistent": True}
+    return {
+        "observation": "observed_ordered",
+        "reason": None,
+        "stages_ms": stages_ms,
+        "clock_consistent": True,
+        "presentation_observation": "unavailable",
+    }

@@ -17,7 +17,7 @@ def helper_output(
     *,
     event_post_ticks=0,
     product_receipt_ticks=1_000_000,
-    product_presented_ticks=4_000_000,
+    product_paint_ticks=4_000_000,
     frame_started_ticks=8_000_000,
     frame_completed_ticks=8_200_000,
     event_route="cghidEventTap",
@@ -35,13 +35,18 @@ def helper_output(
     if include_product:
         lines += [
             f"product_scroll_receipt_ticks={product_receipt_ticks}",
-            f"product_frame_presented_ticks={product_presented_ticks}",
+            f"product_frame_paint_ticks={product_paint_ticks}",
+            # Hane always reports true compositor presentation as
+            # unavailable; this fixture mirrors that so parsing/assessment
+            # never has to special-case it away.
+            "product_frame_presented_ticks=unavailable",
             f"product_mach_timebase_numer={product_ratio[0]}",
             f"product_mach_timebase_denom={product_ratio[1]}",
         ]
     else:
         lines += [
             "product_scroll_receipt_ticks=unavailable",
+            "product_frame_paint_ticks=unavailable",
             "product_frame_presented_ticks=unavailable",
             "product_mach_timebase_numer=unavailable",
             "product_mach_timebase_denom=unavailable",
@@ -77,27 +82,37 @@ class AssessWheelMeasurementTests(unittest.TestCase):
         self.assertEqual(result["observation"], "observed_ordered")
         self.assertTrue(result["clock_consistent"])
         self.assertIsNone(result["reason"])
+        self.assertEqual(result["presentation_observation"], "unavailable")
         self.assertAlmostEqual(result["stages_ms"]["event_post_ms"], 0.0)
-        self.assertLess(result["stages_ms"]["scroll_receipt_ms"], result["stages_ms"]["frame_presented_ms"])
+        self.assertLess(result["stages_ms"]["scroll_receipt_ms"], result["stages_ms"]["frame_paint_ms"])
         self.assertLess(
-            result["stages_ms"]["frame_presented_ms"],
+            result["stages_ms"]["frame_paint_ms"],
             result["stages_ms"]["frames_ms"][0]["capture_started_ms"],
         )
 
     def test_disordered_measurement_is_reported_without_a_product_verdict(self):
-        # Frame-presented ticks before the scroll-receipt ticks: an internally
+        # Frame-paint ticks before the scroll-receipt ticks: an internally
         # inconsistent record, not evidence the product itself is slow or broken.
         record = scroll_event_observation.parse_wheel_measure_output(
-            helper_output(product_receipt_ticks=5_000_000, product_presented_ticks=1_000_000),
+            helper_output(product_receipt_ticks=5_000_000, product_paint_ticks=1_000_000),
             expected_frames=1,
         )
         result = scroll_event_observation.assess_wheel_measurement(record)
         self.assertEqual(result["observation"], "observed_disordered")
         self.assertTrue(result["clock_consistent"])
         self.assertIsNotNone(result["reason"])
+        self.assertEqual(result["presentation_observation"], "unavailable")
         # The raw, unjudged mach-derived values are preserved alongside the
         # disordered observation rather than discarded.
         self.assertIn("scroll_receipt_ms", result["stages_ms"])
+
+    def test_presentation_is_always_reported_unavailable_when_measurement_is_unavailable(self):
+        record = scroll_event_observation.parse_wheel_measure_output(
+            helper_output(include_product=False), expected_frames=1
+        )
+        result = scroll_event_observation.assess_wheel_measurement(record)
+        self.assertEqual(result["observation"], "unavailable")
+        self.assertEqual(result["presentation_observation"], "unavailable")
 
     def test_missing_product_side_is_measurement_unavailable(self):
         record = scroll_event_observation.parse_wheel_measure_output(

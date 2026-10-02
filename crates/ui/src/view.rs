@@ -4466,7 +4466,7 @@ impl EditorView {
 
     /// Marks that this view just received a `ScrollWheelEvent`, so the next
     /// `record_frame_instrumentation` call can pair it with that frame's own
-    /// mach-clock presentation time (Issue #427's measurement-only
+    /// mach-clock paint/submission time (Issue #427's measurement-only
     /// correlation tool). Purely an observation hook: it records nothing
     /// about what the scroll did and never changes scroll behavior.
     pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {
@@ -4484,10 +4484,15 @@ impl EditorView {
         layout: Option<Duration>,
     ) {
         let instrumentation = &mut self.instrumentation;
+        // `paint_ticks` is when `InputCapture::paint` ran (inside
+        // `Window::draw`), not when the platform renderer actually presented
+        // the frame to the compositor; `ScrollEventTimingOutput::record`
+        // reports that true presentation time as unavailable rather than
+        // treating this as it.
         if let Some(receipt_ticks) = instrumentation.pending_scroll_receipt_ticks.take()
-            && let Some(presented_ticks) = hane_metrics::mach_absolute_ticks()
+            && let Some(paint_ticks) = hane_metrics::mach_absolute_ticks()
             && let Some(output) = &mut instrumentation.scroll_event_timing
-            && let Err(error) = output.record(receipt_ticks, presented_ticks)
+            && let Err(error) = output.record(receipt_ticks, paint_ticks)
         {
             eprintln!("could not write scroll event timing: {error}");
         }

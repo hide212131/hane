@@ -146,7 +146,8 @@ pub(crate) struct Instrumentation {
     pub(crate) scroll_event_timing: Option<ScrollEventTimingOutput>,
     /// Set when `on_scroll` observes a `ScrollWheelEvent` and cleared by the
     /// next `record_frame_instrumentation` call, which pairs it with that
-    /// frame's own mach-clock presentation time.
+    /// frame's own mach-clock paint/submission time (not compositor
+    /// presentation, which this process cannot observe).
     pub(crate) pending_scroll_receipt_ticks: Option<u64>,
 }
 
@@ -387,12 +388,17 @@ impl Phase0MetricsOutput {
 }
 
 /// Correlatable mach-clock evidence for one scroll input (Issue #427): when
-/// `EditorView` received the `ScrollWheelEvent` and when the next frame it
-/// affected was actually painted. Both ticks use the same `mach_absolute_time`
-/// clock the GUI measurement helper reads, so a caller can line this
-/// process's record up with the helper's own event-post and screenshot
-/// timestamps. Measurement-only: nothing here changes scroll behavior or the
-/// existing 80ms/55ms/135ms scroll-inertia thresholds.
+/// `EditorView` received the `ScrollWheelEvent` and when the frame it
+/// affected was painted by `InputCapture::paint`. That paint happens inside
+/// `Window::draw`, before GPUI hands the scene to `PlatformWindow::draw` and
+/// the platform renderer commits/presents it (on macOS, an async Metal
+/// command buffer with its own completion handler) — so this is the frame's
+/// paint/submission time, not evidence of compositor presentation. Both
+/// ticks use the same `mach_absolute_time` clock the GUI measurement helper
+/// reads, so a caller can line this process's record up with the helper's
+/// own event-post and screenshot timestamps. Measurement-only: nothing here
+/// changes scroll behavior or the existing 80ms/55ms/135ms scroll-inertia
+/// thresholds.
 pub(crate) struct ScrollEventTimingOutput {
     file: File,
 }
@@ -412,15 +418,19 @@ impl ScrollEventTimingOutput {
     /// Reports the mach timebase ratio as `unavailable` when it cannot be
     /// read, rather than guessing one, so the reader can only treat ticks as
     /// convertible once it has actually seen the ratio used to produce them.
-    pub(crate) fn record(&mut self, receipt_ticks: u64, presented_ticks: u64) -> io::Result<()> {
+    /// `scroll_frame_presented_ticks` is always written as `unavailable`:
+    /// this process has no trustworthy compositor-presentation timestamp on
+    /// the mach clock, and `paint_ticks` must never be relabeled or inferred
+    /// as one.
+    pub(crate) fn record(&mut self, receipt_ticks: u64, paint_ticks: u64) -> io::Result<()> {
         match hane_metrics::mach_timebase_ratio() {
             Some((numer, denom)) => writeln!(
                 self.file,
-                "scroll_receipt_ticks={receipt_ticks} scroll_frame_presented_ticks={presented_ticks} mach_timebase_numer={numer} mach_timebase_denom={denom}"
+                "scroll_receipt_ticks={receipt_ticks} scroll_frame_paint_ticks={paint_ticks} scroll_frame_presented_ticks=unavailable mach_timebase_numer={numer} mach_timebase_denom={denom}"
             )?,
             None => writeln!(
                 self.file,
-                "scroll_receipt_ticks={receipt_ticks} scroll_frame_presented_ticks={presented_ticks} mach_timebase_numer=unavailable mach_timebase_denom=unavailable"
+                "scroll_receipt_ticks={receipt_ticks} scroll_frame_paint_ticks={paint_ticks} scroll_frame_presented_ticks=unavailable mach_timebase_numer=unavailable mach_timebase_denom=unavailable"
             )?,
         }
         self.file.flush()

@@ -757,11 +757,17 @@ func captureImageWithTimesTicks(_ capture: WindowCapture) -> (CapturedWindowFram
 func visibleLineNumbers(_ image: CGImage) -> [Int] {
     // `.fast` recognition with `["en-US"]` reproduced a Vision crash during
     // ScreenCaptureKit warm-up on a local macOS 26.6.2 run (Issue #427); a
-    // separate probe on the same baseline image showed `.accurate` with
-    // `["en-US", "ja-JP"]` does not crash and returns observations. That is
-    // also already the configuration `recognizeText` and `findTextMatch` use
-    // below, so this reuses their proven request instead of a separately
-    // tuned one.
+    // separate offline probe against that one saved baseline image showed
+    // `.accurate` with `["en-US", "ja-JP"]` does not crash there. That probe
+    // ran outside this hosted GUI path, so it is evidence of a plausible
+    // mitigation, not proof this configuration is crash-free during an
+    // actual run — it is also already the configuration `recognizeText` and
+    // `findTextMatch` use below, so this reuses their proven request instead
+    // of a separately tuned one. If Vision still throws against a live
+    // capture, the `catch` below must keep surfacing the raw error through
+    // `fail` (exit 2) so the Python harness observes this as
+    // measurement-unavailable/blocked, never as a product failure or a
+    // silently empty/synthesized result.
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
@@ -857,7 +863,12 @@ func readScrollEventTimingLine(_ path: String, since offset: UInt64) -> String? 
 
 struct ProductScrollTiming {
     let receiptTicks: UInt64
-    let presentedTicks: UInt64
+    // Hane's own frame paint/submission time (`InputCapture::paint`), not
+    // compositor presentation: the product process has no trustworthy
+    // presentation timestamp on this clock, so it always writes
+    // `scroll_frame_presented_ticks=unavailable` and this helper never reads
+    // that field as a ticks value.
+    let paintTicks: UInt64
     let timebaseNumer: UInt32
     let timebaseDenom: UInt32
 }
@@ -870,19 +881,22 @@ func parseScrollEventTimingLine(_ line: String) -> ProductScrollTiming? {
         fields[String(parts[0])] = String(parts[1])
     }
     guard let receiptTicks = fields["scroll_receipt_ticks"].flatMap(UInt64.init),
-          let presentedTicks = fields["scroll_frame_presented_ticks"].flatMap(UInt64.init),
+          let paintTicks = fields["scroll_frame_paint_ticks"].flatMap(UInt64.init),
           let numer = fields["mach_timebase_numer"].flatMap(UInt32.init),
           let denom = fields["mach_timebase_denom"].flatMap(UInt32.init) else {
         return nil
     }
-    return ProductScrollTiming(receiptTicks: receiptTicks, presentedTicks: presentedTicks,
+    return ProductScrollTiming(receiptTicks: receiptTicks, paintTicks: paintTicks,
                                timebaseNumer: numer, timebaseDenom: denom)
 }
 
 // Measurement-only path (Issue #427): distinguishes the OS event post, Hane's
-// ScrollWheelEvent receipt, the frame presentation Hane committed in
+// ScrollWheelEvent receipt, the frame paint/submission Hane committed in
 // response, and this helper's own screenshot capture start/end, all read
-// from the one mach clock both processes share. It does not evaluate
+// from the one mach clock both processes share. Hane's own paint timestamp
+// is not compositor presentation (see `ProductScrollTiming`/
+// `instrument.rs::ScrollEventTimingOutput`), so true presentation is always
+// reported unavailable rather than inferred from paint. It does not evaluate
 // Issue #389's product thresholds (80ms/55ms/135ms) and must not be read as
 // proof of their pass/fail; a separate observer judges only what this
 // command actually measured.
@@ -944,11 +958,15 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     print("mach_timebase_denom=\(machTimebaseInfo.denom)")
     if let productTiming {
         print("product_scroll_receipt_ticks=\(productTiming.receiptTicks)")
-        print("product_frame_presented_ticks=\(productTiming.presentedTicks)")
+        print("product_frame_paint_ticks=\(productTiming.paintTicks)")
+        // Hane never observes true compositor presentation on this clock;
+        // always report it unavailable rather than inferring it from paint.
+        print("product_frame_presented_ticks=unavailable")
         print("product_mach_timebase_numer=\(productTiming.timebaseNumer)")
         print("product_mach_timebase_denom=\(productTiming.timebaseDenom)")
     } else {
         print("product_scroll_receipt_ticks=unavailable")
+        print("product_frame_paint_ticks=unavailable")
         print("product_frame_presented_ticks=unavailable")
         print("product_mach_timebase_numer=unavailable")
         print("product_mach_timebase_denom=unavailable")
