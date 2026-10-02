@@ -69,7 +69,8 @@ def validate_request(body: str, pr: dict, repository: str, history: list, actor:
         if candidate["action"] == request["action"] and candidate["root_cause"] == request["root_cause"]:
             prior.append(candidate)
     if request["action"] == "implement":
-        if any(item == request for item in prior):
+        identity = ("action", "target_sha", "root_cause", "evidence")
+        if any(all(item[key] == request[key] for key in identity) for item in prior):
             raise ValueError("duplicate exact-head implementation request; inspect the previous run")
         if sum(item["evidence"] == request["evidence"] for item in prior) >= 2:
             raise ValueError("two requests reused this root cause/evidence; obtain a distinguishing diagnosis")

@@ -57,6 +57,23 @@ class RequestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(history=[{"id": 1, "user": {"login": "owner"}, "body": request()}])
 
+    def test_category_change_does_not_allow_same_request_to_be_resent(self):
+        for before in ("initial", "product", "test"):
+            for after in ("initial", "product", "test"):
+                if before == after:
+                    continue
+                history = [{"id": 1, "user": {"login": "owner"}, "body": request(category=before)}]
+                with self.subTest(before=before, after=after), self.assertRaisesRegex(ValueError, "duplicate exact-head"):
+                    self.validate(request(category=after), history=history)
+
+    def test_changed_identity_and_diagnosis_are_not_exact_resends(self):
+        history = [{"id": 1, "user": {"login": "owner"}, "body": request()}]
+        self.validate(request(evidence="https://github.com/o/r/actions/runs/2"), history=history)
+        self.validate(request().replace("wheel-timing", "separate-cause"), history=history)
+        self.validate(request("diagnose", "unknown"), history=history)
+        target = pr(); target["head"]["sha"] = "b" * 40
+        self.validate(request(head="b" * 40), target=target, history=history)
+
     def test_two_old_heads_with_same_evidence_require_diagnosis(self):
         history = [{"id": i, "user": {"login": "owner"}, "body": request(head=c * 40)}
                    for i, c in enumerate("bc", 1)]
