@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -65,6 +67,45 @@ class ObservationTests(unittest.TestCase):
             path = Path(temp) / "result.json"
             path.write_text(json.dumps({"verification_kind": "scroll_inertia_focused", "overall_result": "pass"}))
             self.assertEqual(observation.annotate(path)["overall_result"], "blocked")
+
+    def test_direct_annotation_preserves_original_judgment(self):
+        for result in ("pass", "fail", "blocked"):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as temp:
+                original = {"overall_result": result, "overall_reason": "元の判定理由",
+                            "summary": "元の要約"}
+                source = {"verification_kind": "scroll_inertia_focused", **original,
+                          "scenarios": []}
+                path = Path(temp) / "result.json"
+                path.write_text(json.dumps(source), encoding="utf-8")
+                annotated = observation.annotate(path)
+                self.assertEqual(annotated["original_judgment"], original)
+                self.assertEqual(annotated["scenarios"], source["scenarios"])
+                self.assertEqual(annotated["overall_result"], "blocked" if result == "pass" else result)
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8")), annotated)
+
+    def test_repeated_annotation_preserves_first_judgment_and_missing_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            path.write_text(json.dumps({"verification_kind": "scroll_inertia_focused",
+                                        "overall_result": "pass"}), encoding="utf-8")
+            first = observation.annotate(path)
+            second = observation.annotate(path)
+            self.assertEqual(first["original_judgment"], {"overall_result": "pass"})
+            self.assertEqual(second["original_judgment"], first["original_judgment"])
+            self.assertEqual(second["overall_result"], "blocked")
+
+    def test_cli_preserves_original_judgment_and_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            path.write_text(json.dumps({"verification_kind": "scroll_inertia_focused",
+                                        "overall_result": "pass", "summary": "元の要約"}),
+                            encoding="utf-8")
+            done = subprocess.run([sys.executable, "-I", str(ROOT / "aadw_gui_observation.py"), str(path)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 1, done.stderr)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["overall_result"], "blocked")
+            self.assertEqual(saved["original_judgment"], {"overall_result": "pass", "summary": "元の要約"})
 
     def test_pr395_observed_timing_pattern_is_not_a_fix_authorization(self):
         # Numeric observations from run 36500463393; no OCR is rerun.

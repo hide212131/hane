@@ -79,6 +79,10 @@ def annotate(path: Path) -> dict:
     report = json.loads(path.read_text(encoding="utf-8"))
     if report.get("verification_kind") != "scroll_inertia_focused":
         return report
+    # Keep the first judgment even when this function/CLI is used without staging.
+    report.setdefault("original_judgment", {
+        key: report[key] for key in ("overall_result", "overall_reason", "summary") if key in report
+    })
     quality = assess_report(report)
     report["observation_quality"] = quality
     if report.get("overall_result") == "pass" and quality["diagnosis_required"]:
