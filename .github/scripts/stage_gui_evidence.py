@@ -8,6 +8,13 @@ import shutil
 temp = Path(os.environ['RUNNER_TEMP'])
 source, dest = temp / 'hane-gui-interaction', temp / 'hane-gui-artifact'
 dest.mkdir(exist_ok=True)
+
+# Preserve the trusted root context before result parsing or annotation can fail.
+# Do not widen the recursive allowlist to session files with the same name.
+context = source / 'aadw-context.json'
+if context.is_file() and not context.is_symlink():
+    shutil.copyfile(context, dest / 'aadw-context.json')
+
 names = {'result.json', 'summary.md', 'hane.log', 'ascii-fixture.md', 'ime-fixture.md', 'scroll-fixture.md', 'inline-fixture.md'}
 for file in source.rglob('*'):
     relative = file.relative_to(source)
