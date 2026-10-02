@@ -72,14 +72,45 @@ class LinesCoastTests(unittest.TestCase):
         self.assertTrue(result["first_response"])
         self.assertEqual(result["first_response_frame"], 1)
 
+    def test_accepts_first_response_by_the_end_of_the_issue_inertia_window(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 104, 106, 110, 112, 112, 112],
+                   [44, 74, 120, 144, 170, 205, 240, 292]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 2)
+
     def test_rejects_missing_initial_response(self):
         result = gui.evaluate_lines_coast(
             100,
             frames([100, 101, 102, 103, 104, 104, 104, 104],
-                   [100, 124, 148, 172, 208, 244, 290, 340]),
+                   [136, 160, 184, 208, 232, 256, 290, 340]),
         )
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["first_response"])
+
+    def test_accepts_slow_but_in_window_response_using_post_response_rates(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 106, 109, 110, 110],
+                   [0, 24, 40, 64, 108, 120, 144, 190, 240]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 5)
+        self.assertTrue(result["decelerated"])
+        self.assertGreater(result["early_lines_per_ms"], result["late_lines_per_ms"])
+
+    def test_blocks_slow_response_with_too_few_frames_to_judge_deceleration(self):
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 106, 108],
+                   [0, 24, 40, 64, 108, 120, 144]),
+        )
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["first_response_frame"], 5)
 
     def test_rejects_missing_afterglow(self):
         result = gui.evaluate_lines_coast(
@@ -141,38 +172,41 @@ class DirectionReversalTests(unittest.TestCase):
 
 
 class ReversalHelperTimingTests(unittest.TestCase):
-    def test_parses_event_interval_and_frame_times(self):
+    def test_parses_event_interval_and_pre_and_post_frame_times(self):
         evidence = gui.parse_reversal_helper_output(
             "initial_event_elapsed_ms=2.000\n"
-            "pre_reverse_capture_started_elapsed_ms=36.500\n"
-            "pre_reverse_capture_completed_elapsed_ms=37.500\n"
-            "pre_reverse_visible_lines=100,108\n"
+            "pre_frame_00_capture_started_ms=10.000\n"
+            "pre_frame_00_capture_completed_ms=11.000\n"
+            "pre_frame_01_capture_started_ms=36.500\n"
+            "pre_frame_01_capture_completed_ms=37.500\n"
             "reversal_event_route=cghidEventTap\n"
             "reverse_event_elapsed_ms=40.250\n"
             "frame_00_capture_started_ms=4.100\n"
             "frame_00_capture_completed_ms=5.100\n"
             "frame_01_capture_started_ms=25.000\n"
             "frame_01_capture_completed_ms=26.000\n",
+            expected_pre_frames=2,
             expected_frames=2,
         )
         self.assertEqual(evidence["event_route"], "cghidEventTap")
         self.assertEqual(evidence["initial_to_reverse_event_ms"], 38.25)
-        self.assertEqual(evidence["pre_reverse_capture_after_initial_ms"], 34.5)
-        self.assertEqual(evidence["pre_reverse_capture_completed_after_initial_ms"], 35.5)
+        self.assertEqual(evidence["pre_frame_capture_started_after_initial_ms"], [8.0, 34.5])
+        self.assertEqual(evidence["pre_frame_capture_completed_after_initial_ms"], [9.0, 35.5])
         self.assertEqual(evidence["frame_elapsed_ms"], [5.1, 26.0])
         self.assertEqual(evidence["frame_capture_started_ms"], [4.1, 25.0])
         self.assertEqual(evidence["frame_capture_completed_ms"], [5.1, 26.0])
 
-    def test_rejects_out_of_order_pre_reversal_capture(self):
+    def test_rejects_pre_reversal_capture_completed_after_the_reverse_event(self):
         with self.assertRaisesRegex(ValueError, "out of order"):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
-                "pre_reverse_capture_started_elapsed_ms=8\n"
-                "pre_reverse_capture_completed_elapsed_ms=9\n"
+                "pre_frame_00_capture_started_ms=8\n"
+                "pre_frame_00_capture_completed_ms=9\n"
                 "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=7\n"
                 "frame_00_capture_started_ms=3\n"
                 "frame_00_capture_completed_ms=4\n",
+                expected_pre_frames=1,
                 expected_frames=1,
             )
 
@@ -180,11 +214,12 @@ class ReversalHelperTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "frame_00_capture_completed_ms"):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
-                "pre_reverse_capture_started_elapsed_ms=8\n"
-                "pre_reverse_capture_completed_elapsed_ms=8.5\n"
+                "pre_frame_00_capture_started_ms=8\n"
+                "pre_frame_00_capture_completed_ms=8.5\n"
                 "reversal_event_route=cghidEventTap\n"
                 "reverse_event_elapsed_ms=9\n"
                 "frame_00_capture_started_ms=3\n",
+                expected_pre_frames=1,
                 expected_frames=1,
             )
 
@@ -192,30 +227,37 @@ class ReversalHelperTimingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not use the cghidEventTap route"):
             gui.parse_reversal_helper_output(
                 "initial_event_elapsed_ms=2\n"
-                "pre_reverse_capture_started_elapsed_ms=8\n"
-                "pre_reverse_capture_completed_elapsed_ms=8.5\n"
+                "pre_frame_00_capture_started_ms=8\n"
+                "pre_frame_00_capture_completed_ms=8.5\n"
                 "reversal_event_route=target_pid\n"
                 "reverse_event_elapsed_ms=9\n"
                 "frame_00_capture_started_ms=3\n"
                 "frame_00_capture_completed_ms=4\n",
+                expected_pre_frames=1,
                 expected_frames=1,
             )
 
-    def test_reversal_helper_keeps_both_events_on_global_route(self):
+    def test_reversal_helper_captures_every_pre_reverse_candidate_before_sending_reverse_input(self):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         reversal = source.split("func wheelReversal(", 1)[1].split("\n}", 1)[0]
         self.assertEqual(reversal.count("postScroll(pid, unit,"), 2)
+        self.assertLess(
+            reversal.index("for (index, delayMs) in preProbeDelaysMs.enumerated()"),
+            reversal.index("let reversePosted = postScroll(pid, unit, reverseDelta)"),
+            "every pre-reversal candidate frame must be captured before the reverse input is sent",
+        )
+        self.assertNotIn(
+            "visibleLineNumbers", reversal,
+            "OCR must not run inside the reversal helper's timed window",
+        )
         self.assertIn("event.post(tap: .cghidEventTap)", source)
         self.assertNotIn("postToPid", source)
         self.assertIn('print("reversal_event_route=cghidEventTap")', reversal)
-        self.assertIn("visibleLineNumbers(frame.image)", reversal)
-        self.assertIn("preLines.min().map({ $0 > baseline }) == true", reversal)
-        self.assertIn("guard confirmedOldDirection, let confirmedPreImage = preImage else", reversal)
-        self.assertLess(
-            reversal.index("guard confirmedOldDirection"),
-            reversal.index("postScroll(pid, unit, reverseDelta)"),
-        )
-        self.assertIn("firstPosted + 0.135", reversal)
+        self.assertIn("frame.completed < firstPosted + 0.135", reversal)
+
+    def test_wheel_reversal_cli_bounds_pre_reverse_probe_delays_to_the_inertia_window(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        self.assertIn("preProbeDelays.allSatisfy({ $0 > 0 && $0 <= 130 })", source)
 
     def test_ocr_is_warmed_before_timed_reversal_and_capture_uses_display_metadata(self):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
@@ -263,6 +305,147 @@ class ReversalHelperTimingTests(unittest.TestCase):
         self.assertIn('print("event_route=cghidEventTap")', normal_capture)
 
 
+class OldDirectionCandidateSelectionTests(unittest.TestCase):
+    def test_returns_none_when_no_candidate_moved_past_baseline(self):
+        candidates = [{"visible_lines": [100, 101]}, {"visible_lines": [100, 101]}]
+        self.assertIsNone(gui.select_old_direction_candidate(100, candidates))
+
+    def test_returns_none_when_ocr_found_no_lines(self):
+        candidates = [{"visible_lines": []}, {"visible_lines": None}]
+        self.assertIsNone(gui.select_old_direction_candidate(100, candidates))
+
+    def test_prefers_the_latest_candidate_that_captured_old_direction_motion(self):
+        candidates = [
+            {"visible_lines": [100, 101], "capture_completed_after_initial_ms": 60},
+            {"visible_lines": [104, 105], "capture_completed_after_initial_ms": 96},
+            {"visible_lines": [108, 109], "capture_completed_after_initial_ms": 118},
+        ]
+        selected = gui.select_old_direction_candidate(100, candidates)
+        self.assertEqual(selected["capture_completed_after_initial_ms"], 118)
+        self.assertEqual(selected["value"], 108)
+
+
+class ReversalCaptureFramesTests(unittest.TestCase):
+    class _StubInteraction:
+        def __init__(self, reversal_output, ocr_texts):
+            self.reversal_output = reversal_output
+            self.ocr_texts = ocr_texts
+
+        def run_helper(self, _helper, args, _timeout):
+            if args[0] == "wheel-reversal":
+                return True, self.reversal_output, ""
+            if args[0] == "ocr":
+                return True, self.ocr_texts.get(Path(args[1]).name, ""), ""
+            raise AssertionError(f"unexpected helper command: {args[0]}")
+
+    def test_selects_the_candidate_that_captured_old_direction_motion(self):
+        # Three candidates are captured within the window without OCR; only
+        # the last one happened to land on the moved frame. OCR runs after
+        # the helper call returns, once the reverse input has already been sent.
+        reversal_output = (
+            "initial_event_elapsed_ms=2\n"
+            "reversal_event_route=cghidEventTap\n"
+            "reverse_event_elapsed_ms=130\n"
+            "pre_frame_00_capture_started_ms=66\n"
+            "pre_frame_00_capture_completed_ms=68\n"
+            "pre_frame_01_capture_started_ms=98\n"
+            "pre_frame_01_capture_completed_ms=100\n"
+            "pre_frame_02_capture_started_ms=122\n"
+            "pre_frame_02_capture_completed_ms=124\n"
+            "frame_00_capture_started_ms=5\n"
+            "frame_00_capture_completed_ms=6\n"
+        )
+        ocr_texts = {
+            "pre-frame-00.png": "LINE 100",
+            "pre-frame-01.png": "LINE 100",
+            "pre-frame-02.png": "LINE 108",
+        }
+        interaction = self._StubInteraction(reversal_output, ocr_texts)
+        frames, pre_reverse, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-reversal-candidate-selected-test"), "lines", -8, (0,), 1.0,
+            reverse_delta=12, baseline=100, pre_reverse_probe_delays_ms=(64, 96, 120),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(len(pre_reverse["candidates"]), 3)
+        self.assertTrue(pre_reverse["selected"]["path"].endswith("pre-frame-02.png"))
+        self.assertEqual(pre_reverse["selected"]["value"], 108)
+
+    def test_reports_no_selection_when_no_candidate_shows_old_direction(self):
+        # None of the candidate images happened to capture the old-direction
+        # motion; this must surface as "no selection" (observation shortfall)
+        # rather than a synthesized pre-reverse value.
+        reversal_output = (
+            "initial_event_elapsed_ms=2\n"
+            "reversal_event_route=cghidEventTap\n"
+            "reverse_event_elapsed_ms=130\n"
+            "pre_frame_00_capture_started_ms=66\n"
+            "pre_frame_00_capture_completed_ms=68\n"
+            "frame_00_capture_started_ms=5\n"
+            "frame_00_capture_completed_ms=6\n"
+        )
+        ocr_texts = {"pre-frame-00.png": "LINE 100"}
+        interaction = self._StubInteraction(reversal_output, ocr_texts)
+        frames, pre_reverse, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-reversal-no-candidate-test"), "lines", -8, (0,), 1.0,
+            reverse_delta=12, baseline=100, pre_reverse_probe_delays_ms=(64,),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(len(pre_reverse["candidates"]), 1)
+        self.assertIsNone(pre_reverse["selected"])
+
+
+class FrameScheduleTests(unittest.TestCase):
+    def test_lines_and_pixels_schedules_add_a_completable_point_before_the_next_delay(self):
+        # 108ms -> 144ms (Lines) and 112ms -> 160ms (Pixels) both jump past
+        # the 135ms deadline, and existing delays must stay unchanged.
+        self.assertIn(120, gui.FRAME_DELAYS_MS)
+        self.assertIn(128, gui.PIXELS_FRAME_DELAYS_MS)
+        self.assertTrue({0, 24, 40, 64, 108, 144, 190, 240}.issubset(set(gui.FRAME_DELAYS_MS)))
+        self.assertTrue({0, 24, 40, 64, 88, 112, 160, 200}.issubset(set(gui.PIXELS_FRAME_DELAYS_MS)))
+
+    def test_lines_coast_detects_a_response_only_visible_at_the_added_120ms_capture(self):
+        # Measured (actual) capture-completion times: the 108ms point
+        # completes at 110ms with no response yet, and without the fix the
+        # next point would be 144ms -- already past the 135ms deadline. The
+        # added 120ms point's real completion (122ms) must catch the response.
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 100, 106, 110, 112, 112],
+                   [8, 24, 48, 72, 110, 122, 146, 190, 240]),
+        )
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 5)
+
+    def test_lines_coast_evaluates_deceleration_when_response_lands_exactly_on_the_split_frame(self):
+        # Scheduled frame 4 (108ms) actually completes capture at 120ms and
+        # is the first frame to show a response, colliding with the fixed
+        # split_index=4. The remaining frames must still be split in half to
+        # judge deceleration instead of comparing the response frame to
+        # itself (which previously forced early_lines_per_ms to 0).
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 104, 106, 108, 109, 109],
+                   [8, 24, 48, 72, 120, 146, 190, 230, 240]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 4)
+        self.assertTrue(result["decelerated"])
+        self.assertGreater(result["early_lines_per_ms"], 0)
+        self.assertGreater(result["early_lines_per_ms"], result["late_lines_per_ms"])
+
+    def test_pixels_detects_a_response_only_visible_at_the_added_128ms_capture(self):
+        result = gui.evaluate_pixels(
+            100,
+            frames([100, 100, 100, 100, 100, 104, 104],
+                   [8, 24, 48, 64, 90, 130, 200]),
+        )
+        self.assertTrue(result["immediate"])
+        self.assertEqual(result["first_response_frame"], 5)
+
+
 class PixelsDirectFollowTests(unittest.TestCase):
     def test_accepts_immediate_motion_without_later_coast(self):
         result = gui.evaluate_pixels(100, frames([104, 104, 104], [8, 50, 200]))
@@ -277,20 +460,24 @@ class PixelsDirectFollowTests(unittest.TestCase):
         self.assertEqual(result["first_response_frame"], 1)
         self.assertTrue(result["stable_without_app_coast"])
 
-    def test_requires_screenshot_to_complete_inside_80ms_response_threshold(self):
-        within_deadline_capture = frames([104, 104, 104], [77, 119, 199])
+    def test_requires_screenshot_to_complete_inside_lines_inertia_window(self):
+        within_deadline_capture = frames([104, 104, 104], [134.9, 159, 199])
         result = gui.evaluate_pixels(100, within_deadline_capture)
         self.assertEqual(result["result"], "pass")
         self.assertTrue(result["immediate"])
 
-        straddling_capture = frames([104, 104, 104], [80.1, 119, 199])
+        straddling_capture = frames([104, 104, 104], [135.1, 159, 199])
         result = gui.evaluate_pixels(100, straddling_capture)
         self.assertEqual(result["result"], "fail")
         self.assertFalse(result["immediate"])
 
     def test_samples_near_the_initial_response_deadline(self):
         self.assertIn(40, gui.FRAME_DELAYS_MS)
-        self.assertIn(40, gui.PIXELS_FRAME_DELAYS_MS)
+        self.assertTrue({64, 88, 112}.issubset(gui.PIXELS_FRAME_DELAYS_MS))
+
+    def test_pixels_samples_cover_the_response_window_and_later_stability(self):
+        self.assertTrue(any(delay >= 112 for delay in gui.PIXELS_FRAME_DELAYS_MS))
+        self.assertGreaterEqual(gui.PIXELS_FRAME_DELAYS_MS[-1], 180)
 
     def test_rejects_app_side_coast_after_pixels_event(self):
         result = gui.evaluate_pixels(100, frames([104, 106, 109], [8, 50, 200]))
