@@ -4469,7 +4469,16 @@ impl EditorView {
     /// mach-clock paint/submission time (Issue #427's measurement-only
     /// correlation tool). Purely an observation hook: it records nothing
     /// about what the scroll did and never changes scroll behavior.
+    ///
+    /// Only the first receipt in a pending interval is kept: if another
+    /// `ScrollWheelEvent` arrives before `record_frame_instrumentation` has
+    /// consumed the pending tick, that later receipt is dropped rather than
+    /// overwriting the earlier one, so the measured interval always spans
+    /// from the first receipt to the next paint.
     pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {
+        if self.instrumentation.pending_scroll_receipt_ticks.is_some() {
+            return;
+        }
         if self.instrumentation.scroll_event_timing.is_some()
             && let Some(ticks) = hane_metrics::mach_absolute_ticks()
         {
@@ -6048,6 +6057,24 @@ mod tests {
             None,
             "test views must not query the host OS input source"
         );
+    }
+
+    // Issue #427's scroll-event measurement harness pairs one receipt with
+    // the next paint; a second `ScrollWheelEvent` arriving first must not
+    // discard the earlier receipt still waiting for that paint.
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+    #[gpui::test]
+    fn scroll_receipt_for_measurement_keeps_the_first_pending_tick(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.instrumentation.pending_scroll_receipt_ticks = Some(42);
+            view.record_scroll_receipt_for_measurement();
+            assert_eq!(
+                view.instrumentation.pending_scroll_receipt_ticks,
+                Some(42),
+                "a later scroll receipt must not overwrite the one still pending"
+            );
+        });
     }
 
     #[gpui::test]
