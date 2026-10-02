@@ -96,9 +96,10 @@ def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
     first_response = first_response_index is not None
     last_index = len(offsets) - 1
     split_index = 4
-    if first_response_index is not None and first_response_index > split_index:
-        # The fixed split frame precedes the response here, so comparing
-        # against it would mix pre-response frames into the "early" rate.
+    if first_response_index is not None and first_response_index >= split_index:
+        # The fixed split frame is at or after the response here, so
+        # comparing against it would mix pre-response frames into the
+        # "early" rate (or compare the response frame against itself).
         # Split the remaining post-response frames instead; if too few
         # remain to compare early vs. late speed, this is insufficient
         # observation rather than a product failure.

@@ -418,6 +418,24 @@ class FrameScheduleTests(unittest.TestCase):
         self.assertTrue(result["first_response"])
         self.assertEqual(result["first_response_frame"], 5)
 
+    def test_lines_coast_evaluates_deceleration_when_response_lands_exactly_on_the_split_frame(self):
+        # Scheduled frame 4 (108ms) actually completes capture at 120ms and
+        # is the first frame to show a response, colliding with the fixed
+        # split_index=4. The remaining frames must still be split in half to
+        # judge deceleration instead of comparing the response frame to
+        # itself (which previously forced early_lines_per_ms to 0).
+        result = gui.evaluate_lines_coast(
+            100,
+            frames([100, 100, 100, 100, 104, 106, 108, 109, 109],
+                   [8, 24, 48, 72, 120, 146, 190, 230, 240]),
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertTrue(result["first_response"])
+        self.assertEqual(result["first_response_frame"], 4)
+        self.assertTrue(result["decelerated"])
+        self.assertGreater(result["early_lines_per_ms"], 0)
+        self.assertGreater(result["early_lines_per_ms"], result["late_lines_per_ms"])
+
     def test_pixels_detects_a_response_only_visible_at_the_added_128ms_capture(self):
         result = gui.evaluate_pixels(
             100,
