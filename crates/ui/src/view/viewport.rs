@@ -98,7 +98,12 @@ impl EditorView {
     /// it. Repeated wheel events extend the same target stream and only update
     /// its anchor; the render loop consumes at most one interpolation step per
     /// display frame.
-    pub(super) fn queue_wheel_zoom_factor(&mut self, factor: f32, window_offset: f32, cx: &mut Context<Self>) {
+    pub(super) fn queue_wheel_zoom_factor(
+        &mut self,
+        factor: f32,
+        window_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
         self.raw_zoom = (self.raw_zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let target = clamp_and_snap_zoom(self.raw_zoom);
         if target == self.zoom {
@@ -177,7 +182,12 @@ impl EditorView {
         content_y - anchor.window_offset
     }
 
-    pub(super) fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.on_scroll_at(event, Instant::now(), cx);
     }
 

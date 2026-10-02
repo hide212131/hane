@@ -225,7 +225,7 @@ current PR の目的を直接妨げない改善は follow-up に分離できる�
 
 ### 4.5 Merge
 
-ChatGPT の意味判断だけでは merge しない。
+ChatGPT の意味判断だけで merge しない。
 
 current Issue の目的と acceptance criteria を満たし、必要な review / GUI 判断を終えたら、merge 直前に GitHub 上の客観条件を再確認する。
 
@@ -266,6 +266,50 @@ merge は expected head SHA を指定して行う。expected head は concurrent
 - 同じ cluster が一度の fix 後も再現する場合、局所的な条件追加を続けず、presentation と index、計算値と実測値、同期処理と background 処理など共有される不変条件を再設計し、境界をまたぐ回帰テストを追加する。
 
 この手順の目的は push 数を機械的に制限することではない。current head に結び付かない CI / review / GUI evidence の再利用と、安定していない head に対する高コストな検証の繰り返しを避けることである。
+
+### 4.7 原因未確定の修正反復を防ぐ実行契約（Issue #408）
+
+修正前に、Jev / Commander は観測と原因の推定を分け、`product`（製品）、`test`（テスト）、`measurement`（測定器）、`environment`（実行環境）、`unknown`（未確定）を分類する。新規実装は `initial` とする。分類を選択しただけでは原因の証明にならない。根拠となる current code と観測を確認し、変更でどの観測が改善するはずかを説明できる場合にだけ製品修正を依頼する。
+
+既存の修正依頼には、以下の必須行を含める。SHA・原因ID・evidence URLは実際の値へ置き換える。各行を一つずつ記載する。
+
+```text
+@claude
+AADW_COMMANDER_HANDOFF_V2
+AADW_ACTION: implement
+AADW_TARGET_HEAD: <40桁のcurrent head>
+AADW_FAILURE_CLASS: product
+AADW_ROOT_CAUSE: <同じ原因に同じIDを使う>
+AADW_EVIDENCE: https://github.com/<owner>/<repo>/actions/runs/<run-id>
+```
+
+`measurement` / `environment` / `unknown` を製品修正経路へ流さない。原因を区別できる診断は別の明示的な依頼とする。
+
+```text
+@claude
+AADW_DIAGNOSTIC_REQUEST_V1
+AADW_ACTION: diagnose
+AADW_TARGET_HEAD: <40桁のcurrent head>
+AADW_FAILURE_CLASS: unknown
+AADW_ROOT_CAUSE: <原因候補の安定ID>
+AADW_EVIDENCE: https://github.com/<owner>/<repo>/actions/runs/<run-id>
+```
+
+診断用 `AADW Diagnose` は既存と同じClaude接続を使用するが、製品変更・push・次工程の起動を行わない。共有のconcurrency groupで製品修正と同時実行しない。現在のheadのコードとCommanderが提示した観測を調べ、`diagnosis.json` に日本語の結論・根拠・次に必要な観測を返す。取得できないartifactや実機を確認したと主張しない。`unknown` の報告も診断の正常な返却であり、製品の受入成功ではない。診断のsource patchが非空なら失敗とする。実装経路で空patchを成功にする変更は行わない。
+
+`aadw_action_contract.py` は意味判断をしない。同じ権限確認済みCommanderの過去コメントをGitHubから読み、同一head・原因・evidenceの実装再送、および同じ原因とevidenceを2回使った後の追加実装要求を拒否する。これは実行失敗件数を数える機能ではなく、要求の重複を保守的に防ぐ。新しいpersistent counterやworkflow stateは作らない。Commanderは原因IDやリンクを付け替えてこの制限を避けず、識別できる新しい観測を得る。旧workflowの再実行で新しい契約を迂回しない。
+
+同じ失敗が修正後も続き、原因を区別する情報が増えていなければ、次のpatch・full review・同条件GUIの再送を止める。診断では「入力配送」「アプリの入力受信」「描画」「画面取得」「判定」のどこを比較するかを決める。人の判断や実環境が必要なら、その不足を具体的に報告する。停止を未解決のまま隠したり、判定不能を合格に変えたりしない。
+
+実装workerのshell・Git credential禁止を維持する。trusted finalizerによるpush後、別のread-only jobがそのexact headのworkspace testsとClippyを実行する。テスト不合格でもlintを実行し、両方の結果を一度に返す。これが成功するまで、worker run全体を検証済みの実装結果として扱わない。この検証はmacOS / Windowsのrequired CIやcurrent-head reviewを置き換えず、mergeを自動起動しない。
+
+GUIでは元の `result.json` の観測と、trustedな保存処理が付ける `observation_quality` を併せて読む。元の結果は `raw-result.json` に残す。期限内の画像がない・時計が不正・入力経路が不明・OCRや反転入力が慣性窓を越える場合は測定不能であり、製品原因を確定しない。期限内の画像で動きが見えなかった場合も、アプリの入力受信と描画が確認できなければ原因は `unknown` とする。80ms・55ms・135ms等の既存閾値はこの分類のために緩めない。元のfailはpassに変えず、成立しない観測に基づくpassはblockedにする。
+
+測定器の採用・変更時は、既知の正常・既知の異常・測定不能の回帰ケースを確認する。その上で実際の実行環境で入力配送・時計・画面取得の成立を確認する。過去artifactの再評価や数値fixtureのテストは分類器の検証であり、現在の実機で測定が成立した証拠ではない。成立しない場合は測定不能を記録し、受け入れ条件を満たす別の確認方法をCommanderが明示的に選ぶ。GUI不要への読み替えや閾値の緩和は行わない。
+
+停止中のPRは、Closedまたは `aadw:paused` ラベル／本文 `<!-- AADW_PAUSED -->` を確認して、通常の実装を拒否する。既存GUI経路を確実に止めるにはDraftまたはClosedを併用する。Draftだけでは既存の実装経路を止めないことに注意する。停止前後のheadを保存し、ブランチは削除しない。他の独立したPRを一律停止しない。
+
+Issue #408に伴うPR #395の停止解除は、防止策のコード・経路接続テスト・current CI・レビュー・変更なし診断の実行確認、および実環境の観測可否の記録を揃えてから行う。文書の追記だけ、または分類器の単体テスト成功だけで再開しない。再開時はcurrent head/baseを読み直し、新しい診断経路で残る失敗を先に分類する。再開できることと、Issue #389の製品が合格したことは別である。
 
 ---
 

@@ -203,6 +203,12 @@ impl FileStateStore {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
+
+    /// Directory used for per-user Hane state. The application uses the same
+    /// root for state owned by other process-level services.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 impl SettingsRepository for FileStateStore {

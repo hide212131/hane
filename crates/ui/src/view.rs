@@ -50,7 +50,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::hover_card::HoverCard;
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{Sizable, h_flex};
+use gpui_component::{Selectable, Sizable, h_flex};
 use hane_document::{
     Bias, BufferError, LineId, Revision, RevisionDelta, RopeBuffer, SourceOffset, SourceRange,
     TextBuffer,
@@ -87,7 +87,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
+mod ai_settings;
+mod background_parse;
 mod inline_rename;
+mod session_save;
 mod sidebar;
 mod sidebar_filter;
 mod viewport;
@@ -683,6 +686,9 @@ pub struct EditorView {
     stores: StateStores,
     settings: Settings,
     settings_open: bool,
+    settings_ai_page: bool,
+    settings_focus_handle: FocusHandle,
+    ai_settings: ai_settings::AiSettingsPage,
     file_context_menu_state: FileContextMenuState,
     file_context_menu_busy: bool,
     file_context_menu_generation: u64,
@@ -1166,12 +1172,11 @@ mod vscode_windows {
     use std::env;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use winreg::HKEY;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use winreg::HKEY;
 
-    const APP_PATHS_SUBKEY: &str =
-        r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
+    const APP_PATHS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Code.exe";
 
     pub(super) fn resolve_executable() -> OsString {
         resolve_from(&candidate_paths())
@@ -1354,6 +1359,9 @@ impl EditorView {
             stores,
             settings,
             settings_open: false,
+            settings_ai_page: false,
+            settings_focus_handle: cx.focus_handle(),
+            ai_settings: ai_settings::AiSettingsPage::default(),
             file_context_menu_state: FileContextMenuState::NotChecked,
             file_context_menu_busy: false,
             file_context_menu_generation: 0,
@@ -1838,356 +1846,6 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Arms the debounce timer for the active session. Each call invalidates the
-    /// timer armed by the previous keystroke, so a burst of typing produces one
-    /// write at the end rather than one per key.
-    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
-        let autosave = self.settings.autosave;
-        let session = self.sessions.active_mut();
-        session.note_edit();
-        let Some(ticket) = session.autosave_ticket(autosave) else {
-            return;
-        };
-        let id = session.id();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let should_save = view
-                .read_with(cx, |view, _| {
-                    view.sessions.active_id() == id
-                        && view
-                            .sessions
-                            .active()
-                            .autosave_is_current(ticket, view.settings.autosave)
-                })
-                .unwrap_or(false);
-            if should_save {
-                let _ = view.update(cx, |view, cx| view.save_current(cx));
-            }
-        })
-        .detach();
-    }
-
-    /// Journals the active session's text into the recovery drafts on the
-    /// same debounce cadence as autosave: a no-op unless the active session
-    /// is an unnamed note in the current work folder. Kept separate from
-    /// `schedule_autosave` because an unnamed note has no path to write to
-    /// yet and must not wait for one to earn crash safety.
-    ///
-    /// The scheduled save targets the session it was armed for by id, not
-    /// whichever session is active when the timer fires: switching to
-    /// another note within the debounce window must not cancel the write, or
-    /// edits made just before switching away are lost on a crash until the
-    /// draft is revisited and edited again.
-    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
-        let id = self.sessions.active_id();
-        let Some(draft_id) = self.work_folder_drafts.get(&id).map(|draft| draft.draft_id) else {
-            return;
-        };
-        let Some(root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let revision = self.sessions.active().revision();
-        let draft_store = self.draft_store.clone();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let text = view
-                .read_with(cx, |view, _| {
-                    let session = view.sessions.get(id)?;
-                    let current =
-                        session.revision() == revision && view.work_folder_drafts.contains_key(&id);
-                    current.then(|| session.editor().document().full_text())
-                })
-                .ok()
-                .flatten();
-            if let Some(text) = text {
-                let _ = cx
-                    .background_executor()
-                    .spawn(async move { draft_store.write(&root, draft_id, &text) })
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    /// Writes every pending unnamed-note draft synchronously, bypassing the
-    /// debounce in `schedule_draft_save`. Called from the app-quit hook
-    /// registered in `from_sessions` and from `switch_to_work_folder`, and
-    /// public so `main.rs` can also call it from a window-close hook: a
-    /// normal quit — or closing the window, which on some platforms does not
-    /// raise an app-quit event at all — gives a `schedule_draft_save` timer
-    /// no chance to fire if it was armed less than 750ms earlier, so without
-    /// this an unnamed note's last few keystrokes would only survive a crash
-    /// (recovered from whatever the debounce last wrote), not a clean exit.
-    pub fn flush_pending_drafts(&self) {
-        if self.work_folder_drafts.is_empty() {
-            return;
-        }
-        let Some(root) = self.work_folder.as_ref().map(WorkFolder::root) else {
-            return;
-        };
-        for (&id, draft) in &self.work_folder_drafts {
-            let Some(session) = self.sessions.get(id) else {
-                continue;
-            };
-            let text = session.editor().document().full_text();
-            let _ = self.draft_store.write(root, draft.draft_id, &text);
-        }
-    }
-
-    /// Issue #6: arms the debounce timer that keeps a work-folder note's
-    /// filename following its first H1. A no-op outside a work folder.
-    fn schedule_title_sync(&mut self, cx: &mut Context<Self>) {
-        if self.work_folder.is_none() {
-            return;
-        }
-        let id = self.sessions.active_id();
-        let generation = self.sessions.active().generation();
-        let revision = self.sessions.active().revision();
-        self.title_sync_scheduled.insert(id, revision);
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                if view.title_sync_scheduled.get(&id).copied() == Some(revision) {
-                    view.title_sync_scheduled.remove(&id);
-                    view.run_title_sync(id, generation, revision, cx);
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Decides, for the session the timer was armed for, whether its H1
-    /// should create, rename, or stop auto-managing its filename — recomputed
-    /// fresh against the document as it stands now, since edits may have
-    /// landed while the timer was pending.
-    fn run_title_sync(
-        &mut self,
-        id: SessionId,
-        generation: u64,
-        revision: Revision,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .inline_rename
-            .as_ref()
-            .is_some_and(|rename| rename.pending)
-        {
-            self.title_sync_deferred.insert(id);
-            return;
-        }
-        if self.title_sync_in_flight.contains(&id) {
-            // Another probe or write for this session is already running; the
-            // next edit re-arms this timer, so nothing is lost by skipping.
-            return;
-        }
-        let Some(work_folder_root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let Some(session) = self.sessions.get(id) else {
-            return;
-        };
-        if session.generation() != generation || session.revision() != revision {
-            return; // superseded by a later keystroke or a document replacement
-        }
-        let text = session.editor().document().full_text();
-        let extracted = extract_h1_title(&text);
-        let current_stem = session
-            .path()
-            .and_then(Path::file_stem)
-            .and_then(|stem| stem.to_str());
-        let action = decide_title_sync(session.auto_title(), current_stem, extracted.as_deref());
-        match action {
-            TitleSyncAction::None => {}
-            TitleSyncAction::StopTracking => {
-                if let Some(session) = self.sessions.get_mut(id) {
-                    session.stop_auto_naming();
-                }
-            }
-            TitleSyncAction::CreateNamed(title) => {
-                // The folder this note was started in, if it was started
-                // from a selected sidebar folder; otherwise the work folder
-                // root, the same as before folders existed.
-                let target_directory = self
-                    .work_folder_drafts
-                    .get(&id)
-                    .map(|draft| draft.target_directory.clone())
-                    .unwrap_or(work_folder_root);
-                self.begin_title_create(id, target_directory, title, cx);
-            }
-            TitleSyncAction::Rename(title) => self.begin_title_rename(id, title, cx),
-        }
-    }
-
-    /// Picks a collision-free `<title>.md` under `target_directory` in the
-    /// background, then writes the still-untitled session's content there
-    /// for the first time through the same save machinery as any other
-    /// write.
-    fn begin_title_create(
-        &mut self,
-        id: SessionId,
-        target_directory: PathBuf,
-        title: String,
-        cx: &mut Context<Self>,
-    ) {
-        let root = target_directory;
-        self.title_sync_in_flight.insert(id);
-        let files = self.files.clone();
-        let probe_title = title.clone();
-        cx.spawn(async move |view, cx| {
-            let probe_files = files.clone();
-            let probe_root = root.clone();
-            let candidate = cx
-                .background_executor()
-                .spawn(async move {
-                    unique_markdown_filename(&probe_title, |name| {
-                        probe_files.stamp(&probe_root.join(name)).is_some()
-                    })
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.title_sync_in_flight.remove(&id);
-                // A session that no longer exists (closed, or replaced while
-                // the probe was running) defers the same as one that reports
-                // `should_defer_h1_create`; `retry_title_sync` picks this
-                // back up once whatever holds the slot finishes.
-                let should_skip = view
-                    .sessions
-                    .get(id)
-                    .is_none_or(DocumentSession::should_defer_h1_create);
-                if should_skip {
-                    return;
-                }
-                view.title_sync_pending.insert(id, title.clone());
-                view.save_session(id, SaveIntent::CreateNew(root.join(&candidate)), cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Picks a collision-free `<title>.md` in the note's own directory in the
-    /// background, then renames the session's current file to it. The
-    /// directory is the file's current parent, not the work folder root, so
-    /// an H1-driven rename never moves a note out of the folder it lives in.
-    /// `DocumentSession`'s own `apply_file_event` is what actually moves the
-    /// session, the same path a filer-originated rename would take, so a
-    /// rename that lands after the file already moved on for some other
-    /// reason is safely ignored.
-    fn begin_title_rename(&mut self, id: SessionId, title: String, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get_mut(id) else {
-            return;
-        };
-        let Some(from) = session.path().map(Path::to_path_buf) else {
-            return;
-        };
-        let Some(root) = from.parent().map(Path::to_path_buf) else {
-            return;
-        };
-        // Reserved synchronously, before any `await`: a concurrent autosave
-        // that fires in the same tick must see the slot already taken and
-        // queue behind it, not race the rename to the filesystem. A `None`
-        // here means a write is already in flight; the rename is skipped for
-        // now rather than racing that write instead, and the next debounce
-        // (armed by any further edit) tries again.
-        let Some(ticket) = session.begin_rename() else {
-            return;
-        };
-        self.title_sync_in_flight.insert(id);
-        let files = self.files.clone();
-        let probe_title = title.clone();
-        let probe_from = from.clone();
-        cx.spawn(async move |view, cx| {
-            let probe_files = files.clone();
-            let probe_root = root.clone();
-            let rename_from = from.clone();
-            let (target, rename_result) = cx
-                .background_executor()
-                .spawn(async move {
-                    let candidate = unique_markdown_filename(&probe_title, |name| {
-                        let candidate = probe_root.join(name);
-                        candidate != probe_from && probe_files.stamp(&candidate).is_some()
-                    });
-                    let target = probe_root.join(candidate);
-                    let result = probe_files.rename(&rename_from, &target);
-                    (target, result)
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.title_sync_in_flight.remove(&id);
-                let attempt = TitleRenameAttempt {
-                    id,
-                    ticket,
-                    from,
-                    target,
-                    title,
-                };
-                view.finish_title_rename(attempt, rename_result, cx);
-            });
-        })
-        .detach();
-    }
-
-    fn finish_title_rename(
-        &mut self,
-        attempt: TitleRenameAttempt,
-        result: std::io::Result<()>,
-        cx: &mut Context<Self>,
-    ) {
-        let TitleRenameAttempt {
-            id,
-            ticket,
-            from,
-            target,
-            title,
-        } = attempt;
-        if let Ok(()) = result {
-            let outcomes = self.sessions.apply_file_event(&FileEvent::Renamed {
-                from: from.clone(),
-                to: target.clone(),
-            });
-            let applied = outcomes.iter().any(|(session_id, outcome)| {
-                *session_id == id && *outcome == FileEventOutcome::Renamed
-            });
-            if applied {
-                if let Some(session) = self.sessions.get_mut(id) {
-                    session.note_auto_named(title);
-                }
-                if let Some(folder) = self.work_folder.as_mut() {
-                    folder.rename(&from, &target);
-                }
-                self.recent.rename(&from, &target);
-                if let Err(error) = self.stores.recent_files().store(&self.recent) {
-                    self.status = Some(format!("Recent files failed: {error}"));
-                }
-            }
-        }
-        // The picked name may have been raced away, or the file may have
-        // moved on for some other reason; either way the save slot the
-        // rename reserved must be released so anything it queued behind
-        // itself (an autosave that arrived in the meantime) now runs against
-        // whichever path the session actually ended up at.
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.finish_rename(ticket);
-            if let Some(pending) = session.take_pending_save() {
-                self.save_session(id, pending, cx);
-            }
-        }
-        cx.notify();
-    }
-
     /// The directory a new note or folder should be created in: the selected
     /// sidebar folder if one is selected and still exists in the tree,
     /// otherwise the work folder root. `None` outside a work folder.
@@ -2348,221 +2006,6 @@ impl EditorView {
             }
         }
         cx.notify();
-    }
-
-    /// A note stops being a draft once it earns a real path, whether through
-    /// the (future) H1-derived rename or a manual Save As. The recovery
-    /// journal entry is removed on a background thread; a failure here just
-    /// leaves a harmless leftover file, never lost content.
-    fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(draft) = self.work_folder_drafts.remove(&id) else {
-            return;
-        };
-        let draft_id = draft.draft_id;
-        let Some(root) = self
-            .work_folder
-            .as_ref()
-            .map(|folder| folder.root().to_path_buf())
-        else {
-            return;
-        };
-        let draft_store = self.draft_store.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = draft_store.remove(&root, draft_id);
-            })
-            .detach();
-    }
-
-    /// Marks a session auto-managed once its H1-derived first write has
-    /// actually landed, not merely been requested, and adds the new note to
-    /// the work folder index so it appears in the sidebar without waiting
-    /// for the next full rescan.
-    fn apply_pending_title_sync(&mut self, id: SessionId, path: &Path) {
-        let Some(title) = self.title_sync_pending.remove(&id) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.note_auto_named(title);
-        }
-        if let Some(folder) = self.work_folder.as_mut() {
-            folder.insert(path.to_path_buf());
-        }
-    }
-
-    /// Re-decides title sync for a session right after one of its writes
-    /// lands. `begin_title_rename` defers instead of racing a save that is
-    /// still in flight (see `DocumentSession::begin_rename`), so the rename
-    /// it deferred needs a prompt to try again once that save is done,
-    /// rather than waiting on the next keystroke to re-arm the debounce —
-    /// which may never come, if the H1 edit that wanted the rename was the
-    /// document's last edit before the autosave it lost the race to.
-    fn retry_title_sync(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.get(id) else {
-            return;
-        };
-        let generation = session.generation();
-        let revision = session.revision();
-        self.run_title_sync(id, generation, revision, cx);
-    }
-
-    /// Retries title synchronization that was held back by a user-controlled
-    /// filesystem rename. Keeping this at the orchestration boundary means an
-    /// untitled draft is re-evaluated against its rebased directory rather
-    /// than reusing a stale path captured before the folder move.
-    fn retry_deferred_title_sync(&mut self, cx: &mut Context<Self>) {
-        if self.inline_rename.is_some() {
-            return;
-        }
-        let deferred = std::mem::take(&mut self.title_sync_deferred);
-        for id in deferred {
-            self.retry_title_sync(id, cx);
-        }
-    }
-
-    pub(crate) fn save_current(&mut self, cx: &mut Context<Self>) {
-        self.save_active(SaveIntent::Current, cx);
-    }
-
-    pub(crate) fn save_or_prompt(&mut self, cx: &mut Context<Self>) {
-        if self.sessions.active().path().is_some() {
-            self.save_current(cx);
-        } else {
-            self.prompt_save_as(cx);
-        }
-    }
-
-    fn save_active(&mut self, intent: SaveIntent, cx: &mut Context<Self>) {
-        self.save_session(self.sessions.active_id(), intent, cx);
-    }
-
-    /// Hands one accepted write to the I/O boundary. The session decides whether
-    /// there is a write to do at all; the view only reports what happened.
-    fn save_session(&mut self, id: SessionId, intent: SaveIntent, cx: &mut Context<Self>) {
-        let Some(decision) = self
-            .sessions
-            .get_mut(id)
-            .map(|session| session.request_save(intent))
-        else {
-            return;
-        };
-        match decision {
-            SaveDecision::NeedsPath => {
-                self.status = Some("Use Save As for an untitled document".to_owned());
-            }
-            SaveDecision::Queued => {
-                self.status = Some("Save queued…".to_owned());
-            }
-            SaveDecision::Write(job) => {
-                self.status = Some("Saving…".to_owned());
-                let files = self.files.clone();
-                let path = job.path.clone();
-                let ticket = job.ticket;
-                cx.spawn(async move |view, cx| {
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            run_save_job(files.as_ref(), &job.path, &job.document, job.guard)
-                        })
-                        .await;
-                    let _ = view.update(cx, |view, cx| {
-                        view.finish_save(id, ticket, &path, result, cx);
-                    });
-                })
-                .detach();
-            }
-        }
-        cx.notify();
-    }
-
-    fn finish_save(
-        &mut self,
-        id: SessionId,
-        ticket: SaveTicket,
-        path: &Path,
-        result: Result<SavedFile, SaveFailure>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(outcome) = self
-            .sessions
-            .get_mut(id)
-            .map(|session| session.finish_save(ticket, result))
-        else {
-            return;
-        };
-        match outcome {
-            SaveOutcome::Saved => {
-                self.status = Some("Saved".to_owned());
-                self.remember_recent(path);
-                cx.add_recent_document(path);
-                self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id, path);
-                self.retry_title_sync(id, cx);
-            }
-            SaveOutcome::SavedStale => {
-                self.status = Some("Saved snapshot; newer edits pending".to_owned());
-                self.remember_recent(path);
-                cx.add_recent_document(path);
-                self.schedule_autosave(cx);
-                self.retire_work_folder_draft(id, cx);
-                self.apply_pending_title_sync(id, path);
-                self.retry_title_sync(id, cx);
-            }
-            SaveOutcome::Conflict => {
-                self.status = Some(
-                    "Save refused: the file changed on disk. Save As, or save again to overwrite"
-                        .to_owned(),
-                );
-                // The candidate name this was for was raced away; drop it
-                // rather than let a later, unrelated write consume it.
-                self.title_sync_pending.remove(&id);
-            }
-            SaveOutcome::Failed(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-                self.title_sync_pending.remove(&id);
-            }
-            // The document this write belonged to is gone; nothing to report.
-            SaveOutcome::Superseded => {
-                self.title_sync_pending.remove(&id);
-            }
-        }
-        if let Some(pending) = self
-            .sessions
-            .get_mut(id)
-            .and_then(DocumentSession::take_pending_save)
-        {
-            self.save_session(id, pending, cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
-        let directory = self
-            .sessions
-            .active()
-            .file()
-            .directory()
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                self.work_folder
-                    .as_ref()
-                    .map(|folder| folder.root().to_path_buf())
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        let receiver = cx.prompt_for_new_path(&directory, Some("Untitled.md"));
-        cx.spawn(async move |view, cx| match receiver.await {
-            Ok(Ok(Some(path))) => {
-                let _ = view.update(cx, |view, cx| view.save_active(SaveIntent::To(path), cx));
-            }
-            Ok(Err(error)) => {
-                let _ = view.update(cx, |view, cx| {
-                    view.status = Some(format!("Save As failed: {error}"));
-                    cx.notify();
-                });
-            }
-            _ => {}
-        })
-        .detach();
     }
 
     pub(crate) fn prompt_open(&mut self, cx: &mut Context<Self>) {
@@ -2729,8 +2172,6 @@ impl EditorView {
 
     /// Handles a path delivered by another Hane process from Explorer.
     pub fn open_external_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.settings_open = false;
-        self.settings_error = None;
         if path.is_dir() {
             self.switch_to_work_folder(path.to_path_buf(), cx);
         } else {
@@ -2900,6 +2341,20 @@ impl EditorView {
         self.settings_open
     }
 
+    pub fn settings_is_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Installs a handle to the app-owned AI service. The service itself stays
+    /// in the application composition root and outlives this editor view.
+    pub fn attach_ai_service(
+        &mut self,
+        service: Option<hane_ai::AiServiceHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_settings.attach(service, cx);
+    }
+
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor().ime().is_some() {
             self.status = Some("入力変換を確定または取り消してから設定を開いてください".to_owned());
@@ -2918,6 +2373,8 @@ impl EditorView {
         crate::init_components(cx);
         self.blur_sidebar_filter(cx);
         self.settings_open = true;
+        self.settings_ai_page = false;
+        self.ai_settings.begin_settings_session();
         self.settings_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
@@ -2937,7 +2394,7 @@ impl EditorView {
             });
         })
         .detach();
-        window.focus(&self.focus_handle, cx);
+        window.focus(&self.settings_focus_handle, cx);
         cx.notify();
     }
 
@@ -2946,10 +2403,50 @@ impl EditorView {
             return;
         }
         self.settings_open = false;
+        self.settings_ai_page = false;
+        self.ai_settings.close_settings();
         self.file_context_menu_busy = false;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    pub(crate) fn handle_settings_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.input_has_focus(window, cx) {
+            // A settings input owns Escape, including while an IME composition
+            // is active. The visible navigation remains available to leave.
+            return;
+        }
+        self.request_leave_settings(window, cx);
+    }
+
+    fn select_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if ai && !self.settings_ai_page {
+            self.ai_settings.activate(cx);
+        }
+        self.settings_ai_page = ai;
+        window.focus(&self.settings_focus_handle, cx);
+        cx.notify();
+    }
+
+    fn request_leave_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::Close);
+            cx.notify();
+        } else {
+            self.close_settings(window, cx);
+        }
+    }
+
+    fn request_settings_category(&mut self, ai: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_ai_page && !ai && self.ai_settings.is_dirty(cx) {
+            self.ai_settings
+                .confirm_leave(ai_settings::LeaveTarget::General);
+            cx.notify();
+        } else {
+            self.select_settings_category(ai, window, cx);
+        }
     }
 
     fn set_file_context_menu(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -3007,7 +2504,33 @@ impl EditorView {
         }
     }
 
-    fn settings_screen_element(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_screen_element(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        if let Some(target) = self.ai_settings.take_ready_route() {
+            match target {
+                ai_settings::LeaveTarget::General => {
+                    self.select_settings_category(false, window, cx)
+                }
+                ai_settings::LeaveTarget::Close => {
+                    self.close_settings(window, cx);
+                }
+            }
+        }
+        let body = if self.settings_ai_page {
+            self.ai_settings_render(window, cx).into_any_element()
+        } else {
+            self.general_settings_content(cx).into_any_element()
+        };
+        self.settings_screen_shell(body, cx)
+    }
+
+    // Build the page before allocating the settings shell's style temporaries.
+    // Both frames must not be live together on Windows' 1 MiB UI thread stack.
+    #[inline(never)]
+    fn settings_screen_shell(&self, body: gpui::AnyElement, cx: &mut Context<Self>) -> gpui::Div {
         let view = cx.entity();
         let back = Button::new("settings-back")
             .icon(IconName::ArrowLeft)
@@ -3015,9 +2538,73 @@ impl EditorView {
             .ghost()
             .tooltip("アプリに戻る")
             .on_click(move |_, window, app| {
-                view.update(app, |view, cx| view.close_settings(window, cx));
+                view.update(app, |view, cx| view.request_leave_settings(window, cx));
             });
 
+        let view = cx.entity();
+        let general_tab = Button::new("settings-category-general")
+            .label("一般")
+            .ghost()
+            .selected(!self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(false, window, cx)
+                });
+            });
+        let view = cx.entity();
+        let ai_tab = Button::new("settings-category-ai")
+            .label("AI")
+            .ghost()
+            .selected(self.settings_ai_page)
+            .on_click(move |_, window, app| {
+                view.update(app, |view, cx| {
+                    view.request_settings_category(true, window, cx)
+                });
+            });
+
+        let content = div()
+            .id("settings-content")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full();
+        let content = if self.settings_ai_page {
+            content
+                .flex()
+                .flex_col()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(body)
+        } else {
+            content.overflow_y_scroll().child(body)
+        };
+
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(rgb(self.theme.editor_background))
+            .text_color(rgb(self.theme.foreground))
+            .key_context("HaneEditor")
+            .track_focus(&self.settings_focus_handle);
+        let sidebar = div()
+            .id("settings-sidebar")
+            .debug_selector(|| "settings-sidebar".to_owned())
+            .w(px(self.sidebar_width))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .px(px(16.0))
+            .py(px(16.0))
+            .bg(rgb(self.theme.sidebar_background))
+            .child(back)
+            .child(general_tab)
+            .child(ai_tab);
+        install_action_listeners(root.child(sidebar).child(content), cx)
+    }
+
+    fn general_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let unsupported = matches!(
             self.file_context_menu_state,
             FileContextMenuState::Unsupported
@@ -3038,107 +2625,68 @@ impl EditorView {
                 .text_color(rgb(0xb42318))
                 .child(format!("登録に失敗しました: {error}"))
         });
-        let content = div()
-            .id("settings-content")
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(760.0))
-                    .px(px(32.0))
-                    .py(px(28.0))
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_size(px(22.0))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("一般"),
-                    )
-                    .child(
-                        div()
-                            .pt(px(16.0))
-                            .border_t_1()
-                            .border_color(rgb(self.theme.sidebar_active_background))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Windowsとの連携"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-file-context-menu-card")
-                                    .w_full()
-                                    .px(px(16.0))
-                                    .py(px(14.0))
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(self.theme.sidebar_active_background))
-                                    .bg(rgb(self.theme.code_background))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(checkbox)
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
-                                    )
-                                    .child(
-                                        div()
-                                            .pl(px(28.0))
-                                            .text_color(rgb(self.theme.quote_foreground))
-                                            .child(if busy {
-                                                "反映しています…"
-                                            } else {
-                                                self.file_context_menu_status()
-                                            }),
-                                    )
-                                    .children(error),
-                            ),
-                    ),
-            );
-        let root = div()
-            .size_full()
-            .flex()
-            .flex_row()
-            .bg(rgb(self.theme.editor_background))
-            .text_color(rgb(self.theme.foreground))
-            .key_context("HaneEditor")
-            .track_focus(&self.focus_handle(cx));
-        let sidebar = div()
-            .id("settings-sidebar")
-            .debug_selector(|| "settings-sidebar".to_owned())
-            .w(px(self.sidebar_width))
-            .h_full()
-            .flex_none()
+        div()
+            .id("general-settings-content")
+            .w_full()
+            .max_w(px(760.0))
+            .px(px(32.0))
+            .py(px(28.0))
             .flex()
             .flex_col()
             .gap_4()
-            .px(px(16.0))
-            .py(px(16.0))
-            .bg(rgb(self.theme.sidebar_background))
-            .child(back)
             .child(
                 div()
-                    .id("settings-category-general")
-                    .w_full()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded_sm()
-                    .bg(rgb(self.theme.sidebar_active_background))
+                    .text_size(px(22.0))
+                    .font_weight(gpui::FontWeight::BOLD)
                     .child("一般"),
-            );
-        install_action_listeners(root.child(sidebar).child(content), cx)
+            )
+            .child(
+                div()
+                    .pt(px(16.0))
+                    .border_t_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Windowsとの連携"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-file-context-menu-card")
+                            .w_full()
+                            .px(px(16.0))
+                            .py(px(14.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(self.theme.sidebar_active_background))
+                            .bg(rgb(self.theme.code_background))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(checkbox)
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("エクスプローラーのファイルの右クリックメニューに「Haneで開く」を追加します。既定のアプリは変更しません。Windows 11では署名済みのExplorer拡張パッケージが必要です。"),
+                            )
+                            .child(
+                                div()
+                                    .pl(px(28.0))
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child(if busy {
+                                        "反映しています…"
+                                    } else {
+                                        self.file_context_menu_status()
+                                    }),
+                            )
+                            .children(error),
+                    ),
+            )
     }
 
     pub(crate) fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3150,301 +2698,6 @@ impl EditorView {
         self.heights = HeightIndex::new(self.item_heights());
         self.store_settings();
         cx.notify();
-    }
-
-    /// Coalesced background job producing the formal, document-wide `BlockIndex`.
-    /// One job at a time; a result that no longer matches the document revision
-    /// is rebased or re-scheduled rather than published stale.
-    fn schedule_document_parse(&mut self, cx: &mut Context<Self>) {
-        let document = self.sessions.active().editor().document();
-        let revision = document.revision();
-        let disclosure = self.active_height_disclosure();
-        let force_height_disclosure_snapshot = self.force_height_disclosure_snapshot;
-        let disclosure_refresh = disclosure
-            .filter(|disclosure| !disclosure.is_empty())
-            .is_some_and(|disclosure| {
-                self.last_background_height_disclosure != Some((revision, disclosure))
-            });
-        let disclosure_collapse = disclosure
-            .filter(|disclosure| disclosure.is_empty())
-            .is_some_and(|_| {
-                self.last_background_height_disclosure.is_some_and(
-                    |(background_revision, background)| {
-                        background_revision == revision && !background.is_empty()
-                    },
-                )
-            });
-        if !self.block_index.needs_formal_parse(document)
-            && !disclosure_refresh
-            && !disclosure_collapse
-            && !force_height_disclosure_snapshot
-        {
-            return;
-        }
-        if self.document_parse_job_running {
-            return;
-        }
-        self.force_height_disclosure_snapshot = false;
-        self.document_parse_job_running = true;
-        let key = self.document_key();
-        let line_height = self.line_height();
-        let line_height_bits = line_height.to_bits();
-        let previous_height_disclosure = self
-            .last_applied_height_disclosure
-            .filter(|(previous_revision, _)| *previous_revision == revision)
-            .map(|(_, disclosure)| disclosure);
-        let snapshot_is_collapsing_disclosure = previous_height_disclosure
-            .is_some_and(|previous| !previous.is_empty())
-            && disclosure.is_some_and(|disclosure| disclosure.is_empty());
-        if let Some(disclosure) = disclosure {
-            self.last_background_height_disclosure = Some((revision, disclosure));
-        }
-        let snapshot = self.editor().document().clone();
-        cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(40))
-                .await;
-            let current = view
-                .update(cx, |view, _| {
-                    view.document_key() == key
-                        && block_context_revision_is_current(
-                            view.editor().document().revision(),
-                            revision,
-                        )
-                        && height_snapshot_matches_line_height(
-                            view.line_height(),
-                            f32::from_bits(line_height_bits),
-                        )
-                })
-                .unwrap_or(false);
-            if !current {
-                let _ = view.update(cx, |view, cx| {
-                    view.document_parse_job_running = false;
-                    view.schedule_document_parse(cx);
-                });
-                return;
-            }
-            // Sizing the height index is proportional to the block count, so it
-            // is done here rather than on the main thread: for a 100 MB document
-            // that is tens of milliseconds that would otherwise land in one
-            // frame.
-            let (index, heights) = cx
-                .background_executor()
-                .spawn(async move {
-                    let index = BlockIndex::from_buffer(&snapshot);
-                    let heights = HeightIndex::new(block_heights_with_disclosure(
-                        &snapshot,
-                        &index,
-                        line_height,
-                        disclosure,
-                    ));
-                    (index, heights)
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                view.document_parse_job_running = false;
-                if view.document_key() != key
-                    || !height_snapshot_matches_line_height(
-                        view.line_height(),
-                        f32::from_bits(line_height_bits),
-                    )
-                {
-                    // The index itself may still be current, but these
-                    // heights were measured for an older zoom/theme. Keep the
-                    // stale snapshot out of the visible height tree and rerun
-                    // the job with the current line height.
-                    view.schedule_document_parse(cx);
-                    return;
-                }
-                let document = view.sessions.active().editor().document();
-                let publish_outcome =
-                    view.block_index
-                        .publish(index, IndexSource::Formal, document);
-                let index_was_updated = matches!(
-                    publish_outcome,
-                    PublishOutcome::Published | PublishOutcome::Rebased(_)
-                );
-                if index_was_updated {
-                    view.background_presentation_generation = revision.0 + 1;
-                    // Formal boundaries can disagree with what the bounded
-                    // local parse showed, so every cached presentation is
-                    // re-derived once when the index actually changed.
-                    view.block_cache.clear();
-                    view.joined_parse_cache.clear();
-                }
-                let (granularity, len) = view.desired_layout();
-                let snapshot_disclosure_is_current = view.editor().document().revision()
-                    == revision
-                    && view.active_height_disclosure() == disclosure;
-                if snapshot_disclosure_is_current
-                    && granularity == Granularity::Blocks
-                    && len == heights.len()
-                {
-                    if publish_outcome == PublishOutcome::NotMoreAuthoritative {
-                        // The formal index is already current in this case;
-                        // this job only refreshed disclosure-dependent fence
-                        // heights. Preserve measured wrapping/image heights and
-                        // invalidate presentations lazily through their
-                        // disclosure check instead of throwing their caches
-                        // away for a selection change.
-                        view.install_disclosure_heights_preserving_measurements(
-                            heights,
-                            previous_height_disclosure,
-                        );
-                    } else if index_was_updated {
-                        view.install_heights(granularity, heights);
-                    }
-                    if let Some(disclosure) = disclosure {
-                        view.last_background_height_disclosure = Some((revision, disclosure));
-                    }
-                } else {
-                    // The parse was rebased onto edits, or the caret/IME moved
-                    // while it ran, so the prepared heights no longer describe
-                    // the current disclosure. A changed selection, including
-                    // a non-empty selection collapsing to a caret, is retried
-                    // in another background snapshot; rebuilding all selected
-                    // blocks here would put the same document-sized walk back
-                    // on the input thread at the completion boundary. The
-                    // bounded active-end update keeps the caret addressable
-                    // until that snapshot lands.
-                    let current_disclosure = view.active_height_disclosure();
-                    let selection_snapshot_requires_retry = current_disclosure != disclosure
-                        && (current_disclosure.is_some_and(|disclosure| !disclosure.is_empty())
-                            || disclosure.is_some_and(|disclosure| !disclosure.is_empty())
-                            || snapshot_is_collapsing_disclosure);
-                    if selection_snapshot_requires_retry {
-                        if snapshot_is_collapsing_disclosure
-                            && current_disclosure.is_some_and(|disclosure| disclosure.is_empty())
-                        {
-                            // Both snapshots are caret disclosures, so the
-                            // usual non-empty comparison cannot make the
-                            // queued job distinguish the latest caret from
-                            // the one that was captured before it started.
-                            view.force_height_disclosure_snapshot = true;
-                        }
-                        view.schedule_document_parse(cx);
-                        view.ensure_active_disclosure_height();
-                    } else if current_disclosure != disclosure {
-                        // Moving between two caret disclosures only needs the
-                        // bounded endpoint update; a whole-document snapshot
-                        // would make ordinary cursor motion unnecessarily
-                        // expensive.
-                        view.ensure_active_disclosure_height();
-                    } else {
-                        view.resync_heights_for_current_disclosure();
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Coalesced per-block background job producing the whole-span parse of a
-    /// joinable block that exceeds either synchronous line or byte budget — the
-    /// case `presented_block` itself cannot read and reparse synchronously on
-    /// every viewport miss without making a single huge paragraph's render
-    /// cost scale with its length. One job per block, bounded across documents; mirrors
-    /// [`Self::schedule_document_parse`]'s snapshot-and-spawn shape but at
-    /// block granularity, and is what resolves a marker pair arbitrarily far
-    /// apart in such a block without a fixed context window whose result
-    /// would depend on where the viewport happens to sit.
-    fn schedule_joined_parse(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
-        let revision = self.editor().document().revision();
-        for block in blocks {
-            if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
-                // No backlog of obsolete viewport requests. Completion notifies
-                // the view so its current visible blocks can request a free slot.
-                break;
-            }
-            if !block_is_joinable(block.kind) {
-                continue;
-            }
-            // Re-fetched every iteration (cheap: a reference, not a clone) so
-            // its borrow never has to outlive the mutable `self` access below.
-            let document = self.editor().document();
-            let Some(span) = block_line_span(document, block) else {
-                continue;
-            };
-            if block_fits_sync_join_budget(block, &span) {
-                continue;
-            }
-            if self.joined_parse_jobs.contains_key(&block.id)
-                || self
-                    .joined_parse_cache
-                    .get(&block.id)
-                    .is_some_and(|cached| {
-                        cached.revision == revision && cached.source_range == block.source_range
-                    })
-            {
-                continue;
-            }
-            let content = span.start
-                ..span
-                    .end
-                    .saturating_sub(trailing_blank_lines(document, &span));
-            let snapshot = document.clone();
-            let id = block.id;
-            let source_range = block.source_range;
-            let job = JoinedParseJob {
-                document: self.document_key(),
-                revision,
-                source_range,
-            };
-            self.joined_parse_jobs.insert(id, job);
-            self.joined_parse_jobs_running += 1;
-            cx.spawn(async move |view, cx| {
-                let parse =
-                    cx.background_executor()
-                        .spawn(async move {
-                            parse_joined_span(&snapshot, content, source_range, revision)
-                        })
-                        .await;
-                let _ = view.update(cx, |view, cx| {
-                    // Release capacity even for an old document. Dropping a
-                    // Task cannot interrupt synchronous parse already polling;
-                    // capacity remains charged until it really finishes.
-                    view.joined_parse_jobs_running -= 1;
-                    cx.notify();
-                    if view.document_key() != job.document
-                        || view.joined_parse_jobs.get(&id) != Some(&job)
-                    {
-                        return;
-                    }
-                    view.joined_parse_jobs.remove(&id);
-                    // Resolve against the already-published current index;
-                    // never parse source synchronously to validate a result.
-                    // A provisional request can retry once the formal index
-                    // arrives and provides an exact block identity and range.
-                    let current = view
-                        .current_index()
-                        .and_then(|index| index.block_at(source_range.start));
-                    if view.editor().document().revision() != revision
-                        || current.is_none_or(|block| {
-                            block.id != id || block.source_range != source_range
-                        })
-                    {
-                        return;
-                    }
-                    if let Some(parse) = parse {
-                        view.joined_parse_cache.insert(
-                            id,
-                            JoinedBlockCache {
-                                revision,
-                                source_range,
-                                parse,
-                            },
-                        );
-                        // The next viewport miss on this block should read the
-                        // cache instead of the presentation this view already
-                        // built from a bounded, render-window-only parse.
-                        view.block_cache.remove(&id);
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
     }
 
     pub(crate) fn report_error(&mut self, operation: &str, error: BufferError) {
@@ -3544,7 +2797,6 @@ impl EditorView {
         self.after_input(cx);
     }
 
-
     /// Invalidates shaped/layout caches for a new font generation. During an
     /// intermediate wheel-animation frame, keep the existing document-wide
     /// height estimates and let the visible blocks replace only their measured
@@ -3566,7 +2818,6 @@ impl EditorView {
             self.rebuild_height_estimates();
         }
     }
-
 
     /// The presented line under a mouse event, from the mapping the last frame
     /// recorded. Only rendered lines can be clicked, so a miss means the frame
@@ -5911,7 +5162,7 @@ impl Render for EditorView {
             .scroll_inertia
             .is_some_and(|inertia| inertia.last_applied == self.scroll_y);
         if self.settings_open {
-            return self.settings_screen_element(cx);
+            return self.settings_screen_element(window, cx);
         }
         self.schedule_document_parse(cx);
         self.viewport_height = (f32::from(window.viewport_size().height)
@@ -10772,7 +10023,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10819,7 +10074,11 @@ mod tests {
 
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(partial), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Ok(partial),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10871,7 +10130,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
@@ -10944,7 +10207,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             view.finish_work_folder_scan(
-                (Ok(work_folder), Err(error), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Err(error),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
             // A save failure arriving well after the recovery warning was
@@ -11262,7 +10529,11 @@ mod tests {
         };
         view.update(cx, |view, cx| {
             view.finish_work_folder_scan(
-                (Ok(work_folder), Ok(recovered), work_folder_scan_timestamp_for_test()),
+                (
+                    Ok(work_folder),
+                    Ok(recovered),
+                    work_folder_scan_timestamp_for_test(),
+                ),
                 cx,
             );
         });
