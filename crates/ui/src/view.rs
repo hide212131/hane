@@ -4464,6 +4464,28 @@ impl EditorView {
         }
     }
 
+    /// Marks that this view just received a `ScrollWheelEvent`, so the next
+    /// `record_frame_instrumentation` call can pair it with that frame's own
+    /// mach-clock paint/submission time (Issue #427's measurement-only
+    /// correlation tool). Purely an observation hook: it records nothing
+    /// about what the scroll did and never changes scroll behavior.
+    ///
+    /// Only the first receipt in a pending interval is kept: if another
+    /// `ScrollWheelEvent` arrives before `record_frame_instrumentation` has
+    /// consumed the pending tick, that later receipt is dropped rather than
+    /// overwriting the earlier one, so the measured interval always spans
+    /// from the first receipt to the next paint.
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {
+        if self.instrumentation.pending_scroll_receipt_ticks.is_some() {
+            return;
+        }
+        if self.instrumentation.scroll_event_timing.is_some()
+            && let Some(ticks) = hane_metrics::mach_absolute_ticks()
+        {
+            self.instrumentation.pending_scroll_receipt_ticks = Some(ticks);
+        }
+    }
+
     pub(crate) fn record_frame_instrumentation(
         &mut self,
         measurements: &[InputMeasurement],
@@ -4471,6 +4493,18 @@ impl EditorView {
         layout: Option<Duration>,
     ) {
         let instrumentation = &mut self.instrumentation;
+        // `paint_ticks` is when `InputCapture::paint` ran (inside
+        // `Window::draw`), not when the platform renderer actually presented
+        // the frame to the compositor; `ScrollEventTimingOutput::record`
+        // reports that true presentation time as unavailable rather than
+        // treating this as it.
+        if let Some(receipt_ticks) = instrumentation.pending_scroll_receipt_ticks.take()
+            && let Some(paint_ticks) = hane_metrics::mach_absolute_ticks()
+            && let Some(output) = &mut instrumentation.scroll_event_timing
+            && let Err(error) = output.record(receipt_ticks, paint_ticks)
+        {
+            eprintln!("could not write scroll event timing: {error}");
+        }
         if instrumentation.ready_armed && !instrumentation.ready_reported {
             instrumentation.ready_reported = true;
             let startup = instrumentation.process_started.elapsed();
@@ -4584,6 +4618,8 @@ impl EditorView {
     pub(crate) fn step_measurement_scroll(&mut self, _window: &mut Window) {}
 
     fn record_block_index_update(&mut self, _update: &BlockIndexUpdate) {}
+
+    pub(crate) fn record_scroll_receipt_for_measurement(&mut self) {}
 
     pub(crate) fn record_frame_instrumentation(
         &mut self,
@@ -6021,6 +6057,24 @@ mod tests {
             None,
             "test views must not query the host OS input source"
         );
+    }
+
+    // Issue #427's scroll-event measurement harness pairs one receipt with
+    // the next paint; a second `ScrollWheelEvent` arriving first must not
+    // discard the earlier receipt still waiting for that paint.
+    #[cfg(any(feature = "instrument", feature = "timing-probe"))]
+    #[gpui::test]
+    fn scroll_receipt_for_measurement_keeps_the_first_pending_tick(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("", "Untitled", cx));
+        view.update(cx, |view, _cx| {
+            view.instrumentation.pending_scroll_receipt_ticks = Some(42);
+            view.record_scroll_receipt_for_measurement();
+            assert_eq!(
+                view.instrumentation.pending_scroll_receipt_ticks,
+                Some(42),
+                "a later scroll receipt must not overwrite the one still pending"
+            );
+        });
     }
 
     #[gpui::test]

@@ -485,6 +485,168 @@ class PixelsDirectFollowTests(unittest.TestCase):
         self.assertFalse(result["stable_without_app_coast"])
 
 
+class ScrollEventObservationAttachmentTests(unittest.TestCase):
+    def test_attaching_a_disordered_observation_does_not_change_a_failing_producer_result(self):
+        step = gui.evaluate_lines_coast(
+            100,
+            frames([100, 101, 102, 103, 104, 104, 104, 104],
+                   [136, 160, 184, 208, 232, 256, 290, 340]),
+        )
+        self.assertEqual(step["result"], "fail")
+        observation = {"observation": "observed_disordered", "reason": "順序不整合",
+                       "stages_ms": {}, "clock_consistent": True,
+                       "presentation_observation": "unavailable"}
+        attached = gui.attach_scroll_event_observation(step, observation)
+        self.assertEqual(attached["result"], "fail")
+        self.assertFalse(attached["first_response"])
+        self.assertEqual(attached["scroll_event_observation"], observation)
+
+    def test_attaching_an_unavailable_observation_does_not_change_a_passing_producer_result(self):
+        step = gui.evaluate_lines_coast(
+            100,
+            frames([104, 106, 109, 111, 112, 113, 113, 113],
+                   [8, 24, 48, 72, 108, 144, 190, 240]),
+        )
+        self.assertEqual(step["result"], "pass")
+        attached = gui.attach_scroll_event_observation(step, None)
+        self.assertEqual(attached["result"], "pass")
+        self.assertIsNone(attached["scroll_event_observation"])
+
+    def test_attaching_an_observation_does_not_mutate_the_original_step(self):
+        step = gui.evaluate_lines_coast(
+            100,
+            frames([104, 106, 109, 111, 112, 113, 113, 113],
+                   [8, 24, 48, 72, 108, 144, 190, 240]),
+        )
+        gui.attach_scroll_event_observation(step, {"observation": "observed_ordered"})
+        self.assertNotIn("scroll_event_observation", step)
+
+
+class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
+    class _StubInteraction:
+        def __init__(self, output, ocr_text="LINE 100"):
+            self.output = output
+            self.ocr_text = ocr_text
+            self.calls: list[list[str]] = []
+
+        def run_helper(self, _helper, args, _timeout):
+            self.calls.append(args)
+            if args[0] == "wheel-measure":
+                return True, self.output, ""
+            if args[0] == "ocr":
+                return True, self.ocr_text, ""
+            raise AssertionError(f"unexpected helper command: {args[0]}")
+
+    class _StubObservationModule:
+        def __init__(self):
+            self.parse_calls: list[tuple[str, int]] = []
+            self.assessed = {"observation": "observed_ordered", "reason": None,
+                             "stages_ms": {}, "clock_consistent": True,
+                             "presentation_observation": "unavailable"}
+
+        def parse_wheel_measure_output(self, output, expected_frames):
+            self.parse_calls.append((output, expected_frames))
+            return {"stub_record": True}
+
+        def assess_wheel_measurement(self, record):
+            assert record == {"stub_record": True}
+            return self.assessed
+
+    WHEEL_MEASURE_OUTPUT = (
+        "event_route=cghidEventTap\n"
+        "event_post_ticks=1000000\n"
+        "mach_timebase_numer=1\n"
+        "mach_timebase_denom=1\n"
+        "product_scroll_receipt_ticks=1100000\n"
+        "product_frame_paint_ticks=1400000\n"
+        "product_frame_presented_ticks=unavailable\n"
+        "product_mach_timebase_numer=1\n"
+        "product_mach_timebase_denom=1\n"
+        "frame_00_capture_started_ticks=2000000\n"
+        "frame_00_capture_completed_ticks=2200000\n"
+    )
+
+    def test_uses_wheel_measure_and_attaches_a_separate_observer_classification(self):
+        interaction = self._StubInteraction(self.WHEEL_MEASURE_OUTPUT)
+        observation_module = self._StubObservationModule()
+        timing_path = Path("/tmp/hane-wheel-measure-wiring-test/timing.log")
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-measure-wiring-test"), "lines", -8, (0,), 1.0,
+            scroll_event_timing_path=timing_path,
+            scroll_event_observation_module=observation_module,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(interaction.calls[0][0], "wheel-measure")
+        self.assertIn(str(timing_path), interaction.calls[0])
+        self.assertEqual(len(frames_out), 1)
+        self.assertAlmostEqual(frames_out[0]["capture_started_elapsed_ms"], 1.0)
+        self.assertAlmostEqual(frames_out[0]["capture_completed_elapsed_ms"], 1.2)
+        self.assertEqual(observation_module.parse_calls, [(self.WHEEL_MEASURE_OUTPUT, 1)])
+        self.assertEqual(observation, observation_module.assessed)
+
+    def test_without_scroll_event_timing_path_falls_back_to_wheel_capture_unchanged(self):
+        def run_helper(_helper, args, _timeout):
+            if args[0] == "wheel-capture":
+                return True, (
+                    "event_route=cghidEventTap\n"
+                    "event_post_elapsed_ms=1.0\n"
+                    "frame_00_capture_started_ms=2.0\n"
+                    "frame_00_capture_completed_ms=3.0\n"
+                ), ""
+            if args[0] == "ocr":
+                return True, "LINE 100", ""
+            raise AssertionError(f"unexpected helper command: {args[0]}")
+
+        interaction = self._StubInteraction("")
+        interaction.run_helper = run_helper
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-capture-default-test"), "lines", -8, (0,), 1.0,
+        )
+        self.assertIsNone(error)
+        self.assertIsNone(observation)
+        self.assertEqual(len(frames_out), 1)
+
+    def test_missing_observation_module_also_falls_back_to_wheel_capture(self):
+        # Opting into HANE_SCROLL_EVENT_TIMING_PATH alone must not switch the
+        # helper command without an observation module to interpret it with.
+        def run_helper(_helper, args, _timeout):
+            if args[0] == "wheel-capture":
+                return True, (
+                    "event_route=cghidEventTap\n"
+                    "event_post_elapsed_ms=1.0\n"
+                    "frame_00_capture_started_ms=2.0\n"
+                    "frame_00_capture_completed_ms=3.0\n"
+                ), ""
+            if args[0] == "ocr":
+                return True, "LINE 100", ""
+            raise AssertionError(f"unexpected helper command: {args[0]}")
+
+        interaction = self._StubInteraction("")
+        interaction.run_helper = run_helper
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-capture-no-module-test"), "lines", -8, (0,), 1.0,
+            scroll_event_timing_path=Path("/tmp/hane-wheel-capture-no-module-test/timing.log"),
+        )
+        self.assertIsNone(error)
+        self.assertIsNone(observation)
+        self.assertEqual(len(frames_out), 1)
+
+
+class VisionWarmupFailsClosedTests(unittest.TestCase):
+    def test_visible_line_numbers_surfaces_raw_vision_errors_through_fail(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        body = source.split("func visibleLineNumbers(", 1)[1].split("\n}", 1)[0]
+        self.assertIn('fail("could not inspect captured scroll frame: \\(error)")', body)
+
+    def test_accurate_recognition_comment_does_not_claim_runtime_proof(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        body = source.split("func visibleLineNumbers(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("not proof this configuration is crash-free during an", body)
+
+
 class DocumentEdgeTests(unittest.TestCase):
     def test_accepts_reaching_and_staying_at_each_edge(self):
         top = gui.evaluate_document_edge(
