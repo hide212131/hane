@@ -26,7 +26,7 @@ SCOPE_NOTE = (
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
     "Lines / Pixelsの80ms初回応答は、同じScreenCaptureKitサンプルの画像とWindowServer表示時刻で確認する。"
     "余韻・減速・安定は従来の画面取得系列で135msの慣性窓内を確認し、callback遅延と表示時刻を分けて記録する。"
-    "中間位置への位置決め入力は、Hane側receiptと複数時点の画面を記録するが、受入判定には使わない。"
+    "中間位置への位置決めは較正済みの通常画面取得経路で送り、複数時点の画面で位置のみ確認する。受入判定には使わない。"
     "Pixelsは応答付近を連続して撮影し、反転入力は複数の旧方向候補画面を撮影した直後に送り、OCRはその後に行って慣性窓を消費しない。"
     "文書先頭のOCR前に挿入カーソルを先頭行末へ移し、先頭文字の読み取りを妨げない。"
     "両入力は共通のcghidEventTap経路で送り、経路と画面応答を記録する。"
@@ -815,10 +815,12 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
 
 def position_document_midpoint(interaction, module, env, config, helper, pid: int,
                                window_id: str, scenario_dir: Path, helper_timeout: float,
-                               downward_sign: int, label: str,
-                               scroll_event_timing_path: Path,
-                               scroll_event_observation_module: Optional[object]
+                               downward_sign: int, label: str
                                ) -> tuple[dict, Optional[list[int]], str]:
+    # This only establishes a starting location, so keep it on the regular
+    # wheel-capture path that direction calibration already exercised. The
+    # timed display stream is reserved for the actual Lines/Pixels acceptance
+    # inputs below; positioning itself is never acceptance evidence.
     top_step, top_lines, _top_text = move_to_document_top(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir, f"{label}-top", helper_timeout)
@@ -834,8 +836,6 @@ def position_document_midpoint(interaction, module, env, config, helper, pid: in
             scenario_dir / f"{label}-scroll-{attempt_number:02d}", "lines",
             downward_sign * POSITIONING_LINES_DELTA,
             POSITIONING_FRAME_DELAYS_MS, helper_timeout,
-            scroll_event_timing_path=scroll_event_timing_path,
-            scroll_event_observation_module=scroll_event_observation_module,
         )
         position_frames.extend(frames)
         if error:
@@ -895,8 +895,7 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
     steps: list[dict] = []
     position, position_lines, _position_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
-        helper_timeout, downward_sign, "lines-positioning",
-        scroll_event_timing_path, scroll_event_observation_module)
+        helper_timeout, downward_sign, "lines-positioning")
     steps.append(position)
     if position["result"] != "pass":
         steps.extend(skipped(name, "文書中央の検査開始位置を確認できなかった") for name in (
@@ -998,8 +997,7 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
 
     pixel_position, before_lines, before_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
-        helper_timeout, downward_sign, "pixels-before",
-        scroll_event_timing_path, scroll_event_observation_module)
+        helper_timeout, downward_sign, "pixels-before")
     if pixel_position["result"] == "pass":
         before_pixel_offset = min(before_lines) if before_lines else None
         frames, pixels_scroll_event_observation, error = capture_frames(

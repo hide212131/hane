@@ -687,40 +687,6 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(len(observation["window_server_display_responses"]), 2)
         self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
 
-    def test_incomplete_display_response_collection_keeps_position_frames_and_receipt(self):
-        output = self.WHEEL_MEASURE_OUTPUT.replace(
-            "display_response_collection_valid=true", "display_response_collection_valid=false")
-        for index in range(1, 6):
-            started_ticks = 2_000_000 + index * 48_000_000
-            completed_ticks = started_ticks + 200_000
-            output += (
-                f"\nframe_{index:02d}_capture_started_ticks={started_ticks}"
-                f"\nframe_{index:02d}_capture_completed_ticks={completed_ticks}"
-            )
-        interaction = self._StubInteraction(output, ocr_text="LINE 200")
-        timing_path = Path("/tmp/hane-incomplete-display-collection-test/timing.log")
-        with patch.object(
-            gui, "move_to_document_top",
-            return_value=({"result": "pass"}, [1, 2], "LINE 001\nLINE 002"),
-        ):
-            result, lines, text = gui.position_document_midpoint(
-                interaction, None, None, None, "helper", 10, "window",
-                Path("/tmp/hane-incomplete-display-collection-test"), 1.0, -1,
-                "lines-positioning", timing_path, scroll_event_observation,
-            )
-
-        measurement = result["scroll_event_observation"]
-        self.assertEqual(result["result"], "pass")
-        self.assertEqual(lines, [200])
-        self.assertEqual(text, "LINE 200")
-        self.assertEqual(len(result["frames"]), 6)
-        self.assertEqual(result["frames"][0]["event_route"], "cghidEventTap")
-        self.assertEqual(measurement["observation"], "unavailable")
-        self.assertIn("WindowServer display response collection", measurement["display_response_error"])
-        self.assertIn("product_scroll_receipt_ticks=1100000", measurement["wheel_measure_output_excerpt"])
-        self.assertEqual(measurement["window_server_display_responses"], [])
-        self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 6)
-
     def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
             "event_route=cghidEventTap", "event_route=target_pid")
@@ -891,11 +857,9 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         stalled_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
         position_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
         observations = []
-        timing_path = Path("/tmp/hane-position-measurement-test/timing.log")
-        observation_module = object()
 
         def capture(*_args, **_kwargs):
-            observation = {"observation": "observed_ordered", "receipt_ticks": 123 + len(observations)}
+            observation = None
             observations.append(observation)
             if capture_error:
                 return top_frames, observation, capture_error
@@ -908,12 +872,12 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
             result, lines, text = gui.position_document_midpoint(
                 object(), object(), object(), object(), "helper", 123, "window",
                 Path("/tmp/hane-position-measurement-test"), 2.0, -1,
-                "lines-positioning", timing_path, observation_module,
+                "lines-positioning",
             )
-        return result, lines, text, capture_mock, top_frames, position_frames, observations, timing_path, observation_module
+        return result, lines, text, capture_mock, top_frames, position_frames, observations
 
     def test_positioning_uses_calibrated_small_input_until_midpoint_is_visible(self):
-        result, lines, text, capture, top_frames, position_frames, observations, timing_path, observation_module = (
+        result, lines, text, capture, top_frames, position_frames, observations = (
             self._run_position([180, 181, 182])
         )
         self.assertEqual(result["result"], "pass")
@@ -921,7 +885,7 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         self.assertEqual(text, "position frame")
         self.assertEqual(result["frames"], top_frames + position_frames)
         self.assertEqual(len(result["positioning_attempts"]), 2)
-        self.assertIs(result["scroll_event_observation"], observations[-1])
+        self.assertIsNone(result["scroll_event_observation"])
         self.assertEqual(capture.call_count, 2)
         for index, call in enumerate(capture.call_args_list, start=1):
             args, kwargs = call
@@ -930,12 +894,12 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
             self.assertEqual(args[8:12], (
                 "lines", -gui.POSITIONING_LINES_DELTA,
                 gui.POSITIONING_FRAME_DELAYS_MS, 2.0))
-            self.assertEqual(kwargs["scroll_event_timing_path"], timing_path)
-            self.assertIs(kwargs["scroll_event_observation_module"], observation_module)
+            self.assertNotIn("scroll_event_timing_path", kwargs)
+            self.assertNotIn("scroll_event_observation_module", kwargs)
 
     def test_small_top_movement_does_not_count_as_midpoint(self):
         near_top = list(range(2, 23))
-        result, lines, text, capture, _top_frames, _position_frames, observations, *_ = self._run_position(
+        result, lines, text, capture, _top_frames, _position_frames, observations = self._run_position(
             near_top
         )
         self.assertEqual(result["result"], "blocked")
@@ -945,10 +909,10 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         self.assertEqual(capture.call_count, 5)
         self.assertEqual(result["visible_lines"], near_top)
         self.assertEqual(result["positioning_attempts"][-1]["visible_lines"], near_top)
-        self.assertIs(result["scroll_event_observation"], observations[-1])
+        self.assertIsNone(result["scroll_event_observation"])
 
-    def test_capture_error_remains_blocked_and_keeps_partial_measurement_evidence(self):
-        result, lines, text, _capture, top_frames, _position_frames, observations, *_ = self._run_position(
+    def test_capture_error_remains_blocked_and_keeps_partial_positioning_evidence(self):
+        result, lines, text, _capture, top_frames, _position_frames, observations = self._run_position(
             [180, 181], "scroll receipt unavailable"
         )
         self.assertEqual(result["result"], "blocked")
@@ -956,12 +920,12 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         self.assertIsNone(lines)
         self.assertEqual(text, "")
         self.assertEqual(result["frames"], top_frames)
-        self.assertIs(result["scroll_event_observation"], observations[-1])
+        self.assertIsNone(result["scroll_event_observation"])
 
 
 class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
     # The focused checker uses one calibrated direction for Lines and Pixels,
-    # and both measured captures opt into the same wheel-measure path.
+    # and both acceptance captures opt into the same wheel-measure path.
     def test_pixels_capture_opts_into_wheel_measure_with_the_shared_timing_path(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         body = source.split("def run_scroll_behavior_checks(", 1)[1]
@@ -981,13 +945,29 @@ class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
         self.assertIn('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', branch)
         self.assertNotIn("capture_frames(", capture)
 
-    def test_lines_positioning_uses_the_shared_timing_path_and_observer(self):
+    def test_lines_positioning_uses_regular_capture_without_acceptance_timing(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         body = source.split("def run_scroll_behavior_checks(", 1)[1]
         position_call = body.split('position, position_lines, _position_text = position_document_midpoint(', 1)[1]
         position_call = position_call.split(")", 1)[0]
         self.assertIn('"lines-positioning"', position_call)
-        self.assertIn("scroll_event_timing_path, scroll_event_observation_module", position_call)
+        self.assertNotIn("scroll_event_timing_path", position_call)
+        self.assertNotIn("scroll_event_observation_module", position_call)
+
+        pixel_position_call = body.split(
+            'pixel_position, before_lines, before_text = position_document_midpoint(', 1)[1]
+        pixel_position_call = pixel_position_call.split(")", 1)[0]
+        self.assertIn('"pixels-before"', pixel_position_call)
+        self.assertNotIn("scroll_event_timing_path", pixel_position_call)
+        self.assertNotIn("scroll_event_observation_module", pixel_position_call)
+
+    def test_lines_coast_keeps_windowserver_acceptance_measurement(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def run_scroll_behavior_checks(", 1)[1]
+        lines_call = body.split('"lines-coast", "lines", downward_sign * 8,', 1)[1]
+        lines_call = lines_call.split("if error:", 1)[0]
+        self.assertIn("scroll_event_timing_path=scroll_event_timing_path", lines_call)
+        self.assertIn("scroll_event_observation_module=scroll_event_observation_module", lines_call)
 
 
 class ScrollDirectionCalibrationTests(unittest.TestCase):
