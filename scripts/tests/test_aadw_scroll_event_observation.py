@@ -106,6 +106,40 @@ class AssessWheelMeasurementTests(unittest.TestCase):
         # disordered observation rather than discarded.
         self.assertIn("scroll_receipt_ms", result["stages_ms"])
 
+    def test_an_early_pre_paint_frame_does_not_cause_a_disordered_observation(self):
+        # Reproduces Issue #427's observed gap: frame 0 is scheduled at 0ms
+        # delay and its capture legitimately starts before Hane's own paint
+        # (1.565ms vs. a 34.215ms paint), while frame 1 starts well after
+        # paint. The causal chain itself (event post -> receipt -> paint) is
+        # still in order, so this must be `observed_ordered`, not
+        # `observed_disordered` from comparing frame 0 against paint.
+        output = "\n".join([
+            "event_route=cghidEventTap",
+            "event_post_ticks=0",
+            "mach_timebase_numer=1",
+            "mach_timebase_denom=1",
+            "product_scroll_receipt_ticks=2534000",
+            "product_frame_paint_ticks=34215000",
+            "product_frame_presented_ticks=unavailable",
+            "product_mach_timebase_numer=1",
+            "product_mach_timebase_denom=1",
+            "frame_00_capture_started_ticks=1565000",
+            "frame_00_capture_completed_ticks=3000000",
+            "frame_01_capture_started_ticks=59002000",
+            "frame_01_capture_completed_ticks=72418000",
+        ]) + "\n"
+        record = scroll_event_observation.parse_wheel_measure_output(output, expected_frames=2)
+        result = scroll_event_observation.assess_wheel_measurement(record)
+        self.assertEqual(result["observation"], "observed_ordered")
+        self.assertTrue(result["clock_consistent"])
+        self.assertIsNone(result["reason"])
+        frames_ms = result["stages_ms"]["frames_ms"]
+        self.assertTrue(frames_ms[0]["captured_before_paint"])
+        self.assertFalse(frames_ms[1]["captured_before_paint"])
+        # Raw timestamps are preserved even for the pre-paint frame.
+        self.assertAlmostEqual(frames_ms[0]["capture_started_ms"], 1.565)
+        self.assertAlmostEqual(frames_ms[1]["capture_started_ms"], 59.002)
+
     def test_presentation_is_always_reported_unavailable_when_measurement_is_unavailable(self):
         record = scroll_event_observation.parse_wheel_measure_output(
             helper_output(include_product=False), expected_frames=1

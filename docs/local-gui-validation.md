@@ -82,7 +82,7 @@ comment router は trusted default branch の workflow / script だけを使い�
 
 procedure version は trusted default branch の `scripts/hosted_gui_interaction.py` にある `PROCEDURE_VERSION` を読み、人に転記させない。現在の総合 procedure は `hosted-gui-interaction/7` である。
 
-`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/8`) からtrusted routerが読み取る。
+`scroll-inertia` のprocedure versionは `scripts/hosted_scroll_inertia_gui.py` の `PROCEDURE_VERSION` (`hosted-scroll-inertia/9`) からtrusted routerが読み取る。
 
 router が作る依頼は PR、exact head、router が観測した current base、execution context、procedure に結び付ける。同じ context の queued / in-progress / success run がすでにある場合は重複起動を抑止する。base SHA も識別に含めるため、head が同じまま target branch が進んだ場合に、古い base の成功 run を current evidence として自動再利用しない。
 

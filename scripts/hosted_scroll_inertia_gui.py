@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/8"
+PROCEDURE_VERSION = "hosted-scroll-inertia/9"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -600,9 +600,12 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
     contents = "\n".join(f"LINE {number:03d}" for number in range(1, LINE_COUNT + 1)) + "\n"
     fixture.write_text(contents, encoding="utf-8")
     # Issue #427: Hane writes its own mach-clock scroll-timing record to this
-    # path only when launched with HANE_SCROLL_EVENT_TIMING_PATH set; wiring
-    # it here lets the lines_coast capture below also produce a separate
-    # observer classification of the one scroll input both processes see.
+    # path only when launched with HANE_SCROLL_EVENT_TIMING_PATH set; Hane
+    # appends one line per ScrollWheelEvent it receives for as long as the one
+    # process launched below keeps running, so the same path and the one
+    # running process underneath also let the pixels_direct_follow capture
+    # later in this scenario pick up its own, separate scroll input's record
+    # without mixing it up with the lines_coast one above.
     scroll_event_timing_path = scenario_dir / "scroll-event-timing.log"
     config = interaction.make_config(
         gui_validate, workspace_dir=target_dir, scenario="scroll-inertia-focused",
@@ -731,19 +734,26 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                         interaction, gui_validate, env, config, helper, window_id,
                         scenario_dir, "pixels-before", helper_timeout)
                     before_pixel_offset = min(before_lines) if before_lines else None
-                    frames, _pre, error = capture_frames(
+                    frames, pixels_scroll_event_observation, error = capture_frames(
                         interaction, gui_validate, env, config, helper, pid, window_id,
                         scenario_dir / "pixels-direct-follow",
-                        "pixels", -180, PIXELS_FRAME_DELAYS_MS, helper_timeout)
+                        "pixels", -180, PIXELS_FRAME_DELAYS_MS, helper_timeout,
+                        scroll_event_timing_path=scroll_event_timing_path,
+                        scroll_event_observation_module=scroll_event_observation_module,
+                    )
                     pixel_step = (
                         step("pixels_direct_follow", "blocked", error)
                         if error else evaluate_pixels(before_pixel_offset, frames)
                     )
+                    pixel_step = attach_scroll_event_observation(
+                        pixel_step, pixels_scroll_event_observation)
                     pixel_step["baseline_visible_lines"] = before_lines
                     pixel_step["baseline_text"] = before_text
                     if before_capture["result"] != "pass":
-                        pixel_step = step("pixels_direct_follow", "blocked",
-                                          before_capture.get("reason") or "Pixels前の画面を取得できない")
+                        pixel_step = attach_scroll_event_observation(
+                            step("pixels_direct_follow", "blocked",
+                                 before_capture.get("reason") or "Pixels前の画面を取得できない"),
+                            pixels_scroll_event_observation)
                     steps.append(pixel_step)
                 else:
                     steps.append(step("pixels_direct_follow", "blocked", reset_error))
