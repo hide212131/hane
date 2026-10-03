@@ -837,6 +837,65 @@ class ScrollDirectionCalibrationTests(unittest.TestCase):
         self.assertIn("offset > baseline", body)
         self.assertIn("direction-calibration-final-reset", body)
 
+    def test_moves_caret_past_first_line_before_ocr(self):
+        class RecordingInteraction:
+            def __init__(self):
+                self.calls = []
+
+            def run_helper(self, helper, arguments, timeout):
+                self.calls.append((helper, arguments, timeout))
+                return True, "", None
+
+        interaction = RecordingInteraction()
+        expected_calls = [
+            ("helper", ["move-doc-start", "123"], 1.0),
+            ("helper", ["move-caret", "123", "right", "8"], 1.0),
+        ]
+
+        def capture_after_caret_move(*_args):
+            self.assertEqual(interaction.calls, expected_calls)
+            return {"result": "pass"}, [1, 2], "LINE 001\nLINE 002"
+
+        with patch.object(gui, "capture_single", side_effect=capture_after_caret_move):
+            result, lines, recognized = gui.move_to_document_top(
+                interaction, None, None, None, "helper", 123, "window",
+                Path(__file__).parent, "test-top", 1.0,
+            )
+
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(lines, [1, 2])
+        self.assertEqual(recognized, "LINE 001\nLINE 002")
+
+    def assert_helper_failure_blocks_capture(self, failed_call):
+        class RecordingInteraction:
+            def __init__(self):
+                self.calls = []
+
+            def run_helper(self, helper, arguments, timeout):
+                self.calls.append((helper, arguments, timeout))
+                if len(self.calls) == failed_call:
+                    return False, "", "expected helper failure"
+                return True, "", None
+
+        interaction = RecordingInteraction()
+        with patch.object(gui, "capture_single") as capture:
+            result, lines, recognized = gui.move_to_document_top(
+                interaction, None, None, None, "helper", 123, "window",
+                Path(__file__).parent, "test-top", 1.0,
+            )
+
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["reason"], "expected helper failure")
+        self.assertIsNone(lines)
+        self.assertEqual(recognized, "")
+        capture.assert_not_called()
+
+    def test_document_start_helper_failure_blocks_ocr_capture(self):
+        self.assert_helper_failure_blocks_capture(failed_call=1)
+
+    def test_caret_helper_failure_blocks_ocr_capture(self):
+        self.assert_helper_failure_blocks_capture(failed_call=2)
+
     def test_failed_final_reset_preserves_ocr_evidence(self):
         top = gui.step(
             "direction-calibration-top", "pass", visible_lines=[1],
@@ -909,7 +968,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/12")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/13")
 
 
 class DocumentEdgeTests(unittest.TestCase):
