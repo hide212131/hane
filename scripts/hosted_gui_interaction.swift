@@ -345,6 +345,24 @@ func activateApplication(_ pid: pid_t) {
     }
 }
 
+func applicationFocusEvidence(_ pid: pid_t, _ windowID: CGWindowID) ->
+    (frontmostPID: Int?, applicationActive: Bool, targetWindowVisible: Bool) {
+    let frontmostPID = NSWorkspace.shared.frontmostApplication.map {
+        Int($0.processIdentifier)
+    }
+    let applicationActive = NSRunningApplication(processIdentifier: pid)?.isActive ?? false
+    let windows = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[String: Any]] ?? []
+    let targetWindowVisible = windows.contains { row in
+        guard let ownerPID = row[kCGWindowOwnerPID as String] as? Int,
+              let number = row[kCGWindowNumber as String] as? Int,
+              let layer = row[kCGWindowLayer as String] as? Int else { return false }
+        return ownerPID == Int(pid) && number == Int(windowID) && layer == 0
+    }
+    return (frontmostPID, applicationActive, targetWindowVisible)
+}
+
 func deactivateApplication() {
     // Change the global input source while the target editor is not the key
     // application. GPUI reactivates the key window's NSTextInputContext when
@@ -1153,6 +1171,7 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     // ScreenCaptureKit setup runs in this helper process, so restore Hane as
     // the foreground app before the timestamped input event.
     focus(pid)
+    let focusEvidence = applicationFocusEvidence(pid, windowID)
     let timingOffsetBefore = fileSizeOrZero(timingPath)
 
     let eventPostedTicks = postScrollTicks(pid, unit, delta)
@@ -1209,8 +1228,15 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         return path
     }
     let displayResponseArtifactWrittenTicks = monotonicTicks()
+    let frontmostPIDText = focusEvidence.frontmostPID.map { String($0) } ?? "unavailable"
+    let applicationActiveText = focusEvidence.applicationActive ? "true" : "false"
+    let targetWindowVisibleText = focusEvidence.targetWindowVisible ? "true" : "false"
 
     print("event_route=cghidEventTap")
+    print("focus_target_pid=\(pid)")
+    print("focus_frontmost_pid=\(frontmostPIDText)")
+    print("focus_application_active=\(applicationActiveText)")
+    print("focus_target_window_visible=\(targetWindowVisibleText)")
     print("event_post_ticks=\(eventPostedTicks)")
     print("mach_timebase_numer=\(machTimebaseInfo.numer)")
     print("mach_timebase_denom=\(machTimebaseInfo.denom)")
