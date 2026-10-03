@@ -38,6 +38,9 @@ jobs:
       - name: Test AADW GUI command policy
         run: python3 .github/tests/test_aadw_gui_command.py
 
+      - name: Test saved GUI artifact OCR replay
+        run: python3 .github/tests/test_aadw_gui_ocr_replay.py
+
       - name: Test code-block focused GUI procedure
         run: python3 scripts/tests/test_hosted_code_block_gui.py
 
