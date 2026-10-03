@@ -443,6 +443,11 @@ impl EditorView {
     /// `gpui::PinchEvent`), so it is applied directly as a multiplicative
     /// factor rather than accumulated first.
     pub(super) fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A direct-manipulation pinch takes ownership of the viewport even
+        // when its first event is neutral. A still-running Lines-wheel coast
+        // must not keep moving the document underneath the zoom gesture
+        // (issue #389).
+        self.scroll_inertia = None;
         let factor = (1.0 + event.delta).max(0.1);
         let window_offset = f32::from(event.position.y) - self.theme.header_height;
         self.apply_direct_zoom_factor(factor, window_offset, cx);

@@ -12336,6 +12336,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn starting_a_trackpad_pinch_cancels_a_live_inertia_coast(cx: &mut gpui::TestAppContext) {
+        // A neutral first pinch event can establish gesture ownership before
+        // the scale changes. The old Lines-wheel coast must stop at that
+        // point, just as it does when modifier-wheel starts zooming (issue
+        // #389).
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let position = point(px(480.0), px(400.0));
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_scroll(
+                &ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(point(0.0, -5.0)),
+                    modifiers: gpui::Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_some()),
+            "a plain wheel scroll must arm inertia before the pinch arrives"
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_pinch(
+                &gpui::PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers: gpui::Modifiers::none(),
+                    phase: gpui::TouchPhase::Moved,
+                },
+                window,
+                cx,
+            );
+        });
+
+        assert!(
+            view.read_with(cx, |view, _| view.scroll_inertia.is_none()),
+            "even a neutral pinch-begin event must cancel the old scroll coast"
+        );
+        assert_eq!(view.read_with(cx, |view, _| view.zoom), 1.0);
+        let scroll_y_after_pinch = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(
+            !view.update(cx, |view, _cx| view.advance_scroll_inertia()),
+            "the cancelled coast must not advance after the pinch takes ownership"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.scroll_y),
+            scroll_y_after_pinch
+        );
+    }
+
+    #[gpui::test]
     fn height_anchor_recompute_resyncs_a_still_tracking_inertia_coast(cx: &mut gpui::TestAppContext) {
         // Issue #389: `render` calls `step_scroll_inertia` before laying out
         // and remeasuring visible blocks. When a block being remeasured (e.g.
