@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "hosted_scroll_inertia_gui.py"
 SWIFT_HELPER_PATH = Path(__file__).resolve().parents[1] / "hosted_gui_interaction.swift"
@@ -835,6 +836,33 @@ class ScrollDirectionCalibrationTests(unittest.TestCase):
         self.assertIn('((1, "positive"), (-1, "negative"))', body)
         self.assertIn("offset > baseline", body)
         self.assertIn("direction-calibration-final-reset", body)
+
+    def test_failed_final_reset_preserves_ocr_evidence(self):
+        top = gui.step(
+            "direction-calibration-top", "pass", visible_lines=[1],
+            recognized_text="LINE 001",
+        )
+        failed_reset = gui.step(
+            "direction-calibration-final-reset", "blocked",
+            "文書先頭への移動後に先頭行を確認できない",
+            visible_lines=[2], recognized_text="LINE 002",
+        )
+        with (
+            patch.object(gui, "move_to_document_top", side_effect=[
+                (top, [1], "LINE 001"),
+                (failed_reset, [2], "LINE 002"),
+            ]),
+            patch.object(gui, "capture_frames", return_value=(frames([2], [0]), None, None)),
+        ):
+            sign, result = gui.calibrate_scroll_direction(
+                object(), None, None, None, None, 1, "window", Path(__file__).parent, 1.0,
+            )
+
+        self.assertIsNone(sign)
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["reset_visible_lines"], [2])
+        self.assertEqual(result["reset_recognized_text"], "LINE 002")
+        self.assertEqual(result["reset_step"]["visible_lines"], [2])
 
     def test_behavior_inputs_use_one_calibrated_sign(self):
         source = MODULE_PATH.read_text(encoding="utf-8")

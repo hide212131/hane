@@ -35,12 +35,23 @@ on:
         required: false
         type: string
         default: ''
+      source_run_id:
+        description: Completed GUI run whose saved screenshot should be replayed
+        required: false
+        type: string
+        default: ''
+      source_artifact_id:
+        description: Exact artifact id belonging to source_run_id
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: aadw-hosted-gui-pr-${{ inputs.pr_number }}
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -48,6 +59,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
       issues: read
       pull-requests: read
@@ -60,6 +72,8 @@ jobs:
       EXECUTION_CONTEXT: ${{ inputs.execution_context }}
       REQUESTED_PROCEDURE: ${{ inputs.request_procedure }}
       REQUEST_COMMENT_ID: ${{ inputs.request_comment_id }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
 
     steps:
       - name: Check out trusted procedure
@@ -233,11 +247,53 @@ jobs:
               procedure_path='scripts/hosted_scroll_inertia_gui.py'
               validation_kind='scroll-inertia'
               ;;
+            'hosted-gui-ocr-replay/1')
+              procedure_path='scripts/hosted_gui_ocr_replay.py'
+              validation_kind='ocr-replay'
+              ;;
             *)
               echo "::error::Unsupported trusted procedure: ${REQUESTED_PROCEDURE}"
               exit 1
               ;;
           esac
+
+          source_run_attempt=''
+          source_artifact_name=''
+          source_workflow_sha=''
+          if [[ "$validation_kind" == 'ocr-replay' ]]; then
+            if [[ -n "$REQUEST_COMMENT_ID" ]]; then
+              echo '::error::OCR replay is available only through the trusted manual workflow dispatch.'
+              exit 1
+            fi
+            if [[ "$EXECUTION_CONTEXT" != 'merge' || -z "$REQUEST_BASE_SHA" ]]; then
+              echo '::error::OCR replay requires a current merge-context base SHA.'
+              exit 1
+            fi
+            if ! [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo '::error::OCR replay requires positive source_run_id and source_artifact_id values.'
+              exit 1
+            fi
+
+            replay_metadata_dir="$RUNNER_TEMP/aadw-gui-ocr-replay-source"
+            mkdir -p "$replay_metadata_dir"
+            gh api "repos/${REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$replay_metadata_dir/source-run.json"
+            gh api "repos/${REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}" > "$replay_metadata_dir/source-artifact.json"
+            python3 control/scripts/hosted_gui_ocr_replay.py validate-source \
+              --source-run-json "$replay_metadata_dir/source-run.json" \
+              --source-artifact-json "$replay_metadata_dir/source-artifact.json" \
+              --source-run-id "$SOURCE_RUN_ID" \
+              --artifact-id "$SOURCE_ARTIFACT_ID" \
+              --pr-number "$PR_NUMBER" \
+              --repository "$REPOSITORY" \
+              --default-branch "$DEFAULT_BRANCH" \
+              --output "$replay_metadata_dir/provenance.json"
+            source_run_attempt="$(jq -r '.source_run_attempt' "$replay_metadata_dir/provenance.json")"
+            source_artifact_name="$(jq -r '.source_artifact_name' "$replay_metadata_dir/provenance.json")"
+            source_workflow_sha="$(jq -r '.source_workflow_sha' "$replay_metadata_dir/provenance.json")"
+          elif [[ -n "$SOURCE_RUN_ID" || -n "$SOURCE_ARTIFACT_ID" ]]; then
+            echo '::error::Source artifact inputs are valid only for the OCR replay procedure.'
+            exit 1
+          fi
 
           if [[ -n "$comment_procedure_path" && "$comment_procedure_path" != "$procedure_path" ]]; then
             echo "::error::Routed comment procedure does not match the requested procedure path. comment=${comment_procedure_path} requested=${procedure_path}"
@@ -269,9 +325,13 @@ jobs:
             echo "procedure=$actual_procedure"
             echo "procedure_path=$procedure_path"
             echo "validation_kind=$validation_kind"
+            echo "source_run_attempt=$source_run_attempt"
+            echo "source_artifact_name=$source_artifact_name"
+            echo "source_workflow_sha=$source_workflow_sha"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out requested execution tree
+        if: ${{ steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         uses: actions/checkout@v6
         with:
           ref: ${{ steps.preflight.outputs.checkout_ref }}
@@ -280,6 +340,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify exact execution tree
+        if: ${{ steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         id: execution
         shell: bash
         env:
@@ -329,6 +390,7 @@ jobs:
           echo "execution_sha=$execution_sha" >> "$GITHUB_OUTPUT"
 
       - name: Record request context
+        if: ${{ steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         shell: bash
         env:
           EXECUTION_SHA: ${{ steps.execution.outputs.execution_sha }}
@@ -383,7 +445,74 @@ jobs:
               workflow_run_attempt: $run_attempt
             }' > "$RUN_DIR/aadw-context.json"
 
+      - name: Download exact saved GUI artifact for OCR replay
+        if: ${{ steps.preflight.outputs.validation_kind == 'ocr-replay' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ steps.preflight.outputs.source_artifact_name }}
+          path: ${{ runner.temp }}/hane-gui-ocr-replay-source
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run read-only OCR replay on the saved image
+        if: ${{ steps.preflight.outputs.validation_kind == 'ocr-replay' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_BASE_SHA: ${{ steps.preflight.outputs.base_sha }}
+          CONTROL_SHA: ${{ steps.preflight.outputs.control_sha }}
+          SOURCE_WORKFLOW_SHA: ${{ steps.preflight.outputs.source_workflow_sha }}
+          EXPECTED_BASE_REF: ${{ steps.preflight.outputs.base_ref }}
+          SOURCE_DIR: ${{ runner.temp }}/hane-gui-ocr-replay-source
+          RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_DIR"
+
+          current_pr_json="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")"
+          current_state="$(jq -r '.state' <<< "$current_pr_json")"
+          current_draft="$(jq -r '.draft' <<< "$current_pr_json")"
+          current_head_repo="$(jq -r '.head.repo.full_name // ""' <<< "$current_pr_json")"
+          current_head="$(jq -r '.head.sha // ""' <<< "$current_pr_json")"
+          current_base_ref="$(jq -r '.base.ref // ""' <<< "$current_pr_json")"
+          current_base_sha="$(git ls-remote "https://github.com/${REPOSITORY}.git" "refs/heads/${current_base_ref}" | awk 'NR == 1 {print $1}')"
+          if [[ "$current_state" != 'open' || "$current_draft" != 'false' || "$current_head_repo" != "$REPOSITORY" || "$current_head" != "$TARGET_HEAD_SHA" || "$current_base_ref" != "$EXPECTED_BASE_REF" || "$current_base_sha" != "$CURRENT_BASE_SHA" ]]; then
+            echo "::error::PR context changed before OCR replay. state=${current_state} draft=${current_draft} head_repo=${current_head_repo:-unknown} head=${current_head} base_ref=${current_base_ref} base_sha=${current_base_sha}"
+            exit 1
+          fi
+
+          replay_metadata_dir="$RUNNER_TEMP/aadw-gui-ocr-replay-source"
+          if [[ ! -f "$SOURCE_DIR/aadw-context.json" || ! -f "$SOURCE_DIR/result.json" ]]; then
+            echo '::error::The downloaded source artifact is missing its trusted GUI context or result.'
+            exit 1
+          fi
+          source_control_sha="$(jq -r '.control_sha // ""' "$SOURCE_DIR/aadw-context.json")"
+          if ! [[ "$source_control_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The source artifact control SHA is invalid.'
+            exit 1
+          fi
+          if [[ "$source_control_sha" != "$SOURCE_WORKFLOW_SHA" ]]; then
+            echo '::error::The source artifact control SHA does not match its workflow run.'
+            exit 1
+          fi
+          source_helper_blob_sha="$(gh api "repos/${REPOSITORY}/contents/scripts/hosted_gui_interaction.swift?ref=${source_control_sha}" --jq '.sha')"
+          current_helper_blob_sha="$(git -C control rev-parse "HEAD:scripts/hosted_gui_interaction.swift")"
+
+          python3 control/scripts/hosted_gui_ocr_replay.py replay \
+            --source-artifact-dir "$SOURCE_DIR" \
+            --provenance-json "$replay_metadata_dir/provenance.json" \
+            --source-helper-blob-sha "$source_helper_blob_sha" \
+            --current-helper-blob-sha "$current_helper_blob_sha" \
+            --control-sha "$CONTROL_SHA" \
+            --repository "$REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --expected-head-sha "$TARGET_HEAD_SHA" \
+            --current-base-sha "$CURRENT_BASE_SHA" \
+            --expected-macos-version '15.7.9' \
+            --output "$RUN_DIR/ocr-replay.json"
+
       - name: Validate Hane using the trusted procedure
+        if: ${{ steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         env:
           TARGET_DIR: ${{ github.workspace }}/hane
           CONTROL_DIR: ${{ github.workspace }}/control
@@ -441,7 +570,7 @@ jobs:
           esac
 
       - name: Stage public evidence
-        if: always()
+        if: ${{ always() && steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         shell: bash
         env:
           RUN_DIR: ${{ runner.temp }}/hane-gui-interaction
@@ -455,10 +584,19 @@ jobs:
           fi
 
       - name: Upload GUI evidence
-        if: always()
+        if: ${{ always() && steps.preflight.outputs.validation_kind != 'ocr-replay' }}
         uses: actions/upload-artifact@v4
         with:
           name: aadw-gui-evidence-pr-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/hane-gui-artifact
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload OCR replay evidence
+        if: ${{ always() && steps.preflight.outputs.validation_kind == 'ocr-replay' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aadw-gui-ocr-replay-pr-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hane-gui-interaction/ocr-replay.json
           if-no-files-found: error
           retention-days: 14
