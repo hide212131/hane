@@ -349,6 +349,12 @@ def run_replay(args: argparse.Namespace) -> int:
                     "line_001_detected": 1 in visible_lines(ocr_result.stdout),
                     "stderr": ocr_result.stderr,
                 })
+            except OSError as exc:
+                report["ocr"].update({
+                    "completed_at": _utc_now(),
+                    "exit_code": None,
+                    "stderr": str(exc),
+                })
             except subprocess.TimeoutExpired as exc:
                 report["ocr"].update({
                     "completed_at": _utc_now(),

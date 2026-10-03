@@ -5,8 +5,11 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -177,6 +180,63 @@ class SourceImageTests(unittest.TestCase):
     def test_rejects_missing_image(self):
         with tempfile.TemporaryDirectory() as temp, self.assertRaises(FileNotFoundError):
             replay.resolve_source_image(Path(temp))
+
+
+class OcrHelperLaunchFailureTests(unittest.TestCase):
+    def test_records_helper_oserror_in_report_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            image = root / replay.SOURCE_IMAGE
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"png")
+            (root / "aadw-context.json").write_text(
+                json.dumps(source_context()), encoding="utf-8",
+            )
+            (root / "result.json").write_text(
+                json.dumps(source_result()), encoding="utf-8",
+            )
+            provenance_path = root / "provenance.json"
+            provenance_path.write_text(json.dumps(provenance()), encoding="utf-8")
+            report_path = root / "ocr-replay.json"
+            helper_sha = "d" * 40
+            args = SimpleNamespace(
+                source_artifact_dir=str(root),
+                provenance_json=str(provenance_path),
+                pr_number=395,
+                repository=REPOSITORY,
+                expected_head_sha=HEAD_SHA,
+                current_base_sha=BASE_SHA,
+                source_helper_blob_sha=helper_sha,
+                current_helper_blob_sha=helper_sha,
+                control_sha=CONTROL_SHA,
+                expected_macos_version="15.7.9",
+                output=str(report_path),
+            )
+            compile_result = subprocess.CompletedProcess(
+                ["/usr/bin/swiftc"], 0, stdout="", stderr="",
+            )
+            with (
+                patch.object(
+                    replay, "collect_runner",
+                    return_value={
+                        "os": "macOS", "os_version": "15.7.9", "architecture": "arm64",
+                    },
+                ),
+                patch.object(
+                    replay.subprocess, "run",
+                    side_effect=[compile_result, OSError("permission denied")],
+                ),
+            ):
+                result = replay.run_replay(args)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, 1)
+        self.assertEqual(report["product_acceptance"], "not_evaluated")
+        self.assertEqual(report["helper"]["compile_exit_code"], 0)
+        self.assertIsNotNone(report["ocr"]["completed_at"])
+        self.assertIsNone(report["ocr"]["exit_code"])
+        self.assertEqual(report["ocr"]["stderr"], "permission denied")
 
 
 class WorkflowWiringTests(unittest.TestCase):
