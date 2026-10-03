@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 
 TIMED = {"lines_coast": 80.0, "pixels_direct_follow": 80.0, "direction_reversal": 55.0}
-DISPLAY_TIMED_PROCEDURE = "hosted-scroll-inertia/11"
+DISPLAY_TIMED_PROCEDURE = "hosted-scroll-inertia/12"
 
 
 def number(value) -> bool:

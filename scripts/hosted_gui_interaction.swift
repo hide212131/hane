@@ -339,6 +339,9 @@ func activateApplication(_ pid: pid_t) {
     _ = application.activate(options: [.activateAllWindows])
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
     Thread.sleep(forTimeInterval: 0.3)
+    guard application.isActive else {
+        fail("target application did not become the frontmost app: \(pid)")
+    }
 }
 
 func deactivateApplication() {
@@ -465,6 +468,9 @@ func focusEditor(_ pid: pid_t) {
         x: bounds.midX,
         y: bounds.minY + bounds.height * 0.5
     )
+    // `focus(pid)` verifies the app is frontmost before the click. This helper
+    // is a separate short-lived process; the later measurement helpers
+    // reactivate Hane again immediately before each wheel event.
     focus(pid)
     postClick(point)
 }
@@ -554,8 +560,7 @@ func endDocTypeSave(_ pid: pid_t, _ text: String) {
 
 func scrollEditor(_ pid: pid_t, _ pixels: Int32) {
     let bounds = windowBounds(pid)
-    runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.3)
+    activateApplication(pid)
     let point = CGPoint(x: bounds.midX, y: bounds.midY)
     guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left),
@@ -854,13 +859,36 @@ final class WindowServerDisplayCapture: NSObject, SCStreamOutput, SCStreamDelega
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of outputType: SCStreamOutputType) {
         let callbackReceivedTicks = monotonicTicks()
-        guard outputType == .screen, sampleBuffer.isValid,
-              let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
-                sampleBuffer, createIfNecessary: false
-              ) as? [[SCStreamFrameInfo: Any]],
-              let attachments = attachmentsArray.first,
-              let status = attachments[SCStreamFrameInfo.status] as? SCFrameStatus else {
-            rememberError("ScreenCaptureKit sample status or attachments were invalid")
+        guard outputType == .screen else {
+            rememberError("ScreenCaptureKit emitted a non-screen sample")
+            return
+        }
+        guard sampleBuffer.isValid else {
+            rememberError("ScreenCaptureKit emitted an invalid CMSampleBuffer")
+            return
+        }
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]] else {
+            rememberError("ScreenCaptureKit frame attachments could not be read as SCStreamFrameInfo dictionaries")
+            return
+        }
+        guard let attachments = attachmentsArray.first else {
+            rememberError("ScreenCaptureKit sample had no frame attachment dictionary")
+            return
+        }
+        guard let statusValue = attachments[SCStreamFrameInfo.status] else {
+            rememberError("ScreenCaptureKit frame attachments had no status value")
+            return
+        }
+        // Apple exposes this attachment as an integer raw value; casting the
+        // boxed attachment directly to SCFrameStatus rejects valid samples.
+        guard let statusRawValue = statusValue as? Int else {
+            rememberError("ScreenCaptureKit status attachment was not an Int: \(type(of: statusValue))")
+            return
+        }
+        guard let status = SCFrameStatus(rawValue: statusRawValue) else {
+            rememberError("ScreenCaptureKit status attachment had unknown raw value: \(statusRawValue)")
             return
         }
 
@@ -1005,6 +1033,10 @@ func prepareWindowCaptureContext(_ windowID: CGWindowID) -> WindowCapture {
 func wheelCapture(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                   _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int]) {
     let capture = prepareWindowCaptureContext(windowID)
+    // This is a short-lived command-line helper. Reassert the app foreground
+    // after the capture warmup and immediately before posting the wheel event.
+    // The activation stays outside the measured input-to-frame interval.
+    focus(pid)
     let commandStarted = monotonicSeconds()
     let eventPosted = postScroll(pid, unit, delta)
     guard eventPosted >= commandStarted else { fail("scroll event timing was invalid") }
@@ -1117,6 +1149,9 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
     if let error = displayCapture.start() {
         fail("could not start WindowServer display measurement: \(error)")
     }
+    // ScreenCaptureKit setup runs in this helper process, so restore Hane as
+    // the foreground app before the timestamped input event.
+    focus(pid)
     let timingOffsetBefore = fileSizeOrZero(timingPath)
 
     let eventPostedTicks = postScrollTicks(pid, unit, delta)
@@ -1218,6 +1253,7 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                    _ preFrameDirectory: String, _ frameDirectory: String, _ frameDelays: [Int]) {
     let capture = prepareWindowCaptureContext(windowID)
 
+    focus(pid)
     let commandStarted = monotonicSeconds()
     // Keep both reversal-probe inputs on the same global Quartz event path as
     // the other GUI scenarios, including normal window-server target routing.
@@ -1317,6 +1353,7 @@ case "wheel-event":
     guard arguments.count == 4,
           let pid = pid_t(arguments[1]),
           let delta = Int32(arguments[3]) else { fail("wheel-event requires PID, lines|pixels and delta") }
+    activateApplication(pid)
     postScroll(pid, scrollUnit(arguments[2]), delta)
 case "wheel-capture":
     guard arguments.count == 7,
