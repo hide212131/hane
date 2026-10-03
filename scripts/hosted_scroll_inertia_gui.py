@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/12"
+PROCEDURE_VERSION = "hosted-scroll-inertia/13"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -27,6 +27,7 @@ SCOPE_NOTE = (
     "Lines / Pixelsの80ms初回応答は、同じScreenCaptureKitサンプルの画像とWindowServer表示時刻で確認する。"
     "余韻・減速・安定は従来の画面取得系列で135msの慣性窓内を確認し、callback遅延と表示時刻を分けて記録する。"
     "Pixelsは応答付近を連続して撮影し、反転入力は複数の旧方向候補画面を撮影した直後に送り、OCRはその後に行って慣性窓を消費しない。"
+    "文書先頭のOCR前に挿入カーソルを先頭行末へ移し、先頭文字の読み取りを妨げない。"
     "両入力は共通のcghidEventTap経路で送り、経路と画面応答を記録する。"
 )
 EXIT_PASS = 0
@@ -689,6 +690,14 @@ def move_to_document_top(interaction, module, env, config, helper, pid: int,
     ok, _output, error = interaction.run_helper(helper, ["move-doc-start", str(pid)], helper_timeout)
     if not ok:
         return step(label, "blocked", error or "文書先頭への移動を確認できない"), None, ""
+    # The caret at the start of the fixture overlays the first `L` in
+    # `LINE 001`; hosted Vision then recognized that glyph as `K`. Move the
+    # caret to the end of the known eight-character first line before OCR,
+    # without changing document text or scroll position.
+    ok, _output, error = interaction.run_helper(
+        helper, ["move-caret", str(pid), "right", "8"], helper_timeout)
+    if not ok:
+        return step(label, "blocked", error or "OCR前に先頭行からカーソルを移動できない"), None, ""
     capture, lines, text = capture_single(
         interaction, module, env, config, helper, window_id, run_dir, label, helper_timeout)
     if capture["result"] != "pass":
