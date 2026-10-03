@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/13"
+PROCEDURE_VERSION = "hosted-scroll-inertia/14"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -26,6 +26,7 @@ SCOPE_NOTE = (
     "入力イベントは ScrollDelta 相当の Lines / Pixels を明示して発生させ、端末種別は推測しない。"
     "Lines / Pixelsの80ms初回応答は、同じScreenCaptureKitサンプルの画像とWindowServer表示時刻で確認する。"
     "余韻・減速・安定は従来の画面取得系列で135msの慣性窓内を確認し、callback遅延と表示時刻を分けて記録する。"
+    "中間位置への位置決め入力は、Hane側receiptと複数時点の画面を記録するが、受入判定には使わない。"
     "Pixelsは応答付近を連続して撮影し、反転入力は複数の旧方向候補画面を撮影した直後に送り、OCRはその後に行って慣性窓を消費しない。"
     "文書先頭のOCR前に挿入カーソルを先頭行末へ移し、先頭文字の読み取りを妨げない。"
     "両入力は共通のcghidEventTap経路で送り、経路と画面応答を記録する。"
@@ -49,7 +50,7 @@ PIXELS_FRAME_DELAYS_MS = (0, 24, 40, 64, 88, 112, 128, 160, 200)
 PRE_REVERSE_PROBE_DELAYS_MS = (32, 72)
 LINES_INERTIA_WINDOW_MS = 135.0
 # The product trajectory evaluator uses the Issue's 135ms coast window.
-# Procedure /11 separately verifies the 80ms first visual response using the
+# Procedure /14 separately verifies the 80ms first visual response using the
 # WindowServer display timestamp attached to the same streamed image sample.
 VISIBLE_RESPONSE_WINDOW_MS = LINES_INERTIA_WINDOW_MS
 
@@ -780,29 +781,40 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
 
 def position_document_midpoint(interaction, module, env, config, helper, pid: int,
                                window_id: str, scenario_dir: Path, helper_timeout: float,
-                               downward_sign: int, label: str
+                               downward_sign: int, label: str,
+                               scroll_event_timing_path: Path,
+                               scroll_event_observation_module: Optional[object]
                                ) -> tuple[dict, Optional[list[int]], str]:
     top_step, top_lines, _top_text = move_to_document_top(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir, f"{label}-top", helper_timeout)
     if top_step["result"] != "pass":
         return step(label, "blocked", top_step.get("reason")), None, ""
-    ok, _output, error = interaction.run_helper(
-        helper, ["wheel-event", str(pid), "lines", str(downward_sign * 120)], helper_timeout)
-    if not ok:
-        return step(label, "blocked", error or "中間位置へのLines入力を送れない"), None, ""
-    time.sleep(0.24)
-    capture, lines, text = capture_single(
-        interaction, module, env, config, helper, window_id,
-        scenario_dir, label, helper_timeout)
-    if capture["result"] != "pass":
-        return step(label, "blocked", capture.get("reason") or "中間位置の画面を取得できない"), lines, text
+    position_frames, observation, error = capture_frames(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir / f"{label}-scroll", "lines", downward_sign * 120,
+        (0, 48, 96, 144, 200, 240), helper_timeout,
+        scroll_event_timing_path=scroll_event_timing_path,
+        scroll_event_observation_module=scroll_event_observation_module,
+    )
+    if error:
+        return attach_scroll_event_observation(
+            step(label, "blocked", error, frames=position_frames), observation), None, ""
+    if not position_frames:
+        return attach_scroll_event_observation(
+            step(label, "blocked", "中間位置の画面を取得できない", frames=position_frames), observation), None, ""
+    final_frame = position_frames[-1]
+    lines = final_frame.get("visible_lines") or []
+    text = final_frame.get("recognized_text") or ""
     first = min(lines) if lines else None
     last = max(lines) if lines else None
     if first is None or last is None or first <= 1 or last >= LINE_COUNT:
-        return step(label, "blocked", "慣性検査の開始位置を文書中央付近に置けない",
-                    visible_lines=lines, recognized_text=text), lines, text
-    return step(label, "pass", visible_lines=lines, recognized_text=text), lines, text
+        return attach_scroll_event_observation(
+            step(label, "blocked", "慣性検査の開始位置を文書中央付近に置けない",
+                 visible_lines=lines, recognized_text=text, frames=position_frames), observation), lines, text
+    return attach_scroll_event_observation(
+        step(label, "pass", visible_lines=lines, recognized_text=text,
+             frames=position_frames), observation), lines, text
 
 
 def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: int,
@@ -813,7 +825,8 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
     steps: list[dict] = []
     position, position_lines, _position_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
-        helper_timeout, downward_sign, "lines-positioning")
+        helper_timeout, downward_sign, "lines-positioning",
+        scroll_event_timing_path, scroll_event_observation_module)
     steps.append(position)
     if position["result"] != "pass":
         steps.extend(skipped(name, "文書中央の検査開始位置を確認できなかった") for name in (
@@ -915,7 +928,8 @@ def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: in
 
     pixel_position, before_lines, before_text = position_document_midpoint(
         interaction, module, env, config, helper, pid, window_id, scenario_dir,
-        helper_timeout, downward_sign, "pixels-before")
+        helper_timeout, downward_sign, "pixels-before",
+        scroll_event_timing_path, scroll_event_observation_module)
     if pixel_position["result"] == "pass":
         before_pixel_offset = min(before_lines) if before_lines else None
         frames, pixels_scroll_event_observation, error = capture_frames(
