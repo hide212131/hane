@@ -137,6 +137,50 @@ class LinesCoastTests(unittest.TestCase):
         self.assertFalse(result["continued_after_release"])
 
 
+class FirstScreenResponseTests(unittest.TestCase):
+    def test_accepts_a_captured_screen_response_completed_within_80ms(self):
+        result = gui.evaluate_first_response(
+            100, frames([100, 102, 105], [8, 64, 108]), "first_response",
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["first_response_ms"], 64)
+
+    def test_rejects_first_screen_response_after_80ms_even_if_it_moves_later(self):
+        result = gui.evaluate_first_response(
+            100, frames([100, 100, 104], [8, 64, 108]), "first_response",
+        )
+        self.assertEqual(result["result"], "fail")
+        self.assertEqual(result["first_response_ms"], 108)
+
+    def test_no_screen_response_is_a_failure_not_unknown(self):
+        result = gui.evaluate_first_response(
+            100, frames([100, 100, 100], [8, 24, 40]), "first_response",
+        )
+        self.assertEqual(result["result"], "fail")
+
+    def test_missing_screen_lines_are_blocked(self):
+        result = gui.evaluate_first_response(
+            100, [{"visible_lines": [], "elapsed_ms": 24}], "first_response",
+        )
+        self.assertEqual(result["result"], "blocked")
+
+
+class MeasurementPathComparisonTests(unittest.TestCase):
+    def test_same_start_and_different_responses_identify_measurement_path_divergence(self):
+        result = gui.classify_measurement_path_comparison(
+            {"result": "pass"}, {"result": "fail"}, same_start_lines=True,
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(result["classification"], "measurement_path_divergence")
+
+    def test_different_start_position_remains_unknown(self):
+        result = gui.classify_measurement_path_comparison(
+            {"result": "pass"}, {"result": "fail"}, same_start_lines=False,
+        )
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["classification"], "unknown")
+
+
 class DirectionReversalTests(unittest.TestCase):
     def test_accepts_prompt_opposite_direction(self):
         result = gui.evaluate_reversal(100, 108, frames([107, 105, 102, 100, 99, 99],
@@ -961,23 +1005,36 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         self.assertIsNone(result["scroll_event_observation"])
 
 
-class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
-    # The focused checker uses one calibrated direction for Lines and Pixels,
-    # and both acceptance captures opt into the same wheel-measure path.
-    def test_pixels_capture_opts_into_wheel_measure_with_the_shared_timing_path(self):
+class ScrollHelperMeasurementComparisonTests(unittest.TestCase):
+    # The two helpers are compared diagnostically at the same document top;
+    # product acceptance uses the captured screen images from wheel-capture.
+    def test_lines_and_pixels_acceptance_use_the_regular_capture_path(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         body = source.split("def run_scroll_behavior_checks(", 1)[1]
         pixels_call = body.split('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', 1)[1]
         pixels_call = pixels_call.split(")", 1)[0]
-        self.assertIn("scroll_event_timing_path=scroll_event_timing_path", pixels_call)
-        self.assertIn("scroll_event_observation_module=scroll_event_observation_module", pixels_call)
+        self.assertNotIn("scroll_event_timing_path", pixels_call)
+        self.assertNotIn("scroll_event_observation_module", pixels_call)
+        lines_call = body.split('"lines-coast", "lines", downward_sign * 8,', 1)[1]
+        lines_call = lines_call.split("if error:", 1)[0]
+        self.assertNotIn("scroll_event_timing_path", lines_call)
+        self.assertNotIn("scroll_event_observation_module", lines_call)
+
+    def test_comparison_replays_both_units_from_the_same_document_top(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def compare_wheel_measurement_paths(", 1)[1].split(
+            "\ndef run_scroll_behavior_checks", 1)[0]
+        self.assertIn('("lines", "lines", downward_sign * 8, FRAME_DELAYS_MS)', body)
+        self.assertIn('("pixels", "pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS)', body)
+        self.assertIn('for mode in ("wheel_capture", "wheel_measure")', body)
+        self.assertIn('same_start_lines = (', body)
 
     def test_pixels_capture_requires_a_valid_mid_document_baseline(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         body = source.split("def run_scroll_behavior_checks(", 1)[1]
         position = body.split('pixel_position, before_lines, before_text = position_document_midpoint(', 1)[1]
         branch = body.split('if pixel_position["result"] == "pass":', 1)[1]
-        capture = branch.split('frames, pixels_scroll_event_observation, error = capture_frames(', 1)[0]
+        capture = branch.split('frames, _pixels_scroll_event_observation, error = capture_frames(', 1)[0]
         self.assertIn('"pixels-before"', position)
         self.assertIn('step("pixels_direct_follow", "blocked", pixel_position.get("reason"))', branch)
         self.assertIn('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', branch)
@@ -998,15 +1055,6 @@ class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
         self.assertIn('"pixels-before"', pixel_position_call)
         self.assertNotIn("scroll_event_timing_path", pixel_position_call)
         self.assertNotIn("scroll_event_observation_module", pixel_position_call)
-
-    def test_lines_coast_keeps_windowserver_acceptance_measurement(self):
-        source = MODULE_PATH.read_text(encoding="utf-8")
-        body = source.split("def run_scroll_behavior_checks(", 1)[1]
-        lines_call = body.split('"lines-coast", "lines", downward_sign * 8,', 1)[1]
-        lines_call = lines_call.split("if error:", 1)[0]
-        self.assertIn("scroll_event_timing_path=scroll_event_timing_path", lines_call)
-        self.assertIn("scroll_event_observation_module=scroll_event_observation_module", lines_call)
-
 
 class ScrollDirectionCalibrationTests(unittest.TestCase):
     def test_calibration_probes_both_signs_from_the_verified_document_top(self):
@@ -1148,7 +1196,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/17")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/18")
 
 
 class DocumentEdgeTests(unittest.TestCase):
