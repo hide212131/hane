@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/11"
+PROCEDURE_VERSION = "hosted-scroll-inertia/12"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -45,7 +45,7 @@ PIXELS_FRAME_DELAYS_MS = (0, 24, 40, 64, 88, 112, 128, 160, 200)
 # old-direction motion by 67ms, so keep three probes but start the last one at
 # 96ms, leaving 39ms for screen capture and scheduler delay. This changes only
 # when the observer samples; the 135ms acceptance window is unchanged.
-PRE_REVERSE_PROBE_DELAYS_MS = (48, 72, 96)
+PRE_REVERSE_PROBE_DELAYS_MS = (32, 72)
 LINES_INERTIA_WINDOW_MS = 135.0
 # The product trajectory evaluator uses the Issue's 135ms coast window.
 # Procedure /11 separately verifies the 80ms first visual response using the
@@ -683,6 +683,244 @@ def capture_single(interaction, module, env, config, helper, window_id: str,
     return capture, lines, text
 
 
+def move_to_document_top(interaction, module, env, config, helper, pid: int,
+                         window_id: str, run_dir: Path, label: str,
+                         helper_timeout: float) -> tuple[dict, Optional[list[int]], str]:
+    ok, _output, error = interaction.run_helper(helper, ["move-doc-start", str(pid)], helper_timeout)
+    if not ok:
+        return step(label, "blocked", error or "文書先頭への移動を確認できない"), None, ""
+    capture, lines, text = capture_single(
+        interaction, module, env, config, helper, window_id, run_dir, label, helper_timeout)
+    if capture["result"] != "pass":
+        return step(label, "blocked", capture.get("reason") or "文書先頭の画面を取得できない"), lines, text
+    if not lines or min(lines) != 1:
+        return step(label, "blocked", "文書先頭への移動後に先頭行を確認できない",
+                    visible_lines=lines, recognized_text=text), lines, text
+    return step(label, "pass", visible_lines=lines, recognized_text=text), lines, text
+
+
+def calibrate_scroll_direction(interaction, module, env, config, helper, pid: int,
+                                window_id: str, scenario_dir: Path, helper_timeout: float
+                                ) -> tuple[Optional[int], dict]:
+    """Determine which Lines sign advances the fixture from its verified top.
+
+    Quartz scroll deltas are affected by the host's scroll direction setting.
+    Probe each sign from the document top and use observed line movement to
+    choose the downward direction; never infer it from the device type.
+    """
+    delays = (0, 48, 96, 144, 200, 240)
+    top_step, top_lines, _top_text = move_to_document_top(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir, "direction-calibration-top", helper_timeout)
+    if top_step["result"] != "pass":
+        return None, step("scroll_direction_calibration", "blocked", top_step.get("reason"))
+    baseline = min(top_lines) if top_lines else None
+    probes = []
+    downward_sign = None
+    for sign, label in ((1, "positive"), (-1, "negative")):
+        if sign < 0:
+            top_step, top_lines, _top_text = move_to_document_top(
+                interaction, module, env, config, helper, pid, window_id,
+                scenario_dir, "direction-calibration-reset", helper_timeout)
+            if top_step["result"] != "pass":
+                probes.append({"sign": sign, "result": "blocked", "reason": top_step.get("reason")})
+                break
+            baseline = min(top_lines) if top_lines else None
+
+        frames, _observation, error = capture_frames(
+            interaction, module, env, config, helper, pid, window_id,
+            scenario_dir / f"direction-probe-{label}", "lines", sign * 32,
+            delays, helper_timeout)
+        if error:
+            probes.append({"sign": sign, "result": "blocked", "reason": error})
+            break
+        offsets = [first_visible(frame) for frame in frames]
+        moved_down = baseline is not None and any(
+            offset is not None and offset > baseline for offset in offsets)
+        probes.append({"sign": sign, "result": "observed", "offsets": offsets,
+                       "moved_down_from_top": moved_down})
+        if moved_down:
+            downward_sign = sign
+            break
+
+    reset_step, reset_lines, _reset_text = move_to_document_top(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir, "direction-calibration-final-reset", helper_timeout)
+    if reset_step["result"] != "pass":
+        return None, step("scroll_direction_calibration", "blocked", reset_step.get("reason"),
+                          downward_sign=downward_sign, probes=probes)
+    if downward_sign is None:
+        return None, step(
+            "scroll_direction_calibration", "blocked",
+            "正負どちらのLines入力でも文書先頭から下方向への移動を確認できない",
+            probes=probes, reset_visible_lines=reset_lines)
+    return downward_sign, step(
+        "scroll_direction_calibration", "pass", downward_sign=downward_sign,
+        direction="down", probes=probes, reset_visible_lines=reset_lines)
+
+
+def position_document_midpoint(interaction, module, env, config, helper, pid: int,
+                               window_id: str, scenario_dir: Path, helper_timeout: float,
+                               downward_sign: int, label: str
+                               ) -> tuple[dict, Optional[list[int]], str]:
+    top_step, top_lines, _top_text = move_to_document_top(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir, f"{label}-top", helper_timeout)
+    if top_step["result"] != "pass":
+        return step(label, "blocked", top_step.get("reason")), None, ""
+    ok, _output, error = interaction.run_helper(
+        helper, ["wheel-event", str(pid), "lines", str(downward_sign * 120)], helper_timeout)
+    if not ok:
+        return step(label, "blocked", error or "中間位置へのLines入力を送れない"), None, ""
+    time.sleep(0.24)
+    capture, lines, text = capture_single(
+        interaction, module, env, config, helper, window_id,
+        scenario_dir, label, helper_timeout)
+    if capture["result"] != "pass":
+        return step(label, "blocked", capture.get("reason") or "中間位置の画面を取得できない"), lines, text
+    first = min(lines) if lines else None
+    last = max(lines) if lines else None
+    if first is None or last is None or first <= 1 or last >= LINE_COUNT:
+        return step(label, "blocked", "慣性検査の開始位置を文書中央付近に置けない",
+                    visible_lines=lines, recognized_text=text), lines, text
+    return step(label, "pass", visible_lines=lines, recognized_text=text), lines, text
+
+
+def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: int,
+                               window_id: str, scenario_dir: Path,
+                               scroll_event_timing_path: Path, helper_timeout: float,
+                               downward_sign: int,
+                               scroll_event_observation_module: Optional[object]) -> list[dict]:
+    steps: list[dict] = []
+    position, position_lines, _position_text = position_document_midpoint(
+        interaction, module, env, config, helper, pid, window_id, scenario_dir,
+        helper_timeout, downward_sign, "lines-positioning")
+    steps.append(position)
+    if position["result"] != "pass":
+        steps.extend(skipped(name, "文書中央の検査開始位置を確認できなかった") for name in (
+            "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+        return steps
+
+    baseline = min(position_lines) if position_lines else None
+    frames, scroll_event_observation, error = capture_frames(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir / "lines-coast", "lines", downward_sign * 8,
+        FRAME_DELAYS_MS, helper_timeout,
+        scroll_event_timing_path=scroll_event_timing_path,
+        scroll_event_observation_module=scroll_event_observation_module,
+    )
+    if error:
+        steps.append(attach_scroll_event_observation(
+            step("lines_coast", "blocked", error), scroll_event_observation))
+        time.sleep(FRAME_DELAYS_MS[-1] / 1000)
+    else:
+        steps.append(attach_scroll_event_observation(
+            evaluate_lines_coast(baseline, frames), scroll_event_observation))
+
+    reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
+        interaction, module, env, config, helper, window_id,
+        scenario_dir, "reversal-baseline", helper_timeout)
+    reversal_baseline = min(reversal_baseline_lines) if reversal_baseline_lines else None
+    reversal_frames, pre_frame, error = capture_frames(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir / "direction-reversal",
+        "lines", downward_sign * 8, REVERSE_FRAME_DELAYS_MS, helper_timeout,
+        reverse_delta=downward_sign * -12, baseline=reversal_baseline)
+    selected = pre_frame.get("selected") if pre_frame else None
+    reversal_pre = selected["value"] if selected else None
+    if reversal_baseline_capture["result"] != "pass":
+        reversal_step = step("direction_reversal", "blocked",
+                             reversal_baseline_capture.get("reason") or "反転基準画面を取得できない")
+    elif error:
+        reversal_step = step("direction_reversal", "blocked", error)
+    elif pre_frame is not None and pre_frame.get("candidates") and selected is None:
+        # None of the pre-reversal candidate frames captured the old-direction
+        # motion inside the measured inertia window. This is insufficient
+        # observation, not a product failure.
+        reversal_step = step(
+            "direction_reversal", "blocked",
+            "135ms窓内で撮影した候補画像のいずれにも反転前の旧方向への移動が写っていない",
+            baseline=reversal_baseline, candidates=pre_frame.get("candidates"),
+            event_route=pre_frame.get("event_route"),
+            initial_to_reverse_event_ms=pre_frame.get("initial_to_reverse_event_ms"),
+        )
+    else:
+        reversal_step = evaluate_reversal(
+            reversal_baseline, reversal_pre, reversal_frames,
+            pre_frame.get("initial_to_reverse_event_ms") if pre_frame else None,
+            event_route=pre_frame.get("event_route") if pre_frame else None,
+            pre_reverse_capture_completed_after_initial_ms=(
+                selected.get("capture_completed_after_initial_ms") if selected else None
+            ),
+        )
+    if pre_frame:
+        reversal_step["event_route"] = pre_frame.get("event_route")
+        reversal_step["pre_reverse_candidates"] = pre_frame.get("candidates")
+        reversal_step["pre_reverse_capture_after_initial_ms"] = (
+            selected.get("capture_started_after_initial_ms") if selected else None
+        )
+    reversal_step["baseline_visible_lines"] = reversal_baseline_lines
+    reversal_step["baseline_text"] = reversal_baseline_text
+    steps.append(reversal_step)
+
+    top_reset, _top_lines, _top_text = move_to_document_top(
+        interaction, module, env, config, helper, pid, window_id,
+        scenario_dir, "top-edge-start", helper_timeout)
+    if top_reset["result"] != "pass":
+        top_step = step("document_top_edge", "blocked", top_reset.get("reason"))
+        bottom_step = skipped("document_bottom_edge", "文書先頭を確認できず、端の検査を開始できなかった")
+    else:
+        top_frames, _pre, top_error = capture_frames(
+            interaction, module, env, config, helper, pid, window_id,
+            scenario_dir / "top-edge", "lines", -downward_sign * 1000,
+            (0, 48, 96, 144, 200, 260), helper_timeout)
+        top_step = (step("document_top_edge", "blocked", top_error) if top_error else
+                    evaluate_document_edge(top_frames, "top"))
+        bottom_frames, _pre, bottom_error = capture_frames(
+            interaction, module, env, config, helper, pid, window_id,
+            scenario_dir / "bottom-edge", "lines", downward_sign * 1200,
+            (0, 48, 96, 144, 200, 260), helper_timeout)
+        bottom_step = (step("document_bottom_edge", "blocked", bottom_error) if bottom_error else
+                       evaluate_document_edge(bottom_frames, "bottom"))
+    edge_results = {top_step["result"], bottom_step["result"]}
+    edge_result = (
+        "blocked" if "blocked" in edge_results else
+        "fail" if "fail" in edge_results else
+        "pass"
+    )
+    steps.append(step(
+        "document_edges", edge_result,
+        None if edge_result == "pass" else "先頭または末尾で端の表示を維持できない",
+        top=top_step, bottom=bottom_step,
+    ))
+
+    pixel_position, before_lines, before_text = position_document_midpoint(
+        interaction, module, env, config, helper, pid, window_id, scenario_dir,
+        helper_timeout, downward_sign, "pixels-before")
+    if pixel_position["result"] == "pass":
+        before_pixel_offset = min(before_lines) if before_lines else None
+        frames, pixels_scroll_event_observation, error = capture_frames(
+            interaction, module, env, config, helper, pid, window_id,
+            scenario_dir / "pixels-direct-follow",
+            "pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,
+            scroll_event_timing_path=scroll_event_timing_path,
+            scroll_event_observation_module=scroll_event_observation_module,
+        )
+        pixel_step = (
+            step("pixels_direct_follow", "blocked", error)
+            if error else evaluate_pixels(before_pixel_offset, frames)
+        )
+        pixel_step = attach_scroll_event_observation(
+            pixel_step, pixels_scroll_event_observation)
+        pixel_step["baseline_visible_lines"] = before_lines
+        pixel_step["baseline_text"] = before_text
+    else:
+        pixel_step = attach_scroll_event_observation(
+            step("pixels_direct_follow", "blocked", pixel_position.get("reason")), None)
+    steps.append(pixel_step)
+    return steps
+
+
 def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helper,
                          run_dir: Path, binary_path: Path, expected_sha: str,
                          request_id: str, startup_timeout: float, window_timeout: float,
@@ -712,7 +950,8 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
     holder = {"process": None}
     try:
         session_steps, window_id = interaction.open_session(
-            gui_validate, env, config, binary_path, holder, "before"
+            gui_validate, env, config, binary_path, holder, "before",
+            helper, helper_timeout,
         )
         steps.extend(session_steps)
         pid = interaction.current_pid(holder)
@@ -733,124 +972,25 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                 steps.append(step("baseline_capture", baseline_capture["result"],
                                   baseline_capture.get("reason"), visible_lines=baseline_lines,
                                   recognized_text=baseline_text))
-                baseline = min(baseline_lines) if baseline_lines else None
-
-                frames, scroll_event_observation, error = capture_frames(
-                    interaction, gui_validate, env, config, helper, pid, window_id,
-                    scenario_dir / "lines-coast",
-                    "lines", -8, FRAME_DELAYS_MS, helper_timeout,
-                    scroll_event_timing_path=scroll_event_timing_path,
-                    scroll_event_observation_module=scroll_event_observation_module,
-                )
-                if error:
-                    steps.append(attach_scroll_event_observation(
-                        step("lines_coast", "blocked", error), scroll_event_observation))
-                    time.sleep(FRAME_DELAYS_MS[-1] / 1000)
+                if baseline_capture["result"] != "pass" or not baseline_lines:
+                    steps.append(step("scroll_direction_calibration", "blocked",
+                                      "基準画面を取得できず、Linesの向きを確認できない"))
+                    steps.extend(skipped(name, "Linesの向きを確認できなかった") for name in (
+                        "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
                 else:
-                    steps.append(attach_scroll_event_observation(
-                        evaluate_lines_coast(baseline, frames), scroll_event_observation))
-
-                reversal_baseline_capture, reversal_baseline_lines, reversal_baseline_text = capture_single(
-                    interaction, gui_validate, env, config, helper, window_id,
-                    scenario_dir, "reversal-baseline", helper_timeout)
-                reversal_baseline = min(reversal_baseline_lines) if reversal_baseline_lines else None
-                reversal_frames, pre_frame, error = capture_frames(
-                    interaction, gui_validate, env, config, helper, pid, window_id,
-                    scenario_dir / "direction-reversal",
-                    "lines", -8, REVERSE_FRAME_DELAYS_MS, helper_timeout,
-                    reverse_delta=12, baseline=reversal_baseline)
-                selected = pre_frame.get("selected") if pre_frame else None
-                reversal_pre = selected["value"] if selected else None
-                if reversal_baseline_capture["result"] != "pass":
-                    reversal_step = step("direction_reversal", "blocked",
-                                         reversal_baseline_capture.get("reason") or "反転基準画面を取得できない")
-                elif error:
-                    reversal_step = step("direction_reversal", "blocked", error)
-                elif pre_frame is not None and pre_frame.get("candidates") and selected is None:
-                    # None of the pre-reversal candidate frames captured the
-                    # old-direction motion within the inertia window; this is
-                    # insufficient observation, not a product failure.
-                    reversal_step = step(
-                        "direction_reversal", "blocked",
-                        "135ms窓内で撮影した候補画像のいずれにも反転前の旧方向への移動が写っていない",
-                        baseline=reversal_baseline, candidates=pre_frame.get("candidates"),
-                        event_route=pre_frame.get("event_route"),
-                        initial_to_reverse_event_ms=pre_frame.get("initial_to_reverse_event_ms"),
-                    )
-                else:
-                    reversal_step = evaluate_reversal(
-                        reversal_baseline, reversal_pre, reversal_frames,
-                        pre_frame.get("initial_to_reverse_event_ms") if pre_frame else None,
-                        event_route=pre_frame.get("event_route") if pre_frame else None,
-                        pre_reverse_capture_completed_after_initial_ms=(
-                            selected.get("capture_completed_after_initial_ms") if selected else None
-                        ),
-                    )
-                if pre_frame:
-                    reversal_step["event_route"] = pre_frame.get("event_route")
-                    reversal_step["pre_reverse_candidates"] = pre_frame.get("candidates")
-                    reversal_step["pre_reverse_capture_after_initial_ms"] = (
-                        selected.get("capture_started_after_initial_ms") if selected else None
-                    )
-                reversal_step["baseline_visible_lines"] = reversal_baseline_lines
-                reversal_step["baseline_text"] = reversal_baseline_text
-                steps.append(reversal_step)
-
-                top_frames, _pre, top_error = capture_frames(
-                    interaction, gui_validate, env, config, helper, pid, window_id,
-                    scenario_dir / "top-edge", "lines", 1000,
-                    (0, 48, 96, 144, 200, 260), helper_timeout)
-                top_step = (step("document_top_edge", "blocked", top_error) if top_error else
-                            evaluate_document_edge(top_frames, "top"))
-                bottom_frames, _pre, bottom_error = capture_frames(
-                    interaction, gui_validate, env, config, helper, pid, window_id,
-                    scenario_dir / "bottom-edge", "lines", -1200,
-                    (0, 48, 96, 144, 200, 260), helper_timeout)
-                bottom_step = (step("document_bottom_edge", "blocked", bottom_error) if bottom_error else
-                               evaluate_document_edge(bottom_frames, "bottom"))
-                edge_results = {top_step["result"], bottom_step["result"]}
-                edge_result = (
-                    "blocked" if "blocked" in edge_results else
-                    "fail" if "fail" in edge_results else
-                    "pass"
-                )
-                steps.append(step(
-                    "document_edges", edge_result,
-                    None if edge_result == "pass" else "先頭または末尾で端の表示を維持できない",
-                    top=top_step, bottom=bottom_step,
-                ))
-
-                reset_ok, _output, reset_error = interaction.run_helper(
-                    helper, ["wheel-event", str(pid), "lines", "1000"], helper_timeout)
-                if reset_ok:
-                    time.sleep(0.24)
-                    before_capture, before_lines, before_text = capture_single(
-                        interaction, gui_validate, env, config, helper, window_id,
-                        scenario_dir, "pixels-before", helper_timeout)
-                    before_pixel_offset = min(before_lines) if before_lines else None
-                    frames, pixels_scroll_event_observation, error = capture_frames(
-                        interaction, gui_validate, env, config, helper, pid, window_id,
-                        scenario_dir / "pixels-direct-follow",
-                        "pixels", -180, PIXELS_FRAME_DELAYS_MS, helper_timeout,
-                        scroll_event_timing_path=scroll_event_timing_path,
-                        scroll_event_observation_module=scroll_event_observation_module,
-                    )
-                    pixel_step = (
-                        step("pixels_direct_follow", "blocked", error)
-                        if error else evaluate_pixels(before_pixel_offset, frames)
-                    )
-                    pixel_step = attach_scroll_event_observation(
-                        pixel_step, pixels_scroll_event_observation)
-                    pixel_step["baseline_visible_lines"] = before_lines
-                    pixel_step["baseline_text"] = before_text
-                    if before_capture["result"] != "pass":
-                        pixel_step = attach_scroll_event_observation(
-                            step("pixels_direct_follow", "blocked",
-                                 before_capture.get("reason") or "Pixels前の画面を取得できない"),
-                            pixels_scroll_event_observation)
-                    steps.append(pixel_step)
-                else:
-                    steps.append(step("pixels_direct_follow", "blocked", reset_error))
+                    downward_sign, calibration = calibrate_scroll_direction(
+                        interaction, gui_validate, env, config, helper, pid,
+                        window_id, scenario_dir, helper_timeout)
+                    steps.append(calibration)
+                    if downward_sign is None:
+                        steps.extend(skipped(name, "Linesの向きを確認できなかった") for name in (
+                            "lines_coast", "direction_reversal", "document_edges", "pixels_direct_follow"))
+                    else:
+                        steps.extend(run_scroll_behavior_checks(
+                            interaction, gui_validate, env, config, helper, pid,
+                            window_id, scenario_dir, scroll_event_timing_path,
+                            helper_timeout, downward_sign,
+                            scroll_event_observation_module))
 
                 unchanged = fixture.read_bytes() == contents.encode("utf-8")
                 steps.append(step("document_unchanged", "pass" if unchanged else "fail",

@@ -73,6 +73,70 @@ class HelperTests(unittest.TestCase):
         self.assertIn('became inactive again before typing', body)
 
 
+class ActivationStateFreshnessTests(unittest.TestCase):
+    def test_frontmost_check_runs_the_run_loop_and_checks_workspace_pid(self):
+        source = Path(interaction.__file__).with_name('hosted_gui_interaction.swift').read_text()
+        start = source.index('func activateApplication(')
+        end = source.index('\nfunc ', start + 1)
+        body = source[start:end]
+        self.assertIn('RunLoop.current.run(until: Date().addingTimeInterval(0.3))', body)
+        self.assertIn('let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier', body)
+        self.assertIn('application.isActive || frontmostPID == pid', body)
+
+
+class OpenSessionActivationOrderingTests(unittest.TestCase):
+    def test_activates_the_gui_process_before_searching_for_its_window(self):
+        events = []
+        process_holder = {"process": None}
+
+        def launch(_env, _config, _binary_path, holder):
+            events.append("launch")
+            holder["process"] = SimpleNamespace(pid=123)
+            return {"name": "launch", "result": "pass"}
+
+        def find_window(_env, _config, _process):
+            events.append("window_discovery")
+            return {"name": "window_discovery", "result": "pass"}, "window-1"
+
+        def run_helper(_helper, args, _timeout):
+            events.append(args[0])
+            return True, "", ""
+
+        module = SimpleNamespace(do_launch=launch, do_window_discovery=find_window)
+        config = SimpleNamespace(run_dir=Path("/tmp"))
+        with patch.object(interaction, "run_helper", side_effect=run_helper):
+            with patch.object(interaction, "capture_named", side_effect=lambda *_args: (
+                events.append("capture") or {"name": "capture_before", "result": "pass"}
+            )):
+                steps, window_id = interaction.open_session(
+                    module, {}, config, None, process_holder, "before", object(), 1.0)
+
+        self.assertEqual(events, ["launch", "activate", "window_discovery", "capture"])
+        self.assertEqual(window_id, "window-1")
+        self.assertEqual([item["result"] for item in steps], ["pass"] * 4)
+
+    def test_activation_failure_blocks_window_discovery_and_capture(self):
+        events = []
+        process_holder = {"process": None}
+
+        def launch(_env, _config, _binary_path, holder):
+            holder["process"] = SimpleNamespace(pid=123)
+            return {"name": "launch", "result": "pass"}
+
+        module = SimpleNamespace(
+            do_launch=launch,
+            do_window_discovery=lambda *_args: events.append("window_discovery"),
+        )
+        with patch.object(interaction, "run_helper", return_value=(False, "", "activation failed")):
+            steps, window_id = interaction.open_session(
+                module, {}, SimpleNamespace(run_dir=Path("/tmp")), None,
+                process_holder, "before", object(), 1.0)
+
+        self.assertEqual(events, [])
+        self.assertIsNone(window_id)
+        self.assertEqual([item["result"] for item in steps], ["pass", "blocked", "skipped", "skipped"])
+
+
 class InlineSyntaxExpectationTests(unittest.TestCase):
     """Pure source-byte and visible-anchor logic for inline_syntax_boundary."""
 
