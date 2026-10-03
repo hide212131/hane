@@ -190,6 +190,18 @@ def classify_measurement_path_comparison(capture_response: dict, measure_respons
     }
 
 
+def aggregate_acceptance_result(steps: list[dict], priority: dict[str, int]) -> tuple[str, list[str]]:
+    """Aggregate product acceptance steps without treating a diagnostic as acceptance."""
+    acceptance_steps = [item for item in steps
+                        if item.get("name") != "wheel_measurement_path_comparison"]
+    considered = [item["result"] for item in acceptance_steps
+                  if item.get("result") in priority]
+    result = min(considered, key=lambda value: priority[value]) if considered else "blocked"
+    reasons = [item.get("reason") for item in acceptance_steps
+               if item.get("result") not in ("pass", "skipped") and item.get("reason")]
+    return result, reasons
+
+
 def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
     offsets = [first_visible(frame) for frame in frames]
     times = [frame.get("elapsed_ms") for frame in frames]
@@ -1261,7 +1273,7 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
                         steps.append(compare_wheel_measurement_paths(
                             interaction, gui_validate, env, config, helper, pid,
                             window_id, scenario_dir, helper_timeout, downward_sign,
-                            scroll_event_timing_path, scroll_event_observation))
+                            scroll_event_timing_path, scroll_event_observation_module))
                         steps.extend(run_scroll_behavior_checks(
                             interaction, gui_validate, env, config, helper, pid,
                             window_id, scenario_dir, helper_timeout, downward_sign))
@@ -1274,9 +1286,7 @@ def run_focused_scenario(gui_validate, interaction, env, target_dir: Path, helpe
         if holder.get("process") is not None:
             steps.append(interaction.close_session(gui_validate, env, holder))
 
-    result = min((item["result"] for item in steps if item.get("result") in priority),
-                 key=lambda value: priority[value]) if any(item.get("result") in priority for item in steps) else "blocked"
-    reasons = [item.get("reason") for item in steps if item.get("result") not in ("pass", "skipped") and item.get("reason")]
+    result, reasons = aggregate_acceptance_result(steps, priority)
     return {"name": "scroll_inertia", "steps": steps, "result": result,
             "reason": "。".join(reasons) if reasons else "Issue #389 のスクロールGUI確認が成功した",
             "evidence": {"fixture_path": str(fixture), "line_count": LINE_COUNT,

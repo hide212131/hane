@@ -180,6 +180,31 @@ class MeasurementPathComparisonTests(unittest.TestCase):
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(result["classification"], "unknown")
 
+    def test_blocked_diagnostic_does_not_change_product_acceptance(self):
+        steps = [
+            {"name": "wheel_measurement_path_comparison", "result": "blocked",
+             "reason": "measurement output unavailable"},
+            {"name": "lines_coast", "result": "pass"},
+            {"name": "pixels_direct_follow", "result": "pass"},
+        ]
+        result, reasons = gui.aggregate_acceptance_result(
+            steps, {"fail": 0, "blocked": 1, "pass": 2},
+        )
+        self.assertEqual(result, "pass")
+        self.assertEqual(reasons, [])
+        self.assertEqual(steps[0]["result"], "blocked")
+
+    def test_product_acceptance_failure_remains_blocking_when_diagnostic_is_blocked(self):
+        steps = [
+            {"name": "wheel_measurement_path_comparison", "result": "blocked"},
+            {"name": "lines_coast", "result": "fail", "reason": "no coast"},
+        ]
+        result, reasons = gui.aggregate_acceptance_result(
+            steps, {"fail": 0, "blocked": 1, "pass": 2},
+        )
+        self.assertEqual(result, "fail")
+        self.assertEqual(reasons, ["no coast"])
+
 
 class DirectionReversalTests(unittest.TestCase):
     def test_accepts_prompt_opposite_direction(self):
