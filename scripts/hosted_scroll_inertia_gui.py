@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/14"
+PROCEDURE_VERSION = "hosted-scroll-inertia/15"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -50,8 +50,15 @@ PIXELS_FRAME_DELAYS_MS = (0, 24, 40, 64, 88, 112, 128, 160, 200)
 PRE_REVERSE_PROBE_DELAYS_MS = (32, 72)
 LINES_INERTIA_WINDOW_MS = 135.0
 WHEEL_MEASURE_ERROR_OUTPUT_LIMIT = 4000
+# Match the direction-calibration probe that moved the document on hosted macOS.
+# A single 120-line positioning event failed to move the same fixture.
+POSITIONING_LINES_DELTA = 32
+POSITIONING_MAX_STEPS = 16
+POSITIONING_FRAME_DELAYS_MS = (0, 48, 96, 144, 200, 240)
+MIDPOINT_BAND_START = LINE_COUNT // 3
+MIDPOINT_BAND_END = LINE_COUNT * 2 // 3
 # The product trajectory evaluator uses the Issue's 135ms coast window.
-# Procedure /14 separately verifies the 80ms first visual response using the
+# Procedure /15 separately verifies the 80ms first visual response using the
 # WindowServer display timestamp attached to the same streamed image sample.
 VISIBLE_RESPONSE_WINDOW_MS = LINES_INERTIA_WINDOW_MS
 
@@ -102,6 +109,11 @@ def first_visible(frame: dict) -> Optional[int]:
 def last_visible(frame: dict) -> Optional[int]:
     lines = frame.get("visible_lines", [])
     return max(lines) if lines else None
+
+
+def midpoint_band_is_visible(lines: list[int]) -> bool:
+    """Require at least one OCR-recognized line from the fixture's middle third."""
+    return any(MIDPOINT_BAND_START <= line <= MIDPOINT_BAND_END for line in lines)
 
 
 def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
@@ -741,7 +753,7 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
     Probe each sign from the document top and use observed line movement to
     choose the downward direction; never infer it from the device type.
     """
-    delays = (0, 48, 96, 144, 200, 240)
+    delays = POSITIONING_FRAME_DELAYS_MS
     top_step, top_lines, _top_text = move_to_document_top(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir, "direction-calibration-top", helper_timeout)
@@ -769,7 +781,7 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
 
         frames, _observation, error = capture_frames(
             interaction, module, env, config, helper, pid, window_id,
-            scenario_dir / f"direction-probe-{label}", "lines", sign * 32,
+            scenario_dir / f"direction-probe-{label}", "lines", sign * POSITIONING_LINES_DELTA,
             delays, helper_timeout)
         if error:
             probes.append({"sign": sign, "result": "blocked", "reason": error})
@@ -812,31 +824,67 @@ def position_document_midpoint(interaction, module, env, config, helper, pid: in
         scenario_dir, f"{label}-top", helper_timeout)
     if top_step["result"] != "pass":
         return step(label, "blocked", top_step.get("reason")), None, ""
-    position_frames, observation, error = capture_frames(
-        interaction, module, env, config, helper, pid, window_id,
-        scenario_dir / f"{label}-scroll", "lines", downward_sign * 120,
-        (0, 48, 96, 144, 200, 240), helper_timeout,
-        scroll_event_timing_path=scroll_event_timing_path,
-        scroll_event_observation_module=scroll_event_observation_module,
-    )
-    if error:
-        return attach_scroll_event_observation(
-            step(label, "blocked", error, frames=position_frames), observation), None, ""
-    if not position_frames:
-        return attach_scroll_event_observation(
-            step(label, "blocked", "中間位置の画面を取得できない", frames=position_frames), observation), None, ""
-    final_frame = position_frames[-1]
-    lines = final_frame.get("visible_lines") or []
-    text = final_frame.get("recognized_text") or ""
-    first = min(lines) if lines else None
-    last = max(lines) if lines else None
-    if first is None or last is None or first <= 1 or last >= LINE_COUNT:
-        return attach_scroll_event_observation(
-            step(label, "blocked", "慣性検査の開始位置を文書中央付近に置けない",
-                 visible_lines=lines, recognized_text=text, frames=position_frames), observation), lines, text
-    return attach_scroll_event_observation(
-        step(label, "pass", visible_lines=lines, recognized_text=text,
-             frames=position_frames), observation), lines, text
+    position_frames = []
+    positioning_attempts = []
+    previous_first = first_visible({"visible_lines": top_lines})
+    no_progress_steps = 0
+    for attempt_number in range(1, POSITIONING_MAX_STEPS + 1):
+        frames, observation, error = capture_frames(
+            interaction, module, env, config, helper, pid, window_id,
+            scenario_dir / f"{label}-scroll-{attempt_number:02d}", "lines",
+            downward_sign * POSITIONING_LINES_DELTA,
+            POSITIONING_FRAME_DELAYS_MS, helper_timeout,
+            scroll_event_timing_path=scroll_event_timing_path,
+            scroll_event_observation_module=scroll_event_observation_module,
+        )
+        position_frames.extend(frames)
+        if error:
+            failed = step(label, "blocked", error, frames=position_frames,
+                          positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(failed, observation), None, ""
+        if not frames:
+            failed = step(label, "blocked", "中間位置の画面を取得できない",
+                          frames=position_frames, positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(failed, observation), None, ""
+
+        final_frame = frames[-1]
+        lines = final_frame.get("visible_lines") or []
+        text = final_frame.get("recognized_text") or ""
+        first = min(lines) if lines else None
+        last = max(lines) if lines else None
+        positioning_attempts.append({
+            "attempt": attempt_number,
+            "visible_lines": lines,
+            "recognized_text": text,
+            "scroll_event_observation": observation,
+        })
+        if first is None or last is None:
+            failed = step(label, "blocked", "スクロール後の可視行番号を読み取れない",
+                          visible_lines=lines, recognized_text=text, frames=position_frames,
+                          positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(failed, observation), None, text
+        if midpoint_band_is_visible(lines):
+            positioned = step(label, "pass", visible_lines=lines, recognized_text=text,
+                              frames=position_frames, positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(positioned, observation), lines, text
+        if last >= LINE_COUNT:
+            failed = step(label, "blocked", "位置合わせ入力が文書末尾を越え、中間位置を確認できない",
+                          visible_lines=lines, recognized_text=text, frames=position_frames,
+                          positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(failed, observation), lines, text
+
+        no_progress_steps = no_progress_steps + 1 if first <= previous_first else 0
+        previous_first = first
+        if no_progress_steps >= 3:
+            failed = step(label, "blocked", "較正済みの小さいLines入力を3回送り、文書の移動を確認できない",
+                          visible_lines=lines, recognized_text=text, frames=position_frames,
+                          positioning_attempts=positioning_attempts)
+            return attach_scroll_event_observation(failed, observation), lines, text
+
+    failed = step(label, "blocked", "慣性検査の開始位置を文書中央付近に置けない",
+                  visible_lines=lines, recognized_text=text, frames=position_frames,
+                  positioning_attempts=positioning_attempts)
+    return attach_scroll_event_observation(failed, observation), lines, text
 
 
 def run_scroll_behavior_checks(interaction, module, env, config, helper, pid: int,
