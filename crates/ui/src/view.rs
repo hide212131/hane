@@ -12410,6 +12410,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn scroll_inertia_clamps_each_frame_and_tracks_the_document_end(cx: &mut gpui::TestAppContext) {
+        let text = (1..=60)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx, _root) = open_view_for_mouse_tests(cx, &text, false);
+        let max_scroll_y = view.read_with(cx, |view, _| {
+            (view.scrollable_content_height() - view.viewport_height).max(0.0)
+        });
+        assert!(max_scroll_y > 1.0, "the test document must scroll");
+
+        let (scroll_y, last_applied, still_coasting) = view.update(cx, |view, _cx| {
+            view.scroll_y = max_scroll_y - 0.25;
+            view.scroll_inertia = Some(ScrollInertia {
+                velocity: 1_000.0,
+                last_frame: Instant::now() - Duration::from_millis(20),
+                last_applied: view.scroll_y,
+            });
+
+            let still_coasting = view.advance_scroll_inertia();
+            (
+                view.scroll_y,
+                view.scroll_inertia.map(|inertia| inertia.last_applied),
+                still_coasting,
+            )
+        });
+
+        assert!(
+            still_coasting,
+            "the coast must remain live at a document edge"
+        );
+        assert_eq!(
+            scroll_y, max_scroll_y,
+            "an inertia frame must clamp its own position at the document end"
+        );
+        assert_eq!(
+            last_applied,
+            Some(max_scroll_y),
+            "inertia tracking must store the clamped position at the document end"
+        );
+    }
+
+    #[gpui::test]
     fn scroll_inertia_does_not_carry_scroll_y_past_the_document_end(cx: &mut gpui::TestAppContext) {
         let text = (1..=60)
             .map(|n| format!("line {n:02}"))

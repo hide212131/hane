@@ -346,14 +346,14 @@ impl EditorView {
     }
 
     /// Runs once per requested animation frame, before `render`'s own
-    /// `scroll_y` clamp (which also bounds whatever this step adds, so
-    /// inertia can never carry the position past a document edge or survive
-    /// a viewport-height remeasurement that clamped it away). Delegates the
-    /// actual state advance to `advance_scroll_inertia`, which touches
-    /// nothing window-related, so `window.request_animation_frame()` (only
-    /// callable during `request_layout`, `prepaint`, or `paint`) stays
-    /// confined to this wrapper instead of being invoked from tests that
-    /// call the step outside a real frame.
+    /// `scroll_y` clamp. `advance_scroll_inertia` clamps each step and records
+    /// that bounded value as its last applied position; the render clamp also
+    /// handles changes to the viewport or content height between frames.
+    /// Delegates the actual state advance to `advance_scroll_inertia`, which
+    /// touches nothing window-related, so `window.request_animation_frame()`
+    /// (only callable during `request_layout`, `prepaint`, or `paint`) stays
+    /// confined to this wrapper instead of being invoked from tests that call
+    /// the step outside a real frame.
     pub(super) fn step_scroll_inertia(&mut self, window: &Window) {
         if self.advance_scroll_inertia() {
             window.request_animation_frame();
@@ -382,7 +382,11 @@ impl EditorView {
             self.scroll_inertia = None;
             return false;
         };
-        self.scroll_y += distance;
+        self.scroll_y = clamp_scroll_y(
+            self.scroll_y + distance,
+            self.scrollable_content_height(),
+            self.viewport_height,
+        );
         inertia.velocity = next_velocity;
         inertia.last_frame = now;
         inertia.last_applied = self.scroll_y;
