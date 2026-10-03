@@ -880,56 +880,73 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         top_step = {"result": "pass"}
         top_lines = [1, 2, 3]
         top_text = "LINE 001\nLINE 002"
-        position_frames = [
-            {"visible_lines": [1, 2], "recognized_text": "LINE 001"},
-            {"visible_lines": final_lines, "recognized_text": "position frame"},
-        ]
-        observation = {"observation": "observed_ordered", "receipt_ticks": 123}
+        top_frames = [{"visible_lines": [1, 2], "recognized_text": "LINE 001"}]
+        stalled_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
+        position_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
+        observations = []
         timing_path = Path("/tmp/hane-position-measurement-test/timing.log")
         observation_module = object()
+
+        def capture(*_args, **_kwargs):
+            observation = {"observation": "observed_ordered", "receipt_ticks": 123 + len(observations)}
+            observations.append(observation)
+            if capture_error:
+                return top_frames, observation, capture_error
+            if final_lines[0] > 1 and len(observations) == 1:
+                return top_frames, observation, None
+            return position_frames if final_lines[0] > 1 else stalled_frames, observation, None
+
         with patch.object(gui, "move_to_document_top", return_value=(top_step, top_lines, top_text)), \
-                patch.object(gui, "capture_frames", return_value=(position_frames, observation, capture_error)) as capture:
+                patch.object(gui, "capture_frames", side_effect=capture) as capture_mock:
             result, lines, text = gui.position_document_midpoint(
                 object(), object(), object(), object(), "helper", 123, "window",
                 Path("/tmp/hane-position-measurement-test"), 2.0, -1,
                 "lines-positioning", timing_path, observation_module,
             )
-        return result, lines, text, capture, position_frames, observation, timing_path, observation_module
+        return result, lines, text, capture_mock, top_frames, position_frames, observations, timing_path, observation_module
 
-    def test_positioning_uses_measured_120_line_input_and_preserves_six_frame_schedule(self):
-        result, lines, text, capture, position_frames, observation, timing_path, observation_module = (
+    def test_positioning_uses_calibrated_small_input_until_midpoint_is_visible(self):
+        result, lines, text, capture, top_frames, position_frames, observations, timing_path, observation_module = (
             self._run_position([180, 181, 182])
         )
         self.assertEqual(result["result"], "pass")
         self.assertEqual(lines, [180, 181, 182])
         self.assertEqual(text, "position frame")
-        self.assertEqual(result["frames"], position_frames)
-        self.assertIs(result["scroll_event_observation"], observation)
-        args, kwargs = capture.call_args
-        self.assertEqual(args[7], Path("/tmp/hane-position-measurement-test/lines-positioning-scroll"))
-        self.assertEqual(args[8:12], ("lines", -120, (0, 48, 96, 144, 200, 240), 2.0))
-        self.assertEqual(kwargs["scroll_event_timing_path"], timing_path)
-        self.assertIs(kwargs["scroll_event_observation_module"], observation_module)
+        self.assertEqual(result["frames"], top_frames + position_frames)
+        self.assertEqual(len(result["positioning_attempts"]), 2)
+        self.assertIs(result["scroll_event_observation"], observations[-1])
+        self.assertEqual(capture.call_count, 2)
+        for index, call in enumerate(capture.call_args_list, start=1):
+            args, kwargs = call
+            self.assertEqual(args[7], Path(
+                f"/tmp/hane-position-measurement-test/lines-positioning-scroll-{index:02d}"))
+            self.assertEqual(args[8:12], (
+                "lines", -gui.POSITIONING_LINES_DELTA,
+                gui.POSITIONING_FRAME_DELAYS_MS, 2.0))
+            self.assertEqual(kwargs["scroll_event_timing_path"], timing_path)
+            self.assertIs(kwargs["scroll_event_observation_module"], observation_module)
 
     def test_still_at_document_top_remains_blocked_and_keeps_measurement_evidence(self):
-        result, lines, text, _capture, position_frames, observation, *_ = self._run_position([1, 2, 3])
+        result, lines, text, capture, top_frames, _position_frames, observations, *_ = self._run_position([1, 2, 3])
         self.assertEqual(result["result"], "blocked")
-        self.assertIn("文書中央付近", result["reason"])
+        self.assertIn("3回", result["reason"])
         self.assertEqual(lines, [1, 2, 3])
         self.assertEqual(text, "position frame")
-        self.assertEqual(result["frames"], position_frames)
-        self.assertIs(result["scroll_event_observation"], observation)
+        self.assertEqual(capture.call_count, 3)
+        self.assertEqual(len(result["frames"]), 3)
+        self.assertTrue(all(frame["visible_lines"] == [1, 2, 3] for frame in result["frames"]))
+        self.assertIs(result["scroll_event_observation"], observations[-1])
 
     def test_capture_error_remains_blocked_and_keeps_partial_measurement_evidence(self):
-        result, lines, text, _capture, position_frames, observation, *_ = self._run_position(
+        result, lines, text, _capture, top_frames, _position_frames, observations, *_ = self._run_position(
             [180, 181], "scroll receipt unavailable"
         )
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(result["reason"], "scroll receipt unavailable")
         self.assertIsNone(lines)
         self.assertEqual(text, "")
-        self.assertEqual(result["frames"], position_frames)
-        self.assertIs(result["scroll_event_observation"], observation)
+        self.assertEqual(result["frames"], top_frames)
+        self.assertIs(result["scroll_event_observation"], observations[-1])
 
 
 class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
@@ -1103,7 +1120,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/14")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/15")
 
 
 class DocumentEdgeTests(unittest.TestCase):
