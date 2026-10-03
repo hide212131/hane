@@ -866,6 +866,36 @@ class ScrollDirectionCalibrationTests(unittest.TestCase):
         self.assertEqual(lines, [1, 2])
         self.assertEqual(recognized, "LINE 001\nLINE 002")
 
+    def assert_helper_failure_blocks_capture(self, failed_call):
+        class RecordingInteraction:
+            def __init__(self):
+                self.calls = []
+
+            def run_helper(self, helper, arguments, timeout):
+                self.calls.append((helper, arguments, timeout))
+                if len(self.calls) == failed_call:
+                    return False, "", "expected helper failure"
+                return True, "", None
+
+        interaction = RecordingInteraction()
+        with patch.object(gui, "capture_single") as capture:
+            result, lines, recognized = gui.move_to_document_top(
+                interaction, None, None, None, "helper", 123, "window",
+                Path(__file__).parent, "test-top", 1.0,
+            )
+
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["reason"], "expected helper failure")
+        self.assertIsNone(lines)
+        self.assertEqual(recognized, "")
+        capture.assert_not_called()
+
+    def test_document_start_helper_failure_blocks_ocr_capture(self):
+        self.assert_helper_failure_blocks_capture(failed_call=1)
+
+    def test_caret_helper_failure_blocks_ocr_capture(self):
+        self.assert_helper_failure_blocks_capture(failed_call=2)
+
     def test_failed_final_reset_preserves_ocr_evidence(self):
         top = gui.step(
             "direction-calibration-top", "pass", visible_lines=[1],
