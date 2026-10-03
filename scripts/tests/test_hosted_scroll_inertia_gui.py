@@ -630,6 +630,26 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         "product_mach_timebase_denom=1\n"
         "frame_00_capture_started_ticks=2000000\n"
         "frame_00_capture_completed_ticks=2200000\n"
+        "display_response_count=2\n"
+        "display_response_collection_valid=true\n"
+        "display_response_00_sample_id=7\n"
+        "display_response_00_frame_status=complete\n"
+        "display_response_00_timestamp_source=SCStreamFrameInfo.displayTime\n"
+        "display_response_00_image_source=same_CMSampleBuffer\n"
+        "display_response_00_display_time_ticks=1800000\n"
+        "display_response_00_callback_received_ticks=3000000\n"
+        "display_response_00_image_ready_ticks=3100000\n"
+        "display_response_00_artifact_written_ticks=3400000\n"
+        "display_response_00_image_path=/tmp/hane-wheel-measure-wiring-test/frames/display-response-00.png\n"
+        "display_response_01_sample_id=8\n"
+        "display_response_01_frame_status=complete\n"
+        "display_response_01_timestamp_source=SCStreamFrameInfo.displayTime\n"
+        "display_response_01_image_source=same_CMSampleBuffer\n"
+        "display_response_01_display_time_ticks=1900000\n"
+        "display_response_01_callback_received_ticks=3100000\n"
+        "display_response_01_image_ready_ticks=3200000\n"
+        "display_response_01_artifact_written_ticks=3400000\n"
+        "display_response_01_image_path=/tmp/hane-wheel-measure-wiring-test/frames/display-response-01.png\n"
     )
 
     def test_uses_wheel_measure_and_attaches_a_separate_observer_classification(self):
@@ -650,6 +670,67 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertAlmostEqual(frames_out[0]["capture_completed_elapsed_ms"], 1.2)
         self.assertEqual(observation_module.parse_calls, [(self.WHEEL_MEASURE_OUTPUT, 1)])
         self.assertEqual(observation, observation_module.assessed)
+        self.assertEqual(observation["window_server_display_responses"][0]["visible_lines"], [100])
+        self.assertEqual(observation["window_server_display_responses"][0]["sample_id"], 7)
+        self.assertEqual(len(observation["window_server_display_responses"]), 2)
+        self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
+
+    def test_window_server_display_time_is_separate_from_late_callback(self):
+        output = self.WHEEL_MEASURE_OUTPUT.replace(
+            "display_response_00_display_time_ticks=1800000",
+            "display_response_00_display_time_ticks=81000000",
+        ).replace(
+            "display_response_00_callback_received_ticks=3000000",
+            "display_response_00_callback_received_ticks=106000000",
+        ).replace(
+            "display_response_00_image_ready_ticks=3100000",
+            "display_response_00_image_ready_ticks=107000000",
+        ).replace(
+            "display_response_00_artifact_written_ticks=3200000",
+            "display_response_00_artifact_written_ticks=108000000",
+        ).replace(
+            "display_response_00_artifact_written_ticks=3400000",
+            "display_response_00_artifact_written_ticks=108000000",
+        ).replace(
+            "display_response_01_display_time_ticks=1900000",
+            "display_response_01_display_time_ticks=82000000",
+        ).replace(
+            "display_response_01_callback_received_ticks=3100000",
+            "display_response_01_callback_received_ticks=107000000",
+        ).replace(
+            "display_response_01_image_ready_ticks=3200000",
+            "display_response_01_image_ready_ticks=108000000",
+        ).replace(
+            "display_response_01_artifact_written_ticks=3400000",
+            "display_response_01_artifact_written_ticks=109000000",
+        )
+        evidence = gui.parse_wheel_measure_capture_output(output, 1)
+        self.assertAlmostEqual(evidence["display_responses"][0]["display_time_elapsed_ms"], 80.0)
+        self.assertAlmostEqual(evidence["display_responses"][0]["callback_received_elapsed_ms"], 105.0)
+
+    def test_missing_malformed_unpresented_or_unordered_display_metadata_fails_closed(self):
+        mutations = (
+            ("display_response_00_frame_status=complete", "display_response_00_frame_status=idle"),
+            ("display_response_00_timestamp_source=SCStreamFrameInfo.displayTime", "display_response_00_timestamp_source=other"),
+            ("display_response_00_image_source=same_CMSampleBuffer", "display_response_00_image_source=other_sample"),
+            ("display_response_00_sample_id=7", "display_response_00_sample_id=0"),
+            ("display_response_00_sample_id=7", "display_response_00_sample_id=-1"),
+            ("display_response_00_display_time_ticks=1800000", "display_response_00_display_time_ticks=unavailable"),
+            ("display_response_00_display_time_ticks=1800000", "display_response_00_display_time_ticks=18446744073709551616"),
+            ("display_response_00_callback_received_ticks=3000000", "display_response_00_callback_received_ticks=500000"),
+        )
+        for old, new in mutations:
+            with self.subTest(change=new):
+                output = self.WHEEL_MEASURE_OUTPUT.replace(old, new)
+                with self.assertRaises(ValueError):
+                    gui.parse_wheel_measure_capture_output(output, 1)
+
+        for old, new in (
+            ("display_response_collection_valid=true", "display_response_collection_valid=false"),
+            ("display_response_count=2", "display_response_count=3"),
+        ):
+            with self.subTest(change=new), self.assertRaises(ValueError):
+                gui.parse_wheel_measure_capture_output(self.WHEEL_MEASURE_OUTPUT.replace(old, new), 1)
 
     def test_wheel_measure_helper_failure_is_not_turned_into_a_pass(self):
         # A Vision warm-up crash (or any other helper failure) surfaces
@@ -772,6 +853,30 @@ class VisionWarmupFailsClosedTests(unittest.TestCase):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         body = source.split("func visibleLineNumbers(", 1)[1].split("\n}", 1)[0]
         self.assertIn("not proof this configuration is crash-free during an", body)
+
+
+class WindowServerDisplayCaptureContractTests(unittest.TestCase):
+    def test_display_time_and_pixels_come_from_the_same_complete_stream_sample(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        callback = source.split(
+            "func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,",
+            1,
+        )[1].split("\n    func stream(_ stream: SCStream, didStopWithError", 1)[0]
+        self.assertIn("attachments[SCStreamFrameInfo.status] as? SCFrameStatus", callback)
+        self.assertIn("status == .complete", callback)
+        self.assertIn("attachments[SCStreamFrameInfo.displayTime] as? UInt64", callback)
+        self.assertIn("CMSampleBufferGetImageBuffer(sampleBuffer)", callback)
+        self.assertIn("CIImage(cvPixelBuffer: pixelBuffer)", callback)
+        self.assertIn("displayTicks: displayTicks", callback)
+
+    def test_measurement_uses_stream_response_without_repurposing_product_presentation(self):
+        source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
+        measure = source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0]
+        self.assertLess(measure.index("displayCapture.start()"), measure.index("postScrollTicks(pid, unit, delta)"))
+        self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
+        self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
+        self.assertIn('product_frame_presented_ticks=unavailable', measure)
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/11")
 
 
 class DocumentEdgeTests(unittest.TestCase):
