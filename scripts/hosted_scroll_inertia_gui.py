@@ -55,6 +55,8 @@ WHEEL_MEASURE_ERROR_OUTPUT_LIMIT = 4000
 POSITIONING_LINES_DELTA = 32
 POSITIONING_MAX_STEPS = 16
 POSITIONING_FRAME_DELAYS_MS = (0, 48, 96, 144, 200, 240)
+MIDPOINT_BAND_START = LINE_COUNT // 3
+MIDPOINT_BAND_END = LINE_COUNT * 2 // 3
 # The product trajectory evaluator uses the Issue's 135ms coast window.
 # Procedure /15 separately verifies the 80ms first visual response using the
 # WindowServer display timestamp attached to the same streamed image sample.
@@ -107,6 +109,11 @@ def first_visible(frame: dict) -> Optional[int]:
 def last_visible(frame: dict) -> Optional[int]:
     lines = frame.get("visible_lines", [])
     return max(lines) if lines else None
+
+
+def midpoint_band_is_visible(lines: list[int]) -> bool:
+    """Require at least one OCR-recognized line from the fixture's middle third."""
+    return any(MIDPOINT_BAND_START <= line <= MIDPOINT_BAND_END for line in lines)
 
 
 def evaluate_lines_coast(baseline: Optional[int], frames: list[dict]) -> dict:
@@ -856,7 +863,7 @@ def position_document_midpoint(interaction, module, env, config, helper, pid: in
                           visible_lines=lines, recognized_text=text, frames=position_frames,
                           positioning_attempts=positioning_attempts)
             return attach_scroll_event_observation(failed, observation), None, text
-        if first > 1 and last < LINE_COUNT:
+        if midpoint_band_is_visible(lines):
             positioned = step(label, "pass", visible_lines=lines, recognized_text=text,
                               frames=position_frames, positioning_attempts=positioning_attempts)
             return attach_scroll_event_observation(positioned, observation), lines, text

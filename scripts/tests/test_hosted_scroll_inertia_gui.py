@@ -35,6 +35,13 @@ class VisibleLinesTests(unittest.TestCase):
     def test_ignores_non_fixture_text(self):
         self.assertEqual(gui.visible_lines("line one\nLINE xyz\n"), [])
 
+    def test_midpoint_requires_an_observed_line_from_the_central_third(self):
+        self.assertFalse(gui.midpoint_band_is_visible(list(range(2, 23))))
+        self.assertFalse(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_START - 1]))
+        self.assertTrue(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_START]))
+        self.assertTrue(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_END]))
+        self.assertFalse(gui.midpoint_band_is_visible([gui.MIDPOINT_BAND_END + 1]))
+
 
 class CaptureSingleTests(unittest.TestCase):
     def test_ocr_failure_marks_capture_blocked_with_reason(self):
@@ -690,7 +697,7 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
                 f"\nframe_{index:02d}_capture_started_ticks={started_ticks}"
                 f"\nframe_{index:02d}_capture_completed_ticks={completed_ticks}"
             )
-        interaction = self._StubInteraction(output)
+        interaction = self._StubInteraction(output, ocr_text="LINE 200")
         timing_path = Path("/tmp/hane-incomplete-display-collection-test/timing.log")
         with patch.object(
             gui, "move_to_document_top",
@@ -704,8 +711,8 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
 
         measurement = result["scroll_event_observation"]
         self.assertEqual(result["result"], "pass")
-        self.assertEqual(lines, [100])
-        self.assertEqual(text, "LINE 100")
+        self.assertEqual(lines, [200])
+        self.assertEqual(text, "LINE 200")
         self.assertEqual(len(result["frames"]), 6)
         self.assertEqual(result["frames"][0]["event_route"], "cghidEventTap")
         self.assertEqual(measurement["observation"], "unavailable")
@@ -926,15 +933,18 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
             self.assertEqual(kwargs["scroll_event_timing_path"], timing_path)
             self.assertIs(kwargs["scroll_event_observation_module"], observation_module)
 
-    def test_still_at_document_top_remains_blocked_and_keeps_measurement_evidence(self):
-        result, lines, text, capture, top_frames, _position_frames, observations, *_ = self._run_position([1, 2, 3])
+    def test_small_top_movement_does_not_count_as_midpoint(self):
+        near_top = list(range(2, 23))
+        result, lines, text, capture, _top_frames, _position_frames, observations, *_ = self._run_position(
+            near_top
+        )
         self.assertEqual(result["result"], "blocked")
         self.assertIn("3回", result["reason"])
-        self.assertEqual(lines, [1, 2, 3])
+        self.assertEqual(lines, near_top)
         self.assertEqual(text, "position frame")
-        self.assertEqual(capture.call_count, 3)
-        self.assertEqual(len(result["frames"]), 3)
-        self.assertTrue(all(frame["visible_lines"] == [1, 2, 3] for frame in result["frames"]))
+        self.assertEqual(capture.call_count, 5)
+        self.assertEqual(result["visible_lines"], near_top)
+        self.assertEqual(result["positioning_attempts"][-1]["visible_lines"], near_top)
         self.assertIs(result["scroll_event_observation"], observations[-1])
 
     def test_capture_error_remains_blocked_and_keeps_partial_measurement_evidence(self):
