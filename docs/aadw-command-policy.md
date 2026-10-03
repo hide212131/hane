@@ -60,13 +60,28 @@ review finding の件数をゼロにすること自体を目的にしない。
 
 current Issue の目的と acceptance criteria を満たすことを優先する。
 
-### 2.5 one action at a time
+### 2.5 Issue / PR / ADR / 詳細設計の正本を分ける
+
+設計情報を Issue、PR、ADR に重複して持たせない。情報の種類ごとに正本を決め、他の場所から参照する。
+
+- **Issue** は仕事の契約を正とする。何を、何のために行うか、対象範囲・対象外、依存関係、acceptance criteria を置く。コメントで要求・範囲・acceptance criteria が確定または変更された場合は、後続担当がコメント履歴から推測しなくて済むよう Issue 本文へ反映する。
+- **PR** は今回の変更と、その変更を受け入れてよいことを示す evidence の場とする。差分、Issue / ADR / 詳細設計との対応、review の議論と対応、current context に結び付く CI / review / GUI evidence を扱う。将来も守る設計判断や要求を PR コメントだけに残さない。
+- **ADR** は複数の Issue や将来の変更にも効く設計判断を正とする。採用した方針、その理由、重要な代替案、制約・影響、適用状態を記録する。既存 ADR に従うだけの局所変更では新しい ADR を作らない。重要な設計判断を変更する場合は ADR を更新または supersede し、以前の判断を追跡可能にする。
+- **詳細設計書** は、今回の実装に必要な具体的仕様が Issue 本文では長くなりすぎる場合だけ使う。変更ファイル、シンボル、処理順、不変条件、移行手順、テスト対応などを repository 内の文書として置き、Issue から参照する。小さい作業では独立した詳細設計書を必須にしない。
+
+設計用 Draft PR を使う場合、PR 自体を設計内容の正本にはしない。repository 内の ADR または詳細設計書を差分として提示・review する場とする。設計 PR の merge は設計文書の採用・保存であり、製品実装や acceptance criteria の達成を意味しない。
+
+PR の議論で結論が変わった場合は、内容に応じて Issue、ADR、詳細設計書の正本へ反映してから完了させる。要求と設計が矛盾する場合、コメントの新しさだけで優先順位を推測せず、関係する正本を整合させる。
+
+current state と履歴を混同しない。設計時点の「未実装」「未検証」などの記録はその時点の事実として保持できるが、現在の実装・検証状態は current Issue / PR / GitHub evidence から確認する。
+
+### 2.6 one action at a time
 
 一度の判断で複数 action を自動連鎖させない。
 
 current evidence に基づき、次に必要な一つの action を選ぶ。
 
-### 2.6 existing tools first
+### 2.7 existing tools first
 
 AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 
@@ -74,7 +89,7 @@ AADW 専用 command / workflow / wrapper / Gate を前提にしない。
 
 同じ操作や確認が繰り返し問題になると確認された場合だけ、最小の専用部品へ抽出する。
 
-### 2.7 base synchronization と product fix を分離する
+### 2.8 base synchronization と product fix を分離する
 
 target branch の進展を PR branch に取り込む操作は、Issue の製品コードを修正する action とは別に扱う。
 
@@ -87,7 +102,7 @@ target branch の進展を PR branch に取り込む操作は、Issue の製品�
 - conflict resolution に製品コード上の判断が必要な場合は、base sync と conflict fix を区別する。current target branch の変更を基準として取り込みつつ、current Issue の acceptance criteria と PR の root-cause 修正を保持する。両立できない場合は機械的に片側を採用せず、conflict の意味を再評価する。同期のために target branch の変更を別実装として複製しない。
 - product-fix worker は Issue の root-cause 修正を担当し、branch ancestry を更新する Git 操作の代替として使わない。
 
-### 2.8 Jev を意味判断の標準担当にする
+### 2.9 Jev を意味判断の標準担当にする
 
 - 通常の Issue / PR 作業では、依頼の解釈、受入条件、作業範囲、原因分類、実装・検証計画、次の action、継続・停止・完了候補の判断に Jev を使う。
 - この環境の既定接続は既存の local shell `~/.local/bin/jev`、provider `typesafe`、model `jev-latest` とする。設定済み認証をそのまま使い、API keyを表示・workerへ渡さない。単一判断は適切なCLI primitiveを使い、一括の候補フィルタには `filter`、複数の独立質問には `raw`、承認済みの再利用可能な質問には `run` を使う。取得したJev応答だけを判断結果として扱う。
