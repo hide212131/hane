@@ -620,7 +620,7 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         try:
             evidence = parse_wheel_measure_capture_output(output, len(delays))
         except ValueError as exc:
-            return [], None, str(exc)
+            return [], None, f"{exc}\nwheel-measure output:\n{output}"
         # A separate observer classification of what the one shared scroll
         # input established on the mach clock (Issue #427); never feeds back
         # into `evidence`/the frames below, so it cannot change what

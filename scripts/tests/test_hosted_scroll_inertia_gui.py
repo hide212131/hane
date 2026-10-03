@@ -674,6 +674,25 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(len(observation["window_server_display_responses"]), 2)
         self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
 
+    def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
+        output = self.WHEEL_MEASURE_OUTPUT.replace(
+            "event_route=cghidEventTap", "event_route=target_pid")
+        interaction = self._StubInteraction(output)
+        observation_module = self._StubObservationModule()
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-measure-invalid-output-test"), "lines", -120, (0,), 1.0,
+            scroll_event_timing_path=Path("/tmp/hane-wheel-measure-invalid-output-test/timing.log"),
+            scroll_event_observation_module=observation_module,
+        )
+        self.assertEqual(frames_out, [])
+        self.assertIsNone(observation)
+        self.assertIn("did not use the cghidEventTap route", error)
+        self.assertIn("wheel-measure output:", error)
+        self.assertIn("product_scroll_receipt_ticks=1100000", error)
+        self.assertIn(output, error)
+        self.assertEqual(observation_module.parse_calls, [])
+
     def test_window_server_display_time_is_separate_from_late_callback(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
             "display_response_00_display_time_ticks=1800000",
