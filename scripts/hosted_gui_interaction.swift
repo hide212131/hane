@@ -1007,8 +1007,10 @@ func wheelReversal(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         guard let frame else {
             fail("could not capture pre-reversal window frame \(index): \(error ?? "unknown error")")
         }
+        let startedMs = milliseconds(frame.started - firstPosted)
+        let completedMs = milliseconds(frame.completed - firstPosted)
         guard frame.completed < firstPosted + 0.135 else {
-            fail("pre-reversal screen capture exceeded the Lines inertia window")
+            fail("pre-reversal frame \(index) started at \(startedMs)ms and completed at \(completedMs)ms; the Lines inertia deadline is 135ms")
         }
         preFrames.append((index, frame))
     }
