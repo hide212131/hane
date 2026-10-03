@@ -26,6 +26,77 @@ def sample(name="lines_coast", result="pass", times=(20, 50, 200)):
     return step
 
 
+def display_timed_sample(name="lines_coast", result="pass", *, display_elapsed_ms=80.0,
+                         callback_elapsed_ms=105.0, paint_ms=54.0, visible=(2, 3)):
+    step = sample(name, result, times=(105, 180, 240))
+    event_ms = 10.0
+    display_absolute_ms = event_ms + display_elapsed_ms
+    step["scroll_event_observation"] = {
+        "observation": "observed_ordered",
+        "clock_consistent": True,
+        "window_server_display_observation": "observed",
+        "presentation_observation": "unavailable",
+        "stages_ms": {
+            "event_post_ms": event_ms,
+            "scroll_receipt_ms": 22.0,
+            "frame_paint_ms": paint_ms,
+            "window_server_display_responses": [
+                {
+                    "sample_id": 6,
+                    "window_server_display_ms": event_ms + 30.0,
+                    "callback_received_ms": event_ms + 31.0,
+                    "image_ready_ms": event_ms + 32.0,
+                    "artifact_written_ms": event_ms + 33.0,
+                    "frame_status": "complete",
+                    "timestamp_source": "SCStreamFrameInfo.displayTime",
+                    "image_source": "same_CMSampleBuffer",
+                    "image_path": "frames/display-response-00.png",
+                },
+                {
+                    "sample_id": 7,
+                    "window_server_display_ms": display_absolute_ms,
+                    "callback_received_ms": event_ms + callback_elapsed_ms,
+                    "image_ready_ms": event_ms + callback_elapsed_ms + 1.0,
+                    "artifact_written_ms": max(display_absolute_ms, event_ms + callback_elapsed_ms + 2.0),
+                    "frame_status": "complete",
+                    "timestamp_source": "SCStreamFrameInfo.displayTime",
+                    "image_source": "same_CMSampleBuffer",
+                    "image_path": "frames/display-response-01.png",
+                },
+            ],
+        },
+        "window_server_display_responses": [
+            {
+                "sample_id": 6,
+                "frame_status": "complete",
+                "timestamp_source": "SCStreamFrameInfo.displayTime",
+                "image_source": "same_CMSampleBuffer",
+                "display_time_elapsed_ms": 30.0,
+                "callback_received_elapsed_ms": 31.0,
+                "image_ready_elapsed_ms": 32.0,
+                "artifact_written_elapsed_ms": 33.0,
+                "image_path": "frames/display-response-00.png",
+                "path": "frames/display-response-00.png",
+                "visible_lines": [1, 2],
+            },
+            {
+                "sample_id": 7,
+                "frame_status": "complete",
+                "timestamp_source": "SCStreamFrameInfo.displayTime",
+                "image_source": "same_CMSampleBuffer",
+                "display_time_elapsed_ms": display_elapsed_ms,
+                "callback_received_elapsed_ms": callback_elapsed_ms,
+                "image_ready_elapsed_ms": callback_elapsed_ms + 1.0,
+                "artifact_written_elapsed_ms": max(display_elapsed_ms, callback_elapsed_ms + 2.0),
+                "image_path": "frames/display-response-01.png",
+                "path": "frames/display-response-01.png",
+                "visible_lines": list(visible),
+            },
+        ],
+    }
+    return step
+
+
 class ObservationTests(unittest.TestCase):
     def test_observed_success_is_preserved(self):
         self.assertEqual(observation.assess_step(sample())["observation"], "observed_pass")
@@ -113,6 +184,85 @@ class ObservationTests(unittest.TestCase):
                 step = sample(name, times=(20, 80, 200))
                 step["frames"][0]["visible_lines"] = [1, 2]
                 self.assertEqual(observation.assess_step(step)["observation"], "observed_pass")
+
+    def test_v11_windowserver_display_at_80ms_passes_even_if_callback_arrives_later(self):
+        for name in ("lines_coast", "pixels_direct_follow"):
+            with self.subTest(name=name):
+                step = display_timed_sample(name, display_elapsed_ms=80.0, callback_elapsed_ms=105.0)
+                result = observation.assess_step(step, require_display_response=True)
+                self.assertEqual(result["observation"], "observed_pass")
+                self.assertEqual(result["window_server_display_elapsed_ms"], 80.0)
+                self.assertEqual(result["callback_received_elapsed_ms"], 105.0)
+
+    def test_v11_late_or_unpresented_display_does_not_pass(self):
+        late = display_timed_sample(display_elapsed_ms=80.001)
+        result = observation.assess_step(late, require_display_response=True)
+        self.assertEqual(result["observation"], "observed_nonpass")
+        self.assertEqual(result["failure_class"], "unknown")
+
+        unpresented = display_timed_sample(display_elapsed_ms=60.0)
+        unpresented["scroll_event_observation"]["window_server_display_responses"][1]["frame_status"] = "idle"
+        result = observation.assess_step(unpresented, require_display_response=True)
+        self.assertEqual(result["observation"], "unavailable")
+        self.assertEqual(result["failure_class"], "measurement")
+
+    def test_v11_missing_malformed_or_wrong_sample_metadata_is_unavailable(self):
+        mutations = (
+            lambda step: step["scroll_event_observation"].pop("window_server_display_responses"),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(
+                timestamp_source="capture-completion"),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(
+                image_source="different_sample"),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(
+                sample_id=True),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(
+                display_time_elapsed_ms=float("nan")),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(
+                image_path="frames/display-response-00.png"),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"].__setitem__(1, None),
+            lambda step: step["scroll_event_observation"]["stages_ms"].update(
+                window_server_display_responses=None),
+        )
+        for mutate in mutations:
+            step = display_timed_sample()
+            mutate(step)
+            with self.subTest(step=step):
+                result = observation.assess_step(step, require_display_response=True)
+                self.assertEqual(result["observation"], "unavailable")
+                self.assertEqual(result["failure_class"], "measurement")
+
+    def test_v11_sample_displayed_before_hane_paint_cannot_pass(self):
+        step = display_timed_sample(display_elapsed_ms=40.0, paint_ms=55.0)
+        result = observation.assess_step(step, require_display_response=True)
+        self.assertEqual(result["observation"], "unavailable")
+        self.assertEqual(result["failure_class"], "measurement")
+
+    def test_v11_report_requires_valid_display_response_for_both_scroll_modes(self):
+        report = {
+            "procedure_version": observation.DISPLAY_TIMED_PROCEDURE,
+            "scenarios": [{"steps": [
+                display_timed_sample("lines_coast"),
+                sample("direction_reversal"),
+                display_timed_sample("pixels_direct_follow"),
+            ]}],
+        }
+        self.assertFalse(observation.assess_report(report)["diagnosis_required"])
+        report["scenarios"][0]["steps"][0]["scroll_event_observation"].pop("window_server_display_responses")
+        self.assertTrue(observation.assess_report(report)["diagnosis_required"])
+
+    def test_v11_display_collection_requires_two_matching_monotonic_samples(self):
+        for mutate in (
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"].pop(),
+            lambda step: step["scroll_event_observation"]["window_server_display_responses"][1].update(sample_id=6),
+            lambda step: step["scroll_event_observation"]["stages_ms"][
+                "window_server_display_responses"][1].update(window_server_display_ms=40.0),
+        ):
+            step = display_timed_sample()
+            mutate(step)
+            with self.subTest(step=step):
+                result = observation.assess_step(step, require_display_response=True)
+                self.assertEqual(result["observation"], "unavailable")
+                self.assertEqual(result["failure_class"], "measurement")
 
     def test_pass_without_valid_baseline_is_measurement_unavailable(self):
         for baseline in (None, True, 0, 501, "1"):

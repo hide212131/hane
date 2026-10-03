@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Measurement-only correlation of one scroll input (Issue #427).
 
-Distinguishes four points in time on the one mach clock both the GUI helper
+Distinguishes points in time on the one mach clock both the GUI helper
 process and Hane's own product process read: the OS event post, Hane's
 `ScrollWheelEvent` receipt, the frame paint/submission Hane committed in
-response, and the helper's screenshot capture start/end.
+response, the helper's screenshot capture start/end, and a separate
+ScreenCaptureKit sample's WindowServer display time.
 
 Hane's own timestamp is when `InputCapture::paint` ran, inside `Window::draw`
 and before the platform renderer commits/presents the frame (on macOS, an
 async Metal command buffer with its own completion handler) — it is not
-compositor presentation. This module never relabels or infers it as one:
-compositor presentation itself is always reported as a separate, unavailable
-observation.
+compositor presentation. This module never relabels or infers it as one.
+The helper's WindowServer display timestamp is recorded separately;
+product-side presentation remains unavailable.
 
 This module never judges Issue #389's product acceptance: a well-ordered
 measurement is not a pass for the 80ms/55ms/135ms scroll-inertia thresholds,
@@ -43,7 +44,7 @@ def _uint(fields: dict[str, str], name: str) -> Optional[int]:
         parsed = int(value)
     except ValueError:
         return None
-    return parsed if parsed >= 0 else None
+    return parsed if 0 <= parsed <= 0xFFFFFFFFFFFFFFFF else None
 
 
 def parse_wheel_measure_output(output: str, expected_frames: int) -> dict:
@@ -66,6 +67,22 @@ def parse_wheel_measure_output(output: str, expected_frames: int) -> dict:
         "product_frame_paint_ticks": _uint(fields, "product_frame_paint_ticks"),
         "product_mach_timebase_numer": _uint(fields, "product_mach_timebase_numer"),
         "product_mach_timebase_denom": _uint(fields, "product_mach_timebase_denom"),
+        "display_response_collection_valid": fields.get("display_response_collection_valid") == "true",
+        "display_response_count": _uint(fields, "display_response_count"),
+        "display_responses": [
+            {
+                "sample_id": _uint(fields, f"display_response_{index:02d}_sample_id"),
+                "frame_status": fields.get(f"display_response_{index:02d}_frame_status"),
+                "timestamp_source": fields.get(f"display_response_{index:02d}_timestamp_source"),
+                "image_source": fields.get(f"display_response_{index:02d}_image_source"),
+                "display_time_ticks": _uint(fields, f"display_response_{index:02d}_display_time_ticks"),
+                "callback_received_ticks": _uint(fields, f"display_response_{index:02d}_callback_received_ticks"),
+                "image_ready_ticks": _uint(fields, f"display_response_{index:02d}_image_ready_ticks"),
+                "artifact_written_ticks": _uint(fields, f"display_response_{index:02d}_artifact_written_ticks"),
+                "image_path": fields.get(f"display_response_{index:02d}_image_path"),
+            }
+            for index in range(min(_uint(fields, "display_response_count") or 0, 64))
+        ],
         "frames": frames,
     }
 
@@ -73,7 +90,10 @@ def parse_wheel_measure_output(output: str, expected_frames: int) -> dict:
 def _ticks_to_ms(ticks: Optional[int], numer: Optional[int], denom: Optional[int]) -> Optional[float]:
     if ticks is None or not numer or not denom:
         return None
-    return ticks * numer / denom / 1_000_000.0
+    try:
+        return ticks * numer / denom / 1_000_000.0
+    except OverflowError:
+        return None
 
 
 def _unavailable(reason: str) -> dict:
@@ -82,9 +102,9 @@ def _unavailable(reason: str) -> dict:
         "reason": reason,
         "stages_ms": {},
         "clock_consistent": False,
-        # Compositor presentation is never measured on this clock; keep this
-        # explicit even for an unavailable record so no caller can read a
-        # missing key as "not yet reported" (Issue #427).
+        "window_server_display_observation": "unavailable",
+        # Hane's product process does not observe its WindowServer display
+        # time. Preserve that fact separately from the helper observation.
         "presentation_observation": "unavailable",
     }
 
@@ -108,9 +128,10 @@ def assess_wheel_measurement(record: dict) -> dict:
     read back as a pass/fail or as compositor presentation.
 
     `product_frame_paint_ticks` is Hane's paint/submission time, not
-    compositor presentation; this function never relabels or infers
-    presentation from it, and always reports `presentation_observation` as
-    `"unavailable"`."""
+    compositor presentation. The helper's WindowServer display timestamp is
+    reported separately and never copied into the product-side field;
+    `presentation_observation` remains `"unavailable"` for product-side
+    presentation."""
     if record.get("event_route") != "cghidEventTap":
         return _unavailable("OSイベント経路がcghidEventTapではない。")
 
@@ -123,7 +144,8 @@ def assess_wheel_measurement(record: dict) -> dict:
         frame.get("capture_started_ticks") is not None and frame.get("capture_completed_ticks") is not None
         for frame in frames
     )
-    if record.get("event_post_ticks") is None or not numer or not denom or not have_frames:
+    if (record.get("event_post_ticks") is None or not numer or not denom
+            or numer > 0xFFFFFFFF or denom > 0xFFFFFFFF or not have_frames):
         return _unavailable("イベント送出・時計基準・画面取得のいずれかの時刻が欠落している。")
 
     have_product = (
@@ -138,6 +160,52 @@ def assess_wheel_measurement(record: dict) -> dict:
     if numer != product_numer or denom != product_denom:
         return _unavailable("ヘルパーとHaneで観測したmach timebaseの比が一致しない。")
 
+    event_ticks = record["event_post_ticks"]
+    displays = record.get("display_responses")
+    if (record.get("display_response_collection_valid") is not True
+            or not isinstance(displays, list) or not 1 <= len(displays) <= 64
+            or record.get("display_response_count") != len(displays)):
+        return _unavailable("WindowServer表示サンプル群が欠落、不完全、または上限を超えている。")
+    display_stages = []
+    seen_sample_ids: set[int] = set()
+    previous_display_ticks = event_ticks - 1
+    for display in displays:
+        display_ticks = display.get("display_time_ticks")
+        callback_ticks = display.get("callback_received_ticks")
+        image_ready_ticks = display.get("image_ready_ticks")
+        artifact_written_ticks = display.get("artifact_written_ticks")
+        sample_id = display.get("sample_id")
+        if (display.get("frame_status") != "complete"
+                or display.get("timestamp_source") != "SCStreamFrameInfo.displayTime"
+                or display.get("image_source") != "same_CMSampleBuffer"
+                or type(sample_id) is not int or sample_id <= 0 or sample_id in seen_sample_ids
+                or any(type(value) is not int for value in (
+                    display_ticks, callback_ticks, image_ready_ticks, artifact_written_ticks))
+                or not isinstance(display.get("image_path"), str) or not display["image_path"]):
+            return _unavailable("WindowServer表示時刻と同一サンプル画像のメタデータが欠落または不正。")
+        if (display_ticks < event_ticks or callback_ticks < event_ticks
+                or display_ticks <= previous_display_ticks
+                or image_ready_ticks < callback_ticks
+                or artifact_written_ticks < max(image_ready_ticks, display_ticks)):
+            return _unavailable("WindowServer表示サンプルの時刻がイベント後に成立していない。")
+        stage = {
+            "sample_id": sample_id,
+            "window_server_display_ms": _ticks_to_ms(display_ticks, numer, denom),
+            "callback_received_ms": _ticks_to_ms(callback_ticks, numer, denom),
+            "image_ready_ms": _ticks_to_ms(image_ready_ticks, numer, denom),
+            "artifact_written_ms": _ticks_to_ms(artifact_written_ticks, numer, denom),
+            "frame_status": display["frame_status"],
+            "timestamp_source": display["timestamp_source"],
+            "image_source": display["image_source"],
+            "image_path": display["image_path"],
+        }
+        if any(value is None or not math.isfinite(value) for key, value in stage.items()
+               if key.endswith("_ms")):
+            return _unavailable("WindowServer表示サンプル時刻をミリ秒へ変換できない。")
+        display_stages.append(stage)
+        seen_sample_ids.add(sample_id)
+        previous_display_ticks = display_ticks
+
     event_post_ms = _ticks_to_ms(record["event_post_ticks"], numer, denom)
     receipt_ms = _ticks_to_ms(record["product_scroll_receipt_ticks"], numer, denom)
     paint_ms = _ticks_to_ms(record["product_frame_paint_ticks"], numer, denom)
@@ -150,7 +218,7 @@ def assess_wheel_measurement(record: dict) -> dict:
     ]
     all_ms = [event_post_ms, receipt_ms, paint_ms, *(
         value for frame in frame_stages for value in frame.values()
-    )]
+    ), *(value for stage in display_stages for key, value in stage.items() if key.endswith("_ms"))]
     if any(value is None or not math.isfinite(value) for value in all_ms):
         return _unavailable("mach時刻をミリ秒へ変換できない。")
 
@@ -166,6 +234,7 @@ def assess_wheel_measurement(record: dict) -> dict:
         "event_post_ms": event_post_ms,
         "scroll_receipt_ms": receipt_ms,
         "frame_paint_ms": paint_ms,
+        "window_server_display_responses": display_stages,
         "frames_ms": frame_stages,
     }
     ordered = event_post_ms <= receipt_ms <= paint_ms
@@ -175,6 +244,7 @@ def assess_wheel_measurement(record: dict) -> dict:
             "reason": "event post → ScrollWheelEvent受信 → フレーム描画の順序が成立していない。",
             "stages_ms": stages_ms,
             "clock_consistent": True,
+            "window_server_display_observation": "observed",
             "presentation_observation": "unavailable",
         }
     return {
@@ -182,5 +252,6 @@ def assess_wheel_measurement(record: dict) -> dict:
         "reason": None,
         "stages_ms": stages_ms,
         "clock_consistent": True,
+        "window_server_display_observation": "observed",
         "presentation_observation": "unavailable",
     }
