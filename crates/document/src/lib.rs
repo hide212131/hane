@@ -214,6 +214,52 @@ pub struct RopeBuffer {
     delta_capacity: usize,
 }
 
+/// An immutable, independently readable view of a document's source bytes.
+///
+/// Cloning the underlying `Rope` shares its persistent tree. This deliberately
+/// avoids cloning `RopeBuffer`, which also owns edit history and line indexes.
+#[derive(Clone)]
+pub struct RopeSnapshot {
+    rope: Rope,
+    byte_offset: usize,
+}
+
+impl RopeSnapshot {
+    /// The number of source bytes in the snapshot.
+    #[must_use]
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    /// Whether the snapshot contains no source bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rope.len_bytes() == 0
+    }
+}
+
+impl io::Read for RopeSnapshot {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.byte_offset == self.rope.len_bytes() {
+            return Ok(0);
+        }
+
+        let (chunk, chunk_byte_offset, _, _) = self.rope.chunk_at_byte(self.byte_offset);
+        let offset_in_chunk = self.byte_offset - chunk_byte_offset;
+        let byte_count = output
+            .len()
+            .min(chunk.len().saturating_sub(offset_in_chunk));
+        if byte_count == 0 {
+            return Err(io::Error::other("rope snapshot made no read progress"));
+        }
+
+        output[..byte_count]
+            .copy_from_slice(&chunk.as_bytes()[offset_in_chunk..offset_in_chunk + byte_count]);
+        self.byte_offset += byte_count;
+        Ok(byte_count)
+    }
+}
+
 /// Rewrites every bare CR in `s` to `\n` so a line-break-only-on-`\n` index can
 /// see it. A CR immediately followed by `\n` (within `s`, or by
 /// `trailing_is_lf` when the CR is `s`'s last byte) is a CRLF pair and is left
@@ -299,6 +345,15 @@ impl RopeBuffer {
     #[must_use]
     pub fn full_text(&self) -> String {
         self.rope.to_string()
+    }
+
+    /// Captures a read-only source snapshot that shares the current Rope.
+    #[must_use]
+    pub fn snapshot(&self) -> RopeSnapshot {
+        RopeSnapshot {
+            rope: self.rope.clone(),
+            byte_offset: 0,
+        }
     }
 
     /// Writes the current Rope without first materializing the full document as
@@ -791,6 +846,45 @@ mod tests {
             delta.transform_range(SourceRange::new(4, 7)),
             Some(SourceRange::new(8, 11))
         );
+    }
+
+    #[test]
+    fn rope_snapshot_streams_original_utf8_bytes_across_small_reads() {
+        let source = "start 日本語🙂 end\r\n";
+        let buffer = RopeBuffer::from_text(source);
+        let mut snapshot = buffer.snapshot();
+        let mut actual = Vec::new();
+        let mut chunk = [0; 2];
+        loop {
+            let read = io::Read::read(&mut snapshot, &mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            actual.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(actual, source.as_bytes());
+        assert_eq!(snapshot.len_bytes(), source.len());
+    }
+
+    #[test]
+    fn rope_snapshot_keeps_its_source_when_the_buffer_is_edited() {
+        let mut buffer = RopeBuffer::from_text("日本語の本文🙂");
+        let mut snapshot = buffer.snapshot();
+        buffer
+            .edit(SourceRange::new(0, "日本語".len()), "別")
+            .unwrap();
+
+        let mut actual = Vec::new();
+        io::Read::read_to_end(&mut snapshot, &mut actual).unwrap();
+        assert_eq!(actual, "日本語の本文🙂".as_bytes());
+        assert_eq!(buffer.full_text(), "別の本文🙂");
+    }
+
+    #[test]
+    fn an_empty_rope_snapshot_returns_eof() {
+        let mut snapshot = RopeBuffer::new().snapshot();
+        let mut output = [0; 8];
+        assert_eq!(io::Read::read(&mut snapshot, &mut output).unwrap(), 0);
     }
 
     #[test]

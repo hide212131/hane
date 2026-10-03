@@ -89,6 +89,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 mod ai_settings;
 mod background_parse;
+mod content_search;
 mod inline_rename;
 mod session_save;
 mod sidebar;
@@ -605,6 +606,9 @@ pub struct EditorView {
     /// any. `None` keeps single-file editing exactly as it was: no sidebar,
     /// no folder concept anywhere else in the view.
     work_folder: Option<WorkFolder>,
+    /// Search UI state is kept with the view so rapid input edits share one
+    /// bounded controller and one long-lived input entity.
+    content_search: content_search::ContentSearchState,
     /// Where a not-yet-named work-folder note's content is journalled, so a
     /// crash before it earns a real filename never loses it. Removed once the
     /// session it belongs to gets a real path or closes.
@@ -1272,6 +1276,7 @@ impl EditorView {
             settings_error: None,
             recent,
             work_folder: None,
+            content_search: content_search::ContentSearchState::default(),
             draft_store: Arc::new(OsDraftStore),
             work_folder_drafts: HashMap::new(),
             selected_folder: None,
@@ -1491,6 +1496,8 @@ impl EditorView {
                     Err(error) => Some(format!("Could not recover unsaved drafts: {error}")),
                 };
 
+                self.content_search_workspace_changed(cx);
+
                 if let Some(path) = first {
                     // Opening the first entry replaces whichever session is
                     // active through the same background-loading path as any
@@ -1544,6 +1551,7 @@ impl EditorView {
     /// Switches to another open document, carrying the current one's scroll
     /// position with it and rebuilding everything derived from the document.
     pub fn activate_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        self.preserve_content_search_navigation_for_action();
         if id == self.sessions.active_id() {
             self.sidebar_focus = SidebarFocus::ActiveSession;
             self.reveal_file_tab(id);
@@ -1739,6 +1747,8 @@ impl EditorView {
         self.schedule_autosave(cx);
         self.schedule_draft_save(cx);
         self.schedule_title_sync(cx);
+        let edited_session = self.sessions.active_id();
+        self.invalidate_content_search_session(edited_session, cx);
         cx.notify();
     }
 
@@ -1791,6 +1801,7 @@ impl EditorView {
                 target_directory,
             },
         );
+        self.content_search_workspace_changed(cx);
         self.on_document_replaced();
         self.schedule_document_parse(cx);
         self.status = None;
@@ -1895,6 +1906,7 @@ impl EditorView {
                     folder.insert_folder(path.clone());
                 }
                 self.expanded_folders.insert(path);
+                self.content_search_workspace_changed(cx);
                 self.status = None;
             }
             Err(error) => {
@@ -2039,6 +2051,7 @@ impl EditorView {
         self.flush_pending_drafts();
         self.sessions = SessionSet::with_untitled("", "Untitled");
         self.work_folder = None;
+        self.content_search_workspace_changed(cx);
         self.work_folder_drafts.clear();
         self.selected_folder = None;
         self.expanded_folders.clear();
@@ -2100,6 +2113,7 @@ impl EditorView {
     }
 
     fn open_with_policy(&mut self, path: &Path, policy: OpenPolicy, cx: &mut Context<Self>) {
+        self.preserve_content_search_navigation_for_action();
         // Whichever path was asked for most recently is what the user wants
         // to see; a load that lands after a newer request must not steal
         // focus back to what it was asked for.
@@ -2167,13 +2181,19 @@ impl EditorView {
             return;
         }
         match loaded {
-            Err(error) => self.status = Some(format!("Open failed: {error}")),
+            Err(error) => {
+                self.cancel_pending_search_navigation_for_path(path);
+                self.status = Some(format!("Open failed: {error}"));
+            }
             Ok(loaded) => {
+                let search_navigation_verification =
+                    self.verify_loaded_search_navigation(path, &loaded);
                 // The read took time, and the target session may have been
                 // edited in the meantime: re-check before replacing it.
                 if into
                     .is_some_and(|id| self.sessions.get(id).is_some_and(DocumentSession::is_dirty))
                 {
+                    self.cancel_pending_search_navigation_for_path(path);
                     self.status =
                         Some("Save current changes before opening another file".to_owned());
                 } else {
@@ -2191,6 +2211,7 @@ impl EditorView {
                     // stale result that targets the current active session is
                     // discarded instead of applied.
                     if !is_latest_request && into == Some(previously_active) {
+                        self.cancel_pending_search_navigation_for_path(path);
                         self.status =
                             Some("A newer document is open; this load was discarded".to_owned());
                     } else {
@@ -2208,6 +2229,15 @@ impl EditorView {
                             self.on_document_replaced();
                             self.status = Some("Opened".to_owned());
                             self.schedule_document_parse(cx);
+                            match search_navigation_verification {
+                                Some(Ok(navigation_id)) => {
+                                    self.finish_pending_search_navigation(navigation_id, true, cx);
+                                }
+                                Some(Err(())) => {
+                                    self.discard_pending_search_navigation_for_path(path, cx);
+                                }
+                                None => {}
+                            }
                         } else {
                             // The session now holds the loaded document and is
                             // ready to be reused instantly next time it is
@@ -5090,7 +5120,8 @@ impl Render for EditorView {
         // its width out of the same window, so it must be subtracted here too,
         // not just in the element tree, or wrapping would be computed for a
         // column wider than what is actually drawn.
-        let sidebar_width = if self.work_folder.is_some() {
+        let sidebar_visible = self.work_folder.is_some() || self.content_search_sidebar_visible();
+        let sidebar_width = if sidebar_visible {
             self.sidebar_width + SIDEBAR_RESIZER_WIDTH
         } else {
             0.0
@@ -5371,7 +5402,7 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle(cx));
         let sidebar_viewport_height = f32::from(window.viewport_size().height);
         let sidebar = self.work_folder_sidebar(sidebar_viewport_height, cx);
-        let resizer = if self.work_folder.is_some() {
+        let resizer = if sidebar_visible {
             Some(self.sidebar_resizer(cx))
         } else {
             None

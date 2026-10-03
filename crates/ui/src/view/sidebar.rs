@@ -127,6 +127,9 @@ impl EditorView {
         sidebar_viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
+        if self.content_search_sidebar_visible() {
+            return Some(self.content_search_sidebar(sidebar_viewport_height, cx));
+        }
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
@@ -203,6 +206,26 @@ impl EditorView {
             .child(
                 toolbar_button("work-folder-new-folder", icons::ICON_FOLDER_NEW)
                     .on_click(cx.listener(|view, _, _, cx| view.new_work_folder_folder(cx))),
+            )
+            .child(
+                div()
+                    .id("work-folder-content-search")
+                    .h(px(24.0))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(rgb(self.theme.code_background))
+                    .child("本文検索")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.toggle_content_search_mode(
+                            content_search::SidebarMode::Content,
+                            window,
+                            cx,
+                        );
+                    })),
             );
         let mut filter_input = div().relative().flex_1().min_w(px(0.0)).h_full();
         if self.sidebar_filter.is_empty() {

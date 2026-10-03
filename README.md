@@ -14,6 +14,7 @@ Hane は、巨大な Markdown 文書も軽快に編集できるデスクトッ�
 - **設定の保存** — テーマや自動保存などの設定は次回起動時も引き継がれます。
 - **テーマ** — system / light / dark のテーマを切り替えられます。
 - **Work folder mode** — フォルダを指定すると、配下の Markdown 一覧をサイドバーから選んですぐ編集できます。`+` を押すだけでファイル名を聞かれずに新しいメモを書き始められ、最初の H1 がファイル名になります。
+- **本文検索** — Work folder 内の Markdown 本文を検索し、一致した箇所へ移動できます。開いている未保存文書や下書きも検索対象です。
 
 ## 動作環境
 
@@ -95,6 +96,7 @@ cargo run --release -p hane
 | 元に戻す / やり直す | Command + Z / Command + Shift + Z | Ctrl + Z / Ctrl + Y（Ctrl + Shift + Z も可） |
 | 開く | Command + O | Ctrl + O |
 | フォルダを開く（work folder mode） | Command + Shift + O | Ctrl + Shift + O |
+| Work folder の本文を検索 | Command + Shift + F | Ctrl + Shift + F |
 | 保存 / 名前を付けて保存 | Command + S / Command + Shift + S | Ctrl + S / Ctrl + Shift + S |
 | 自動保存の切り替え | Command + Option + A | Ctrl + Alt + A |
 
@@ -107,6 +109,12 @@ cargo run --release -p hane
 新規メモは最初の H1（`# ...`）がファイル名になり、自動命名対象のメモは以後 H1 を変更するとファイル名も追従します。ファイル名と H1 が最初から異なる既存の Markdown は、自動命名対象と判断されないため勝手にリネームされません。
 
 H1 をまだ付けていない新規メモは `.hane/drafts` にバックグラウンドで保存されるため、アプリを終了・クラッシュさせても内容を失いません。
+
+#### 本文検索
+
+Work folder mode のサイドバーで「本文検索」を選ぶか、Command + Shift + F（Windows / Linux は Ctrl + Shift + F）を押します。検索語を入力すると確定後に検索が始まり、初期設定では大文字・小文字を区別しません。必要に応じて大小文字の切り替えを使ってください。
+
+結果をクリックするか、上下キーで選んで Enter を押すと、その文書を開いて一致箇所を選択します。開いている文書は未保存の編集内容を優先し、Work folder の下書きも検索します。検索後に文書内容が変わっていた場合は古い位置へ移動せず、再検索して選び直すよう案内します。
 
 ## ライセンス
 

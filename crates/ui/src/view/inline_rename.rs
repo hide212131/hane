@@ -609,6 +609,7 @@ impl EditorView {
                     }
                 }
                 self.follow_inline_rename_paths(&from, &target, kind);
+                self.content_search_workspace_changed(cx);
                 if let Err(error) = self.stores.recent_files().store(&self.recent) {
                     self.status = Some(format!("Recent files failed: {error}"));
                 } else {
