@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location("hosted_scroll_inertia_gui", MODUL
 assert SPEC is not None and SPEC.loader is not None
 gui = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gui)
+OBSERVATION_MODULE_PATH = MODULE_PATH.with_name("aadw_scroll_event_observation.py")
+OBSERVATION_SPEC = importlib.util.spec_from_file_location(
+    "aadw_scroll_event_observation", OBSERVATION_MODULE_PATH)
+assert OBSERVATION_SPEC is not None and OBSERVATION_SPEC.loader is not None
+scroll_event_observation = importlib.util.module_from_spec(OBSERVATION_SPEC)
+OBSERVATION_SPEC.loader.exec_module(scroll_event_observation)
 
 
 def frames(offsets, times):
@@ -674,6 +680,64 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(len(observation["window_server_display_responses"]), 2)
         self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
 
+    def test_incomplete_display_response_collection_keeps_position_frames_and_receipt(self):
+        output = self.WHEEL_MEASURE_OUTPUT.replace(
+            "display_response_collection_valid=true", "display_response_collection_valid=false")
+        for index in range(1, 6):
+            started_ticks = 2_000_000 + index * 48_000_000
+            completed_ticks = started_ticks + 200_000
+            output += (
+                f"\nframe_{index:02d}_capture_started_ticks={started_ticks}"
+                f"\nframe_{index:02d}_capture_completed_ticks={completed_ticks}"
+            )
+        interaction = self._StubInteraction(output)
+        timing_path = Path("/tmp/hane-incomplete-display-collection-test/timing.log")
+        with patch.object(
+            gui, "move_to_document_top",
+            return_value=({"result": "pass"}, [1, 2], "LINE 001\nLINE 002"),
+        ):
+            result, lines, text = gui.position_document_midpoint(
+                interaction, None, None, None, "helper", 10, "window",
+                Path("/tmp/hane-incomplete-display-collection-test"), 1.0, -1,
+                "lines-positioning", timing_path, scroll_event_observation,
+            )
+
+        measurement = result["scroll_event_observation"]
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(lines, [100])
+        self.assertEqual(text, "LINE 100")
+        self.assertEqual(len(result["frames"]), 6)
+        self.assertEqual(result["frames"][0]["event_route"], "cghidEventTap")
+        self.assertEqual(measurement["observation"], "unavailable")
+        self.assertIn("WindowServer display response collection", measurement["display_response_error"])
+        self.assertIn("product_scroll_receipt_ticks=1100000", measurement["wheel_measure_output_excerpt"])
+        self.assertEqual(measurement["window_server_display_responses"], [])
+        self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 6)
+
+    def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
+        output = self.WHEEL_MEASURE_OUTPUT.replace(
+            "event_route=cghidEventTap", "event_route=target_pid")
+        output += "\nextra=" + ("x" * (gui.WHEEL_MEASURE_ERROR_OUTPUT_LIMIT + 100))
+        interaction = self._StubInteraction(output)
+        observation_module = self._StubObservationModule()
+        frames_out, observation, error = gui.capture_frames(
+            interaction, None, None, None, "helper", 10, "window",
+            Path("/tmp/hane-wheel-measure-invalid-output-test"), "lines", -120, (0,), 1.0,
+            scroll_event_timing_path=Path("/tmp/hane-wheel-measure-invalid-output-test/timing.log"),
+            scroll_event_observation_module=observation_module,
+        )
+        self.assertEqual(frames_out, [])
+        self.assertIsNone(observation)
+        self.assertIn("did not use the cghidEventTap route", error)
+        self.assertIn("wheel-measure output:", error)
+        self.assertIn("product_scroll_receipt_ticks=1100000", error)
+        diagnostic_output = error.split("wheel-measure output:\n", 1)[1]
+        self.assertEqual(
+            diagnostic_output,
+            output[:gui.WHEEL_MEASURE_ERROR_OUTPUT_LIMIT] + "\n...(truncated)",
+        )
+        self.assertEqual(observation_module.parse_calls, [])
+
     def test_window_server_display_time_is_separate_from_late_callback(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
             "display_response_00_display_time_ticks=1800000",
@@ -721,15 +785,21 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         for old, new in mutations:
             with self.subTest(change=new):
                 output = self.WHEEL_MEASURE_OUTPUT.replace(old, new)
-                with self.assertRaises(ValueError):
-                    gui.parse_wheel_measure_capture_output(output, 1)
+                evidence = gui.parse_wheel_measure_capture_output(output, 1)
+                self.assertEqual(evidence["frame_elapsed_ms"], [1.2])
+                self.assertEqual(evidence["display_responses"], [])
+                self.assertIsNotNone(evidence["display_response_error"])
 
         for old, new in (
             ("display_response_collection_valid=true", "display_response_collection_valid=false"),
             ("display_response_count=2", "display_response_count=3"),
         ):
-            with self.subTest(change=new), self.assertRaises(ValueError):
-                gui.parse_wheel_measure_capture_output(self.WHEEL_MEASURE_OUTPUT.replace(old, new), 1)
+            with self.subTest(change=new):
+                evidence = gui.parse_wheel_measure_capture_output(
+                    self.WHEEL_MEASURE_OUTPUT.replace(old, new), 1)
+                self.assertEqual(evidence["frame_elapsed_ms"], [1.2])
+                self.assertEqual(evidence["display_responses"], [])
+                self.assertIsNotNone(evidence["display_response_error"])
 
     def test_wheel_measure_helper_failure_is_not_turned_into_a_pass(self):
         # A Vision warm-up crash (or any other helper failure) surfaces
@@ -805,6 +875,63 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         self.assertEqual(len(frames_out), 1)
 
 
+class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
+    def _run_position(self, final_lines, capture_error=None):
+        top_step = {"result": "pass"}
+        top_lines = [1, 2, 3]
+        top_text = "LINE 001\nLINE 002"
+        position_frames = [
+            {"visible_lines": [1, 2], "recognized_text": "LINE 001"},
+            {"visible_lines": final_lines, "recognized_text": "position frame"},
+        ]
+        observation = {"observation": "observed_ordered", "receipt_ticks": 123}
+        timing_path = Path("/tmp/hane-position-measurement-test/timing.log")
+        observation_module = object()
+        with patch.object(gui, "move_to_document_top", return_value=(top_step, top_lines, top_text)), \
+                patch.object(gui, "capture_frames", return_value=(position_frames, observation, capture_error)) as capture:
+            result, lines, text = gui.position_document_midpoint(
+                object(), object(), object(), object(), "helper", 123, "window",
+                Path("/tmp/hane-position-measurement-test"), 2.0, -1,
+                "lines-positioning", timing_path, observation_module,
+            )
+        return result, lines, text, capture, position_frames, observation, timing_path, observation_module
+
+    def test_positioning_uses_measured_120_line_input_and_preserves_six_frame_schedule(self):
+        result, lines, text, capture, position_frames, observation, timing_path, observation_module = (
+            self._run_position([180, 181, 182])
+        )
+        self.assertEqual(result["result"], "pass")
+        self.assertEqual(lines, [180, 181, 182])
+        self.assertEqual(text, "position frame")
+        self.assertEqual(result["frames"], position_frames)
+        self.assertIs(result["scroll_event_observation"], observation)
+        args, kwargs = capture.call_args
+        self.assertEqual(args[7], Path("/tmp/hane-position-measurement-test/lines-positioning-scroll"))
+        self.assertEqual(args[8:12], ("lines", -120, (0, 48, 96, 144, 200, 240), 2.0))
+        self.assertEqual(kwargs["scroll_event_timing_path"], timing_path)
+        self.assertIs(kwargs["scroll_event_observation_module"], observation_module)
+
+    def test_still_at_document_top_remains_blocked_and_keeps_measurement_evidence(self):
+        result, lines, text, _capture, position_frames, observation, *_ = self._run_position([1, 2, 3])
+        self.assertEqual(result["result"], "blocked")
+        self.assertIn("文書中央付近", result["reason"])
+        self.assertEqual(lines, [1, 2, 3])
+        self.assertEqual(text, "position frame")
+        self.assertEqual(result["frames"], position_frames)
+        self.assertIs(result["scroll_event_observation"], observation)
+
+    def test_capture_error_remains_blocked_and_keeps_partial_measurement_evidence(self):
+        result, lines, text, _capture, position_frames, observation, *_ = self._run_position(
+            [180, 181], "scroll receipt unavailable"
+        )
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(result["reason"], "scroll receipt unavailable")
+        self.assertIsNone(lines)
+        self.assertEqual(text, "")
+        self.assertEqual(result["frames"], position_frames)
+        self.assertIs(result["scroll_event_observation"], observation)
+
+
 class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
     # The focused checker uses one calibrated direction for Lines and Pixels,
     # and both measured captures opt into the same wheel-measure path.
@@ -826,6 +953,14 @@ class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
         self.assertIn('step("pixels_direct_follow", "blocked", pixel_position.get("reason"))', branch)
         self.assertIn('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', branch)
         self.assertNotIn("capture_frames(", capture)
+
+    def test_lines_positioning_uses_the_shared_timing_path_and_observer(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def run_scroll_behavior_checks(", 1)[1]
+        position_call = body.split('position, position_lines, _position_text = position_document_midpoint(', 1)[1]
+        position_call = position_call.split(")", 1)[0]
+        self.assertIn('"lines-positioning"', position_call)
+        self.assertIn("scroll_event_timing_path, scroll_event_observation_module", position_call)
 
 
 class ScrollDirectionCalibrationTests(unittest.TestCase):
@@ -968,7 +1103,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/13")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/14")
 
 
 class DocumentEdgeTests(unittest.TestCase):
