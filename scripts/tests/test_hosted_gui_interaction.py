@@ -73,6 +73,17 @@ class HelperTests(unittest.TestCase):
         self.assertIn('became inactive again before typing', body)
 
 
+class ActivationStateFreshnessTests(unittest.TestCase):
+    def test_frontmost_check_runs_the_run_loop_and_checks_workspace_pid(self):
+        source = Path(interaction.__file__).with_name('hosted_gui_interaction.swift').read_text()
+        start = source.index('func activateApplication(')
+        end = source.index('\nfunc ', start + 1)
+        body = source[start:end]
+        self.assertIn('RunLoop.current.run(until: Date().addingTimeInterval(0.3))', body)
+        self.assertIn('let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier', body)
+        self.assertIn('application.isActive || frontmostPID == pid', body)
+
+
 class OpenSessionActivationOrderingTests(unittest.TestCase):
     def test_activates_the_gui_process_before_searching_for_its_window(self):
         events = []

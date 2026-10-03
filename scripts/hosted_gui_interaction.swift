@@ -338,8 +338,9 @@ func activateApplication(_ pid: pid_t) {
     }
     _ = application.activate(options: [.activateAllWindows])
     runAppleScript("tell application \"System Events\" to set frontmost of first process whose unix id is \(pid) to true")
-    Thread.sleep(forTimeInterval: 0.3)
-    guard application.isActive else {
+    RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+    let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard application.isActive || frontmostPID == pid else {
         fail("target application did not become the frontmost app: \(pid)")
     }
 }
