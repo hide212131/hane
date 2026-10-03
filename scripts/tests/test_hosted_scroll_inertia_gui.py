@@ -171,6 +171,18 @@ class DirectionReversalTests(unittest.TestCase):
         self.assertEqual(result["result"], "blocked")
 
 
+class ReversalProbeScheduleTests(unittest.TestCase):
+    def test_default_schedule_leaves_time_to_finish_the_last_screen_capture(self):
+        delays = gui.PRE_REVERSE_PROBE_DELAYS_MS
+        self.assertEqual(len(delays), 3)
+        self.assertEqual(delays, tuple(sorted(set(delays))))
+        # The 120ms probe in hosted run 37082138091 completed after the
+        # unchanged 135ms deadline. Keep the final scheduled start at or
+        # before 100ms, leaving at least 35ms for capture and scheduling.
+        self.assertLessEqual(delays[-1], 100)
+        self.assertLess(delays[-1], gui.LINES_INERTIA_WINDOW_MS)
+
+
 class ReversalHelperTimingTests(unittest.TestCase):
     def test_parses_event_interval_and_pre_and_post_frame_times(self):
         evidence = gui.parse_reversal_helper_output(
@@ -254,6 +266,9 @@ class ReversalHelperTimingTests(unittest.TestCase):
         self.assertNotIn("postToPid", source)
         self.assertIn('print("reversal_event_route=cghidEventTap")', reversal)
         self.assertIn("frame.completed < firstPosted + 0.135", reversal)
+        self.assertIn("let startedMs = milliseconds(frame.started - firstPosted)", reversal)
+        self.assertIn("let completedMs = milliseconds(frame.completed - firstPosted)", reversal)
+        self.assertIn("the Lines inertia deadline is 135ms", reversal)
 
     def test_wheel_reversal_cli_bounds_pre_reverse_probe_delays_to_the_inertia_window(self):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
@@ -345,13 +360,13 @@ class ReversalCaptureFramesTests(unittest.TestCase):
         reversal_output = (
             "initial_event_elapsed_ms=2\n"
             "reversal_event_route=cghidEventTap\n"
-            "reverse_event_elapsed_ms=130\n"
-            "pre_frame_00_capture_started_ms=66\n"
-            "pre_frame_00_capture_completed_ms=68\n"
-            "pre_frame_01_capture_started_ms=98\n"
-            "pre_frame_01_capture_completed_ms=100\n"
-            "pre_frame_02_capture_started_ms=122\n"
-            "pre_frame_02_capture_completed_ms=124\n"
+            "reverse_event_elapsed_ms=102\n"
+            "pre_frame_00_capture_started_ms=50\n"
+            "pre_frame_00_capture_completed_ms=52\n"
+            "pre_frame_01_capture_started_ms=74\n"
+            "pre_frame_01_capture_completed_ms=76\n"
+            "pre_frame_02_capture_started_ms=98\n"
+            "pre_frame_02_capture_completed_ms=100\n"
             "frame_00_capture_started_ms=5\n"
             "frame_00_capture_completed_ms=6\n"
         )
@@ -364,7 +379,8 @@ class ReversalCaptureFramesTests(unittest.TestCase):
         frames, pre_reverse, error = gui.capture_frames(
             interaction, None, None, None, "helper", 10, "window",
             Path("/tmp/hane-reversal-candidate-selected-test"), "lines", -8, (0,), 1.0,
-            reverse_delta=12, baseline=100, pre_reverse_probe_delays_ms=(64, 96, 120),
+            reverse_delta=12, baseline=100,
+            pre_reverse_probe_delays_ms=gui.PRE_REVERSE_PROBE_DELAYS_MS,
         )
         self.assertIsNone(error)
         self.assertEqual(len(pre_reverse["candidates"]), 3)
