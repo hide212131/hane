@@ -174,11 +174,12 @@ class DirectionReversalTests(unittest.TestCase):
 class ReversalProbeScheduleTests(unittest.TestCase):
     def test_default_schedule_leaves_time_to_finish_the_last_screen_capture(self):
         delays = gui.PRE_REVERSE_PROBE_DELAYS_MS
-        self.assertEqual(len(delays), 3)
+        self.assertEqual(len(delays), 2)
         self.assertEqual(delays, tuple(sorted(set(delays))))
-        # The 120ms probe in hosted run 37082138091 completed after the
-        # unchanged 135ms deadline. Keep the final scheduled start at or
-        # before 100ms, leaving at least 35ms for capture and scheduling.
+        # The third sequential capture exceeded the 135ms limit on a local
+        # Mac. Two probes starting at 32ms and 72ms leave time for capture
+        # completion before reversal, even when each screenshot takes ~30ms.
+        self.assertEqual(delays, (32, 72))
         self.assertLessEqual(delays[-1], 100)
         self.assertLess(delays[-1], gui.LINES_INERTIA_WINDOW_MS)
 
@@ -354,37 +355,34 @@ class ReversalCaptureFramesTests(unittest.TestCase):
             raise AssertionError(f"unexpected helper command: {args[0]}")
 
     def test_selects_the_candidate_that_captured_old_direction_motion(self):
-        # Three candidates are captured within the window without OCR; only
-        # the last one happened to land on the moved frame. OCR runs after
-        # the helper call returns, once the reverse input has already been sent.
+        # Two candidates are captured within the window without OCR; the
+        # second one happened to land on the moved frame. OCR runs after the
+        # helper call returns, once the reverse input has already been sent.
         reversal_output = (
             "initial_event_elapsed_ms=2\n"
             "reversal_event_route=cghidEventTap\n"
             "reverse_event_elapsed_ms=102\n"
-            "pre_frame_00_capture_started_ms=50\n"
-            "pre_frame_00_capture_completed_ms=52\n"
-            "pre_frame_01_capture_started_ms=74\n"
-            "pre_frame_01_capture_completed_ms=76\n"
-            "pre_frame_02_capture_started_ms=98\n"
-            "pre_frame_02_capture_completed_ms=100\n"
+            "pre_frame_00_capture_started_ms=32\n"
+            "pre_frame_00_capture_completed_ms=34\n"
+            "pre_frame_01_capture_started_ms=72\n"
+            "pre_frame_01_capture_completed_ms=74\n"
             "frame_00_capture_started_ms=5\n"
             "frame_00_capture_completed_ms=6\n"
         )
         ocr_texts = {
             "pre-frame-00.png": "LINE 100",
-            "pre-frame-01.png": "LINE 100",
-            "pre-frame-02.png": "LINE 108",
+            "pre-frame-01.png": "LINE 108",
         }
         interaction = self._StubInteraction(reversal_output, ocr_texts)
         frames, pre_reverse, error = gui.capture_frames(
             interaction, None, None, None, "helper", 10, "window",
-            Path("/tmp/hane-reversal-candidate-selected-test"), "lines", -8, (0,), 1.0,
-            reverse_delta=12, baseline=100,
+            Path("/tmp/hane-reversal-candidate-selected-test"), "lines", 8, (0,), 1.0,
+            reverse_delta=-12, baseline=100,
             pre_reverse_probe_delays_ms=gui.PRE_REVERSE_PROBE_DELAYS_MS,
         )
         self.assertIsNone(error)
-        self.assertEqual(len(pre_reverse["candidates"]), 3)
-        self.assertTrue(pre_reverse["selected"]["path"].endswith("pre-frame-02.png"))
+        self.assertEqual(len(pre_reverse["candidates"]), 2)
+        self.assertTrue(pre_reverse["selected"]["path"].endswith("pre-frame-01.png"))
         self.assertEqual(pre_reverse["selected"]["value"], 108)
 
     def test_reports_no_selection_when_no_candidate_shows_old_direction(self):
@@ -807,40 +805,44 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
 
 
 class PixelsScrollEventMeasurementWiringTests(unittest.TestCase):
-    # Issue #427 gap: the pixels_direct_follow capture went through plain
-    # wheel-capture with no product-side correlation at all. Mocking the full
-    # run_focused_scenario flow (session/build/OCR) end to end would mostly
-    # exercise unrelated plumbing already covered elsewhere, so this checks
-    # the one relevant call site directly: the pixels capture_frames call
-    # must opt into the same wheel-measure path and shared timing file as
-    # lines_coast, the same way CaptureFramesScrollEventMeasurementTests
-    # above already proves that opt-in behaves correctly once made.
+    # The focused checker uses one calibrated direction for Lines and Pixels,
+    # and both measured captures opt into the same wheel-measure path.
     def test_pixels_capture_opts_into_wheel_measure_with_the_shared_timing_path(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        body = source.split("def run_focused_scenario(", 1)[1]
-        pixels_call = body.split('"pixels", -180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', 1)[1]
+        body = source.split("def run_scroll_behavior_checks(", 1)[1]
+        pixels_call = body.split('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', 1)[1]
         pixels_call = pixels_call.split(")", 1)[0]
         self.assertIn("scroll_event_timing_path=scroll_event_timing_path", pixels_call)
         self.assertIn("scroll_event_observation_module=scroll_event_observation_module", pixels_call)
 
-    # Issue #427 regression (PR #429 CodeRabbit review): when the pixels
-    # baseline screen itself fails to capture, pixel_step used to be replaced
-    # outright with a fresh blocked step(), dropping the
-    # pixels_scroll_event_observation already returned by the same
-    # capture_frames call. Unlike lines_coast's blocked branch, that
-    # observation never reached the final result. This checks the
-    # before_capture-failure branch re-attaches it with
-    # attach_scroll_event_observation, and that the branch still produces a
-    # literal "blocked" judgment (so a disordered/ordered observation can
-    # never upgrade it to pass -- see ScrollEventObservationAttachmentTests).
-    def test_before_capture_failure_reattaches_the_pixels_scroll_event_observation(self):
+    def test_pixels_capture_requires_a_valid_mid_document_baseline(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        body = source.split("def run_focused_scenario(", 1)[1]
-        branch = body.split('if before_capture["result"] != "pass":', 1)[1]
-        branch = branch.split("steps.append(pixel_step)", 1)[0]
-        self.assertIn("attach_scroll_event_observation(", branch)
-        self.assertIn("pixels_scroll_event_observation)", branch)
-        self.assertIn('step("pixels_direct_follow", "blocked",', branch)
+        body = source.split("def run_scroll_behavior_checks(", 1)[1]
+        position = body.split('pixel_position, before_lines, before_text = position_document_midpoint(', 1)[1]
+        branch = body.split('if pixel_position["result"] == "pass":', 1)[1]
+        capture = branch.split('frames, pixels_scroll_event_observation, error = capture_frames(', 1)[0]
+        self.assertIn('"pixels-before"', position)
+        self.assertIn('step("pixels_direct_follow", "blocked", pixel_position.get("reason"))', branch)
+        self.assertIn('"pixels", downward_sign * 180, PIXELS_FRAME_DELAYS_MS, helper_timeout,', branch)
+        self.assertNotIn("capture_frames(", capture)
+
+
+class ScrollDirectionCalibrationTests(unittest.TestCase):
+    def test_calibration_probes_both_signs_from_the_verified_document_top(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def calibrate_scroll_direction(", 1)[1].split("\ndef position_document_midpoint", 1)[0]
+        self.assertIn('"direction-calibration-top"', body)
+        self.assertIn('((1, "positive"), (-1, "negative"))', body)
+        self.assertIn("offset > baseline", body)
+        self.assertIn("direction-calibration-final-reset", body)
+
+    def test_behavior_inputs_use_one_calibrated_sign(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        body = source.split("def run_scroll_behavior_checks(", 1)[1].split("\ndef run_focused_scenario", 1)[0]
+        self.assertIn('"lines", downward_sign * 8', body)
+        self.assertIn('reverse_delta=downward_sign * -12', body)
+        self.assertIn('"lines", -downward_sign * 1000', body)
+        self.assertIn('"lines", downward_sign * 1200', body)
 
 
 class VisionWarmupFailsClosedTests(unittest.TestCase):
@@ -862,7 +864,9 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
             "func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,",
             1,
         )[1].split("\n    func stream(_ stream: SCStream, didStopWithError", 1)[0]
-        self.assertIn("attachments[SCStreamFrameInfo.status] as? SCFrameStatus", callback)
+        self.assertIn("attachments[SCStreamFrameInfo.status]", callback)
+        self.assertIn("statusValue as? Int", callback)
+        self.assertIn("SCFrameStatus(rawValue: statusRawValue)", callback)
         self.assertIn("status == .complete", callback)
         self.assertIn("attachments[SCStreamFrameInfo.displayTime] as? UInt64", callback)
         self.assertIn("CMSampleBufferGetImageBuffer(sampleBuffer)", callback)
@@ -873,10 +877,11 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         source = SWIFT_HELPER_PATH.read_text(encoding="utf-8")
         measure = source.split("func wheelMeasure(", 1)[1].split("\n}", 1)[0]
         self.assertLess(measure.index("displayCapture.start()"), measure.index("postScrollTicks(pid, unit, delta)"))
+        self.assertLess(measure.index("focus(pid)"), measure.index("postScrollTicks(pid, unit, delta)"))
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/11")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/12")
 
 
 class DocumentEdgeTests(unittest.TestCase):

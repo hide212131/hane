@@ -15,9 +15,11 @@ on:
       - 'scripts/aadw_gui_observation.py'
       - 'scripts/aadw_scroll_event_observation.py'
       - 'scripts/hosted_gui_interaction.swift'
+      - 'scripts/hosted_gui_interaction.py'
       - 'scripts/hosted_scroll_inertia_gui.py'
       - 'scripts/tests/test_aadw_gui_observation.py'
       - 'scripts/tests/test_aadw_scroll_event_observation.py'
+      - 'scripts/tests/test_hosted_gui_interaction.py'
       - 'scripts/tests/test_hosted_scroll_inertia_gui.py'
   workflow_dispatch:
 
@@ -40,9 +42,11 @@ jobs:
             scripts/tests/test_hosted_sidebar_chrome_gui.py \
             scripts/aadw_gui_observation.py \
             scripts/aadw_scroll_event_observation.py \
+            scripts/hosted_gui_interaction.py \
             scripts/hosted_scroll_inertia_gui.py \
             scripts/tests/test_aadw_gui_observation.py \
             scripts/tests/test_aadw_scroll_event_observation.py \
+            scripts/tests/test_hosted_gui_interaction.py \
             scripts/tests/test_hosted_scroll_inertia_gui.py
       - name: Run GUI router tests
         run: python3 .github/tests/test_aadw_gui_command.py
@@ -54,6 +58,11 @@ jobs:
             scripts/tests/test_aadw_gui_observation.py \
             scripts/tests/test_aadw_scroll_event_observation.py \
             scripts/tests/test_hosted_scroll_inertia_gui.py
+      - name: Run GUI activation tests
+        run: |
+          python3 -m unittest \
+            scripts.tests.test_hosted_gui_interaction.ActivationStateFreshnessTests \
+            scripts.tests.test_hosted_gui_interaction.OpenSessionActivationOrderingTests
 
   swift-helper-build:
     runs-on: macos-15
