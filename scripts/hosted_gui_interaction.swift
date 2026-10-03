@@ -9,6 +9,7 @@
 
 import AppKit
 import Carbon
+import CoreImage
 import CryptoKit
 import Darwin
 import Foundation
@@ -743,6 +744,201 @@ struct CapturedWindowFrameTicks {
     let completedTicks: UInt64
 }
 
+struct CapturedWindowDisplayFrame {
+    let image: CGImage
+    let sampleID: UInt64
+    let displayTicks: UInt64
+    let callbackReceivedTicks: UInt64
+    let imageReadyTicks: UInt64
+}
+
+/// Captures complete ScreenCaptureKit frames displayed after a scroll input.
+/// Each image and WindowServer display timestamp are extracted from the same
+/// CMSampleBuffer; SCScreenshotManager frames remain separate evidence for
+/// the later coast/settling measurements.
+final class WindowServerDisplayCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let capture: WindowCapture
+    private var stream: SCStream?
+    private let callbackQueue = DispatchQueue(label: "hane.window-server-display-capture", qos: .userInitiated)
+    private let imageContext = CIContext()
+    private let condition = NSCondition()
+    private let responseWindowTicks = UInt64(0.135 / machSecondsPerTick)
+    private let maximumResponseFrames = 64
+    private var streamStarted = false
+    private var eventPostTicks: UInt64?
+    private var nextSampleID: UInt64 = 0
+    private var responseFrames: [CapturedWindowDisplayFrame] = []
+    private var lastResponseDisplayTicks: UInt64?
+    private var responseCollectionValid = true
+    private var lastError: String?
+
+    init(capture: WindowCapture) {
+        self.capture = capture
+        super.init()
+    }
+
+    func start() -> String? {
+        let stream = SCStream(filter: capture.filter, configuration: capture.configuration, delegate: self)
+        self.stream = stream
+        do {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: callbackQueue)
+        } catch {
+            return String(describing: error)
+        }
+
+        let result = WindowCaptureResult()
+        let completed = DispatchSemaphore(value: 0)
+        stream.startCapture { error in
+            result.finish(error: error.map { String(describing: $0) })
+            completed.signal()
+        }
+        guard completed.wait(timeout: .now() + 10) == .success else {
+            return "timed out while starting ScreenCaptureKit display stream"
+        }
+        let (_, _, error) = result.values()
+        guard error == nil else { return error }
+        return waitUntilStarted(timeout: 10)
+    }
+
+    func markEventPosted(_ ticks: UInt64) {
+        condition.lock()
+        eventPostTicks = ticks
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitForDisplayResponses(timeout: TimeInterval) -> ([CapturedWindowDisplayFrame], Bool, String?) {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        while responseFrames.isEmpty && Date() < deadline {
+            if !condition.wait(until: deadline) { break }
+        }
+        let frames = responseFrames
+        let collectionValid = responseCollectionValid
+        let error = lastError
+        condition.unlock()
+        guard !frames.isEmpty else {
+            return ([], collectionValid,
+                    error ?? "no complete ScreenCaptureKit frame with a valid WindowServer display time followed the scroll input")
+        }
+
+        // Do not return a sample as already-presented until the shared mach
+        // clock has reached its attached WindowServer display timestamp.
+        let latestDisplayTicks = frames.last!.displayTicks
+        while true {
+            let nowTicks = monotonicTicks()
+            if nowTicks >= latestDisplayTicks { break }
+            let remaining = Double(latestDisplayTicks - nowTicks) * machSecondsPerTick
+            if remaining > 0 { Thread.sleep(forTimeInterval: min(remaining, 0.01)) }
+        }
+        return (frames, collectionValid, nil)
+    }
+
+    func stop() -> String? {
+        guard let stream else { return nil }
+        let result = WindowCaptureResult()
+        let completed = DispatchSemaphore(value: 0)
+        stream.stopCapture { error in
+            result.finish(error: error.map { String(describing: $0) })
+            completed.signal()
+        }
+        guard completed.wait(timeout: .now() + 10) == .success else {
+            return "timed out while stopping ScreenCaptureKit display stream"
+        }
+        let (_, _, error) = result.values()
+        callbackQueue.sync {}
+        self.stream = nil
+        return error
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of outputType: SCStreamOutputType) {
+        let callbackReceivedTicks = monotonicTicks()
+        guard outputType == .screen, sampleBuffer.isValid,
+              let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+                sampleBuffer, createIfNecessary: false
+              ) as? [[SCStreamFrameInfo: Any]],
+              let attachments = attachmentsArray.first,
+              let status = attachments[SCStreamFrameInfo.status] as? SCFrameStatus else {
+            rememberError("ScreenCaptureKit sample status or attachments were invalid")
+            return
+        }
+
+        condition.lock()
+        nextSampleID += 1
+        let sampleID = nextSampleID
+        streamStarted = true
+        let inputTicks = eventPostTicks
+        condition.broadcast()
+        condition.unlock()
+
+        guard let inputTicks, status == .complete else { return }
+        guard let displayTicks = attachments[SCStreamFrameInfo.displayTime] as? UInt64,
+              displayTicks > 0 else {
+            rememberError("complete ScreenCaptureKit sample had no valid post-input displayTime")
+            return
+        }
+        // Samples displayed before the event are stale. The measurement
+        // window ends at the existing 135ms inertia boundary; the separate
+        // 80ms observer gate evaluates the actual display timestamps within it.
+        guard callbackReceivedTicks >= inputTicks, displayTicks >= inputTicks else { return }
+        let (latestAllowedTicks, overflow) = inputTicks.addingReportingOverflow(responseWindowTicks)
+        guard !overflow, displayTicks <= latestAllowedTicks else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            rememberError("complete ScreenCaptureKit sample had no image buffer")
+            return
+        }
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let image = imageContext.createCGImage(ciImage, from: ciImage.extent) else {
+            rememberError("could not create an image from the timed ScreenCaptureKit sample")
+            return
+        }
+        let imageReadyTicks = monotonicTicks()
+        condition.lock()
+        if let lastResponseDisplayTicks, displayTicks <= lastResponseDisplayTicks {
+            responseCollectionValid = false
+            lastError = "ScreenCaptureKit display timestamps were not strictly increasing"
+        } else if responseFrames.count >= maximumResponseFrames {
+            responseCollectionValid = false
+            lastError = "ScreenCaptureKit display response exceeded the bounded frame collection"
+        } else {
+            responseFrames.append(CapturedWindowDisplayFrame(
+                image: image,
+                sampleID: sampleID,
+                displayTicks: displayTicks,
+                callbackReceivedTicks: callbackReceivedTicks,
+                imageReadyTicks: imageReadyTicks
+            ))
+            self.lastResponseDisplayTicks = displayTicks
+        }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        rememberError("ScreenCaptureKit display stream stopped: \(error)")
+    }
+
+    private func waitUntilStarted(timeout: TimeInterval) -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while !streamStarted && Date() < deadline {
+            if !condition.wait(until: deadline) { break }
+        }
+        if streamStarted { return nil }
+        return lastError ?? "timed out waiting for a ScreenCaptureKit frame callback"
+    }
+
+    private func rememberError(_ message: String) {
+        condition.lock()
+        responseCollectionValid = false
+        lastError = message
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 // Raw-ticks counterpart of captureImageWithTimes, used only by wheel-measure
 // so that its frame times are directly comparable (same mach clock, no
 // seconds round-trip) with the product-side ticks it polls for (Issue #427).
@@ -917,9 +1113,14 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
                   _ windowID: CGWindowID, _ frameDirectory: String, _ frameDelays: [Int],
                   _ timingPath: String, _ pollTimeoutMs: Int) {
     let capture = prepareWindowCaptureContext(windowID)
+    let displayCapture = WindowServerDisplayCapture(capture: capture)
+    if let error = displayCapture.start() {
+        fail("could not start WindowServer display measurement: \(error)")
+    }
     let timingOffsetBefore = fileSizeOrZero(timingPath)
 
     let eventPostedTicks = postScrollTicks(pid, unit, delta)
+    displayCapture.markEventPosted(eventPostedTicks)
     let eventPostedSeconds = Double(eventPostedTicks) * machSecondsPerTick
 
     var frames: [(Int, CapturedWindowFrameTicks)] = []
@@ -947,6 +1148,15 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         if productTiming == nil { Thread.sleep(forTimeInterval: 0.01) }
     }
 
+    if let stopError = displayCapture.stop() {
+        fail("could not stop WindowServer display measurement: \(stopError)")
+    }
+    let (displayResponses, displayCollectionValid, displayError) =
+        displayCapture.waitForDisplayResponses(timeout: 10)
+    guard !displayResponses.isEmpty else {
+        fail("could not capture a timed WindowServer display response: \(displayError ?? "unknown error")")
+    }
+
     try? FileManager.default.createDirectory(
         at: URL(fileURLWithPath: frameDirectory, isDirectory: true),
         withIntermediateDirectories: true
@@ -956,6 +1166,13 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
             .appendingPathComponent(String(format: "frame-%02d.png", index)).path
         writeWindowImage(frame.image, path: path)
     }
+    let displayResponsePaths = displayResponses.enumerated().map { index, response in
+        let path = URL(fileURLWithPath: frameDirectory, isDirectory: true)
+            .appendingPathComponent(String(format: "display-response-%02d.png", index)).path
+        writeWindowImage(response.image, path: path)
+        return path
+    }
+    let displayResponseArtifactWrittenTicks = monotonicTicks()
 
     print("event_route=cghidEventTap")
     print("event_post_ticks=\(eventPostedTicks)")
@@ -975,6 +1192,20 @@ func wheelMeasure(_ pid: pid_t, _ unit: CGScrollEventUnit, _ delta: Int32,
         print("product_frame_presented_ticks=unavailable")
         print("product_mach_timebase_numer=unavailable")
         print("product_mach_timebase_denom=unavailable")
+    }
+    print("display_response_count=\(displayResponses.count)")
+    print("display_response_collection_valid=\(displayCollectionValid ? "true" : "false")")
+    for (index, response) in displayResponses.enumerated() {
+        let prefix = String(format: "display_response_%02d_", index)
+        print(prefix + "sample_id=\(response.sampleID)")
+        print(prefix + "frame_status=complete")
+        print(prefix + "timestamp_source=SCStreamFrameInfo.displayTime")
+        print(prefix + "image_source=same_CMSampleBuffer")
+        print(prefix + "display_time_ticks=\(response.displayTicks)")
+        print(prefix + "callback_received_ticks=\(response.callbackReceivedTicks)")
+        print(prefix + "image_ready_ticks=\(response.imageReadyTicks)")
+        print(prefix + "artifact_written_ticks=\(displayResponseArtifactWrittenTicks)")
+        print(prefix + "image_path=\(displayResponsePaths[index])")
     }
     for (index, frame) in frames {
         print(String(format: "frame_%02d_capture_started_ticks=", index) + String(frame.startedTicks))

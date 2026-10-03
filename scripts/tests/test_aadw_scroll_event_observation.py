@@ -51,6 +51,21 @@ def helper_output(
             "product_mach_timebase_numer=unavailable",
             "product_mach_timebase_denom=unavailable",
         ]
+    response_display_ticks = event_post_ticks + 8_400_000
+    response_callback_ticks = event_post_ticks + 9_000_000
+    lines += [
+        "display_response_count=1",
+        "display_response_collection_valid=true",
+        "display_response_00_sample_id=1",
+        "display_response_00_frame_status=complete",
+        "display_response_00_timestamp_source=SCStreamFrameInfo.displayTime",
+        "display_response_00_image_source=same_CMSampleBuffer",
+        f"display_response_00_display_time_ticks={response_display_ticks}",
+        f"display_response_00_callback_received_ticks={response_callback_ticks}",
+        f"display_response_00_image_ready_ticks={response_callback_ticks + 100_000}",
+        f"display_response_00_artifact_written_ticks={response_callback_ticks + 200_000}",
+        "display_response_00_image_path=/tmp/display-response-00.png",
+    ]
     if include_frame:
         lines += [
             f"frame_00_capture_started_ticks={frame_started_ticks}",
@@ -66,6 +81,8 @@ class ParseWheelMeasureOutputTests(unittest.TestCase):
         self.assertEqual(record["event_post_ticks"], 0)
         self.assertEqual(record["product_scroll_receipt_ticks"], 1_000_000)
         self.assertEqual(record["frames"][0]["capture_started_ticks"], 8_000_000)
+        self.assertEqual(record["display_response_count"], 1)
+        self.assertEqual(record["display_responses"][0]["sample_id"], 1)
 
     def test_unavailable_product_fields_parse_as_none(self):
         record = scroll_event_observation.parse_wheel_measure_output(
@@ -83,6 +100,7 @@ class AssessWheelMeasurementTests(unittest.TestCase):
         self.assertTrue(result["clock_consistent"])
         self.assertIsNone(result["reason"])
         self.assertEqual(result["presentation_observation"], "unavailable")
+        self.assertEqual(result["window_server_display_observation"], "observed")
         self.assertAlmostEqual(result["stages_ms"]["event_post_ms"], 0.0)
         self.assertLess(result["stages_ms"]["scroll_receipt_ms"], result["stages_ms"]["frame_paint_ms"])
         self.assertLess(
@@ -123,6 +141,17 @@ class AssessWheelMeasurementTests(unittest.TestCase):
             "product_frame_presented_ticks=unavailable",
             "product_mach_timebase_numer=1",
             "product_mach_timebase_denom=1",
+            "display_response_count=1",
+            "display_response_collection_valid=true",
+            "display_response_00_sample_id=1",
+            "display_response_00_frame_status=complete",
+            "display_response_00_timestamp_source=SCStreamFrameInfo.displayTime",
+            "display_response_00_image_source=same_CMSampleBuffer",
+            "display_response_00_display_time_ticks=80000000",
+            "display_response_00_callback_received_ticks=81000000",
+            "display_response_00_image_ready_ticks=82000000",
+            "display_response_00_artifact_written_ticks=83000000",
+            "display_response_00_image_path=/tmp/display-response-00.png",
             "frame_00_capture_started_ticks=1565000",
             "frame_00_capture_completed_ticks=3000000",
             "frame_01_capture_started_ticks=59002000",
