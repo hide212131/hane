@@ -692,7 +692,8 @@ def move_to_document_top(interaction, module, env, config, helper, pid: int,
     capture, lines, text = capture_single(
         interaction, module, env, config, helper, window_id, run_dir, label, helper_timeout)
     if capture["result"] != "pass":
-        return step(label, "blocked", capture.get("reason") or "文書先頭の画面を取得できない"), lines, text
+        return step(label, "blocked", capture.get("reason") or "文書先頭の画面を取得できない",
+                    visible_lines=lines, recognized_text=text), lines, text
     if not lines or min(lines) != 1:
         return step(label, "blocked", "文書先頭への移動後に先頭行を確認できない",
                     visible_lines=lines, recognized_text=text), lines, text
@@ -713,7 +714,10 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir, "direction-calibration-top", helper_timeout)
     if top_step["result"] != "pass":
-        return None, step("scroll_direction_calibration", "blocked", top_step.get("reason"))
+        return None, step(
+            "scroll_direction_calibration", "blocked", top_step.get("reason"),
+            initial_top_step=top_step, initial_top_visible_lines=top_lines,
+            initial_top_recognized_text=_top_text)
     baseline = min(top_lines) if top_lines else None
     probes = []
     downward_sign = None
@@ -723,7 +727,11 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
                 interaction, module, env, config, helper, pid, window_id,
                 scenario_dir, "direction-calibration-reset", helper_timeout)
             if top_step["result"] != "pass":
-                probes.append({"sign": sign, "result": "blocked", "reason": top_step.get("reason")})
+                probes.append({
+                    "sign": sign, "result": "blocked", "reason": top_step.get("reason"),
+                    "reset_step": top_step, "reset_visible_lines": top_lines,
+                    "reset_recognized_text": _top_text,
+                })
                 break
             baseline = min(top_lines) if top_lines else None
 
@@ -743,12 +751,14 @@ def calibrate_scroll_direction(interaction, module, env, config, helper, pid: in
             downward_sign = sign
             break
 
-    reset_step, reset_lines, _reset_text = move_to_document_top(
+    reset_step, reset_lines, reset_text = move_to_document_top(
         interaction, module, env, config, helper, pid, window_id,
         scenario_dir, "direction-calibration-final-reset", helper_timeout)
     if reset_step["result"] != "pass":
         return None, step("scroll_direction_calibration", "blocked", reset_step.get("reason"),
-                          downward_sign=downward_sign, probes=probes)
+                          downward_sign=downward_sign, probes=probes,
+                          reset_step=reset_step, reset_visible_lines=reset_lines,
+                          reset_recognized_text=reset_text)
     if downward_sign is None:
         return None, step(
             "scroll_direction_calibration", "blocked",
