@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -602,14 +603,20 @@ class ScrollEventObservationAttachmentTests(unittest.TestCase):
 
 class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
     class _StubInteraction:
-        def __init__(self, output, ocr_text="LINE 100"):
+        def __init__(self, output, ocr_text="LINE 100", timing_delta=b""):
             self.output = output
             self.ocr_text = ocr_text
+            self.timing_delta = timing_delta
             self.calls: list[list[str]] = []
 
         def run_helper(self, _helper, args, _timeout):
             self.calls.append(args)
             if args[0] == "wheel-measure":
+                if self.timing_delta:
+                    timing_path = Path(args[7])
+                    timing_path.parent.mkdir(parents=True, exist_ok=True)
+                    with timing_path.open("ab") as timing_file:
+                        timing_file.write(self.timing_delta)
                 return True, self.output, ""
             if args[0] == "ocr":
                 return True, self.ocr_text, ""
@@ -632,6 +639,10 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
 
     WHEEL_MEASURE_OUTPUT = (
         "event_route=cghidEventTap\n"
+        "focus_target_pid=10\n"
+        "focus_frontmost_pid=10\n"
+        "focus_application_active=true\n"
+        "focus_target_window_visible=true\n"
         "event_post_ticks=1000000\n"
         "mach_timebase_numer=1\n"
         "mach_timebase_denom=1\n"
@@ -664,28 +675,54 @@ class CaptureFramesScrollEventMeasurementTests(unittest.TestCase):
         "display_response_01_image_path=/tmp/hane-wheel-measure-wiring-test/frames/display-response-01.png\n"
     )
 
-    def test_uses_wheel_measure_and_attaches_a_separate_observer_classification(self):
-        interaction = self._StubInteraction(self.WHEEL_MEASURE_OUTPUT)
-        observation_module = self._StubObservationModule()
-        timing_path = Path("/tmp/hane-wheel-measure-wiring-test/timing.log")
-        frames_out, observation, error = gui.capture_frames(
-            interaction, None, None, None, "helper", 10, "window",
-            Path("/tmp/hane-wheel-measure-wiring-test"), "lines", -8, (0,), 1.0,
-            scroll_event_timing_path=timing_path,
-            scroll_event_observation_module=observation_module,
-        )
-        self.assertIsNone(error)
-        self.assertEqual(interaction.calls[0][0], "wheel-measure")
-        self.assertIn(str(timing_path), interaction.calls[0])
-        self.assertEqual(len(frames_out), 1)
-        self.assertAlmostEqual(frames_out[0]["capture_started_elapsed_ms"], 1.0)
-        self.assertAlmostEqual(frames_out[0]["capture_completed_elapsed_ms"], 1.2)
-        self.assertEqual(observation_module.parse_calls, [(self.WHEEL_MEASURE_OUTPUT, 1)])
-        self.assertEqual(observation, observation_module.assessed)
-        self.assertEqual(observation["window_server_display_responses"][0]["visible_lines"], [100])
-        self.assertEqual(observation["window_server_display_responses"][0]["sample_id"], 7)
-        self.assertEqual(len(observation["window_server_display_responses"]), 2)
-        self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
+    def test_uses_wheel_measure_and_preserves_stdout_focus_and_exact_timing_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timing_path = Path(directory) / "timing.log"
+            timing_path.write_text('{"older":"record"}\n', encoding="utf-8")
+            interaction = self._StubInteraction(
+                self.WHEEL_MEASURE_OUTPUT, timing_delta=b'{"new":"record"}\n')
+            observation_module = self._StubObservationModule()
+            frames_out, observation, error = gui.capture_frames(
+                interaction, None, None, None, "helper", 10, "window",
+                Path("/tmp/hane-wheel-measure-wiring-test"), "lines", -8, (0,), 1.0,
+                scroll_event_timing_path=timing_path,
+                scroll_event_observation_module=observation_module,
+            )
+            self.assertIsNone(error)
+            self.assertEqual(interaction.calls[0][0], "wheel-measure")
+            self.assertIn(str(timing_path), interaction.calls[0])
+            self.assertEqual(len(frames_out), 1)
+            self.assertAlmostEqual(frames_out[0]["capture_started_elapsed_ms"], 1.0)
+            self.assertAlmostEqual(frames_out[0]["capture_completed_elapsed_ms"], 1.2)
+            self.assertEqual(observation_module.parse_calls, [(self.WHEEL_MEASURE_OUTPUT, 1)])
+            self.assertEqual(observation["observation"], "observed_ordered")
+            self.assertIn("focus_target_window_visible=true", observation["wheel_measure_output_excerpt"])
+            self.assertEqual(observation["scroll_event_timing_log_delta"], {
+                "status": "appended", "appended_bytes": len(b'{"new":"record"}\n'),
+                "content_excerpt": '{"new":"record"}\n', "truncated": False,
+            })
+            self.assertEqual(observation["window_server_display_responses"][0]["visible_lines"], [100])
+            self.assertEqual(observation["window_server_display_responses"][0]["sample_id"], 7)
+            self.assertEqual(len(observation["window_server_display_responses"]), 2)
+            self.assertEqual([call[0] for call in interaction.calls].count("ocr"), 3)
+
+    def test_no_timing_record_is_explicit_and_does_not_upgrade_the_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timing_path = Path(directory) / "timing.log"
+            interaction = self._StubInteraction(self.WHEEL_MEASURE_OUTPUT)
+            observation_module = self._StubObservationModule()
+            _frames_out, observation, error = gui.capture_frames(
+                interaction, None, None, None, "helper", 10, "window",
+                Path("/tmp/hane-wheel-measure-wiring-test"), "lines", -8, (0,), 1.0,
+                scroll_event_timing_path=timing_path,
+                scroll_event_observation_module=observation_module,
+            )
+            self.assertIsNone(error)
+            self.assertEqual(observation["observation"], "observed_ordered")
+            self.assertEqual(observation["scroll_event_timing_log_delta"], {
+                "status": "missing", "appended_bytes": 0,
+                "content_excerpt": "", "truncated": False,
+            })
 
     def test_measurement_parse_failure_preserves_stdout_for_diagnosis(self):
         output = self.WHEEL_MEASURE_OUTPUT.replace(
@@ -1111,7 +1148,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/16")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/17")
 
 
 class DocumentEdgeTests(unittest.TestCase):

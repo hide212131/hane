@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = 1
-PROCEDURE_VERSION = "hosted-scroll-inertia/16"
+PROCEDURE_VERSION = "hosted-scroll-inertia/17"
 VERIFICATION_KIND = "scroll_inertia_focused"
 SCOPE_NOTE = (
     "Issue #389 に限定した focused GUI evidence。Lines の初回応答・解放後の余韻と減速・"
@@ -82,6 +82,32 @@ def step(name: str, result: str, reason: Optional[str] = None, **detail) -> dict
 def bounded_wheel_measure_output(output: str) -> str:
     excerpt = output[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT]
     return excerpt if len(output) <= WHEEL_MEASURE_ERROR_OUTPUT_LIMIT else excerpt + "\n...(truncated)"
+
+
+def scroll_event_timing_log_delta(path: Path, offset: int) -> dict:
+    """Preserve the exact bounded product timing-log bytes appended by one
+    wheel-measure invocation, including an explicit record when no bytes were
+    available. This is diagnostic evidence only and never changes acceptance."""
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return {"status": "missing", "appended_bytes": 0, "content_excerpt": "",
+                "truncated": False}
+    except OSError as exc:
+        return {"status": "read_error", "appended_bytes": 0,
+                "content_excerpt": str(exc)[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT],
+                "truncated": False}
+
+    file_was_truncated = len(content) < offset
+    appended = content if file_was_truncated else content[offset:]
+    excerpt = appended[:WHEEL_MEASURE_ERROR_OUTPUT_LIMIT]
+    return {
+        "status": "truncated_before_read" if file_was_truncated else (
+            "appended" if appended else "no_new_bytes"),
+        "appended_bytes": len(appended),
+        "content_excerpt": excerpt.decode("utf-8", errors="replace"),
+        "truncated": len(appended) > len(excerpt),
+    }
 
 
 def skipped(name: str, reason: str) -> dict:
@@ -640,6 +666,12 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
     scroll_event_observation = None
     use_wheel_measure = scroll_event_timing_path is not None and scroll_event_observation_module is not None
     if use_wheel_measure:
+        try:
+            timing_log_offset = scroll_event_timing_path.stat().st_size
+        except FileNotFoundError:
+            timing_log_offset = 0
+        except OSError:
+            timing_log_offset = 0
         ok, output, error = interaction.run_helper(helper, [
             "wheel-measure", str(pid), unit, str(delta), str(window_id), str(frame_dir),
             ",".join(str(delay) for delay in delays),
@@ -658,9 +690,11 @@ def capture_frames(interaction, module, env, config, helper, pid: int, window_id
         scroll_event_observation = scroll_event_observation_module.assess_wheel_measurement(
             scroll_event_observation_module.parse_wheel_measure_output(output, len(delays))
         )
+        scroll_event_observation["wheel_measure_output_excerpt"] = bounded_wheel_measure_output(output)
+        scroll_event_observation["scroll_event_timing_log_delta"] = scroll_event_timing_log_delta(
+            scroll_event_timing_path, timing_log_offset)
         if evidence["display_response_error"] is not None:
             scroll_event_observation["display_response_error"] = evidence["display_response_error"]
-            scroll_event_observation["wheel_measure_output_excerpt"] = bounded_wheel_measure_output(output)
     else:
         ok, output, error = interaction.run_helper(helper, [
             "wheel-capture", str(pid), unit, str(delta), str(window_id), str(frame_dir),
