@@ -856,14 +856,15 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         top_frames = [{"visible_lines": [1, 2], "recognized_text": "LINE 001"}]
         stalled_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
         position_frames = [{"visible_lines": final_lines, "recognized_text": "position frame"}]
-        observations = []
+        calls = 0
 
         def capture(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
             observation = None
-            observations.append(observation)
             if capture_error:
                 return top_frames, observation, capture_error
-            if final_lines[0] > 1 and len(observations) == 1:
+            if final_lines[0] > 1 and calls == 1:
                 return top_frames, observation, None
             return position_frames if final_lines[0] > 1 else stalled_frames, observation, None
 
@@ -874,10 +875,10 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
                 Path("/tmp/hane-position-measurement-test"), 2.0, -1,
                 "lines-positioning",
             )
-        return result, lines, text, capture_mock, top_frames, position_frames, observations
+        return result, lines, text, capture_mock, top_frames, position_frames
 
     def test_positioning_uses_calibrated_small_input_until_midpoint_is_visible(self):
-        result, lines, text, capture, top_frames, position_frames, observations = (
+        result, lines, text, capture, top_frames, position_frames = (
             self._run_position([180, 181, 182])
         )
         self.assertEqual(result["result"], "pass")
@@ -899,7 +900,7 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
 
     def test_small_top_movement_does_not_count_as_midpoint(self):
         near_top = list(range(2, 23))
-        result, lines, text, capture, _top_frames, _position_frames, observations = self._run_position(
+        result, lines, text, capture, _top_frames, _position_frames = self._run_position(
             near_top
         )
         self.assertEqual(result["result"], "blocked")
@@ -912,7 +913,7 @@ class PositionDocumentMidpointMeasurementTests(unittest.TestCase):
         self.assertIsNone(result["scroll_event_observation"])
 
     def test_capture_error_remains_blocked_and_keeps_partial_positioning_evidence(self):
-        result, lines, text, _capture, top_frames, _position_frames, observations = self._run_position(
+        result, lines, text, _capture, top_frames, _position_frames = self._run_position(
             [180, 181], "scroll receipt unavailable"
         )
         self.assertEqual(result["result"], "blocked")
@@ -1110,7 +1111,7 @@ class WindowServerDisplayCaptureContractTests(unittest.TestCase):
         self.assertIn("displayCapture.markEventPosted(eventPostedTicks)", measure)
         self.assertIn('print(prefix + "image_source=same_CMSampleBuffer")', measure)
         self.assertIn('product_frame_presented_ticks=unavailable', measure)
-        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/15")
+        self.assertEqual(gui.PROCEDURE_VERSION, "hosted-scroll-inertia/16")
 
 
 class DocumentEdgeTests(unittest.TestCase):
